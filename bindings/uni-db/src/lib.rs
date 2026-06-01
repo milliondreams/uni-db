@@ -83,8 +83,11 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncSession>()?;
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncTransactionBuilder>()?;
-    m.add_class::<async_api::AsyncQueryBuilder>()?;
     m.add_class::<async_api::AsyncQueryCursor>()?;
+    m.add_class::<async_api::AsyncStreamingAppender>()?;
+    m.add_class::<async_api::AsyncTxAppenderBuilder>()?;
+    m.add_class::<async_api::AsyncSessionTemplateBuilder>()?;
+    m.add_class::<async_api::AsyncSessionTemplate>()?;
     m.add_class::<async_api::AsyncSchemaBuilder>()?;
     m.add_class::<async_api::AsyncLabelBuilder>()?;
     m.add_class::<async_api::AsyncEdgeTypeBuilder>()?;

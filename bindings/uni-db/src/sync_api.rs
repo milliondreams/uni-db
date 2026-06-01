@@ -936,65 +936,7 @@ impl Database {
         script: &str,
         grants: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
-        use uni_plugin::{Capability, CapabilitySet};
-
-        let mut cap_set = CapabilitySet::new();
-        // Default: any grants list adds the corresponding capability
-        // with the broadest possible attenuation (e.g., Filesystem
-        // {read: ["**"]}). Tightening to specific patterns is host-
-        // side work after M7.
-        let grants = grants.unwrap_or_else(|| {
-            vec![
-                "ScalarFn".to_owned(),
-                "AggregateFn".to_owned(),
-                "Procedure".to_owned(),
-            ]
-        });
-        for g in &grants {
-            match g.as_str() {
-                "ScalarFn" => {
-                    cap_set.insert(Capability::ScalarFn);
-                }
-                "AggregateFn" => {
-                    cap_set.insert(Capability::AggregateFn);
-                }
-                "Procedure" => {
-                    cap_set.insert(Capability::Procedure);
-                }
-                "Filesystem" => {
-                    cap_set.insert(Capability::Filesystem {
-                        read: vec!["**".into()],
-                        write: vec!["**".into()],
-                    });
-                }
-                "Network" => {
-                    cap_set.insert(Capability::Network {
-                        allow: vec!["**".into()],
-                    });
-                }
-                "HostQuery" => {
-                    cap_set.insert(Capability::HostQuery {
-                        read_only: true,
-                        scopes: vec!["**".into()],
-                    });
-                }
-                "Kms" => {
-                    cap_set.insert(Capability::Kms {
-                        key_ids: vec!["*".into()],
-                    });
-                }
-                "Secret" => {
-                    cap_set.insert(Capability::Secret {
-                        ids: vec!["*".into()],
-                    });
-                }
-                other => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "unknown grant `{other}`; supported: ScalarFn / AggregateFn / Procedure / Filesystem / Network / HostQuery / Kms / Secret"
-                    )));
-                }
-            }
-        }
+        let cap_set = crate::builders::build_capability_set_strict(grants)?;
 
         let mut loader = uni_plugin_rhai::RhaiLoader::new();
         uni_plugin_rhai::host_fn_impls::register_default_host_fns(&mut loader);

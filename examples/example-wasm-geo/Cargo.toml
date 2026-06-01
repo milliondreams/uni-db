@@ -4,11 +4,12 @@
 #   cd examples/example-wasm-geo
 #   cargo build --target wasm32-wasip2 --release
 #
-# Produces target/wasm32-wasip2/release/example_wasm_geo.wasm (a
-# wasm32 module). The test harness in
-# `crates/uni-plugin-wasm/tests/example_wasm_geo_e2e.rs` wraps it
-# into a Component Model binary on-the-fly via the `wit-component`
-# crate — no external `wasm-tools` install required.
+# Produces target/wasm32-wasip2/release/example_wasm_geo.wasm — a
+# Component Model binary directly. Under the current Rust toolchain
+# `wasm32-wasip2` emits a component, so no `wit-component` /
+# `wasm-tools component new` post-processing step is required; the
+# host loads the bytes as-is (see
+# `crates/uni-plugin-wasm/tests/example_wasm_geo_e2e.rs`).
 
 [workspace]
 

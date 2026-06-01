@@ -61,6 +61,75 @@ pub(crate) fn build_capability_set(grants: Option<Vec<String>>) -> uni_plugin::C
     cap_set
 }
 
+/// Like [`build_capability_set`] but rejects unknown grant names.
+///
+/// Used by the Rhai loader (sync and async), which validates grants strictly.
+/// Grants default to `ScalarFn` / `AggregateFn` / `Procedure` when `None`.
+///
+/// # Errors
+/// Returns a `ValueError` if `grants` contains an unrecognized capability name.
+pub(crate) fn build_capability_set_strict(
+    grants: Option<Vec<String>>,
+) -> PyResult<uni_plugin::CapabilitySet> {
+    use uni_plugin::Capability;
+    let mut cap_set = uni_plugin::CapabilitySet::new();
+    // Any grant adds the capability with the broadest attenuation
+    // (e.g. Filesystem {read: ["**"]}); tightening is host-side work.
+    let grants = grants.unwrap_or_else(|| {
+        vec![
+            "ScalarFn".to_owned(),
+            "AggregateFn".to_owned(),
+            "Procedure".to_owned(),
+        ]
+    });
+    for g in &grants {
+        match g.as_str() {
+            "ScalarFn" => {
+                cap_set.insert(Capability::ScalarFn);
+            }
+            "AggregateFn" => {
+                cap_set.insert(Capability::AggregateFn);
+            }
+            "Procedure" => {
+                cap_set.insert(Capability::Procedure);
+            }
+            "Filesystem" => {
+                cap_set.insert(Capability::Filesystem {
+                    read: vec!["**".into()],
+                    write: vec!["**".into()],
+                });
+            }
+            "Network" => {
+                cap_set.insert(Capability::Network {
+                    allow: vec!["**".into()],
+                });
+            }
+            "HostQuery" => {
+                cap_set.insert(Capability::HostQuery {
+                    read_only: true,
+                    scopes: vec!["**".into()],
+                });
+            }
+            "Kms" => {
+                cap_set.insert(Capability::Kms {
+                    key_ids: vec!["*".into()],
+                });
+            }
+            "Secret" => {
+                cap_set.insert(Capability::Secret {
+                    ids: vec!["*".into()],
+                });
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown grant `{other}`; supported: ScalarFn / AggregateFn / Procedure / Filesystem / Network / HostQuery / Kms / Secret"
+                )));
+            }
+        }
+    }
+    Ok(cap_set)
+}
+
 /// M8 F2 helper: serialize a [`uni_plugin_pyo3::LoadOutcome`] into a
 /// metadata dict matching `Database::load_rhai_plugin`'s return shape.
 pub(crate) fn load_outcome_to_pydict(
@@ -1971,6 +2040,61 @@ impl ::uni_db::SessionHook for PySessionHook {
 // StreamingAppender
 // ============================================================================
 
+/// Convert a PyArrow `RecordBatch` into an Arrow [`RecordBatch`], zero-copy.
+///
+/// Uses the Arrow PyCapsule C Data Interface (`__arrow_c_array__`). Shared by
+/// the sync and async streaming appenders so the FFI extraction lives in one
+/// place.
+///
+/// # Errors
+/// Returns a `TypeError` if `batch` does not expose `__arrow_c_array__`, or a
+/// `ValueError` if the Arrow FFI import fails.
+pub(crate) fn record_batch_from_pyarrow(
+    batch: &Bound<'_, PyAny>,
+) -> PyResult<arrow_array::RecordBatch> {
+    let capsule_tuple = batch.call_method0("__arrow_c_array__").map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "Expected a PyArrow RecordBatch with __arrow_c_array__ support: {}",
+            e
+        ))
+    })?;
+    let schema_capsule = capsule_tuple.get_item(0)?;
+    let array_capsule = capsule_tuple.get_item(1)?;
+
+    // Safety: the capsules are produced by the Arrow C Data Interface, which
+    // guarantees valid `arrow_schema` / `arrow_array` pointers; per that
+    // interface the consumer takes ownership, so we `ptr::read` them out.
+    let (ffi_schema, ffi_array) = unsafe {
+        let schema_ptr =
+            pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
+                as *mut arrow_array::ffi::FFI_ArrowSchema;
+        let array_ptr =
+            pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
+                as *mut arrow_array::ffi::FFI_ArrowArray;
+        (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
+    };
+
+    // Safety: `ffi_array` / `ffi_schema` were just read from valid Arrow C Data
+    // Interface capsules and describe a consistent array/schema pair.
+    let array_data = unsafe {
+        arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).map_err(
+            |e: arrow_schema::ArrowError| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+            },
+        )?
+    };
+    let struct_array = arrow_array::StructArray::from(array_data);
+    let schema = arrow_schema::Schema::new(
+        struct_array
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+    );
+    arrow_array::RecordBatch::try_new(std::sync::Arc::new(schema), struct_array.columns().to_vec())
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+}
+
 /// A streaming appender for single-label data loading.
 ///
 /// Rows are buffered and flushed in batches. Use as a context manager:
@@ -2035,49 +2159,7 @@ impl StreamingAppender {
     /// Accepts a PyArrow RecordBatch. Uses the Arrow PyCapsule C Data Interface
     /// (`__arrow_c_array__`) for zero-copy transfer.
     fn write_batch(&self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Use Arrow PyCapsule interface (__arrow_c_array__) for zero-copy
-        let capsule_tuple = batch.call_method0("__arrow_c_array__").map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                "Expected a PyArrow RecordBatch with __arrow_c_array__ support: {}",
-                e
-            ))
-        })?;
-        let schema_capsule = capsule_tuple.get_item(0)?;
-        let array_capsule = capsule_tuple.get_item(1)?;
-
-        // Extract raw pointers from PyCapsules and convert via Arrow FFI
-        let (ffi_schema, ffi_array) = unsafe {
-            let schema_ptr =
-                pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
-                    as *mut arrow_array::ffi::FFI_ArrowSchema;
-            let array_ptr =
-                pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
-                    as *mut arrow_array::ffi::FFI_ArrowArray;
-            // Move out of the capsule pointers (Arrow C Data Interface: consumer owns the data)
-            (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
-        };
-
-        let array_data = unsafe {
-            arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).map_err(
-                |e: arrow_schema::ArrowError| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
-                },
-            )?
-        };
-        let struct_array = arrow_array::StructArray::from(array_data);
-        let schema = arrow_schema::Schema::new(
-            struct_array
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<_>>(),
-        );
-        let record_batch = arrow_array::RecordBatch::try_new(
-            std::sync::Arc::new(schema),
-            struct_array.columns().to_vec(),
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
+        let record_batch = record_batch_from_pyarrow(batch)?;
         let mut guard = self.inner.lock().unwrap();
         let appender = guard.as_mut().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")

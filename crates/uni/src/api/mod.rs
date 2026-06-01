@@ -51,6 +51,7 @@ pub mod indexes;
 pub mod locy_builder;
 pub mod locy_result;
 pub mod multi_agent;
+pub mod plugin_trust;
 /// Commit notifications — moved to `uni-plugin-host`; re-exported to keep the
 /// `uni_db::api::notifications::*` path stable.
 pub mod notifications {
@@ -346,6 +347,10 @@ pub struct UniInner {
     pub(crate) commit_tx: tokio::sync::broadcast::Sender<Arc<notifications::CommitNotification>>,
     /// Write lease configuration for multi-agent access.
     pub(crate) write_lease: Option<multi_agent::WriteLease>,
+    /// Host plugin trust policy — signature enforcement + trust root.
+    /// Consulted at every plugin-load site. Default: Disabled + empty root
+    /// (accept everything, as before).
+    pub(crate) plugin_trust: Arc<plugin_trust::PluginTrustConfig>,
     /// Number of currently active sessions.
     pub(crate) active_session_count: AtomicUsize,
     /// Total queries executed across all sessions.
@@ -608,6 +613,7 @@ impl UniInner {
             start_time: Instant::now(),
             commit_tx,
             write_lease: None,
+            plugin_trust: self.plugin_trust.clone(),
             active_session_count: AtomicUsize::new(0),
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
@@ -739,6 +745,7 @@ impl UniInner {
             start_time: Instant::now(),
             commit_tx,
             write_lease: None,
+            plugin_trust: self.plugin_trust.clone(),
             active_session_count: AtomicUsize::new(0),
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
@@ -1599,6 +1606,12 @@ impl Uni {
 
         let plugin: Arc<dyn uni_plugin::Plugin> = Arc::new(plugin);
         let manifest = plugin.manifest();
+        // Enforce the host signature policy. Default (Disabled) is a no-op;
+        // RequireSigned rejects an unsigned manifest or an untrusted key.
+        self.inner
+            .plugin_trust
+            .enforce(manifest)
+            .map_err(plugin_err_to_uni)?;
         let plugin_id = manifest.id.clone();
         let caps = manifest.capabilities.clone();
         let mut r = PluginRegistrar::new(plugin_id.clone(), &caps, &self.inner.plugin_registry);
@@ -2678,6 +2691,7 @@ pub struct UniBuilder {
     fail_if_exists: bool,
     read_only: bool,
     write_lease: Option<multi_agent::WriteLease>,
+    plugin_trust: Arc<plugin_trust::PluginTrustConfig>,
     temp_dir: Option<TempDir>,
 }
 
@@ -2696,6 +2710,7 @@ impl UniBuilder {
             fail_if_exists: false,
             read_only: false,
             write_lease: None,
+            plugin_trust: Arc::new(plugin_trust::PluginTrustConfig::default()),
             temp_dir: None,
         }
     }
@@ -2769,6 +2784,19 @@ impl UniBuilder {
     /// processes share the same database.
     pub fn write_lease(mut self, lease: multi_agent::WriteLease) -> Self {
         self.write_lease = Some(lease);
+        self
+    }
+
+    /// Set the host plugin trust policy (signature enforcement + trust root).
+    ///
+    /// Applies to externally-loaded plugins (`add_plugin` and, as the
+    /// signing subsystem lands, the WASM/Extism/Rhai/Python loaders).
+    /// Compile-time built-in plugins are implicitly trusted. The default
+    /// is [`SignaturePolicy::Disabled`](uni_plugin::verify::SignaturePolicy)
+    /// with an empty trust root — accept everything, identical to prior
+    /// behavior.
+    pub fn plugin_trust(mut self, cfg: plugin_trust::PluginTrustConfig) -> Self {
+        self.plugin_trust = Arc::new(cfg);
         self
     }
 
@@ -3544,6 +3572,7 @@ impl UniBuilder {
                 start_time: Instant::now(),
                 commit_tx,
                 write_lease: self.write_lease,
+                plugin_trust: self.plugin_trust,
                 active_session_count: AtomicUsize::new(0),
                 total_queries: AtomicU64::new(0),
                 total_commits: AtomicU64::new(0),

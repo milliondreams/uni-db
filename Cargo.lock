@@ -12821,8 +12821,10 @@ dependencies = [
  "uni-db",
  "uni-locy",
  "uni-plugin",
+ "uni-plugin-extism",
  "uni-plugin-pyo3",
  "uni-plugin-rhai",
+ "uni-plugin-wasm",
  "uni-store",
 ]
 

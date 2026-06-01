@@ -619,6 +619,43 @@ impl TxAppenderBuilder {
     }
 }
 
+/// Default grant set for the WASM loaders when the caller passes none:
+/// surface registration for scalar / aggregate / procedure plugins.
+#[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
+fn default_surface_grants() -> Vec<String> {
+    vec![
+        "ScalarFn".to_owned(),
+        "AggregateFn".to_owned(),
+        "Procedure".to_owned(),
+    ]
+}
+
+/// Marshal a WASM / Extism `LoadOutcome` into the dict shape the Python
+/// plugin-load APIs return (the WASM/Extism outcomes already carry
+/// `Vec<String>` capability lists, so no `Debug`-formatting is needed).
+#[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
+#[allow(clippy::too_many_arguments)]
+fn wasm_outcome_to_pydict(
+    py: Python<'_>,
+    plugin_id: String,
+    version: String,
+    scalars_registered: Vec<String>,
+    aggregates_registered: Vec<String>,
+    procedures_registered: Vec<String>,
+    effective_capabilities: Vec<String>,
+    denied_capabilities: Vec<String>,
+) -> PyResult<Py<PyAny>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("plugin_id", plugin_id)?;
+    dict.set_item("version", version)?;
+    dict.set_item("scalars_registered", scalars_registered)?;
+    dict.set_item("aggregates_registered", aggregates_registered)?;
+    dict.set_item("procedures_registered", procedures_registered)?;
+    dict.set_item("effective_capabilities", effective_capabilities)?;
+    dict.set_item("denied_capabilities", denied_capabilities)?;
+    Ok(dict.into())
+}
+
 // ============================================================================
 // Database (main entry point)
 // ============================================================================
@@ -979,6 +1016,79 @@ impl Database {
             .collect();
         dict.set_item("denied_capabilities", denied)?;
         Ok(dict.into())
+    }
+
+    /// Load a WASM Component Model plugin from raw bytes.
+    ///
+    /// Thin passthrough to [`Uni::load_wasm_component`](uni_db::Uni). `grants`
+    /// uses the same variant names as [`Self::load_rhai_plugin`]
+    /// (`ScalarFn` / `AggregateFn` / `Procedure` / `Filesystem` / `Network`
+    /// / `HostQuery` / `Kms` / `Secret`) and drives both the surface
+    /// registration gate and the host-fn grant set. Defaults to
+    /// scalar / aggregate / procedure when omitted.
+    ///
+    /// Returns a dict with `plugin_id`, `version`, `scalars_registered`,
+    /// `aggregates_registered`, `procedures_registered`,
+    /// `effective_capabilities`, `denied_capabilities`.
+    #[cfg(feature = "wasm-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_component(
+        &self,
+        py: Python<'_>,
+        wasm_bytes: &[u8],
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let cap_set = crate::builders::build_capability_set(grants.clone());
+        let host_grants = grants.unwrap_or_else(default_surface_grants);
+        let loader = uni_plugin_wasm::WasmLoader::new();
+        let outcome = self
+            .inner
+            .load_wasm_component(&loader, wasm_bytes, &host_grants, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        wasm_outcome_to_pydict(
+            py,
+            outcome.plugin_id,
+            outcome.version,
+            outcome.scalars_registered,
+            outcome.aggregates_registered,
+            outcome.procedures_registered,
+            outcome.effective_capabilities,
+            outcome.denied_capabilities,
+        )
+    }
+
+    /// Load an Extism WASM plugin from raw bytes.
+    ///
+    /// Thin passthrough to [`Uni::load_wasm_extism`](uni_db::Uni); see
+    /// [`Self::load_wasm_component`] for the `grants` and return shape.
+    /// Extism host-grant-backed host functions require registered
+    /// implementations on the loader; this v1 wrapper covers surface-grant
+    /// plugins (scalar / aggregate / procedure).
+    #[cfg(feature = "extism-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_extism(
+        &self,
+        py: Python<'_>,
+        wasm_bytes: &[u8],
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let cap_set = crate::builders::build_capability_set(grants.clone());
+        let host_grants = grants.unwrap_or_else(default_surface_grants);
+        let loader = uni_plugin_extism::ExtismLoader::new();
+        let outcome = self
+            .inner
+            .load_wasm_extism(&loader, wasm_bytes, &host_grants, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        wasm_outcome_to_pydict(
+            py,
+            outcome.plugin_id,
+            outcome.version,
+            outcome.scalars_registered,
+            outcome.aggregates_registered,
+            outcome.procedures_registered,
+            outcome.effective_capabilities,
+            outcome.denied_capabilities,
+        )
     }
 
     // ========================================================================

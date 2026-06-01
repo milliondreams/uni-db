@@ -136,10 +136,11 @@ impl LocyAggState for MaxLocyState {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn ingest(
+    fn ingest_indices(
         &mut self,
-        _batch: &datafusion::arrow::record_batch::RecordBatch,
-        _value_col: usize,
+        _col: &dyn arrow_array::Array,
+        _indices: &[usize],
+        _cx: &uni_plugin::traits::locy::FoldContext,
     ) -> Result<(), FnError> {
         Ok(())
     }

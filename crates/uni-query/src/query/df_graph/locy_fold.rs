@@ -9,13 +9,14 @@
 use crate::query::df_graph::common::{
     ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
 };
-use arrow_array::builder::{Float64Builder, Int64Builder, LargeBinaryBuilder};
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow_array::builder::Float64Builder;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::scalar::ScalarValue;
 use futures::{Stream, TryStreamExt};
 use smol_str::SmolStr;
 use std::any::Any;
@@ -25,7 +26,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use uni_locy::SemiringKind;
-use uni_plugin::traits::locy::LocyAggregate;
+use uni_plugin::traits::locy::{FoldContext, FoldSemiring, LocyAggregate};
 
 use super::locy_explain::ProofTerm;
 
@@ -37,7 +38,9 @@ use super::locy_explain::ProofTerm;
 ///
 /// Accepts legacy grammar aliases: the bare (`SUM`/`MAX`/`MIN`/`COUNT`) and
 /// `M`-prefixed (`MSUM`/`MMAX`/`MMIN`/`MCOUNT`) forms, plus `NOR`→`MNOR`,
-/// `PROD`→`MPROD`, and `COUNTALL` (which has no arguments) collapses to `COUNT`.
+/// `PROD`→`MPROD`. `COUNTALL` (the zero-argument `COUNT()`/`MCOUNT()` form)
+/// resolves to its own dedicated aggregate, distinct from null-skipping
+/// `COUNT`.
 ///
 /// # Examples
 ///
@@ -72,7 +75,6 @@ pub fn resolve_locy_aggregate(
         "MCOUNT" => "COUNT".to_owned(),
         "NOR" => "MNOR".to_owned(),
         "PROD" => "MPROD".to_owned(),
-        "COUNTALL" => "COUNT".to_owned(),
         other => other.to_owned(),
     };
     let qname = uni_plugin::QName::builtin(canonical);
@@ -279,26 +281,21 @@ impl FoldExec {
             fields.push(Arc::new(input_schema.field(ki).clone()));
         }
 
-        // Fold output columns
+        // Fold output columns — type derived from the aggregate trait. The
+        // input column type is resolved first (name-then-index) so
+        // type-preserving aggregates (`MIN`/`MAX`) can return it.
         for binding in fold_bindings {
-            let output_type = match binding.name.as_str() {
-                "SUM" | "AVG" | "MNOR" | "MPROD" => DataType::Float64,
-                "COUNT" | "COUNTALL" => DataType::Int64,
-                "MAX" | "MIN" => {
-                    let idx = binding
-                        .input_col_name
-                        .as_ref()
-                        .and_then(|name| input_schema.index_of(name).ok())
-                        .unwrap_or(binding.input_col_index);
-                    if idx < input_schema.fields().len() {
-                        input_schema.field(idx).data_type().clone()
-                    } else {
-                        DataType::Float64
-                    }
-                }
-                "COLLECT" => DataType::LargeBinary,
-                _ => DataType::Float64,
+            let idx = binding
+                .input_col_name
+                .as_ref()
+                .and_then(|name| input_schema.index_of(name).ok())
+                .unwrap_or(binding.input_col_index);
+            let input_type = if idx < input_schema.fields().len() {
+                input_schema.field(idx).data_type().clone()
+            } else {
+                DataType::Float64
             };
+            let output_type = binding.aggregate.output_type_for_input(&input_type);
             fields.push(Arc::new(Field::new(
                 &binding.output_name,
                 output_type,
@@ -433,10 +430,24 @@ impl ExecutionPlan for FoldExec {
                 output_columns.push(taken);
             }
 
-            // Fold binding columns: compute aggregates per group
+            // Per-fold evaluation context. `TopKProofs` / `BddExact` are
+            // provenance specializations handled above the aggregate (see
+            // `compute_fold_aggregate`); the aggregate trait only sees the
+            // two value-level combinators.
+            let cx = FoldContext {
+                strict,
+                epsilon,
+                semiring: match semiring_kind {
+                    SemiringKind::MaxMinProb => FoldSemiring::MaxMin,
+                    _ => FoldSemiring::AddMult,
+                },
+            };
+
+            // Fold binding columns: compute aggregates per group via the
+            // resolved `LocyAggregate` trait object.
             for binding in &fold_bindings {
                 let col: Arc<dyn Array> = if binding.name.as_str() == "COUNTALL" {
-                    // CountAll doesn't need an input column — use a dummy
+                    // COUNTALL has no input column — the aggregate ignores it.
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
                     // Resolve input column: prefer name-based lookup, fall back to index.
@@ -466,15 +477,13 @@ impl ExecutionPlan for FoldExec {
                 };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
-                    binding.name.as_str(),
+                    &binding.aggregate,
                     FoldGroups {
                         ordered_keys: &ordered_keys,
                         groups: &groups,
                         num_groups,
                     },
-                    strict,
-                    epsilon,
-                    semiring_kind,
+                    &cx,
                     topk_ctx.as_ref(),
                 )?;
                 output_columns.push(agg_col);
@@ -522,122 +531,66 @@ struct TopKFoldCtx<'a> {
     body_support_map: Option<&'a HashMap<Vec<u8>, Vec<ProofTerm>>>,
 }
 
+/// Compute one fold-output column by dispatching through the resolved
+/// [`LocyAggregate`] trait object.
+///
+/// For each key group a fresh [`LocyAggState`](uni_plugin::traits::locy::LocyAggState)
+/// is created, fed the group's rows via `ingest_indices`, and finalized; the
+/// per-group [`ScalarValue`]s are assembled into the output array (whose type
+/// follows the finalized scalars — `Int64`/`Float64` for `MIN`/`MAX` over those
+/// inputs, `LargeBinary` for `COLLECT`, etc.).
+///
+/// `TopKProofs` noisy-OR is the one provenance specialization that sits
+/// *above* the aggregate: when a TopK context is threaded and the aggregate is
+/// noisy-OR, each group folds via DNF inclusion-exclusion over its support
+/// chains instead (degrading to plain noisy-OR when no support map exists).
+///
+/// # Errors
+///
+/// Returns a [`DFResult`] error if a plugin aggregate rejects a value (e.g., a
+/// strict probability-domain violation) or if the per-group scalars cannot be
+/// assembled into an Arrow array.
 fn compute_fold_aggregate(
     col: &dyn Array,
-    name: &str,
+    aggregate: &Arc<dyn LocyAggregate>,
     groups_ctx: FoldGroups<'_>,
-    strict: bool,
-    probability_epsilon: f64,
-    semiring_kind: SemiringKind,
+    cx: &FoldContext,
     topk_ctx: Option<&TopKFoldCtx<'_>>,
 ) -> DFResult<arrow_array::ArrayRef> {
     let ordered_keys = groups_ctx.ordered_keys;
     let groups = groups_ctx.groups;
     let num_groups = groups_ctx.num_groups;
-    match name {
-        "SUM" => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                builder.append_option(sum_f64(col, &groups[key]));
-            }
-            Ok(Arc::new(builder.finish()))
+
+    // Phase D D-C0: TopKProofs noisy-OR uses DNF inclusion-exclusion over each
+    // row's support chain. This is a provenance specialization layered above
+    // the MNOR aggregate; it falls back to independence-mode noisy-OR when no
+    // support map is present (the common / non-recursive case).
+    if let Some(ctx) = topk_ctx
+        && aggregate.is_noisy_or()
+    {
+        let mut builder = Float64Builder::with_capacity(num_groups);
+        for key in ordered_keys {
+            builder.append_option(topk_dnf_disjunction(col, &groups[key], cx.strict, ctx)?);
         }
-        "COUNT" => {
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
-                builder.append_value(count as i64);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        "COUNTALL" => {
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                builder.append_value(indices.len() as i64);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        "MAX" => compute_minmax(col, ordered_keys, groups, num_groups, false),
-        "MIN" => compute_minmax(col, ordered_keys, groups, num_groups, true),
-        "AVG" => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
-                let avg = sum_f64(col, indices)
-                    .filter(|_| count > 0)
-                    .map(|s| s / count as f64);
-                builder.append_option(avg);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        "COLLECT" => {
-            let mut builder = LargeBinaryBuilder::with_capacity(num_groups, num_groups * 32);
-            for key in ordered_keys {
-                let values: Vec<uni_common::Value> = groups[key]
-                    .iter()
-                    .filter(|&&i| !col.is_null(i))
-                    .map(|&i| scalar_to_value(col, i))
-                    .collect();
-                let encoded =
-                    uni_common::cypher_value_codec::encode(&uni_common::Value::List(values));
-                builder.append_value(&encoded);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        "MNOR" => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let v = match (semiring_kind, topk_ctx) {
-                    (SemiringKind::MaxMinProb, _) => maxmin_disjunction_f64(col, indices, strict)?,
-                    // Phase D D-C0: TopKProofs MNOR uses DNF inclusion-exclusion
-                    // over the rows' support chains when the tracker is
-                    // available. Falls through to independence-OR for
-                    // legacy / test paths that don't thread a tracker.
-                    (SemiringKind::TopKProofs { .. }, Some(ctx)) => {
-                        topk_dnf_disjunction(col, indices, strict, ctx)?
-                    }
-                    _ => noisy_or_f64(col, indices, strict)?,
-                };
-                builder.append_option(v);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        "MPROD" => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let v = match semiring_kind {
-                    SemiringKind::MaxMinProb => maxmin_conjunction_f64(col, &groups[key], strict)?,
-                    _ => product_f64(col, &groups[key], strict, probability_epsilon)?,
-                };
-                builder.append_option(v);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        other => Err(datafusion::error::DataFusionError::Execution(format!(
-            "compute_fold_aggregate: unsupported aggregate `{other}`"
-        ))),
+        return Ok(Arc::new(builder.finish()));
     }
+
+    // Generic trait dispatch: one aggregate state per key group.
+    let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_groups);
+    for key in ordered_keys {
+        let mut state = aggregate.create();
+        state
+            .ingest_indices(col, &groups[key], cx)
+            .map_err(fn_error_to_df)?;
+        scalars.push(state.finalize().map_err(fn_error_to_df)?);
+    }
+    ScalarValue::iter_to_array(scalars)
 }
 
-fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
-    let mut sum = 0.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            sum += arr.value(i);
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            sum += arr.value(i) as f64;
-        }
-    }
-    if has_value { Some(sum) } else { None }
+/// Map a plugin [`FnError`](uni_plugin::FnError) to a DataFusion error,
+/// preserving the message so strict-domain text survives to the caller.
+fn fn_error_to_df(e: uni_plugin::FnError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.message)
 }
 
 /// Phase D D-C0: TopKProofs MNOR via DNF inclusion-exclusion over the
@@ -761,327 +714,6 @@ fn topk_dnf_disjunction(
     let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), proofs, k);
     let tag = uni_locy::TopKTag { proofs: kept };
     Ok(Some(tag.to_dnf().weight(&base_weights)))
-}
-
-/// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1] unless strict.
-fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
-    let mut complement_product = 1.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
-        };
-        if strict && !(0.0..=1.0).contains(&raw) {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
-            )));
-        }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MNOR input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        complement_product *= 1.0 - p;
-    }
-    if has_value {
-        Ok(Some(1.0 - complement_product))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Product: P = ∏ pᵢ. Inputs clamped to [0, 1] unless strict.
-///
-/// Switches to log-space when the running product drops below
-/// `probability_epsilon` to prevent floating-point underflow.
-fn product_f64(
-    col: &dyn Array,
-    indices: &[usize],
-    strict: bool,
-    probability_epsilon: f64,
-) -> DFResult<Option<f64>> {
-    let mut product = 1.0;
-    let mut log_sum = 0.0;
-    let mut use_log = false;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
-        };
-        if strict && !(0.0..=1.0).contains(&raw) {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
-            )));
-        }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MPROD input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        if p == 0.0 {
-            return Ok(Some(0.0));
-        }
-        if use_log {
-            log_sum += p.ln();
-        } else {
-            product *= p;
-            if product < probability_epsilon {
-                // Switch to log-space to prevent underflow
-                log_sum = product.ln();
-                use_log = true;
-            }
-        }
-    }
-    if !has_value {
-        return Ok(None);
-    }
-    if use_log {
-        Ok(Some(log_sum.exp()))
-    } else {
-        Ok(Some(product))
-    }
-}
-
-/// MaxMinProb disjunction over a group: `P = max(pᵢ)`. Per rollout D-9
-/// the caller emits `FuzzyNotProbabilistic` when this path runs on a
-/// PROB-bearing rule — fuzzy max is not a probability.
-fn maxmin_disjunction_f64(
-    col: &dyn Array,
-    indices: &[usize],
-    strict: bool,
-) -> DFResult<Option<f64>> {
-    let mut acc: f64 = 0.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
-        };
-        if strict && !(0.0..=1.0).contains(&raw) {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
-            )));
-        }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MNOR input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        acc = acc.max(p);
-    }
-    if has_value { Ok(Some(acc)) } else { Ok(None) }
-}
-
-/// MaxMinProb conjunction over a group: `P = min(pᵢ)`. Same caveats as
-/// [`maxmin_disjunction_f64`].
-fn maxmin_conjunction_f64(
-    col: &dyn Array,
-    indices: &[usize],
-    strict: bool,
-) -> DFResult<Option<f64>> {
-    let mut acc: f64 = 1.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
-        };
-        if strict && !(0.0..=1.0).contains(&raw) {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
-            )));
-        }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MPROD input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        acc = acc.min(p);
-    }
-    if has_value { Ok(Some(acc)) } else { Ok(None) }
-}
-
-fn compute_minmax(
-    col: &dyn Array,
-    ordered_keys: &[Vec<ScalarKey>],
-    groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
-    num_groups: usize,
-    is_min: bool,
-) -> DFResult<arrow_array::ArrayRef> {
-    match col.data_type() {
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let mut result: Option<i64> = None;
-                for &i in &groups[key] {
-                    if !arr.is_null(i) {
-                        let v = arr.value(i);
-                        result = Some(match result {
-                            None => v,
-                            Some(cur) if is_min => cur.min(v),
-                            Some(cur) => cur.max(v),
-                        });
-                    }
-                }
-                builder.append_option(result);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let mut result: Option<f64> = None;
-                for &i in &groups[key] {
-                    if !arr.is_null(i) {
-                        let v = arr.value(i);
-                        result = Some(match result {
-                            None => v,
-                            Some(cur) if is_min => cur.min(v),
-                            Some(cur) => cur.max(v),
-                        });
-                    }
-                }
-                builder.append_option(result);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        dt => {
-            // Fallback: treat as string comparison.
-            // Use LargeStringBuilder for LargeUtf8 input to match the output schema
-            // (build_output_schema preserves the input type for MAX/MIN).
-            let use_large = matches!(dt, DataType::LargeUtf8);
-            let mut values: Vec<Option<String>> = Vec::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let mut result: Option<String> = None;
-                for &i in indices {
-                    if col.is_null(i) {
-                        continue;
-                    }
-                    let v = format!("{:?}", scalar_to_value(col, i));
-                    result = Some(match result {
-                        None => v,
-                        Some(cur) if is_min && v < cur => v,
-                        Some(cur) if !is_min && v > cur => v,
-                        Some(cur) => cur,
-                    });
-                }
-                values.push(result);
-            }
-            Ok(build_optional_string_array(&values, use_large))
-        }
-    }
-}
-
-fn build_optional_string_array(
-    values: &[Option<String>],
-    use_large: bool,
-) -> arrow_array::ArrayRef {
-    if use_large {
-        let mut builder = arrow_array::builder::LargeStringBuilder::new();
-        for v in values {
-            match v {
-                Some(s) => builder.append_value(s),
-                None => builder.append_null(),
-            }
-        }
-        Arc::new(builder.finish())
-    } else {
-        let mut builder = arrow_array::builder::StringBuilder::new();
-        for v in values {
-            match v {
-                Some(s) => builder.append_value(s),
-                None => builder.append_null(),
-            }
-        }
-        Arc::new(builder.finish())
-    }
-}
-
-fn scalar_to_value(col: &dyn Array, row_idx: usize) -> uni_common::Value {
-    if col.is_null(row_idx) {
-        return uni_common::Value::Null;
-    }
-    match col.data_type() {
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            uni_common::Value::Int(arr.value(row_idx))
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            uni_common::Value::Float(arr.value(row_idx))
-        }
-        DataType::Utf8 => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .unwrap();
-            uni_common::Value::String(arr.value(row_idx).to_string())
-        }
-        DataType::LargeUtf8 => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::LargeStringArray>()
-                .unwrap();
-            uni_common::Value::String(arr.value(row_idx).to_string())
-        }
-        DataType::Boolean => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::BooleanArray>()
-                .unwrap();
-            uni_common::Value::Bool(arr.value(row_idx))
-        }
-        DataType::LargeBinary => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::LargeBinaryArray>()
-                .unwrap();
-            let bytes = arr.value(row_idx);
-            uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null)
-        }
-        _ => uni_common::Value::Null,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2694,5 +2326,97 @@ mod tests {
                 "default registry should contain built-in `{name}`"
             );
         }
+    }
+
+    // ── User-defined aggregate runs through the trait (G1 regression) ─────
+
+    /// A novel aggregate not in `uni-plugin-builtin`: per-group `max − min`.
+    ///
+    /// Requires real columnar state (two accumulators), so it is *not*
+    /// expressible via the `update_step` scalar fast path. Before the fold
+    /// executor dispatched through [`LocyAggState`], a binding like this hit
+    /// the closed-enum `_ => Err("unsupported aggregate")` arm at runtime;
+    /// now it executes through `create`/`ingest_indices`/`finalize`.
+    #[derive(Debug)]
+    struct RangeAgg;
+
+    impl LocyAggregate for RangeAgg {
+        fn semilattice(&self) -> uni_plugin::traits::locy::Semilattice {
+            uni_plugin::traits::locy::Semilattice::NON_MONOTONE
+        }
+        fn output_type(&self) -> DataType {
+            DataType::Float64
+        }
+        fn create(&self) -> Box<dyn uni_plugin::traits::locy::LocyAggState> {
+            Box::new(RangeState {
+                min: None,
+                max: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RangeState {
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    impl uni_plugin::traits::locy::LocyAggState for RangeState {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn ingest_indices(
+            &mut self,
+            col: &dyn Array,
+            indices: &[usize],
+            _cx: &FoldContext,
+        ) -> Result<(), uni_plugin::FnError> {
+            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+            for &i in indices {
+                if arr.is_null(i) {
+                    continue;
+                }
+                let v = arr.value(i);
+                self.min = Some(self.min.map_or(v, |m| m.min(v)));
+                self.max = Some(self.max.map_or(v, |m| m.max(v)));
+            }
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _other: &dyn uni_plugin::traits::locy::LocyAggState,
+        ) -> Result<(), uni_plugin::FnError> {
+            Ok(())
+        }
+        fn finalize(&self) -> Result<ScalarValue, uni_plugin::FnError> {
+            match (self.min, self.max) {
+                (Some(lo), Some(hi)) => Ok(ScalarValue::Float64(Some(hi - lo))),
+                _ => Ok(ScalarValue::Float64(None)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_defined_aggregate_runs_in_non_recursive_fold() {
+        // group "a": [1.0, 5.0] → range 4.0 ; group "b": [3.0] → range 0.0
+        let batch = make_test_batch(vec!["a", "a", "b"], vec![1.0, 5.0, 3.0]);
+        let input = make_memory_exec(batch);
+        let binding = FoldBinding {
+            output_name: "r".into(),
+            name: SmolStr::new_static("RANGE"),
+            aggregate: Arc::new(RangeAgg),
+            input_col_index: 1,
+            input_col_name: Some("value".to_string()),
+        };
+        let out = execute_fold(input, vec![0], vec![binding]).await;
+        assert_eq!(out.num_rows(), 2);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("range output is Float64");
+        // ordered_keys preserves first-seen order: "a" then "b".
+        assert_eq!(col.value(0), 4.0);
+        assert_eq!(col.value(1), 0.0);
     }
 }

@@ -7,7 +7,7 @@
 //! Locy predicates evaluate to boolean (or fuzzy) columns and are the
 //! surface neural predicates plug into.
 
-use arrow_array::{BooleanArray, Float64Array};
+use arrow_array::{Array, BooleanArray, Float64Array};
 use arrow_schema::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{ColumnarValue, Volatility};
@@ -15,6 +15,49 @@ use datafusion::scalar::ScalarValue;
 
 use crate::errors::FnError;
 use crate::traits::scalar::ArgType;
+
+/// Probability semiring selected for a `FOLD` evaluation.
+///
+/// Mirrors the host's `uni_locy::SemiringKind` minus the provenance-only
+/// `TopKProofs` / `BddExact` variants, which are handled above the aggregate
+/// trait by the executor. Plugin aggregates only ever see the two value-level
+/// combinators: independence (`AddMult`) and Viterbi/fuzzy (`MaxMin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FoldSemiring {
+    /// Independence-mode probability: noisy-OR (`1 − ∏(1 − pᵢ)`) / product.
+    #[default]
+    AddMult,
+    /// Viterbi / fuzzy-truth: max-disjunction / min-conjunction.
+    MaxMin,
+}
+
+/// Per-fold evaluation context threaded into [`LocyAggState::ingest_indices`].
+///
+/// Carries the probability-domain policy (`strict`), the underflow guard
+/// (`epsilon`, used by bounded-product log-space switching), and the active
+/// [`FoldSemiring`]. Constructed once per `FOLD` execution and passed by
+/// reference to every per-group ingest call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FoldContext {
+    /// When `true`, probability-domain aggregates error on inputs outside
+    /// `[0, 1]` instead of clamping them with a warning.
+    pub strict: bool,
+    /// Underflow threshold: bounded-product switches to log-space once the
+    /// running product drops below this value. `0.0` disables the switch.
+    pub epsilon: f64,
+    /// Active probability semiring for this fold.
+    pub semiring: FoldSemiring,
+}
+
+impl Default for FoldContext {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            epsilon: 0.0,
+            semiring: FoldSemiring::AddMult,
+        }
+    }
+}
 
 /// A Locy aggregate plugin (`FOLD value AS plugin_name`).
 ///
@@ -31,6 +74,16 @@ pub trait LocyAggregate: Send + Sync + std::fmt::Debug {
 
     /// Declared output type for `FOLD` results.
     fn output_type(&self) -> DataType;
+
+    /// Output type given the aggregate's *input* column type.
+    ///
+    /// Defaults to [`LocyAggregate::output_type`] (input-independent).
+    /// Type-preserving aggregates (`MIN` / `MAX`) override this to return the
+    /// input type so an `Int64` column folds to an `Int64` result rather than
+    /// being widened to `Float64`.
+    fn output_type_for_input(&self, _input: &DataType) -> DataType {
+        self.output_type()
+    }
 
     /// Construct a fresh per-grouping state.
     fn create(&self) -> Box<dyn LocyAggState>;
@@ -105,12 +158,40 @@ pub trait LocyAggState: Send + 'static {
     /// they need to expose a different concrete type than the implementor.
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Ingest a batch's values from column `value_col` into the state.
+    /// Ingest the rows at `indices` of `col` into the state under `cx`.
+    ///
+    /// This is the primitive the non-recursive `FOLD` executor calls once per
+    /// key group: `col` is the whole fold-input column and `indices` selects
+    /// the rows belonging to one group. [`FoldContext`] carries the
+    /// strict-domain / epsilon / semiring policy. Implementations skip null
+    /// rows. Built-in aggregates override this for byte-identical, context-aware
+    /// folding; user aggregates may rely on the [`LocyAggState::ingest`] default
+    /// if they do not need per-group dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FnError`] if a value cannot be ingested (e.g., a strict
+    /// probability-domain violation or an unexpected Arrow type).
+    fn ingest_indices(
+        &mut self,
+        col: &dyn Array,
+        indices: &[usize],
+        cx: &FoldContext,
+    ) -> Result<(), FnError>;
+
+    /// Ingest every row of column `value_col` in `batch` into the state.
+    ///
+    /// Convenience wrapper over [`LocyAggState::ingest_indices`] across all
+    /// rows with a default [`FoldContext`]. Kept for callers and tests that
+    /// fold a whole batch as a single group.
     ///
     /// # Errors
     ///
     /// Returns [`FnError`] if the column cannot be ingested.
-    fn ingest(&mut self, batch: &RecordBatch, value_col: usize) -> Result<(), FnError>;
+    fn ingest(&mut self, batch: &RecordBatch, value_col: usize) -> Result<(), FnError> {
+        let indices: Vec<usize> = (0..batch.num_rows()).collect();
+        self.ingest_indices(batch.column(value_col), &indices, &FoldContext::default())
+    }
 
     /// Merge `other`'s state into `self`.
     ///

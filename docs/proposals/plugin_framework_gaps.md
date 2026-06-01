@@ -25,6 +25,13 @@ two **undisclosed surface gaps** (G2, G3), and a cluster of
 **documentation-drift discrepancies** (G4) where the proposal now
 *under*-reports the shipped state.
 
+**Update 2026-05-31 (release-honesty pass):** G2, G3, and G4 have since been closed
+**as documentation** — `config_param` struck from §3.1, the v1 loader-surface scope
+disclosed in §1/§5, two ⏳ §19 criteria (29, 30) added to track the deferred
+implementations, and the §19 scorecard counts refreshed to match the tree. No
+production code changed; the real `config_param` / additional-WASM-world builds are
+scoped post-release tickets. See each gap's resolution note and §5.
+
 Severity legend:
 - 🔴 **High** — a verified ✅ claim does not hold at runtime, or a load-bearing
   invariant is violated.
@@ -155,7 +162,18 @@ non-recursive path.
 
 ---
 
-### G2 🟡 `PluginRegistrar::config_param` is missing (undisclosed)
+### G2 ✅ RESOLVED (doc) 2026-05-31 — `config_param` struck from §3.1, tracked as §19 criterion 29
+
+**Resolution.** `config_param` and the full `ConfigParam` struct were removed from
+`plugin_framework.md` §3.1 (they specified an unimplemented surface, so §3.1 now
+reflects the 16 registrar methods that actually exist), and a new §19 ⏳
+**criterion 29** tracks the GUC config-parameter story (`config_param` +
+`SHOW`/`SET <plugin>.<name>` + `host.config_get`) as deferred-pending-need — to be
+designed against the first plugin that needs a tunable. Building it now was judged
+the wrong release-window risk (it would touch the query parser and all five
+loaders) for a feature with no current consumer; a registration-only half-build was
+rejected because it would re-create the cosmetic-at-registration / dead-at-runtime
+anti-pattern that G1 just eliminated. The original finding follows.
 
 **Proposal claim.** §3.1 lists `config_param(&mut self, param: ConfigParam) ->
 &mut Self` among the registrar methods and fully specifies the `ConfigParam`
@@ -178,7 +196,18 @@ add a §19 ⏳ criterion for it so the omission is tracked.
 
 ---
 
-### G3 🟡 WASM/script ABIs cover only 3 of 25 surfaces (scope overstated)
+### G3 ✅ RESOLVED (doc) 2026-05-31 — scope caveat added, tracked as §19 criterion 30
+
+**Resolution.** A "v1 loader scope" caveat was added to `plugin_framework.md` §1 and
+§5.1 stating the non-Rust loaders (CM / Extism / PyO3 / Rhai) author
+scalar/aggregate/procedure in v1 and the other 22 surfaces are
+compile-time-Rust-only; §19 gained ⏳ **criterion 30** capturing the coverage gap;
+and both the §10 WIT-world preview and Appendix A now carry explicit
+"planned, not yet implemented — only `scalar-plugin`/`aggregate-plugin`/`procedure-plugin`
+exist today" markers. No WIT world was built: `operator`/`storage` are genuinely
+infeasible across the Component Model (in-process trait objects, `&Expr` trees, async
+streams) and the tractable ones (`crdt`/`connector`, ~250–350 LOC each) have no
+waiting consumer — both are deferred pending real need. The original finding follows.
 
 **Proposal claim.** §1: "five loaders … all converge on the same in-process
 registry" and the framework opens "every extensibility surface … from day one."
@@ -211,7 +240,17 @@ authoring of those is a real near-term need.
 
 ---
 
-### G4 🟢 Documentation drift — §19 now *under*-reports the shipped state
+### G4 ✅ ADDRESSED (doc) 2026-05-31 — §19 / status text refreshed to match reality
+
+**Resolution.** Applied to `plugin_framework.md`: G4.1 — criterion 12 reworded to
+"all 38 APOC procedures across 6 namespaces have real bodies" (long tail still
+absent, ▶ retained); G4.2 — criterion 1 corrected to **5 CRDTs** (adds RGA) and
+**5 collations**, reconciling with the status header; G4.3 — the two dead test-path
+citations updated to `tests/common/dispatch/ephemeral_entities.rs` (12) and
+`tests/common/planner/pushdown_test.rs` (18, not 10/10); G4.4 — test counts refreshed
+to ≈497 static attributes across 11 plugin crates (the prior "269"/"336+" were stale);
+G4.5 — `procedure_call.rs` count corrected from the stale 922 to the actual 1115
+(2309 → 1115) at both §16 and criterion 3. The original findings follow.
 
 The status block is dated 2026-05-24; the code advanced. None of these are code
 bugs — they are stale/incorrect proposal text that should be corrected so the
@@ -254,16 +293,21 @@ exhaustive:
 | Priority | Gap | Action | Rough size |
 |----------|-----|--------|-----------|
 | ~~P0~~ ✅ | G1 | **DONE 2026-05-31** — routed `compute_fold_aggregate` through `LocyAggState` (option a); byte-identical, novel-user-aggregate test added. | landed |
-| **P1** | G2 | Implement `config_param` + `SHOW`/`SET`/`host.config_get`, or strike `ConfigParam` from §3.1 and add a ⏳ criterion. | medium / small |
-| **P1** | G3 | Add the WASM-surface-scope caveat to §1/§5 + a ⏳ criterion; optionally land storage/index/CRDT WIT worlds if needed. | small (docs) / large (worlds) |
-| **P2** | G4 | Refresh §19 counts, APOC wording, test-path citations; reconcile CRDT/collation counts. | small (docs) |
+| ~~P1~~ ✅ | G2 | **DONE (doc) 2026-05-31** — struck `config_param`/`ConfigParam` from §3.1; added ⏳ §19 criterion 29. Real implementation deferred to a post-release ticket (do the **full** GUC path, never registration-only) when a plugin needs a tunable. | landed (docs) |
+| ~~P1~~ ✅ | G3 | **DONE (doc) 2026-05-31** — added the v1 loader-scope caveat to §1/§5; added ⏳ §19 criterion 30; marked the §10/Appendix-A WIT worlds "planned, not implemented." `crdt`/`connector` WIT worlds deferred pending need; `operator`/`storage` are CM-infeasible. | landed (docs) |
+| ~~P2~~ ✅ | G4 | **DONE (doc) 2026-05-31** — refreshed §19 counts (≈497 tests, 1115-line `procedure_call.rs`), APOC wording (38 procs / 6 namespaces), the two test-path citations; reconciled CRDT (5) / collation (5) counts. | landed (docs) |
 
 **G1 was the most important item** — the one place a §19 ✅ ("verified") claim
 did not hold at runtime — and it is now **fixed (2026-05-31)**: the fold
 executor genuinely dispatches through the `LocyAggState` trait, built-ins and
 user plugins share one execution path, and byte-identical output is verified
-across the full Locy/Cypher TCK + integration suites. Remaining work is the
-undisclosed-but-bounded surface gaps (G2, G3) and documentation hygiene (G4).
+across the full Locy/Cypher TCK + integration suites. The remaining gaps — the
+undisclosed-but-bounded surface gaps (G2, G3) and documentation hygiene (G4) — were
+closed **as documentation on 2026-05-31**: §3.1 no longer advertises an unbuilt
+`config_param`, §1/§5 disclose the v1 loader-surface scope, two new ⏳ §19 criteria
+(29, 30) track the deferred implementations, and the §19 scorecard counts now match
+the tree. The proposal is release-honest; the actual `config_param` and additional
+WASM-world implementations remain as scoped post-release tickets driven by real need.
 
 ---
 

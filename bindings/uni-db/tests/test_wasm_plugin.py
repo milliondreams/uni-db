@@ -12,6 +12,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import uni_db
@@ -60,6 +62,30 @@ class TestWasmPlugin(unittest.TestCase):
             outcome = self.db.load_wasm_extism(f.read(), grants=["ScalarFn"])
         self.assertTrue(outcome["plugin_id"])
         self.assertGreaterEqual(len(outcome["scalars_registered"]), 1)
+
+
+@pytest.mark.asyncio
+async def test_async_load_wasm_component():
+    """`await AsyncUni.load_wasm_component(...)` — does not block the loop."""
+    if not os.path.exists(_CM_WASM):
+        pytest.skip(f"missing fixture: {_CM_WASM}")
+    db = await uni_db.AsyncUni.temporary()
+    with open(_CM_WASM, "rb") as f:
+        outcome = await db.load_wasm_component(f.read(), grants=["ScalarFn"])
+    assert outcome["plugin_id"]
+    assert len(outcome["scalars_registered"]) >= 1
+    assert any("haversine" in q for q in outcome["scalars_registered"])
+
+
+@pytest.mark.asyncio
+async def test_async_load_wasm_extism():
+    if not os.path.exists(_EXTISM_WASM):
+        pytest.skip(f"missing fixture: {_EXTISM_WASM}")
+    db = await uni_db.AsyncUni.temporary()
+    with open(_EXTISM_WASM, "rb") as f:
+        outcome = await db.load_wasm_extism(f.read(), grants=["ScalarFn"])
+    assert outcome["plugin_id"]
+    assert len(outcome["scalars_registered"]) >= 1
 
 
 if __name__ == "__main__":

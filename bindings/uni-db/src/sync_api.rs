@@ -622,7 +622,7 @@ impl TxAppenderBuilder {
 /// Default grant set for the WASM loaders when the caller passes none:
 /// surface registration for scalar / aggregate / procedure plugins.
 #[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
-fn default_surface_grants() -> Vec<String> {
+pub(crate) fn default_surface_grants() -> Vec<String> {
     vec![
         "ScalarFn".to_owned(),
         "AggregateFn".to_owned(),
@@ -635,7 +635,7 @@ fn default_surface_grants() -> Vec<String> {
 /// `Vec<String>` capability lists, so no `Debug`-formatting is needed).
 #[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
 #[allow(clippy::too_many_arguments)]
-fn wasm_outcome_to_pydict(
+pub(crate) fn wasm_outcome_to_pydict(
     py: Python<'_>,
     plugin_id: String,
     version: String,

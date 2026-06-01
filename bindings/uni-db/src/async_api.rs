@@ -113,6 +113,81 @@ impl AsyncDatabase {
     }
 
     // ========================================================================
+    // Plugin Loading (async, instance-scoped — mirrors sync `Uni`)
+    // ========================================================================
+
+    /// Async `await db.load_wasm_component(wasm_bytes, grants=None)`.
+    ///
+    /// Same contract as the sync [`Uni.load_wasm_component`]; returned as a
+    /// Python awaitable so an asyncio app never blocks the event loop on
+    /// wasmtime instantiation.
+    #[cfg(feature = "wasm-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_component<'py>(
+        &self,
+        py: Python<'py>,
+        wasm_bytes: Vec<u8>,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cap_set = crate::builders::build_capability_set(grants.clone());
+            let host_grants = grants.unwrap_or_else(crate::sync_api::default_surface_grants);
+            let loader = uni_plugin_wasm::WasmLoader::new();
+            let outcome = inner
+                .load_wasm_component(&loader, &wasm_bytes, &host_grants, &cap_set)
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                crate::sync_api::wasm_outcome_to_pydict(
+                    py,
+                    outcome.plugin_id,
+                    outcome.version,
+                    outcome.scalars_registered,
+                    outcome.aggregates_registered,
+                    outcome.procedures_registered,
+                    outcome.effective_capabilities,
+                    outcome.denied_capabilities,
+                )
+            })
+        })
+    }
+
+    /// Async `await db.load_wasm_extism(wasm_bytes, grants=None)`.
+    ///
+    /// Async counterpart of the sync [`Uni.load_wasm_extism`]; see
+    /// [`Self::load_wasm_component`] for the contract.
+    #[cfg(feature = "extism-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_extism<'py>(
+        &self,
+        py: Python<'py>,
+        wasm_bytes: Vec<u8>,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cap_set = crate::builders::build_capability_set(grants.clone());
+            let host_grants = grants.unwrap_or_else(crate::sync_api::default_surface_grants);
+            let loader = uni_plugin_extism::ExtismLoader::new();
+            let outcome = inner
+                .load_wasm_extism(&loader, &wasm_bytes, &host_grants, &cap_set)
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                crate::sync_api::wasm_outcome_to_pydict(
+                    py,
+                    outcome.plugin_id,
+                    outcome.version,
+                    outcome.scalars_registered,
+                    outcome.aggregates_registered,
+                    outcome.procedures_registered,
+                    outcome.effective_capabilities,
+                    outcome.denied_capabilities,
+                )
+            })
+        })
+    }
+
+    // ========================================================================
     // Context Manager
     // ========================================================================
 

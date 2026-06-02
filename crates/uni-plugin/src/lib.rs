@@ -60,6 +60,7 @@ pub mod adapters;
 pub mod capability;
 pub mod circuit_breaker;
 pub mod errors;
+pub mod fs_guard;
 pub mod host;
 pub mod host_services;
 pub mod lifecycle;
@@ -82,6 +83,8 @@ pub use crate::capability::{
 };
 #[doc(inline)]
 pub use crate::errors::{FnError, PluginError, ReloadError};
+#[doc(inline)]
+pub use crate::fs_guard::normalize_capability_path;
 #[doc(inline)]
 pub use crate::host_services::{HttpEgress, HttpResponse, KmsProvider};
 #[doc(inline)]

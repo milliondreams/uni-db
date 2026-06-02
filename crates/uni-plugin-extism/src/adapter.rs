@@ -25,9 +25,9 @@ use uni_plugin::QName;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::scalar::{FnSignature, ScalarPluginFn};
 
+use crate::adapter_common::{acquire, extism_err_to_fn_err, sanitize_qname};
 use crate::ipc::{decode_batch, encode_batch};
-use crate::pool::{ExtismInstancePool, PooledInstance};
-use uni_plugin_wasm_rt::IpcError;
+use crate::pool::ExtismInstancePool;
 
 /// Plugin-side scalar-fn export name from a qname.
 ///
@@ -38,7 +38,7 @@ use uni_plugin_wasm_rt::IpcError;
 /// the plugin's `register` JSON, so the host always knows the
 /// canonical qname even though the export symbol has underscores.
 pub(crate) fn scalar_export_name(qname: &QName) -> String {
-    format!("invoke_{}", qname.to_string().replace('.', "_"))
+    format!("invoke_{}", sanitize_qname(qname))
 }
 
 /// `ScalarPluginFn` adapter wrapping an Extism plugin pool.
@@ -122,12 +122,7 @@ impl ScalarPluginFn for ExtismScalarFn {
         let batch = self.args_to_batch(args, rows)?;
         let bytes = encode_batch(&batch).map_err(extism_err_to_fn_err)?;
 
-        let mut leased = PooledInstance::acquire(Arc::clone(&self.pool)).map_err(|e| {
-            FnError::new(
-                FnError::CODE_RESOURCE_LIMIT,
-                format!("acquire plugin instance: {e}"),
-            )
-        })?;
+        let mut leased = acquire(&self.pool)?;
         let out_bytes: Vec<u8> = {
             let plugin = leased.get_mut();
             let out: &[u8] = plugin
@@ -164,10 +159,6 @@ impl ScalarPluginFn for ExtismScalarFn {
         }
         Ok(ColumnarValue::Array(out_batch.column(0).clone()))
     }
-}
-
-fn extism_err_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("extism IPC: {e}"))
 }
 
 #[cfg(test)]

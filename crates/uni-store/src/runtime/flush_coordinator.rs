@@ -20,7 +20,6 @@
 //!                          └─ BinaryHeap reorder by seq
 //! ```
 
-use crate::runtime::wal::WriteAheadLog;
 use crate::storage::manager::{FlushInProgressGuard, StorageManager};
 use parking_lot::RwLock as PlRwLock;
 use std::cmp::Reverse;
@@ -386,10 +385,10 @@ async fn finalizer_loop(
             }
             let Reverse((_, s)) = pending.pop().unwrap();
             let FlushSubmit {
-                seq: _,
                 rotated,
                 result,
                 ack,
+                ..
             } = s;
             let ack_result = match result {
                 Ok(outcome) => finalize_fn.finalize(rotated, outcome, shared.clone()).await,
@@ -430,10 +429,4 @@ impl Ord for FlushSubmit {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.seq.cmp(&other.seq)
     }
-}
-
-// Silence unused-import warnings for items only used during full implementation:
-#[allow(dead_code)]
-fn _unused_wal_marker() -> Option<Arc<WriteAheadLog>> {
-    None
 }

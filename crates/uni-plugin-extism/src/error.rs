@@ -36,11 +36,6 @@ pub enum ExtismError {
         capability: String,
     },
 
-    /// Bytes-in / bytes-out exchange across the wasm boundary failed
-    /// (alloc, copy, length mismatch).
-    #[error("extism wasm-memory exchange failure: {0}")]
-    MemoryExchange(String),
-
     /// The plugin's output failed to decode under the expected wire
     /// format (JSON or MessagePack for control surfaces).
     #[error("extism output decode error: {0}")]
@@ -56,27 +51,9 @@ pub enum ExtismError {
     #[error("extism plugin exceeded resource limit: {0}")]
     ResourceLimit(String),
 
-    /// Loader scaffolding shipped without a complete cutover for this entry
-    /// point. M6a cutover commits remove these.
-    #[error("uni-plugin-extism: {feature} not yet wired (M6a in progress)")]
-    NotYetImplemented {
-        /// The not-yet-wired feature.
-        feature: String,
-    },
-
     /// Internal / unexpected error.
     #[error("uni-plugin-extism internal error: {0}")]
     Internal(String),
-}
-
-impl ExtismError {
-    /// Construct a `NotYetImplemented` for the named feature.
-    #[must_use]
-    pub fn not_yet(feature: impl Into<String>) -> Self {
-        Self::NotYetImplemented {
-            feature: feature.into(),
-        }
-    }
 }
 
 impl uni_plugin_wasm_rt::pool::PoolResourceLimit for ExtismError {

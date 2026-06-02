@@ -226,5 +226,3 @@ impl AlgoContext {
         }
     }
 }
-
-// Placeholder procedure implementations will be added in Phase 3.3

@@ -27,12 +27,10 @@
 
 // Rust guideline compliant
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
-
-use std::sync::OnceLock;
 
 use uni_plugin::PluginRegistry;
 use uni_plugin::circuit_breaker::{BreakerConfig, CircuitBreaker};

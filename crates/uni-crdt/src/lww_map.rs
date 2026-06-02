@@ -28,12 +28,15 @@ impl<K: Hash + Eq + Clone, V: Clone> LWWMap<K, V> {
         Self::default()
     }
 
+    /// A fresh, empty register for a key not yet present. The `-1` timestamp
+    /// sentinel sorts before any real write, so the first `set` always wins.
+    fn empty_register() -> LWWRegister<Option<V>> {
+        LWWRegister::new(None, -1)
+    }
+
     /// Put a key-value pair into the map with a timestamp.
     pub fn put(&mut self, key: K, value: V, timestamp: i64) {
-        let register = self
-            .map
-            .entry(key)
-            .or_insert_with(|| LWWRegister::new(None, -1));
+        let register = self.map.entry(key).or_insert_with(Self::empty_register);
         register.set(Some(value), timestamp);
     }
 
@@ -42,7 +45,7 @@ impl<K: Hash + Eq + Clone, V: Clone> LWWMap<K, V> {
         let register = self
             .map
             .entry(key.clone())
-            .or_insert_with(|| LWWRegister::new(None, -1));
+            .or_insert_with(Self::empty_register);
         register.set(None, timestamp);
     }
 
@@ -76,7 +79,7 @@ impl<K: Hash + Eq + Clone, V: Clone + Serialize> CrdtMerge for LWWMap<K, V> {
             let register = self
                 .map
                 .entry(key.clone())
-                .or_insert_with(|| LWWRegister::new(None, -1));
+                .or_insert_with(Self::empty_register);
             register.merge(other_register);
         }
     }

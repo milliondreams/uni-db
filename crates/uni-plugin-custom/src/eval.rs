@@ -34,6 +34,8 @@ use thiserror::Error;
 use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
 
+use crate::decode::stringify;
+
 /// Errors produced by the expression evaluator.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -179,8 +181,8 @@ fn add_values(l: Value, r: Value) -> Result<Value, EvalError> {
         (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
         (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
         (Value::String(a), Value::String(b)) => Ok(Value::String(a + &b)),
-        (Value::String(a), b) => Ok(Value::String(a + &stringify_value(&b))),
-        (a, Value::String(b)) => Ok(Value::String(stringify_value(&a) + &b)),
+        (Value::String(a), b) => Ok(Value::String(a + &stringify(&b))),
+        (a, Value::String(b)) => Ok(Value::String(stringify(&a) + &b)),
         (Value::List(mut a), Value::List(b)) => {
             a.extend(b);
             Ok(Value::List(a))
@@ -313,20 +315,9 @@ fn apply_unary(op: UnaryOp, v: Value) -> Result<Value, EvalError> {
     }
 }
 
-fn stringify_value(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::String(s) => s.clone(),
-        other => format!("{other:?}"),
-    }
-}
-
 fn apply_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match (name, args) {
-        ("toString", [v]) => Ok(Value::String(stringify_value(v))),
+        ("toString", [v]) => Ok(Value::String(stringify(v))),
         ("upper" | "toUpper", [Value::String(s)]) => Ok(Value::String(s.to_uppercase())),
         ("lower" | "toLower", [Value::String(s)]) => Ok(Value::String(s.to_lowercase())),
         ("trim", [Value::String(s)]) => Ok(Value::String(s.trim().to_owned())),

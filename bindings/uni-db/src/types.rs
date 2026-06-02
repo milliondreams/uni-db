@@ -801,6 +801,68 @@ impl EdgeTypeInfo {
     }
 }
 
+impl From<::uni_db::api::schema::PropertyInfo> for PropertyInfo {
+    fn from(p: ::uni_db::api::schema::PropertyInfo) -> Self {
+        PropertyInfo {
+            name: p.name,
+            data_type: p.data_type,
+            nullable: p.nullable,
+            is_indexed: p.is_indexed,
+            description: p.description,
+        }
+    }
+}
+
+impl From<::uni_db::api::schema::IndexInfo> for IndexInfo {
+    fn from(idx: ::uni_db::api::schema::IndexInfo) -> Self {
+        IndexInfo {
+            name: idx.name,
+            index_type: idx.index_type,
+            properties: idx.properties,
+            status: idx.status,
+        }
+    }
+}
+
+impl From<::uni_db::api::schema::ConstraintInfo> for ConstraintInfo {
+    fn from(c: ::uni_db::api::schema::ConstraintInfo) -> Self {
+        ConstraintInfo {
+            name: c.name,
+            constraint_type: c.constraint_type,
+            properties: c.properties,
+            enabled: c.enabled,
+        }
+    }
+}
+
+impl From<::uni_db::api::schema::LabelInfo> for LabelInfo {
+    fn from(i: ::uni_db::api::schema::LabelInfo) -> Self {
+        LabelInfo {
+            name: i.name,
+            count: i.count,
+            properties: i.properties.into_iter().map(Into::into).collect(),
+            indexes: i.indexes.into_iter().map(Into::into).collect(),
+            constraints: i.constraints.into_iter().map(Into::into).collect(),
+            description: i.description,
+        }
+    }
+}
+
+impl From<::uni_db::api::schema::EdgeTypeInfo> for EdgeTypeInfo {
+    fn from(i: ::uni_db::api::schema::EdgeTypeInfo) -> Self {
+        EdgeTypeInfo {
+            name: i.name,
+            count: i.count,
+            source_labels: i.source_labels,
+            target_labels: i.target_labels,
+            properties: i.properties.into_iter().map(Into::into).collect(),
+            indexes: i.indexes.into_iter().map(Into::into).collect(),
+            constraints: i.constraints.into_iter().map(Into::into).collect(),
+            description: i.description,
+        }
+    }
+}
+
 /// Statistics from a bulk loading operation.
 #[pyclass(get_all)]
 #[derive(Debug, Clone, Default)]
@@ -3990,7 +4052,9 @@ impl PyPromoteReport {
         Self {
             vertices_inserted: r.vertices_inserted,
             vertices_skipped_uid_conflict: r.vertices_skipped_uid_conflict,
-            vertices_skipped_no_uid: r.vertices_skipped_no_uid,
+            // Reserved field on the Python side — the Rust `PromoteReport`
+            // no longer carries it; it was always 0.
+            vertices_skipped_no_uid: 0,
             edges_inserted: r.edges_inserted,
             edges_skipped_duplicate: r.edges_skipped_duplicate,
             edges_skipped_no_endpoint: r.edges_skipped_no_endpoint,

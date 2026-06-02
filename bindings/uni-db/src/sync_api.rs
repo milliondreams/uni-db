@@ -524,38 +524,11 @@ impl TxBulkWriterBuilder {
             .defer_vector_indexes(self.defer_vector_indexes)
             .defer_scalar_indexes(self.defer_scalar_indexes)
             .async_indexes(self.async_indexes);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(vc) = self.validate_constraints {
-            builder = builder.validate_constraints(vc);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
+        crate::apply_opt!(builder, self.batch_size, batch_size);
+        crate::apply_opt!(builder, self.validate_constraints, validate_constraints);
+        crate::apply_opt!(builder, self.max_buffer_size_bytes, max_buffer_size_bytes);
         if let Some(ref callback) = self.on_progress {
-            struct PyProgressWrapper {
-                py_obj: Py<PyAny>,
-            }
-            unsafe impl Send for PyProgressWrapper {}
-
-            let wrapper = PyProgressWrapper {
-                py_obj: callback.clone_ref(py),
-            };
-            builder = builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
-                Python::attach(|py| {
-                    let py_progress = crate::types::BulkProgress {
-                        phase: format!("{:?}", progress.phase),
-                        rows_processed: progress.rows_processed,
-                        total_rows: progress.total_rows,
-                        current_label: progress.current_label.clone(),
-                        elapsed_secs: progress.elapsed.as_secs_f64(),
-                    };
-                    if let Ok(bound) = Py::new(py, py_progress) {
-                        let _ = wrapper.py_obj.call1(py, (bound,));
-                    }
-                });
-            });
+            builder = builder.on_progress(convert::make_progress_callback(callback.clone_ref(py)));
         }
         let real_writer = builder
             .build()
@@ -601,15 +574,9 @@ impl TxAppenderBuilder {
         let tx_ref = self.tx.borrow(py);
         let tx = tx_ref.check_active()?;
         let mut builder = tx.appender(&self.label);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(dvi) = self.defer_vector_indexes {
-            builder = builder.defer_vector_indexes(dvi);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
+        crate::apply_opt!(builder, self.batch_size, batch_size);
+        crate::apply_opt!(builder, self.defer_vector_indexes, defer_vector_indexes);
+        crate::apply_opt!(builder, self.max_buffer_size_bytes, max_buffer_size_bytes);
         let appender = builder
             .build()
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -619,9 +586,6 @@ impl TxAppenderBuilder {
     }
 }
 
-/// Default grant set for the WASM loaders when the caller passes none:
-/// surface registration for scalar / aggregate / procedure plugins.
-#[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
 /// Marshal a WASM / Extism `LoadOutcome` into the dict shape the Python
 /// plugin-load APIs return (the WASM/Extism outcomes already carry
 /// `Vec<String>` capability lists, so no `Debug`-formatting is needed).
@@ -801,42 +765,7 @@ impl Database {
             .block_on(core::get_label_info_core(&self.inner, name))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        Ok(info.map(|i| LabelInfo {
-            name: i.name,
-            count: i.count,
-            properties: i
-                .properties
-                .into_iter()
-                .map(|p| PropertyInfo {
-                    name: p.name,
-                    data_type: p.data_type,
-                    nullable: p.nullable,
-                    is_indexed: p.is_indexed,
-                    description: p.description,
-                })
-                .collect(),
-            indexes: i
-                .indexes
-                .into_iter()
-                .map(|idx| IndexInfo {
-                    name: idx.name,
-                    index_type: idx.index_type,
-                    properties: idx.properties,
-                    status: idx.status,
-                })
-                .collect(),
-            constraints: i
-                .constraints
-                .into_iter()
-                .map(|c| ConstraintInfo {
-                    name: c.name,
-                    constraint_type: c.constraint_type,
-                    properties: c.properties,
-                    enabled: c.enabled,
-                })
-                .collect(),
-            description: i.description,
-        }))
+        Ok(info.map(LabelInfo::from))
     }
 
     /// Get detailed information about an edge type.
@@ -845,44 +774,7 @@ impl Database {
             .block_on(core::get_edge_type_info_core(&self.inner, name))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        Ok(info.map(|i| crate::types::EdgeTypeInfo {
-            name: i.name,
-            count: i.count,
-            source_labels: i.source_labels,
-            target_labels: i.target_labels,
-            properties: i
-                .properties
-                .into_iter()
-                .map(|p| PropertyInfo {
-                    name: p.name,
-                    data_type: p.data_type,
-                    nullable: p.nullable,
-                    is_indexed: p.is_indexed,
-                    description: p.description,
-                })
-                .collect(),
-            indexes: i
-                .indexes
-                .into_iter()
-                .map(|idx| IndexInfo {
-                    name: idx.name,
-                    index_type: idx.index_type,
-                    properties: idx.properties,
-                    status: idx.status,
-                })
-                .collect(),
-            constraints: i
-                .constraints
-                .into_iter()
-                .map(|c| ConstraintInfo {
-                    name: c.name,
-                    constraint_type: c.constraint_type,
-                    properties: c.properties,
-                    enabled: c.enabled,
-                })
-                .collect(),
-            description: i.description,
-        }))
+        Ok(info.map(crate::types::EdgeTypeInfo::from))
     }
 
     /// Load schema from a JSON file.
@@ -1026,10 +918,6 @@ impl Database {
             outcome.denied_capabilities,
         )
     }
-
-    // ========================================================================
-    // Index Methods
-    // ========================================================================
 
     // ========================================================================
     // Session Methods
@@ -1242,21 +1130,7 @@ impl Database {
 
     /// Get the configured write lease, if any.
     fn write_lease(&self) -> Option<crate::types::PyWriteLease> {
-        self.inner.write_lease().map(|wl| match wl {
-            ::uni_db::api::multi_agent::WriteLease::Local => crate::types::PyWriteLease {
-                variant: crate::types::WriteLeaseVariant::Local,
-            },
-            ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => {
-                crate::types::PyWriteLease {
-                    variant: crate::types::WriteLeaseVariant::DynamoDB {
-                        table: table.clone(),
-                    },
-                }
-            }
-            _ => crate::types::PyWriteLease {
-                variant: crate::types::WriteLeaseVariant::Local,
-            },
-        })
+        self.inner.write_lease().map(convert::write_lease_to_py)
     }
 }
 

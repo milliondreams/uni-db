@@ -39,10 +39,6 @@ impl GraphAlgoAdapter for TriangleCountAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type TriangleCountProcedure = GenericAlgoProcedure<TriangleCountAdapter>;

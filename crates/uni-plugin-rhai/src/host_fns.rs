@@ -60,6 +60,31 @@ pub struct RhaiHostFnSpec {
     pub register: RhaiHostFnRegister,
 }
 
+#[cfg(feature = "rhai-runtime")]
+impl RhaiHostFnSpec {
+    /// Build a spec for a capability-gated host fn.
+    ///
+    /// Convenience constructor for the common shape used by the built-in
+    /// host-fn modules (`fs`, `net`, `kms`, `secret`): a symbolic `name`, a
+    /// `required_capability` placeholder, human-readable `docs`, and a
+    /// `register` closure. Folds the four-field struct literal into one call
+    /// so a new field can't silently diverge across call sites.
+    #[must_use]
+    pub fn gated(
+        name: impl Into<String>,
+        required_capability: Capability,
+        docs: impl Into<String>,
+        register: impl Fn(&mut rhai::Engine, &uni_plugin::CapabilitySet) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            required_capability: Some(required_capability),
+            docs: docs.into(),
+            register: Arc::new(register),
+        }
+    }
+}
+
 impl std::fmt::Debug for RhaiHostFnSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RhaiHostFnSpec")

@@ -93,17 +93,13 @@ async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(s: &Q, label: &str) -> Resu
         let Some(Value::Node(node)) = row.value("n") else {
             continue;
         };
-        let row_label = node
-            .labels
-            .iter()
-            .find(|l| l.as_str() == label)
-            .cloned()
-            .unwrap_or_else(|| label.to_string());
-        let uid = VertexDataset::compute_vertex_uid(&row_label, None, &node.properties);
+        // The MATCH already filters to nodes carrying `label`, so the
+        // bucketed row's label is always `label`.
+        let uid = VertexDataset::compute_vertex_uid(label, None, &node.properties);
         bucket.insert(
             uid,
             VertexRow {
-                label: row_label,
+                label: label.to_string(),
                 vid: node.vid,
                 properties: node.properties.clone(),
             },
@@ -145,36 +141,69 @@ async fn scan_edge_type<Q: ForkQueryHost + ?Sized>(s: &Q, edge_type: &str) -> Re
     Ok(bucket)
 }
 
-fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDiff) {
+/// Split two content-keyed buckets into *added* (present in `b`, not `a`)
+/// and *deleted* (present in `a`, not `b`) rows, moving each row out of its
+/// owning map via the supplied builders. Returns the rows shared by both
+/// buckets (`(uid, row_a, row_b)`) so the caller can diff their properties.
+fn partition_added_deleted<R, A, D>(
+    mut a: HashMap<UniId, R>,
+    mut b: HashMap<UniId, R>,
+    mut mk_added: A,
+    mut mk_deleted: D,
+) -> Vec<(UniId, R, R)>
+where
+    A: FnMut(UniId, R),
+    D: FnMut(UniId, R),
+{
     let keys_a: HashSet<UniId> = a.keys().copied().collect();
     let keys_b: HashSet<UniId> = b.keys().copied().collect();
 
-    for uid in keys_b.difference(&keys_a) {
-        let row = b[uid].clone();
-        out.added.push(DiffVertex {
-            label: row.label,
-            uid: *uid,
-            vid: Some(row.vid),
-            properties: row.properties,
-        });
+    let mut common = Vec::new();
+    for uid in &keys_b {
+        if !keys_a.contains(uid) {
+            mk_added(*uid, b.remove(uid).expect("key from keys_b"));
+        }
     }
-    for uid in keys_a.difference(&keys_b) {
-        let row = a[uid].clone();
-        out.deleted.push(DiffVertex {
-            label: row.label,
-            uid: *uid,
-            vid: Some(row.vid),
-            properties: row.properties,
-        });
+    for uid in &keys_a {
+        match keys_b.contains(uid) {
+            true => {
+                let row_a = a.remove(uid).expect("key from keys_a");
+                let row_b = b.remove(uid).expect("shared key in b");
+                common.push((*uid, row_a, row_b));
+            }
+            false => mk_deleted(*uid, a.remove(uid).expect("key from keys_a")),
+        }
     }
-    for uid in keys_a.intersection(&keys_b) {
-        let row_a = &a[uid];
-        let row_b = &b[uid];
+    common
+}
+
+fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDiff) {
+    let common = partition_added_deleted(
+        a,
+        b,
+        |uid, row| {
+            out.added.push(DiffVertex {
+                label: row.label,
+                uid,
+                vid: Some(row.vid),
+                properties: row.properties,
+            });
+        },
+        |uid, row| {
+            out.deleted.push(DiffVertex {
+                label: row.label,
+                uid,
+                vid: Some(row.vid),
+                properties: row.properties,
+            });
+        },
+    );
+    for (uid, row_a, row_b) in common {
         let changes = property_changes(&row_a.properties, &row_b.properties);
         if !changes.is_empty() {
             out.changed.push(VertexPropertyChange {
                 label: label.to_string(),
-                uid: *uid,
+                uid,
                 changes,
             });
         }
@@ -182,38 +211,37 @@ fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDif
 }
 
 fn diff_edge_type(edge_type: &str, a: EdgeBucket, b: EdgeBucket, out: &mut EdgeDiff) {
-    let keys_a: HashSet<UniId> = a.keys().copied().collect();
-    let keys_b: HashSet<UniId> = b.keys().copied().collect();
-
-    for edge_uid in keys_b.difference(&keys_a) {
-        let row = b[edge_uid].clone();
-        out.added.push(DiffEdge {
-            edge_type: edge_type.to_string(),
-            edge_uid: *edge_uid,
-            src_uid: row.src_uid,
-            dst_uid: row.dst_uid,
-            properties: row.properties,
-        });
-    }
-    for edge_uid in keys_a.difference(&keys_b) {
-        let row = a[edge_uid].clone();
-        out.deleted.push(DiffEdge {
-            edge_type: edge_type.to_string(),
-            edge_uid: *edge_uid,
-            src_uid: row.src_uid,
-            dst_uid: row.dst_uid,
-            properties: row.properties,
-        });
-    }
     // Note: under content-addressed identity, two edges with the same
     // edge_uid have, by construction, identical (src, dst, type,
-    // properties) — so the intersection cannot contain a property
-    // difference. The `changed` branch is intentionally unreachable
-    // under multi-edge semantics; property mutations surface as
-    // added+deleted of distinct edge UIDs. `EdgePropertyChange`
-    // remains in the public API for forward compatibility with a
-    // future identity model that anchors on a stable edge id.
-    let _ = (keys_a.intersection(&keys_b), out as &mut EdgeDiff);
+    // properties) — so the shared (intersection) rows cannot contain a
+    // property difference. The `changed` branch is intentionally
+    // unreachable under multi-edge semantics; property mutations surface
+    // as added+deleted of distinct edge UIDs. `EdgePropertyChange` remains
+    // in the public API for forward compatibility with a future identity
+    // model that anchors on a stable edge id. We therefore discard the
+    // common rows.
+    partition_added_deleted(
+        a,
+        b,
+        |edge_uid, row| {
+            out.added.push(DiffEdge {
+                edge_type: edge_type.to_string(),
+                edge_uid,
+                src_uid: row.src_uid,
+                dst_uid: row.dst_uid,
+                properties: row.properties,
+            });
+        },
+        |edge_uid, row| {
+            out.deleted.push(DiffEdge {
+                edge_type: edge_type.to_string(),
+                edge_uid,
+                src_uid: row.src_uid,
+                dst_uid: row.dst_uid,
+                properties: row.properties,
+            });
+        },
+    );
 }
 
 fn property_changes(a: &Properties, b: &Properties) -> Vec<PropertyChange> {
@@ -261,9 +289,13 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     label: &str,
     uids: &[UniId],
 ) -> HashMap<UniId, Vid> {
-    use uni_common::core::id::UniId as UniIdT;
-
-    let mut out: HashMap<UniIdT, Vid> = HashMap::new();
+    // NOTE: every error path below degrades to whatever has been
+    // resolved so far (an empty or partial map) rather than
+    // propagating. This is deliberate: `run_promote` treats an
+    // unresolved UID as "not present on primary" and inserts it, so a
+    // transient resolve failure must not abort the promote. Changing
+    // this to propagate would alter promote semantics.
+    let mut out: HashMap<UniId, Vid> = HashMap::new();
     if uids.is_empty() {
         return out;
     }
@@ -272,8 +304,7 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     // branch-isolated, so a single UID may have a fork-only VID and
     // a primary VID both registered — we keep both and let the
     // primary Cypher MATCH below decide which is real.
-    let candidates_per_uid: HashMap<UniIdT, Vec<Vid>> = match primary_storage.uid_index(label).ok()
-    {
+    let candidates_per_uid: HashMap<UniId, Vec<Vid>> = match primary_storage.uid_index(label).ok() {
         Some(uix) => match resolve_all_candidate_vids(&uix, uids).await {
             Ok(m) => m,
             Err(_) => return out,
@@ -330,6 +361,16 @@ async fn resolve_all_candidate_vids(
     use arrow_array::Array;
     use futures::TryStreamExt;
 
+    // Lance/DataFusion errors all wrap uniformly as `Internal`; the
+    // generic bound lets one helper cover the scan-builder and stream
+    // error types alike.
+    fn internal<E>(e: E) -> uni_common::UniError
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        uni_common::UniError::Internal(anyhow::anyhow!(e))
+    }
+
     let ds = uix.open().await.map_err(uni_common::UniError::Internal)?;
     let hex_values: Vec<String> = uids.iter().map(uid_to_hex).collect();
     let filter = format!(
@@ -343,21 +384,17 @@ async fn resolve_all_candidate_vids(
     let mut stream = ds
         .scan()
         .filter(&filter)
-        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
+        .map_err(internal)?
         .project(&["_uid_hex", "_vid"])
-        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
+        .map_err(internal)?
         .try_into_stream()
         .await
-        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?;
+        .map_err(internal)?;
 
     let hex_to_uid: HashMap<String, UniId> =
         uids.iter().map(|uid| (uid_to_hex(uid), *uid)).collect();
     let mut out: HashMap<UniId, Vec<Vid>> = HashMap::new();
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
-    {
+    while let Some(batch) = stream.try_next().await.map_err(internal)? {
         let uid_hex_col = batch
             .column_by_name("_uid_hex")
             .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())

@@ -1,3 +1,4 @@
+use crate::steps::assertions::{assert_err, assert_err_mentions, assert_ok, parse_gherkin_value};
 use crate::LocyWorld;
 use cucumber::then;
 use std::collections::HashMap;
@@ -19,26 +20,6 @@ fn extract_field_value<'a>(row: &'a HashMap<String, Value>, field_path: &str) ->
     }
 }
 
-/// Parse a Gherkin value literal into a Value.
-fn parse_gherkin_value(s: &str) -> Value {
-    let t = s.trim();
-    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
-        Value::String(t[1..t.len() - 1].to_string())
-    } else if let Ok(i) = t.parse::<i64>() {
-        Value::Int(i)
-    } else if let Ok(f) = t.parse::<f64>() {
-        Value::Float(f)
-    } else if t == "true" {
-        Value::Bool(true)
-    } else if t == "false" {
-        Value::Bool(false)
-    } else if t == "null" {
-        Value::Null
-    } else {
-        Value::String(t.to_string())
-    }
-}
-
 /// Flexible value comparison (int/float cross-compare, etc.)
 ///
 /// Tolerance is 1e-6 rather than 1e-9 to accommodate f32-precision values that
@@ -51,6 +32,24 @@ fn values_match(actual: &Value, expected: &Value) -> bool {
         (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < 1e-6,
         _ => actual == expected,
     }
+}
+
+/// Borrow command result `$idx`, matching it against `$pat` (a `CommandResult`
+/// variant) and binding its payload as `$bind`, or panic naming `$kind`.
+///
+/// Replaces the repeated `match world.expect_command_result(idx) { Variant(x)
+/// => …, other => panic!(…) }` shape shared by the command-result assertions.
+macro_rules! expect_command_variant {
+    ($world:expr, $idx:expr, $kind:literal, $pat:pat => $bind:expr) => {{
+        let idx = $idx;
+        match $world.expect_command_result(idx) {
+            $pat => $bind,
+            other => panic!(
+                "Expected command result {} to be {}, got {:?}",
+                idx, $kind, other
+            ),
+        }
+    }};
 }
 
 /// Assert that a warning with the given `code` and `rule_name` is present.
@@ -95,18 +94,131 @@ fn assert_warning_absent(world: &LocyWorld, code: uni_locy::RuntimeWarningCode, 
     );
 }
 
+/// Assert that a compile warning with the given `code` is present.
+fn assert_compile_warning_present(
+    world: &LocyWorld,
+    code: uni_locy::types::WarningCode,
+    code_label: &str,
+) {
+    let result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = result.compile_warnings().iter().any(|w| w.code == code);
+    assert!(
+        found,
+        "expected {} compile warning, got: {:?}",
+        code_label,
+        result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Assert that no compile warning with the given `code` is present.
+fn assert_compile_warning_absent(
+    world: &LocyWorld,
+    code: uni_locy::types::WarningCode,
+    code_label: &str,
+) {
+    let result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = result.compile_warnings().iter().any(|w| w.code == code);
+    assert!(
+        !found,
+        "expected no {} warning, got: {:?}",
+        code_label,
+        result
+            .compile_warnings()
+            .iter()
+            .filter(|w| w.code == code)
+            .map(|w| w.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Borrow the neural call for `model_name` on the EXPLAIN child at
+/// `child_idx` of command result `idx`, panicking with a clear message if the
+/// command is not an Explain, the child is missing, or no matching call exists.
+fn find_explain_neural_call<'a>(
+    world: &'a LocyWorld,
+    idx: usize,
+    child_idx: usize,
+    model_name: &str,
+) -> &'a uni_locy::result::NeuralProvenance {
+    let node = match world.expect_command_result(idx) {
+        CommandResult::Explain(node) => node,
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    };
+    let child = node
+        .children
+        .get(child_idx)
+        .unwrap_or_else(|| panic!("No child at index {}", child_idx));
+    child
+        .neural_calls
+        .iter()
+        .find(|c| c.model_name == model_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "Child {} has no NeuralProvenance for model '{}' (got: {:?})",
+                child_idx,
+                model_name,
+                child
+                    .neural_calls
+                    .iter()
+                    .map(|c| c.model_name.clone())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+/// Find the `CalibrationResult` for `model_name`, panicking if absent.
+fn find_calibration<'a>(
+    world: &'a LocyWorld,
+    model_name: &str,
+) -> &'a uni_locy::result::CalibrationResult {
+    let result = world.expect_locy_ok();
+    result
+        .command_results()
+        .iter()
+        .find_map(|cr| match cr {
+            uni_locy::CommandResult::Calibrate(c) if c.model_name == model_name => Some(c),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no CalibrationResult for model '{}'", model_name))
+}
+
+/// Find the `ValidationResult` for `rule_name`, panicking if absent.
+fn find_validation<'a>(
+    world: &'a LocyWorld,
+    rule_name: &str,
+) -> &'a uni_locy::result::ValidationResult {
+    let result = world.expect_locy_ok();
+    result
+        .command_results()
+        .iter()
+        .find_map(|cr| match cr {
+            uni_locy::CommandResult::Validate(v) if v.rule_name == rule_name => Some(v),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no ValidationResult for rule '{}'", rule_name))
+}
+
 #[then("evaluation should succeed")]
 async fn evaluation_should_succeed(world: &mut LocyWorld) {
     let locy_result = world
         .locy_result()
         .expect("No evaluation result found - did you forget to evaluate a program?");
-
-    match locy_result {
-        Ok(_) => {}
-        Err(err) => {
-            panic!("Expected successful evaluation, but got error: {}", err);
-        }
-    }
+    assert_ok(locy_result, "evaluation");
 }
 
 #[then(regex = r#"^evaluation should succeed with timed_out (true|false)$"#)]
@@ -121,9 +233,10 @@ async fn evaluation_should_succeed_with_timed_out(world: &mut LocyWorld, expecte
 
     let expected_flag = expected == "true";
     assert_eq!(
-        result.timed_out, expected_flag,
+        result.timed_out(),
+        expected_flag,
         "expected timed_out={expected_flag}, got timed_out={}",
-        result.timed_out,
+        result.timed_out(),
     );
 }
 
@@ -156,10 +269,7 @@ async fn evaluation_should_fail(world: &mut LocyWorld) {
     let locy_result = world
         .locy_result()
         .expect("No evaluation result found - did you forget to evaluate a program?");
-
-    if locy_result.is_ok() {
-        panic!("Expected evaluation failure, but evaluation succeeded");
-    }
+    assert_err(locy_result, "evaluation");
 }
 
 #[then(regex = r#"^the evaluation error should mention ['"](.+)['"]$"#)]
@@ -167,24 +277,7 @@ async fn evaluation_error_should_mention(world: &mut LocyWorld, expected_text: S
     let locy_result = world
         .locy_result()
         .expect("No evaluation result found - did you forget to evaluate a program?");
-
-    match locy_result {
-        Ok(_) => {
-            panic!(
-                "Expected evaluation error mentioning '{}', but evaluation succeeded",
-                expected_text
-            );
-        }
-        Err(err) => {
-            let error_message = err.to_string();
-            if !error_message.contains(&expected_text) {
-                panic!(
-                    "Expected error message to contain '{}', but got: {}",
-                    expected_text, error_message
-                );
-            }
-        }
-    }
+    assert_err_mentions(locy_result, "evaluation", &expected_text);
 }
 
 #[then(regex = r#"^the derived relation ['"](.+)['"] should have (\d+) facts$"#)]
@@ -525,20 +618,15 @@ async fn stats_mutations_executed(world: &mut LocyWorld, expected: usize) {
 
 #[then(regex = r#"^the command result (\d+) should be a Query with (\d+) rows$"#)]
 async fn command_result_query_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Query(rows) => assert_eq!(
-            rows.len(),
-            expected,
-            "Expected Query command result {} to have {} rows, got {}",
-            idx,
-            expected,
-            rows.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be a Query, got {:?}",
-            idx, other
-        ),
-    }
+    let rows = expect_command_variant!(world, idx, "a Query", CommandResult::Query(rows) => rows);
+    assert_eq!(
+        rows.len(),
+        expected,
+        "Expected Query command result {} to have {} rows, got {}",
+        idx,
+        expected,
+        rows.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be a Query containing row where (.+) = (.+)$"#)]
@@ -548,46 +636,35 @@ async fn command_result_query_containing_row(
     field: String,
     value_str: String,
 ) {
-    match world.expect_command_result(idx) {
-        CommandResult::Query(rows) => {
-            let expected = parse_gherkin_value(&value_str);
-            let found = rows.iter().any(|row| {
-                extract_field_value(row, field.trim())
-                    .map(|v| values_match(v, &expected))
-                    .unwrap_or(false)
-            });
-            assert!(
-                found,
-                "Expected Query result {} to contain row where {} = {}, but not found in {} rows",
-                idx,
-                field,
-                value_str,
-                rows.len()
-            );
-        }
-        other => panic!(
-            "Expected command result {} to be a Query, got {:?}",
-            idx, other
-        ),
-    }
+    let rows = expect_command_variant!(world, idx, "a Query", CommandResult::Query(rows) => rows);
+    let expected = parse_gherkin_value(&value_str);
+    let found = rows.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .map(|v| values_match(v, &expected))
+            .unwrap_or(false)
+    });
+    assert!(
+        found,
+        "Expected Query result {} to contain row where {} = {}, but not found in {} rows",
+        idx,
+        field,
+        value_str,
+        rows.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be an Assume with (\d+) rows$"#)]
 async fn command_result_assume_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Assume(rows) => assert_eq!(
-            rows.len(),
-            expected,
-            "Expected Assume command result {} to have {} rows, got {}",
-            idx,
-            expected,
-            rows.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be an Assume, got {:?}",
-            idx, other
-        ),
-    }
+    let rows =
+        expect_command_variant!(world, idx, "an Assume", CommandResult::Assume(rows) => rows);
+    assert_eq!(
+        rows.len(),
+        expected,
+        "Expected Assume command result {} to have {} rows, got {}",
+        idx,
+        expected,
+        rows.len()
+    );
 }
 
 #[then(
@@ -599,112 +676,84 @@ async fn command_result_assume_containing_row(
     field: String,
     value_str: String,
 ) {
-    match world.expect_command_result(idx) {
-        CommandResult::Assume(rows) => {
-            let expected = parse_gherkin_value(&value_str);
-            let found = rows.iter().any(|row| {
-                extract_field_value(row, field.trim())
-                    .map(|v| values_match(v, &expected))
-                    .unwrap_or(false)
-            });
-            assert!(
-                found,
-                "Expected Assume result {} to contain row where {} = {}, but not found in {} rows",
-                idx,
-                field,
-                value_str,
-                rows.len()
-            );
-        }
-        other => panic!(
-            "Expected command result {} to be an Assume, got {:?}",
-            idx, other
-        ),
-    }
+    let rows =
+        expect_command_variant!(world, idx, "an Assume", CommandResult::Assume(rows) => rows);
+    let expected = parse_gherkin_value(&value_str);
+    let found = rows.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .map(|v| values_match(v, &expected))
+            .unwrap_or(false)
+    });
+    assert!(
+        found,
+        "Expected Assume result {} to contain row where {} = {}, but not found in {} rows",
+        idx,
+        field,
+        value_str,
+        rows.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be an Explain with rule ['"](.+)['"]$"#)]
 async fn command_result_explain_rule(world: &mut LocyWorld, idx: usize, rule_name: String) {
-    match world.expect_command_result(idx) {
-        CommandResult::Explain(node) => assert_eq!(
-            node.rule, rule_name,
-            "Expected Explain root rule '{}', got '{}'",
-            rule_name, node.rule
-        ),
-        other => panic!(
-            "Expected command result {} to be an Explain, got {:?}",
-            idx, other
-        ),
-    }
+    let node =
+        expect_command_variant!(world, idx, "an Explain", CommandResult::Explain(node) => node);
+    assert_eq!(
+        node.rule, rule_name,
+        "Expected Explain root rule '{}', got '{}'",
+        rule_name, node.rule
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be an Explain with (\d+) children$"#)]
 async fn command_result_explain_children(world: &mut LocyWorld, idx: usize, expected: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Explain(node) => assert_eq!(
-            node.children.len(),
-            expected,
-            "Expected Explain with {} children, got {}",
-            expected,
-            node.children.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be an Explain, got {:?}",
-            idx, other
-        ),
-    }
+    let node =
+        expect_command_variant!(world, idx, "an Explain", CommandResult::Explain(node) => node);
+    assert_eq!(
+        node.children.len(),
+        expected,
+        "Expected Explain with {} children, got {}",
+        expected,
+        node.children.len()
+    );
 }
 
 #[then(
     regex = r#"^the command result (\d+) should be an Abduce with at least (\d+) modifications$"#
 )]
 async fn command_result_abduce_modifications(world: &mut LocyWorld, idx: usize, min: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Abduce(abduce_result) => assert!(
-            abduce_result.modifications.len() >= min,
-            "Expected Abduce with at least {} modifications, got {}",
-            min,
-            abduce_result.modifications.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be an Abduce, got {:?}",
-            idx, other
-        ),
-    }
+    let abduce_result =
+        expect_command_variant!(world, idx, "an Abduce", CommandResult::Abduce(r) => r);
+    assert!(
+        abduce_result.modifications.len() >= min,
+        "Expected Abduce with at least {} modifications, got {}",
+        min,
+        abduce_result.modifications.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be a Derive affecting (\d+) elements$"#)]
 async fn command_result_derive_affecting(world: &mut LocyWorld, idx: usize, expected: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Derive { affected } => assert_eq!(
-            *affected, expected,
-            "Expected Derive affecting {} elements, got {}",
-            expected, affected
-        ),
-        other => panic!(
-            "Expected command result {} to be a Derive, got {:?}",
-            idx, other
-        ),
-    }
+    let affected = expect_command_variant!(world, idx, "a Derive", CommandResult::Derive { affected } => affected);
+    assert_eq!(
+        *affected, expected,
+        "Expected Derive affecting {} elements, got {}",
+        expected, affected
+    );
 }
 
 // ── Cypher Command Result Assertions ─────────────────────────────────────
 
 #[then(regex = r#"^the command result (\d+) should be a Cypher with at least (\d+) rows$"#)]
 async fn command_result_cypher_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Cypher(rows) => assert!(
-            rows.len() >= min,
-            "Expected Cypher command result {} to have at least {} rows, got {}",
-            idx,
-            min,
-            rows.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be a Cypher, got {:?}",
-            idx, other
-        ),
-    }
+    let rows = expect_command_variant!(world, idx, "a Cypher", CommandResult::Cypher(rows) => rows);
+    assert!(
+        rows.len() >= min,
+        "Expected Cypher command result {} to have at least {} rows, got {}",
+        idx,
+        min,
+        rows.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be a Cypher containing row where (.+) = (.+)$"#)]
@@ -714,64 +763,47 @@ async fn command_result_cypher_containing_row(
     field: String,
     value_str: String,
 ) {
-    match world.expect_command_result(idx) {
-        CommandResult::Cypher(rows) => {
-            let expected = parse_gherkin_value(&value_str);
-            let found = rows.iter().any(|row| {
-                extract_field_value(row, field.trim())
-                    .map(|v| values_match(v, &expected))
-                    .unwrap_or(false)
-            });
-            assert!(
-                found,
-                "Cypher command result {} has no row where {} = {} (out of {} rows)",
-                idx,
-                field,
-                value_str,
-                rows.len()
-            );
-        }
-        other => panic!(
-            "Expected command result {} to be a Cypher, got {:?}",
-            idx, other
-        ),
-    }
+    let rows = expect_command_variant!(world, idx, "a Cypher", CommandResult::Cypher(rows) => rows);
+    let expected = parse_gherkin_value(&value_str);
+    let found = rows.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .map(|v| values_match(v, &expected))
+            .unwrap_or(false)
+    });
+    assert!(
+        found,
+        "Cypher command result {} has no row where {} = {} (out of {} rows)",
+        idx,
+        field,
+        value_str,
+        rows.len()
+    );
 }
 
 // ── "at least" Variants for Query and Derive ─────────────────────────────
 
 #[then(regex = r#"^the command result (\d+) should be a Query with at least (\d+) rows$"#)]
 async fn command_result_query_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Query(rows) => assert!(
-            rows.len() >= min,
-            "Expected Query command result {} to have at least {} rows, got {}",
-            idx,
-            min,
-            rows.len()
-        ),
-        other => panic!(
-            "Expected command result {} to be a Query, got {:?}",
-            idx, other
-        ),
-    }
+    let rows = expect_command_variant!(world, idx, "a Query", CommandResult::Query(rows) => rows);
+    assert!(
+        rows.len() >= min,
+        "Expected Query command result {} to have at least {} rows, got {}",
+        idx,
+        min,
+        rows.len()
+    );
 }
 
 #[then(regex = r#"^the command result (\d+) should be a Derive with at least (\d+) affected$"#)]
 async fn command_result_derive_at_least_affected(world: &mut LocyWorld, idx: usize, min: usize) {
-    match world.expect_command_result(idx) {
-        CommandResult::Derive { affected } => assert!(
-            *affected >= min,
-            "Expected Derive command result {} to have at least {} affected, got {}",
-            idx,
-            min,
-            affected
-        ),
-        other => panic!(
-            "Expected command result {} to be a Derive, got {:?}",
-            idx, other
-        ),
-    }
+    let affected = expect_command_variant!(world, idx, "a Derive", CommandResult::Derive { affected } => affected);
+    assert!(
+        *affected >= min,
+        "Expected Derive command result {} to have at least {} affected, got {}",
+        idx,
+        min,
+        affected
+    );
 }
 
 // ── Graph State Assertions ────────────────────────────────────────────────
@@ -922,21 +954,7 @@ async fn result_should_contain_fuzzy_warning(world: &mut LocyWorld, rule_name: S
     regex = r#"^the calibration result for ['"](.+)['"] should have calibrated_ece less than half the raw_ece$"#
 )]
 async fn calibration_result_ece_reduction(world: &mut LocyWorld, model_name: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let mut found = None;
-    for cr in locy_result.command_results() {
-        if let uni_locy::CommandResult::Calibrate(c) = cr {
-            if c.model_name == model_name {
-                found = Some(c.clone());
-                break;
-            }
-        }
-    }
-    let result = found.unwrap_or_else(|| panic!("no CalibrationResult for model '{}'", model_name));
+    let result = find_calibration(world, &model_name);
     assert!(
         result.calibrated_ece < result.raw_ece * 0.5,
         "expected calibrated_ece (={}) < raw_ece (={}) * 0.5",
@@ -956,54 +974,30 @@ async fn calibration_confidence_band_quantile(
     expected: f64,
     tolerance: f64,
 ) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    for cr in locy_result.command_results() {
-        if let uni_locy::CommandResult::Calibrate(c) = cr {
-            if c.model_name == model_name {
-                let q = c.confidence_band_quantile.unwrap_or_else(|| {
-                    panic!(
-                        "calibration result for '{}' has no confidence_band_quantile (method = {:?})",
-                        model_name, c.method
-                    )
-                });
-                assert!(
-                    (q - expected).abs() <= tolerance,
-                    "expected confidence_band_quantile ≈ {} (±{}), got {}",
-                    expected,
-                    tolerance,
-                    q
-                );
-                return;
-            }
-        }
-    }
-    panic!("no CalibrationResult for model '{}'", model_name);
+    let c = find_calibration(world, &model_name);
+    let q = c.confidence_band_quantile.unwrap_or_else(|| {
+        panic!(
+            "calibration result for '{}' has no confidence_band_quantile (method = {:?})",
+            model_name, c.method
+        )
+    });
+    assert!(
+        (q - expected).abs() <= tolerance,
+        "expected confidence_band_quantile ≈ {} (±{}), got {}",
+        expected,
+        tolerance,
+        q
+    );
 }
 
 #[then(regex = r#"^the calibration result for ['"](.+)['"] should report method ['"](.+)['"]$"#)]
 async fn calibration_result_method(world: &mut LocyWorld, model_name: String, method: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    for cr in locy_result.command_results() {
-        if let uni_locy::CommandResult::Calibrate(c) = cr {
-            if c.model_name == model_name {
-                let actual = format!("{:?}", c.method);
-                assert!(
-                    actual.eq_ignore_ascii_case(&method),
-                    "expected method {method}, got {actual}"
-                );
-                return;
-            }
-        }
-    }
-    panic!("no CalibrationResult for model '{}'", model_name);
+    let c = find_calibration(world, &model_name);
+    let actual = format!("{:?}", c.method);
+    assert!(
+        actual.eq_ignore_ascii_case(&method),
+        "expected method {method}, got {actual}"
+    );
 }
 
 #[then(
@@ -1016,11 +1010,6 @@ async fn validation_metric_threshold(
     comparator: String,
     threshold: f64,
 ) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
     let metric = match metric_name.to_ascii_lowercase().as_str() {
         "brier_score" => uni_cypher::locy_ast::ValidationMetric::BrierScore,
         "log_loss" => uni_cypher::locy_ast::ValidationMetric::LogLoss,
@@ -1030,221 +1019,93 @@ async fn validation_metric_threshold(
         "auc" => uni_cypher::locy_ast::ValidationMetric::Auc,
         other => panic!("unknown VALIDATE metric '{other}'"),
     };
-    for cr in locy_result.command_results() {
-        if let uni_locy::CommandResult::Validate(v) = cr {
-            if v.rule_name == rule_name {
-                let value = v.metric(metric).unwrap_or_else(|| {
-                    panic!(
-                        "rule '{}' validation did not report metric '{}'",
-                        rule_name, metric_name
-                    )
-                });
-                let pass = match comparator.as_str() {
-                    "greater" => value > threshold,
-                    "less" => value < threshold,
-                    other => panic!("unknown comparator '{other}'"),
-                };
-                assert!(
-                    pass,
-                    "expected {metric_name} {comparator} {threshold}, got {value}"
-                );
-                return;
-            }
-        }
-    }
-    panic!("no ValidationResult for rule '{}'", rule_name);
+    let v = find_validation(world, &rule_name);
+    let value = v.metric(metric).unwrap_or_else(|| {
+        panic!(
+            "rule '{}' validation did not report metric '{}'",
+            rule_name, metric_name
+        )
+    });
+    let pass = match comparator.as_str() {
+        "greater" => value > threshold,
+        "less" => value < threshold,
+        other => panic!("unknown comparator '{other}'"),
+    };
+    assert!(
+        pass,
+        "expected {metric_name} {comparator} {threshold}, got {value}"
+    );
 }
 
 #[then(regex = r#"^the result should contain an EceBinningBias warning$"#)]
 async fn result_contains_ece_binning_bias(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result
-        .compile_warnings()
-        .iter()
-        .any(|w| matches!(w.code, uni_locy::types::WarningCode::EceBinningBias));
-    assert!(
-        found,
-        "expected EceBinningBias compile warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .map(|w| format!("{:?}", w.code))
-            .collect::<Vec<_>>()
+    assert_compile_warning_present(
+        world,
+        uni_locy::types::WarningCode::EceBinningBias,
+        "EceBinningBias",
     );
 }
 
 #[then(regex = r#"^the result should contain a FoldInRecursivePath warning$"#)]
 async fn result_contains_fold_in_recursive_path(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result
-        .compile_warnings()
-        .iter()
-        .any(|w| matches!(w.code, uni_locy::types::WarningCode::FoldInRecursivePath));
-    assert!(
-        found,
-        "expected FoldInRecursivePath compile warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .map(|w| format!("{:?}", w.code))
-            .collect::<Vec<_>>()
+    assert_compile_warning_present(
+        world,
+        uni_locy::types::WarningCode::FoldInRecursivePath,
+        "FoldInRecursivePath",
     );
 }
 
 #[then(regex = r#"^the result should contain a PositiveComplementCorrelation warning$"#)]
 async fn result_contains_positive_complement_correlation(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result.compile_warnings().iter().any(|w| {
-        matches!(
-            w.code,
-            uni_locy::types::WarningCode::PositiveComplementCorrelation
-        )
-    });
-    assert!(
-        found,
-        "expected PositiveComplementCorrelation compile warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .map(|w| format!("{:?}", w.code))
-            .collect::<Vec<_>>()
+    assert_compile_warning_present(
+        world,
+        uni_locy::types::WarningCode::PositiveComplementCorrelation,
+        "PositiveComplementCorrelation",
     );
 }
 
 #[then(regex = r#"^the result should contain a SharedRetrievalContext warning$"#)]
 async fn result_contains_shared_retrieval_context(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result
-        .compile_warnings()
-        .iter()
-        .any(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext));
-    assert!(
-        found,
-        "expected SharedRetrievalContext compile warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .map(|w| format!("{:?}", w.code))
-            .collect::<Vec<_>>()
+    assert_compile_warning_present(
+        world,
+        uni_locy::types::WarningCode::SharedRetrievalContext,
+        "SharedRetrievalContext",
     );
 }
 
 #[then(regex = r#"^the result should not contain a SharedRetrievalContext warning$"#)]
 async fn result_does_not_contain_shared_retrieval_context(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result
-        .compile_warnings()
-        .iter()
-        .any(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext));
-    assert!(
-        !found,
-        "expected no SharedRetrievalContext warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .filter(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext))
-            .map(|w| w.message.clone())
-            .collect::<Vec<_>>()
+    assert_compile_warning_absent(
+        world,
+        uni_locy::types::WarningCode::SharedRetrievalContext,
+        "SharedRetrievalContext",
     );
 }
 
 #[then(regex = r#"^the result should contain a CrossPredicateCorrelation warning$"#)]
 async fn result_contains_cross_predicate_correlation(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result.compile_warnings().iter().any(|w| {
-        matches!(
-            w.code,
-            uni_locy::types::WarningCode::CrossPredicateCorrelation
-        )
-    });
-    assert!(
-        found,
-        "expected CrossPredicateCorrelation compile warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .map(|w| format!("{:?}", w.code))
-            .collect::<Vec<_>>()
+    assert_compile_warning_present(
+        world,
+        uni_locy::types::WarningCode::CrossPredicateCorrelation,
+        "CrossPredicateCorrelation",
     );
 }
 
 #[then(regex = r#"^the result should not contain a CrossPredicateCorrelation warning$"#)]
 async fn result_does_not_contain_cross_predicate_correlation(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result.compile_warnings().iter().any(|w| {
-        matches!(
-            w.code,
-            uni_locy::types::WarningCode::CrossPredicateCorrelation
-        )
-    });
-    assert!(
-        !found,
-        "expected no CrossPredicateCorrelation warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .filter(|w| matches!(
-                w.code,
-                uni_locy::types::WarningCode::CrossPredicateCorrelation
-            ))
-            .map(|w| w.message.clone())
-            .collect::<Vec<_>>()
+    assert_compile_warning_absent(
+        world,
+        uni_locy::types::WarningCode::CrossPredicateCorrelation,
+        "CrossPredicateCorrelation",
     );
 }
 
 #[then(regex = r#"^the result should not contain a PositiveComplementCorrelation warning$"#)]
 async fn result_does_not_contain_positive_complement_correlation(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-    let found = locy_result.compile_warnings().iter().any(|w| {
-        matches!(
-            w.code,
-            uni_locy::types::WarningCode::PositiveComplementCorrelation
-        )
-    });
-    assert!(
-        !found,
-        "expected no PositiveComplementCorrelation warning, got: {:?}",
-        locy_result
-            .compile_warnings()
-            .iter()
-            .filter(|w| matches!(
-                w.code,
-                uni_locy::types::WarningCode::PositiveComplementCorrelation
-            ))
-            .map(|w| w.message.clone())
-            .collect::<Vec<_>>()
+    assert_compile_warning_absent(
+        world,
+        uni_locy::types::WarningCode::PositiveComplementCorrelation,
+        "PositiveComplementCorrelation",
     );
 }
 
@@ -1620,47 +1481,14 @@ async fn command_result_explain_child_neural_call(
     model_name: String,
     expected: f64,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-    match cmd {
-        CommandResult::Explain(node) => {
-            let child = node
-                .children
-                .get(child_idx)
-                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
-            let call = child
-                .neural_calls
-                .iter()
-                .find(|c| c.model_name == model_name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Child {} has no NeuralProvenance for model '{}' (got: {:?})",
-                        child_idx,
-                        model_name,
-                        child
-                            .neural_calls
-                            .iter()
-                            .map(|c| c.model_name.clone())
-                            .collect::<Vec<_>>()
-                    )
-                });
-            assert!(
-                (call.raw_probability - expected).abs() < 1e-6,
-                "model '{}' raw_probability: expected {}, got {}",
-                model_name,
-                expected,
-                call.raw_probability
-            );
-        }
-        other => panic!(
-            "Expected command result {} to be an Explain, got {:?}",
-            idx, other
-        ),
-    }
+    let call = find_explain_neural_call(world, idx, child_idx, &model_name);
+    assert!(
+        (call.raw_probability - expected).abs() < 1e-6,
+        "model '{}' raw_probability: expected {}, got {}",
+        model_name,
+        expected,
+        call.raw_probability
+    );
 }
 
 /// Phase C B1-B3 follow-up: assert the EXPLAIN child has a
@@ -1674,36 +1502,12 @@ async fn command_result_explain_child_neural_call_has_band(
     child_idx: usize,
     model_name: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-    match cmd {
-        CommandResult::Explain(node) => {
-            let child = node
-                .children
-                .get(child_idx)
-                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
-            let call = child
-                .neural_calls
-                .iter()
-                .find(|c| c.model_name == model_name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Child {} has no NeuralProvenance for '{}'",
-                        child_idx, model_name
-                    )
-                });
-            assert!(
-                call.confidence_band.is_some(),
-                "model '{}' expected confidence_band, got None",
-                model_name
-            );
-        }
-        other => panic!("Expected Explain, got {:?}", other),
-    }
+    let call = find_explain_neural_call(world, idx, child_idx, &model_name);
+    assert!(
+        call.confidence_band.is_some(),
+        "model '{}' expected confidence_band, got None",
+        model_name
+    );
 }
 
 /// Phase C B1-B3 follow-up: assert calibrated_probability is set.
@@ -1716,36 +1520,12 @@ async fn command_result_explain_child_neural_call_has_calibrated(
     child_idx: usize,
     model_name: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-    match cmd {
-        CommandResult::Explain(node) => {
-            let child = node
-                .children
-                .get(child_idx)
-                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
-            let call = child
-                .neural_calls
-                .iter()
-                .find(|c| c.model_name == model_name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Child {} has no NeuralProvenance for '{}'",
-                        child_idx, model_name
-                    )
-                });
-            assert!(
-                call.calibrated_probability.is_some(),
-                "model '{}' expected calibrated_probability=Some, got None",
-                model_name
-            );
-        }
-        other => panic!("Expected Explain, got {:?}", other),
-    }
+    let call = find_explain_neural_call(world, idx, child_idx, &model_name);
+    assert!(
+        call.calibrated_probability.is_some(),
+        "model '{}' expected calibrated_probability=Some, got None",
+        model_name
+    );
 }
 
 #[then(

@@ -86,46 +86,37 @@ fn strip_query_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
+/// Print a query execution error to stdout in the REPL's red error style.
+fn print_query_error(e: impl std::fmt::Display) {
+    println!("{}", format!("Error: {}", e).red());
+}
+
 pub async fn execute_query(db: &Uni, query: &str) {
     let start = Instant::now();
 
     if let Some(clean_query) = strip_query_keyword(query, "EXPLAIN") {
-        let result = {
-            let s = db.session();
-            s.query_with(clean_query).explain().await
-        };
-        match result {
+        match db.session().query_with(clean_query).explain().await {
             Ok(output) => print_explain(output, start.elapsed()),
-            Err(e) => println!("{}", format!("Error: {}", e).red()),
+            Err(e) => print_query_error(e),
         }
         return;
     }
 
     if let Some(clean_query) = strip_query_keyword(query, "PROFILE") {
-        let result = {
-            let s = db.session();
-            s.query_with(clean_query).profile().await
-        };
-        match result {
+        match db.session().query_with(clean_query).profile().await {
             Ok((results, output)) => {
                 print_results(results, start.elapsed());
                 println!();
                 print_profile(output);
             }
-            Err(e) => println!("{}", format!("Error: {}", e).red()),
+            Err(e) => print_query_error(e),
         }
         return;
     }
 
-    let result = {
-        let s = db.session();
-        s.query(query).await
-    };
-    match result {
+    match db.session().query(query).await {
         Ok(results) => print_results(results, start.elapsed()),
-        Err(e) => {
-            println!("{}", format!("Error: {}", e).red());
-        }
+        Err(e) => print_query_error(e),
     }
 }
 

@@ -10,21 +10,27 @@
 //! Initial set: `text.toUpper`, `text.toLower`, `text.replace`,
 //! `text.reverse`. Additional procedures (`text.split`, `text.regexGroups`,
 //! `text.distance`, `text.fuzzyMatch`, etc.) land as user demand surfaces.
+//!
+//! Index units differ deliberately between procedures: `text.length`
+//! counts Unicode scalar values (chars), whereas `text.indexOf` returns a
+//! UTF-8 **byte** offset (matching Rust's `str::find`). The two are not
+//! interchangeable for non-ASCII input.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use arrow_array::{Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
+
+use super::support::{
+    self, ApocProc, FloatToInt, MAX_SYNTHESIZED_LEN, batch_err, bool_result, int_result,
+    string_result,
+};
 
 /// Register `uni.text.*` procedures into `r`.
 ///
@@ -32,14 +38,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 ///
 /// Returns [`PluginError::DuplicateRegistration`] if a qname is taken.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    for proc in TextProc::ALL {
-        r.procedure(
-            proc.qname(),
-            proc.signature_cached().clone(),
-            Arc::new(*proc),
-        )?;
-    }
-    Ok(())
+    support::register_all::<TextProc>(r)
 }
 
 fn binary_str_bool_sig(docs: &str) -> ProcedureSignature {
@@ -201,6 +200,36 @@ enum TextProc {
 }
 
 impl TextProc {
+    /// Canonical docstring per variant. The `register_into` strings
+    /// were descriptive (e.g. "Uppercase a string.") while the
+    /// `OnceLock` placeholders were terse ("Uppercase."). We keep the
+    /// descriptive form.
+    fn docs(&self) -> &'static str {
+        match self {
+            Self::ToUpper => "Uppercase a string.",
+            Self::ToLower => "Lowercase a string.",
+            Self::Replace => "Replace every occurrence of `search` in `text` with `replacement`.",
+            Self::Reverse => "Reverse a string by Unicode scalar values.",
+            Self::Trim => "Trim Unicode whitespace from both ends of a string.",
+            Self::LTrim => "Trim Unicode whitespace from the left end of a string.",
+            Self::RTrim => "Trim Unicode whitespace from the right end of a string.",
+            Self::Contains => "Returns true if `text` contains `substring`.",
+            Self::StartsWith => "Returns true if `text` starts with `prefix`.",
+            Self::EndsWith => "Returns true if `text` ends with `suffix`.",
+            Self::Length => {
+                "Length of a string in Unicode scalar values (chars). Note: this counts \
+                 chars, whereas `text.indexOf` returns a UTF-8 byte offset."
+            }
+            Self::Repeat => "Repeat `text` `count` times.",
+            Self::IndexOf => {
+                "UTF-8 byte offset of the first occurrence of `substring` in `text`, or -1 if \
+                 not present. Note: this is a byte offset, whereas `text.length` counts chars."
+            }
+        }
+    }
+}
+
+impl ApocProc for TextProc {
     const ALL: &'static [Self] = &[
         Self::ToUpper,
         Self::ToLower,
@@ -235,28 +264,8 @@ impl TextProc {
         }
     }
 
-    /// Canonical docstring per variant. The `register_into` strings
-    /// were descriptive (e.g. "Uppercase a string.") while the
-    /// `OnceLock` placeholders were terse ("Uppercase."). We keep the
-    /// descriptive form.
-    fn docs(&self) -> &'static str {
-        match self {
-            Self::ToUpper => "Uppercase a string.",
-            Self::ToLower => "Lowercase a string.",
-            Self::Replace => "Replace every occurrence of `search` in `text` with `replacement`.",
-            Self::Reverse => "Reverse a string by Unicode scalar values.",
-            Self::Trim => "Trim Unicode whitespace from both ends of a string.",
-            Self::LTrim => "Trim Unicode whitespace from the left end of a string.",
-            Self::RTrim => "Trim Unicode whitespace from the right end of a string.",
-            Self::Contains => "Returns true if `text` contains `substring`.",
-            Self::StartsWith => "Returns true if `text` starts with `prefix`.",
-            Self::EndsWith => "Returns true if `text` ends with `suffix`.",
-            Self::Length => "Length of a string in Unicode scalar values (chars).",
-            Self::Repeat => "Repeat `text` `count` times.",
-            Self::IndexOf => {
-                "Byte index of the first occurrence of `substring` in `text`, or -1 if not present."
-            }
-        }
+    fn index(&self) -> usize {
+        *self as usize
     }
 
     fn build_signature(&self) -> ProcedureSignature {
@@ -274,42 +283,12 @@ impl TextProc {
             Self::IndexOf => index_of_sig(self.docs()),
         }
     }
-
-    fn signature_cached(&self) -> &'static ProcedureSignature {
-        static UPPER_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static LOWER_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static REPLACE_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static REVERSE_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static TRIM_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static LTRIM_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static RTRIM_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static CONTAINS_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static STARTS_WITH_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static ENDS_WITH_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static LENGTH_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static REPEAT_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static INDEX_OF_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        match self {
-            Self::ToUpper => UPPER_SIG.get_or_init(|| self.build_signature()),
-            Self::ToLower => LOWER_SIG.get_or_init(|| self.build_signature()),
-            Self::Replace => REPLACE_SIG.get_or_init(|| self.build_signature()),
-            Self::Reverse => REVERSE_SIG.get_or_init(|| self.build_signature()),
-            Self::Trim => TRIM_SIG.get_or_init(|| self.build_signature()),
-            Self::LTrim => LTRIM_SIG.get_or_init(|| self.build_signature()),
-            Self::RTrim => RTRIM_SIG.get_or_init(|| self.build_signature()),
-            Self::Contains => CONTAINS_SIG.get_or_init(|| self.build_signature()),
-            Self::StartsWith => STARTS_WITH_SIG.get_or_init(|| self.build_signature()),
-            Self::EndsWith => ENDS_WITH_SIG.get_or_init(|| self.build_signature()),
-            Self::Length => LENGTH_SIG.get_or_init(|| self.build_signature()),
-            Self::Repeat => REPEAT_SIG.get_or_init(|| self.build_signature()),
-            Self::IndexOf => INDEX_OF_SIG.get_or_init(|| self.build_signature()),
-        }
-    }
 }
 
 impl ProcedurePlugin for TextProc {
     fn signature(&self) -> &ProcedureSignature {
-        self.signature_cached()
+        static CACHE: OnceLock<Vec<ProcedureSignature>> = OnceLock::new();
+        support::cached_signature(&CACHE, self)
     }
 
     fn invoke(
@@ -317,34 +296,31 @@ impl ProcedurePlugin for TextProc {
         _ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
+        // `text` accepts a string array's first element; integer args
+        // (`repeat`'s count) must be scalar and reject floats.
+        let str_arg = |idx| support::extract_string(args, idx, "text", true);
         // Each branch builds a 1-row batch with the procedure's declared
         // yield schema. Boolean/Int outputs avoid the string path.
-        let (schema, array): (SchemaRef, Arc<dyn Array>) = match self {
-            Self::ToUpper => string_result(extract_string(args, 0)?.to_uppercase()),
-            Self::ToLower => string_result(extract_string(args, 0)?.to_lowercase()),
-            Self::Reverse => string_result(extract_string(args, 0)?.chars().rev().collect()),
+        let (schema, array) = match self {
+            Self::ToUpper => string_result(str_arg(0)?.to_uppercase()),
+            Self::ToLower => string_result(str_arg(0)?.to_lowercase()),
+            Self::Reverse => string_result(str_arg(0)?.chars().rev().collect()),
             Self::Replace => {
-                let text = extract_string(args, 0)?;
-                let search = extract_string(args, 1)?;
-                let replacement = extract_string(args, 2)?;
+                let text = str_arg(0)?;
+                let search = str_arg(1)?;
+                let replacement = str_arg(2)?;
                 string_result(text.replace(&search, &replacement))
             }
-            Self::Trim => string_result(extract_string(args, 0)?.trim().to_owned()),
-            Self::LTrim => string_result(extract_string(args, 0)?.trim_start().to_owned()),
-            Self::RTrim => string_result(extract_string(args, 0)?.trim_end().to_owned()),
-            Self::Contains => {
-                bool_result(extract_string(args, 0)?.contains(extract_string(args, 1)?.as_str()))
-            }
-            Self::StartsWith => {
-                bool_result(extract_string(args, 0)?.starts_with(extract_string(args, 1)?.as_str()))
-            }
-            Self::EndsWith => {
-                bool_result(extract_string(args, 0)?.ends_with(extract_string(args, 1)?.as_str()))
-            }
-            Self::Length => int_result(extract_string(args, 0)?.chars().count() as i64),
+            Self::Trim => string_result(str_arg(0)?.trim().to_owned()),
+            Self::LTrim => string_result(str_arg(0)?.trim_start().to_owned()),
+            Self::RTrim => string_result(str_arg(0)?.trim_end().to_owned()),
+            Self::Contains => bool_result(str_arg(0)?.contains(str_arg(1)?.as_str())),
+            Self::StartsWith => bool_result(str_arg(0)?.starts_with(str_arg(1)?.as_str())),
+            Self::EndsWith => bool_result(str_arg(0)?.ends_with(str_arg(1)?.as_str())),
+            Self::Length => int_result(str_arg(0)?.chars().count() as i64),
             Self::Repeat => {
-                let s = extract_string(args, 0)?;
-                let count = extract_i64_text(args, 1)?;
+                let s = str_arg(0)?;
+                let count = support::extract_i64(args, 1, "text", FloatToInt::Reject, false)?;
                 if count < 0 {
                     return Err(FnError::new(
                         FnError::CODE_TYPE_COERCION,
@@ -352,12 +328,12 @@ impl ProcedurePlugin for TextProc {
                     ));
                 }
                 // Cap to a sane limit to prevent OOM on pathological cases.
-                let capped = (count as usize).min(1_000_000);
+                let capped = (count as usize).min(MAX_SYNTHESIZED_LEN);
                 string_result(s.repeat(capped))
             }
             Self::IndexOf => {
-                let haystack = extract_string(args, 0)?;
-                let needle = extract_string(args, 1)?;
+                let haystack = str_arg(0)?;
+                let needle = str_arg(1)?;
                 let idx = haystack
                     .find(needle.as_str())
                     .map(|p| p as i64)
@@ -365,101 +341,15 @@ impl ProcedurePlugin for TextProc {
                 int_result(idx)
             }
         };
-
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])
-            .map_err(|e| FnError::new(0x701, format!("text: {e}")))?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
-    }
-}
-
-fn string_result(s: String) -> (SchemaRef, Arc<dyn Array>) {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Utf8,
-        false,
-    )]));
-    let arr = Arc::new(StringArray::from(vec![s])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn bool_result(b: bool) -> (SchemaRef, Arc<dyn Array>) {
-    use arrow_array::BooleanArray;
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Boolean,
-        false,
-    )]));
-    let arr = Arc::new(BooleanArray::from(vec![b])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn int_result(n: i64) -> (SchemaRef, Arc<dyn Array>) {
-    use arrow_array::Int64Array;
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Int64,
-        false,
-    )]));
-    let arr = Arc::new(Int64Array::from(vec![n])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn extract_i64_text(args: &[ColumnarValue], idx: usize) -> Result<i64, FnError> {
-    let arg = args.get(idx).ok_or_else(|| {
-        FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("text: expected integer at position {idx}"),
-        )
-    })?;
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Ok(*v),
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            "text: integer argument required",
-        )),
-    }
-}
-
-fn extract_string(args: &[ColumnarValue], idx: usize) -> Result<String, FnError> {
-    let arg = args.get(idx).ok_or_else(|| {
-        FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("text: expected argument at position {idx}"),
-        )
-    })?;
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
-        ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(s.clone()),
-        ColumnarValue::Array(arr) => {
-            if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                if a.is_empty() || a.is_null(0) {
-                    Err(FnError::new(
-                        FnError::CODE_UNEXPECTED_NULL,
-                        "text: string argument must not be null",
-                    ))
-                } else {
-                    Ok(a.value(0).to_owned())
-                }
-            } else {
-                Err(FnError::new(
-                    FnError::CODE_TYPE_COERCION,
-                    "text: expected StringArray",
-                ))
-            }
-        }
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            "text: string argument required",
-        )),
+        support::one_row_stream(schema, array, batch_err::TEXT, "text")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::StringArray;
+    use datafusion::scalar::ScalarValue;
     use futures::StreamExt;
 
     async fn invoke_one(proc: TextProc, args: Vec<&str>) -> String {

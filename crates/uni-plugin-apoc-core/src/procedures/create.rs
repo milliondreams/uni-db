@@ -11,18 +11,18 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
+
+use super::support::{self, ApocProc, MAX_SYNTHESIZED_LEN, batch_err};
 
 /// Register `uni.create.*` procedures into `r`.
 ///
@@ -30,14 +30,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 ///
 /// Returns [`PluginError::DuplicateRegistration`] if a qname is taken.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    for proc in CreateProc::ALL {
-        r.procedure(
-            proc.qname(),
-            proc.signature_cached().clone(),
-            Arc::new(*proc),
-        )?;
-    }
-    Ok(())
+    support::register_all::<CreateProc>(r)
 }
 
 fn uuid_sig(docs: &str) -> ProcedureSignature {
@@ -79,15 +72,6 @@ enum CreateProc {
 }
 
 impl CreateProc {
-    const ALL: &'static [Self] = &[Self::Uuid, Self::Uuids];
-
-    fn qname(&self) -> QName {
-        match self {
-            Self::Uuid => QName::new("apoc-core", "create.uuid"),
-            Self::Uuids => QName::new("apoc-core", "create.uuids"),
-        }
-    }
-
     /// Canonical docstring per variant. The `register_into` strings
     /// were descriptive; the `OnceLock` ones were just "uuid"/"uuids".
     /// We keep the descriptive form.
@@ -97,6 +81,21 @@ impl CreateProc {
             Self::Uuids => "Generate N fresh random UUIDv4 strings, one per row.",
         }
     }
+}
+
+impl ApocProc for CreateProc {
+    const ALL: &'static [Self] = &[Self::Uuid, Self::Uuids];
+
+    fn qname(&self) -> QName {
+        match self {
+            Self::Uuid => QName::new("apoc-core", "create.uuid"),
+            Self::Uuids => QName::new("apoc-core", "create.uuids"),
+        }
+    }
+
+    fn index(&self) -> usize {
+        *self as usize
+    }
 
     fn build_signature(&self) -> ProcedureSignature {
         match self {
@@ -104,20 +103,12 @@ impl CreateProc {
             Self::Uuids => uuids_sig(self.docs()),
         }
     }
-
-    fn signature_cached(&self) -> &'static ProcedureSignature {
-        static UUID_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static UUIDS_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        match self {
-            Self::Uuid => UUID_SIG.get_or_init(|| self.build_signature()),
-            Self::Uuids => UUIDS_SIG.get_or_init(|| self.build_signature()),
-        }
-    }
 }
 
 impl ProcedurePlugin for CreateProc {
     fn signature(&self) -> &ProcedureSignature {
-        self.signature_cached()
+        static CACHE: OnceLock<Vec<ProcedureSignature>> = OnceLock::new();
+        support::cached_signature(&CACHE, self)
     }
 
     fn invoke(
@@ -155,23 +146,20 @@ impl ProcedurePlugin for CreateProc {
                 // Cap at a reasonable upper bound to prevent OOM in
                 // pathological cases; users wanting larger batches can
                 // call repeatedly or open a feature request.
-                let capped = count.min(1_000_000) as usize;
+                let capped = (count as usize).min(MAX_SYNTHESIZED_LEN);
                 (0..capped).map(|_| generate_uuid_v4()).collect()
             }
         };
 
+        // `create` emits N rows, so it builds its own batch rather than using
+        // the single-row `support::one_row_stream`.
         let arr = Arc::new(StringArray::from(
             values
                 .into_iter()
                 .map(Some)
                 .collect::<Vec<Option<String>>>(),
         )) as Arc<dyn Array>;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
-            .map_err(|e| FnError::new(0x705, format!("create: {e}")))?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
+        support::one_row_stream(schema, arr, batch_err::CREATE, "create")
     }
 }
 

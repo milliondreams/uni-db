@@ -16,8 +16,8 @@ Total findings collected: ~4500 lines across 22 reports.
 - **§3 Dead code** — 🟡 PARTIAL. The 5 truly DEAD items + 1 VESTIGIAL scaffold
   have been deleted in this PR (see §3 below for the strikethrough table). The
   remaining items were reclassified as STUBs for unfinished features and
-  captured in [`docs/KNOWN_GAPS.md`](docs/KNOWN_GAPS.md) so they aren't
-  silently erased.
+  tracked in `docs/KNOWN_GAPS.md` so they weren't silently erased (that file was
+  removed once every gap closed — see git history).
 - **§4 Hygiene** — ✅ DONE in commit `19b2281` ("chore(hygiene)"). All
   four items addressed plus one extra duplication found in passing; see
   the strikethrough table in §4 below. Two items the doc flagged were
@@ -278,8 +278,9 @@ After re-classification, items split into three buckets:
 - ✅ `uni` `scheduler.rs:267-268`: dead `mem::take` deleted.
 - ✅ `uni-btic`: `BticError::SentinelExclusivity` deleted.
 
-**📝 Reclassified as STUBs and tracked in `docs/KNOWN_GAPS.md`** (deletion
-would hide unfinished features):
+**📝 Reclassified as STUBs and tracked in `docs/KNOWN_GAPS.md`** (since removed
+once every gap closed — see git history; immediate deletion would have hidden
+unfinished features):
 
 - `uni-store` `load_properties_columnar` — Phase 2 zero-copy perf path never
   finished.

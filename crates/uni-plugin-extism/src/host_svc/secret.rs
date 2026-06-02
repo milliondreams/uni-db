@@ -56,10 +56,8 @@ extism::host_fn!(pub(crate) uni_secret_acquire(ctx: HostSvcCtx; req_json: String
     let bundle = bundle
         .lock()
         .map_err(|_| extism::Error::msg("uni.secret.acquire: host service ctx poisoned"))?;
-    let req: AcquireReq = serde_json::from_str(&req_json)
-        .map_err(|e| extism::Error::msg(format!("uni.secret.acquire: bad request json: {e}")))?;
-    let resp = do_acquire(&bundle, req).map_err(|e| extism::Error::msg(e.to_string()))?;
-    serde_json::to_string(&resp).map_err(|e| extism::Error::msg(e.to_string()))
+    super::dispatch_json(&bundle, &req_json, "uni.secret.acquire", do_acquire)
+        .map_err(|e| extism::Error::msg(e.to_string()))
 });
 
 #[cfg(test)]

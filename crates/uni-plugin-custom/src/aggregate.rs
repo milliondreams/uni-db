@@ -28,11 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
-};
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use datafusion::logical_expr::Volatility;
 use datafusion::scalar::ScalarValue;
@@ -47,8 +43,12 @@ use uni_plugin::{
     PluginManifest, PluginRegistrar, PluginRegistry, ProvidedSurfaces, QName, Scope, SideEffects,
 };
 
-use crate::eval::{EvalError, eval_expr};
-use crate::{CustomError, CustomPlugin, DeclaredPlugin};
+use crate::decode::{
+    array_value_at, declared_plugin_id, eval_err_to_fn, local_part, map_plugin_error, stringify,
+    type_str_to_arrow,
+};
+use crate::eval::eval_expr;
+use crate::{CustomError, DeclaredPlugin};
 
 /// Parameter name under which the accumulator's running state is bound
 /// when evaluating `update_expr` / `finalize_expr`.
@@ -224,16 +224,6 @@ impl PluginAccumulator for DeclaredAccumulator {
     }
 }
 
-fn eval_err_to_fn(e: EvalError) -> FnError {
-    let code = match &e {
-        EvalError::UnboundParameter(_) => 0xB10,
-        EvalError::Unsupported(_) => 0xB11,
-        EvalError::TypeMismatch { .. } => FnError::CODE_TYPE_COERCION,
-        EvalError::Arithmetic(_) => 0xB12,
-    };
-    FnError::new(code, e.to_string())
-}
-
 /// Convert a [`uni_common::Value`] to a [`ScalarValue`] of the requested
 /// Arrow type.
 ///
@@ -265,98 +255,6 @@ pub(crate) fn value_to_scalar(v: &Value, target: &DataType) -> Result<ScalarValu
         (dt, other) => Err(FnError::new(
             FnError::CODE_TYPE_COERCION,
             format!("declared aggregate cannot coerce {other:?} to {dt:?}"),
-        )),
-    }
-}
-
-fn stringify(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::String(s) => s.clone(),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Decode a single Arrow row into a [`uni_common::Value`].
-///
-/// Mirrors `crate::scalar::array_value_at` (private there); duplicated
-/// here to keep the per-row hot loop free of cross-module indirection.
-/// If a third caller appears, promote into a shared helper module.
-fn array_value_at(arr: &ArrayRef, row: usize) -> Result<Value, FnError> {
-    if row >= arr.len() || arr.is_null(row) {
-        return Ok(Value::Null);
-    }
-    match arr.data_type() {
-        DataType::Utf8 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Utf8 downcast"))?;
-            Ok(Value::String(a.value(row).to_owned()))
-        }
-        DataType::Int64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int64 downcast"))?;
-            Ok(Value::Int(a.value(row)))
-        }
-        DataType::Int32 => arr
-            .as_primitive_opt::<Int64Type>()
-            .map(|a| Ok(Value::Int(a.value(row))))
-            .unwrap_or_else(|| {
-                let i32a = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int32Array>()
-                    .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int32 downcast"))?;
-                Ok(Value::Int(i64::from(i32a.value(row))))
-            }),
-        DataType::Float64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float64 downcast"))?;
-            Ok(Value::Float(a.value(row)))
-        }
-        DataType::Float32 => arr
-            .as_primitive_opt::<Float64Type>()
-            .map(|a| Ok(Value::Float(a.value(row))))
-            .unwrap_or_else(|| {
-                let f32a = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float32 downcast"))?;
-                Ok(Value::Float(f64::from(f32a.value(row))))
-            }),
-        DataType::Boolean => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Bool downcast"))?;
-            Ok(Value::Bool(a.value(row)))
-        }
-        DataType::LargeBinary => {
-            // uni-db stores node/edge properties as CypherValue-encoded
-            // LargeBinary blobs. Decode into the rich `Value` model so
-            // the interpreter can operate on Int/Float/String/etc.
-            let a = arr
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "LargeBinary downcast"))?;
-            let bytes = a.value(row);
-            uni_common::cypher_value_codec::decode(bytes).map_err(|e| {
-                FnError::new(
-                    FnError::CODE_TYPE_COERCION,
-                    format!("LargeBinary decode: {e}"),
-                )
-            })
-        }
-        other => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("declared aggregate input type {other:?} not supported"),
         )),
     }
 }
@@ -451,34 +349,6 @@ pub fn install_aggregate_into_registry(
     Ok(())
 }
 
-fn map_plugin_error(e: PluginError, qname: &str) -> CustomError {
-    match e {
-        PluginError::DuplicateRegistration(_) => CustomError::NativeShadow(qname.to_owned()),
-        other => CustomError::Registration(other.to_string()),
-    }
-}
-
-fn type_str_to_arrow(s: &str) -> Option<DataType> {
-    match s.to_ascii_lowercase().as_str() {
-        "string" | "utf8" | "str" => Some(DataType::Utf8),
-        "int" | "integer" | "int64" | "i64" => Some(DataType::Int64),
-        "float" | "double" | "float64" | "f64" => Some(DataType::Float64),
-        "bool" | "boolean" => Some(DataType::Boolean),
-        _ => None,
-    }
-}
-
-fn declared_plugin_id(qname: &str) -> String {
-    qname
-        .split_once('.')
-        .map(|(ns, _)| ns.to_owned())
-        .unwrap_or_else(|| CustomPlugin::ID.to_owned())
-}
-
-fn local_part(qname: &str) -> &str {
-    qname.split_once('.').map(|(_, l)| l).unwrap_or(qname)
-}
-
 /// Synthetic [`Plugin`] wrapping a single declared aggregate.
 struct SyntheticAggregatePlugin {
     plugin_id: PluginId,
@@ -536,6 +406,8 @@ impl Plugin for SyntheticAggregatePlugin {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::Int64Array;
+
     use super::*;
 
     fn parse(src: &str) -> Expr {

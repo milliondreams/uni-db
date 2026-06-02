@@ -223,15 +223,14 @@ impl RhaiScalarFn {
 /// failures).
 fn classify_rhai_error(local: &str, e: &rhai::EvalAltResult) -> FnError {
     use rhai::EvalAltResult as E;
-    let (code, retryable) = match e {
-        E::ErrorTooManyOperations(_) | E::ErrorTooManyModules(_) => (0x711, false),
-        E::ErrorStackOverflow(_) => (0x712, false),
-        E::ErrorDataTooLarge(..) => (0x713, false),
-        E::ErrorTerminated(..) => (0x714, false),
-        E::ErrorFunctionNotFound(..) => (0x715, false),
-        _ => (0x710, false),
+    let code = match e {
+        E::ErrorTooManyOperations(_) | E::ErrorTooManyModules(_) => 0x711,
+        E::ErrorStackOverflow(_) => 0x712,
+        E::ErrorDataTooLarge(..) => 0x713,
+        E::ErrorTerminated(..) => 0x714,
+        E::ErrorFunctionNotFound(..) => 0x715,
+        _ => 0x710,
     };
-    let mut err = FnError::new(code, format!("Rhai `{local}`: {e}"));
-    err.retryable = retryable;
-    err
+    // All Rhai runtime failures are non-retryable (the default for `FnError`).
+    FnError::new(code, format!("Rhai `{local}`: {e}"))
 }

@@ -38,10 +38,6 @@ impl GraphAlgoAdapter for KCoreAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type KCoreProcedure = GenericAlgoProcedure<KCoreAdapter>;

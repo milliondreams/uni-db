@@ -21,7 +21,6 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use datafusion::logical_expr::Volatility;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyTuple};
 use smol_str::SmolStr;
@@ -32,6 +31,9 @@ use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar, QName};
 use crate::adapter_aggregate::{PyAggregateFn, build_py_agg_signature};
 use crate::adapter_procedure::PyProcedure;
 use crate::adapter_scalar::PyScalarFn;
+use crate::adapter_scalar_helpers::{
+    determinism_to_volatility, type_name_to_datatype as type_name_to_datatype_shared,
+};
 use crate::error::PyPluginError;
 use crate::manifest::{
     ManifestBuilder, PyAggregateEntry, PyManifest, PyProcedureEntry, PyScalarEntry,
@@ -138,10 +140,6 @@ impl PyPluginLoader {
         let module_src_c = CString::new(module_src).map_err(|e| {
             PyPluginError::ManifestInvalid(format!("module source contains NUL: {e}"))
         })?;
-        let module_name_c = CString::new(module_name)
-            .unwrap_or_else(|_| CString::new("uni_plugin_pyo3_module").expect("static"));
-        let filename_c = CString::new(format!("{module_name}.py"))
-            .unwrap_or_else(|_| CString::new("uni_plugin_pyo3_module.py").expect("static"));
         py.run(
             module_src_c.as_c_str(),
             Some(&module.dict()),
@@ -153,62 +151,10 @@ impl PyPluginLoader {
             // failed to import.
             PyPluginError::from(err).with_qname(format!("<module {module_name}>"))
         })?;
-        // Discourage unused-var warnings.
-        let _ = (module_name_c, filename_c);
 
-        // Phase 3: drain the builder.
+        // Phase 3: drain the builder and register adapters.
         let manifest = builder.into_manifest();
-        manifest.validate_non_empty()?;
-
-        let resolved_id = self.resolve_plugin_id(&manifest, module_name)?;
-        let runtime = PyPluginRuntime::new(resolved_id.clone());
-
-        let declared = derive_declared_capabilities(&manifest);
-        let (effective, denied) = intersect_caps(&declared, registrar_caps);
-
-        registrar.set_plugin_id(resolved_id.clone());
-
-        let scalars_registered = if effective.contains(&Capability::ScalarFn) {
-            register_scalars(
-                registrar,
-                Arc::clone(&runtime),
-                &resolved_id,
-                &manifest.scalar_fns,
-            )?
-        } else {
-            Vec::new()
-        };
-        let aggregates_registered = if effective.contains(&Capability::AggregateFn) {
-            register_aggregates(
-                registrar,
-                Arc::clone(&runtime),
-                &resolved_id,
-                &manifest.aggregate_fns,
-            )?
-        } else {
-            Vec::new()
-        };
-        let procedures_registered = if effective.contains(&Capability::Procedure) {
-            register_procedures(
-                registrar,
-                Arc::clone(&runtime),
-                &resolved_id,
-                &manifest.procedures,
-            )?
-        } else {
-            Vec::new()
-        };
-
-        Ok(LoadOutcome {
-            plugin_id: resolved_id,
-            version: manifest.version.to_string(),
-            effective_capabilities: effective,
-            denied_capabilities: denied,
-            scalars_registered,
-            aggregates_registered,
-            procedures_registered,
-            runtime,
-        })
+        self.finalize(&manifest, module_name, registrar, registrar_caps)
     }
 
     /// Drain a [`ManifestBuilder`] populated by the bindings-side
@@ -228,12 +174,33 @@ impl PyPluginLoader {
         registrar_caps: &CapabilitySet,
     ) -> Result<LoadOutcome, PyPluginError> {
         let manifest = builder.into_manifest();
+        self.finalize(&manifest, "py.live", registrar, registrar_caps)
+    }
+
+    /// Validate the drained manifest, resolve the plugin id, derive +
+    /// intersect capabilities, and register each granted adapter family
+    /// on `registrar`. Shared tail of [`Self::load`] and
+    /// [`Self::load_from_builder`].
+    ///
+    /// `default_id` is the fallback module/scope name fed to
+    /// [`Self::resolve_plugin_id`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load`].
+    fn finalize(
+        &self,
+        manifest: &PyManifest,
+        default_id: &str,
+        registrar: &mut PluginRegistrar<'_>,
+        registrar_caps: &CapabilitySet,
+    ) -> Result<LoadOutcome, PyPluginError> {
         manifest.validate_non_empty()?;
 
-        let resolved_id = self.resolve_plugin_id(&manifest, "py.live")?;
+        let resolved_id = self.resolve_plugin_id(manifest, default_id)?;
         let runtime = PyPluginRuntime::new(resolved_id.clone());
 
-        let declared = derive_declared_capabilities(&manifest);
+        let declared = derive_declared_capabilities(manifest);
         let (effective, denied) = intersect_caps(&declared, registrar_caps);
 
         registrar.set_plugin_id(resolved_id.clone());
@@ -453,38 +420,20 @@ fn register_procedures(
 }
 
 fn type_name_to_datatype(name: &str) -> Result<DataType, PyPluginError> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "float" | "float64" | "double" => Ok(DataType::Float64),
-        "int" | "int64" | "long" => Ok(DataType::Int64),
-        "string" | "str" | "utf8" => Ok(DataType::Utf8),
-        "bool" | "boolean" => Ok(DataType::Boolean),
-        other => Err(PyPluginError::ManifestInvalid(format!(
-            "unknown yield/arg type `{other}`"
-        ))),
-    }
+    type_name_to_datatype_shared(name).ok_or_else(|| {
+        let normalized = name.trim().to_ascii_lowercase();
+        PyPluginError::ManifestInvalid(format!("unknown yield/arg type `{normalized}`"))
+    })
 }
 
 fn type_name_to_argtype(name: &str) -> Result<ArgType, PyPluginError> {
-    let dt = match name.trim().to_ascii_lowercase().as_str() {
-        "float" | "float64" | "double" => DataType::Float64,
-        "int" | "int64" | "long" => DataType::Int64,
-        "string" | "str" | "utf8" => DataType::Utf8,
-        "bool" | "boolean" => DataType::Boolean,
-        other => {
-            return Err(PyPluginError::ManifestInvalid(format!(
-                "unknown argument/return type `{other}` — v1 covers float/int/string/bool"
-            )));
-        }
-    };
+    let dt = type_name_to_datatype_shared(name).ok_or_else(|| {
+        let normalized = name.trim().to_ascii_lowercase();
+        PyPluginError::ManifestInvalid(format!(
+            "unknown argument/return type `{normalized}` — v1 covers float/int/string/bool"
+        ))
+    })?;
     Ok(ArgType::Primitive(dt))
-}
-
-fn determinism_to_volatility(d: &str) -> Volatility {
-    match d.trim().to_ascii_lowercase().as_str() {
-        "pure" => Volatility::Immutable,
-        "session" | "session-scoped" | "sessionscoped" => Volatility::Stable,
-        _ => Volatility::Volatile,
-    }
 }
 
 fn derive_declared_capabilities(m: &PyManifest) -> CapabilitySet {
@@ -544,8 +493,8 @@ fn build_module_with_sink<'py>(
     // methods. Each decorator method returns a decorator that captures
     // the wrapped callable into our `ManifestBuilder` (passed through
     // as a `PyDecoratorSink` pyclass holding the `Arc<ManifestBuilder>`).
-    let sink =
-        Py::new(py, PyDecoratorSink::new(Arc::clone(builder))).map_err(PyPluginError::from)?;
+    let sink = Py::new(py, PyDecoratorSink::from_builder(Arc::clone(builder)))
+        .map_err(PyPluginError::from)?;
     module
         .setattr("_uni_decorator_sink", sink.clone_ref(py))
         .map_err(PyPluginError::from)?;
@@ -587,10 +536,6 @@ impl PyDecoratorSink {
     pub fn from_builder(builder: Arc<ManifestBuilder>) -> Self {
         Self { builder }
     }
-
-    fn new(builder: Arc<ManifestBuilder>) -> Self {
-        Self::from_builder(builder)
-    }
 }
 
 #[pymethods]
@@ -606,22 +551,15 @@ impl PyDecoratorSink {
         vectorized: bool,
         determinism: &str,
     ) -> PyResult<Py<PyAny>> {
-        let args_vec = extract_args_list(&args)?;
-        let determinism_owned = SmolStr::new(determinism);
-        let builder = Arc::clone(&self.builder);
-        let returns_smol = SmolStr::new(&returns);
-        let name_smol = SmolStr::new(&name);
-        // Build a Python callable wrapper: receives the user fn,
-        // appends to builder, returns the fn unchanged.
-        let trampoline = PyDecoratorTrampoline::new_scalar(
-            builder,
-            name_smol,
-            args_vec,
-            returns_smol,
+        make_scalar_trampoline(
+            py,
+            Arc::clone(&self.builder),
+            name,
+            args,
+            returns,
             vectorized,
-            determinism_owned,
-        );
-        Ok(Py::new(py, trampoline)?.into_any())
+            determinism,
+        )
     }
 
     /// `@db.aggregate_fn(name, args=[...], returns=..., determinism='pure')`
@@ -637,18 +575,14 @@ impl PyDecoratorSink {
         returns: String,
         determinism: &str,
     ) -> PyResult<Py<PyAny>> {
-        let args_vec = extract_args_list(&args)?;
-        let determinism_owned = SmolStr::new(determinism);
-        let returns_smol = SmolStr::new(&returns);
-        let name_smol = SmolStr::new(&name);
-        let trampoline = PyDecoratorTrampoline::new_aggregate(
+        make_aggregate_trampoline(
+            py,
             Arc::clone(&self.builder),
-            name_smol,
-            args_vec,
-            returns_smol,
-            determinism_owned,
-        );
-        Ok(Py::new(py, trampoline)?.into_any())
+            name,
+            args,
+            returns,
+            determinism,
+        )
     }
 
     /// `@db.procedure(name, args=[...], yields=[...], mode='read')`
@@ -661,18 +595,7 @@ impl PyDecoratorSink {
         yields: Bound<'_, PyAny>,
         mode: &str,
     ) -> PyResult<Py<PyAny>> {
-        let args_vec = extract_args_list(&args)?;
-        let yields_vec = extract_args_list(&yields)?;
-        let mode_owned = SmolStr::new(mode);
-        let name_smol = SmolStr::new(&name);
-        let trampoline = PyDecoratorTrampoline::new_procedure(
-            Arc::clone(&self.builder),
-            name_smol,
-            args_vec,
-            yields_vec,
-            mode_owned,
-        );
-        Ok(Py::new(py, trampoline)?.into_any())
+        make_procedure_trampoline(py, Arc::clone(&self.builder), name, args, yields, mode)
     }
 
     /// `db.set_plugin_id("ai.example.geo")` — overrides the default
@@ -951,42 +874,29 @@ impl PyDecoratorTrampoline {
 type AggCallables = (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>);
 
 fn extract_agg_methods(obj: &Bound<'_, PyAny>) -> PyResult<AggCallables> {
+    const KEYS: [&str; 4] = ["init", "accumulate", "merge", "finalize"];
+
     // If `obj` is a dict, read keys; else read attributes.
-    if let Ok(dict) = obj.cast::<PyDict>() {
-        let init = dict
-            .get_item("init")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("aggregate spec dict missing `init` key")
-            })?
-            .unbind();
-        let accumulate = dict
-            .get_item("accumulate")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "aggregate spec dict missing `accumulate` key",
-                )
-            })?
-            .unbind();
-        let merge = dict
-            .get_item("merge")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("aggregate spec dict missing `merge` key")
-            })?
-            .unbind();
-        let finalize = dict
-            .get_item("finalize")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "aggregate spec dict missing `finalize` key",
-                )
-            })?
-            .unbind();
-        return Ok((init, accumulate, merge, finalize));
-    }
-    let init = obj.getattr("init")?.unbind();
-    let accumulate = obj.getattr("accumulate")?.unbind();
-    let merge = obj.getattr("merge")?.unbind();
-    let finalize = obj.getattr("finalize")?.unbind();
+    let resolved: Vec<Py<PyAny>> = if let Ok(dict) = obj.cast::<PyDict>() {
+        KEYS.iter()
+            .map(|key| {
+                dict.get_item(key)?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "aggregate spec dict missing `{key}` key"
+                        ))
+                    })
+                    .map(|v| v.unbind())
+            })
+            .collect::<PyResult<_>>()?
+    } else {
+        KEYS.iter()
+            .map(|key| obj.getattr(*key).map(|v| v.unbind()))
+            .collect::<PyResult<_>>()?
+    };
+
+    let [init, accumulate, merge, finalize] =
+        resolved.try_into().expect("KEYS has exactly four entries");
     Ok((init, accumulate, merge, finalize))
 }
 

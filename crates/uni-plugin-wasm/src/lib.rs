@@ -14,16 +14,11 @@
 //!
 //! # Crate status
 //!
-//! M6 ships the **scaffolding**: the public `WasmLoader` type, the
-//! [`WasmInstancePool`] skeleton, the `ipc` Arrow-IPC marshalling
-//! helpers, and an error model. The actual wasmtime `Linker` wiring per
-//! WIT world arrives in M6 cutover commits that bind a representative
-//! WASM plugin end-to-end through the `scalar-plugin` world.
-//!
-//! Until the cutover, this crate compiles cleanly behind the
-//! `wasmtime-runtime` feature (default-on) but the loader's `load()`
-//! returns an `WasmError::NotYetImplemented` so callers exercise the
-//! plumbing without depending on a working WASM artifact.
+//! [`WasmLoader::load`] is fully wired behind the `wasmtime-runtime`
+//! feature (default-on): it instantiates a component, negotiates
+//! capabilities against the host grants, and registers the plugin's
+//! scalar / aggregate / procedure adapters end-to-end through the
+//! respective WIT worlds.
 
 // Rust guideline compliant
 #![warn(missing_docs)]
@@ -62,6 +57,8 @@ pub mod pool {
 pub mod adapter;
 #[cfg(feature = "wasmtime-runtime")]
 pub mod adapter_aggregate;
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) mod adapter_common;
 #[cfg(feature = "wasmtime-runtime")]
 pub mod adapter_procedure;
 #[cfg(feature = "wasmtime-runtime")]

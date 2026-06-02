@@ -55,10 +55,6 @@ impl GraphAlgoAdapter for NodeSimilarityAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type NodeSimilarityProcedure = GenericAlgoProcedure<NodeSimilarityAdapter>;

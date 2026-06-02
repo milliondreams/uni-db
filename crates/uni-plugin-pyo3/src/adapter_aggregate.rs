@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_schema::{DataType, Field};
-use datafusion::logical_expr::Volatility;
 use datafusion::scalar::ScalarValue;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyTuple};
@@ -39,6 +38,9 @@ use uni_plugin::errors::FnError;
 use uni_plugin::traits::aggregate::{AggSignature, AggregatePluginFn, PluginAccumulator};
 use uni_plugin::traits::scalar::ArgType;
 
+use crate::adapter_scalar_helpers::{
+    classify_pyerr, determinism_to_volatility, type_name_to_datatype,
+};
 use crate::runtime::PyPluginRuntime;
 
 const STATE_FIELD_NAME: &str = "_py_state_json";
@@ -136,7 +138,7 @@ impl PyAccumulator {
         let bound = init.bind(py);
         let state = bound
             .call0()
-            .map_err(|e| classify_pyerr(self.local_name.as_str(), e))?
+            .map_err(|e| classify_pyerr(0x820, "aggregate ", self.local_name.as_str(), e))?
             .unbind();
         self.state = Some(state);
         Ok(())
@@ -194,11 +196,11 @@ impl PluginAccumulator for PyAccumulator {
                         )?);
                     }
                 }
-                let tuple =
-                    PyTuple::new(py, args).map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                let tuple = PyTuple::new(py, args)
+                    .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
                 let result = bound
                     .call1(tuple)
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                    .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
                 state = result.unbind();
             }
             self.state = Some(state);
@@ -231,9 +233,9 @@ impl PluginAccumulator for PyAccumulator {
                 .clone_ref(py);
             let json_loads = py
                 .import("json")
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?
                 .getattr("loads")
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
             let merge_bound = merge.bind(py);
             for i in 0..state_arr.len() {
                 if state_arr.is_null(i) {
@@ -242,12 +244,12 @@ impl PluginAccumulator for PyAccumulator {
                 let json_str = state_arr.value(i);
                 let other = json_loads
                     .call1((json_str,))
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                    .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
                 let tuple = PyTuple::new(py, [state.bind(py).clone(), other])
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                    .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
                 let result = merge_bound
                     .call1(tuple)
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                    .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
                 state = result.unbind();
             }
             self.state = Some(state);
@@ -268,14 +270,14 @@ impl PluginAccumulator for PyAccumulator {
             };
             let json_dumps = py
                 .import("json")
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?
                 .getattr("dumps")
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
             let s: String = json_dumps
                 .call1((state_obj,))
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?
                 .extract()
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
             Ok(vec![ScalarValue::Utf8(Some(s))])
         })
     }
@@ -304,7 +306,7 @@ impl PluginAccumulator for PyAccumulator {
             let bound = finalize.bind(py);
             let result = bound
                 .call1((state_obj,))
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x820, "aggregate ", local_name.as_str(), e))?;
             crate::adapter_scalar_helpers::py_to_scalar(&result, &return_dt)
         })
     }
@@ -336,11 +338,7 @@ pub fn build_py_agg_signature(
         .collect::<Result<_, FnError>>()?;
     let returns_type = type_name_to_argtype(returns.as_str())?;
     let state_fields = vec![Field::new(STATE_FIELD_NAME, DataType::Utf8, true)];
-    let volatility = match determinism.trim().to_ascii_lowercase().as_str() {
-        "pure" => Volatility::Immutable,
-        "session" | "session-scoped" | "sessionscoped" => Volatility::Stable,
-        _ => Volatility::Volatile,
-    };
+    let volatility = determinism_to_volatility(determinism);
     Ok(AggSignature {
         args: arg_types,
         returns: returns_type,
@@ -351,18 +349,10 @@ pub fn build_py_agg_signature(
 }
 
 fn type_name_to_argtype(name: &str) -> Result<ArgType, FnError> {
-    let dt = match name.trim().to_ascii_lowercase().as_str() {
-        "float" | "float64" | "double" => DataType::Float64,
-        "int" | "int64" | "long" => DataType::Int64,
-        "string" | "str" | "utf8" => DataType::Utf8,
-        "bool" | "boolean" => DataType::Boolean,
-        other => {
-            return Err(FnError::new(
-                0x80,
-                format!("unknown aggregate type `{other}`"),
-            ));
-        }
-    };
+    let dt = type_name_to_datatype(name).ok_or_else(|| {
+        let normalized = name.trim().to_ascii_lowercase();
+        FnError::new(0x80, format!("unknown aggregate type `{normalized}`"))
+    })?;
     Ok(ArgType::Primitive(dt))
 }
 
@@ -374,25 +364,6 @@ fn default_scalar_for_type(dt: &DataType) -> ScalarValue {
         DataType::Boolean => ScalarValue::Boolean(None),
         _ => ScalarValue::Null,
     }
-}
-
-fn classify_pyerr(qname: &str, e: PyErr) -> FnError {
-    use pyo3::types::PyTracebackMethods;
-    Python::attach(|py| {
-        let traceback = e
-            .traceback(py)
-            .and_then(|tb| tb.format().ok())
-            .unwrap_or_default();
-        let value = e.value(py);
-        let msg = value
-            .repr()
-            .map(|r| r.to_string())
-            .unwrap_or_else(|_| e.to_string());
-        FnError::new(
-            0x820,
-            format!("PyO3 aggregate `{qname}`: {msg}\n{traceback}"),
-        )
-    })
 }
 
 #[cfg(test)]

@@ -36,10 +36,10 @@ use crate::query::df_expr::{TranslationContext, VariableKind, cypher_expr_to_df}
 use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::df_graph::bind_fixed_path::BindFixedPathExec;
 use crate::query::df_graph::bind_zero_length_path::BindZeroLengthPathExec;
-use crate::query::df_graph::mutation_common::{MutationKind, extended_schema_for_new_vars};
-use crate::query::df_graph::mutation_create::new_create_exec;
+use crate::query::df_graph::mutation_common::{
+    MutationKind, extended_schema_for_new_vars, new_create_exec, new_merge_exec,
+};
 use crate::query::df_graph::mutation_delete::new_delete_exec;
-use crate::query::df_graph::mutation_merge::new_merge_exec;
 use crate::query::df_graph::mutation_remove::new_remove_exec;
 use crate::query::df_graph::mutation_set::new_set_exec;
 use crate::query::df_graph::recursive_cte::RecursiveCTEExec;

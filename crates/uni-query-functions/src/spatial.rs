@@ -118,13 +118,9 @@ fn eval_distance(args: &[Value]) -> Result<Value> {
 
             Ok(Value::Float(EARTH_RADIUS_KM * c * 1000.0)) // Return meters
         }
-        "Cartesian" => {
-            let (x1, y1) = get_cartesian_coords(p1, "First point")?;
-            let (x2, y2) = get_cartesian_coords(p2, "Second point")?;
-
-            Ok(Value::Float(((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt()))
-        }
-        "Cartesian-3D" => {
+        // The 2D "Cartesian" case is the 3D formula with z defaulting to 0 in both
+        // points, so the two CRS variants share a single Euclidean computation.
+        "Cartesian" | "Cartesian-3D" => {
             let (x1, y1) = get_cartesian_coords(p1, "First point")?;
             let (x2, y2) = get_cartesian_coords(p2, "Second point")?;
             let z1 = p1.get("z").and_then(|v| v.as_f64()).unwrap_or(0.0);

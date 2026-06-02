@@ -24,19 +24,6 @@ pub enum RhaiError {
     #[error("rhai parse failed: {0}")]
     ParseFailed(String),
 
-    /// A capability-gated host function was referenced by a script that
-    /// did not receive the matching grant. Rhai raises
-    /// `ErrorFunctionNotFound`; the loader normalises that into this
-    /// variant when the function name maps to a known host fn in the
-    /// registry.
-    #[error("rhai plugin called host fn `{host_fn}` without {capability} grant")]
-    CapabilityDenied {
-        /// Host function the plugin attempted to invoke.
-        host_fn: String,
-        /// The capability the plugin would need.
-        capability: String,
-    },
-
     /// Runtime error during script execution (type mismatch, arithmetic
     /// error, host-fn panic). Wraps Rhai's runtime error message.
     #[error("rhai runtime error: {0}")]
@@ -47,30 +34,7 @@ pub enum RhaiError {
     #[error("rhai <-> arrow conversion failure: {0}")]
     Conversion(String),
 
-    /// Resource limit exceeded: `set_max_operations`, wall-clock deadline,
-    /// `set_max_call_levels`, or a memory cap.
-    #[error("rhai plugin exceeded resource limit: {0}")]
-    ResourceLimit(String),
-
-    /// Loader scaffolding shipped without a complete cutover for this entry
-    /// point. M7 phase commits remove these.
-    #[error("uni-plugin-rhai: {feature} not yet wired (M7 in progress)")]
-    NotYetImplemented {
-        /// The not-yet-wired feature.
-        feature: String,
-    },
-
     /// Internal / unexpected error.
     #[error("uni-plugin-rhai internal error: {0}")]
     Internal(String),
-}
-
-impl RhaiError {
-    /// Construct a `NotYetImplemented` for the named feature.
-    #[must_use]
-    pub fn not_yet(feature: impl Into<String>) -> Self {
-        Self::NotYetImplemented {
-            feature: feature.into(),
-        }
-    }
 }

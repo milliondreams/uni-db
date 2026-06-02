@@ -392,6 +392,90 @@ pub fn prepare_params(
     Ok(rust_params)
 }
 
+/// Convert an optional Python params dict to Rust params, preserving the
+/// `None`/`Some` distinction so callers can pick the parameterized vs.
+/// parameter-free query path.
+pub fn convert_params(
+    py: Python,
+    params: Option<HashMap<String, Py<PyAny>>>,
+) -> PyResult<Option<HashMap<String, Value>>> {
+    match params {
+        Some(p) => {
+            let mut map = HashMap::with_capacity(p.len());
+            for (k, v) in p {
+                map.insert(k, py_object_to_value(py, &v)?);
+            }
+            Ok(Some(map))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build a bulk-writer progress callback that forwards each `BulkProgress`
+/// update to the given Python callable.
+///
+/// The Python object is not `Send`, but the bulk-writer requires a `Send`
+/// closure; the returned closure always re-attaches the GIL before touching it,
+/// so the `unsafe impl Send` wrapper is sound (the object is only ever used
+/// while the GIL is held).
+pub fn make_progress_callback(
+    cb: Py<PyAny>,
+) -> impl Fn(::uni_db::api::bulk::BulkProgress) + Send + 'static {
+    struct PyProgressWrapper {
+        py_obj: Py<PyAny>,
+    }
+    // SAFETY: `py_obj` is only dereferenced inside `Python::attach`, i.e. with
+    // the GIL held, so it is never accessed concurrently from Rust threads.
+    unsafe impl Send for PyProgressWrapper {}
+
+    let wrapper = PyProgressWrapper { py_obj: cb };
+    move |progress: ::uni_db::api::bulk::BulkProgress| {
+        Python::attach(|py| {
+            let py_progress = crate::types::BulkProgress {
+                phase: format!("{:?}", progress.phase),
+                rows_processed: progress.rows_processed,
+                total_rows: progress.total_rows,
+                current_label: progress.current_label.clone(),
+                elapsed_secs: progress.elapsed.as_secs_f64(),
+            };
+            if let Ok(bound) = Py::new(py, py_progress) {
+                let _ = wrapper.py_obj.call1(py, (bound,));
+            }
+        });
+    }
+}
+
+/// Map a Rust `WriteLease` to its Python representation.
+///
+/// `WriteLease` is `#[non_exhaustive]`; the catch-all (covering `Custom` and any
+/// future variant) reports `Local`, matching the pre-existing behavior.
+pub fn write_lease_to_py(
+    wl: &::uni_db::api::multi_agent::WriteLease,
+) -> crate::types::PyWriteLease {
+    match wl {
+        ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => crate::types::PyWriteLease {
+            variant: crate::types::WriteLeaseVariant::DynamoDB {
+                table: table.clone(),
+            },
+        },
+        _ => crate::types::PyWriteLease {
+            variant: crate::types::WriteLeaseVariant::Local,
+        },
+    }
+}
+
+/// Convert a borrowed Python params dict to Rust params.
+pub fn convert_params_ref(
+    py: Python,
+    params: &HashMap<String, Py<PyAny>>,
+) -> PyResult<HashMap<String, Value>> {
+    let mut map = HashMap::with_capacity(params.len());
+    for (k, v) in params {
+        map.insert(k.clone(), py_object_to_value(py, v)?);
+    }
+    Ok(map)
+}
+
 /// Convert query result rows to Python Row objects.
 pub fn rows_to_py(py: Python, rows: Vec<::uni_db::Row>) -> PyResult<Vec<Py<PyAny>>> {
     let mut result = Vec::new();
@@ -732,6 +816,9 @@ fn locy_incomplete_to_py(
 /// Convert a LocyResult to a Python dict.
 pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResult<Py<PyAny>> {
     let result = result.into_inner();
+    // Capture before the by-value field moves below — `timed_out()`
+    // borrows `&result`, which would conflict afterwards.
+    let timed_out = result.timed_out();
     let dict = PyDict::new(py);
 
     // derived: HashMap<String, Vec<Row>> -> Python dict of lists of dicts
@@ -801,7 +888,7 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
     }
     dict.set_item("approximate_groups", approx_dict)?;
 
-    dict.set_item("timed_out", result.timed_out)?;
+    dict.set_item("timed_out", timed_out)?;
     dict.set_item(
         "incomplete",
         locy_incomplete_to_py(py, result.incomplete.as_ref())?,
@@ -851,6 +938,9 @@ pub fn locy_result_to_py_class(
     result: uni_db::locy::LocyResult,
 ) -> PyResult<crate::types::PyLocyResult> {
     let result = result.into_inner();
+    // Capture before the by-value field moves below — `timed_out()`
+    // borrows `&result`, which would conflict afterwards.
+    let timed_out = result.timed_out();
     // Reuse the existing dict-based conversion for the inner fields
     let derived_dict = pyo3::types::PyDict::new(py);
     for (rule_name, rows) in result.derived {
@@ -927,7 +1017,7 @@ pub fn locy_result_to_py_class(
         warnings: warn_list.into(),
         approximate_groups: approx_dict.into(),
         derived_fact_set,
-        timed_out: result.timed_out,
+        timed_out,
         incomplete,
     })
 }

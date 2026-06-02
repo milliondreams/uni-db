@@ -1,21 +1,13 @@
 use std::sync::Arc;
 
 use crate::fixtures::load_graph;
+use crate::steps::assertions::parse_gherkin_value;
 use crate::LocyWorld;
 use cucumber::given;
-use uni_common::Value;
 use uni_locy::{FeatureValue, MockClassifier, NeuralClassifier};
 
-#[given("an empty graph")]
-async fn an_empty_graph(world: &mut LocyWorld) {
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-}
-
-#[given("any graph")]
-async fn any_graph(world: &mut LocyWorld) {
+#[given(regex = r"^(?:an empty graph|any graph)$")]
+async fn empty_or_any_graph(world: &mut LocyWorld) {
     world
         .init_db()
         .await
@@ -100,22 +92,7 @@ async fn register_edge_type(
 
 #[given(regex = r#"^the parameter (\w+) = (.+)$"#)]
 fn set_parameter(world: &mut LocyWorld, name: String, value_str: String) {
-    let t = value_str.trim();
-    let value =
-        if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
-            Value::String(t[1..t.len() - 1].to_string())
-        } else if let Ok(i) = t.parse::<i64>() {
-            Value::Int(i)
-        } else if let Ok(f) = t.parse::<f64>() {
-            Value::Float(f)
-        } else if t == "true" {
-            Value::Bool(true)
-        } else if t == "false" {
-            Value::Bool(false)
-        } else {
-            Value::String(t.to_string())
-        };
-    world.add_param(name, value);
+    world.add_param(name, parse_gherkin_value(&value_str));
 }
 
 // ───────────────────────────────────────────────────────────────────────

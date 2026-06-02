@@ -5,12 +5,12 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, AllSimplePaths, AllSimplePathsConfig};
-use crate::algo::procedure_template::parse_vid_arg;
+use crate::algo::procedure_template::{arg_string_list, arg_u64, err_stream, parse_vid_arg};
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::Result;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
 pub struct AllSimplePathsProcedure;
@@ -45,37 +45,27 @@ impl AlgoProcedure for AllSimplePathsProcedure {
         let signature = self.signature();
         let args = match signature.validate_args(args) {
             Ok(a) => a,
-            Err(e) => return stream::once(async { Err(e) }).boxed(),
+            Err(e) => return err_stream(e),
         };
 
-        // Previously these matches used `unwrap_or(0)`, which silently
-        // routed bad input to vertex 0 instead of failing.
-        let start_vid = match parse_vid_arg(&args[0], "startNode") {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
-        };
-        let end_vid = match parse_vid_arg(&args[1], "endNode") {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
-        };
-
-        let edge_types = args[2]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        let max_len = args[3].as_u64().unwrap() as usize;
-
-        let node_labels = if args[4].is_null() {
-            Vec::new()
-        } else {
-            args[4]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect::<Vec<_>>()
+        // Parse every terminal up front; bad input now surfaces a clear
+        // error instead of the old `unwrap_or(0)` / `unwrap()`.
+        let (start_vid, end_vid, edge_types, max_len, node_labels) = match (|| {
+            let node_labels = if args[4].is_null() {
+                Vec::new()
+            } else {
+                arg_string_list(&args, 4, "nodeLabels")?
+            };
+            Ok((
+                parse_vid_arg(&args[0], "startNode")?,
+                parse_vid_arg(&args[1], "endNode")?,
+                arg_string_list(&args, 2, "relationshipTypes")?,
+                arg_u64(&args, 3, "maxLength")? as usize,
+                node_labels,
+            ))
+        })() {
+            Ok(parsed) => parsed,
+            Err(e) => return err_stream(e),
         };
 
         let stream = async_stream::try_stream! {

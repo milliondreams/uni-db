@@ -3,7 +3,6 @@
 
 //! uni.algo.kShortestPaths procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, KShortestPaths, KShortestPathsConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -58,11 +57,12 @@ impl GraphAlgoAdapter for KShortestPathsAdapter {
             .collect())
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[3].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(3)
     }
 }
 

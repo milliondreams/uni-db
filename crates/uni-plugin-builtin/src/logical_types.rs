@@ -27,6 +27,39 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// Shared `to_display` body for the Utf8-backed logical types.
+///
+/// `type_name` prefixes the coercion error; `null_repr` is the display
+/// string for a SQL `NULL` (most types use `""`, `geo.point` overrides
+/// with `"POINT EMPTY"`).
+fn utf8_to_display(type_name: &str, null_repr: &str, v: &ScalarValue) -> Result<String, FnError> {
+    match v {
+        ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
+        ScalarValue::Utf8(None) => Ok(null_repr.to_owned()),
+        other => Err(FnError::new(
+            FnError::CODE_TYPE_COERCION,
+            format!("{type_name}::to_display: expected Utf8, got {other:?}"),
+        )),
+    }
+}
+
+/// Shared `cast_to` body for the Utf8-backed logical types: the only
+/// supported target is `Utf8` (an identity cast); anything else errors.
+fn utf8_cast_to(
+    type_name: &str,
+    v: &ColumnarValue,
+    target: &DataType,
+) -> Result<ColumnarValue, FnError> {
+    if matches!(target, DataType::Utf8) {
+        Ok(v.clone())
+    } else {
+        Err(FnError::new(
+            FnError::CODE_TYPE_COERCION,
+            format!("{type_name}::cast_to: unsupported target {target:?}"),
+        ))
+    }
+}
+
 /// URI logical type — Utf8-backed, validates RFC-3986 shape on parse.
 #[derive(Debug)]
 pub struct UriLogicalType;
@@ -49,24 +82,10 @@ impl LogicalTypeProvider for UriLogicalType {
         Ok(ScalarValue::Utf8(Some(s.to_owned())))
     }
     fn to_display(&self, v: &ScalarValue) -> Result<String, FnError> {
-        match v {
-            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
-            ScalarValue::Utf8(None) => Ok(String::new()),
-            other => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("uri::to_display: expected Utf8, got {other:?}"),
-            )),
-        }
+        utf8_to_display("uri", "", v)
     }
     fn cast_to(&self, v: &ColumnarValue, target: &DataType) -> Result<ColumnarValue, FnError> {
-        if matches!(target, DataType::Utf8) {
-            Ok(v.clone())
-        } else {
-            Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("uri::cast_to: unsupported target {target:?}"),
-            ))
-        }
+        utf8_cast_to("uri", v, target)
     }
     fn cast_from(&self, v: &ColumnarValue) -> Result<ColumnarValue, FnError> {
         Ok(v.clone())
@@ -125,24 +144,11 @@ impl LogicalTypeProvider for GeoPointLogicalType {
         Ok(ScalarValue::Utf8(Some(format!("POINT({x} {y})"))))
     }
     fn to_display(&self, v: &ScalarValue) -> Result<String, FnError> {
-        match v {
-            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
-            ScalarValue::Utf8(None) => Ok("POINT EMPTY".to_owned()),
-            other => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("geo.point::to_display: expected Utf8, got {other:?}"),
-            )),
-        }
+        // `geo.point` renders a NULL as the WKT empty-point literal.
+        utf8_to_display("geo.point", "POINT EMPTY", v)
     }
     fn cast_to(&self, v: &ColumnarValue, target: &DataType) -> Result<ColumnarValue, FnError> {
-        if matches!(target, DataType::Utf8) {
-            Ok(v.clone())
-        } else {
-            Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("geo.point::cast_to: unsupported target {target:?}"),
-            ))
-        }
+        utf8_cast_to("geo.point", v, target)
     }
     fn cast_from(&self, v: &ColumnarValue) -> Result<ColumnarValue, FnError> {
         Ok(v.clone())
@@ -179,24 +185,10 @@ impl LogicalTypeProvider for EmailLogicalType {
         Ok(ScalarValue::Utf8(Some(s.to_owned())))
     }
     fn to_display(&self, v: &ScalarValue) -> Result<String, FnError> {
-        match v {
-            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
-            ScalarValue::Utf8(None) => Ok(String::new()),
-            other => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("email::to_display: expected Utf8, got {other:?}"),
-            )),
-        }
+        utf8_to_display("email", "", v)
     }
     fn cast_to(&self, v: &ColumnarValue, target: &DataType) -> Result<ColumnarValue, FnError> {
-        if matches!(target, DataType::Utf8) {
-            Ok(v.clone())
-        } else {
-            Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("email::cast_to: unsupported target {target:?}"),
-            ))
-        }
+        utf8_cast_to("email", v, target)
     }
     fn cast_from(&self, v: &ColumnarValue) -> Result<ColumnarValue, FnError> {
         Ok(v.clone())
@@ -238,24 +230,10 @@ impl LogicalTypeProvider for Ipv4LogicalType {
             .map_err(|e| FnError::new(0x920, format!("ipv4: parse `{s}`: {e}")))
     }
     fn to_display(&self, v: &ScalarValue) -> Result<String, FnError> {
-        match v {
-            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
-            ScalarValue::Utf8(None) => Ok(String::new()),
-            other => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("ipv4::to_display: expected Utf8, got {other:?}"),
-            )),
-        }
+        utf8_to_display("ipv4", "", v)
     }
     fn cast_to(&self, v: &ColumnarValue, target: &DataType) -> Result<ColumnarValue, FnError> {
-        if matches!(target, DataType::Utf8) {
-            Ok(v.clone())
-        } else {
-            Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("ipv4::cast_to: unsupported target {target:?}"),
-            ))
-        }
+        utf8_cast_to("ipv4", v, target)
     }
     fn cast_from(&self, v: &ColumnarValue) -> Result<ColumnarValue, FnError> {
         Ok(v.clone())
@@ -279,24 +257,10 @@ impl LogicalTypeProvider for Ipv6LogicalType {
             .map_err(|e| FnError::new(0x930, format!("ipv6: parse `{s}`: {e}")))
     }
     fn to_display(&self, v: &ScalarValue) -> Result<String, FnError> {
-        match v {
-            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
-            ScalarValue::Utf8(None) => Ok(String::new()),
-            other => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("ipv6::to_display: expected Utf8, got {other:?}"),
-            )),
-        }
+        utf8_to_display("ipv6", "", v)
     }
     fn cast_to(&self, v: &ColumnarValue, target: &DataType) -> Result<ColumnarValue, FnError> {
-        if matches!(target, DataType::Utf8) {
-            Ok(v.clone())
-        } else {
-            Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("ipv6::cast_to: unsupported target {target:?}"),
-            ))
-        }
+        utf8_cast_to("ipv6", v, target)
     }
     fn cast_from(&self, v: &ColumnarValue) -> Result<ColumnarValue, FnError> {
         Ok(v.clone())

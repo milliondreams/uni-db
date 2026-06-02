@@ -36,10 +36,6 @@ impl GraphAlgoAdapter for ArticulationPointsAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type ArticulationPointsProcedure = GenericAlgoProcedure<ArticulationPointsAdapter>;

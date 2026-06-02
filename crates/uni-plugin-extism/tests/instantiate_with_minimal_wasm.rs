@@ -1,4 +1,4 @@
-//! Integration tests for `ExtismLoader::instantiate` against minimal
+//! Integration tests for `ExtismLoader::build_plugin` against minimal
 //! hand-assembled WASM modules.
 //!
 //! M6a.1.1 acceptance test: prove the SDK plumbing reaches wasmtime
@@ -35,7 +35,7 @@ fn instantiate_succeeds_on_valid_wasm_with_no_caps() {
         .expect("manifest prepares");
 
     let plugin = loader
-        .instantiate(&trivial_wasm(), &prepared)
+        .build_plugin(&trivial_wasm(), &prepared)
         .expect("trivial wasm instantiates");
 
     // The trivial module exports `answer`, not the Extism PDK's
@@ -52,7 +52,7 @@ fn instantiate_fails_on_invalid_wasm() {
         .expect("manifest prepares");
 
     let err = loader
-        .instantiate(b"obviously not wasm", &prepared)
+        .build_plugin(b"obviously not wasm", &prepared)
         .expect_err("garbage bytes must fail");
     assert!(
         matches!(err, ExtismError::Instantiate(_)),
@@ -118,7 +118,7 @@ fn instantiate_filters_host_fns_through_effective_capabilities() {
     // build_plugin must succeed — it sees one allowed fn and the rest
     // are absent from the import table (Extism analogue of linker absence).
     let _plugin = loader
-        .instantiate(&trivial_wasm(), &prepared)
+        .build_plugin(&trivial_wasm(), &prepared)
         .expect("instantiation succeeds with cap-filtered host fns");
 }
 
@@ -139,6 +139,6 @@ fn instantiate_honors_manifest_resource_limits() {
         .prepare(manifest.as_bytes(), &CapabilitySet::new())
         .unwrap();
     let _plugin = loader
-        .instantiate(&trivial_wasm(), &prepared)
+        .build_plugin(&trivial_wasm(), &prepared)
         .expect("instantiation honors resource limits");
 }

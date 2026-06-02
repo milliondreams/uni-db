@@ -11,20 +11,22 @@
 //! `convert.toInteger`, `convert.toFloat`. NULL-tolerant: invalid
 //! coercions yield NULL rather than erroring.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
+
+use super::support::{
+    self, ApocProc, batch_err, nullable_bool_result, nullable_float_result, nullable_int_result,
+    nullable_string_result,
+};
 
 /// Register `uni.convert.*` procedures into `r`.
 ///
@@ -32,14 +34,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 ///
 /// Returns [`PluginError::DuplicateRegistration`] if a qname is taken.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    for proc in ConvertProc::ALL {
-        r.procedure(
-            proc.qname(),
-            proc.signature_cached().clone(),
-            Arc::new(*proc),
-        )?;
-    }
-    Ok(())
+    support::register_all::<ConvertProc>(r)
 }
 
 fn build_sig(yields_type: DataType, arg_doc: &str, docs: &str) -> ProcedureSignature {
@@ -69,22 +64,6 @@ enum ConvertProc {
 }
 
 impl ConvertProc {
-    const ALL: &'static [Self] = &[
-        Self::ToString,
-        Self::ToBoolean,
-        Self::ToInteger,
-        Self::ToFloat,
-    ];
-
-    fn qname(&self) -> QName {
-        match self {
-            Self::ToString => QName::new("apoc-core", "convert.toString"),
-            Self::ToBoolean => QName::new("apoc-core", "convert.toBoolean"),
-            Self::ToInteger => QName::new("apoc-core", "convert.toInteger"),
-            Self::ToFloat => QName::new("apoc-core", "convert.toFloat"),
-        }
-    }
-
     fn arg_doc(&self) -> &'static str {
         match self {
             Self::ToString => "Value to coerce to string.",
@@ -117,28 +96,38 @@ impl ConvertProc {
             Self::ToFloat => DataType::Float64,
         }
     }
+}
+
+impl ApocProc for ConvertProc {
+    const ALL: &'static [Self] = &[
+        Self::ToString,
+        Self::ToBoolean,
+        Self::ToInteger,
+        Self::ToFloat,
+    ];
+
+    fn qname(&self) -> QName {
+        match self {
+            Self::ToString => QName::new("apoc-core", "convert.toString"),
+            Self::ToBoolean => QName::new("apoc-core", "convert.toBoolean"),
+            Self::ToInteger => QName::new("apoc-core", "convert.toInteger"),
+            Self::ToFloat => QName::new("apoc-core", "convert.toFloat"),
+        }
+    }
+
+    fn index(&self) -> usize {
+        *self as usize
+    }
 
     fn build_signature(&self) -> ProcedureSignature {
         build_sig(self.yields_type(), self.arg_doc(), self.docs())
-    }
-
-    fn signature_cached(&self) -> &'static ProcedureSignature {
-        static TO_STRING_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static TO_BOOLEAN_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static TO_INTEGER_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static TO_FLOAT_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        match self {
-            Self::ToString => TO_STRING_SIG.get_or_init(|| self.build_signature()),
-            Self::ToBoolean => TO_BOOLEAN_SIG.get_or_init(|| self.build_signature()),
-            Self::ToInteger => TO_INTEGER_SIG.get_or_init(|| self.build_signature()),
-            Self::ToFloat => TO_FLOAT_SIG.get_or_init(|| self.build_signature()),
-        }
     }
 }
 
 impl ProcedurePlugin for ConvertProc {
     fn signature(&self) -> &ProcedureSignature {
-        self.signature_cached()
+        static CACHE: OnceLock<Vec<ProcedureSignature>> = OnceLock::new();
+        support::cached_signature(&CACHE, self)
     }
 
     fn invoke(
@@ -169,7 +158,7 @@ impl ProcedurePlugin for ConvertProc {
                     ScalarValue::LargeUtf8(Some(s)) => Some(s),
                     _ => None,
                 };
-                build_string_result(result)
+                nullable_string_result(result)
             }
             Self::ToBoolean => {
                 let result: Option<bool> = match scalar {
@@ -186,20 +175,22 @@ impl ProcedurePlugin for ConvertProc {
                     }
                     _ => None,
                 };
-                build_bool_result(result)
+                nullable_bool_result(result)
             }
             Self::ToInteger => {
                 let result: Option<i64> = match scalar {
                     ScalarValue::Null => None,
                     ScalarValue::Boolean(Some(b)) => Some(if b { 1 } else { 0 }),
                     ScalarValue::Int64(i) => i,
+                    // `convert` guards `is_finite` before truncating, unlike
+                    // `math`'s unguarded float→int truncation; preserved as-is.
                     ScalarValue::Float64(Some(f)) if f.is_finite() => Some(f as i64),
                     ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
                         s.trim().parse().ok()
                     }
                     _ => None,
                 };
-                build_int_result(result)
+                nullable_int_result(result)
             }
             Self::ToFloat => {
                 let result: Option<f64> = match scalar {
@@ -212,61 +203,17 @@ impl ProcedurePlugin for ConvertProc {
                     }
                     _ => None,
                 };
-                build_float_result(result)
+                nullable_float_result(result)
             }
         };
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])
-            .map_err(|e| FnError::new(0x704, format!("convert: {e}")))?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
+        support::one_row_stream(schema, array, batch_err::CONVERT, "convert")
     }
-}
-
-fn build_string_result(s: Option<String>) -> (SchemaRef, Arc<dyn Array>) {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Utf8,
-        true,
-    )]));
-    let arr = Arc::new(StringArray::from(vec![s])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn build_bool_result(b: Option<bool>) -> (SchemaRef, Arc<dyn Array>) {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Boolean,
-        true,
-    )]));
-    let arr = Arc::new(BooleanArray::from(vec![b])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn build_int_result(i: Option<i64>) -> (SchemaRef, Arc<dyn Array>) {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Int64,
-        true,
-    )]));
-    let arr = Arc::new(Int64Array::from(vec![i])) as Arc<dyn Array>;
-    (schema, arr)
-}
-
-fn build_float_result(f: Option<f64>) -> (SchemaRef, Arc<dyn Array>) {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-        "result",
-        DataType::Float64,
-        true,
-    )]));
-    let arr = Arc::new(Float64Array::from(vec![f])) as Arc<dyn Array>;
-    (schema, arr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
     use futures::StreamExt;
 
     async fn invoke(proc: ConvertProc, scalar: ScalarValue) -> RecordBatch {

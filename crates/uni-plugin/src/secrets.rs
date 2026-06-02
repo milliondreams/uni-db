@@ -46,13 +46,26 @@ impl SecretHandle {
 /// handles via [`SecretStore::acquire`]; capability-gated host imports
 /// resolve handles back to bytes via [`SecretStore::unseal_for_host_use`]
 /// which is itself private to the framework's host-import implementations.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SecretStore {
     /// Named secrets — `name → bytes`.
     by_name: RwLock<HashMap<String, Vec<u8>>>,
     /// Handle → name mapping.
     by_handle: RwLock<HashMap<u64, String>>,
+    /// Next handle to hand out. Starts at `1` so the first acquire yields
+    /// a non-zero handle; the `id == 0` guard in [`SecretStore::acquire`]
+    /// remains as defense in depth against a counter forced/wrapped to 0.
     next: AtomicU64,
+}
+
+impl Default for SecretStore {
+    fn default() -> Self {
+        Self {
+            by_name: RwLock::default(),
+            by_handle: RwLock::default(),
+            next: AtomicU64::new(1),
+        }
+    }
 }
 
 impl SecretStore {

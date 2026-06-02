@@ -96,17 +96,15 @@ fn do_verify(ctx: &HostSvcCtx, req: VerifyReq) -> Result<VerifyResp, FnError> {
 }
 
 // The `host_fn!`-generated fns are thin shells: parse JSON → dispatch → encode
-// JSON. All attenuation/dispatch logic lives in the `do_*` fns above so it is
-// unit-testable without a WASM guest.
+// JSON via the shared `dispatch_json`. All attenuation/dispatch logic lives in
+// the `do_*` fns above so it is unit-testable without a WASM guest.
 extism::host_fn!(pub(crate) uni_kms_sign(ctx: HostSvcCtx; req_json: String) -> String {
     let bundle = ctx.get()?;
     let bundle = bundle
         .lock()
         .map_err(|_| extism::Error::msg("uni.kms.sign: host service ctx poisoned"))?;
-    let req: SignReq = serde_json::from_str(&req_json)
-        .map_err(|e| extism::Error::msg(format!("uni.kms.sign: bad request json: {e}")))?;
-    let resp = do_sign(&bundle, req).map_err(|e| extism::Error::msg(e.to_string()))?;
-    serde_json::to_string(&resp).map_err(|e| extism::Error::msg(e.to_string()))
+    super::dispatch_json(&bundle, &req_json, "uni.kms.sign", do_sign)
+        .map_err(|e| extism::Error::msg(e.to_string()))
 });
 
 extism::host_fn!(pub(crate) uni_kms_verify(ctx: HostSvcCtx; req_json: String) -> String {
@@ -114,10 +112,8 @@ extism::host_fn!(pub(crate) uni_kms_verify(ctx: HostSvcCtx; req_json: String) ->
     let bundle = bundle
         .lock()
         .map_err(|_| extism::Error::msg("uni.kms.verify: host service ctx poisoned"))?;
-    let req: VerifyReq = serde_json::from_str(&req_json)
-        .map_err(|e| extism::Error::msg(format!("uni.kms.verify: bad request json: {e}")))?;
-    let resp = do_verify(&bundle, req).map_err(|e| extism::Error::msg(e.to_string()))?;
-    serde_json::to_string(&resp).map_err(|e| extism::Error::msg(e.to_string()))
+    super::dispatch_json(&bundle, &req_json, "uni.kms.verify", do_verify)
+        .map_err(|e| extism::Error::msg(e.to_string()))
 });
 
 #[cfg(test)]

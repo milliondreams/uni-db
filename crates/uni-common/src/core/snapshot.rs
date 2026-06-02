@@ -19,19 +19,23 @@ pub struct SnapshotManifest {
     pub edges: HashMap<String, EdgeSnapshot>,
 }
 
+/// Snapshot counters for one entity kind (a vertex label or an edge type).
+///
+/// Labels and edge types capture the identical shape, so one struct serves
+/// both via the [`LabelSnapshot`] / [`EdgeSnapshot`] aliases — the map key
+/// (in [`SnapshotManifest::vertices`] vs `edges`) already conveys which kind.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LabelSnapshot {
+pub struct EntitySnapshot {
     pub version: u32,
     pub count: u64,
     pub lance_version: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EdgeSnapshot {
-    pub version: u32,
-    pub count: u64,
-    pub lance_version: u64,
-}
+/// Snapshot counters for a vertex label. Alias of [`EntitySnapshot`].
+pub type LabelSnapshot = EntitySnapshot;
+
+/// Snapshot counters for an edge type. Alias of [`EntitySnapshot`].
+pub type EdgeSnapshot = EntitySnapshot;
 
 impl SnapshotManifest {
     pub fn new(snapshot_id: String, schema_version: u32) -> Self {

@@ -5,12 +5,12 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{AStar, AStarConfig, Algorithm};
-use crate::algo::procedure_template::parse_vid_arg;
+use crate::algo::procedure_template::{arg_str, err_stream, parse_vid_arg};
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::Result;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uni_common::core::id::Vid;
@@ -50,22 +50,23 @@ impl AlgoProcedure for AStarProcedure {
         let signature = self.signature();
         let args = match signature.validate_args(args) {
             Ok(a) => a,
-            Err(e) => return stream::once(async { Err(e) }).boxed(),
+            Err(e) => return err_stream(e),
         };
 
-        // Previously these matches used `unwrap_or(0)`, which silently
-        // routed bad input to vertex 0 instead of failing.
-        let start_vid = match parse_vid_arg(&args[0], "startNode") {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
+        // Parse every terminal up front; bad input now surfaces a clear
+        // error instead of the old `unwrap_or(0)` (silent vertex-0 routing)
+        // or `unwrap()` (panic).
+        let (start_vid, end_vid, edge_type, heuristic_prop) = match (|| {
+            Ok((
+                parse_vid_arg(&args[0], "startNode")?,
+                parse_vid_arg(&args[1], "endNode")?,
+                arg_str(&args, 2, "edgeType")?.to_string(),
+                arg_str(&args, 3, "heuristicProperty")?.to_string(),
+            ))
+        })() {
+            Ok(parsed) => parsed,
+            Err(e) => return err_stream(e),
         };
-        let end_vid = match parse_vid_arg(&args[1], "endNode") {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
-        };
-
-        let edge_type = args[2].as_str().unwrap().to_string();
-        let heuristic_prop = args[3].as_str().unwrap().to_string();
 
         let stream = async_stream::try_stream! {
             let schema = ctx.storage.schema_manager().schema();

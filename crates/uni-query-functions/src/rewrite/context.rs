@@ -4,13 +4,10 @@ use std::collections::HashMap;
 
 /// Contextual information available during query rewriting
 ///
-/// The context provides information about the current query environment,
-/// including variable scope, schema metadata, and configuration options.
+/// The context carries rewrite statistics and configuration options for the
+/// current query.
 #[derive(Default)]
 pub struct RewriteContext {
-    /// Variables currently in scope (from MATCH, WITH, etc.)
-    pub scope: HashMap<String, VariableInfo>,
-
     /// Rewrite statistics (for observability)
     pub stats: RewriteStats,
 
@@ -27,65 +24,10 @@ impl RewriteContext {
     /// Create a new rewrite context with custom configuration
     pub fn with_config(config: RewriteConfig) -> Self {
         Self {
-            scope: HashMap::new(),
             stats: RewriteStats::default(),
             config,
         }
     }
-
-    /// Get information about a variable in scope
-    pub fn get_variable(&self, name: &str) -> Option<&VariableInfo> {
-        self.scope.get(name)
-    }
-
-    /// Add a variable to the scope
-    pub fn add_variable(&mut self, name: String, info: VariableInfo) {
-        self.scope.insert(name, info);
-    }
-}
-
-/// Information about a variable in scope
-#[derive(Debug, Clone)]
-pub struct VariableInfo {
-    /// Variable name
-    pub name: String,
-
-    /// Label (for nodes) or None
-    pub label: Option<String>,
-
-    /// Whether this is an edge (true) or node (false)
-    pub is_edge: bool,
-
-    /// Known properties with their types
-    pub properties: HashMap<String, PropertyType>,
-}
-
-/// Property type information
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PropertyType {
-    /// String property
-    String,
-
-    /// Integer property
-    Integer,
-
-    /// Float property
-    Float,
-
-    /// Boolean property
-    Boolean,
-
-    /// DateTime property
-    DateTime,
-
-    /// List of values
-    List,
-
-    /// Map/object
-    Map,
-
-    /// Unknown or dynamic type
-    Unknown,
 }
 
 /// Statistics collected during rewriting
@@ -164,15 +106,6 @@ pub struct RewriteConfig {
     /// Enable temporal function rewrites
     pub enable_temporal: bool,
 
-    /// Enable spatial function rewrites (future)
-    pub enable_spatial: bool,
-
-    /// Enable property access rewrites (future)
-    pub enable_property: bool,
-
-    /// Whether to fall back to scalar execution on rewrite failure
-    pub fallback_to_scalar: bool,
-
     /// Enable verbose logging of rewrite operations
     pub verbose_logging: bool,
 }
@@ -181,9 +114,6 @@ impl Default for RewriteConfig {
     fn default() -> Self {
         Self {
             enable_temporal: true,
-            enable_spatial: false,
-            enable_property: false,
-            fallback_to_scalar: true,
             verbose_logging: false,
         }
     }
@@ -194,20 +124,6 @@ impl RewriteConfig {
     pub fn all_enabled() -> Self {
         Self {
             enable_temporal: true,
-            enable_spatial: true,
-            enable_property: true,
-            fallback_to_scalar: true,
-            verbose_logging: false,
-        }
-    }
-
-    /// Create a config with all rewrites disabled
-    pub fn all_disabled() -> Self {
-        Self {
-            enable_temporal: false,
-            enable_spatial: false,
-            enable_property: false,
-            fallback_to_scalar: true,
             verbose_logging: false,
         }
     }
@@ -226,7 +142,6 @@ mod tests {
     #[test]
     fn test_context_default() {
         let ctx = RewriteContext::default();
-        assert!(ctx.scope.is_empty());
         assert_eq!(ctx.stats.functions_visited, 0);
         assert!(ctx.config.enable_temporal);
     }
@@ -253,12 +168,8 @@ mod tests {
     fn test_config_builders() {
         let all_enabled = RewriteConfig::all_enabled();
         assert!(all_enabled.enable_temporal);
-        assert!(all_enabled.enable_spatial);
-        assert!(all_enabled.enable_property);
 
-        let all_disabled = RewriteConfig::all_disabled();
-        assert!(!all_disabled.enable_temporal);
-        assert!(!all_disabled.enable_spatial);
-        assert!(!all_disabled.enable_property);
+        let verbose = RewriteConfig::default().with_verbose_logging();
+        assert!(verbose.verbose_logging);
     }
 }

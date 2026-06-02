@@ -4,9 +4,8 @@
 //! Closeness Centrality Algorithm.
 
 use crate::algo::GraphProjection;
-use crate::algo::algorithms::Algorithm;
+use crate::algo::algorithms::{Algorithm, bfs_levels};
 use rayon::prelude::*;
-use std::collections::VecDeque;
 use uni_common::core::id::Vid;
 
 pub struct Closeness;
@@ -38,29 +37,16 @@ impl Algorithm for Closeness {
 
         // Parallel BFS from every node
         scores.par_iter_mut().enumerate().for_each(|(s, score)| {
-            let mut q = VecDeque::with_capacity(n);
-            let mut d = vec![-1; n];
+            let d = bfs_levels(graph, s as u32);
 
-            d[s] = 0;
-            q.push_back(s as u32);
-
-            let mut sum_dist = 0;
-            let mut reached = 0;
-
-            while let Some(u) = q.pop_front() {
-                let dist_u = d[u as usize];
-
-                // Skip self in sum
-                if u as usize != s {
-                    sum_dist += dist_u;
+            // Accumulate distances to all reached nodes (excluding self,
+            // whose distance is 0 and is skipped by the `> 0` filter).
+            let mut sum_dist = 0i64;
+            let mut reached = 0u64;
+            for &dist_v in &d {
+                if dist_v > 0 {
+                    sum_dist += dist_v as i64;
                     reached += 1;
-                }
-
-                for &v in graph.out_neighbors(u) {
-                    if d[v as usize] == -1 {
-                        d[v as usize] = dist_u + 1;
-                        q.push_back(v);
-                    }
                 }
             }
 

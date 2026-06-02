@@ -16,7 +16,7 @@ use std::time::Duration;
 use rhai::Engine;
 use uni_plugin::{Capability, CapabilitySet, HttpEgress};
 
-use crate::host_fn_impls::rt_err;
+use crate::host_fn_impls::{require_allowed, require_service, rt_err};
 use crate::host_fns::RhaiHostFnSpec;
 use crate::loader::RhaiLoader;
 
@@ -36,11 +36,11 @@ pub fn register(loader: &mut RhaiLoader) {
         allow: vec!["**".into()],
     };
     let get_http = http.clone();
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.http.get".into(),
-        required_capability: Some(placeholder.clone()),
-        docs: "HTTP GET against a URL in the granted allow-list.".into(),
-        register: Arc::new(move |engine: &mut Engine, caps: &CapabilitySet| {
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.http.get",
+        placeholder.clone(),
+        "HTTP GET against a URL in the granted allow-list.",
+        move |engine: &mut Engine, caps: &CapabilitySet| {
             let http = get_http.clone();
             let caps = caps.clone();
             engine.register_fn(
@@ -49,13 +49,13 @@ pub fn register(loader: &mut RhaiLoader) {
                     http_request(&http, &caps, url, None)
                 },
             );
-        }),
-    });
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.http.post".into(),
-        required_capability: Some(placeholder),
-        docs: "HTTP POST against a URL in the granted allow-list.".into(),
-        register: Arc::new(move |engine: &mut Engine, caps: &CapabilitySet| {
+        },
+    ));
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.http.post",
+        placeholder,
+        "HTTP POST against a URL in the granted allow-list.",
+        move |engine: &mut Engine, caps: &CapabilitySet| {
             let http = http.clone();
             let caps = caps.clone();
             engine.register_fn(
@@ -64,8 +64,8 @@ pub fn register(loader: &mut RhaiLoader) {
                     http_request(&http, &caps, url, Some(body.as_bytes()))
                 },
             );
-        }),
-    });
+        },
+    ));
 }
 
 /// Shared GET/POST body: enforce allow-list, resolve timeout, dispatch, map the
@@ -76,14 +76,12 @@ fn http_request(
     url: &str,
     body: Option<&[u8]>,
 ) -> Result<String, Box<rhai::EvalAltResult>> {
-    if !caps.iter().any(|c| c.network_allows(url)) {
-        return Err(rt_err(format!(
-            "uni.http: url `{url}` not in granted Network allow-list"
-        )));
-    }
-    let egress = http
-        .as_ref()
-        .ok_or_else(|| rt_err("uni.http: no HTTP egress configured"))?;
+    require_allowed(
+        caps,
+        |c| c.network_allows(url),
+        format!("uni.http: url `{url}` not in granted Network allow-list"),
+    )?;
+    let egress = require_service(http, "uni.http: no HTTP egress configured")?;
     let timeout = caps
         .iter()
         .find_map(|c| match c {

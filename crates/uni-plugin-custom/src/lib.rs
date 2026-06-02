@@ -53,6 +53,7 @@
 #![warn(missing_debug_implementations)]
 
 mod aggregate;
+mod decode;
 mod eval;
 mod scalar;
 
@@ -462,10 +463,8 @@ pub mod procedures {
         SideEffects,
     };
 
-    use super::{
-        CustomError, CustomPlugin, DeclaredPlugin, DeclaredPluginStore, DeclaredScalarFn,
-        Persistence,
-    };
+    use super::{CustomError, DeclaredPlugin, DeclaredPluginStore, DeclaredScalarFn, Persistence};
+    use crate::decode::{declared_plugin_id, local_part, map_plugin_error, type_str_to_arrow};
 
     // -------------------------------------------------------------
     // Signatures
@@ -493,22 +492,15 @@ pub mod procedures {
     /// Signature for `uni.plugin.dropDeclared`.
     #[must_use]
     pub fn drop_declared_signature() -> ProcedureSignature {
-        ProcedureSignature {
-            args: vec![NamedArgType {
-                name: smol_str::SmolStr::new("qname"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Qualified name of the declared plugin to drop.".to_owned(),
-            }],
-            yields: vec![Field::new("removed", DataType::Boolean, false)],
-            mode: ProcedureMode::Write,
-            side_effects: SideEffects::ReadOnly,
-            retry_contract: None,
-            batch_input: None,
-            docs:
-                "Drop a previously declared plugin. Errors if other declared plugins depend on it."
-                    .to_owned(),
-        }
+        write_signature(
+            vec![named_arg(
+                "qname",
+                DataType::Utf8,
+                "Qualified name of the declared plugin to drop.",
+            )],
+            "removed",
+            "Drop a previously declared plugin. Errors if other declared plugins depend on it.",
+        )
     }
 
     fn named_arg(name: &str, ty: DataType, doc: &str) -> NamedArgType {
@@ -547,53 +539,73 @@ pub mod procedures {
         named_arg_default("deps_json", DataType::Utf8, DEPS_JSON_DOC, "[]")
     }
 
-    /// Signature for `uni.plugin.declareFunction`.
-    #[must_use]
-    pub fn declare_function_signature() -> ProcedureSignature {
+    /// Build a `Write`-mode [`ProcedureSignature`] that yields a single
+    /// boolean column.
+    ///
+    /// Shared by `dropDeclared` and the four `declare*` signatures,
+    /// which differ only in their args, the yielded column name, and
+    /// the docstring.
+    fn write_signature(args: Vec<NamedArgType>, yield_col: &str, docs: &str) -> ProcedureSignature {
         ProcedureSignature {
-            args: vec![
-                named_arg("qname", DataType::Utf8, "Qualified name to register."),
-                named_arg("body", DataType::Utf8, "Cypher expression body."),
-                named_arg("return_type", DataType::Utf8, "Return type ('string', 'int', 'float', 'bool')."),
-                named_arg("arg_names_json", DataType::Utf8, "JSON array of argument names, in positional order."),
-                deps_arg(),
-            ],
-            yields: vec![Field::new("registered", DataType::Boolean, false)],
+            args,
+            yields: vec![Field::new(yield_col, DataType::Boolean, false)],
             mode: ProcedureMode::Write,
             side_effects: SideEffects::ReadOnly,
             retry_contract: None,
             batch_input: None,
-            docs: "Declare a new scalar function. Body is a Cypher expression; arguments are bound by name (positional)."
-                .to_owned(),
+            docs: docs.to_owned(),
         }
+    }
+
+    /// Signature for `uni.plugin.declareFunction`.
+    #[must_use]
+    pub fn declare_function_signature() -> ProcedureSignature {
+        write_signature(
+            vec![
+                named_arg("qname", DataType::Utf8, "Qualified name to register."),
+                named_arg("body", DataType::Utf8, "Cypher expression body."),
+                named_arg(
+                    "return_type",
+                    DataType::Utf8,
+                    "Return type ('string', 'int', 'float', 'bool').",
+                ),
+                named_arg(
+                    "arg_names_json",
+                    DataType::Utf8,
+                    "JSON array of argument names, in positional order.",
+                ),
+                deps_arg(),
+            ],
+            "registered",
+            "Declare a new scalar function. Body is a Cypher expression; arguments are bound by name (positional).",
+        )
     }
 
     /// Signature for `uni.plugin.declareProcedure`.
     #[must_use]
     pub fn declare_procedure_signature() -> ProcedureSignature {
-        ProcedureSignature {
-            args: vec![
+        write_signature(
+            vec![
                 named_arg("qname", DataType::Utf8, "Qualified name to register."),
                 named_arg("body", DataType::Utf8, "Cypher query body."),
                 named_arg("mode", DataType::Utf8, "'READ' or 'WRITE'."),
-                named_arg("yield_json", DataType::Utf8, "JSON array describing yielded columns."),
+                named_arg(
+                    "yield_json",
+                    DataType::Utf8,
+                    "JSON array describing yielded columns.",
+                ),
                 deps_arg(),
             ],
-            yields: vec![Field::new("registered", DataType::Boolean, false)],
-            mode: ProcedureMode::Write,
-            side_effects: SideEffects::ReadOnly,
-            retry_contract: None,
-            batch_input: None,
-            docs: "Declare a new procedure. The body is a full Cypher query; arguments are bound by name."
-                .to_owned(),
-        }
+            "registered",
+            "Declare a new procedure. The body is a full Cypher query; arguments are bound by name.",
+        )
     }
 
     /// Signature for `uni.plugin.declareAggregate`.
     #[must_use]
     pub fn declare_aggregate_signature() -> ProcedureSignature {
-        ProcedureSignature {
-            args: vec![
+        write_signature(
+            vec![
                 named_arg("qname", DataType::Utf8, "Qualified name to register."),
                 named_arg(
                     "init_expr",
@@ -624,22 +636,16 @@ pub mod procedures {
                 ),
                 deps_arg(),
             ],
-            yields: vec![Field::new("registered", DataType::Boolean, false)],
-            mode: ProcedureMode::Write,
-            side_effects: SideEffects::ReadOnly,
-            retry_contract: None,
-            batch_input: None,
-            docs:
-                "Declare a new aggregate function from Cypher init / update / finalize expressions."
-                    .to_owned(),
-        }
+            "registered",
+            "Declare a new aggregate function from Cypher init / update / finalize expressions.",
+        )
     }
 
     /// Signature for `uni.plugin.declareTrigger`.
     #[must_use]
     pub fn declare_trigger_signature() -> ProcedureSignature {
-        ProcedureSignature {
-            args: vec![
+        write_signature(
+            vec![
                 named_arg("qname", DataType::Utf8, "Qualified name to register."),
                 named_arg(
                     "event_filter",
@@ -653,15 +659,9 @@ pub mod procedures {
                 ),
                 deps_arg(),
             ],
-            yields: vec![Field::new("registered", DataType::Boolean, false)],
-            mode: ProcedureMode::Write,
-            side_effects: SideEffects::ReadOnly,
-            retry_contract: None,
-            batch_input: None,
-            docs:
-                "Declare a new trigger that fires the given Cypher body on matched mutation events."
-                    .to_owned(),
-        }
+            "registered",
+            "Declare a new trigger that fires the given Cypher body on matched mutation events.",
+        )
     }
 
     // -------------------------------------------------------------
@@ -932,8 +932,9 @@ pub mod procedures {
             qname,
             signature,
             function: Arc::new(scalar_fn) as Arc<dyn ScalarPluginFn>,
+            manifest: std::sync::OnceLock::new(),
         };
-        let manifest = plugin.manifest_owned();
+        let manifest = plugin.manifest().clone();
         let caps = manifest.capabilities.clone();
         let mut r = PluginRegistrar::new(manifest.id, &caps, registry);
         plugin
@@ -942,13 +943,6 @@ pub mod procedures {
         r.commit_to_registry()
             .map_err(|e| map_plugin_error(e, &record.qname))?;
         Ok(())
-    }
-
-    fn map_plugin_error(e: PluginError, qname: &str) -> CustomError {
-        match e {
-            PluginError::DuplicateRegistration(_) => CustomError::NativeShadow(qname.to_owned()),
-            other => CustomError::Registration(other.to_string()),
-        }
     }
 
     /// Install a synthesized procedure (M9 cutover, M11 A.3).
@@ -986,7 +980,8 @@ pub mod procedures {
                 uni_plugin::traits::procedure::ProcedureMode::Dbms => {
                     s.insert(uni_plugin::Capability::ProcedureDbms);
                 }
-                uni_plugin::traits::procedure::ProcedureMode::Read => {}
+                // `Read` and any future modes require no extra
+                // capability beyond the base `Procedure`.
                 _ => {}
             }
             s
@@ -1000,36 +995,17 @@ pub mod procedures {
         Ok(())
     }
 
-    fn type_str_to_arrow(s: &str) -> Option<DataType> {
-        match s.to_ascii_lowercase().as_str() {
-            "string" | "utf8" | "str" => Some(DataType::Utf8),
-            "int" | "integer" | "int64" | "i64" => Some(DataType::Int64),
-            "float" | "double" | "float64" | "f64" => Some(DataType::Float64),
-            "bool" | "boolean" => Some(DataType::Boolean),
-            _ => None,
-        }
-    }
-
-    fn declared_plugin_id(qname: &str) -> String {
-        // Use the first dotted segment as the plugin id so the
-        // registrar's `validate_qname` accepts the declared qname
-        // (e.g. "mycorp.fullName" registers under plugin id "mycorp").
-        qname
-            .split_once('.')
-            .map(|(ns, _)| ns.to_owned())
-            .unwrap_or_else(|| CustomPlugin::ID.to_owned())
-    }
-
-    fn local_part(qname: &str) -> &str {
-        qname.split_once('.').map(|(_, l)| l).unwrap_or(qname)
-    }
-
     /// Synthetic [`Plugin`] wrapping a single declared scalar function.
     struct SyntheticScalarPlugin {
         plugin_id: PluginId,
         qname: QName,
         signature: uni_plugin::traits::scalar::FnSignature,
         function: Arc<dyn ScalarPluginFn>,
+        /// Lazily-built, then cached, manifest. Each synthetic plugin
+        /// has a distinct manifest, so it cannot be a shared static;
+        /// the `OnceLock` gives `manifest()` a stable `&` reference
+        /// without leaking a fresh `Box` on every call.
+        manifest: std::sync::OnceLock<PluginManifest>,
     }
 
     impl std::fmt::Debug for SyntheticScalarPlugin {
@@ -1042,7 +1018,7 @@ pub mod procedures {
     }
 
     impl SyntheticScalarPlugin {
-        fn manifest_owned(&self) -> PluginManifest {
+        fn build_manifest(&self) -> PluginManifest {
             PluginManifest {
                 id: self.plugin_id.clone(),
                 version: Version::new(0, 0, 1),
@@ -1063,14 +1039,7 @@ pub mod procedures {
 
     impl Plugin for SyntheticScalarPlugin {
         fn manifest(&self) -> &PluginManifest {
-            // Cheap to build; we only need a stable reference for
-            // the duration of `register`. Stash in a thread-local
-            // OnceLock would be wrong since each synthetic plugin
-            // has a distinct manifest — so build once per registrar
-            // call by leaking into a Box. The leak is bounded by
-            // declared-plugin count and the host is single-process.
-            // For correctness we use a OnceLock keyed to `self`.
-            self.manifest_cell()
+            self.manifest.get_or_init(|| self.build_manifest())
         }
 
         fn register(&self, r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
@@ -1080,21 +1049,6 @@ pub mod procedures {
                 Arc::clone(&self.function),
             )?;
             Ok(())
-        }
-    }
-
-    impl SyntheticScalarPlugin {
-        fn manifest_cell(&self) -> &PluginManifest {
-            // SAFETY: we build a fresh manifest on every call and
-            // intentionally leak it; this is invoked at most a
-            // handful of times per declaration. The lifetime of the
-            // leaked `Box` is `'static`, so the returned reference
-            // is sound.
-            //
-            // M-UNSAFE: no `unsafe` is used — `Box::leak` is the
-            // safe API.
-            let manifest = self.manifest_owned();
-            Box::leak(Box::new(manifest))
         }
     }
 
@@ -1151,8 +1105,8 @@ pub mod procedures {
             let init_src = extract_string(args, 1, "init_expr")?;
             let update_src = extract_string(args, 2, "update_expr")?;
             let finalize_src = extract_string(args, 3, "finalize_expr")?;
-            let return_type = extract_string_or(args, 4, "return_type", "float")?;
-            let arg_names_json = extract_string_or(args, 5, "arg_names_json", "[]")?;
+            let return_type = extract_string_or(args, 4, "float");
+            let arg_names_json = extract_string_or(args, 5, "[]");
             let arg_names: Vec<String> = serde_json::from_str(&arg_names_json).map_err(|e| {
                 FnError::new(
                     FnError::CODE_TYPE_COERCION,
@@ -1285,12 +1239,21 @@ pub mod procedures {
                     args: &[ColumnarValue],
                 ) -> Result<SendableRecordBatchStream, FnError> {
                     let qname = extract_string(args, 0, "qname")?;
+                    // Name the persisted keys after the declared
+                    // signature's positional args (e.g. `body`,
+                    // `event_filter`, `yield_json`) instead of opaque
+                    // `arg1`/`arg2` placeholders.
+                    let sig_args = $sig_fn().args;
                     let mut sig = serde_json::Map::new();
                     // `$field_count - 1` skips the trailing `deps_json`
                     // arg, which is parsed separately via `parse_deps`.
                     for i in 1..($field_count - 1) {
-                        let v = extract_string(args, i, "field")?;
-                        sig.insert(format!("arg{}", i), serde_json::Value::String(v));
+                        let key = sig_args
+                            .get(i)
+                            .map(|a| a.name.to_string())
+                            .unwrap_or_else(|| format!("arg{i}"));
+                        let v = extract_string(args, i, &key)?;
+                        sig.insert(key, serde_json::Value::String(v));
                     }
                     // M11 A.1: for procedure-kind declarations, extract
                     // the `mode` arg (position 2 — qname=0, body=1,
@@ -1332,8 +1295,13 @@ pub mod procedures {
                         .principal
                         .map(|p| p.id.clone())
                         .unwrap_or_else(|| "anonymous".to_owned());
-                    let body = sig
-                        .get("arg1")
+                    // `body` mirrors the first positional arg after
+                    // `qname` (position 1), looked up by its signature
+                    // name.
+                    let body = sig_args
+                        .get(1)
+                        .map(|a| a.name.to_string())
+                        .and_then(|key| sig.get(&key))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_owned();
@@ -1405,37 +1373,38 @@ pub mod procedures {
     // helpers
     // -------------------------------------------------------------
 
-    /// Like [`extract_string`] but returns `default` when the argument
-    /// is missing or null. Used for trailing optional args
-    /// (`deps_json`, defaulted-on-declare* signatures) since the
-    /// current procedure dispatch path does not auto-fill defaults from
-    /// the [`ProcedureSignature`].
-    fn extract_string_or(
-        args: &[ColumnarValue],
-        i: usize,
-        _name: &str,
-        default: &str,
-    ) -> Result<String, FnError> {
-        match args.get(i) {
-            None => Ok(default.to_owned()),
-            Some(cv) => match cv {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
-                ColumnarValue::Scalar(ScalarValue::Utf8(None))
-                | ColumnarValue::Scalar(ScalarValue::Null) => Ok(default.to_owned()),
-                ColumnarValue::Array(arr) => arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .and_then(|a| a.iter().next().flatten().map(|s| s.to_owned()))
-                    .map_or_else(|| Ok(default.to_owned()), Ok),
-                _ => Ok(default.to_owned()),
-            },
+    /// Decode a present [`ColumnarValue`] into a Utf8 [`String`].
+    ///
+    /// Returns `Some` only for a non-null Utf8 scalar or the first
+    /// non-null element of a `StringArray`; every other shape (null,
+    /// empty array, non-Utf8) yields `None`. Shared by [`extract_string`]
+    /// and [`extract_string_or`].
+    fn columnar_utf8(cv: &ColumnarValue) -> Option<String> {
+        match cv {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Some(s.clone()),
+            ColumnarValue::Array(arr) => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|a| a.iter().next().flatten().map(|s| s.to_owned())),
+            _ => None,
         }
+    }
+
+    /// Like [`extract_string`] but returns `default` when the argument
+    /// is missing, null, or not a Utf8 string. Used for trailing
+    /// optional args (`deps_json`, defaulted-on-declare* signatures)
+    /// since the current procedure dispatch path does not auto-fill
+    /// defaults from the [`ProcedureSignature`].
+    fn extract_string_or(args: &[ColumnarValue], i: usize, default: &str) -> String {
+        args.get(i)
+            .and_then(columnar_utf8)
+            .unwrap_or_else(|| default.to_owned())
     }
 
     /// Parse the `deps_json` arg at position `i` into a `Vec<String>`,
     /// defaulting to an empty vec when absent or null.
     fn parse_deps(args: &[ColumnarValue], i: usize) -> Result<Vec<String>, FnError> {
-        let raw = extract_string_or(args, i, "deps_json", "[]")?;
+        let raw = extract_string_or(args, i, "[]");
         serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
             FnError::new(
                 FnError::CODE_TYPE_COERCION,
@@ -1451,28 +1420,19 @@ pub mod procedures {
                 format!("declare procedure missing arg `{name}` at position {i}"),
             )
         })?;
-        match cv {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
-            ColumnarValue::Scalar(ScalarValue::Utf8(None))
-            | ColumnarValue::Scalar(ScalarValue::Null) => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("declare procedure arg `{name}` was null"),
-            )),
-            ColumnarValue::Array(arr) => arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .and_then(|a| a.iter().next().flatten().map(|s| s.to_owned()))
-                .ok_or_else(|| {
-                    FnError::new(
-                        FnError::CODE_TYPE_COERCION,
-                        format!("declare procedure arg `{name}` not Utf8"),
-                    )
-                }),
-            _ => Err(FnError::new(
-                FnError::CODE_TYPE_COERCION,
-                format!("declare procedure arg `{name}` not Utf8"),
-            )),
+        if let Some(s) = columnar_utf8(cv) {
+            return Ok(s);
         }
+        // Present but unusable: keep the original diagnostics —
+        // explicit null vs anything else (non-Utf8 scalar, non-string
+        // array, empty / null-first array).
+        let msg = match cv {
+            ColumnarValue::Scalar(ScalarValue::Utf8(None) | ScalarValue::Null) => {
+                format!("declare procedure arg `{name}` was null")
+            }
+            _ => format!("declare procedure arg `{name}` not Utf8"),
+        };
+        Err(FnError::new(FnError::CODE_TYPE_COERCION, msg))
     }
 
     fn single_bool(col: &str, v: bool) -> Result<SendableRecordBatchStream, FnError> {

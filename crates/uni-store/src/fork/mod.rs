@@ -8,8 +8,6 @@
 //! - [`recovery`] — driver invoked from `Uni::open` that resumes any
 //!   `Pending` create or `Tombstoned` drop left behind by a crash.
 
-// Rust guideline compliant
-
 pub mod id_alloc;
 pub mod index_builder;
 pub mod recovery;

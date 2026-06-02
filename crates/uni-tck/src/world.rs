@@ -44,8 +44,7 @@ fn get_tck_run_context_for_current_thread() -> TckRunContext {
     TCK_RUN_CONTEXT.with(|ctx| ctx.borrow().clone())
 }
 
-#[derive(World)]
-#[world(init = Self::new)]
+#[derive(World, Default)]
 pub struct UniWorld {
     db: Option<Arc<Uni>>,
     /// Temp directory that auto-cleans when UniWorld is dropped.
@@ -117,24 +116,7 @@ pub struct SideEffects {
     edge_ids_before: HashSet<u64>,
 }
 
-impl Default for UniWorld {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl UniWorld {
-    pub fn new() -> Self {
-        Self {
-            db: None,
-            _temp_dir: None,
-            last_result: None,
-            last_error: None,
-            side_effects: SideEffects::default(),
-            params: HashMap::new(),
-        }
-    }
-
     pub async fn init_db(&mut self) -> anyhow::Result<()> {
         // Keep DB init idempotent so chained Given steps operate on the same graph state.
         if self.db.is_some() {
@@ -320,31 +302,19 @@ impl UniWorld {
 
     /// Collect all node IDs (VIDs) currently in the graph.
     async fn collect_node_ids(&self) -> HashSet<u64> {
-        let mut ids = HashSet::new();
-        if let Ok(result) = self
-            .db()
-            .session()
-            .query("MATCH (n) RETURN id(n) AS id")
-            .await
-        {
-            for row in result.rows() {
-                if let Some(Value::Int(id)) = row.values().first() {
-                    ids.insert(*id as u64);
-                }
-            }
-        }
-        ids
+        self.collect_ids("MATCH (n) RETURN id(n) AS id").await
     }
 
     /// Collect all edge IDs (EIDs) currently in the graph.
     async fn collect_edge_ids(&self) -> HashSet<u64> {
-        let mut ids = HashSet::new();
-        if let Ok(result) = self
-            .db()
-            .session()
-            .query("MATCH ()-[r]->() RETURN id(r) AS id")
+        self.collect_ids("MATCH ()-[r]->() RETURN id(r) AS id")
             .await
-        {
+    }
+
+    /// Run an `id`-returning query and collect the integer IDs into a set.
+    async fn collect_ids(&self, query: &str) -> HashSet<u64> {
+        let mut ids = HashSet::new();
+        if let Ok(result) = self.db().session().query(query).await {
             for row in result.rows() {
                 if let Some(Value::Int(id)) = row.values().first() {
                     ids.insert(*id as u64);

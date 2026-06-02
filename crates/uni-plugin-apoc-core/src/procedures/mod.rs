@@ -5,9 +5,16 @@
 //! namespace.
 //!
 //! Currently shipped:
-//! - [`bitwise`] — `apoc.bitwise.*` analogue (and/or/xor/not/shiftLeft/shiftRight).
-//! - [`text`] — `apoc.text.*` analogue (toUpper/toLower/replace/reverse).
-//! - [`math`] — `apoc.math.*` analogue (sigmoid/tanh/cosh/sinh/coth).
+//! - [`bitwise`] — `apoc.bitwise.*` analogue
+//!   (and/or/xor/not/shiftLeft/shiftRight).
+//! - [`text`] — `apoc.text.*` analogue (toUpper/toLower/replace/reverse/
+//!   trim/contains/startsWith/endsWith/length/repeat/indexOf).
+//! - [`math`] — `apoc.math.*` analogue (sigmoid/tanh/cosh/sinh/coth/
+//!   maxLong/minLong/maxDouble/minDouble/round).
+//! - [`number`] — `apoc.number.*` analogue (parseInt/parseFloat/toString).
+//! - [`convert`] — `apoc.convert.*` analogue
+//!   (toString/toBoolean/toInteger/toFloat).
+//! - [`create`] — `apoc.create.*` analogue (uuid/uuids).
 //!
 //! Planned (M4 onwards):
 //! - `coll` — `apoc.coll.*` (collection helpers).
@@ -21,6 +28,8 @@ pub mod create;
 pub mod math;
 pub mod number;
 pub mod text;
+
+mod support;
 
 use uni_plugin::{PluginError, PluginRegistrar};
 

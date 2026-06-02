@@ -28,9 +28,9 @@
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uni_common::UniConfig;
 use uni_common::Value;
@@ -85,23 +85,33 @@ impl IntoArrow for Vec<HashMap<String, Value>> {
 
 impl IntoArrow for arrow_array::RecordBatch {
     fn into_property_maps(self) -> Vec<HashMap<String, Value>> {
-        let schema = self.schema();
-        let num_rows = self.num_rows();
-        let mut rows = Vec::with_capacity(num_rows);
-        for row_idx in 0..num_rows {
-            let mut props = HashMap::with_capacity(schema.fields().len());
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col = self.column(col_idx);
-                let value =
-                    uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), row_idx, None);
-                if !value.is_null() {
-                    props.insert(field.name().clone(), value);
-                }
-            }
-            rows.push(props);
-        }
-        rows
+        record_batch_to_property_maps(&self)
     }
+}
+
+/// Convert each row of an Arrow `RecordBatch` to a property map.
+///
+/// Columns become property keys; values are converted from Arrow types to Uni
+/// [`Value`]s via `arrow_to_value`. Null values are omitted from the map.
+pub fn record_batch_to_property_maps(
+    batch: &arrow_array::RecordBatch,
+) -> Vec<HashMap<String, Value>> {
+    let schema = batch.schema();
+    let num_rows = batch.num_rows();
+    let mut rows = Vec::with_capacity(num_rows);
+    for row_idx in 0..num_rows {
+        let mut props = HashMap::with_capacity(schema.fields().len());
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(col_idx);
+            let value =
+                uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), row_idx, None);
+            if !value.is_null() {
+                props.insert(field.name().clone(), value);
+            }
+        }
+        rows.push(props);
+    }
+    rows
 }
 
 /// Builder for configuring a bulk writer.
@@ -109,66 +119,19 @@ pub struct BulkWriterBuilder {
     backend: BulkBackend,
     config: BulkConfig,
     progress_callback: Option<Box<dyn Fn(BulkProgress) + Send>>,
-    /// Session write guard — released when the BulkWriter is committed/aborted/dropped.
-    session_write_guard: Option<Arc<AtomicBool>>,
-    /// If true, the write guard was already acquired by the caller (e.g. AppenderBuilder).
-    guard_pre_acquired: bool,
-    /// If true, the session is pinned to a read-only snapshot.
-    is_pinned: bool,
-    /// Session ID for error messages.
-    session_id: String,
 }
 
 impl BulkWriterBuilder {
-    /// Create a new bulk writer builder with a pre-acquired write guard.
+    /// Create a bulk writer builder.
     ///
-    /// Used by `AppenderBuilder` which acquires the guard before creating the builder.
-    pub fn new_with_guard(backend: BulkBackend, guard: Arc<AtomicBool>) -> Self {
-        Self {
-            backend,
-            config: BulkConfig::default(),
-            progress_callback: None,
-            session_write_guard: Some(guard),
-            guard_pre_acquired: true,
-            is_pinned: false,
-            session_id: String::new(),
-        }
-    }
-
-    /// Create a bulk writer builder without a write guard.
-    ///
-    /// Used by `Transaction::bulk_writer()` — the Transaction already holds
-    /// the session write guard, so the BulkWriter must not release it.
+    /// Used by `Transaction::bulk_writer()` and `AppenderBuilder` — the
+    /// Transaction already holds the session write guard, so the BulkWriter
+    /// neither acquires nor releases one.
     pub fn new_unguarded(backend: BulkBackend) -> Self {
         Self {
             backend,
             config: BulkConfig::default(),
             progress_callback: None,
-            session_write_guard: None,
-            guard_pre_acquired: true,
-            is_pinned: false,
-            session_id: String::new(),
-        }
-    }
-
-    /// Create a new bulk writer builder with deferred guard acquisition.
-    ///
-    /// The guard is acquired in [`build()`](Self::build) rather than at creation time,
-    /// so that `Session::bulk_writer()` is infallible.
-    pub fn new_deferred(
-        backend: BulkBackend,
-        guard: Arc<AtomicBool>,
-        session_id: String,
-        is_pinned: bool,
-    ) -> Self {
-        Self {
-            backend,
-            config: BulkConfig::default(),
-            progress_callback: None,
-            session_write_guard: Some(guard),
-            guard_pre_acquired: false,
-            is_pinned,
-            session_id,
         }
     }
 
@@ -238,37 +201,9 @@ impl BulkWriterBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The session is pinned to a read-only snapshot
-    /// - Another write context is already active on the session
-    /// - The database is not writable
+    /// Returns an error if the database is not writable.
     pub fn build(self) -> Result<BulkWriter> {
-        // Check pinned state (deferred from Session::bulk_writer)
-        if self.is_pinned {
-            return Err(UniError::ReadOnly {
-                operation: "bulk_writer".to_string(),
-            }
-            .into());
-        }
-
-        // Acquire write guard if not pre-acquired (deferred from Session::bulk_writer)
-        if !self.guard_pre_acquired
-            && let Some(guard) = &self.session_write_guard
-            && guard
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(UniError::WriteContextAlreadyActive {
-                session_id: self.session_id.clone(),
-                hint: "Only one Transaction, BulkWriter, or Appender can be active per Session at a time. Commit or rollback the active one first, or create a separate Session for concurrent writes.",
-            }.into());
-        }
-
         if self.backend.writer.is_none() {
-            // Release session guard on failure so the session isn't stuck.
-            if let Some(guard) = &self.session_write_guard {
-                guard.store(false, Ordering::SeqCst);
-            }
             return Err(anyhow!("BulkWriter requires a writable database instance"));
         }
 
@@ -285,7 +220,6 @@ impl BulkWriterBuilder {
             initial_table_versions: HashMap::new(),
             buffer_size_bytes: 0,
             committed: false,
-            session_write_guard: self.session_write_guard,
         })
     }
 }
@@ -354,9 +288,6 @@ pub struct BulkStats {
     pub indexes_pending: bool,
 }
 
-/// Alias for [`BulkStats`] (spec §8.1 compatibility).
-pub type BulkStatsAccumulator = BulkStats;
-
 /// Edge data for bulk insertion.
 ///
 /// Contains source/destination vertex IDs and properties.
@@ -407,8 +338,6 @@ pub struct BulkWriter {
     // Current buffer size in bytes (approximate)
     buffer_size_bytes: usize,
     committed: bool,
-    /// Session write guard — released when committed/aborted/dropped.
-    session_write_guard: Option<Arc<AtomicBool>>,
 }
 
 impl BulkWriter {
@@ -429,7 +358,7 @@ impl BulkWriter {
     }
 
     /// Returns the current timestamp in microseconds since Unix epoch.
-    fn get_current_timestamp_micros(&self) -> i64 {
+    fn get_current_timestamp_micros() -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -695,66 +624,38 @@ impl BulkWriter {
         match op {
             "=" | "==" => Ok(prop_val == &target_val),
             "!=" | "<>" => Ok(prop_val != &target_val),
-            ">" => self
-                .compare_json_values(prop_val, &target_val)
-                .map(|c| c > 0),
-            "<" => self
-                .compare_json_values(prop_val, &target_val)
-                .map(|c| c < 0),
-            ">=" => self
-                .compare_json_values(prop_val, &target_val)
-                .map(|c| c >= 0),
-            "<=" => self
-                .compare_json_values(prop_val, &target_val)
-                .map(|c| c <= 0),
+            ">" => self.compare_values(prop_val, &target_val).map(|c| c > 0),
+            "<" => self.compare_values(prop_val, &target_val).map(|c| c < 0),
+            ">=" => self.compare_values(prop_val, &target_val).map(|c| c >= 0),
+            "<=" => self.compare_values(prop_val, &target_val).map(|c| c <= 0),
             _ => Ok(true), // Unknown operator - allow
         }
     }
 
     /// Compare two values, returning -1, 0, or 1.
-    fn compare_json_values(&self, a: &Value, b: &Value) -> Result<i8> {
-        match (a, b) {
-            (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2) as i8),
-            (Value::Float(f1), Value::Float(f2)) => {
-                if f1 < f2 {
-                    Ok(-1)
-                } else if f1 > f2 {
-                    Ok(1)
-                } else {
-                    Ok(0)
-                }
-            }
+    ///
+    /// Incomparable floats (NaN) compare as equal (0), matching the prior
+    /// branch-based implementation.
+    fn compare_values(&self, a: &Value, b: &Value) -> Result<i8> {
+        let ordering = match (a, b) {
+            (Value::Int(n1), Value::Int(n2)) => n1.cmp(n2),
+            (Value::Float(f1), Value::Float(f2)) => f1.partial_cmp(f2).unwrap_or(Ordering::Equal),
             (Value::Int(n), Value::Float(f)) => {
-                let nf = *n as f64;
-                if nf < *f {
-                    Ok(-1)
-                } else if nf > *f {
-                    Ok(1)
-                } else {
-                    Ok(0)
-                }
+                (*n as f64).partial_cmp(f).unwrap_or(Ordering::Equal)
             }
             (Value::Float(f), Value::Int(n)) => {
-                let nf = *n as f64;
-                if *f < nf {
-                    Ok(-1)
-                } else if *f > nf {
-                    Ok(1)
-                } else {
-                    Ok(0)
-                }
+                f.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal)
             }
-            (Value::String(s1), Value::String(s2)) => match s1.cmp(s2) {
-                std::cmp::Ordering::Less => Ok(-1),
-                std::cmp::Ordering::Greater => Ok(1),
-                std::cmp::Ordering::Equal => Ok(0),
-            },
-            _ => Err(anyhow!(
-                "Cannot compare incompatible types: {:?} vs {:?}",
-                a,
-                b
-            )),
-        }
+            (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
+            _ => {
+                return Err(anyhow!(
+                    "Cannot compare incompatible types: {:?} vs {:?}",
+                    a,
+                    b
+                ));
+            }
+        };
+        Ok(ordering as i8)
     }
 
     /// Checkpoint: flush all pending data to storage.
@@ -788,13 +689,10 @@ impl BulkWriter {
 
     // Helper to flush vertex buffer if full
     async fn check_flush_vertices(&mut self, label: &str) -> Result<()> {
-        let should_flush = {
-            if let Some(buf) = self.pending_vertices.get(label) {
-                buf.len() >= self.config.batch_size
-            } else {
-                false
-            }
-        };
+        let should_flush = self
+            .pending_vertices
+            .get(label)
+            .is_some_and(|buf| buf.len() >= self.config.batch_size);
 
         if should_flush {
             self.flush_vertices_buffer(label).await?;
@@ -847,7 +745,7 @@ impl BulkWriter {
             let versions = vec![1; vertices.len()]; // Version 1 for bulk load
 
             // Generate timestamps for this batch
-            let now = self.get_current_timestamp_micros();
+            let now = Self::get_current_timestamp_micros();
             let mut created_at: HashMap<Vid, i64> = HashMap::new();
             let mut updated_at: HashMap<Vid, i64> = HashMap::new();
             for (vid, _) in &vertices {
@@ -947,7 +845,7 @@ impl BulkWriter {
         };
 
         // Convert to L1Entry format and track buffer size
-        let now = self.get_current_timestamp_micros();
+        let now = Self::get_current_timestamp_micros();
         let mut added_size = 0usize;
         let entries: Vec<L1Entry> = edges
             .into_iter()
@@ -1224,7 +1122,7 @@ impl BulkWriter {
                     self.stats.indexes_rebuilt += 1;
 
                     // Update index metadata after successful sync rebuild
-                    let now = chrono::Utc::now();
+                    let now = Utc::now();
                     let vtable_name = uni_store::backend::table_names::vertex_table_name(label);
                     let row_count = self
                         .backend
@@ -1361,7 +1259,6 @@ impl BulkWriter {
         }
 
         self.committed = true;
-        self.release_guard();
         self.stats.duration = self.start_time.elapsed();
         Ok(self.stats.clone())
     }
@@ -1424,9 +1321,6 @@ impl BulkWriter {
         // 3. Clear backend cache to ensure next read picks up rolled-back state
         self.backend.storage.backend().clear_cache();
 
-        // Release session write guard on abort
-        self.release_guard();
-
         if rollback_errors.is_empty() {
             log::info!(
                 "Bulk load aborted successfully. Rolled back {} tables, dropped {} tables.",
@@ -1452,22 +1346,6 @@ impl BulkWriter {
                 current_label: label,
                 elapsed: self.start_time.elapsed(),
             });
-        }
-    }
-
-    /// Release the session write guard if this bulk writer holds one.
-    fn release_guard(&self) {
-        if let Some(guard) = &self.session_write_guard {
-            guard.store(false, Ordering::SeqCst);
-        }
-    }
-}
-
-impl Drop for BulkWriter {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Release session write guard on drop (abort case or forgotten writer)
-            self.release_guard();
         }
     }
 }

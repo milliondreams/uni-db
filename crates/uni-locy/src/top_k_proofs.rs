@@ -127,58 +127,76 @@ impl<const K: usize> TopKProofs<K> {
     }
 
     /// Merge `additional` into `base`, dedup by dependency key
-    /// (max-weight wins), sort descending, truncate to K. Returns a
-    /// [`PruneNotice`] callers can use to drive
-    /// `TopKPruningCrossedDependency` emission.
-    pub fn merge_top_k(mut base: Vec<Proof>, additional: Vec<Proof>) -> (Vec<Proof>, PruneNotice) {
-        base.extend(additional);
-        // Dedup: max-weight wins per dependency key.
-        let mut keep: Vec<Proof> = Vec::with_capacity(base.len());
-        let mut seen: std::collections::HashMap<(Vec<u32>, Vec<u32>), usize> =
-            std::collections::HashMap::new();
-        for p in base.drain(..) {
-            let key = p.dependency_key();
-            match seen.get(&key) {
-                Some(&idx) => {
-                    if p.weight > keep[idx].weight {
-                        keep[idx] = p;
-                    }
-                }
-                None => {
-                    seen.insert(key, keep.len());
-                    keep.push(p);
-                }
-            }
-        }
-        keep.sort_by(|a, b| {
-            b.weight
-                .partial_cmp(&a.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if keep.len() <= K {
-            return (keep, PruneNotice::None);
-        }
-        // Identify pruning-crossed-dependency: any discarded proof
-        // whose base_rvs intersect with any retained proof's base_rvs.
-        let (retained, dropped) = keep.split_at(K);
-        let mut crossed = false;
-        for d in dropped {
-            if retained
-                .iter()
-                .any(|r| BaseRvSet::intersect_any(&r.base_rvs, &d.base_rvs))
-            {
-                crossed = true;
-                break;
-            }
-        }
-        let notice = if crossed {
-            PruneNotice::CrossedDependency
-        } else {
-            PruneNotice::Pruned
-        };
-        let retained_owned = retained.to_vec();
-        (retained_owned, notice)
+    /// (max-weight wins), sort descending, truncate to the const-`K`
+    /// capacity. Returns a [`PruneNotice`] callers can use to drive
+    /// `TopKPruningCrossedDependency` emission. Thin wrapper over
+    /// [`merge_top_k_with`], which carries a runtime `k` for the
+    /// `SemiringDispatch` hot path.
+    pub fn merge_top_k(base: Vec<Proof>, additional: Vec<Proof>) -> (Vec<Proof>, PruneNotice) {
+        merge_top_k_with(base, additional, K)
     }
+}
+
+/// Merge `additional` into `base`, dedup by dependency key
+/// (max-weight wins), sort descending, truncate to `k`. Returns a
+/// [`PruneNotice`] callers use to drive `TopKPruningCrossedDependency`
+/// emission.
+///
+/// [`TopKProofs::<K>::merge_top_k`] is the const-generic façade over
+/// this; the `SemiringDispatch` runtime path needs a value-level `k`
+/// because const-generic `K` isn't available once the semiring kind is
+/// resolved at runtime.
+pub fn merge_top_k_with(
+    mut base: Vec<Proof>,
+    additional: Vec<Proof>,
+    k: usize,
+) -> (Vec<Proof>, PruneNotice) {
+    base.extend(additional);
+    // Dedup: max-weight wins per dependency key.
+    let mut keep: Vec<Proof> = Vec::with_capacity(base.len());
+    let mut seen: std::collections::HashMap<(Vec<u32>, Vec<u32>), usize> =
+        std::collections::HashMap::new();
+    for p in base.drain(..) {
+        let key = p.dependency_key();
+        match seen.get(&key) {
+            Some(&idx) => {
+                if p.weight > keep[idx].weight {
+                    keep[idx] = p;
+                }
+            }
+            None => {
+                seen.insert(key, keep.len());
+                keep.push(p);
+            }
+        }
+    }
+    keep.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if keep.len() <= k {
+        return (keep, PruneNotice::None);
+    }
+    // Identify pruning-crossed-dependency: any discarded proof
+    // whose base_rvs intersect with any retained proof's base_rvs.
+    let (retained, dropped) = keep.split_at(k);
+    let mut crossed = false;
+    for d in dropped {
+        if retained
+            .iter()
+            .any(|r| BaseRvSet::intersect_any(&r.base_rvs, &d.base_rvs))
+        {
+            crossed = true;
+            break;
+        }
+    }
+    let notice = if crossed {
+        PruneNotice::CrossedDependency
+    } else {
+        PruneNotice::Pruned
+    };
+    (retained.to_vec(), notice)
 }
 
 /// Result of a top-K pruning step. Callers use this to drive
@@ -284,16 +302,7 @@ impl<const K: usize> LocySemiring for TopKProofs<K> {
         op: &'static str,
         strict: bool,
     ) -> Result<f64, SemiringError> {
-        if !(0.0..=1.0).contains(&raw) {
-            if strict {
-                return Err(SemiringError::DomainViolation { value: raw, op });
-            }
-            let clamped = raw.clamp(0.0, 1.0);
-            tracing::warn!("{op} input {raw} outside [0,1], clamped to {clamped}");
-            Ok(clamped)
-        } else {
-            Ok(raw)
-        }
+        crate::semiring::validate_probability_domain(raw, op, strict)
     }
 }
 

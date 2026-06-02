@@ -1,16 +1,19 @@
 //! APOC-equivalent built-ins implemented in Rust.
 //!
 //! `uni-plugin-apoc-core` ships the subset of APOC analogues that belong
-//! in the host process rather than in user-loaded Lua/WASM plugins:
+//! in the host process rather than in user-loaded Lua/WASM plugins.
 //!
-//! - **Perf-critical scalar functions** invoked in inner loops (`apoc.text.*`,
-//!   `apoc.coll.*`, `apoc.math.*`, `apoc.convert.*`) where a row-rate Lua
-//!   bridge would be a correctness-equivalent but throughput-fatal choice.
-//! - **Host-intimate procedures** that need access to internal mutation,
-//!   schema, or catalog APIs not exposed across the capability membrane
-//!   (`apoc.refactor.*`, `apoc.schema.*`, `apoc.atomic.*`).
-//! - **Procedures with retry contracts or transaction-batching semantics**
-//!   the host orchestrates (`apoc.atomic.*`, `apoc.periodic.iterate` body).
+//! Currently shipped (perf-critical procedures invoked in inner loops, where a
+//! row-rate Lua bridge would be a correctness-equivalent but throughput-fatal
+//! choice): `apoc.bitwise.*`, `apoc.text.*`, `apoc.math.*`, `apoc.number.*`,
+//! `apoc.convert.*`, and the graph-free `apoc.create.*` synthesizers
+//! (`uuid`/`uuids`). See [`procedures`] for the full inventory.
+//!
+//! Planned (host-intimate procedures needing internal mutation, schema, or
+//! catalog APIs not exposed across the capability membrane, plus procedures
+//! with retry/transaction-batching contracts the host orchestrates):
+//! `apoc.refactor.*`, `apoc.schema.*`, `apoc.atomic.*`,
+//! `apoc.periodic.iterate`.
 //!
 //! Everything else — high-level orchestration, format/IO procedures,
 //! external-system adapters, low-traffic utilities — lives in

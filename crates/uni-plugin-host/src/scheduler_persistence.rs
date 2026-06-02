@@ -31,7 +31,7 @@ use uni_plugin::scheduler::{
 use uni_plugin::traits::background::{CancellationToken, Schedule};
 
 use crate::persistence::LazyCypherSink;
-use uni_sidecar::SystemSidecar;
+use uni_sidecar::VecSidecar;
 
 /// JSON-encoded shape of a scheduler job row in the sidecar / system
 /// label. Stable across restarts so the on-disk + on-graph forms are
@@ -62,7 +62,7 @@ fn default_schedule() -> Schedule {
 /// The Cypher mirror is best-effort; failures are logged at debug.
 #[derive(Debug)]
 pub struct SystemLabelSchedulerPersistence {
-    sidecar: SystemSidecar<Vec<PersistedJob>>,
+    sidecar: VecSidecar<PersistedJob>,
     write_guard: parking_lot::Mutex<()>,
     cypher_sink: Arc<LazyCypherSink>,
 }
@@ -72,7 +72,7 @@ impl SystemLabelSchedulerPersistence {
     #[must_use]
     pub fn new(data_path: impl Into<PathBuf>) -> Self {
         Self {
-            sidecar: SystemSidecar::new(data_path.into(), "background_jobs.json"),
+            sidecar: VecSidecar::new(data_path.into(), "background_jobs.json"),
             write_guard: parking_lot::Mutex::new(()),
             cypher_sink: Arc::new(LazyCypherSink::new()),
         }
@@ -93,8 +93,35 @@ impl SystemLabelSchedulerPersistence {
 
     fn write_all(&self, rows: &[PersistedJob]) -> Result<(), SchedulerPersistenceError> {
         self.sidecar
-            .store(&rows.to_vec())
+            .store(rows)
             .map_err(|e| SchedulerPersistenceError::Backend(e.to_string()))
+    }
+
+    /// Serialize a read-modify-write against the sidecar: take the write
+    /// guard, load the full row set, apply `f`, and persist the result
+    /// atomically. Every mutating entry point routes through this so the
+    /// lock → read → mutate → write skeleton lives in one place.
+    fn mutate_rows<F>(&self, f: F) -> Result<(), SchedulerPersistenceError>
+    where
+        F: FnOnce(&mut Vec<PersistedJob>),
+    {
+        let _guard = self.write_guard.lock();
+        let mut rows = self.read_all()?;
+        f(&mut rows);
+        self.write_all(&rows)
+    }
+
+    /// Best-effort Cypher mirror: issue `cypher` against the lazy sink,
+    /// logging (but not propagating) a skip at debug. `context` labels the
+    /// log line (e.g. `"cypher mirror skipped"`).
+    fn mirror_cypher(&self, qname: &str, cypher: &str, context: &str) {
+        if let Err(e) = self.cypher_sink.try_write_cypher(cypher) {
+            tracing::debug!(
+                qname = %qname,
+                error = %e,
+                "SystemLabelSchedulerPersistence: {context}",
+            );
+        }
     }
 
     fn upsert(
@@ -102,34 +129,26 @@ impl SystemLabelSchedulerPersistence {
         id: &QName,
         status: SchedulerJobStatus,
     ) -> Result<(), SchedulerPersistenceError> {
-        let _guard = self.write_guard.lock();
-        let mut rows = self.read_all()?;
         let qname_str = id.to_string();
         let status_str = format!("{status:?}");
-        match rows.iter_mut().find(|r| r.qname == qname_str) {
-            Some(existing) => existing.status = status_str.clone(),
-            None => rows.push(PersistedJob {
-                qname: qname_str.clone(),
-                status: status_str.clone(),
-                consecutive_failures: 0,
-                schedule: Schedule::Manual,
-                next_fire_at: None,
-            }),
-        }
-        self.write_all(&rows)?;
-        // Best-effort Cypher mirror.
+        self.mutate_rows(
+            |rows| match rows.iter_mut().find(|r| r.qname == qname_str) {
+                Some(existing) => existing.status = status_str.clone(),
+                None => rows.push(PersistedJob {
+                    qname: qname_str.clone(),
+                    status: status_str.clone(),
+                    consecutive_failures: 0,
+                    schedule: Schedule::Manual,
+                    next_fire_at: None,
+                }),
+            },
+        )?;
         let cypher = format!(
             "MERGE (j:_BackgroundJob {{qname: '{q}'}}) SET j.status = '{s}'",
             q = qname_str.replace('\'', "''"),
             s = status_str.replace('\'', "''"),
         );
-        if let Err(e) = self.cypher_sink.try_write_cypher(&cypher) {
-            tracing::debug!(
-                qname = %qname_str,
-                error = %e,
-                "SystemLabelSchedulerPersistence: cypher mirror skipped",
-            );
-        }
+        self.mirror_cypher(&qname_str, &cypher, "cypher mirror skipped");
         Ok(())
     }
 }
@@ -140,25 +159,23 @@ impl SchedulerPersistence for SystemLabelSchedulerPersistence {
         id: &QName,
         schedule: &Schedule,
     ) -> Result<(), SchedulerPersistenceError> {
-        let _guard = self.write_guard.lock();
-        let mut rows = self.read_all()?;
         let qname_str = id.to_string();
         let next_fire_at = schedule.next_after(std::time::SystemTime::now());
-        match rows.iter_mut().find(|r| r.qname == qname_str) {
-            Some(existing) => {
-                existing.schedule = schedule.clone();
-                existing.next_fire_at = next_fire_at;
-            }
-            None => rows.push(PersistedJob {
-                qname: qname_str.clone(),
-                status: format!("{:?}", SchedulerJobStatus::Pending),
-                consecutive_failures: 0,
-                schedule: schedule.clone(),
-                next_fire_at,
-            }),
-        }
-        self.write_all(&rows)?;
-        Ok(())
+        self.mutate_rows(
+            |rows| match rows.iter_mut().find(|r| r.qname == qname_str) {
+                Some(existing) => {
+                    existing.schedule = schedule.clone();
+                    existing.next_fire_at = next_fire_at;
+                }
+                None => rows.push(PersistedJob {
+                    qname: qname_str.clone(),
+                    status: format!("{:?}", SchedulerJobStatus::Pending),
+                    consecutive_failures: 0,
+                    schedule: schedule.clone(),
+                    next_fire_at,
+                }),
+            },
+        )
     }
 
     fn record_started(
@@ -184,22 +201,13 @@ impl SchedulerPersistence for SystemLabelSchedulerPersistence {
     }
 
     fn cancel(&self, id: &QName) -> Result<(), SchedulerPersistenceError> {
-        let _guard = self.write_guard.lock();
-        let mut rows = self.read_all()?;
         let qname_str = id.to_string();
-        rows.retain(|r| r.qname != qname_str);
-        self.write_all(&rows)?;
+        self.mutate_rows(|rows| rows.retain(|r| r.qname != qname_str))?;
         let cypher = format!(
             "MATCH (j:_BackgroundJob {{qname: '{q}'}}) DETACH DELETE j",
             q = qname_str.replace('\'', "''"),
         );
-        if let Err(e) = self.cypher_sink.try_write_cypher(&cypher) {
-            tracing::debug!(
-                qname = %qname_str,
-                error = %e,
-                "SystemLabelSchedulerPersistence: cypher cancel mirror skipped",
-            );
-        }
+        self.mirror_cypher(&qname_str, &cypher, "cypher cancel mirror skipped");
         Ok(())
     }
 
@@ -208,6 +216,14 @@ impl SchedulerPersistence for SystemLabelSchedulerPersistence {
         let records: Vec<SchedulerJobRecord> = rows
             .into_iter()
             .filter_map(|r| {
+                // The persisted `qname` is the dotted `namespace.local` form
+                // (`QName::to_string`). Split on the *last* dot so a multi-dot
+                // local part (e.g. `system.ttl_sweep`) stays intact as the
+                // local segment. A qname with no dot can't be reconstructed into
+                // a `(namespace, local)` pair, so the row is dropped — such rows
+                // are never written by this backend (every `QName` it persists
+                // is namespaced) and would only appear from hand-edited or
+                // foreign-written sidecars.
                 let parts: Vec<&str> = r.qname.rsplitn(2, '.').collect();
                 let qname = match parts.as_slice() {
                     [local, ns] => QName::new(*ns, *local),
@@ -215,6 +231,10 @@ impl SchedulerPersistence for SystemLabelSchedulerPersistence {
                 };
                 Some(SchedulerJobRecord {
                     id: qname,
+                    // Restored jobs always re-enter as `Pending`: on restart the
+                    // scheduler re-evaluates each schedule from scratch, so the
+                    // persisted run-state (`Running`/`Idle`/...) is intentionally
+                    // not resurrected — it would be stale across the restart.
                     status: SchedulerJobStatus::Pending,
                     next_fire_at: r.next_fire_at,
                     last_started_at: None,

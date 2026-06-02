@@ -36,10 +36,6 @@ impl GraphAlgoAdapter for BridgesAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type BridgesProcedure = GenericAlgoProcedure<BridgesAdapter>;

@@ -101,20 +101,30 @@ fn bound_val(btic: &Btic, side: BoundSide) -> i64 {
 /// When `pick` is `Greater`, selects metadata from `max(a.bound, b.bound)`.
 /// When `pick` is `Less`, selects metadata from `min(a.bound, b.bound)`.
 /// When both bounds are equal, uses the finer granularity and least certainty.
+///
+/// # Precondition
+/// `pick` must be `Greater` or `Less`; passing `Equal` is a logic error
+/// (the extremal value would be undefined) and will panic.
 fn pick_bound_meta(
     a: &Btic,
     b: &Btic,
     side: BoundSide,
     pick: std::cmp::Ordering,
 ) -> (Granularity, Certainty) {
+    debug_assert_ne!(
+        pick,
+        std::cmp::Ordering::Equal,
+        "pick_bound_meta requires Greater or Less"
+    );
+
     let va = bound_val(a, side);
     let vb = bound_val(b, side);
     let (ga, ca) = bound_meta(a, side);
     let (gb, cb) = bound_meta(b, side);
 
     match va.cmp(&vb) {
-        ord if ord == pick => (ga, ca),
         std::cmp::Ordering::Equal => (ga.finer(gb), ca.least_certain(cb)),
+        ord if ord == pick => (ga, ca),
         _ => (gb, cb),
     }
 }

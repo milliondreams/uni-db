@@ -18,11 +18,11 @@ use uni_plugin::QName;
 use uni_plugin::adapter_common::arrow_types::argtype_to_arrow;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::procedure::{ProcedureContext, ProcedurePlugin, ProcedureSignature};
-use uni_plugin_wasm_rt::IpcError;
 use uni_plugin_wasm_rt::ipc::{decode_batches, encode_batch};
 
+use crate::adapter_common::{acquire, ipc_to_fn_err};
 use crate::loader::ProcedurePluginInstance;
-use crate::pool::{PooledInstance, WasmInstancePool};
+use crate::pool::WasmInstancePool;
 
 /// `ProcedurePlugin` adapter wrapping a CM procedure-plugin pool.
 pub struct ComponentProcedure {
@@ -103,12 +103,7 @@ impl ProcedurePlugin for ComponentProcedure {
         let ipc = encode_batch(&batch).map_err(ipc_to_fn_err)?;
 
         let qname_str = self.qname.to_string();
-        let mut leased = PooledInstance::acquire(Arc::clone(&self.pool)).map_err(|e| {
-            FnError::new(
-                FnError::CODE_RESOURCE_LIMIT,
-                format!("acquire procedure instance: {e}"),
-            )
-        })?;
+        let mut leased = acquire(&self.pool, "procedure")?;
         let out_bytes = leased
             .get_mut()
             .invoke_procedure(&qname_str, &ipc)
@@ -143,8 +138,4 @@ fn build_args_schema(sig: &ProcedureSignature) -> SchemaRef {
         .map(|(i, a)| Field::new(format!("arg{i}"), argtype_to_arrow(&a.ty), true))
         .collect();
     Arc::new(Schema::new(fields))
-}
-
-fn ipc_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("wasm IPC: {e}"))
 }

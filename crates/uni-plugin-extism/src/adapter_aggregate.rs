@@ -34,13 +34,9 @@ use uni_plugin::adapter_common::arrow_types::argtype_to_arrow;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::aggregate::{AggSignature, AggregatePluginFn, PluginAccumulator};
 
+use crate::adapter_common::{acquire, extism_err_to_fn_err, sanitize_qname};
 use crate::ipc::{decode_batch, encode_batch};
-use crate::pool::{ExtismInstancePool, PooledInstance};
-use uni_plugin_wasm_rt::IpcError;
-
-fn sanitize_qname(qname: &QName) -> String {
-    qname.to_string().replace('.', "_")
-}
+use crate::pool::ExtismInstancePool;
 
 /// Plugin-side aggregate-`new` export name from a qname.
 #[must_use]
@@ -179,16 +175,16 @@ impl ExtismAggregateAccumulator {
 
     fn call_with_envelope(&self, export: &str, batch: RecordBatch) -> Result<Vec<u8>, FnError> {
         let ipc = encode_batch(&batch).map_err(extism_err_to_fn_err)?;
-        let mut buf = Vec::with_capacity(4 + self.state.len() + ipc.len());
-        let state_len: u32 = u32::try_from(self.state.len()).map_err(|_| {
-            FnError::new(
+        // Reject states wider than the u32 length prefix before building the
+        // envelope (`build_envelope` would otherwise silently clamp to
+        // `u32::MAX`, corrupting the wire framing).
+        if u32::try_from(self.state.len()).is_err() {
+            return Err(FnError::new(
                 FnError::CODE_RESOURCE_LIMIT,
                 "aggregate state exceeds u32::MAX bytes",
-            )
-        })?;
-        buf.extend_from_slice(&state_len.to_le_bytes());
-        buf.extend_from_slice(&self.state);
-        buf.extend_from_slice(&ipc);
+            ));
+        }
+        let buf = build_envelope(&self.state, &ipc);
 
         let mut leased = acquire(&self.pool)?;
         let out: Vec<u8> = leased
@@ -216,7 +212,7 @@ impl PluginAccumulator for ExtismAggregateAccumulator {
                     format!("update_batch: RecordBatch assembly: {e}"),
                 )
             })?;
-        let new_state = self.call_with_envelope(&self.update_export.clone(), batch)?;
+        let new_state = self.call_with_envelope(&self.update_export, batch)?;
         self.state = new_state;
         Ok(())
     }
@@ -243,7 +239,7 @@ impl PluginAccumulator for ExtismAggregateAccumulator {
                 format!("merge_batch: RecordBatch assembly: {e}"),
             )
         })?;
-        let new_state = self.call_with_envelope(&self.merge_export.clone(), batch)?;
+        let new_state = self.call_with_envelope(&self.merge_export, batch)?;
         self.state = new_state;
         Ok(())
     }
@@ -329,22 +325,14 @@ fn build_returns_field(sig: &AggSignature) -> Field {
     Field::new("returns", argtype_to_arrow(&sig.returns), true)
 }
 
-fn acquire(
-    pool: &Arc<ExtismInstancePool<extism::Plugin>>,
-) -> Result<PooledInstance<extism::Plugin>, FnError> {
-    PooledInstance::acquire(Arc::clone(pool)).map_err(|e| {
-        FnError::new(
-            FnError::CODE_RESOURCE_LIMIT,
-            format!("acquire plugin instance: {e}"),
-        )
-    })
-}
-
-fn extism_err_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("extism IPC: {e}"))
-}
-
-/// Helper exposed for tests of the host-side envelope shape.
+/// Build the length-prefixed `update`/`merge` envelope
+/// `[state_len: u32 LE][state_bytes][ipc_stream_bytes]`.
+///
+/// Used by [`ExtismAggregateAccumulator::call_with_envelope`] on the
+/// host side and mirrored by the plugin's [`parse_envelope`] equivalent;
+/// also exposed for envelope round-trip tests. Callers that cannot
+/// tolerate a clamped length must reject `state.len() > u32::MAX` before
+/// calling — this writer saturates the prefix at `u32::MAX`.
 #[doc(hidden)]
 #[must_use]
 pub fn build_envelope(state: &[u8], ipc: &[u8]) -> Vec<u8> {

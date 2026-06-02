@@ -26,8 +26,10 @@
 use std::sync::Arc;
 
 use extism::{Function, UserData, ValType};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use uni_plugin::secrets::SecretStore;
-use uni_plugin::{Capability, CapabilitySet, HttpEgress, KmsProvider};
+use uni_plugin::{Capability, CapabilitySet, FnError, HttpEgress, KmsProvider};
 
 use crate::host_fns::HostFnSpec;
 use crate::loader::ExtismLoader;
@@ -83,6 +85,37 @@ pub(crate) fn from_hex(s: &str) -> Result<Vec<u8>, String> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Deserialize a JSON request, run `f`, and re-serialize its response as
+/// JSON — the shared `host_fn!`-shell body for every `uni.{kms,secret,http}`
+/// service fn.
+///
+/// `label` is the host-fn name used in error messages (e.g.
+/// `"uni.kms.sign"`). Each `do_*` body holds the capability attenuation and
+/// dispatch; this only owns the JSON (de)serialization the kms / secret /
+/// net shells previously duplicated verbatim.
+///
+/// # Errors
+///
+/// Returns [`FnError`] when the request JSON is malformed, the `f` dispatch
+/// fails, or the response cannot be serialized.
+pub(crate) fn dispatch_json<Req, Resp, F>(
+    ctx: &HostSvcCtx,
+    req_json: &str,
+    label: &str,
+    f: F,
+) -> Result<String, FnError>
+where
+    Req: DeserializeOwned,
+    Resp: Serialize,
+    F: FnOnce(&HostSvcCtx, Req) -> Result<Resp, FnError>,
+{
+    let req: Req = serde_json::from_str(req_json)
+        .map_err(|e| FnError::new(0xC30, format!("{label}: bad request json: {e}")))?;
+    let resp = f(ctx, req)?;
+    serde_json::to_string(&resp)
+        .map_err(|e| FnError::new(0xC31, format!("{label}: response json: {e}")))
 }
 
 /// Build the concrete `extism::Function` for a known service-fn `name`.

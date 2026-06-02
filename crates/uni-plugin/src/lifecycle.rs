@@ -236,13 +236,8 @@ impl EpochFencedReload {
     /// Safe to call multiple times (idempotent at `Removed`).
     pub fn finalize(&self) {
         // Drive forward to Removed regardless of where we are.
-        loop {
-            match self.old.state() {
-                LifecycleState::Removed => return,
-                _ => {
-                    self.old.advance();
-                }
-            }
+        while self.old.state() != LifecycleState::Removed {
+            self.old.advance();
         }
     }
 

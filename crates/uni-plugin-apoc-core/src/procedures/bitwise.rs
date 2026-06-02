@@ -11,20 +11,18 @@
 //! to `ProcedurePlugin` registrations. Each procedure yields one row with
 //! a single `result` column.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use arrow_array::{Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
+
+use super::support::{self, ApocProc, FloatToInt, batch_err, int_result};
 
 /// Register `uni.bitwise.*` procedures into `r`.
 ///
@@ -32,14 +30,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 ///
 /// Returns [`PluginError::DuplicateRegistration`] if a qname is taken.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    for proc in BitwiseProc::ALL {
-        r.procedure(
-            proc.qname(),
-            proc.signature_cached().clone(),
-            Arc::new(*proc),
-        )?;
-    }
-    Ok(())
+    support::register_all::<BitwiseProc>(r)
 }
 
 fn unary_sig(docs: &str) -> ProcedureSignature {
@@ -96,6 +87,23 @@ enum BitwiseProc {
 }
 
 impl BitwiseProc {
+    /// Canonical docstring per variant. The previous `register_into`
+    /// strings were more descriptive than the `OnceLock` fallbacks
+    /// ("Bitwise AND." vs "Bitwise AND of two integers."); we keep the
+    /// descriptive form here.
+    fn docs(&self) -> &'static str {
+        match self {
+            Self::And => "Bitwise AND of two integers.",
+            Self::Or => "Bitwise OR of two integers.",
+            Self::Xor => "Bitwise XOR of two integers.",
+            Self::Not => "Bitwise NOT of an integer.",
+            Self::ShiftLeft => "Bitwise left-shift of an integer.",
+            Self::ShiftRight => "Bitwise right-shift of an integer.",
+        }
+    }
+}
+
+impl ApocProc for BitwiseProc {
     const ALL: &'static [Self] = &[
         Self::And,
         Self::Or,
@@ -116,19 +124,8 @@ impl BitwiseProc {
         }
     }
 
-    /// Canonical docstring per variant. The previous `register_into`
-    /// strings were more descriptive than the `OnceLock` fallbacks
-    /// ("Bitwise AND." vs "Bitwise AND of two integers."); we keep the
-    /// descriptive form here.
-    fn docs(&self) -> &'static str {
-        match self {
-            Self::And => "Bitwise AND of two integers.",
-            Self::Or => "Bitwise OR of two integers.",
-            Self::Xor => "Bitwise XOR of two integers.",
-            Self::Not => "Bitwise NOT of an integer.",
-            Self::ShiftLeft => "Bitwise left-shift of an integer.",
-            Self::ShiftRight => "Bitwise right-shift of an integer.",
-        }
+    fn index(&self) -> usize {
+        *self as usize
     }
 
     fn build_signature(&self) -> ProcedureSignature {
@@ -137,28 +134,12 @@ impl BitwiseProc {
             _ => binary_sig(self.docs()),
         }
     }
-
-    fn signature_cached(&self) -> &'static ProcedureSignature {
-        static AND_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static OR_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static XOR_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static NOT_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static SHL_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static SHR_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        match self {
-            Self::And => AND_SIG.get_or_init(|| self.build_signature()),
-            Self::Or => OR_SIG.get_or_init(|| self.build_signature()),
-            Self::Xor => XOR_SIG.get_or_init(|| self.build_signature()),
-            Self::Not => NOT_SIG.get_or_init(|| self.build_signature()),
-            Self::ShiftLeft => SHL_SIG.get_or_init(|| self.build_signature()),
-            Self::ShiftRight => SHR_SIG.get_or_init(|| self.build_signature()),
-        }
-    }
 }
 
 impl ProcedurePlugin for BitwiseProc {
     fn signature(&self) -> &ProcedureSignature {
-        self.signature_cached()
+        static CACHE: OnceLock<Vec<ProcedureSignature>> = OnceLock::new();
+        support::cached_signature(&CACHE, self)
     }
 
     fn invoke(
@@ -166,73 +147,26 @@ impl ProcedurePlugin for BitwiseProc {
         _ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
+        let extract = |idx| support::extract_i64(args, idx, "bitwise", FloatToInt::Reject, true);
         let result = match self {
-            Self::Not => {
-                let a = extract_i64(args, 0)?;
-                !a
-            }
-            other => {
-                let a = extract_i64(args, 0)?;
-                let b = extract_i64(args, 1)?;
-                match other {
-                    Self::And => a & b,
-                    Self::Or => a | b,
-                    Self::Xor => a ^ b,
-                    Self::ShiftLeft => a.wrapping_shl((b & 63) as u32),
-                    Self::ShiftRight => a.wrapping_shr((b & 63) as u32),
-                    Self::Not => unreachable!(),
-                }
-            }
+            Self::Not => !extract(0)?,
+            Self::And => extract(0)? & extract(1)?,
+            Self::Or => extract(0)? | extract(1)?,
+            Self::Xor => extract(0)? ^ extract(1)?,
+            Self::ShiftLeft => extract(0)?.wrapping_shl((extract(1)? & 63) as u32),
+            Self::ShiftRight => extract(0)?.wrapping_shr((extract(1)? & 63) as u32),
         };
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "result",
-            DataType::Int64,
-            false,
-        )]));
-        let arr = Arc::new(Int64Array::from(vec![result])) as Arc<dyn Array>;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
-            .map_err(|e| FnError::new(0x700, format!("bitwise: {e}")))?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
-    }
-}
-
-fn extract_i64(args: &[ColumnarValue], idx: usize) -> Result<i64, FnError> {
-    let arg = args.get(idx).ok_or_else(|| {
-        FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("bitwise: expected argument at position {idx}"),
-        )
-    })?;
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Ok(*v),
-        ColumnarValue::Array(arr) => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "expected Int64Array"))?;
-            if a.is_empty() || a.is_null(0) {
-                Err(FnError::new(
-                    FnError::CODE_UNEXPECTED_NULL,
-                    "bitwise: integer argument must not be null",
-                ))
-            } else {
-                Ok(a.value(0))
-            }
-        }
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            "bitwise: integer argument required",
-        )),
+        let (schema, array) = int_result(result);
+        support::one_row_stream(schema, array, batch_err::BITWISE, "bitwise")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Int64Array;
+    use datafusion::scalar::ScalarValue;
     use futures::StreamExt;
 
     async fn invoke_one(proc: BitwiseProc, args: Vec<i64>) -> i64 {

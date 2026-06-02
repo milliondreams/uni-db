@@ -14,8 +14,6 @@
 
 // Rust guideline compliant
 
-use std::collections::BTreeMap;
-
 use tracing::{info, instrument, warn};
 use uni_common::api::error::UniError;
 use uni_common::core::fork::{ForkInfo, ForkStatus};
@@ -150,6 +148,3 @@ pub fn join_uri_with(base_uri: String) -> impl FnMut(&str) -> String {
         }
     }
 }
-
-#[allow(unused_imports, dead_code)]
-fn _btreemap_unused_workaround(_x: BTreeMap<String, String>) {}

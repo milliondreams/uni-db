@@ -154,6 +154,98 @@ async fn hydrate_entity_if_needed(
     }
 }
 
+/// Promote a VID-string placeholder variable to a `Map`, draining its
+/// dotted system/property columns (`var.<prop>`) into the new map.
+///
+/// Used by `record_batches_to_rows` for search-procedure outputs, where the
+/// bare variable arrives as a VID string rather than a materialized Map.
+fn promote_vid_placeholder(row: &mut HashMap<String, Value>, var: &str) {
+    let prefix = format!("{}.", var);
+    let mut map = HashMap::new();
+
+    let dotted_keys: Vec<String> = row
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+
+    for key in &dotted_keys {
+        let prop_name = &key[prefix.len()..];
+        if let Some(val) = row.remove(key) {
+            map.insert(prop_name.to_string(), val);
+        }
+    }
+
+    // Replace the VID-string placeholder with the constructed Map
+    row.insert(var.to_string(), Value::Map(map));
+}
+
+/// Merge the helper system columns (`var._vid`, `var._labels`, `var._eid`,
+/// `var._type`) and remaining USER property columns (`var.<prop>`) into the
+/// bare `Map` variable, removing the dotted helper columns from `row`.
+///
+/// Merging user properties keeps `RETURN var.prop` consistent after a
+/// unit-subquery SET refreshes the dotted columns: without it the (now stale)
+/// bare entity Struct from the outer scan would override the post-SET values.
+/// Internal helpers (`_all_props`, `_src_vid`, …) and `overflow_json` are
+/// dropped silently.
+fn merge_dotted_columns(row: &mut HashMap<String, Value>, var: &str) {
+    // Merge node system fields (_vid, _labels)
+    let vid_key = format!("{}._vid", var);
+    let labels_key = format!("{}._labels", var);
+
+    let vid_val = row.remove(&vid_key);
+    let labels_val = row.remove(&labels_key);
+
+    if let Some(Value::Map(map)) = row.get_mut(var) {
+        if let Some(v) = vid_val {
+            map.insert("_vid".to_string(), v);
+        }
+        if let Some(v) = labels_val {
+            map.insert("_labels".to_string(), v);
+        }
+    }
+
+    // Merge edge system fields (_eid, _type, _src_vid, _dst_vid).
+    // These are emitted as helper columns by the traverse exec.
+    // The structural projection already includes them in the struct,
+    // but we still need to remove the dotted helper columns.
+    let eid_key = format!("{}._eid", var);
+    let type_key = format!("{}._type", var);
+
+    let eid_val = row.remove(&eid_key);
+    let type_val = row.remove(&type_key);
+
+    if (eid_val.is_some() || type_val.is_some())
+        && let Some(Value::Map(map)) = row.get_mut(var)
+    {
+        if let Some(v) = eid_val {
+            map.entry("_eid".to_string()).or_insert(v);
+        }
+        if let Some(v) = type_val {
+            map.entry("_type".to_string()).or_insert(v);
+        }
+    }
+
+    // Drain remaining dotted columns, merging surviving USER properties.
+    let prefix = format!("{}.", var);
+    let dotted_keys: Vec<String> = row
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in dotted_keys {
+        let prop_name = key[prefix.len()..].to_string();
+        let val = row.remove(&key);
+        if prop_name.starts_with('_') || prop_name == "overflow_json" {
+            continue;
+        }
+        if let (Some(val), Some(Value::Map(map))) = (val, row.get_mut(var)) {
+            map.insert(prop_name, val);
+        }
+    }
+}
+
 impl Executor {
     /// Helper to verify and filter candidates against an optional predicate.
     ///
@@ -730,91 +822,11 @@ impl Executor {
                     .collect();
 
                 for var in &vid_placeholder_vars {
-                    // Build a Map from system and property columns
-                    let prefix = format!("{}.", var);
-                    let mut map = HashMap::new();
-
-                    let dotted_keys: Vec<String> = row
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-
-                    for key in &dotted_keys {
-                        let prop_name = &key[prefix.len()..];
-                        if let Some(val) = row.remove(key) {
-                            map.insert(prop_name.to_string(), val);
-                        }
-                    }
-
-                    // Replace the VID-string placeholder with the constructed Map
-                    row.insert(var.clone(), Value::Map(map));
+                    promote_vid_placeholder(&mut row, var);
                 }
 
                 for var in &bare_vars {
-                    // Merge node system fields (_vid, _labels)
-                    let vid_key = format!("{}._vid", var);
-                    let labels_key = format!("{}._labels", var);
-
-                    let vid_val = row.remove(&vid_key);
-                    let labels_val = row.remove(&labels_key);
-
-                    if let Some(Value::Map(map)) = row.get_mut(var) {
-                        if let Some(v) = vid_val {
-                            map.insert("_vid".to_string(), v);
-                        }
-                        if let Some(v) = labels_val {
-                            map.insert("_labels".to_string(), v);
-                        }
-                    }
-
-                    // Merge edge system fields (_eid, _type, _src_vid, _dst_vid).
-                    // These are emitted as helper columns by the traverse exec.
-                    // The structural projection already includes them in the struct,
-                    // but we still need to remove the dotted helper columns.
-                    let eid_key = format!("{}._eid", var);
-                    let type_key = format!("{}._type", var);
-
-                    let eid_val = row.remove(&eid_key);
-                    let type_val = row.remove(&type_key);
-
-                    if (eid_val.is_some() || type_val.is_some())
-                        && let Some(Value::Map(map)) = row.get_mut(var)
-                    {
-                        if let Some(v) = eid_val {
-                            map.entry("_eid".to_string()).or_insert(v);
-                        }
-                        if let Some(v) = type_val {
-                            map.entry("_type".to_string()).or_insert(v);
-                        }
-                    }
-
-                    // Drain remaining dotted columns. Merge USER property
-                    // columns (`var.prop` where `prop` doesn't start with `_`
-                    // and isn't `overflow_json`) into the bare Map so that
-                    // post-Apply refresh of dotted columns surfaces through
-                    // `RETURN var.prop`. Without this, the bare entity
-                    // Struct from the outer scan (which is stale after a
-                    // unit-subquery SET) would override post-SET dotted
-                    // values when `record_batches_to_rows` finalizes the
-                    // row. Internal helpers (`_all_props`, `_src_vid`, etc.)
-                    // are dropped silently.
-                    let prefix = format!("{}.", var);
-                    let dotted_keys: Vec<String> = row
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-                    for key in dotted_keys {
-                        let prop_name = key[prefix.len()..].to_string();
-                        let val = row.remove(&key);
-                        if prop_name.starts_with('_') || prop_name == "overflow_json" {
-                            continue;
-                        }
-                        if let (Some(val), Some(Value::Map(map))) = (val, row.get_mut(var)) {
-                            map.insert(prop_name, val);
-                        }
-                    }
+                    merge_dotted_columns(&mut row, var);
                 }
 
                 rows.push(row);

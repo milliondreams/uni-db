@@ -3,7 +3,6 @@
 
 //! uni.algo.katzCentrality procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, KatzCentrality, KatzCentralityConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -49,11 +48,12 @@ impl GraphAlgoAdapter for KatzCentralityAdapter {
             .collect())
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[4].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(4)
     }
 }
 

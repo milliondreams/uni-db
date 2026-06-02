@@ -14,6 +14,11 @@ use uni_query::{Edge, Node, Path, Value};
 /// Type alias for edge bracket parsing result: (edge_type, properties)
 type EdgeBracketResult<'a> = (Option<&'a str>, Option<HashMap<String, Value>>);
 
+/// Build a recoverable nom error for `input` with the given kind.
+fn nom_err(input: &str, kind: nom::error::ErrorKind) -> nom::Err<nom::error::Error<&str>> {
+    nom::Err::Error(nom::error::Error::new(input, kind))
+}
+
 /// Parse a TCK value string into a `Value`, failing on trailing input.
 pub fn parse_value(input: &str) -> Result<Value, String> {
     match value(input.trim()) {
@@ -68,18 +73,12 @@ fn number(input: &str) -> IResult<&str, Value> {
     if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
         match num_str.parse::<f64>() {
             Ok(f) => Ok((input, Value::Float(f))),
-            Err(_) => Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Float,
-            ))),
+            Err(_) => Err(nom_err(input, nom::error::ErrorKind::Float)),
         }
     } else {
         match num_str.parse::<i64>() {
             Ok(i) => Ok((input, Value::Int(i))),
-            Err(_) => Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Digit,
-            ))),
+            Err(_) => Err(nom_err(input, nom::error::ErrorKind::Digit)),
         }
     }
 }
@@ -118,10 +117,7 @@ fn string(input: &str) -> IResult<&str, String> {
         }
     }
 
-    Err(nom::Err::Error(nom::error::Error::new(
-        input,
-        nom::error::ErrorKind::Char,
-    )))
+    Err(nom_err(input, nom::error::ErrorKind::Char))
 }
 
 fn list(input: &str) -> IResult<&str, Vec<Value>> {
@@ -208,37 +204,28 @@ fn edge(input: &str) -> IResult<&str, Edge> {
     // `[{}]` is a list containing an empty map, not an edge with empty properties.
     // `[:TYPE {props}]` or `[:TYPE]` are edges.
     if edge_type.is_none() {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Verify,
-        )));
+        return Err(nom_err(input, nom::error::ErrorKind::Verify));
     }
 
-    Ok((
-        input,
-        Edge {
-            eid: Eid::from(0),
-            edge_type: edge_type.unwrap_or_default().to_string(),
-            src: Vid::from(0),
-            dst: Vid::from(0),
-            properties: properties.unwrap_or_default(),
-        },
-    ))
+    Ok((input, build_edge(edge_type, properties)))
 }
 
 /// Parse a bracketed edge within a path, allowing empty `[]` for untyped edges.
 fn edge_in_path(input: &str) -> IResult<&str, Edge> {
     let (input, (edge_type, properties)) = parse_edge_brackets(input)?;
-    Ok((
-        input,
-        Edge {
-            eid: Eid::from(0),
-            edge_type: edge_type.unwrap_or_default().to_string(),
-            src: Vid::from(0),
-            dst: Vid::from(0),
-            properties: properties.unwrap_or_default(),
-        },
-    ))
+    Ok((input, build_edge(edge_type, properties)))
+}
+
+/// Build an [`Edge`] from a parsed edge type and properties, using placeholder
+/// IDs (real IDs are not available in TCK result tables).
+fn build_edge(edge_type: Option<&str>, properties: Option<HashMap<String, Value>>) -> Edge {
+    Edge {
+        eid: Eid::from(0),
+        edge_type: edge_type.unwrap_or_default().to_string(),
+        src: Vid::from(0),
+        dst: Vid::from(0),
+        properties: properties.unwrap_or_default(),
+    }
 }
 
 /// Shared bracket parsing for edge functions.

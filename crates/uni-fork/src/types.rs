@@ -302,8 +302,9 @@ impl PromotePattern {
     pub fn where_clause(mut self, expr: impl Into<String>) -> Self {
         let expr = expr.into();
         match &mut self {
-            Self::Vertex { where_clause, .. } => *where_clause = Some(expr),
-            Self::Edge { where_clause, .. } => *where_clause = Some(expr),
+            Self::Vertex { where_clause, .. } | Self::Edge { where_clause, .. } => {
+                *where_clause = Some(expr)
+            }
         }
         self
     }
@@ -369,8 +370,6 @@ pub struct PromoteReport {
     pub vertices_inserted: usize,
     /// Number of fork rows skipped because primary already has the same UID.
     pub vertices_skipped_uid_conflict: usize,
-    /// Reserved for future use — currently always 0.
-    pub vertices_skipped_no_uid: usize,
     /// Number of edges inserted into primary.
     pub edges_inserted: usize,
     /// Number of fork edges skipped because primary already has an

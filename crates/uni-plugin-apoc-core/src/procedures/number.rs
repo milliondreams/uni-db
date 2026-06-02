@@ -6,20 +6,20 @@
 //! follow-up — Rust has no direct equivalent of Java's `DecimalFormat`
 //! patterns, so format procedures use the `format!` syntax.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
+
+use super::support::{
+    self, ApocProc, batch_err, nullable_float_result, nullable_int_result, string_result,
+};
 
 /// Register `uni.number.*` procedures into `r`.
 ///
@@ -27,14 +27,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 ///
 /// Returns [`PluginError::DuplicateRegistration`] if a qname is taken.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    for proc in NumberProc::ALL {
-        r.procedure(
-            proc.qname(),
-            proc.signature_cached().clone(),
-            Arc::new(*proc),
-        )?;
-    }
-    Ok(())
+    support::register_all::<NumberProc>(r)
 }
 
 fn parse_int_sig(docs: &str) -> ProcedureSignature {
@@ -96,16 +89,6 @@ enum NumberProc {
 }
 
 impl NumberProc {
-    const ALL: &'static [Self] = &[Self::ParseInt, Self::ParseFloat, Self::ToString];
-
-    fn qname(&self) -> QName {
-        match self {
-            Self::ParseInt => QName::new("apoc-core", "number.parseInt"),
-            Self::ParseFloat => QName::new("apoc-core", "number.parseFloat"),
-            Self::ToString => QName::new("apoc-core", "number.toString"),
-        }
-    }
-
     /// Canonical docstring per variant. The `register_into` versions
     /// were descriptive ("Parse a string as a 64-bit signed integer; ...")
     /// whereas the `OnceLock` versions were placeholders ("parseInt").
@@ -117,6 +100,22 @@ impl NumberProc {
             Self::ToString => "Format a number as its default string representation.",
         }
     }
+}
+
+impl ApocProc for NumberProc {
+    const ALL: &'static [Self] = &[Self::ParseInt, Self::ParseFloat, Self::ToString];
+
+    fn qname(&self) -> QName {
+        match self {
+            Self::ParseInt => QName::new("apoc-core", "number.parseInt"),
+            Self::ParseFloat => QName::new("apoc-core", "number.parseFloat"),
+            Self::ToString => QName::new("apoc-core", "number.toString"),
+        }
+    }
+
+    fn index(&self) -> usize {
+        *self as usize
+    }
 
     fn build_signature(&self) -> ProcedureSignature {
         match self {
@@ -125,22 +124,12 @@ impl NumberProc {
             Self::ToString => float_to_string_sig(self.docs()),
         }
     }
-
-    fn signature_cached(&self) -> &'static ProcedureSignature {
-        static PARSE_INT_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static PARSE_FLOAT_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        static TO_STRING_SIG: OnceLock<ProcedureSignature> = OnceLock::new();
-        match self {
-            Self::ParseInt => PARSE_INT_SIG.get_or_init(|| self.build_signature()),
-            Self::ParseFloat => PARSE_FLOAT_SIG.get_or_init(|| self.build_signature()),
-            Self::ToString => TO_STRING_SIG.get_or_init(|| self.build_signature()),
-        }
-    }
 }
 
 impl ProcedurePlugin for NumberProc {
     fn signature(&self) -> &ProcedureSignature {
-        self.signature_cached()
+        static CACHE: OnceLock<Vec<ProcedureSignature>> = OnceLock::new();
+        support::cached_signature(&CACHE, self)
     }
 
     fn invoke(
@@ -148,96 +137,32 @@ impl ProcedurePlugin for NumberProc {
         _ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
-        match self {
+        // `number` only accepts scalar arguments (no array fast-path).
+        let (schema, array) = match self {
             Self::ParseInt => {
-                let s = extract_string(args, 0)?;
+                let s = support::extract_string(args, 0, "number", false)?;
                 let parsed: Option<i64> = s.trim().parse().ok();
-                let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-                    "result",
-                    DataType::Int64,
-                    true,
-                )]));
-                let arr = Arc::new(Int64Array::from(vec![parsed])) as Arc<dyn Array>;
-                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
-                    .map_err(|e| FnError::new(0x703, format!("number.parseInt: {e}")))?;
-                Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream::iter(vec![Ok(batch)]),
-                )))
+                nullable_int_result(parsed)
             }
             Self::ParseFloat => {
-                let s = extract_string(args, 0)?;
+                let s = support::extract_string(args, 0, "number", false)?;
                 let parsed: Option<f64> = s.trim().parse().ok();
-                let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-                    "result",
-                    DataType::Float64,
-                    true,
-                )]));
-                let arr = Arc::new(Float64Array::from(vec![parsed])) as Arc<dyn Array>;
-                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
-                    .map_err(|e| FnError::new(0x703, format!("number.parseFloat: {e}")))?;
-                Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream::iter(vec![Ok(batch)]),
-                )))
+                nullable_float_result(parsed)
             }
             Self::ToString => {
-                let v = extract_f64(args, 0)?;
-                let s = format!("{v}");
-                let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-                    "result",
-                    DataType::Utf8,
-                    false,
-                )]));
-                let arr = Arc::new(StringArray::from(vec![s])) as Arc<dyn Array>;
-                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
-                    .map_err(|e| FnError::new(0x703, format!("number.toString: {e}")))?;
-                Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    schema,
-                    stream::iter(vec![Ok(batch)]),
-                )))
+                let v = support::extract_f64(args, 0, "number")?;
+                string_result(format!("{v}"))
             }
-        }
-    }
-}
-
-fn extract_string(args: &[ColumnarValue], idx: usize) -> Result<String, FnError> {
-    let arg = args.get(idx).ok_or_else(|| {
-        FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("number: expected argument at position {idx}"),
-        )
-    })?;
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
-        ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => Ok(s.clone()),
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            "number: string argument required",
-        )),
-    }
-}
-
-fn extract_f64(args: &[ColumnarValue], idx: usize) -> Result<f64, FnError> {
-    let arg = args.get(idx).ok_or_else(|| {
-        FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("number: expected argument at position {idx}"),
-        )
-    })?;
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => Ok(*v),
-        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Ok(*v as f64),
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            "number: numeric argument required",
-        )),
+        };
+        support::one_row_stream(schema, array, batch_err::NUMBER, "number")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, Float64Array, Int64Array, StringArray};
+    use datafusion::scalar::ScalarValue;
     use futures::StreamExt;
 
     #[tokio::test]

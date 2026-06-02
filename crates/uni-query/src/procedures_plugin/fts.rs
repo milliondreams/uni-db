@@ -6,19 +6,16 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
-use crate::procedures_plugin::host_args::{columnar_args_to_values, require_host};
-use crate::procedures_plugin::vector::{fts_query_yields, resolve_yields_and_schema};
+use crate::procedures_plugin::vector::{fts_query_yields, run_search_procedure};
 use crate::query::df_graph::search_procedures::run_fts_query;
 
 // Rust guideline compliant
@@ -93,30 +90,23 @@ impl ProcedurePlugin for FtsQueryProc {
         ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
-        let host = require_host(&ctx, "uni.fts.query")?.clone();
-        let uni_args = columnar_args_to_values(args);
-        let sig = signature();
-        let fallback_schema = Arc::new(Schema::new(sig.yields.clone()));
-        let (yield_items, output_schema) = resolve_yields_and_schema(&host, sig, &fallback_schema);
-        let target_properties = host.target_properties().clone();
-
-        let stream_schema = output_schema.clone();
-        let stream = stream::once(async move {
-            let batch = run_fts_query(
-                &host,
-                &uni_args,
-                &yield_items,
-                &target_properties,
-                &output_schema,
-            )
-            .await?
-            .unwrap_or_else(|| arrow_array::RecordBatch::new_empty(output_schema.clone()));
-            Ok::<_, datafusion::error::DataFusionError>(batch)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            stream_schema,
-            stream,
-        )))
+        run_search_procedure(
+            "uni.fts.query",
+            &ctx,
+            args,
+            signature(),
+            |host, uni_args, yield_items, output_schema| async move {
+                let target_properties = host.target_properties().clone();
+                run_fts_query(
+                    &host,
+                    &uni_args,
+                    &yield_items,
+                    &target_properties,
+                    &output_schema,
+                )
+                .await
+            },
+        )
     }
 }
 

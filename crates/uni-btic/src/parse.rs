@@ -96,12 +96,11 @@ fn strip_certainty_prefix(s: &str) -> (&str, Certainty) {
     }
 }
 
-/// Check for and strip " BCE" suffix (case-insensitive).
+/// Check for and strip a "BCE" suffix (case-insensitive), tolerating an
+/// optional space before it (e.g. "500 BCE" or "500BCE").
 fn strip_bce_suffix(s: &str) -> Option<&str> {
-    if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(" BCE") {
-        Some(&s[..s.len() - 4])
-    } else if s.len() > 3 && s[s.len() - 3..].eq_ignore_ascii_case("BCE") {
-        Some(&s[..s.len() - 3])
+    if s.len() >= 3 && s[s.len() - 3..].eq_ignore_ascii_case("BCE") {
+        Some(s[..s.len() - 3].trim_end())
     } else {
         None
     }
@@ -148,53 +147,37 @@ fn parse_datetime_component(
     s: &str,
     certainty: Certainty,
 ) -> Result<(i64, Granularity, Certainty), BticError> {
-    // Strip trailing 'Z' or timezone offset for parsing
-    let (s_clean, _tz_offset_secs) = strip_timezone(s);
+    // Strip the trailing 'Z' or timezone offset, then apply the offset so the
+    // resulting timestamp is anchored to UTC.
+    let (s_clean, tz_offset_secs) = strip_timezone(s);
 
-    // Try parsing with various precision levels
-    // Full: 2024-06-15T14:30:00.000
-    // Seconds: 2024-06-15T14:30:00
-    // Minutes: 2024-06-15T14:30
-    // Hours: 2024-06-15T14
-
+    // Try parsing from most specific precision to least. Each format carries the
+    // granularity it implies; because chrono requires the whole input to match,
+    // a string with a fractional part will not match the fraction-free seconds
+    // format and so falls through to a millisecond format.
+    //
+    // - Millisecond: 2024-06-15T14:30:00.000
+    // - Second:      2024-06-15T14:30:00
+    // - Minute:      2024-06-15T14:30
+    // - Hour:        2024-06-15T14
     let formats_and_gran = [
+        ("%Y-%m-%dT%H:%M:%S", Granularity::Second),
         ("%Y-%m-%dT%H:%M:%S%.3f", Granularity::Millisecond),
         ("%Y-%m-%dT%H:%M:%S%.f", Granularity::Millisecond),
-        ("%Y-%m-%dT%H:%M:%S", Granularity::Second),
         ("%Y-%m-%dT%H:%M", Granularity::Minute),
         ("%Y-%m-%dT%H", Granularity::Hour),
     ];
 
     for (fmt, gran) in &formats_and_gran {
         if let Ok(ndt) = NaiveDateTime::parse_from_str(s_clean, fmt) {
-            let ms = datetime_to_ms(ndt);
-            // Determine if this is second vs millisecond granularity
-            let actual_gran = if *gran == Granularity::Millisecond {
-                infer_sub_second_granularity(s_clean)
-            } else {
-                *gran
-            };
-            return Ok((ms, actual_gran, certainty));
+            let ms = datetime_to_ms(ndt) - (tz_offset_secs as i64) * 1_000;
+            return Ok((ms, *gran, certainty));
         }
     }
 
     Err(BticError::ParseError(format!(
         "cannot parse datetime '{s}'"
     )))
-}
-
-/// Determine whether a datetime string has sub-second precision.
-///
-/// Expects a string containing `T` (the caller guarantees this).
-/// Returns `Millisecond` if a decimal point appears in the time part,
-/// otherwise `Second`.
-fn infer_sub_second_granularity(s: &str) -> Granularity {
-    let time_part = s.split_once('T').map(|(_, t)| t).unwrap_or("");
-    if time_part.contains('.') {
-        Granularity::Millisecond
-    } else {
-        Granularity::Second
-    }
 }
 
 /// Parse a date-only component: YYYY-MM-DD, YYYY-MM, YYYY.

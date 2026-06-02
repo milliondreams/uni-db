@@ -18,11 +18,11 @@ use uni_plugin::QName;
 use uni_plugin::adapter_common::arrow_types::argtype_to_arrow;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::aggregate::{AggSignature, AggregatePluginFn, PluginAccumulator};
-use uni_plugin_wasm_rt::IpcError;
 use uni_plugin_wasm_rt::ipc::{decode_batch, encode_batch};
 
+use crate::adapter_common::{acquire, ipc_to_fn_err};
 use crate::loader::AggregatePluginInstance;
-use crate::pool::{PooledInstance, WasmInstancePool};
+use crate::pool::WasmInstancePool;
 
 /// `AggregatePluginFn` adapter wrapping a CM aggregate-plugin pool.
 pub struct ComponentAggregateFn {
@@ -52,7 +52,7 @@ impl ComponentAggregateFn {
     }
 
     fn call_new(&self) -> Result<Vec<u8>, FnError> {
-        let mut leased = acquire(&self.pool)?;
+        let mut leased = acquire(&self.pool, "aggregate")?;
         let qname_str = self.qname.to_string();
         let state = leased.get_mut().agg_new(&qname_str).map_err(|e| {
             FnError::new(
@@ -118,7 +118,7 @@ impl PluginAccumulator for ComponentAggregateAccumulator {
                 )
             })?;
         let ipc = encode_batch(&batch).map_err(ipc_to_fn_err)?;
-        let mut leased = acquire(&self.pool)?;
+        let mut leased = acquire(&self.pool, "aggregate")?;
         let new_state = leased
             .get_mut()
             .agg_update(&self.qname, &self.state, &ipc)
@@ -156,7 +156,7 @@ impl PluginAccumulator for ComponentAggregateAccumulator {
             )
         })?;
         let ipc = encode_batch(&batch).map_err(ipc_to_fn_err)?;
-        let mut leased = acquire(&self.pool)?;
+        let mut leased = acquire(&self.pool, "aggregate")?;
         let new_state = leased
             .get_mut()
             .agg_merge(&self.qname, &self.state, &ipc)
@@ -178,7 +178,7 @@ impl PluginAccumulator for ComponentAggregateAccumulator {
 
     fn evaluate(&self) -> Result<ScalarValue, FnError> {
         self.surface_init_err()?;
-        let mut leased = acquire(&self.pool)?;
+        let mut leased = acquire(&self.pool, "aggregate")?;
         let out_bytes = leased
             .get_mut()
             .agg_evaluate(&self.qname, &self.state)
@@ -244,19 +244,4 @@ fn build_args_schema(sig: &AggSignature) -> SchemaRef {
 
 fn build_returns_field(sig: &AggSignature) -> Field {
     Field::new("returns", argtype_to_arrow(&sig.returns), true)
-}
-
-fn acquire(
-    pool: &Arc<WasmInstancePool<AggregatePluginInstance>>,
-) -> Result<PooledInstance<AggregatePluginInstance>, FnError> {
-    PooledInstance::acquire(Arc::clone(pool)).map_err(|e| {
-        FnError::new(
-            FnError::CODE_RESOURCE_LIMIT,
-            format!("acquire aggregate instance: {e}"),
-        )
-    })
-}
-
-fn ipc_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("wasm IPC: {e}"))
 }

@@ -1438,7 +1438,6 @@ fn build_locy_result(
         compile_warnings: compiled.warnings.clone(),
         approximate_groups,
         derived_fact_set,
-        timed_out: incomplete.is_some(),
         incomplete,
     };
     let metrics = QueryMetrics {

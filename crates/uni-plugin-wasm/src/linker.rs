@@ -157,9 +157,9 @@ pub fn build_scalar_linker_v2(
 }
 
 fn add_host_log(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
-    // The bindgen-generated `scalar_host_log::add_to_linker_get_host`
-    // registers `host-log` on the linker. Each linker call routes the
-    // log into the host's `tracing` macros at the matching level.
+    // Hand-roll the `uni:plugin/host-log` interface with `func_wrap`
+    // (no bindgen helper): the single `log` function routes the guest's
+    // message into the host's `tracing` macros at the matching level.
     let mut instance = linker
         .instance("uni:plugin/host-log")
         .map_err(|e| WasmError::Instantiate(format!("link host-log instance: {e}")))?;

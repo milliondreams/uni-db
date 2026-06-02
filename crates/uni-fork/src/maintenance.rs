@@ -40,32 +40,38 @@ pub trait ForkMaintenanceHost: Send + Sync + 'static {
     async fn build_fork_local_indexes(&self, threshold: u64);
 }
 
-/// Spawn the TTL sweeper task. Returns `None` (no task) when `disable` is set.
+/// Spawn an interval-driven background task that runs `tick_fn` every
+/// `interval` and exits on the shutdown broadcast.
 ///
-/// Holds the host (typically backed by a `Weak<UniInner>`) so the sweeper does
-/// not extend the database's lifetime.
-pub fn spawn_sweeper<H: ForkMaintenanceHost>(
-    host: Arc<H>,
+/// The ticker uses `MissedTickBehavior::Skip` so a long tick body doesn't
+/// trigger a thundering catch-up burst on the next tick. `task_label` names
+/// the task in shutdown-debug logs. Returns `None` (no task) when `disable`
+/// is set.
+fn spawn_ticker<F, Fut>(
     interval: Duration,
     disable: bool,
+    task_label: &'static str,
     mut shutdown_rx: broadcast::Receiver<()>,
-) -> Option<tokio::task::JoinHandle<()>> {
+    mut tick_fn: F,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     if disable {
-        debug!("fork sweeper disabled by config");
+        debug!("{task_label} disabled by config");
         return None;
     }
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
-        // `MissedTickBehavior::Skip` so a long cascade doesn't trigger
-        // a thundering catch-up burst on the next tick.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    host.sweep_expired_forks().await;
+                    tick_fn().await;
                 }
                 _ = shutdown_rx.recv() => {
-                    debug!("fork sweeper received shutdown signal");
+                    debug!("{task_label} received shutdown signal");
                     break;
                 }
             }
@@ -74,32 +80,38 @@ pub fn spawn_sweeper<H: ForkMaintenanceHost>(
     Some(handle)
 }
 
+/// Spawn the TTL sweeper task. Returns `None` (no task) when `disable` is set.
+///
+/// Holds the host (typically backed by a `Weak<UniInner>`) so the sweeper does
+/// not extend the database's lifetime.
+pub fn spawn_sweeper<H: ForkMaintenanceHost>(
+    host: Arc<H>,
+    interval: Duration,
+    disable: bool,
+    shutdown_rx: broadcast::Receiver<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_ticker(interval, disable, "fork sweeper", shutdown_rx, move || {
+        let host = Arc::clone(&host);
+        async move { host.sweep_expired_forks().await }
+    })
+}
+
 /// Spawn the fork-local index builder task. Returns `None` when `disable` is set.
 pub fn spawn_index_builder<H: ForkMaintenanceHost>(
     host: Arc<H>,
     interval: Duration,
     threshold: u64,
     disable: bool,
-    mut shutdown_rx: broadcast::Receiver<()>,
+    shutdown_rx: broadcast::Receiver<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if disable {
-        debug!("fork index builder disabled by config");
-        return None;
-    }
-    let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    host.build_fork_local_indexes(threshold).await;
-                }
-                _ = shutdown_rx.recv() => {
-                    debug!("fork index builder received shutdown signal");
-                    break;
-                }
-            }
-        }
-    });
-    Some(handle)
+    spawn_ticker(
+        interval,
+        disable,
+        "fork index builder",
+        shutdown_rx,
+        move || {
+            let host = Arc::clone(&host);
+            async move { host.build_fork_local_indexes(threshold).await }
+        },
+    )
 }

@@ -119,49 +119,30 @@ impl Drop for FlushInProgressGuard {
     }
 }
 
-/// Race-safe write: creates the table if missing, otherwise appends.
-/// Retries with exponential backoff on Lance "Incompatible transaction"
-/// errors, which fire under async-flush when ≥2 streams concurrently
-/// try to create the same table OR when an Append races with a still-
-/// in-progress Overwrite (create_table). Each retry re-checks
-/// `table_exists` and adjusts strategy: Append if now-exists, Create
-/// if still-missing. Up to 10 attempts (~10s worst case).
-///
-/// Used by every dataset's `write_batch` helper to absorb the Lance
-/// commit-conflict-resolver behavior described in
-/// `lance-3.0.1/src/io/commit/conflict_resolver.rs`. RecordBatch
-/// clones are cheap (column data is Arc'd).
-/// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
-///
-/// Source `batch` must contain the join columns in `on` plus any
-/// columns to update. Matched rows have `WhenMatched::UpdateAll`
-/// applied; unmatched source rows are dropped (partial writes never
-/// INSERT). Returns an error if the target table does not exist.
-pub async fn merge_insert_batch_with_lance_conflict_retry(
-    backend: &dyn crate::backend::StorageBackend,
-    table_name: &str,
-    batch: arrow_array::RecordBatch,
-    on: &[&str],
-) -> anyhow::Result<()> {
+/// Whether a Lance error represents a commit conflict that retrying may
+/// resolve. These fire under async-flush when ≥2 streams concurrently try
+/// to create the same table OR when an Append races with a still-in-progress
+/// Overwrite (create_table). See the Lance commit-conflict-resolver in
+/// `lance-3.0.1/src/io/commit/conflict_resolver.rs`.
+fn is_lance_conflict(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("Incompatible transaction") || msg.contains("conflict")
+}
+
+/// Runs `op` with exponential-backoff retry on Lance commit conflicts.
+/// Up to 10 attempts (~10s worst case); backoff is 1ms, 2ms, 4ms, ...,
+/// 512ms. Non-conflict errors return immediately. `op` is re-invoked each
+/// attempt so it can re-check table existence and adjust strategy.
+async fn retry_on_lance_conflict<F, Fut>(mut op: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     for attempt in 0u32..10 {
-        let exists = backend.table_exists(table_name).await?;
-        if !exists {
-            anyhow::bail!(
-                "merge_insert target table '{}' does not exist (partial writes \
-                 require the row to already be present; CREATE goes through Append)",
-                table_name
-            );
-        }
-        match backend
-            .merge_insert(table_name, on, vec![batch.clone()])
-            .await
-        {
+        match op().await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                let msg = e.to_string();
-                let is_conflict =
-                    msg.contains("Incompatible transaction") || msg.contains("conflict");
-                if !is_conflict || attempt == 9 {
+                if !is_lance_conflict(&e) || attempt == 9 {
                     return Err(e);
                 }
                 let backoff_ms = 1u64 << attempt;
@@ -172,37 +153,61 @@ pub async fn merge_insert_batch_with_lance_conflict_retry(
     unreachable!("retry loop exits via Ok or Err")
 }
 
+/// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
+///
+/// Source `batch` must contain the join columns in `on` plus any
+/// columns to update. Matched rows have `WhenMatched::UpdateAll`
+/// applied; unmatched source rows are dropped (partial writes never
+/// INSERT). Returns an error if the target table does not exist.
+/// Retries on Lance commit conflicts via `retry_on_lance_conflict`.
+/// RecordBatch clones are cheap (column data is Arc'd).
+pub async fn merge_insert_batch_with_lance_conflict_retry(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+    on: &[&str],
+) -> anyhow::Result<()> {
+    retry_on_lance_conflict(|| async {
+        let exists = backend.table_exists(table_name).await?;
+        if !exists {
+            anyhow::bail!(
+                "merge_insert target table '{}' does not exist (partial writes \
+                 require the row to already be present; CREATE goes through Append)",
+                table_name
+            );
+        }
+        backend
+            .merge_insert(table_name, on, vec![batch.clone()])
+            .await
+    })
+    .await
+}
+
+/// Race-safe write: creates the table if missing, otherwise appends.
+/// Each attempt re-checks `table_exists` and adjusts strategy: Append if
+/// now-exists, Create if still-missing. Retries on Lance commit conflicts
+/// via `retry_on_lance_conflict`.
+///
+/// Used by every dataset's `write_batch` helper to absorb the Lance
+/// commit-conflict-resolver behavior. RecordBatch clones are cheap
+/// (column data is Arc'd).
 pub async fn write_batch_with_lance_conflict_retry(
     backend: &dyn crate::backend::StorageBackend,
     table_name: &str,
     batch: arrow_array::RecordBatch,
 ) -> anyhow::Result<()> {
     use crate::backend::types::WriteMode;
-    for attempt in 0u32..10 {
+    retry_on_lance_conflict(|| async {
         let exists = backend.table_exists(table_name).await?;
-        let result = if exists {
+        if exists {
             backend
                 .write(table_name, vec![batch.clone()], WriteMode::Append)
                 .await
         } else {
             backend.create_table(table_name, vec![batch.clone()]).await
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                let is_conflict =
-                    msg.contains("Incompatible transaction") || msg.contains("conflict");
-                if !is_conflict || attempt == 9 {
-                    return Err(e);
-                }
-                // Exponential backoff: 1ms, 2ms, 4ms, ..., 512ms.
-                let backoff_ms = 1u64 << attempt;
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            }
         }
-    }
-    unreachable!("retry loop exits via Ok or Err")
+    })
+    .await
 }
 
 /// Helper to manage compaction_in_progress flag

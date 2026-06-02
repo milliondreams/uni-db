@@ -17,6 +17,7 @@
 
 use arrow_schema::{DataType, Field};
 use datafusion::logical_expr::Volatility;
+use uni_plugin::adapter_common::arrow_types::argtype_to_arrow;
 use uni_plugin::capability::SideEffects;
 use uni_plugin::traits::aggregate::AggSignature;
 use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
@@ -245,20 +246,6 @@ pub fn wire_proc_sig_to_internal(
         batch_input: None,
         docs: String::new(),
     })
-}
-
-/// Best-effort conversion of an internal [`ArgType`] to the Arrow
-/// [`DataType`] surfaced in procedure-yield fields. `CypherValue` /
-/// `Variadic` collapse to `LargeBinary`; `Vector` collapses to its
-/// element's `DataType` per row (Arrow `FixedSizeList` would be more
-/// faithful, but downstream `YIELD` binding currently expects flat
-/// columns — same trade-off used by the in-tree procedure registry).
-fn argtype_to_arrow(t: &ArgType) -> DataType {
-    match t {
-        ArgType::Primitive(d) => d.clone(),
-        ArgType::CypherValue | ArgType::Variadic(_) => DataType::LargeBinary,
-        ArgType::Vector { element, .. } => element.clone(),
-    }
 }
 
 #[cfg(test)]

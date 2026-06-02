@@ -43,7 +43,6 @@
 #![warn(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
-pub mod checked_call;
 pub mod error;
 pub mod host_fns;
 
@@ -61,6 +60,8 @@ pub mod ipc {
 pub mod adapter;
 #[cfg(feature = "extism-runtime")]
 pub mod adapter_aggregate;
+#[cfg(feature = "extism-runtime")]
+pub mod adapter_common;
 #[cfg(feature = "extism-runtime")]
 pub mod adapter_procedure;
 
@@ -89,8 +90,6 @@ pub mod loader;
 #[cfg(feature = "extism-runtime")]
 pub mod wire_translate;
 
-#[doc(inline)]
-pub use checked_call::checked_call;
 #[doc(inline)]
 pub use error::ExtismError;
 #[doc(inline)]

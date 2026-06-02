@@ -123,11 +123,7 @@ impl CrdtMerge for Crdt {
     /// Panics if the types don't match. For a non-panicking version, use `try_merge`.
     fn merge(&mut self, other: &Self) {
         if let Err(e) = self.try_merge(other) {
-            panic!(
-                "Cannot merge different CRDT types: {} and {} ({e})",
-                self.type_name(),
-                other.type_name()
-            );
+            panic!("CRDT merge failed: {e}");
         }
     }
 }

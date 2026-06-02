@@ -1065,30 +1065,7 @@ impl SchemaManager {
     }
 
     pub fn add_label(&self, name: &str) -> Result<u16> {
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        if schema.labels.contains_key(name) {
-            return Err(anyhow!("Label '{}' already exists", name));
-        }
-
-        let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
-        if id >= VIRTUAL_LABEL_ID_START {
-            return Err(anyhow!(
-                "Native label space exhausted (next id {id:#x} would enter the \
-                 virtual range {VIRTUAL_LABEL_ID_START:#x}..{VIRTUAL_LABEL_ID_SENTINEL:#x} \
-                 reserved for catalog-resolved labels)"
-            ));
-        }
-        schema.labels.insert(
-            name.to_string(),
-            LabelMeta {
-                id,
-                created_at: Utc::now(),
-                state: SchemaElementState::Active,
-                description: None,
-            },
-        );
-        Ok(id)
+        self.add_label_with_desc(name, None)
     }
 
     pub fn add_label_with_desc(&self, name: &str, description: Option<String>) -> Result<u16> {
@@ -1124,35 +1101,7 @@ impl SchemaManager {
         src_labels: Vec<String>,
         dst_labels: Vec<String>,
     ) -> Result<u32> {
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        if schema.edge_types.contains_key(name) {
-            return Err(anyhow!("Edge type '{}' already exists", name));
-        }
-
-        let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
-
-        // Ensure we stay in the schema-defined sub-range (bit 31 = 0, and
-        // below the virtual reservation `VIRTUAL_EDGE_TYPE_ID_START`).
-        if id >= VIRTUAL_EDGE_TYPE_ID_START {
-            return Err(anyhow!(
-                "Native edge type space exhausted (next id {id:#x} would enter the \
-                 virtual range {VIRTUAL_EDGE_TYPE_ID_START:#x}..{VIRTUAL_EDGE_TYPE_ID_SENTINEL:#x} \
-                 reserved for catalog-resolved edge types)"
-            ));
-        }
-
-        schema.edge_types.insert(
-            name.to_string(),
-            EdgeTypeMeta {
-                id,
-                src_labels,
-                dst_labels,
-                state: SchemaElementState::Active,
-                description: None,
-            },
-        );
-        Ok(id)
+        self.add_edge_type_with_desc(name, src_labels, dst_labels, None)
     }
 
     pub fn add_edge_type_with_desc(
@@ -1170,8 +1119,16 @@ impl SchemaManager {
 
         let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
 
-        if id >= MAX_SCHEMA_TYPE_ID {
-            return Err(anyhow!("Schema edge type ID exhaustion"));
+        // Stay in the schema-defined sub-range (bit 31 = 0, and below the
+        // virtual reservation `VIRTUAL_EDGE_TYPE_ID_START`) — same bound as
+        // `add_edge_type`, so the two entry points cannot disagree on the
+        // legal ceiling.
+        if id >= VIRTUAL_EDGE_TYPE_ID_START {
+            return Err(anyhow!(
+                "Native edge type space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_EDGE_TYPE_ID_START:#x}..{VIRTUAL_EDGE_TYPE_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved edge types)"
+            ));
         }
 
         schema.edge_types.insert(
@@ -1209,35 +1166,7 @@ impl SchemaManager {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
-        validate_property_name(prop_name)?;
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        let version = schema.schema_version;
-        let props = schema
-            .properties
-            .entry(label_or_type.to_string())
-            .or_default();
-
-        if props.contains_key(prop_name) {
-            return Err(anyhow!(
-                "Property '{}' already exists for '{}'",
-                prop_name,
-                label_or_type
-            ));
-        }
-
-        props.insert(
-            prop_name.to_string(),
-            PropertyMeta {
-                r#type: data_type,
-                nullable,
-                added_in: version,
-                state: SchemaElementState::Active,
-                generation_expression: None,
-                description: None,
-            },
-        );
-        Ok(())
+        self.add_property_with_desc(label_or_type, prop_name, data_type, nullable, None)
     }
 
     pub fn add_property_with_desc(

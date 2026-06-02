@@ -8,7 +8,6 @@
 //! which performs unweighted BFS; this procedure honors edge weights via
 //! the configurable `weightProperty` projection knob.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, Dijkstra, DijkstraConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -85,11 +84,12 @@ impl GraphAlgoAdapter for DijkstraAdapter {
         Ok(rows)
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

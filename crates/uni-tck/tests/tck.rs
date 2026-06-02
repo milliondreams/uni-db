@@ -106,18 +106,12 @@ fn main() {
     }
 
     // For duplicate names, append @L<line> to disambiguate
-    let mut name_index: HashMap<String, usize> = HashMap::new();
     let tests: Vec<Trial> = scenarios
         .into_iter()
         .zip(base_names)
         .map(
             |((feature_path, scenario_name, scenario_line), base_name)| {
-                let ignored_reason = ignored_scenario_reason(
-                    &feature_path,
-                    &scenario_name,
-                    scenario_line,
-                    schema_mode,
-                );
+                let ignored_reason = ignored_scenario_reason(&feature_path, &scenario_name);
                 if let Some(reason) = ignored_reason {
                     // Ignored trials don't execute their closure, so emit a skipped
                     // result eagerly to keep JSON aggregation complete.
@@ -131,8 +125,6 @@ fn main() {
                 }
 
                 let test_name = if name_counts[&base_name] > 1 {
-                    let idx = name_index.entry(base_name.clone()).or_default();
-                    *idx += 1;
                     format!("{base_name} @L{scenario_line}")
                 } else {
                     base_name
@@ -150,22 +142,13 @@ fn main() {
     libtest_mimic::run(&args, tests).exit();
 }
 
-fn ignored_scenario_reason(
-    feature_path: &Path,
-    scenario_name: &str,
-    _scenario_line: usize,
-    _schema_mode: TckSchemaMode,
-) -> Option<&'static str> {
+fn ignored_scenario_reason(feature_path: &Path, scenario_name: &str) -> Option<&'static str> {
     let normalized_path = feature_path.to_string_lossy().replace('\\', "/");
     let is_hanging_literals7 = normalized_path
         .ends_with("tck/features/expressions/literals/Literals7.feature")
         && scenario_name.trim() == "[12] Return 40-deep nested empty lists";
 
-    if is_hanging_literals7 {
-        Some("Temporarily ignored in all modes: hangs in nextest run")
-    } else {
-        None
-    }
+    is_hanging_literals7.then_some("Temporarily ignored in all modes: hangs in nextest run")
 }
 
 /// Walk the feature directory and parse all `.feature` files, expanding

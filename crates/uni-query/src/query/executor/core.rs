@@ -45,6 +45,13 @@ fn numeric_to_value(val: f64) -> Value {
 }
 
 /// Cross-type ordering rank for Cypher min/max (lower rank = smaller).
+///
+/// NOTE: This is deliberately a *different* ordering from
+/// [`Executor::compare_values`] (used for `ORDER BY`). The two systems must
+/// not be merged: `min`/`max` follow the openCypher aggregation ordering
+/// (Null < List < String < Boolean < Number), whereas `ORDER BY` follows the
+/// openCypher comparability/ordering rules for sort, which rank the type
+/// families differently. Unifying them would silently break one or the other.
 fn cypher_type_rank(val: &Value) -> u8 {
     match val {
         Value::Null => 0,
@@ -503,6 +510,12 @@ impl Executor {
     }
 
     /// Total ordering for Cypher ORDER BY, including cross-type comparisons.
+    ///
+    /// NOTE: This uses a different cross-type rank from
+    /// [`cypher_cross_type_cmp`]/[`cypher_type_rank`] (the `min`/`max`
+    /// aggregation ordering). The divergence is intentional — sort ordering
+    /// and aggregation ordering follow distinct openCypher rules — so the two
+    /// must stay separate.
     pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 

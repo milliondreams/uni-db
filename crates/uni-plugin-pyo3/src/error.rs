@@ -46,27 +46,9 @@ pub enum PyPluginError {
     #[error("arrow <-> pyarrow conversion failure: {0}")]
     ArrowConversion(String),
 
-    /// Loader scaffolding shipped without a complete cutover for this
-    /// entry point. M8 sub-milestones close these.
-    #[error("uni-plugin-pyo3: {feature} not yet wired (M8 in progress)")]
-    NotYetImplemented {
-        /// The not-yet-wired feature.
-        feature: String,
-    },
-
     /// Internal / unexpected error.
     #[error("uni-plugin-pyo3 internal error: {0}")]
     Internal(String),
-}
-
-impl PyPluginError {
-    /// Construct a `NotYetImplemented` for the named feature.
-    #[must_use]
-    pub fn not_yet(feature: impl Into<String>) -> Self {
-        Self::NotYetImplemented {
-            feature: feature.into(),
-        }
-    }
 }
 
 #[cfg(feature = "pyo3")]

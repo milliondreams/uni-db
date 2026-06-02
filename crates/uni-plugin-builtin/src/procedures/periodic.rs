@@ -39,7 +39,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
 use futures::stream;
 use uni_plugin::scheduler::SchedulerControl;
 use uni_plugin::traits::background::Schedule;
@@ -282,7 +281,7 @@ pub fn register_into(
     for proc in PeriodicProc::ALL {
         r.procedure(
             proc.qname(),
-            proc.build_signature(),
+            proc.signature_cached().clone(),
             Arc::new(PeriodicProcPlugin::new(*proc, Arc::clone(&scheduler))),
         )?;
     }
@@ -429,29 +428,7 @@ fn commit_invoke(scheduler: &dyn SchedulerControl) -> Result<SendableRecordBatch
 }
 
 fn extract_utf8(args: &[ColumnarValue], idx: usize, field: &str) -> Result<String, FnError> {
-    match args.get(idx) {
-        Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))) => Ok(s.clone()),
-        Some(ColumnarValue::Array(arr)) => {
-            let a = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                FnError::new(
-                    FnError::CODE_TYPE_COERCION,
-                    format!("uni.periodic.*: arg `{field}` must be Utf8"),
-                )
-            })?;
-            if a.is_empty() || a.is_null(0) {
-                Err(FnError::new(
-                    FnError::CODE_UNEXPECTED_NULL,
-                    format!("uni.periodic.*: arg `{field}` must not be null"),
-                ))
-            } else {
-                Ok(a.value(0).to_owned())
-            }
-        }
-        _ => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("uni.periodic.*: missing or non-Utf8 arg `{field}`"),
-        )),
-    }
+    super::extract_utf8_arg(args, idx, "uni.periodic.*", field)
 }
 
 fn single_bool(name: &str, value: bool) -> Result<SendableRecordBatchStream, FnError> {
@@ -472,6 +449,7 @@ fn single_bool(name: &str, value: bool) -> Result<SendableRecordBatchStream, FnE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::scalar::ScalarValue;
     use parking_lot::Mutex;
     use uni_plugin::scheduler::SchedulerJobRecord;
 

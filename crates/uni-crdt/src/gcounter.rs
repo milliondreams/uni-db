@@ -51,9 +51,7 @@ impl CrdtMerge for GCounter {
     fn merge(&mut self, other: &Self) {
         for (actor, other_count) in &other.counts {
             let count = self.counts.entry(actor.clone()).or_insert(0);
-            if *other_count > *count {
-                *count = *other_count;
-            }
+            *count = (*count).max(*other_count);
         }
     }
 }

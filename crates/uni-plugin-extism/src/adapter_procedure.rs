@@ -26,9 +26,9 @@ use uni_plugin::adapter_common::arrow_types::argtype_to_arrow;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::procedure::{ProcedureContext, ProcedurePlugin, ProcedureSignature};
 
+use crate::adapter_common::{acquire, extism_err_to_fn_err, sanitize_qname};
 use crate::ipc::{decode_batches, encode_batch};
-use crate::pool::{ExtismInstancePool, PooledInstance};
-use uni_plugin_wasm_rt::IpcError;
+use crate::pool::ExtismInstancePool;
 
 /// Plugin-side procedure-invoke export name from a qname.
 ///
@@ -37,7 +37,7 @@ use uni_plugin_wasm_rt::IpcError;
 /// `.`). Matches the scalar / aggregate sanitization.
 #[must_use]
 pub(crate) fn proc_invoke_export_name(qname: &QName) -> String {
-    format!("proc_{}_invoke", qname.to_string().replace('.', "_"))
+    format!("proc_{}_invoke", sanitize_qname(qname))
 }
 
 /// `ProcedurePlugin` adapter wrapping an Extism plugin pool.
@@ -169,21 +169,6 @@ fn build_args_schema(sig: &ProcedureSignature) -> SchemaRef {
         .map(|(i, a)| Field::new(format!("arg{i}"), argtype_to_arrow(&a.ty), true))
         .collect();
     Arc::new(Schema::new(fields))
-}
-
-fn acquire(
-    pool: &Arc<ExtismInstancePool<extism::Plugin>>,
-) -> Result<PooledInstance<extism::Plugin>, FnError> {
-    PooledInstance::acquire(Arc::clone(pool)).map_err(|e| {
-        FnError::new(
-            FnError::CODE_RESOURCE_LIMIT,
-            format!("acquire plugin instance: {e}"),
-        )
-    })
-}
-
-fn extism_err_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("extism IPC: {e}"))
 }
 
 #[cfg(test)]

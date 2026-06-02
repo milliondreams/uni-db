@@ -8,10 +8,8 @@
 //! Uses BFS (unweighted) or Dijkstra (weighted) from every node.
 
 use crate::algo::GraphProjection;
-use crate::algo::algorithms::Algorithm;
+use crate::algo::algorithms::{Algorithm, dijkstra_distances};
 use rayon::prelude::*;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use uni_common::core::id::Vid;
 
 pub struct HarmonicCentrality;
@@ -50,40 +48,15 @@ impl Algorithm for HarmonicCentrality {
 }
 
 fn compute_harmonic_score(graph: &GraphProjection, start: u32) -> f64 {
-    let n = graph.vertex_count();
-    let mut dist = vec![f64::INFINITY; n];
-    let mut heap = BinaryHeap::new();
+    let dist = dijkstra_distances(graph, start);
 
-    dist[start as usize] = 0.0;
-    heap.push(Reverse((0.0f64.to_bits(), start)));
-
-    let mut sum_inv_dist = 0.0;
-
-    while let Some(Reverse((d_bits, u))) = heap.pop() {
-        let d = f64::from_bits(d_bits);
-        if d > dist[u as usize] {
-            continue;
-        }
-
-        if u != start && d > 0.0 {
-            sum_inv_dist += 1.0 / d;
-        }
-
-        for (i, &v) in graph.out_neighbors(u).iter().enumerate() {
-            let weight = if graph.has_weights() {
-                graph.out_weight(u, i)
-            } else {
-                1.0
-            };
-            let new_dist = d + weight;
-            if new_dist < dist[v as usize] {
-                dist[v as usize] = new_dist;
-                heap.push(Reverse((new_dist.to_bits(), v)));
-            }
-        }
-    }
-
-    sum_inv_dist
+    // Harmonic centrality: sum of 1/d(start, v) over all reachable
+    // v != start. Unreachable nodes (INFINITY) and the source itself
+    // (distance 0) contribute nothing.
+    dist.into_iter()
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|d| 1.0 / d)
+        .sum()
 }
 
 #[cfg(test)]

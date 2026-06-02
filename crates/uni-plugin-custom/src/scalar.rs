@@ -11,10 +11,8 @@
 
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type};
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 use datafusion::logical_expr::{ColumnarValue, Volatility};
 use uni_common::Value;
@@ -22,7 +20,8 @@ use uni_cypher::ast::Expr;
 use uni_plugin::FnError;
 use uni_plugin::traits::scalar::{ArgType, FnSignature, NullHandling, ScalarPluginFn};
 
-use crate::eval::{EvalError, eval_expr};
+use crate::decode::{array_value_at, eval_err_to_fn, stringify};
+use crate::eval::eval_expr;
 
 /// A scalar function declared from Cypher via
 /// `uni.plugin.declareFunction`.
@@ -120,95 +119,12 @@ impl ScalarPluginFn for DeclaredScalarFn {
     }
 }
 
-fn eval_err_to_fn(e: EvalError) -> FnError {
-    let code = match &e {
-        EvalError::UnboundParameter(_) => 0xB10,
-        EvalError::Unsupported(_) => 0xB11,
-        EvalError::TypeMismatch { .. } => FnError::CODE_TYPE_COERCION,
-        EvalError::Arithmetic(_) => 0xB12,
-    };
-    FnError::new(code, e.to_string())
-}
-
 fn columnar_to_array(cv: &ColumnarValue, rows: usize) -> Result<ArrayRef, FnError> {
     match cv {
         ColumnarValue::Array(a) => Ok(Arc::clone(a)),
         ColumnarValue::Scalar(s) => s
             .to_array_of_size(rows)
             .map_err(|e| FnError::new(FnError::CODE_TYPE_COERCION, format!("scalar→array: {e}"))),
-    }
-}
-
-fn array_value_at(arr: &ArrayRef, row: usize) -> Result<Value, FnError> {
-    if row >= arr.len() {
-        return Ok(Value::Null);
-    }
-    if arr.is_null(row) {
-        return Ok(Value::Null);
-    }
-    match arr.data_type() {
-        DataType::Utf8 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Utf8 downcast"))?;
-            Ok(Value::String(a.value(row).to_owned()))
-        }
-        DataType::Int64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int64 downcast"))?;
-            Ok(Value::Int(a.value(row)))
-        }
-        DataType::Int32 => {
-            let a = arr.as_primitive_opt::<Int64Type>();
-            match a {
-                Some(a) => Ok(Value::Int(a.value(row))),
-                None => {
-                    let i32a = arr
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int32Array>()
-                        .ok_or_else(|| {
-                            FnError::new(FnError::CODE_TYPE_COERCION, "Int32 downcast")
-                        })?;
-                    Ok(Value::Int(i64::from(i32a.value(row))))
-                }
-            }
-        }
-        DataType::Float64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float64 downcast"))?;
-            Ok(Value::Float(a.value(row)))
-        }
-        DataType::Float32 => {
-            let a = arr.as_primitive_opt::<Float64Type>();
-            match a {
-                Some(a) => Ok(Value::Float(a.value(row))),
-                None => {
-                    let f32a = arr
-                        .as_any()
-                        .downcast_ref::<arrow_array::Float32Array>()
-                        .ok_or_else(|| {
-                            FnError::new(FnError::CODE_TYPE_COERCION, "Float32 downcast")
-                        })?;
-                    Ok(Value::Float(f64::from(f32a.value(row))))
-                }
-            }
-        }
-        DataType::Boolean => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Bool downcast"))?;
-            Ok(Value::Bool(a.value(row)))
-        }
-        other => Err(FnError::new(
-            FnError::CODE_TYPE_COERCION,
-            format!("declared fn input type {other:?} not supported"),
-        )),
     }
 }
 
@@ -286,20 +202,10 @@ fn build_output(
     }
 }
 
-fn stringify(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::String(s) => s.clone(),
-        other => format!("{other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, StringArray};
     use datafusion::scalar::ScalarValue;
     use uni_cypher::parse_expression;
 

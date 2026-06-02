@@ -28,9 +28,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -43,7 +42,7 @@ use smol_str::SmolStr;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::procedure::{ProcedureContext, ProcedurePlugin, ProcedureSignature};
 
-use crate::adapter_scalar_helpers::py_to_scalar;
+use crate::adapter_scalar_helpers::{PrimitiveColumnBuilder, classify_pyerr};
 use crate::runtime::PyPluginRuntime;
 
 /// Procedure adapter dispatching to a Python callable held in
@@ -119,10 +118,10 @@ impl ProcedurePlugin for PyProcedure {
             }
             let bound = callable.bind(py);
             let tuple = pyo3::types::PyTuple::new(py, py_args)
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x830, "procedure ", local_name.as_str(), e))?;
             let result = bound
                 .call1(tuple)
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x830, "procedure ", local_name.as_str(), e))?;
             build_record_batch_from_dicts(&result, schema.clone(), local_name.as_str())
         })?;
 
@@ -173,16 +172,18 @@ fn build_record_batch_from_dicts(
     schema: SchemaRef,
     qname: &str,
 ) -> Result<RecordBatch, FnError> {
-    let mut builders: Vec<ColumnBuilder> = schema
+    let mut builders: Vec<PrimitiveColumnBuilder> = schema
         .fields()
         .iter()
-        .map(|f| ColumnBuilder::new(f.data_type()))
+        .map(|f| PrimitiveColumnBuilder::new(f.data_type(), 0, 0x830, "PyO3 procedure: yield type"))
         .collect::<Result<_, FnError>>()?;
 
-    let iter = obj.try_iter().map_err(|e| classify_pyerr(qname, e))?;
+    let iter = obj
+        .try_iter()
+        .map_err(|e| classify_pyerr(0x830, "procedure ", qname, e))?;
     let mut row_count: usize = 0;
     for item in iter {
-        let row = item.map_err(|e| classify_pyerr(qname, e))?;
+        let row = item.map_err(|e| classify_pyerr(0x830, "procedure ", qname, e))?;
         let dict = row.cast::<PyDict>().map_err(|_| {
             FnError::new(
                 0x831,
@@ -191,10 +192,12 @@ fn build_record_batch_from_dicts(
         })?;
         for (i, field) in schema.fields().iter().enumerate() {
             let name = field.name();
-            let value = dict.get_item(name).map_err(|e| classify_pyerr(qname, e))?;
+            let value = dict
+                .get_item(name)
+                .map_err(|e| classify_pyerr(0x830, "procedure ", qname, e))?;
             match value {
                 Some(v) if !v.is_none() => {
-                    builders[i].push_py(&v, qname)?;
+                    builders[i].push_py(&v, 0x830, "procedure ", qname)?;
                 }
                 _ => builders[i].push_null(),
             }
@@ -202,7 +205,10 @@ fn build_record_batch_from_dicts(
         row_count += 1;
     }
 
-    let columns: Vec<ArrayRef> = builders.into_iter().map(ColumnBuilder::finish).collect();
+    let columns: Vec<ArrayRef> = builders
+        .into_iter()
+        .map(PrimitiveColumnBuilder::finish)
+        .collect();
     RecordBatch::try_new(schema, columns).map_err(|e| {
         FnError::new(
             0x832,
@@ -211,107 +217,11 @@ fn build_record_batch_from_dicts(
     })
 }
 
-/// Per-column builder dispatching by Arrow datatype.
-#[derive(Debug)]
-enum ColumnBuilder {
-    Float64(Float64Builder),
-    Int64(Int64Builder),
-    Utf8(StringBuilder),
-    Boolean(BooleanBuilder),
-}
-
-impl ColumnBuilder {
-    fn new(dt: &DataType) -> Result<Self, FnError> {
-        Ok(match dt {
-            DataType::Float64 => ColumnBuilder::Float64(Float64Builder::with_capacity(0)),
-            DataType::Int64 => ColumnBuilder::Int64(Int64Builder::with_capacity(0)),
-            DataType::Utf8 => ColumnBuilder::Utf8(StringBuilder::with_capacity(0, 0)),
-            DataType::Boolean => ColumnBuilder::Boolean(BooleanBuilder::with_capacity(0)),
-            other => {
-                return Err(FnError::new(
-                    0x830,
-                    format!(
-                        "PyO3 procedure: yield type `{other}` not yet supported \
-                         (v1 covers Float64/Int64/Utf8/Boolean)"
-                    ),
-                ));
-            }
-        })
-    }
-
-    fn push_null(&mut self) {
-        match self {
-            ColumnBuilder::Float64(b) => b.append_null(),
-            ColumnBuilder::Int64(b) => b.append_null(),
-            ColumnBuilder::Utf8(b) => b.append_null(),
-            ColumnBuilder::Boolean(b) => b.append_null(),
-        }
-    }
-
-    fn push_py(&mut self, value: &Bound<'_, PyAny>, qname: &str) -> Result<(), FnError> {
-        let dt = match self {
-            ColumnBuilder::Float64(_) => DataType::Float64,
-            ColumnBuilder::Int64(_) => DataType::Int64,
-            ColumnBuilder::Utf8(_) => DataType::Utf8,
-            ColumnBuilder::Boolean(_) => DataType::Boolean,
-        };
-        let scalar = py_to_scalar(value, &dt).map_err(|mut e| {
-            e.message = format!("PyO3 procedure `{qname}`: {}", e.message);
-            e
-        })?;
-        match (self, scalar) {
-            (ColumnBuilder::Float64(b), ScalarValue::Float64(Some(v))) => b.append_value(v),
-            (ColumnBuilder::Float64(b), ScalarValue::Float64(None)) => b.append_null(),
-            (ColumnBuilder::Int64(b), ScalarValue::Int64(Some(v))) => b.append_value(v),
-            (ColumnBuilder::Int64(b), ScalarValue::Int64(None)) => b.append_null(),
-            (ColumnBuilder::Utf8(b), ScalarValue::Utf8(Some(v))) => b.append_value(v),
-            (ColumnBuilder::Utf8(b), ScalarValue::Utf8(None)) => b.append_null(),
-            (ColumnBuilder::Boolean(b), ScalarValue::Boolean(Some(v))) => b.append_value(v),
-            (ColumnBuilder::Boolean(b), ScalarValue::Boolean(None)) => b.append_null(),
-            (_, other) => {
-                return Err(FnError::new(
-                    0x83,
-                    format!("py_to_scalar returned unexpected variant for procedure: {other:?}"),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> ArrayRef {
-        match self {
-            ColumnBuilder::Float64(mut b) => Arc::new(b.finish()),
-            ColumnBuilder::Int64(mut b) => Arc::new(b.finish()),
-            ColumnBuilder::Utf8(mut b) => Arc::new(b.finish()),
-            ColumnBuilder::Boolean(mut b) => Arc::new(b.finish()),
-        }
-    }
-}
-
-fn classify_pyerr(qname: &str, e: PyErr) -> FnError {
-    use pyo3::types::PyTracebackMethods;
-    Python::attach(|py| {
-        let traceback = e
-            .traceback(py)
-            .and_then(|tb| tb.format().ok())
-            .unwrap_or_default();
-        let value = e.value(py);
-        let msg = value
-            .repr()
-            .map(|r| r.to_string())
-            .unwrap_or_else(|_| e.to_string());
-        FnError::new(
-            0x830,
-            format!("PyO3 procedure `{qname}`: {msg}\n{traceback}"),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Array, Float64Array, Int64Array, StringArray};
-    use arrow_schema::Field;
+    use arrow_schema::{DataType, Field};
     use futures::StreamExt;
     use std::ffi::CString;
     use uni_plugin::PluginId;

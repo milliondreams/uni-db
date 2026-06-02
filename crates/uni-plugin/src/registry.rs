@@ -200,43 +200,100 @@ impl std::fmt::Debug for VirtualEntry {
     }
 }
 
-/// Inner mutable state for the virtual label-ID allocator. Held behind
-/// a `parking_lot::Mutex` because allocations are rare (one per first
-/// reference to a previously-unseen label name) and the contention
-/// surface is tiny.
-#[derive(Debug)]
-struct VirtualLabelInner {
-    name_to_id: HashMap<SmolStr, u16>,
-    id_to_entry: HashMap<u16, VirtualEntry>,
-    next_id: u16,
+/// A virtual identifier type (label `u16` or edge-type `u32`) that the
+/// allocator can hand out. Captures the per-type `START`/`SENTINEL`
+/// bounds and the saturating increment so the allocator body can be
+/// written once, generically.
+trait VirtualId:
+    Copy + Eq + Ord + std::hash::Hash + std::fmt::Debug + std::fmt::LowerHex + 'static
+{
+    /// First ID handed out (inclusive lower bound of the virtual range).
+    const START: Self;
+    /// Reserved upper bound (exclusive); reaching it means the space is
+    /// exhausted.
+    const SENTINEL: Self;
+    /// Human-facing label for the kind of identifier, used in the
+    /// exhaustion error message (e.g. `"label"`, `"edge-type"`).
+    const KIND_LABEL: &'static str;
+
+    /// Increment without overflow (the allocator never relies on the
+    /// wrapped value because it bails at `SENTINEL` first).
+    fn next(self) -> Self;
 }
 
-impl Default for VirtualLabelInner {
+impl VirtualId for u16 {
+    const START: Self = uni_common::core::schema::VIRTUAL_LABEL_ID_START;
+    const SENTINEL: Self = uni_common::core::schema::VIRTUAL_LABEL_ID_SENTINEL;
+    const KIND_LABEL: &'static str = "label";
+
+    fn next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+impl VirtualId for u32 {
+    const START: Self = uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_START;
+    const SENTINEL: Self = uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_SENTINEL;
+    const KIND_LABEL: &'static str = "edge-type";
+
+    fn next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+/// Inner mutable state for a virtual-ID allocator (labels use `u16`,
+/// edge-types use `u32`). Held behind a `parking_lot::Mutex` because
+/// allocations are rare (one per first reference to a previously-unseen
+/// name) and the contention surface is tiny.
+#[derive(Debug)]
+struct VirtualIdSpace<Id: VirtualId> {
+    name_to_id: HashMap<SmolStr, Id>,
+    id_to_entry: HashMap<Id, VirtualEntry>,
+    next_id: Id,
+}
+
+impl<Id: VirtualId> Default for VirtualIdSpace<Id> {
     fn default() -> Self {
         Self {
             name_to_id: HashMap::new(),
             id_to_entry: HashMap::new(),
-            next_id: uni_common::core::schema::VIRTUAL_LABEL_ID_START,
+            next_id: Id::START,
         }
     }
 }
 
-/// Inner mutable state for the virtual edge-type-ID allocator. Same
-/// shape as `VirtualLabelInner` but with `u32` IDs.
-#[derive(Debug)]
-struct VirtualEdgeTypeInner {
-    name_to_id: HashMap<SmolStr, u32>,
-    id_to_entry: HashMap<u32, VirtualEntry>,
-    next_id: u32,
-}
-
-impl Default for VirtualEdgeTypeInner {
-    fn default() -> Self {
-        Self {
-            name_to_id: HashMap::new(),
-            id_to_entry: HashMap::new(),
-            next_id: uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_START,
+impl<Id: VirtualId> VirtualIdSpace<Id> {
+    /// Allocate (or look up) an ID for `name`, replacing the stored
+    /// table on re-registration. Returns `Err` when the virtual range is
+    /// exhausted.
+    fn register(
+        &mut self,
+        name: SmolStr,
+        table: Arc<dyn crate::traits::catalog::CatalogTable>,
+    ) -> Result<Id, PluginError> {
+        if let Some(&id) = self.name_to_id.get(&name) {
+            self.id_to_entry.insert(
+                id,
+                VirtualEntry {
+                    name: name.clone(),
+                    table,
+                },
+            );
+            return Ok(id);
         }
+        if self.next_id >= Id::SENTINEL {
+            return Err(PluginError::Internal(format!(
+                "virtual {}-ID space exhausted ({} slots taken; sentinel {:#x})",
+                Id::KIND_LABEL,
+                self.id_to_entry.len(),
+                Id::SENTINEL,
+            )));
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.next();
+        self.name_to_id.insert(name.clone(), id);
+        self.id_to_entry.insert(id, VirtualEntry { name, table });
+        Ok(id)
     }
 }
 
@@ -345,6 +402,41 @@ pub struct PluginRecordSnapshot {
     pub background_job_count: usize,
 }
 
+impl From<&PluginRecord> for PluginRecordSnapshot {
+    /// Deep-clone a live `PluginRecord` into a standalone snapshot. The
+    /// field list lives only on the two struct definitions; this clones
+    /// each (`Vec`s deep-clone their elements, counts are `Copy`).
+    fn from(r: &PluginRecord) -> Self {
+        Self {
+            scalars: r.scalars.clone(),
+            aggregates: r.aggregates.clone(),
+            windows: r.windows.clone(),
+            procedures: r.procedures.clone(),
+            locy_aggregates: r.locy_aggregates.clone(),
+            locy_predicates: r.locy_predicates.clone(),
+            operators: r.operators.clone(),
+            algorithms: r.algorithms.clone(),
+            pregels: r.pregels.clone(),
+            index_kinds: r.index_kinds.clone(),
+            storage_schemes: r.storage_schemes.clone(),
+            label_storages: r.label_storages.clone(),
+            crdt_kinds: r.crdt_kinds.clone(),
+            logical_types: r.logical_types.clone(),
+            collations: r.collations.clone(),
+            cdc_outputs: r.cdc_outputs.clone(),
+            catalogs: r.catalogs.clone(),
+            hook_count: r.hook_count,
+            auth_count: r.auth_count,
+            authz_count: r.authz_count,
+            connector_count: r.connector_count,
+            trigger_count: r.trigger_count,
+            replacement_scan_count: r.replacement_scan_count,
+            optimizer_rule_count: r.optimizer_rule_count,
+            background_job_count: r.background_job_count,
+        }
+    }
+}
+
 /// All-surfaces plugin registry.
 ///
 /// Per-surface tables wrapped in `arc-swap` for wait-free reads. The
@@ -399,11 +491,11 @@ pub struct PluginRegistry {
     /// VIRTUAL_LABEL_ID_SENTINEL`) on first observation of an unknown label
     /// name that a `CatalogProvider` or `ReplacementScanProvider` claims.
     /// See [`Self::register_virtual_label`] / [`Self::virtual_label_by_id`].
-    virtual_labels: Mutex<VirtualLabelInner>,
+    virtual_labels: Mutex<VirtualIdSpace<u16>>,
     /// Virtual edge-type allocator. Allocates IDs in
     /// `uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_START..
     /// VIRTUAL_EDGE_TYPE_ID_SENTINEL`. Same first-observation semantics.
-    virtual_edge_types: Mutex<VirtualEdgeTypeInner>,
+    virtual_edge_types: Mutex<VirtualIdSpace<u32>>,
     per_plugin: RwLock<dashmap::DashMap<PluginId, PluginRecord>>,
 }
 
@@ -663,30 +755,7 @@ impl PluginRegistry {
         name: impl Into<SmolStr>,
         table: Arc<dyn crate::traits::catalog::CatalogTable>,
     ) -> Result<u16, PluginError> {
-        let name = name.into();
-        let mut inner = self.virtual_labels.lock();
-        if let Some(&id) = inner.name_to_id.get(&name) {
-            inner.id_to_entry.insert(
-                id,
-                VirtualEntry {
-                    name: name.clone(),
-                    table,
-                },
-            );
-            return Ok(id);
-        }
-        if inner.next_id == uni_common::core::schema::VIRTUAL_LABEL_ID_SENTINEL {
-            return Err(PluginError::Internal(format!(
-                "virtual label-ID space exhausted ({} slots taken; sentinel {:#x})",
-                inner.id_to_entry.len(),
-                uni_common::core::schema::VIRTUAL_LABEL_ID_SENTINEL
-            )));
-        }
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.saturating_add(1);
-        inner.name_to_id.insert(name.clone(), id);
-        inner.id_to_entry.insert(id, VirtualEntry { name, table });
-        Ok(id)
+        self.virtual_labels.lock().register(name.into(), table)
     }
 
     /// Look up a virtual label by name. Returns `None` if no provider
@@ -713,30 +782,7 @@ impl PluginRegistry {
         name: impl Into<SmolStr>,
         table: Arc<dyn crate::traits::catalog::CatalogTable>,
     ) -> Result<u32, PluginError> {
-        let name = name.into();
-        let mut inner = self.virtual_edge_types.lock();
-        if let Some(&id) = inner.name_to_id.get(&name) {
-            inner.id_to_entry.insert(
-                id,
-                VirtualEntry {
-                    name: name.clone(),
-                    table,
-                },
-            );
-            return Ok(id);
-        }
-        if inner.next_id >= uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_SENTINEL {
-            return Err(PluginError::Internal(format!(
-                "virtual edge-type-ID space exhausted ({} slots taken; sentinel {:#x})",
-                inner.id_to_entry.len(),
-                uni_common::core::edge_type::VIRTUAL_EDGE_TYPE_ID_SENTINEL
-            )));
-        }
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.saturating_add(1);
-        inner.name_to_id.insert(name.clone(), id);
-        inner.id_to_entry.insert(id, VirtualEntry { name, table });
-        Ok(id)
+        self.virtual_edge_types.lock().register(name.into(), table)
     }
 
     /// Look up a virtual edge type by name.
@@ -905,33 +951,7 @@ impl PluginRegistry {
     #[must_use]
     pub fn iter_for_plugin(&self, plugin: &PluginId) -> Option<PluginRecordSnapshot> {
         let guard = self.per_plugin.read();
-        guard.get(plugin).map(|r| PluginRecordSnapshot {
-            scalars: r.scalars.clone(),
-            aggregates: r.aggregates.clone(),
-            windows: r.windows.clone(),
-            procedures: r.procedures.clone(),
-            locy_aggregates: r.locy_aggregates.clone(),
-            locy_predicates: r.locy_predicates.clone(),
-            operators: r.operators.clone(),
-            algorithms: r.algorithms.clone(),
-            pregels: r.pregels.clone(),
-            index_kinds: r.index_kinds.clone(),
-            storage_schemes: r.storage_schemes.clone(),
-            label_storages: r.label_storages.clone(),
-            crdt_kinds: r.crdt_kinds.clone(),
-            logical_types: r.logical_types.clone(),
-            collations: r.collations.clone(),
-            cdc_outputs: r.cdc_outputs.clone(),
-            catalogs: r.catalogs.clone(),
-            hook_count: r.hook_count,
-            auth_count: r.auth_count,
-            authz_count: r.authz_count,
-            connector_count: r.connector_count,
-            trigger_count: r.trigger_count,
-            replacement_scan_count: r.replacement_scan_count,
-            optimizer_rule_count: r.optimizer_rule_count,
-            background_job_count: r.background_job_count,
-        })
+        guard.get(plugin).map(|r| PluginRecordSnapshot::from(&*r))
     }
 
     /// Remove all registrations for the given plugin.

@@ -36,10 +36,6 @@ impl GraphAlgoAdapter for GraphColoringAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type GraphColoringProcedure = GenericAlgoProcedure<GraphColoringAdapter>;

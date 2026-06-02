@@ -17,7 +17,47 @@
 pub mod periodic;
 pub mod system;
 
-use uni_plugin::{PluginError, PluginRegistrar};
+use arrow_array::{Array, StringArray};
+use datafusion::logical_expr::ColumnarValue;
+use datafusion::scalar::ScalarValue;
+use uni_plugin::{FnError, PluginError, PluginRegistrar};
+
+/// Extract a non-null Utf8 argument at `idx` from a procedure's
+/// `ColumnarValue` arguments.
+///
+/// Accepts both a `Utf8` scalar and the first row of a `StringArray`.
+/// `prefix` names the procedure (e.g. `"uni.system.echo"`) and `field`
+/// names the argument (e.g. `"message"`) for the error messages.
+pub(crate) fn extract_utf8_arg(
+    args: &[ColumnarValue],
+    idx: usize,
+    prefix: &str,
+    field: &str,
+) -> Result<String, FnError> {
+    match args.get(idx) {
+        Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))) => Ok(s.clone()),
+        Some(ColumnarValue::Array(arr)) => {
+            let a = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                FnError::new(
+                    FnError::CODE_TYPE_COERCION,
+                    format!("{prefix}: arg `{field}` must be Utf8"),
+                )
+            })?;
+            if a.is_empty() || a.is_null(0) {
+                Err(FnError::new(
+                    FnError::CODE_UNEXPECTED_NULL,
+                    format!("{prefix}: arg `{field}` must not be null"),
+                ))
+            } else {
+                Ok(a.value(0).to_owned())
+            }
+        }
+        _ => Err(FnError::new(
+            FnError::CODE_TYPE_COERCION,
+            format!("{prefix}: missing or non-Utf8 arg `{field}`"),
+        )),
+    }
+}
 
 /// Register all built-in procedures into `r`.
 ///

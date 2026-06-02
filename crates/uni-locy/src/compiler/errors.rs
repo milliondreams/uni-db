@@ -67,9 +67,6 @@ pub enum LocyCompileError {
     #[error("model name collision: '{name}' is already declared")]
     ModelNameCollision { name: String },
 
-    #[error("unknown model '{name}' invoked in rule '{rule}'; declare it with CREATE MODEL first")]
-    UnknownModel { name: String, rule: String },
-
     #[error(
         "model '{name}' arity mismatch in rule '{rule}': expected {expected} input(s), got {actual}"
     )]
@@ -78,17 +75,6 @@ pub enum LocyCompileError {
         rule: String,
         expected: usize,
         actual: usize,
-    },
-
-    #[error(
-        "model '{name}' output type mismatch in rule '{rule}': declared as {declared:?}, \
-         but used as {expected:?}"
-    )]
-    ModelOutputTypeMismatch {
-        name: String,
-        rule: String,
-        declared: String,
-        expected: String,
     },
 
     // ─── Phase C C2: CALIBRATE statement ────────────────────────────────

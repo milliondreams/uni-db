@@ -42,6 +42,22 @@ use uni_plugin::traits::crdt::{CrdtKind, CrdtOp};
 use crate::{Crdt, CrdtError};
 
 impl Crdt {
+    /// Error out unless `self` and `other` are the same `Crdt` variant.
+    ///
+    /// Shared by the registry path and the native [`Self::try_merge`]
+    /// fallback so the [`CrdtError::TypeMismatch`] message is produced in
+    /// exactly one place.
+    fn ensure_same_kind(&self, other: &Self) -> Result<(), CrdtError> {
+        if std::mem::discriminant(self) == std::mem::discriminant(other) {
+            Ok(())
+        } else {
+            Err(CrdtError::TypeMismatch(
+                self.type_name().to_owned(),
+                other.type_name().to_owned(),
+            ))
+        }
+    }
+
     /// The canonical [`CrdtKind`] this variant maps to.
     ///
     /// Used by [`Self::merge_via_registry`] to look up the provider.
@@ -80,12 +96,7 @@ impl Crdt {
         other: &Self,
         registry: &PluginRegistry,
     ) -> Result<(), CrdtError> {
-        if std::mem::discriminant(self) != std::mem::discriminant(other) {
-            return Err(CrdtError::TypeMismatch(
-                self.type_name().to_owned(),
-                other.type_name().to_owned(),
-            ));
-        }
+        self.ensure_same_kind(other)?;
 
         let kind = self.kind();
         let Some(provider) = registry.crdt_kind(&kind) else {

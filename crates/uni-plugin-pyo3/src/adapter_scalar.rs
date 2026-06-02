@@ -21,7 +21,6 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use datafusion::logical_expr::ColumnarValue;
@@ -32,7 +31,7 @@ use smol_str::SmolStr;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::scalar::{ArgType, FnSignature, NullHandling, ScalarPluginFn};
 
-use crate::adapter_scalar_helpers::scalar_to_py;
+use crate::adapter_scalar_helpers::{PrimitiveColumnBuilder, classify_pyerr, scalar_to_py};
 use crate::arrow_bridge::{arrow_array_to_pyarrow, assert_array_datatype, pyarrow_to_arrow_array};
 use crate::runtime::PyPluginRuntime;
 
@@ -146,11 +145,11 @@ impl PyScalarFn {
                 py_args.push(py_arr);
             }
             let bound = callable.bind(py);
-            let tuple =
-                PyTuple::new(py, py_args).map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+            let tuple = PyTuple::new(py, py_args)
+                .map_err(|e| classify_pyerr(0x820, "", local_name.as_str(), e))?;
             let result = bound
                 .call1(tuple)
-                .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                .map_err(|e| classify_pyerr(0x820, "", local_name.as_str(), e))?;
             let array = pyarrow_to_arrow_array(py, &result)
                 .map_err(|e| FnError::new(0x84, e.to_string()))?;
             assert_array_datatype(array.as_ref(), &ret_ty)
@@ -183,7 +182,8 @@ impl PyScalarFn {
 
         Python::attach(|py| -> Result<ColumnarValue, FnError> {
             let bound = callable.bind(py);
-            let mut out = ScalarBuilder::new(&ret_ty, rows)?;
+            let mut out =
+                PrimitiveColumnBuilder::new(&ret_ty, rows, 0x83, "PyO3 row-mode: return type")?;
             for row in 0..rows {
                 // Build per-row Python args. Propagate NULLs by short-
                 // circuiting to null output when any arg is null and
@@ -211,11 +211,11 @@ impl PyScalarFn {
                     continue;
                 }
                 let tuple = PyTuple::new(py, py_args)
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
+                    .map_err(|e| classify_pyerr(0x820, "", local_name.as_str(), e))?;
                 let result = bound
                     .call1(tuple)
-                    .map_err(|e| classify_pyerr(local_name.as_str(), e))?;
-                out.push_py_value(&result, &local_name)?;
+                    .map_err(|e| classify_pyerr(0x820, "", local_name.as_str(), e))?;
+                out.push_py(&result, 0x820, "", &local_name)?;
             }
             Ok(ColumnarValue::Array(out.finish()))
         })
@@ -232,96 +232,6 @@ fn materialize_args(args: &[ColumnarValue], rows: usize) -> Result<Vec<ArrayRef>
                 .map_err(|e| FnError::new(0x83, format!("scalar→array: {e}"))),
         })
         .collect()
-}
-
-/// Per-batch output builder for the row-mode scalar adapter.
-#[derive(Debug)]
-enum ScalarBuilder {
-    Float64(Float64Builder),
-    Int64(Int64Builder),
-    Utf8(StringBuilder),
-    Boolean(BooleanBuilder),
-}
-
-impl ScalarBuilder {
-    fn new(ret_ty: &DataType, capacity: usize) -> Result<Self, FnError> {
-        Ok(match ret_ty {
-            DataType::Float64 => ScalarBuilder::Float64(Float64Builder::with_capacity(capacity)),
-            DataType::Int64 => ScalarBuilder::Int64(Int64Builder::with_capacity(capacity)),
-            DataType::Utf8 => ScalarBuilder::Utf8(StringBuilder::with_capacity(capacity, 0)),
-            DataType::Boolean => ScalarBuilder::Boolean(BooleanBuilder::with_capacity(capacity)),
-            other => {
-                return Err(FnError::new(
-                    0x83,
-                    format!(
-                        "PyO3 row-mode: return type `{other}` not yet supported \
-                         (v1 covers Float64/Int64/Utf8/Boolean)"
-                    ),
-                ));
-            }
-        })
-    }
-
-    fn push_null(&mut self) {
-        match self {
-            ScalarBuilder::Float64(b) => b.append_null(),
-            ScalarBuilder::Int64(b) => b.append_null(),
-            ScalarBuilder::Utf8(b) => b.append_null(),
-            ScalarBuilder::Boolean(b) => b.append_null(),
-        }
-    }
-
-    fn push_py_value(&mut self, value: &Bound<'_, PyAny>, qname: &str) -> Result<(), FnError> {
-        if value.is_none() {
-            self.push_null();
-            return Ok(());
-        }
-        match self {
-            ScalarBuilder::Float64(b) => {
-                let v: f64 = value.extract().map_err(|e| classify_pyerr(qname, e))?;
-                b.append_value(v);
-            }
-            ScalarBuilder::Int64(b) => {
-                let v: i64 = value.extract().map_err(|e| classify_pyerr(qname, e))?;
-                b.append_value(v);
-            }
-            ScalarBuilder::Utf8(b) => {
-                let v: String = value.extract().map_err(|e| classify_pyerr(qname, e))?;
-                b.append_value(v);
-            }
-            ScalarBuilder::Boolean(b) => {
-                let v: bool = value.extract().map_err(|e| classify_pyerr(qname, e))?;
-                b.append_value(v);
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> ArrayRef {
-        match self {
-            ScalarBuilder::Float64(mut b) => Arc::new(b.finish()),
-            ScalarBuilder::Int64(mut b) => Arc::new(b.finish()),
-            ScalarBuilder::Utf8(mut b) => Arc::new(b.finish()),
-            ScalarBuilder::Boolean(mut b) => Arc::new(b.finish()),
-        }
-    }
-}
-
-/// Map a `PyErr` into an `FnError` in the `0x82–0x8F` family.
-fn classify_pyerr(qname: &str, e: PyErr) -> FnError {
-    use pyo3::types::PyTracebackMethods;
-    Python::attach(|py| {
-        let traceback = e
-            .traceback(py)
-            .and_then(|tb| tb.format().ok())
-            .unwrap_or_default();
-        let value = e.value(py);
-        let msg = value
-            .repr()
-            .map(|r| r.to_string())
-            .unwrap_or_else(|_| e.to_string());
-        FnError::new(0x820, format!("PyO3 `{qname}`: {msg}\n{traceback}"))
-    })
 }
 
 #[cfg(test)]

@@ -65,10 +65,8 @@ pub mod locy_slg;
 pub mod locy_traits;
 pub mod locy_validate;
 pub mod mutation_common;
-pub mod mutation_create;
 pub mod mutation_delete;
 pub mod mutation_foreach;
-pub mod mutation_merge;
 pub mod mutation_remove;
 pub mod mutation_set;
 pub mod nfa;
@@ -109,11 +107,15 @@ use crate::types::QueryWarning;
 
 pub use apply::GraphApplyExec;
 pub use ext_id_lookup::GraphExtIdLookupExec;
-pub use mutation_common::{MutationContext, MutationExec};
-pub use mutation_create::MutationCreateExec;
+// CREATE and MERGE both execute through `MutationExec`; these aliases and
+// the `new_*_exec` builders are re-exported here so the planner can refer to
+// them by their clause-specific names without a dedicated module each.
+pub use mutation_common::{
+    MutationContext, MutationExec, MutationExec as MutationCreateExec,
+    MutationExec as MutationMergeExec, new_create_exec, new_merge_exec,
+};
 pub use mutation_delete::MutationDeleteExec;
 pub use mutation_foreach::ForeachExec;
-pub use mutation_merge::MutationMergeExec;
 pub use mutation_remove::MutationRemoveExec;
 pub use mutation_set::MutationSetExec;
 pub use optional_filter::OptionalFilterExec;
@@ -271,6 +273,31 @@ impl L0Context {
 }
 
 impl GraphExecutionContext {
+    /// Shared constructor for the public entry points. The three public
+    /// constructors differ only in the L0 visibility context, deadline,
+    /// and cancellation token; every other field starts at its default.
+    fn with_parts(
+        storage: Arc<StorageManager>,
+        l0_context: L0Context,
+        property_manager: Arc<PropertyManager>,
+        deadline: Option<Instant>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            storage,
+            l0_context,
+            property_manager,
+            deadline,
+            algo_registry: None,
+            procedure_registry: None,
+            plugin_registry: None,
+            xervo_runtime: None,
+            warnings: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token,
+            writer: None,
+        }
+    }
+
     /// Create a new graph execution context.
     ///
     /// # Arguments
@@ -283,19 +310,13 @@ impl GraphExecutionContext {
         l0: Arc<RwLock<L0Buffer>>,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
+        Self::with_parts(
             storage,
-            l0_context: L0Context::with_current(l0),
+            L0Context::with_current(l0),
             property_manager,
-            deadline: None,
-            algo_registry: None,
-            procedure_registry: None,
-            plugin_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: None,
-            writer: None,
-        }
+            None,
+            None,
+        )
     }
 
     /// Create context with full L0 visibility.
@@ -310,19 +331,7 @@ impl GraphExecutionContext {
         l0_context: L0Context,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
-            storage,
-            l0_context,
-            property_manager,
-            deadline: None,
-            algo_registry: None,
-            procedure_registry: None,
-            plugin_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: None,
-            writer: None,
-        }
+        Self::with_parts(storage, l0_context, property_manager, None, None)
     }
 
     /// Create context from a query context.
@@ -331,19 +340,13 @@ impl GraphExecutionContext {
         query_ctx: &QueryContext,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
+        Self::with_parts(
             storage,
-            l0_context: L0Context::from_query_context(query_ctx),
+            L0Context::from_query_context(query_ctx),
             property_manager,
-            deadline: query_ctx.deadline,
-            algo_registry: None,
-            procedure_registry: None,
-            plugin_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: query_ctx.cancellation_token.clone(),
-            writer: None,
-        }
+            query_ctx.deadline,
+            query_ctx.cancellation_token.clone(),
+        )
     }
 
     /// Set query timeout deadline.
@@ -571,36 +574,11 @@ impl GraphExecutionContext {
     ///
     /// Vector of (neighbor VID, edge ID) pairs.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
-        let am = self.adjacency_manager();
         let version_hwm = self.storage.version_high_water_mark();
-
-        // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
-        // For snapshot queries, filter by version via StorageManager delegate.
-        let mut neighbors = if let Some(hwm) = version_hwm {
-            self.storage
-                .get_neighbors_at_version(vid, edge_type, direction, hwm)
-        } else {
-            am.get_neighbors(vid, edge_type, direction)
-        };
-
-        // Overlay transaction L0 if present (transaction edges bypass Writer/AM).
-        if version_hwm.is_none()
-            && let Some(tx_l0) = &self.l0_context.transaction_l0
-        {
-            let tx_guard = tx_l0.read();
-            overlay_l0_neighbors(
-                vid,
-                edge_type,
-                direction,
-                &tx_guard,
-                &mut neighbors,
-                version_hwm,
-            );
-        }
-
-        self.record_neighbor_reads(vid, &neighbors);
-
-        neighbors
+        // Single-vid case: acquire the transaction-L0 guard once for this
+        // vertex (the batch path amortizes it across many vertices).
+        let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
+        self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref())
     }
 
     /// Get neighbors for multiple vertices in batch.
@@ -623,45 +601,63 @@ impl GraphExecutionContext {
         edge_type: u32,
         direction: Direction,
     ) -> Vec<(Vid, Vid, Eid)> {
-        let am = self.adjacency_manager();
         let version_hwm = self.storage.version_high_water_mark();
-
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
 
         let mut results = Vec::new();
-
         for &vid in vids {
-            let mut neighbors = if let Some(hwm) = version_hwm {
-                self.storage
-                    .get_neighbors_at_version(vid, edge_type, direction, hwm)
-            } else {
-                am.get_neighbors(vid, edge_type, direction)
-            };
-
-            // Overlay transaction L0 if present
-            if version_hwm.is_none()
-                && let Some(ref tx_guard) = tx_guard
-            {
-                overlay_l0_neighbors(
-                    vid,
-                    edge_type,
-                    direction,
-                    tx_guard,
-                    &mut neighbors,
-                    version_hwm,
-                );
-            }
-
-            self.record_neighbor_reads(vid, &neighbors);
-
+            let neighbors =
+                self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref());
             results.extend(
                 neighbors
                     .into_iter()
                     .map(|(neighbor, eid)| (vid, neighbor, eid)),
             );
         }
-
         results
+    }
+
+    /// Resolve a single vertex's neighbours, overlaying the transaction L0
+    /// (if visible) and recording the traversal into the SSI read-set.
+    ///
+    /// `tx_guard` is the already-acquired read guard over the transaction
+    /// L0 buffer (if any), so batch callers acquire the lock once and pass
+    /// the borrow in for every vertex.
+    fn neighbors_for_vid(
+        &self,
+        vid: Vid,
+        edge_type: u32,
+        direction: Direction,
+        version_hwm: Option<u64>,
+        tx_guard: Option<&L0Buffer>,
+    ) -> Vec<(Vid, Eid)> {
+        // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
+        // For snapshot queries, filter by version via StorageManager delegate.
+        let mut neighbors = if let Some(hwm) = version_hwm {
+            self.storage
+                .get_neighbors_at_version(vid, edge_type, direction, hwm)
+        } else {
+            self.adjacency_manager()
+                .get_neighbors(vid, edge_type, direction)
+        };
+
+        // Overlay transaction L0 if present (transaction edges bypass Writer/AM).
+        if version_hwm.is_none()
+            && let Some(tx_guard) = tx_guard
+        {
+            overlay_l0_neighbors(
+                vid,
+                edge_type,
+                direction,
+                tx_guard,
+                &mut neighbors,
+                version_hwm,
+            );
+        }
+
+        self.record_neighbor_reads(vid, &neighbors);
+
+        neighbors
     }
 
     /// Records traversed edges and discovered neighbours into the SSI read-set.

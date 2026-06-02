@@ -4,13 +4,13 @@
 //! uni.algo.shortestPath procedure implementation.
 
 use crate::algo::DirectTraversal;
+use crate::algo::procedure_template::{arg_string_list, err_stream, parse_vid_arg};
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::{Result, anyhow};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 use uni_store::storage::direction::Direction;
 
 pub struct ShortestPathProcedure;
@@ -48,23 +48,19 @@ impl AlgoProcedure for ShortestPathProcedure {
         let signature = self.signature();
         let args = match signature.validate_args(args) {
             Ok(a) => a,
-            Err(e) => return stream::once(async { Err(e) }).boxed(),
+            Err(e) => return err_stream(e),
         };
 
-        let source_vid = match vid_from_value(&args[0]) {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
+        let (source_vid, target_vid, edge_types_str) = match (|| {
+            Ok((
+                parse_vid_arg(&args[0], "sourceNode")?,
+                parse_vid_arg(&args[1], "targetNode")?,
+                arg_string_list(&args, 2, "relationshipTypes")?,
+            ))
+        })() {
+            Ok(parsed) => parsed,
+            Err(e) => return err_stream(e),
         };
-        let target_vid = match vid_from_value(&args[1]) {
-            Ok(v) => v,
-            Err(e) => return stream::once(async move { Err(e) }).boxed(),
-        };
-        let edge_types_str: Vec<String> = args[2]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
 
         // Use stream::once with an async block for the single result
         let result_stream = async move {
@@ -120,26 +116,4 @@ impl AlgoProcedure for ShortestPathProcedure {
             })
             .boxed()
     }
-}
-
-fn vid_from_value(val: &Value) -> Result<Vid> {
-    // In the new storage model, VIDs are pure auto-increment integers
-    if let Some(s) = val.as_str() {
-        // Try parsing as simple integer first
-        if let Ok(id) = s.parse::<u64>() {
-            return Ok(Vid::new(id));
-        }
-        // Legacy format "label:offset" - parse and combine
-        let parts: Vec<_> = s.split(':').collect();
-        if parts.len() == 2
-            && let (Ok(l), Ok(o)) = (parts[0].parse::<u16>(), parts[1].parse::<u64>())
-        {
-            // Legacy: combine label and offset for backward compat
-            return Ok(Vid::new((l as u64) << 48 | o));
-        }
-    }
-    if let Some(v) = val.as_u64() {
-        return Ok(Vid::from(v));
-    }
-    Err(anyhow!("Invalid Vid format: {:?}", val))
 }

@@ -351,9 +351,67 @@ impl NeuralClassifier for CalibratedClassifier {
 /// feature values share one record (consistent with the existing
 /// memoization semantics; the classifier output for a given input
 /// is deterministic).
+/// Shared `RwLock<HashMap<(model, input_hash), V>>` backing the two
+/// per-query side-channel stores ([`NeuralProvenanceStore`] and
+/// [`ModelInvocationCache`]). Centralizes the lock-poison-tolerant
+/// accessors so each store only adds its domain-specific surface
+/// (eviction policy, record shape) on top.
+#[derive(Debug)]
+struct KeyedStore<V> {
+    inner: std::sync::RwLock<HashMap<(String, u64), V>>,
+}
+
+impl<V> Default for KeyedStore<V> {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl<V: Clone> KeyedStore<V> {
+    fn get(&self, model: &str, input_hash: u64) -> Option<V> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|g| g.get(&(model.to_string(), input_hash)).cloned())
+    }
+}
+
+impl<V> KeyedStore<V> {
+    fn insert(&self, model: &str, input_hash: u64, value: V) {
+        if let Ok(mut g) = self.inner.write() {
+            g.insert((model.to_string(), input_hash), value);
+        }
+    }
+
+    /// Insert, but first drop the whole map when it has reached
+    /// `max_entries` (`max_entries == 0` disables the bound). The
+    /// size check and insert happen under one write lock so the bound
+    /// holds even under concurrent inserts.
+    fn insert_bounded(&self, model: &str, input_hash: u64, value: V, max_entries: usize) {
+        if let Ok(mut g) = self.inner.write() {
+            if max_entries > 0 && g.len() >= max_entries {
+                g.clear();
+            }
+            g.insert((model.to_string(), input_hash), value);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut g) = self.inner.write() {
+            g.clear();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.read().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NeuralProvenanceStore {
-    inner: std::sync::RwLock<HashMap<(String, u64), NeuralProvenanceRecord>>,
+    inner: KeyedStore<NeuralProvenanceRecord>,
 }
 
 /// A single stored record. Matches the user-visible
@@ -378,32 +436,23 @@ pub struct NeuralProvenanceRecord {
 
 impl NeuralProvenanceStore {
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub fn record(&self, model: &str, input_hash: u64, record: NeuralProvenanceRecord) {
-        if let Ok(mut g) = self.inner.write() {
-            g.insert((model.to_string(), input_hash), record);
-        }
+        self.inner.insert(model, input_hash, record);
     }
 
     pub fn get(&self, model: &str, input_hash: u64) -> Option<NeuralProvenanceRecord> {
-        self.inner
-            .read()
-            .ok()
-            .and_then(|g| g.get(&(model.to_string(), input_hash)).cloned())
+        self.inner.get(model, input_hash)
     }
 
     pub fn clear(&self) {
-        if let Ok(mut g) = self.inner.write() {
-            g.clear();
-        }
+        self.inner.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().map(|g| g.len()).unwrap_or(0)
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -423,48 +472,39 @@ impl NeuralProvenanceStore {
 /// follow-up can swap the inner type without changing the public API.
 #[derive(Debug, Default)]
 pub struct ModelInvocationCache {
-    inner: std::sync::RwLock<HashMap<(String, u64), f64>>,
+    inner: KeyedStore<f64>,
     max_entries: usize,
 }
 
 impl ModelInvocationCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
-            inner: std::sync::RwLock::new(HashMap::new()),
+            inner: KeyedStore::default(),
             max_entries,
         }
     }
 
     /// Lookup. Returns `Some(prob)` on hit, `None` on miss.
     pub fn get(&self, model: &str, input_hash: u64) -> Option<f64> {
-        self.inner
-            .read()
-            .ok()
-            .and_then(|g| g.get(&(model.to_string(), input_hash)).copied())
+        self.inner.get(model, input_hash)
     }
 
     /// Insert. On overflow (cache size ≥ `max_entries`), drops the
     /// entire cache before inserting — naive but bounded. Callers
     /// should size `max_entries` for the expected working set.
     pub fn insert(&self, model: &str, input_hash: u64, value: f64) {
-        if let Ok(mut g) = self.inner.write() {
-            if g.len() >= self.max_entries && self.max_entries > 0 {
-                g.clear();
-            }
-            g.insert((model.to_string(), input_hash), value);
-        }
+        self.inner
+            .insert_bounded(model, input_hash, value, self.max_entries);
     }
 
     /// Empty the cache. Useful for `LocyConfig` users who reuse a
     /// shared cache across evaluations and want explicit reset.
     pub fn clear(&self) {
-        if let Ok(mut g) = self.inner.write() {
-            g.clear();
-        }
+        self.inner.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().map(|g| g.len()).unwrap_or(0)
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {

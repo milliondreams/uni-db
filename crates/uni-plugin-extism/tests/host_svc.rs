@@ -105,6 +105,6 @@ fn granted_service_fns_build_against_real_wasm() {
     // a None-service ctx here) must build cleanly; the trivial module imports
     // none of them, mirroring Extism's "linker absence" gating model.
     let _plugin = loader
-        .instantiate(&trivial_wasm(), &prepared)
+        .build_plugin(&trivial_wasm(), &prepared)
         .expect("plugin builds with all service fns present");
 }

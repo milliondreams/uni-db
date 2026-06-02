@@ -23,7 +23,6 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use uni_algo::algo::procedures::{AlgoContext, AlgoProcedure, AlgoResultRow, ValueType};
-use uni_common::Value;
 use uni_plugin::FnError;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmHost, AlgorithmProvider, AlgorithmSignature,
@@ -256,9 +255,4 @@ pub fn host_bridge_from_storage(
     l0: Option<Arc<uni_store::runtime::L0Manager>>,
 ) -> AlgorithmHostBridge {
     AlgorithmHostBridge::new(AlgoContext::new(storage, l0))
-}
-
-#[allow(dead_code)]
-fn _value_to_uni_value_dead(_v: &serde_json::Value) -> Value {
-    Value::Null
 }

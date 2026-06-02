@@ -219,28 +219,18 @@ impl PluginSessionHook for LegacyHookAdapter {
         };
         // v1.1 path: if the host populated `commit_result`, mirror its
         // fields into the legacy `CommitResult`. Otherwise keep the
-        // pre-v1.1 zero-stub behavior for backward compat.
-        let result = if let Some(r) = ctx.commit_result {
-            CommitResult {
+        // pre-v1.1 zero-stub behavior for backward compat (the all-zero
+        // `CommitResult::default()`).
+        let result = ctx
+            .commit_result
+            .map(|r| CommitResult {
                 mutations_committed: r.mutations as usize,
-                rules_promoted: 0,
                 version: r.version,
-                started_at_version: 0,
                 wal_lsn: r.wal_lsn,
                 duration: r.duration,
-                rule_promotion_errors: Vec::new(),
-            }
-        } else {
-            CommitResult {
-                mutations_committed: 0,
-                rules_promoted: 0,
-                version: 0,
-                started_at_version: 0,
-                wal_lsn: 0,
-                duration: std::time::Duration::ZERO,
-                rule_promotion_errors: Vec::new(),
-            }
-        };
+                ..CommitResult::default()
+            })
+            .unwrap_or_default();
         self.inner.after_commit(&legacy_ctx, &result);
     }
 

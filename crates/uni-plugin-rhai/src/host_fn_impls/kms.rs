@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rhai::Engine;
 use uni_plugin::{Capability, CapabilitySet, KmsProvider};
 
-use crate::host_fn_impls::rt_err;
+use crate::host_fn_impls::{require_allowed, require_service, rt_err};
 use crate::host_fns::RhaiHostFnSpec;
 use crate::loader::RhaiLoader;
 
@@ -26,36 +26,34 @@ pub fn register(loader: &mut RhaiLoader) {
         key_ids: vec!["*".into()],
     };
     let sign_kms = kms.clone();
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.kms.sign".into(),
-        required_capability: Some(placeholder.clone()),
-        docs: "Sign bytes with a host-managed key (returns hex signature).".into(),
-        register: Arc::new(move |engine: &mut Engine, caps: &CapabilitySet| {
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.kms.sign",
+        placeholder.clone(),
+        "Sign bytes with a host-managed key (returns hex signature).",
+        move |engine: &mut Engine, caps: &CapabilitySet| {
             register_sign(engine, caps.clone(), sign_kms.clone());
-        }),
-    });
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.kms.verify".into(),
-        required_capability: Some(placeholder),
-        docs: "Verify a hex signature against a host-managed key.".into(),
-        register: Arc::new(move |engine: &mut Engine, caps: &CapabilitySet| {
+        },
+    ));
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.kms.verify",
+        placeholder,
+        "Verify a hex signature against a host-managed key.",
+        move |engine: &mut Engine, caps: &CapabilitySet| {
             register_verify(engine, caps.clone(), kms.clone());
-        }),
-    });
+        },
+    ));
 }
 
 fn register_sign(engine: &mut Engine, caps: CapabilitySet, kms: Option<Arc<dyn KmsProvider>>) {
     engine.register_fn(
         "uni_kms_sign",
         move |key_id: &str, data: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-            if !caps.iter().any(|c| c.kms_allows(key_id)) {
-                return Err(rt_err(format!(
-                    "uni.kms.sign: key `{key_id}` not in granted Kms allow-list"
-                )));
-            }
-            let kms = kms
-                .as_ref()
-                .ok_or_else(|| rt_err("uni.kms.sign: no KMS provider configured"))?;
+            require_allowed(
+                &caps,
+                |c| c.kms_allows(key_id),
+                format!("uni.kms.sign: key `{key_id}` not in granted Kms allow-list"),
+            )?;
+            let kms = require_service(&kms, "uni.kms.sign: no KMS provider configured")?;
             let sig = kms
                 .sign(key_id, data.as_bytes())
                 .map_err(|e| rt_err(format!("uni.kms.sign(`{key_id}`): {e}")))?;
@@ -68,14 +66,12 @@ fn register_verify(engine: &mut Engine, caps: CapabilitySet, kms: Option<Arc<dyn
     engine.register_fn(
         "uni_kms_verify",
         move |key_id: &str, data: &str, sig: &str| -> Result<bool, Box<rhai::EvalAltResult>> {
-            if !caps.iter().any(|c| c.kms_allows(key_id)) {
-                return Err(rt_err(format!(
-                    "uni.kms.verify: key `{key_id}` not in granted Kms allow-list"
-                )));
-            }
-            let kms = kms
-                .as_ref()
-                .ok_or_else(|| rt_err("uni.kms.verify: no KMS provider configured"))?;
+            require_allowed(
+                &caps,
+                |c| c.kms_allows(key_id),
+                format!("uni.kms.verify: key `{key_id}` not in granted Kms allow-list"),
+            )?;
+            let kms = require_service(&kms, "uni.kms.verify: no KMS provider configured")?;
             let sig_bytes =
                 from_hex(sig).map_err(|e| rt_err(format!("uni.kms.verify: signature hex: {e}")))?;
             kms.verify(key_id, data.as_bytes(), &sig_bytes)

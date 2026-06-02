@@ -42,10 +42,6 @@ impl GraphAlgoAdapter for MaximalCliquesAdapter {
             })
             .collect())
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type MaximalCliquesProcedure = GenericAlgoProcedure<MaximalCliquesAdapter>;

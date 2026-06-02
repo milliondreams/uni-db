@@ -26,6 +26,6 @@ pub mod bulk;
 
 pub use appender::{AppenderBuilder, StreamingAppender};
 pub use bulk::{
-    BulkBackend, BulkConfig, BulkPhase, BulkProgress, BulkStats, BulkStatsAccumulator, BulkWriter,
-    BulkWriterBuilder, EdgeData, IntoArrow,
+    BulkBackend, BulkConfig, BulkPhase, BulkProgress, BulkStats, BulkWriter, BulkWriterBuilder,
+    EdgeData, IntoArrow, record_batch_to_property_maps,
 };

@@ -1,11 +1,10 @@
 //! `ExtismLoader` — top-level entry point for loading Extism plugins.
 //!
-//! **M6a partial:** manifest parsing, capability filtering, and real
-//! `extism-sdk` instantiation (with cap-filtered host fns + resource
-//! limits) ship here. The full end-to-end `load()` path — read manifest
-//! export → re-instantiate with effective grants → read register export →
-//! push adapters into `PluginRegistrar` — still returns
-//! [`ExtismError::NotYetImplemented`] until the subsequent M6a commits.
+//! Manifest parsing, capability filtering, and real `extism-sdk`
+//! instantiation (with cap-filtered host fns + resource limits) ship
+//! here, alongside the end-to-end [`ExtismLoader::load`] path: read the
+//! manifest export → re-instantiate with effective grants → read the
+//! register export → push adapters into the `PluginRegistrar`.
 
 // Rust guideline compliant
 
@@ -161,6 +160,30 @@ impl ExtismLoader {
         self.runtime_fns.len()
     }
 
+    /// Names of the host fns a plugin holding `caps` is allowed to import.
+    ///
+    /// A host fn is allowed when its `required_capability` *variant* is in
+    /// `caps`, or when it declares no required capability (always
+    /// available). Pattern attenuation (key-id / secret-id / URL globs) is
+    /// enforced later, in the host-fn body — this is the structural,
+    /// link-time half of capability enforcement.
+    ///
+    /// Used both for the per-load allow-list ([`Self::prepare_parsed`],
+    /// against the effective `declared ∩ granted` set) and for the pass-1
+    /// bootstrap ([`Self::load`], against the host's *offered* grants).
+    /// Both call sites must produce byte-identical sets for the same
+    /// capability input, so the filter lives here once.
+    fn allowed_host_fn_names(&self, caps: &uni_plugin::CapabilitySet) -> Vec<String> {
+        self.host_fns
+            .iter()
+            .filter(|spec| match &spec.required_capability {
+                None => true,
+                Some(req) => caps.contains_variant(req),
+            })
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     /// Attach a KMS provider backing `uni_kms_*` (builder style).
     ///
     /// Pair with [`crate::host_svc::register_default_host_svc`] to register the
@@ -241,8 +264,7 @@ impl ExtismLoader {
         manifest_json: &[u8],
         grants: &uni_plugin::CapabilitySet,
     ) -> Result<PreparedExtismPlugin, ExtismError> {
-        let manifest: ExtismPluginManifest = serde_json::from_slice(manifest_json)
-            .map_err(|e| ExtismError::ManifestInvalid(format!("json parse: {e}")))?;
+        let manifest = crate::exports::parse_manifest_json(manifest_json)?;
         Ok(self.prepare_parsed(manifest, grants))
     }
 
@@ -275,15 +297,7 @@ impl ExtismLoader {
         // Host-fn filter: only fns whose required_capability *variant* is in
         // the effective set (or which have no required_capability — always
         // available). Pattern attenuation is enforced in the host-fn body.
-        let allowed: Vec<String> = self
-            .host_fns
-            .iter()
-            .filter(|spec| match &spec.required_capability {
-                None => true,
-                Some(req) => effective.contains_variant(req),
-            })
-            .map(|s| s.name.clone())
-            .collect();
+        let allowed = self.allowed_host_fn_names(&effective);
 
         PreparedExtismPlugin {
             manifest,
@@ -302,8 +316,9 @@ impl ExtismLoader {
     /// import table*. This is the Extism analogue of Component Model's
     /// linker absence: the plugin literally cannot resolve an unauthorized
     /// host fn at link time. Per proposal §5.6.2 this is the structural
-    /// half of capability enforcement; the runtime `checked_call` helper
-    /// (M6a.1.4) is the defense-in-depth half.
+    /// half of capability enforcement; the call-time pattern attenuation in
+    /// each `host_svc` body (`kms_allows` / `secret_allows` /
+    /// `network_allows`) is the defense-in-depth half.
     ///
     /// Resource limits declared in the parsed manifest are applied to
     /// the underlying wasmtime config: `memory_max_pages` (linear
@@ -325,25 +340,6 @@ impl ExtismLoader {
         prepared: &PreparedExtismPlugin,
     ) -> Result<extism::Plugin, ExtismError> {
         build_plugin_from_parts(bytes, prepared, &self.runtime_fns_for_load(prepared))
-    }
-
-    /// Instantiate the plugin via the extism-sdk.
-    ///
-    /// This is the SDK-gated half of the M6a loader path. The caller
-    /// supplies the prepared capability state (produced by
-    /// [`Self::prepare`]); this method returns a live `extism::Plugin`
-    /// ready for the manifest/register reader passes (M6a.1.2) and the
-    /// scalar adapter (M6a.1.5).
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::build_plugin`].
-    pub fn instantiate(
-        &self,
-        bytes: &[u8],
-        prepared: &PreparedExtismPlugin,
-    ) -> Result<extism::Plugin, ExtismError> {
-        self.build_plugin(bytes, prepared)
     }
 
     /// End-to-end load: read manifest, intersect with host grants,
@@ -394,15 +390,7 @@ impl ExtismLoader {
         // execution pool below is rebuilt with the real `declared ∩ grants`
         // attenuation. A guest importing a host fn the host did *not* offer
         // fails to instantiate here, which is the intended link-time gate.
-        let bootstrap_allowed: Vec<String> = self
-            .host_fns
-            .iter()
-            .filter(|spec| match &spec.required_capability {
-                None => true,
-                Some(req) => host_grants.contains_variant(req),
-            })
-            .map(|s| s.name.clone())
-            .collect();
+        let bootstrap_allowed = self.allowed_host_fn_names(host_grants);
         let bootstrap_prepared = PreparedExtismPlugin {
             manifest: ExtismPluginManifest {
                 id: String::new(),
@@ -770,10 +758,10 @@ mod tests {
     }
 
     #[test]
-    fn instantiate_rejects_garbage_bytes_as_instantiate_error() {
-        // M6a.1.1: `instantiate` is real now. With garbage bytes,
+    fn build_plugin_rejects_garbage_bytes_as_instantiate_error() {
+        // M6a.1.1: `build_plugin` is real now. With garbage bytes,
         // wasmtime fails to compile/instantiate — surface as
-        // `ExtismError::Instantiate`, not the old `NotYetImplemented`.
+        // `ExtismError::Instantiate`.
         let l = ExtismLoader::new();
         let prep = l
             .prepare(
@@ -781,7 +769,7 @@ mod tests {
                 &CapabilitySet::new(),
             )
             .unwrap();
-        let err = l.instantiate(b"not real wasm", &prep).unwrap_err();
+        let err = l.build_plugin(b"not real wasm", &prep).unwrap_err();
         assert!(
             matches!(err, ExtismError::Instantiate(_)),
             "expected Instantiate(_), got: {err:?}"

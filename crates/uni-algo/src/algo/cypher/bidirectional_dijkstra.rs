@@ -3,7 +3,6 @@
 
 //! uni.algo.bidirectionalDijkstra procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, BidirectionalDijkstra, BidirectionalDijkstraConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -45,11 +44,10 @@ impl GraphAlgoAdapter for BidirectionalDijkstraAdapter {
         Ok(rows)
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder.include_reverse(true)
+    // `include_reverse` defaults to true (this algorithm searches from both
+    // ends), so only the weight-property index needs overriding.
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

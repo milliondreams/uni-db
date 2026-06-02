@@ -376,14 +376,9 @@ fn check_prev_in_base_case(rule_name: &str, def: &RuleDefinition) -> Result<(), 
 }
 
 fn find_prev_ref(expr: &LocyExpr) -> Option<String> {
-    match expr {
-        LocyExpr::PrevRef(field) => Some(field.clone()),
-        LocyExpr::BinaryOp { left, right, .. } => {
-            find_prev_ref(left).or_else(|| find_prev_ref(right))
-        }
-        LocyExpr::UnaryOp(_, inner) => find_prev_ref(inner),
-        LocyExpr::Cypher(_) => None,
-    }
+    // `collect_prev_refs` walks left-first, matching this fn's former
+    // `.or_else` order, so the first collected ref is the same one.
+    collect_prev_refs(expr).into_iter().next()
 }
 
 fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
@@ -826,14 +821,19 @@ fn check_shared_neural_inputs(
                 .is_some_and(|cm| cm.annotations.independent)
         })
     };
-    // Returns Some(sorted-deduped models) when ≥ 2 distinct non-independent
-    // models share a group; None otherwise (no warning to emit).
-    fn dedup_sorted<'a>(models: &[&'a str]) -> Vec<&'a str> {
-        let mut unique: Vec<&'a str> = models.to_vec();
+    // Sort + dedup a group's models. Returns the unique set only when
+    // ≥ 2 distinct non-independent models share the group (i.e. a
+    // warning is warranted); `None` means no warning to emit.
+    let group_to_warn = |models: &[&str]| -> Option<Vec<String>> {
+        let mut unique: Vec<&str> = models.to_vec();
         unique.sort();
         unique.dedup();
-        unique
-    }
+        if unique.len() >= 2 && !all_independent(&unique) {
+            Some(unique.into_iter().map(str::to_string).collect())
+        } else {
+            None
+        }
+    };
     // ── F2a: group by shared input-variable name ────────────────
     let mut by_var: HashMap<String, Vec<&str>> = HashMap::new();
     for (model, args) in &invocations {
@@ -845,8 +845,9 @@ fn check_shared_neural_inputs(
     }
     let mut warned_a: HashSet<String> = HashSet::new();
     for (var, models) in &by_var {
-        let unique = dedup_sorted(models);
-        if unique.len() >= 2 && !all_independent(&unique) && warned_a.insert(var.clone()) {
+        if let Some(unique) = group_to_warn(models)
+            && warned_a.insert(var.clone())
+        {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedNeuralInputArgument,
                 message: format!(
@@ -881,8 +882,7 @@ fn check_shared_neural_inputs(
         }
     }
     for models in by_expr.values() {
-        let unique = dedup_sorted(models);
-        if unique.len() >= 2 && !all_independent(&unique) {
+        if let Some(unique) = group_to_warn(models) {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedNeuralFeatureValue,
                 message: format!(
@@ -925,8 +925,7 @@ fn check_shared_neural_inputs(
         }
     }
     for ((v, prop), models) in &by_retrieval_prop {
-        let unique = dedup_sorted(models);
-        if unique.len() >= 2 && !all_independent(&unique) {
+        if let Some(unique) = group_to_warn(models) {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedRetrievalContext,
                 message: format!(
@@ -1046,6 +1045,20 @@ impl<'a> InvocationLifter<'a> {
         }
     }
 
+    /// Record a `var.prop` feature reference: push it onto
+    /// `refs` for the invocation record and emit the matching hidden
+    /// YIELD item (`__feat_<var>_<prop>`) so the property is
+    /// materialized into the per-row fact_row, deduping by column name.
+    fn register_property_feature(&mut self, v: &str, prop: &str, refs: &mut Vec<(String, String)>) {
+        refs.push((v.to_string(), prop.to_string()));
+        let col_name = format!("__feat_{}_{}", v, prop);
+        if self.seen_hidden.insert(col_name.clone()) {
+            let hidden_expr =
+                Expr::Property(Box::new(Expr::Variable(v.to_string())), prop.to_string());
+            self.hidden_items.push((col_name, hidden_expr));
+        }
+    }
+
     /// Validate feature expressions and emit hidden YIELD items for
     /// shapes that require pre-materialization (`Property(Variable,
     /// prop)` for graph properties; `similar_to(...)` /
@@ -1064,14 +1077,7 @@ impl<'a> InvocationLifter<'a> {
                     if matches!(boxed_inner.as_ref(), Expr::Variable(_)) =>
                 {
                     if let Expr::Variable(v) = boxed_inner.as_ref() {
-                        feature_property_refs.push((v.clone(), prop.clone()));
-                        let col_name = format!("__feat_{}_{}", v, prop);
-                        if !self.seen_hidden.contains(&col_name) {
-                            self.seen_hidden.insert(col_name.clone());
-                            let hidden_expr =
-                                Expr::Property(Box::new(Expr::Variable(v.clone())), prop.clone());
-                            self.hidden_items.push((col_name, hidden_expr));
-                        }
+                        self.register_property_feature(v, prop, &mut feature_property_refs);
                     }
                     rewritten.push(fexpr.clone());
                 }
@@ -1219,16 +1225,11 @@ impl<'a> InvocationLifter<'a> {
                                 if matches!(boxed_inner.as_ref(), Expr::Variable(_)) =>
                             {
                                 if let Expr::Variable(v) = boxed_inner.as_ref() {
-                                    feature_property_refs.push((v.clone(), prop.clone()));
-                                    let col_name = format!("__feat_{}_{}", v, prop);
-                                    if !self.seen_hidden.contains(&col_name) {
-                                        self.seen_hidden.insert(col_name.clone());
-                                        let hidden_expr = Expr::Property(
-                                            Box::new(Expr::Variable(v.clone())),
-                                            prop.clone(),
-                                        );
-                                        self.hidden_items.push((col_name, hidden_expr));
-                                    }
+                                    self.register_property_feature(
+                                        v,
+                                        prop,
+                                        &mut feature_property_refs,
+                                    );
                                 }
                             }
                             other => {

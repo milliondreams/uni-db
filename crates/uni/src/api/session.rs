@@ -26,6 +26,20 @@ use crate::api::transaction::{IsolationLevel, Transaction};
 use uni_common::{Result, UniError, Value};
 use uni_query::{ExecuteResult, ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
 
+/// Build the [`UniError::Query`] returned when a `session.query()` /
+/// `QueryBuilder::fetch_all` is rejected for containing mutation clauses.
+///
+/// Shared by `execute_cached` and `QueryBuilder::fetch_all` so the
+/// user-facing wording lives in exactly one place.
+fn read_only_violation(cypher: &str) -> UniError {
+    UniError::Query {
+        message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
+             REMOVE) require a transaction. Use session.tx() to start one."
+            .to_string(),
+        query: Some(cypher.to_string()),
+    }
+}
+
 /// Atomic counters for plan cache hits/misses, shared between Session and its
 /// query execution helpers.
 pub(crate) struct PlanCacheMetrics {
@@ -203,38 +217,69 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session from a shared database reference.
-    pub(crate) fn new(db: Arc<UniInner>) -> Self {
-        // Clone the global rule registry into this session
-        let global_registry = db.locy_rule_registry.read().unwrap();
-        let session_registry = global_registry.clone();
-        drop(global_registry);
-
-        db.active_session_count.fetch_add(1, Ordering::Relaxed);
-
+    /// Shared base constructor for the three public-facing constructors
+    /// (`new` / `new_forked` / `new_from_template`).
+    ///
+    /// The arguments are exactly the fields those constructors differ in;
+    /// every other field is initialized identically (fresh id, fresh
+    /// session-local plugin registry, fresh metrics / plan cache / write
+    /// guard / cancellation token, no principal). Each caller is
+    /// responsible for incrementing `db.active_session_count` before
+    /// delegating here so the increment lives next to the matching
+    /// `Drop`-time decrement at each call site.
+    #[allow(clippy::too_many_arguments)]
+    fn new_base(
+        db: Arc<UniInner>,
+        fork_scope: Option<Arc<uni_store::fork::ForkScope>>,
+        params: HashMap<String, Value>,
+        rule_registry: LocyRuleRegistry,
+        cancellation_token: CancellationToken,
+        hooks: HashMap<String, Arc<dyn SessionHook>>,
+        query_timeout: Option<Duration>,
+        transaction_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             db,
             original_db: None,
-            fork_scope: None,
+            fork_scope,
             id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
+            params: Arc::new(std::sync::RwLock::new(params)),
+            rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
             session_plugin_registry: Arc::new(uni_plugin::PluginRegistry::new()),
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            cancellation_token: Arc::new(std::sync::RwLock::new(cancellation_token)),
             plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
-            hooks: HashMap::new(),
-            query_timeout: None,
-            transaction_timeout: None,
+            hooks,
+            query_timeout,
+            transaction_timeout,
             replacement_scans_enabled: Arc::new(AtomicBool::new(false)),
             principal: None,
         }
+    }
+
+    /// Create a new session from a shared database reference.
+    pub(crate) fn new(db: Arc<UniInner>) -> Self {
+        // Clone the global rule registry into this session
+        let session_registry = db.locy_rule_registry.read().unwrap().clone();
+
+        db.active_session_count.fetch_add(1, Ordering::Relaxed);
+
+        Self::new_base(
+            db,
+            None,
+            HashMap::new(),
+            session_registry,
+            CancellationToken::new(),
+            HashMap::new(),
+            None,
+            None,
+        )
     }
 
     /// Create a forked session from a fork-scoped `UniInner`.
@@ -269,29 +314,16 @@ impl Session {
         // affecting the parent — exactly the spec §4.6 contract.
         let child_token = parent_token.child_token();
 
-        Self {
+        Self::new_base(
             db,
-            original_db: None,
-            fork_scope: Some(scope),
-            id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
-            session_plugin_registry: Arc::new(uni_plugin::PluginRegistry::new()),
-            active_write_guard: Arc::new(AtomicBool::new(false)),
-            metrics_inner: Arc::new(SessionMetricsInner::new()),
-            created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(child_token)),
-            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
-            plan_cache_metrics: Arc::new(PlanCacheMetrics {
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-            }),
-            hooks: HashMap::new(),
-            query_timeout: None,
-            transaction_timeout: None,
-            replacement_scans_enabled: Arc::new(AtomicBool::new(false)),
-            principal: None,
-        }
+            Some(scope),
+            HashMap::new(),
+            session_registry,
+            child_token,
+            HashMap::new(),
+            None,
+            None,
+        )
     }
 
     /// Open or create a fork by name.
@@ -333,29 +365,16 @@ impl Session {
     ) -> Self {
         db.active_session_count.fetch_add(1, Ordering::Relaxed);
 
-        Self {
+        Self::new_base(
             db,
-            original_db: None,
-            fork_scope: None,
-            id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(params)),
-            rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
-            session_plugin_registry: Arc::new(uni_plugin::PluginRegistry::new()),
-            active_write_guard: Arc::new(AtomicBool::new(false)),
-            metrics_inner: Arc::new(SessionMetricsInner::new()),
-            created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
-            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
-            plan_cache_metrics: Arc::new(PlanCacheMetrics {
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-            }),
+            None,
+            params,
+            rule_registry,
+            CancellationToken::new(),
             hooks,
             query_timeout,
             transaction_timeout,
-            replacement_scans_enabled: Arc::new(AtomicBool::new(false)),
-            principal: None,
-        }
+        )
     }
 
     /// Attach an authenticated [`Principal`] to this session.
@@ -433,34 +452,38 @@ impl Session {
         module_name: &str,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_pyo3::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        let placeholder = PluginId::new("pyo3.session.loading");
-        let mut r =
-            PluginRegistrar::new(placeholder, registrar_caps, &self.session_plugin_registry);
-        let outcome = loader
-            .load(py, module_src, module_name, &mut r, registrar_caps)
-            .map_err(|e| match e {
-                uni_plugin_pyo3::PyPluginError::PythonException {
-                    qname,
-                    message,
-                    traceback,
-                } => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python exception in {qname}: {message}\n{traceback}"),
-                },
-                uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python plugin manifest: {m}"),
-                },
-                uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python plugin arrow conversion: {m}"),
-                },
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry()
-            .map_err(crate::api::plugin_err_to_uni)?;
-        Ok(outcome)
+        crate::api::with_loading_registrar(
+            &self.session_plugin_registry,
+            "pyo3.session.loading",
+            registrar_caps,
+            |r| {
+                loader
+                    .load(py, module_src, module_name, r, registrar_caps)
+                    .map_err(|e| match e {
+                        uni_plugin_pyo3::PyPluginError::PythonException {
+                            qname,
+                            message,
+                            traceback,
+                        } => UniError::InvalidArgument {
+                            arg: "module_src".to_owned(),
+                            message: format!("python exception in {qname}: {message}\n{traceback}"),
+                        },
+                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin manifest: {m}"),
+                            }
+                        }
+                        uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin arrow conversion: {m}"),
+                            }
+                        }
+                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                    })
+            },
+        )
     }
 
     /// Commit accumulated decorator entries from a
@@ -484,22 +507,24 @@ impl Session {
         builder: &uni_plugin_pyo3::ManifestBuilder,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_pyo3::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        let placeholder = PluginId::new("pyo3.session.loading");
-        let mut r =
-            PluginRegistrar::new(placeholder, registrar_caps, &self.session_plugin_registry);
-        let outcome = loader
-            .load_from_builder(builder, &mut r, registrar_caps)
-            .map_err(|e| match e {
-                uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => UniError::InvalidArgument {
-                    arg: "decorators".to_owned(),
-                    message: format!("python plugin manifest: {m}"),
-                },
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry()
-            .map_err(crate::api::plugin_err_to_uni)?;
-        Ok(outcome)
+        crate::api::with_loading_registrar(
+            &self.session_plugin_registry,
+            "pyo3.session.loading",
+            registrar_caps,
+            |r| {
+                loader
+                    .load_from_builder(builder, r, registrar_caps)
+                    .map_err(|e| match e {
+                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
+                            UniError::InvalidArgument {
+                                arg: "decorators".to_owned(),
+                                message: format!("python plugin manifest: {m}"),
+                            }
+                        }
+                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                    })
+            },
+        )
     }
 
     /// Run every registered [`AuthzPolicy`] against the session's
@@ -1190,7 +1215,7 @@ impl Session {
         let cached = self.plan_cache.lock().ok().and_then(|mut cache| {
             cache
                 .get(cache_key, schema_version)
-                .map(|entry| (entry.ast.clone(), entry.plan.clone()))
+                .map(|entry| entry.plan.clone())
         });
 
         // Session-local plugin registry — threaded across the async
@@ -1201,7 +1226,7 @@ impl Session {
         let session_pr = Arc::clone(&self.session_plugin_registry);
         let session_principal = self.principal.clone();
 
-        if let Some((_ast, plan)) = cached {
+        if let Some(plan) = cached {
             // Cache hit — skip parse and plan, execute the cached plan directly
             self.plan_cache_metrics.hits.fetch_add(1, Ordering::Relaxed);
             return uni_query::scoped_with_session_context(
@@ -1223,12 +1248,7 @@ impl Session {
 
         // Enforce read-only semantics for session queries — mutations require
         // a transaction for isolation, WAL protection, and commit hooks.
-        uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-            message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
-                 REMOVE) require a transaction. Use session.tx() to start one."
-                .to_string(),
-            query: Some(cypher.to_string()),
-        })?;
+        uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(cypher))?;
 
         // Time-travel queries bypass the cache entirely
         if matches!(ast, uni_cypher::ast::Query::TimeTravel { .. }) {
@@ -1247,7 +1267,7 @@ impl Session {
             .with_plugin_registry(Arc::clone(&self.db.plugin_registry))
             .with_replacement_scans(self.replacement_scans_enabled());
         let plan = planner
-            .plan(ast.clone())
+            .plan(ast)
             .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?;
 
         // Cache the entry
@@ -1255,7 +1275,6 @@ impl Session {
             cache.insert(
                 cache_key,
                 PlanCacheEntry {
-                    ast,
                     plan: plan.clone(),
                     schema_version,
                     hit_count: 0,
@@ -1411,12 +1430,7 @@ impl<'a> QueryBuilder<'a> {
             // own validation). Parse is cheap relative to execution.
             let ast = uni_cypher::parse(&self.cypher)
                 .map_err(crate::api::impl_query::into_parse_error)?;
-            uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-                message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, \
-                     SET, REMOVE) require a transaction. Use session.tx() to start one."
-                    .to_string(),
-                query: Some(self.cypher.clone()),
-            })?;
+            uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(&self.cypher))?;
 
             // Custom config — bypass cache and use the config-aware path
             let mut db_config = self.session.db.config.clone();
@@ -1593,7 +1607,6 @@ impl uni_fork::ForkQueryHost for Session {
 
 /// Entry in the transparent plan cache.
 struct PlanCacheEntry {
-    ast: uni_query::CypherQuery,
     plan: uni_query::LogicalPlan,
     schema_version: u32,
     hit_count: u64,

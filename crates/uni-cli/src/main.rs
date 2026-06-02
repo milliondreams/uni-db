@@ -135,20 +135,15 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Query { statement, path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
-
+            let db = open_db(&path).await?;
             repl::execute_query(&db, &statement).await;
         }
         Commands::Repl { path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
+            let db = open_db(&path).await?;
             repl::run_repl(db).await?;
         }
         Commands::Plugin { command, path } => {
-            let db = uni_db::Uni::open(path.to_string_lossy().to_string())
-                .build()
-                .await?;
+            let db = open_db(&path).await?;
             match command {
                 PluginCmd::Install { source, grants } => {
                     install_plugin(&db, &source, grants.as_deref()).await?;
@@ -156,8 +151,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Snapshot { command, path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
+            let db = open_db(&path).await?;
 
             match command {
                 SnapshotCmd::List => {
@@ -202,30 +196,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Open the database at `path` with the CLI's standard settings.
+///
+/// # Errors
+///
+/// Returns an error if the storage at `path` cannot be opened or built.
+async fn open_db(path: &std::path::Path) -> Result<uni_db::Uni> {
+    Ok(uni_db::Uni::open(path.to_string_lossy()).build().await?)
+}
+
 /// Dispatch `uni plugin install <source>` by extension / scheme.
 async fn install_plugin(db: &uni_db::Uni, source: &str, grants: Option<&str>) -> Result<()> {
     let caps = parse_grants(grants);
 
-    // Scheme dispatch — OCI / extism Hub land in M12; CLI rejects them
-    // with a clear "not yet supported" message rather than silent
-    // failure.
-    if source.starts_with("oci://") {
-        anyhow::bail!(
-            "{} OCI plugin installation lands in M12",
-            "not yet supported:".red()
-        );
-    }
-    if source.starts_with("extism://") {
-        anyhow::bail!(
-            "{} Extism Hub installation lands in M12",
-            "not yet supported:".red()
-        );
-    }
-    if source.starts_with("https://") || source.starts_with("http://") {
-        anyhow::bail!(
-            "{} HTTP plugin fetch lands in M12 (download, signature pin)",
-            "not yet supported:".red()
-        );
+    // Scheme dispatch — OCI / extism Hub / HTTP land in M12; CLI rejects
+    // them with a clear "not yet supported" message rather than silent
+    // failure. The order of the `http`/`https` prefixes is irrelevant
+    // because they share the same message.
+    const M12_SCHEMES: &[(&str, &str)] = &[
+        ("oci://", "OCI plugin installation lands in M12"),
+        ("extism://", "Extism Hub installation lands in M12"),
+        (
+            "https://",
+            "HTTP plugin fetch lands in M12 (download, signature pin)",
+        ),
+        (
+            "http://",
+            "HTTP plugin fetch lands in M12 (download, signature pin)",
+        ),
+    ];
+    for (prefix, message) in M12_SCHEMES {
+        if source.starts_with(prefix) {
+            anyhow::bail!("{} {message}", "not yet supported:".red());
+        }
     }
 
     // Local file by extension.
@@ -298,31 +301,46 @@ fn parse_grants(grants: Option<&str>) -> CapabilitySet {
     let mut set = CapabilitySet::new();
     for n in names {
         match n {
-            "ScalarFn" => set.insert(Capability::ScalarFn),
-            "AggregateFn" => set.insert(Capability::AggregateFn),
-            "Procedure" => set.insert(Capability::Procedure),
-            "Filesystem" => set.insert(Capability::Filesystem {
-                read: vec!["**".into()],
-                write: vec!["**".into()],
-            }),
-            "Network" => set.insert(Capability::Network {
-                allow: vec!["**".into()],
-            }),
-            "HostQuery" => set.insert(Capability::HostQuery {
-                read_only: true,
-                scopes: vec!["**".into()],
-            }),
-            "Kms" => set.insert(Capability::Kms {
-                key_ids: vec!["*".into()],
-            }),
-            "Secret" => set.insert(Capability::Secret {
-                ids: vec!["*".into()],
-            }),
+            "ScalarFn" => {
+                set.insert(Capability::ScalarFn);
+            }
+            "AggregateFn" => {
+                set.insert(Capability::AggregateFn);
+            }
+            "Procedure" => {
+                set.insert(Capability::Procedure);
+            }
+            "Filesystem" => {
+                set.insert(Capability::Filesystem {
+                    read: vec!["**".into()],
+                    write: vec!["**".into()],
+                });
+            }
+            "Network" => {
+                set.insert(Capability::Network {
+                    allow: vec!["**".into()],
+                });
+            }
+            "HostQuery" => {
+                set.insert(Capability::HostQuery {
+                    read_only: true,
+                    scopes: vec!["**".into()],
+                });
+            }
+            "Kms" => {
+                set.insert(Capability::Kms {
+                    key_ids: vec!["*".into()],
+                });
+            }
+            "Secret" => {
+                set.insert(Capability::Secret {
+                    ids: vec!["*".into()],
+                });
+            }
             other => {
                 eprintln!("{} unknown grant `{other}` ignored", "warn:".yellow());
-                false
             }
-        };
+        }
     }
     set
 }

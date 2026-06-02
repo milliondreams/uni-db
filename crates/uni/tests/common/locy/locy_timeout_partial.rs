@@ -89,7 +89,7 @@ async fn locy_timeout_allow_partial_returns_result() -> Result<()> {
         .await?;
 
     assert!(
-        result.timed_out,
+        result.timed_out(),
         "allow_partial result should flag timed_out"
     );
     let detail = result

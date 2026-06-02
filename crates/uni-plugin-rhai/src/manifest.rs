@@ -134,73 +134,65 @@ pub fn parse_manifest(engine: &Engine, ast: &AST) -> Result<RhaiManifest, RhaiEr
     })
 }
 
-fn parse_scalar_entries(map: &Map) -> Result<Vec<ScalarEntry>, RhaiError> {
-    let Some(arr) = map.get("scalar_fns") else {
+/// Parse the array under `key` into a `Vec<T>`, building each entry from
+/// its map via `build`.
+///
+/// A missing `key` yields an empty vec (the field is optional). A present
+/// but non-array value, or a non-map element, is a `ManifestInvalid` error
+/// labelled with `key`.
+fn parse_entry_array<T>(
+    map: &Map,
+    key: &str,
+    build: impl Fn(&Map) -> Result<T, RhaiError>,
+) -> Result<Vec<T>, RhaiError> {
+    let Some(arr) = map.get(key) else {
         return Ok(vec![]);
     };
     let arr = arr
         .clone()
         .try_cast::<rhai::Array>()
-        .ok_or_else(|| RhaiError::ManifestInvalid("scalar_fns must be an array of maps".into()))?;
+        .ok_or_else(|| RhaiError::ManifestInvalid(format!("{key} must be an array of maps")))?;
     let mut entries = Vec::with_capacity(arr.len());
     for d in arr {
         let m = d
             .try_cast::<Map>()
-            .ok_or_else(|| RhaiError::ManifestInvalid("scalar_fns entry must be a map".into()))?;
-        entries.push(ScalarEntry {
-            name: required_string(&m, "name")?,
-            args: required_string_array(&m, "args")?,
-            returns: required_string(&m, "returns")?,
-            vectorized: optional_bool(&m, "vectorized").unwrap_or(false),
-        });
+            .ok_or_else(|| RhaiError::ManifestInvalid(format!("{key} entry must be a map")))?;
+        entries.push(build(&m)?);
     }
     Ok(entries)
+}
+
+fn parse_scalar_entries(map: &Map) -> Result<Vec<ScalarEntry>, RhaiError> {
+    parse_entry_array(map, "scalar_fns", |m| {
+        Ok(ScalarEntry {
+            name: required_string(m, "name")?,
+            args: required_string_array(m, "args")?,
+            returns: required_string(m, "returns")?,
+            vectorized: optional_bool(m, "vectorized").unwrap_or(false),
+        })
+    })
 }
 
 fn parse_aggregate_entries(map: &Map) -> Result<Vec<AggregateEntry>, RhaiError> {
-    let Some(arr) = map.get("aggregate_fns") else {
-        return Ok(vec![]);
-    };
-    let arr = arr
-        .clone()
-        .try_cast::<rhai::Array>()
-        .ok_or_else(|| RhaiError::ManifestInvalid("aggregate_fns must be an array".into()))?;
-    let mut entries = Vec::with_capacity(arr.len());
-    for d in arr {
-        let m = d.try_cast::<Map>().ok_or_else(|| {
-            RhaiError::ManifestInvalid("aggregate_fns entry must be a map".into())
-        })?;
-        entries.push(AggregateEntry {
-            name: required_string(&m, "name")?,
-            args: required_string_array(&m, "args")?,
-            returns: required_string(&m, "returns")?,
-            state: optional_string(&m, "state").unwrap_or_else(|| "map".into()),
-        });
-    }
-    Ok(entries)
+    parse_entry_array(map, "aggregate_fns", |m| {
+        Ok(AggregateEntry {
+            name: required_string(m, "name")?,
+            args: required_string_array(m, "args")?,
+            returns: required_string(m, "returns")?,
+            state: optional_string(m, "state").unwrap_or_else(|| "map".into()),
+        })
+    })
 }
 
 fn parse_procedure_entries(map: &Map) -> Result<Vec<ProcedureEntry>, RhaiError> {
-    let Some(arr) = map.get("procedures") else {
-        return Ok(vec![]);
-    };
-    let arr = arr
-        .clone()
-        .try_cast::<rhai::Array>()
-        .ok_or_else(|| RhaiError::ManifestInvalid("procedures must be an array".into()))?;
-    let mut entries = Vec::with_capacity(arr.len());
-    for d in arr {
-        let m = d
-            .try_cast::<Map>()
-            .ok_or_else(|| RhaiError::ManifestInvalid("procedures entry must be a map".into()))?;
-        entries.push(ProcedureEntry {
-            name: required_string(&m, "name")?,
-            args: required_string_array(&m, "args")?,
-            yields: required_string_array(&m, "yields")?,
-            mode: optional_string(&m, "mode").unwrap_or_else(|| "read".into()),
-        });
-    }
-    Ok(entries)
+    parse_entry_array(map, "procedures", |m| {
+        Ok(ProcedureEntry {
+            name: required_string(m, "name")?,
+            args: required_string_array(m, "args")?,
+            yields: required_string_array(m, "yields")?,
+            mode: optional_string(m, "mode").unwrap_or_else(|| "read".into()),
+        })
+    })
 }
 
 fn required_string(map: &Map, key: &str) -> Result<String, RhaiError> {

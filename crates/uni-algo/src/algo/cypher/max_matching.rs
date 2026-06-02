@@ -43,10 +43,6 @@ impl GraphAlgoAdapter for MaxMatchingAdapter {
             Err(e) => Err(anyhow!("MaxMatching error: {}", e)),
         }
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type MaxMatchingProcedure = GenericAlgoProcedure<MaxMatchingAdapter>;

@@ -993,6 +993,12 @@ impl TryFrom<&Value> for String {
 impl TryFrom<&Value> for i64 {
     type Error = UniError;
 
+    // Float→i64 **truncates toward zero** (`1.9` → `1`). This is deliberate and
+    // must not be "fixed" to match the strict `i32` impl below: this conversion
+    // backs Cypher's `toInteger()`, whose spec truncates a float. The `i32`
+    // impl, by contrast, is the *strict typed* coercion used for schema/storage
+    // and rejects out-of-range or fractional floats. The two policies differ on
+    // purpose.
     fn try_from(value: &Value) -> std::result::Result<Self, Self::Error> {
         match value {
             Value::Int(i) => Ok(*i),
@@ -1005,6 +1011,10 @@ impl TryFrom<&Value> for i64 {
 impl TryFrom<&Value> for i32 {
     type Error = UniError;
 
+    // Strict typed coercion (schema/storage): unlike the `i64`/`toInteger`
+    // impl above, an out-of-range or fractional float is an error, not a
+    // truncation — losing precision when narrowing into a typed column is a
+    // bug, not a convenience.
     fn try_from(value: &Value) -> std::result::Result<Self, Self::Error> {
         match value {
             Value::Int(i) => i32::try_from(*i).map_err(|_| UniError::Type {

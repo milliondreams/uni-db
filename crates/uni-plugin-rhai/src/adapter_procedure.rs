@@ -21,11 +21,8 @@ use rhai::{Dynamic, Map, Scope};
 use smol_str::SmolStr;
 
 use uni_plugin::adapter_common::batch_builder::batch_into_stream;
-use uni_plugin::capability::SideEffects;
 use uni_plugin::errors::FnError;
-use uni_plugin::traits::procedure::{
-    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
-};
+use uni_plugin::traits::procedure::{ProcedureContext, ProcedurePlugin, ProcedureSignature};
 
 use crate::dynamic_bridge::{OutBuilder, scalar_to_dynamic};
 use crate::runtime::RhaiPluginRuntime;
@@ -142,32 +139,20 @@ fn coerce_for(target: &DataType, value: Dynamic) -> Result<Dynamic, FnError> {
         return Ok(value);
     }
     match target {
-        DataType::Float64 => {
-            if let Ok(i) = value.as_int() {
-                return Ok(Dynamic::from(i as f64));
-            }
-            if value.as_float().is_ok() {
-                return Ok(value);
-            }
-            Ok(value)
-        }
-        DataType::Int64 => {
-            if let Ok(f) = value.as_float() {
-                return Ok(Dynamic::from(f as i64));
-            }
-            Ok(value)
-        }
+        // Rhai often returns INT for a Float-declared field (and vice versa
+        // for Int-declared fields); coerce the mismatched numeric type and
+        // pass everything else through unchanged.
+        DataType::Float64 => match value.as_int() {
+            Ok(i) => Ok(Dynamic::from(i as f64)),
+            Err(_) => Ok(value),
+        },
+        DataType::Int64 => match value.as_float() {
+            Ok(f) => Ok(Dynamic::from(f as i64)),
+            Err(_) => Ok(value),
+        },
         _ => Ok(value),
     }
 }
-
-// Force the `ProcedureMode` / `SideEffects` types into the namespace so
-// rustdoc cross-links resolve; the loader uses these when building
-// ProcedureSignatures.
-#[allow(dead_code)]
-const _: Option<ProcedureMode> = None;
-#[allow(dead_code)]
-const _SE: Option<SideEffects> = None;
 
 #[cfg(test)]
 mod tests {
@@ -177,6 +162,8 @@ mod tests {
     use crate::manifest::compile;
     use arrow_schema::Field;
     use futures::StreamExt;
+    use uni_plugin::capability::SideEffects;
+    use uni_plugin::traits::procedure::ProcedureMode;
     use uni_plugin::{CapabilitySet, PluginId};
 
     fn build_runtime(script: &str) -> Arc<RhaiPluginRuntime> {

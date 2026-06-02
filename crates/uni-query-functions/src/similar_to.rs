@@ -212,35 +212,12 @@ pub fn resolve_source_type(
     })
 }
 
-/// Compute cosine similarity between two vectors, returning a score in [0, 1].
+/// Compute cosine similarity between two vectors, returning a score in [-1, 1].
+///
+/// Arithmetic is performed in f64 (see `cosine_similarity_inner`) and the
+/// clamped result is narrowed to f32.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, SimilarToError> {
-    if a.len() != b.len() {
-        return Err(SimilarToError::DimensionMismatch {
-            a: a.len(),
-            b: b.len(),
-        });
-    }
-
-    let mut dot = 0.0f64;
-    let mut mag1 = 0.0f64;
-    let mut mag2 = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = *x as f64;
-        let y = *y as f64;
-        dot += x * y;
-        mag1 += x * x;
-        mag2 += y * y;
-    }
-    let mag1 = mag1.sqrt();
-    let mag2 = mag2.sqrt();
-
-    if mag1 == 0.0 || mag2 == 0.0 {
-        return Ok(0.0);
-    }
-
-    // Cosine similarity in [-1, 1], map to [0, 1]
-    let sim = (dot / (mag1 * mag2)) as f32;
-    Ok(sim.clamp(-1.0, 1.0))
+    cosine_similarity_inner(a, b).map(|sim| sim as f32)
 }
 
 /// Score two vectors using the specified distance metric, returning a similarity
@@ -305,7 +282,7 @@ pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
         .then(|| value_to_f64_vec(v1).ok().zip(value_to_f64_vec(v2).ok()))
         .flatten();
     if let Some((vec1, vec2)) = f64_vecs {
-        let sim = cosine_similarity_f64(&vec1, &vec2)?;
+        let sim = cosine_similarity_inner(&vec1, &vec2)?;
         return Ok(Value::Float(sim));
     }
     // Fallback: f32 path for Value::Vector (indexed data already in f32).
@@ -315,8 +292,12 @@ pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
     Ok(Value::Float(sim as f64))
 }
 
-/// Compute cosine similarity between two f64 vectors, returning a score in [-1, 1].
-fn cosine_similarity_f64(a: &[f64], b: &[f64]) -> Result<f64, SimilarToError> {
+/// Compute the raw cosine similarity (in f64) between two equal-length vectors,
+/// clamped to [-1, 1]. Returns 0 when either vector has zero magnitude.
+///
+/// Generic over the element type so both the f32 and f64 callers share one body;
+/// arithmetic is always performed in f64 to preserve precision.
+fn cosine_similarity_inner<T: Copy + Into<f64>>(a: &[T], b: &[T]) -> Result<f64, SimilarToError> {
     if a.len() != b.len() {
         return Err(SimilarToError::DimensionMismatch {
             a: a.len(),
@@ -326,7 +307,8 @@ fn cosine_similarity_f64(a: &[f64], b: &[f64]) -> Result<f64, SimilarToError> {
     let mut dot = 0.0f64;
     let mut mag1 = 0.0f64;
     let mut mag2 = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let (x, y): (f64, f64) = (x.into(), y.into());
         dot += x * y;
         mag1 += x * x;
         mag2 += y * y;
@@ -339,33 +321,20 @@ fn cosine_similarity_f64(a: &[f64], b: &[f64]) -> Result<f64, SimilarToError> {
     Ok((dot / (mag1 * mag2)).clamp(-1.0, 1.0))
 }
 
-/// Convert a Value to a `Vec<f64>` for high-precision vector operations.
-fn value_to_f64_vec(v: &Value) -> Result<Vec<f64>, SimilarToError> {
+/// Convert a Value to a numeric vector for vector operations.
+///
+/// Generic over the element type: `cast` maps the `f64` source value onto the
+/// target representation (identity for `f64`, narrowing for `f32`). List elements
+/// are read as full-precision `f64` before casting, while `Value::Vector` data is
+/// already `f32` and is widened to `f64` first.
+fn value_to_vec<T>(v: &Value, cast: impl Fn(f64) -> T) -> Result<Vec<T>, SimilarToError> {
     match v {
-        Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
-        Value::List(list) => list
-            .iter()
-            .map(|v| {
-                v.as_f64().ok_or_else(|| SimilarToError::InvalidOption {
-                    message: "vector element must be a number".to_string(),
-                })
-            })
-            .collect(),
-        _ => Err(SimilarToError::InvalidVectorValue {
-            actual: format!("{v:?}"),
-        }),
-    }
-}
-
-/// Convert a Value to a `Vec<f32>` for vector operations.
-pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
-    match v {
-        Value::Vector(vec) => Ok(vec.clone()),
+        Value::Vector(vec) => Ok(vec.iter().map(|&x| cast(x as f64)).collect()),
         Value::List(list) => list
             .iter()
             .map(|v| {
                 v.as_f64()
-                    .map(|f| f as f32)
+                    .map(&cast)
                     .ok_or_else(|| SimilarToError::InvalidOption {
                         message: "vector element must be a number".to_string(),
                     })
@@ -375,6 +344,16 @@ pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
             actual: format!("{v:?}"),
         }),
     }
+}
+
+/// Convert a Value to a `Vec<f64>` for high-precision vector operations.
+fn value_to_f64_vec(v: &Value) -> Result<Vec<f64>, SimilarToError> {
+    value_to_vec(v, |f| f)
+}
+
+/// Convert a Value to a `Vec<f32>` for vector operations.
+pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
+    value_to_vec(v, |f| f as f32)
 }
 
 /// Validate options against the number of sources.

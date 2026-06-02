@@ -1,3 +1,4 @@
+use crate::steps::assertions::{assert_err, assert_err_mentions, assert_ok};
 use crate::LocyWorld;
 use cucumber::then;
 
@@ -6,13 +7,7 @@ async fn program_should_compile_successfully(world: &mut LocyWorld) {
     let compile_result = world
         .compile_result()
         .expect("No compile result found - did you forget to compile a program?");
-
-    match compile_result {
-        Ok(_) => {}
-        Err(err) => {
-            panic!("Expected successful compilation, but got error: {}", err);
-        }
-    }
+    assert_ok(compile_result, "compilation");
 }
 
 #[then("the program should fail to compile")]
@@ -20,10 +15,7 @@ async fn program_should_fail_to_compile(world: &mut LocyWorld) {
     let compile_result = world
         .compile_result()
         .expect("No compile result found - did you forget to compile a program?");
-
-    if compile_result.is_ok() {
-        panic!("Expected compile failure, but compilation succeeded");
-    }
+    assert_err(compile_result, "compile");
 }
 
 #[then(regex = r#"^the compile error should mention ['"](.+)['"]$"#)]
@@ -31,24 +23,7 @@ async fn compile_error_should_mention(world: &mut LocyWorld, expected_text: Stri
     let compile_result = world
         .compile_result()
         .expect("No compile result found - did you forget to compile a program?");
-
-    match compile_result {
-        Ok(_) => {
-            panic!(
-                "Expected compile error mentioning '{}', but compilation succeeded",
-                expected_text
-            );
-        }
-        Err(err) => {
-            let error_message = err.to_string();
-            if !error_message.contains(&expected_text) {
-                panic!(
-                    "Expected error message to contain '{}', but got: {}",
-                    expected_text, error_message
-                );
-            }
-        }
-    }
+    assert_err_mentions(compile_result, "compile", &expected_text);
 }
 
 #[then(regex = r#"^the program should have (\d+) strata$"#)]
@@ -75,8 +50,9 @@ async fn program_should_have_n_strata(world: &mut LocyWorld, expected_count: usi
     }
 }
 
-#[then(regex = r#"^the stratum (\d+) should be recursive$"#)]
-async fn stratum_should_be_recursive(world: &mut LocyWorld, stratum_idx: usize) {
+#[then(regex = r#"^the stratum (\d+) should( not)? be recursive$"#)]
+async fn stratum_recursive(world: &mut LocyWorld, stratum_idx: usize, negation: String) {
+    let expect_recursive = negation.is_empty();
     let compile_result = world.compile_result().expect("No compile result found");
 
     let compiled = compile_result.as_ref().expect("Compilation failed");
@@ -85,26 +61,17 @@ async fn stratum_should_be_recursive(world: &mut LocyWorld, stratum_idx: usize) 
         .get(stratum_idx)
         .unwrap_or_else(|| panic!("No stratum at index {}", stratum_idx));
 
-    assert!(
-        stratum.is_recursive,
-        "Expected stratum {} to be recursive, but it is not",
-        stratum_idx
-    );
-}
-
-#[then(regex = r#"^the stratum (\d+) should not be recursive$"#)]
-async fn stratum_should_not_be_recursive(world: &mut LocyWorld, stratum_idx: usize) {
-    let compile_result = world.compile_result().expect("No compile result found");
-
-    let compiled = compile_result.as_ref().expect("Compilation failed");
-    let stratum = compiled
-        .strata
-        .get(stratum_idx)
-        .unwrap_or_else(|| panic!("No stratum at index {}", stratum_idx));
-
-    assert!(
-        !stratum.is_recursive,
-        "Expected stratum {} to not be recursive, but it is",
-        stratum_idx
-    );
+    if expect_recursive {
+        assert!(
+            stratum.is_recursive,
+            "Expected stratum {} to be recursive, but it is not",
+            stratum_idx
+        );
+    } else {
+        assert!(
+            !stratum.is_recursive,
+            "Expected stratum {} to not be recursive, but it is",
+            stratum_idx
+        );
+    }
 }

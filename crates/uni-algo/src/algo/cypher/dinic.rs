@@ -3,7 +3,6 @@
 
 //! uni.algo.maxFlow procedure implementation (using Dinic).
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, Dinic, DinicConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -41,11 +40,12 @@ impl GraphAlgoAdapter for DinicAdapter {
         }])
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

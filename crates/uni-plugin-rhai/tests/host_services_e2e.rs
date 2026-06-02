@@ -248,9 +248,9 @@ impl HttpEgress for RecordingHttp {
 
 /// End-to-end proof of guest-boundary trace propagation: with a real OTel layer
 /// installed and a span active, a Rhai guest's `uni_http_get` call carries the
-/// host's W3C `traceparent` through to the egress. Backs the
-/// `docs/KNOWN_GAPS.md` "continues the host's trace" claim with a positive
-/// assertion (the prior coverage only proved extraction in isolation).
+/// host's W3C `traceparent` through to the egress. Positive proof that
+/// guest-boundary trace propagation works end to end (prior coverage only
+/// proved context extraction in isolation).
 ///
 /// Run with `cargo nextest run -p uni-plugin-rhai --features otel`.
 #[cfg(feature = "otel")]

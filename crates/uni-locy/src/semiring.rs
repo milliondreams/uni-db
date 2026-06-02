@@ -59,6 +59,30 @@ impl std::fmt::Display for SemiringError {
 
 impl std::error::Error for SemiringError {}
 
+/// Domain-check a raw scalar before feeding it to `plus` / `times`.
+///
+/// Returns the value unchanged when it lies in `[0, 1]`. Outside that
+/// range it returns [`SemiringError::DomainViolation`] when `strict` is
+/// set, otherwise clamps and emits the pre-refactor tracing literal
+/// (`"<op> input <raw> outside [0,1], clamped to <clamped>"`) so any
+/// string-asserting tests remain stable. Shared by every `f64`-tagged
+/// [`LocySemiring::validate_domain`] impl.
+pub fn validate_probability_domain(
+    raw: f64,
+    op: &'static str,
+    strict: bool,
+) -> Result<f64, SemiringError> {
+    if (0.0..=1.0).contains(&raw) {
+        return Ok(raw);
+    }
+    if strict {
+        return Err(SemiringError::DomainViolation { value: raw, op });
+    }
+    let clamped = raw.clamp(0.0, 1.0);
+    tracing::warn!("{op} input {raw} outside [0,1], clamped to {clamped}");
+    Ok(clamped)
+}
+
 /// Consolidated semiring configuration threaded through planner and
 /// executors. Constructed by [`crate::LocyConfig::resolve`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -207,18 +231,7 @@ impl LocySemiring for AddMultProb {
         op: &'static str,
         strict: bool,
     ) -> Result<f64, SemiringError> {
-        if !(0.0..=1.0).contains(&raw) {
-            if strict {
-                return Err(SemiringError::DomainViolation { value: raw, op });
-            }
-            // Preserve the pre-refactor tracing literal exactly (locy_fold.rs:208,225,478,495)
-            // so any string-asserting tests remain stable.
-            let clamped = raw.clamp(0.0, 1.0);
-            tracing::warn!("{op} input {raw} outside [0,1], clamped to {clamped}");
-            Ok(clamped)
-        } else {
-            Ok(raw)
-        }
+        validate_probability_domain(raw, op, strict)
     }
 }
 
@@ -271,16 +284,7 @@ impl LocySemiring for MaxMinProb {
         op: &'static str,
         strict: bool,
     ) -> Result<f64, SemiringError> {
-        if !(0.0..=1.0).contains(&raw) {
-            if strict {
-                return Err(SemiringError::DomainViolation { value: raw, op });
-            }
-            let clamped = raw.clamp(0.0, 1.0);
-            tracing::warn!("{op} input {raw} outside [0,1], clamped to {clamped}");
-            Ok(clamped)
-        } else {
-            Ok(raw)
-        }
+        validate_probability_domain(raw, op, strict)
     }
 }
 
@@ -394,6 +398,20 @@ impl SemiringDispatch {
             Self::TopKProofs { inner, .. } => inner.validate_domain(raw, op, strict),
         }
     }
+
+    // -----------------------------------------------------------------
+    // Stage 2 tag-flow surface (pending wiring).
+    //
+    // The methods below (`plus_tag` / `times_tag` / `zero_tag` /
+    // `singleton_tag` / `weight_of`) and the [`AggregatorValue`] enum
+    // are the typed-tag interface that Stage 2 will plumb through
+    // `MonotonicAggState` / `FoldExec` / record-batch encoding so the
+    // `TopKProofs` runtime path stops falling back to `AddMultProb` row
+    // math (see `SemiringDispatch::new`). They have no non-test callers
+    // yet — kept here, compiled and unit-tested, so the Stage 2 wiring
+    // lands against an already-validated surface rather than re-deriving
+    // it. Do not delete pending Stage 2.
+    // -----------------------------------------------------------------
 
     /// Phase C C0 Stage 2: tag-level `plus` that supports both f64
     /// semirings (AddMultProb / MaxMinProb) and the proof-tag
@@ -570,10 +588,9 @@ impl AggregatorValue {
     }
 }
 
-/// Helper that delegates to `TopKProofs::<dynamic_k>::merge_top_k`.
-/// The library impl is generic over K (compile-time const); the
-/// runtime needs a value-level K. We reimplement the same
-/// algorithm here to bridge.
+/// Helper that delegates to [`crate::top_k_proofs::merge_top_k_with`]
+/// over cloned proof lists. The library impl is generic over `K`
+/// (compile-time const); the runtime needs a value-level `k`.
 fn merge_top_k_dispatch(
     a: &crate::top_k_proofs::TopKTag,
     b: &crate::top_k_proofs::TopKTag,
@@ -585,71 +602,20 @@ fn merge_top_k_dispatch(
     merge_top_k_dispatch_owned(a.proofs.clone(), b.proofs.clone(), k)
 }
 
-/// Phase C C0 Stage 2: runtime-K variant of
-/// `TopKProofs::<K>::merge_top_k`. Const-generic K isn't
-/// available at runtime, so this fn duplicates the algorithm with
-/// a value-level k. Exposed pub(crate) so the fixpoint loop can
-/// call it directly without constructing `AggregatorValue`
+/// Phase C C0 Stage 2: runtime-K merge over owned proof lists.
+/// Delegates to [`crate::top_k_proofs::merge_top_k_with`]; exposed
+/// `pub` (re-exported as `merge_top_k_runtime`) so the fixpoint loop
+/// can call it directly without constructing `AggregatorValue`
 /// wrappers when it has owned `Vec<Proof>` already.
 pub fn merge_top_k_dispatch_owned(
-    mut base: Vec<crate::top_k_proofs::Proof>,
+    base: Vec<crate::top_k_proofs::Proof>,
     additional: Vec<crate::top_k_proofs::Proof>,
     k: usize,
 ) -> (
     Vec<crate::top_k_proofs::Proof>,
     crate::top_k_proofs::PruneNotice,
 ) {
-    use crate::dependency_dnf::BaseRvSet;
-    use crate::top_k_proofs::PruneNotice;
-
-    base.extend(additional);
-    // Dedup by (base_rvs, neural_calls) — max-weight wins.
-    let mut keep: Vec<crate::top_k_proofs::Proof> = Vec::with_capacity(base.len());
-    let mut seen: std::collections::HashMap<(Vec<u32>, Vec<u32>), usize> =
-        std::collections::HashMap::new();
-    for p in base.drain(..) {
-        let mut rvs: Vec<u32> = p.base_rvs.iter().map(|r| r.0).collect();
-        rvs.sort_unstable();
-        let mut calls: Vec<u32> = p.neural_calls.iter().map(|c| c.0).collect();
-        calls.sort_unstable();
-        let key = (rvs, calls);
-        match seen.get(&key) {
-            Some(&idx) => {
-                if p.weight > keep[idx].weight {
-                    keep[idx] = p;
-                }
-            }
-            None => {
-                seen.insert(key, keep.len());
-                keep.push(p);
-            }
-        }
-    }
-    keep.sort_by(|a, b| {
-        b.weight
-            .partial_cmp(&a.weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if keep.len() <= k {
-        return (keep, PruneNotice::None);
-    }
-    let (retained, dropped) = keep.split_at(k);
-    let mut crossed = false;
-    for d in dropped {
-        if retained
-            .iter()
-            .any(|r| BaseRvSet::intersect_any(&r.base_rvs, &d.base_rvs))
-        {
-            crossed = true;
-            break;
-        }
-    }
-    let notice = if crossed {
-        PruneNotice::CrossedDependency
-    } else {
-        PruneNotice::Pruned
-    };
-    (retained.to_vec(), notice)
+    crate::top_k_proofs::merge_top_k_with(base, additional, k)
 }
 
 impl Default for SemiringDispatch {

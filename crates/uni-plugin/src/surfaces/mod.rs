@@ -3,7 +3,7 @@
 //! This module is filled during Phase 4 of the §1.1 consolidation pass. It
 //! introduces the [`SurfaceKind`] enum and four family traits
 //! ([`NamedUniqueSurface`], [`VersionedSurface`], [`KeyedUniqueSurface`],
-//! [`AppendSurface`]) that collapse the 26 surfaces in [`crate::registry`]
+//! [`AppendSurface`]) that collapse the 25 surfaces in [`crate::registry`]
 //! to a handful of generic patterns.
 //!
 //! # Phase 4 status
@@ -61,10 +61,10 @@ pub enum Discriminator {
     Arity(usize),
 }
 
-/// Enumeration of the 26 plugin surfaces.
+/// Enumeration of the 25 plugin surfaces.
 ///
-/// Used by [`RecordedKey`] and by [`crate::registry::PluginRecordSnapshot`]
-/// accessors to filter the per-plugin footprint by surface.
+/// Used by [`crate::registry::PluginRecordSnapshot`] accessors to filter the
+/// per-plugin footprint by surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SurfaceKind {
@@ -120,28 +120,6 @@ pub enum SurfaceKind {
     BackgroundJob,
 }
 
-/// A registry key recorded in a plugin's footprint.
-///
-/// Currently used only for [`KeyedUniqueSurface::record_key`] callers that
-/// want a surface-agnostic key handle; the mirror fields on
-/// `crate::registry::PluginRecord` remain per-surface for ergonomic
-/// iteration in [`PluginRegistry::remove_plugin`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RecordedKey {
-    /// A qualified-name key (Scalar, Aggregate, Window, …).
-    QName(QName),
-    /// A qualified-name plus arity discriminator (Procedure).
-    QNameArity(QName, usize),
-    /// An index-kind key.
-    IndexKind(IndexKind),
-    /// A CRDT-kind key.
-    CrdtKind(CrdtKind),
-    /// A small-string key (storage scheme, label, collation name, …).
-    Name(SmolStr),
-    /// An append-family registration (no name; used for count tracking).
-    Anonymous,
-}
-
 // ── Family traits ─────────────────────────────────────────────────────
 
 /// Named-unique family: `DashMap<QName, Arc<Entry<K, Sig, P>>>`.
@@ -195,10 +173,6 @@ pub trait KeyedUniqueSurface: 'static {
 
     /// Surface discriminant.
     const KIND: SurfaceKind;
-
-    /// Convert the surface key into a [`RecordedKey`] for per-plugin
-    /// footprint tracking.
-    fn record_key(key: &Self::Key) -> RecordedKey;
 
     /// Preflight: refuse a duplicate key.
     ///
@@ -276,7 +250,7 @@ impl<P: ?Sized> Debug for AppendEntry<P> {
     }
 }
 
-// ── Marker types for the 26 surfaces ──────────────────────────────────
+// ── Marker types for the 25 surfaces ──────────────────────────────────
 //
 // Each marker is zero-sized; they exist only so `Surface` trait impls can
 // dispatch via the type system. Sub-phases 4b-4e add the per-marker impls.
@@ -435,10 +409,6 @@ impl KeyedUniqueSurface for IndexKindSurface {
     type Provider = dyn IndexKindProvider;
     const KIND: SurfaceKind = SurfaceKind::IndexKind;
 
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::IndexKind(key.clone())
-    }
-
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(provider.kind())
     }
@@ -448,10 +418,6 @@ impl KeyedUniqueSurface for StorageBackendSurface {
     type Key = SmolStr;
     type Provider = dyn StorageBackend;
     const KIND: SurfaceKind = SurfaceKind::StorageBackend;
-
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
 
     fn duplicate_error(key: &Self::Key) -> PluginError {
         PluginError::StorageSchemeConflict(key.to_string())
@@ -467,10 +433,6 @@ impl KeyedUniqueSurface for LabelStorageSurface {
     type Provider = dyn Storage;
     const KIND: SurfaceKind = SurfaceKind::LabelStorage;
 
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
-
     fn duplicate_error(key: &Self::Key) -> PluginError {
         PluginError::internal(format!("label storage for `{key}` already registered"))
     }
@@ -483,10 +445,6 @@ impl KeyedUniqueSurface for CrdtSurface {
     type Key = CrdtKind;
     type Provider = dyn CrdtKindProvider;
     const KIND: SurfaceKind = SurfaceKind::Crdt;
-
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::CrdtKind(key.clone())
-    }
 
     fn duplicate_error(key: &Self::Key) -> PluginError {
         PluginError::internal(format!("CRDT kind `{}` already registered", key.0))
@@ -502,10 +460,6 @@ impl KeyedUniqueSurface for LogicalTypeSurface {
     type Provider = dyn LogicalTypeProvider;
     const KIND: SurfaceKind = SurfaceKind::LogicalType;
 
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
-
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(SmolStr::new(provider.name()))
     }
@@ -515,10 +469,6 @@ impl KeyedUniqueSurface for CollationSurface {
     type Key = SmolStr;
     type Provider = dyn CollationProvider;
     const KIND: SurfaceKind = SurfaceKind::Collation;
-
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
 
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(SmolStr::new(provider.name()))
@@ -530,10 +480,6 @@ impl KeyedUniqueSurface for CdcSurface {
     type Provider = dyn CdcOutputProvider;
     const KIND: SurfaceKind = SurfaceKind::Cdc;
 
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
-
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(SmolStr::new(provider.name()))
     }
@@ -543,10 +489,6 @@ impl KeyedUniqueSurface for CatalogSurface {
     type Key = SmolStr;
     type Provider = dyn CatalogProvider;
     const KIND: SurfaceKind = SurfaceKind::Catalog;
-
-    fn record_key(key: &Self::Key) -> RecordedKey {
-        RecordedKey::Name(key.clone())
-    }
 
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(SmolStr::new(provider.name()))
@@ -1407,12 +1349,6 @@ mod tests {
     fn keyed_unique_default_duplicate_error_is_internal() {
         let err = <LogicalTypeSurface as KeyedUniqueSurface>::duplicate_error(&SmolStr::new("x"));
         assert!(matches!(err, PluginError::Internal(_)));
-    }
-
-    #[test]
-    fn recorded_key_round_trips() {
-        let k = RecordedKey::Name(SmolStr::new("s3"));
-        assert_eq!(k, k.clone());
     }
 
     // ── Foundation ops-trait tests ───────────────────────────────────

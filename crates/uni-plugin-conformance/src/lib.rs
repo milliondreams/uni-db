@@ -3,8 +3,7 @@
 //! This crate publishes a portable test harness that plugin authors run against
 //! their built `.wasm` (or compile-time Rust) plugins to verify:
 //!
-//! - Manifest correctness (parses, capabilities declared match
-//!   registrations).
+//! - Manifest correctness (id is present and well-shaped).
 //! - Schema correctness (declared signatures match actual `invoke` shapes).
 //! - Determinism honesty (a `Pure` plugin produces identical output on
 //!   identical inputs across repeated calls).
@@ -18,9 +17,11 @@
 //! six invariants: `manifest.parse`, `manifest.id_format`, `abi.in_range`,
 //! `capabilities.declared`, `registration.commit`, and
 //! `registration.idempotent`. The [`run_against`] entry point dispatches
-//! to that suite for [`ConformanceTarget::LiveRust`]; the
-//! [`ConformanceTarget::WasmPath`] branch is still a stub pending M6a/M6b
-//! SDK integration (tracked in `docs/KNOWN_GAPS.md`).
+//! to that suite for [`ConformanceTarget::LiveRust`]. The
+//! [`ConformanceTarget::WasmPath`] branch is an intentional marker that points
+//! callers at [`run_against_wasm`] (the real bridge): `run_against` takes only
+//! an enum and, by dep-graph design, the conformance crate cannot depend on
+//! wasmtime to construct a loader itself.
 //!
 //! # Examples
 //!
@@ -87,10 +88,11 @@ impl ConformanceReport {
         if self.passed() {
             return;
         }
+        use std::fmt::Write as _;
         let failures: Vec<&CheckResult> = self.checks.iter().filter(|c| !c.passed).collect();
         let mut msg = String::from("conformance failures:\n");
         for f in failures {
-            msg.push_str(&format!("  - {} [{}]: {}\n", f.name, f.id, f.detail));
+            let _ = writeln!(msg, "  - {} [{}]: {}", f.name, f.id, f.detail);
         }
         panic!("{msg}");
     }
@@ -191,14 +193,24 @@ pub fn run_against_wasm<L: WasmConformanceLoader>(
 /// [`uni_plugin::Plugin`]. Each probe exercises one invariant from
 /// proposal §16.4 and produces a [`CheckResult`].
 ///
-/// Probes:
-/// 1. **manifest.parse** — id non-empty, version semver-valid.
+/// The probes run in two phases. The first four are manifest-only
+/// (they read the parsed manifest and never touch a registry); the last
+/// two drive the plugin against a fresh registry.
+///
+/// Manifest probes:
+/// 1. **manifest.parse** — id is non-empty. (The `version` field is a
+///    typed `semver::Version`, so it is already valid by construction;
+///    this probe only guards the id.)
 /// 2. **manifest.id_format** — id follows reverse-DNS shape (or is a
 ///    reserved single-token id like `"builtin"`).
 /// 3. **abi.in_range** — declared ABI range matches at least one major
 ///    in 0..=63.
-/// 4. **capabilities.declared** — the manifest's `CapabilitySet`
-///    accessor doesn't panic.
+/// 4. **capabilities.declared** — smoke-touch the manifest's
+///    `CapabilitySet` accessor. This is a deliberate always-pass probe:
+///    reading the field cannot fail, so it exists to reserve the stable
+///    `id` for future capability/registration cross-checks.
+///
+/// Registration probes:
 /// 5. **registration.commit** — `register()` + `commit_to_registry()`
 ///    succeed against a fresh registry under declared capabilities.
 /// 6. **registration.idempotent** — `remove_plugin` + re-register
@@ -210,9 +222,11 @@ pub fn run_against_plugin(plugin: &dyn uni_plugin::Plugin) -> ConformanceReport 
     let mut checks: Vec<CheckResult> = Vec::new();
     let manifest = plugin.manifest();
 
+    // ── Phase 1: manifest-only probes (read the parsed manifest) ──────
+
     checks.push(check(
         "manifest.parse",
-        "Manifest has non-empty id and valid semver version",
+        "Manifest has a non-empty id",
         || {
             if manifest.id.as_str().is_empty() {
                 return Err("manifest.id is empty".to_owned());
@@ -257,52 +271,45 @@ pub fn run_against_plugin(plugin: &dyn uni_plugin::Plugin) -> ConformanceReport 
         "capabilities.declared",
         "Manifest's CapabilitySet accessor is safe to call",
         || {
+            // Deliberate always-pass: reading the field cannot fail. The
+            // probe exists to reserve a stable `id` for future
+            // capability/registration cross-checks.
             let _ = &manifest.capabilities;
             Ok(())
         },
     ));
 
+    // ── Phase 2: registration probes (drive a fresh registry) ─────────
+
+    // `register()` + `commit_to_registry()` against the given registry
+    // under the manifest's declared capabilities. `label` prefixes any
+    // error so the originating call site stays identifiable (e.g.
+    // "first ", "re-").
+    let register_once =
+        |registry: &uni_plugin::PluginRegistry, label: &str| -> Result<(), String> {
+            let caps = manifest.capabilities.clone();
+            let mut r = uni_plugin::PluginRegistrar::new(manifest.id.clone(), &caps, registry);
+            plugin
+                .register(&mut r)
+                .map_err(|e| format!("{label}register failed: {e}"))?;
+            r.commit_to_registry()
+                .map_err(|e| format!("{label}commit failed: {e}"))
+        };
+
     checks.push(check(
         "registration.commit",
         "Plugin's register() + commit succeed against a fresh registry",
-        || {
-            use uni_plugin::{PluginRegistrar, PluginRegistry};
-            let registry = PluginRegistry::new();
-            let caps = manifest.capabilities.clone();
-            let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, &registry);
-            plugin
-                .register(&mut r)
-                .map_err(|e| format!("register failed: {e}"))?;
-            r.commit_to_registry()
-                .map_err(|e| format!("commit failed: {e}"))
-        },
+        || register_once(&uni_plugin::PluginRegistry::new(), ""),
     ));
 
     checks.push(check(
         "registration.idempotent",
         "remove_plugin + re-register succeeds",
         || {
-            use uni_plugin::{PluginRegistrar, PluginRegistry};
-            let registry = PluginRegistry::new();
-            let caps = manifest.capabilities.clone();
-            {
-                let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, &registry);
-                plugin
-                    .register(&mut r)
-                    .map_err(|e| format!("first register: {e}"))?;
-                r.commit_to_registry()
-                    .map_err(|e| format!("first commit: {e}"))?;
-            }
+            let registry = uni_plugin::PluginRegistry::new();
+            register_once(&registry, "first ")?;
             registry.remove_plugin(&manifest.id);
-            {
-                let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, &registry);
-                plugin
-                    .register(&mut r)
-                    .map_err(|e| format!("re-register: {e}"))?;
-                r.commit_to_registry()
-                    .map_err(|e| format!("re-commit: {e}"))?;
-            }
-            Ok(())
+            register_once(&registry, "re-")
         },
     ));
 

@@ -17,111 +17,75 @@ use arrow_array::{Array, Float64Array, Int64Array, StringArray, builder::Float64
 use parking_lot::Mutex;
 use rhai::{Engine, EvalAltResult, Position};
 
-/// Immutable Float64 column wrapper exposed to Rhai scripts.
-#[derive(Clone, Debug)]
-pub struct Float64Column {
-    inner: Arc<Float64Array>,
-}
-
-impl Float64Column {
-    /// Wrap an existing `Float64Array`.
-    #[must_use]
-    pub fn new(arr: Arc<Float64Array>) -> Self {
-        Self { inner: arr }
-    }
-
-    /// Number of rows.
-    #[must_use]
-    pub fn len(&mut self) -> i64 {
-        self.inner.len() as i64
-    }
-
-    /// Returns true if the column has no rows.
-    #[must_use]
-    pub fn is_empty(&mut self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Read row `i`; returns `()` for nulls.
-    pub fn get(&mut self, i: i64) -> rhai::Dynamic {
-        let idx = i as usize;
-        if idx >= self.inner.len() || self.inner.is_null(idx) {
-            return rhai::Dynamic::UNIT;
+/// Define an immutable column wrapper exposing a single Arrow array type to
+/// Rhai scripts.
+///
+/// Rhai's custom-type registration keys on a concrete named type, so each
+/// element type needs its own wrapper struct. This macro generates the
+/// identical `new` / `len` / `is_empty` / `get` surface; the only per-type
+/// difference is how a cell value is mapped into a `rhai::Dynamic`
+/// (`$to_dynamic`), e.g. `Utf8Column` allocates a fresh `String` per access.
+macro_rules! immutable_column {
+    ($(#[$meta:meta])* $name:ident, $array:ty, $to_dynamic:expr) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug)]
+        pub struct $name {
+            inner: Arc<$array>,
         }
-        rhai::Dynamic::from(self.inner.value(idx))
-    }
-}
 
-/// Immutable Int64 column wrapper.
-#[derive(Clone, Debug)]
-pub struct Int64Column {
-    inner: Arc<Int64Array>,
-}
+        impl $name {
+            /// Wrap an existing array.
+            #[must_use]
+            pub fn new(arr: Arc<$array>) -> Self {
+                Self { inner: arr }
+            }
 
-impl Int64Column {
-    /// Wrap.
-    #[must_use]
-    pub fn new(arr: Arc<Int64Array>) -> Self {
-        Self { inner: arr }
-    }
+            /// Number of rows.
+            #[must_use]
+            pub fn len(&mut self) -> i64 {
+                self.inner.len() as i64
+            }
 
-    /// Length.
-    #[must_use]
-    pub fn len(&mut self) -> i64 {
-        self.inner.len() as i64
-    }
+            /// Returns true if the column has no rows.
+            #[must_use]
+            pub fn is_empty(&mut self) -> bool {
+                self.inner.is_empty()
+            }
 
-    /// Returns true if the column has no rows.
-    #[must_use]
-    pub fn is_empty(&mut self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Read row `i`.
-    pub fn get(&mut self, i: i64) -> rhai::Dynamic {
-        let idx = i as usize;
-        if idx >= self.inner.len() || self.inner.is_null(idx) {
-            return rhai::Dynamic::UNIT;
+            /// Read row `i`; returns `()` for nulls or out-of-range indices.
+            pub fn get(&mut self, i: i64) -> rhai::Dynamic {
+                let idx = i as usize;
+                if idx >= self.inner.len() || self.inner.is_null(idx) {
+                    return rhai::Dynamic::UNIT;
+                }
+                let cell = self.inner.value(idx);
+                $to_dynamic(cell)
+            }
         }
-        rhai::Dynamic::from(self.inner.value(idx))
-    }
+    };
 }
 
-/// Immutable Utf8 column wrapper. Indexer allocates a fresh `String`
-/// per access — documented as a perf-conscious choice.
-#[derive(Clone, Debug)]
-pub struct Utf8Column {
-    inner: Arc<StringArray>,
-}
+immutable_column!(
+    /// Immutable Float64 column wrapper exposed to Rhai scripts.
+    Float64Column,
+    Float64Array,
+    rhai::Dynamic::from
+);
 
-impl Utf8Column {
-    /// Wrap.
-    #[must_use]
-    pub fn new(arr: Arc<StringArray>) -> Self {
-        Self { inner: arr }
-    }
+immutable_column!(
+    /// Immutable Int64 column wrapper.
+    Int64Column,
+    Int64Array,
+    rhai::Dynamic::from
+);
 
-    /// Length.
-    #[must_use]
-    pub fn len(&mut self) -> i64 {
-        self.inner.len() as i64
-    }
-
-    /// Returns true if the column has no rows.
-    #[must_use]
-    pub fn is_empty(&mut self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Read row `i` as a fresh `String`.
-    pub fn get(&mut self, i: i64) -> rhai::Dynamic {
-        let idx = i as usize;
-        if idx >= self.inner.len() || self.inner.is_null(idx) {
-            return rhai::Dynamic::UNIT;
-        }
-        rhai::Dynamic::from(self.inner.value(idx).to_owned())
-    }
-}
+immutable_column!(
+    /// Immutable Utf8 column wrapper. The indexer allocates a fresh `String`
+    /// per access — documented as a perf-conscious choice.
+    Utf8Column,
+    StringArray,
+    |v: &str| rhai::Dynamic::from(v.to_owned())
+);
 
 /// Mutable Float64 column the script allocates via
 /// `uni::float_column(n)` and writes to via indexer-set.

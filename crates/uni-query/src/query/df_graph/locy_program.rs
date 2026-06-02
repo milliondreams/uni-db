@@ -40,7 +40,6 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
-use uni_cypher::locy_ast::GoalQuery;
 use uni_locy::{
     ClassifierRegistry, CommandResult, FactRow, ModelInvocationCache, RuntimeWarning, SemiringKind,
 };
@@ -727,45 +726,6 @@ impl RecordBatchStream for ProgramStream {
 // Inline command execution helpers
 // ---------------------------------------------------------------------------
 
-/// Execute QUERY by scanning converged DerivedStore directly (no SLG).
-///
-/// Strata have already converged all facts, so we can scan the DerivedStore
-/// without re-derivation. WHERE filtering and RETURN projection are applied
-/// in-memory.
-///
-/// NOTE: Currently unused because the DerivedStore uses inferred Arrow types
-/// (Float64 for all property-derived columns), so string property values are
-/// not preserved. Once `infer_expr_type` is improved to use actual schema types,
-/// this function can be re-enabled for QUERYs whose WHERE/RETURN only reference
-/// reliably-typed columns.
-#[allow(dead_code)]
-fn execute_query_inline(
-    query: &GoalQuery,
-    derived_store: &DerivedStore,
-    params: &HashMap<String, Value>,
-) -> DFResult<Vec<FactRow>> {
-    let rule_name = query.rule_name.to_string();
-    let batches = derived_store.get(&rule_name).cloned().unwrap_or_default();
-    let rows = super::locy_eval::record_batches_to_locy_rows(&batches);
-
-    // Apply WHERE filter
-    let filtered = if let Some(ref where_expr) = query.where_expr {
-        rows.into_iter()
-            .filter(|row| {
-                let merged = super::locy_query::merge_params(row, params);
-                super::locy_eval::eval_expr(where_expr, &merged)
-                    .is_ok_and(|v| v.as_bool().unwrap_or(false))
-            })
-            .collect()
-    } else {
-        rows
-    };
-
-    // Apply RETURN (project, distinct, order, skip, limit)
-    super::locy_query::apply_return_clause(filtered, &query.return_clause, params)
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
-}
-
 /// Execute Cypher passthrough via execute_subplan.
 async fn execute_cypher_inline(
     query: &uni_cypher::ast::Query,
@@ -791,103 +751,6 @@ async fn execute_cypher_inline(
     )
     .await?;
     Ok(super::locy_eval::record_batches_to_locy_rows(&batches))
-}
-
-/// Returns true if the WHERE or RETURN expressions contain property access
-/// (e.g. `a.name`) that requires full node objects not available in DerivedStore.
-#[allow(dead_code)]
-fn needs_node_enrichment(query: &GoalQuery) -> bool {
-    let where_has_property = query
-        .where_expr
-        .as_ref()
-        .is_some_and(expr_has_property_access);
-    let return_has_property = query.return_clause.as_ref().is_some_and(|rc| {
-        rc.items.iter().any(|item| match item {
-            uni_cypher::ast::ReturnItem::Expr { expr, .. } => expr_has_property_access(expr),
-            uni_cypher::ast::ReturnItem::All => false,
-        })
-    });
-    where_has_property || return_has_property
-}
-
-/// Recursively check whether an expression contains property access (`a.name`).
-#[allow(dead_code)]
-fn expr_has_property_access(expr: &Expr) -> bool {
-    match expr {
-        Expr::Property(..) => true,
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_property_access(left) || expr_has_property_access(right)
-        }
-        Expr::UnaryOp { expr, .. } => expr_has_property_access(expr),
-        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_property_access),
-        Expr::List(items) => items.iter().any(expr_has_property_access),
-        Expr::Map(entries) => entries.iter().any(|(_, e)| expr_has_property_access(e)),
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => {
-            case_expr
-                .as_ref()
-                .is_some_and(|e| expr_has_property_access(e))
-                || when_then
-                    .iter()
-                    .any(|(w, t)| expr_has_property_access(w) || expr_has_property_access(t))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
-        }
-        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsUnique(e) => expr_has_property_access(e),
-        Expr::In { expr, list } => expr_has_property_access(expr) || expr_has_property_access(list),
-        Expr::ArrayIndex { array, index } => {
-            expr_has_property_access(array) || expr_has_property_access(index)
-        }
-        Expr::ArraySlice { array, start, end } => {
-            expr_has_property_access(array)
-                || start.as_ref().is_some_and(|e| expr_has_property_access(e))
-                || end.as_ref().is_some_and(|e| expr_has_property_access(e))
-        }
-        Expr::Quantifier {
-            list, predicate, ..
-        } => expr_has_property_access(list) || expr_has_property_access(predicate),
-        Expr::Reduce {
-            init, list, expr, ..
-        } => {
-            expr_has_property_access(init)
-                || expr_has_property_access(list)
-                || expr_has_property_access(expr)
-        }
-        Expr::ListComprehension {
-            list,
-            where_clause,
-            map_expr,
-            ..
-        } => {
-            expr_has_property_access(list)
-                || where_clause
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
-                || expr_has_property_access(map_expr)
-        }
-        Expr::PatternComprehension {
-            where_clause,
-            map_expr,
-            ..
-        } => {
-            where_clause
-                .as_ref()
-                .is_some_and(|e| expr_has_property_access(e))
-                || expr_has_property_access(map_expr)
-        }
-        Expr::ValidAt {
-            entity, timestamp, ..
-        } => expr_has_property_access(entity) || expr_has_property_access(timestamp),
-        Expr::MapProjection { base, .. } => expr_has_property_access(base),
-        Expr::LabelCheck { expr, .. } => expr_has_property_access(expr),
-        // Leaf nodes (Literal, Parameter, Variable, Wildcard) and subqueries
-        // (Exists, CountSubquery, CollectSubquery) — no property access.
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------

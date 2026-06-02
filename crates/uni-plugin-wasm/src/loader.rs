@@ -20,7 +20,6 @@
 // Rust guideline compliant
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Deserialize;
 use wasmtime::component::{Component, Linker};
@@ -205,29 +204,67 @@ impl std::fmt::Debug for ScalarPluginInstance {
     }
 }
 
+/// A plugin-returned `fn-error` record. Each `wit-bindgen` world emits its own
+/// structurally-identical type; this trait lets [`map_call`] format any of them
+/// uniformly.
+trait WasmCallErr {
+    fn code(&self) -> u32;
+    fn message(&self) -> &str;
+    fn retryable(&self) -> bool;
+}
+
+macro_rules! impl_wasm_call_err {
+    ($ty:ty) => {
+        impl WasmCallErr for $ty {
+            fn code(&self) -> u32 {
+                self.code
+            }
+            fn message(&self) -> &str {
+                &self.message
+            }
+            fn retryable(&self) -> bool {
+                self.retryable
+            }
+        }
+    };
+}
+impl_wasm_call_err!(crate::bindings::scalar::FnError);
+impl_wasm_call_err!(crate::bindings::aggregate::FnError);
+impl_wasm_call_err!(crate::bindings::procedure::FnError);
+
+/// Collapse a typed export call's nested result into our error model.
+///
+/// `Ok(Ok(bytes))` is the success path; `Ok(Err(fn_err))` is a plugin-returned
+/// fn-error; the outer `Err` is a wasmtime trap. The latter two both classify
+/// as [`WasmError::Invoke`], tagged with `label` (the export name).
+fn map_call<E: WasmCallErr>(
+    label: &str,
+    result: Result<Result<Vec<u8>, E>, wasmtime::Error>,
+) -> Result<Vec<u8>, WasmError> {
+    match result {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(fn_err)) => Err(WasmError::Invoke(format!(
+            "{label} fn-error code={} retryable={}: {}",
+            fn_err.code(),
+            fn_err.retryable(),
+            fn_err.message()
+        ))),
+        Err(e) => Err(WasmError::Invoke(format!("{label} trap: {e}"))),
+    }
+}
+
 impl ScalarPluginInstance {
     /// Call the plugin's `invoke-scalar` export.
     ///
     /// # Errors
     ///
-    /// - [`WasmError::Instantiate`] (re-purposed as the invoke-error
-    ///   bucket) if the underlying wasmtime call traps.
+    /// - [`WasmError::Invoke`] if the underlying wasmtime call traps or
+    ///   the plugin returns a fn-error.
     pub fn invoke_scalar(&mut self, qname: &str, ipc: &[u8]) -> Result<Vec<u8>, WasmError> {
-        // Reset fuel for each call when the engine was built with
-        // `consume_fuel = true`. The store carries the budget set by
-        // the manifest's `fuel_per_call`; if absent, we leave the
-        // store untouched.
         let result = self
             .bindings
             .call_invoke_scalar(&mut self.store, qname, ipc);
-        match result {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(fn_err)) => Err(WasmError::Instantiate(format!(
-                "plugin returned fn-error code={} retryable={}: {}",
-                fn_err.code, fn_err.retryable, fn_err.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!("invoke-scalar trap: {e}"))),
-        }
+        map_call("invoke-scalar", result)
     }
 
     /// Call the plugin's `manifest` export.
@@ -267,14 +304,10 @@ impl std::fmt::Debug for AggregatePluginInstance {
 impl AggregatePluginInstance {
     /// Call `agg-new`.
     pub fn agg_new(&mut self, qname: &str) -> Result<Vec<u8>, WasmError> {
-        match self.bindings.call_agg_new(&mut self.store, qname) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(WasmError::Instantiate(format!(
-                "agg_new fn-error code={}: {}",
-                e.code, e.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!("agg_new trap: {e}"))),
-        }
+        map_call(
+            "agg-new",
+            self.bindings.call_agg_new(&mut self.store, qname),
+        )
     }
 
     /// Call `agg-update`.
@@ -284,17 +317,11 @@ impl AggregatePluginInstance {
         state: &[u8],
         values_ipc: &[u8],
     ) -> Result<Vec<u8>, WasmError> {
-        match self
-            .bindings
-            .call_agg_update(&mut self.store, qname, state, values_ipc)
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(WasmError::Instantiate(format!(
-                "agg_update fn-error code={}: {}",
-                e.code, e.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!("agg_update trap: {e}"))),
-        }
+        map_call(
+            "agg-update",
+            self.bindings
+                .call_agg_update(&mut self.store, qname, state, values_ipc),
+        )
     }
 
     /// Call `agg-merge`.
@@ -304,32 +331,20 @@ impl AggregatePluginInstance {
         state: &[u8],
         other_states_ipc: &[u8],
     ) -> Result<Vec<u8>, WasmError> {
-        match self
-            .bindings
-            .call_agg_merge(&mut self.store, qname, state, other_states_ipc)
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(WasmError::Instantiate(format!(
-                "agg_merge fn-error code={}: {}",
-                e.code, e.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!("agg_merge trap: {e}"))),
-        }
+        map_call(
+            "agg-merge",
+            self.bindings
+                .call_agg_merge(&mut self.store, qname, state, other_states_ipc),
+        )
     }
 
     /// Call `agg-evaluate`.
     pub fn agg_evaluate(&mut self, qname: &str, state: &[u8]) -> Result<Vec<u8>, WasmError> {
-        match self
-            .bindings
-            .call_agg_evaluate(&mut self.store, qname, state)
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(WasmError::Instantiate(format!(
-                "agg_evaluate fn-error code={}: {}",
-                e.code, e.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!("agg_evaluate trap: {e}"))),
-        }
+        map_call(
+            "agg-evaluate",
+            self.bindings
+                .call_agg_evaluate(&mut self.store, qname, state),
+        )
     }
 }
 
@@ -349,19 +364,11 @@ impl std::fmt::Debug for ProcedurePluginInstance {
 impl ProcedurePluginInstance {
     /// Call `invoke-procedure`.
     pub fn invoke_procedure(&mut self, qname: &str, args_ipc: &[u8]) -> Result<Vec<u8>, WasmError> {
-        match self
-            .bindings
-            .call_invoke_procedure(&mut self.store, qname, args_ipc)
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(WasmError::Instantiate(format!(
-                "invoke_procedure fn-error code={}: {}",
-                e.code, e.message
-            ))),
-            Err(e) => Err(WasmError::Instantiate(format!(
-                "invoke_procedure trap: {e}"
-            ))),
-        }
+        map_call(
+            "invoke-procedure",
+            self.bindings
+                .call_invoke_procedure(&mut self.store, qname, args_ipc),
+        )
     }
 }
 
@@ -394,6 +401,35 @@ impl WasmLoader {
     pub fn with_http(mut self, http: Arc<dyn uni_plugin::HttpEgress>) -> Self {
         self.http = Some(http);
         self
+    }
+
+    /// Build the pass-1 bootstrap `PreparedComponent` used to instantiate a
+    /// component far enough to read its `manifest` export.
+    ///
+    /// The manifest is empty (unknown until pass 1), and `effective` is the
+    /// host's *offered* grants (not empty) so a plugin importing a
+    /// capability-gated interface (e.g. host-net) can link. This is the
+    /// tightest safe upper bound — the plugin can never exceed what the host
+    /// offered, and the execution pool (pass 2) further restricts to
+    /// `declared ∩ grants`. A plugin importing an interface the host did NOT
+    /// offer still fails here at instantiate (link absence).
+    fn bootstrap_prepared(&self, host_grants: &uni_plugin::CapabilitySet) -> PreparedComponent {
+        PreparedComponent {
+            manifest: ComponentManifest {
+                id: String::new(),
+                version: String::new(),
+                abi: None,
+                capabilities: Vec::new(),
+                determinism: None,
+                description: None,
+                fuel_per_call: None,
+                memory_max_pages: None,
+                timeout_ms: None,
+            },
+            effective: host_grants.clone(),
+            denied_capabilities: Vec::new(),
+            http: self.http.clone(),
+        }
     }
 
     /// Parse a CM-plugin manifest and intersect declared/granted
@@ -486,31 +522,9 @@ impl WasmLoader {
         host_grants: &uni_plugin::CapabilitySet,
         registrar: &mut uni_plugin::PluginRegistrar<'_>,
     ) -> Result<LoadOutcome, WasmError> {
-        // Pass 1 — minimal prepared state (no caps yet), instantiate
-        // to read manifest.
-        let bootstrap = PreparedComponent {
-            manifest: ComponentManifest {
-                id: String::new(),
-                version: String::new(),
-                abi: None,
-                capabilities: Vec::new(),
-                determinism: None,
-                description: None,
-                fuel_per_call: None,
-                memory_max_pages: None,
-                timeout_ms: None,
-            },
-            // Bootstrap with the host's *offered* grants (not empty) so a
-            // plugin importing a capability-gated interface (e.g. host-net)
-            // can be instantiated far enough to read its manifest. This is the
-            // tightest safe upper bound — the plugin can never exceed what the
-            // host offered, and the execution pool (pass 2) further restricts
-            // to `declared ∩ grants`. A plugin importing an interface the host
-            // did NOT offer still fails here at instantiate (link absence).
-            effective: host_grants.clone(),
-            denied_capabilities: Vec::new(),
-            http: self.http.clone(),
-        };
+        // Pass 1 — minimal prepared state (offered grants, empty manifest),
+        // instantiate to read manifest.
+        let bootstrap = self.bootstrap_prepared(host_grants);
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;
         drop(bootstrap_inst);
@@ -577,30 +591,9 @@ impl WasmLoader {
         bytes: &[u8],
         host_grants: &uni_plugin::CapabilitySet,
     ) -> Result<Box<dyn uni_plugin::Plugin + Send + Sync>, WasmError> {
-        // Pass 1 — instantiate with no caps to read the manifest export.
-        let bootstrap = PreparedComponent {
-            manifest: ComponentManifest {
-                id: String::new(),
-                version: String::new(),
-                abi: None,
-                capabilities: Vec::new(),
-                determinism: None,
-                description: None,
-                fuel_per_call: None,
-                memory_max_pages: None,
-                timeout_ms: None,
-            },
-            // Bootstrap with the host's *offered* grants (not empty) so a
-            // plugin importing a capability-gated interface (e.g. host-net)
-            // can be instantiated far enough to read its manifest. This is the
-            // tightest safe upper bound — the plugin can never exceed what the
-            // host offered, and the execution pool (pass 2) further restricts
-            // to `declared ∩ grants`. A plugin importing an interface the host
-            // did NOT offer still fails here at instantiate (link absence).
-            effective: host_grants.clone(),
-            denied_capabilities: Vec::new(),
-            http: self.http.clone(),
-        };
+        // Pass 1 — instantiate with the offered grants to read the manifest
+        // export.
+        let bootstrap = self.bootstrap_prepared(host_grants);
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;
         drop(bootstrap_inst);
@@ -678,20 +671,14 @@ fn select_linker_for_manifest(
     effective_caps: &uni_plugin::CapabilitySet,
 ) -> Result<Linker<HostState>, WasmError> {
     use crate::linker::{build_scalar_linker_v1, build_scalar_linker_v2};
-    use crate::multi_version::SUPPORTED_MAJORS;
+    use crate::multi_version::{SUPPORTED_MAJORS, major_for_abi};
 
     let Some(abi_str) = manifest.abi.as_deref() else {
         return build_scalar_linker_v1(engine, effective_caps);
     };
     let abi = uni_plugin::AbiRange::parse(abi_str)
         .map_err(|e| WasmError::InvalidWasm(format!("manifest abi parse: {e}")))?;
-    let Some(major) = SUPPORTED_MAJORS.iter().copied().find(|m| abi.matches(*m)) else {
-        return Err(WasmError::AbiUnsupported {
-            requested: abi_str.to_owned(),
-            supported: SUPPORTED_MAJORS.to_vec(),
-        });
-    };
-    match major {
+    match major_for_abi(&abi)? {
         1 => build_scalar_linker_v1(engine, effective_caps),
         2 => build_scalar_linker_v2(engine, effective_caps),
         _ => Err(WasmError::AbiUnsupported {
@@ -719,11 +706,12 @@ fn apply_resource_limits(store: &mut Store<HostState>, manifest: &ComponentManif
         // out of fuel; the host surfaces as `WasmError::ResourceLimit`.
         let _ = store.set_fuel(fuel);
     }
-    if let Some(ms) = manifest.timeout_ms {
+    if manifest.timeout_ms.is_some() {
         // Set the store's epoch deadline; a per-engine timer ticks
         // the epoch and traps the plugin. Pure-compute plugins
         // without a timer config become no-op for this field.
-        let _ = ms;
+        // TODO(phase-d): honor the concrete `timeout_ms` value via a
+        // per-engine timer task rather than a fixed deadline of 1.
         store.set_epoch_deadline(1);
     }
 }
@@ -1047,14 +1035,66 @@ fn build_procedure_pool(
     })
 }
 
+/// Translate one wire arg type into the internal [`ArgType`].
+fn wire_arg(w: &WireArgType) -> Result<uni_plugin::traits::scalar::ArgType, WasmError> {
+    use uni_plugin::traits::scalar::ArgType;
+    Ok(match w {
+        WireArgType::Primitive { arrow } => ArgType::Primitive(arrow_name_to_dt(arrow)?),
+        WireArgType::CypherValue => ArgType::CypherValue,
+    })
+}
+
+/// Parse a wire `volatility` string into a DataFusion [`Volatility`].
+fn parse_volatility(s: &str) -> Result<datafusion::logical_expr::Volatility, WasmError> {
+    use datafusion::logical_expr::Volatility;
+    Ok(match s {
+        "immutable" => Volatility::Immutable,
+        "stable" => Volatility::Stable,
+        "volatile" => Volatility::Volatile,
+        other => {
+            return Err(WasmError::InvalidWasm(format!(
+                "unsupported volatility: `{other}`"
+            )));
+        }
+    })
+}
+
+/// Parse a wire `null_handling` string into a [`NullHandling`].
+fn parse_null_handling(s: &str) -> Result<uni_plugin::traits::scalar::NullHandling, WasmError> {
+    use uni_plugin::traits::scalar::NullHandling;
+    Ok(match s {
+        "propagate" => NullHandling::PropagateNulls,
+        "user_handled" => NullHandling::UserHandled,
+        other => {
+            return Err(WasmError::InvalidWasm(format!(
+                "unsupported null_handling: `{other}`"
+            )));
+        }
+    })
+}
+
+/// Parse a wire procedure `mode` string into a [`ProcedureMode`].
+fn parse_proc_mode(s: &str) -> Result<uni_plugin::traits::procedure::ProcedureMode, WasmError> {
+    use uni_plugin::traits::procedure::ProcedureMode;
+    Ok(match s {
+        "read" => ProcedureMode::Read,
+        "write" => ProcedureMode::Write,
+        "schema" => ProcedureMode::Schema,
+        "dbms" => ProcedureMode::Dbms,
+        other => {
+            return Err(WasmError::InvalidWasm(format!(
+                "unsupported procedure mode: `{other}`"
+            )));
+        }
+    })
+}
+
 fn wire_agg_sig_to_internal(
     wire_sig: &WireFnSignature,
     wire_state: &WireArgType,
 ) -> Result<uni_plugin::traits::aggregate::AggSignature, WasmError> {
     use arrow_schema::Field;
-    use datafusion::logical_expr::Volatility;
     use uni_plugin::traits::aggregate::AggSignature;
-    use uni_plugin::traits::scalar::ArgType;
 
     let internal = wire_fn_sig_to_internal(wire_sig)?;
     let state_field = match wire_state {
@@ -1068,23 +1108,11 @@ fn wire_agg_sig_to_internal(
             ));
         }
     };
-    let volatility = match wire_sig.volatility.as_str() {
-        "immutable" => Volatility::Immutable,
-        "stable" => Volatility::Stable,
-        "volatile" => Volatility::Volatile,
-        other => {
-            return Err(WasmError::InvalidWasm(format!(
-                "unsupported volatility: `{other}`"
-            )));
-        }
-    };
-    let args: Vec<ArgType> = internal.args;
-    let returns = internal.returns;
     Ok(AggSignature {
-        args,
-        returns,
+        volatility: internal.volatility,
+        args: internal.args,
+        returns: internal.returns,
         state_fields: vec![state_field],
-        volatility,
         supports_partial: true,
     })
 }
@@ -1096,15 +1124,9 @@ fn wire_proc_sig_to_internal(
 ) -> Result<uni_plugin::traits::procedure::ProcedureSignature, WasmError> {
     use arrow_schema::Field;
     use uni_plugin::capability::SideEffects;
-    use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
+    use uni_plugin::traits::procedure::{NamedArgType, ProcedureSignature};
     use uni_plugin::traits::scalar::ArgType;
 
-    fn wire_arg(w: &WireArgType) -> Result<ArgType, WasmError> {
-        Ok(match w {
-            WireArgType::Primitive { arrow } => ArgType::Primitive(arrow_name_to_dt(arrow)?),
-            WireArgType::CypherValue => ArgType::CypherValue,
-        })
-    }
     let named_args: Vec<NamedArgType> = args
         .iter()
         .enumerate()
@@ -1131,21 +1153,10 @@ fn wire_proc_sig_to_internal(
             Ok::<Field, WasmError>(Field::new(format!("yield{i}"), dt, true))
         })
         .collect::<Result<_, _>>()?;
-    let proc_mode = match mode {
-        "read" => ProcedureMode::Read,
-        "write" => ProcedureMode::Write,
-        "schema" => ProcedureMode::Schema,
-        "dbms" => ProcedureMode::Dbms,
-        other => {
-            return Err(WasmError::InvalidWasm(format!(
-                "unsupported procedure mode: `{other}`"
-            )));
-        }
-    };
     Ok(ProcedureSignature {
         args: named_args,
         yields: yield_fields,
-        mode: proc_mode,
+        mode: parse_proc_mode(mode)?,
         side_effects: SideEffects::default(),
         retry_contract: None,
         batch_input: None,
@@ -1161,54 +1172,15 @@ fn arrow_name_to_dt(name: &str) -> Result<arrow_schema::DataType, WasmError> {
 fn wire_fn_sig_to_internal(
     wire: &WireFnSignature,
 ) -> Result<uni_plugin::traits::scalar::FnSignature, WasmError> {
-    use arrow_schema::DataType;
-    use datafusion::logical_expr::Volatility;
-    use uni_plugin::traits::scalar::{ArgType, FnSignature, NullHandling};
+    use uni_plugin::traits::scalar::{ArgType, FnSignature};
 
-    fn wire_arg(w: &WireArgType) -> Result<ArgType, WasmError> {
-        Ok(match w {
-            WireArgType::Primitive { arrow } => ArgType::Primitive(arrow_name(arrow)?),
-            WireArgType::CypherValue => ArgType::CypherValue,
-        })
-    }
-    fn arrow_name(name: &str) -> Result<DataType, WasmError> {
-        arrow_name_to_dt(name)
-    }
     let args: Vec<ArgType> = wire.args.iter().map(wire_arg).collect::<Result<_, _>>()?;
-    let returns = wire_arg(&wire.returns)?;
-    let volatility = match wire.volatility.as_str() {
-        "immutable" => Volatility::Immutable,
-        "stable" => Volatility::Stable,
-        "volatile" => Volatility::Volatile,
-        other => {
-            return Err(WasmError::InvalidWasm(format!(
-                "unsupported volatility: `{other}`"
-            )));
-        }
-    };
-    let null_handling = match wire.null_handling.as_str() {
-        "propagate" => NullHandling::PropagateNulls,
-        "user_handled" => NullHandling::UserHandled,
-        other => {
-            return Err(WasmError::InvalidWasm(format!(
-                "unsupported null_handling: `{other}`"
-            )));
-        }
-    };
     Ok(FnSignature {
         args,
-        returns,
-        volatility,
-        null_handling,
+        returns: wire_arg(&wire.returns)?,
+        volatility: parse_volatility(&wire.volatility)?,
+        null_handling: parse_null_handling(&wire.null_handling)?,
     })
-}
-
-// Kept for future epoch-deadline timer use; currently no-op stub
-// (timeout enforcement requires a per-engine timer task — Phase D
-// expands this when the pool's prewarm path lands).
-#[allow(dead_code)]
-fn epoch_timeout_marker() -> Duration {
-    Duration::from_millis(0)
 }
 
 #[cfg(test)]

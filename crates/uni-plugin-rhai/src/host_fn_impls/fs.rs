@@ -37,18 +37,18 @@ pub fn register(loader: &mut RhaiLoader) {
         read: vec!["**".into()],
         write: vec!["**".into()],
     };
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.fs.read".into(),
-        required_capability: Some(placeholder.clone()),
-        docs: "Read a UTF-8 file from the host filesystem.".into(),
-        register: Arc::new(register_fs_read),
-    });
-    loader.host_fns_mut().register(RhaiHostFnSpec {
-        name: "uni.fs.write".into(),
-        required_capability: Some(placeholder),
-        docs: "Write a UTF-8 string to a host filesystem path.".into(),
-        register: Arc::new(register_fs_write),
-    });
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.fs.read",
+        placeholder.clone(),
+        "Read a UTF-8 file from the host filesystem.",
+        register_fs_read,
+    ));
+    loader.host_fns_mut().register(RhaiHostFnSpec::gated(
+        "uni.fs.write",
+        placeholder,
+        "Write a UTF-8 string to a host filesystem path.",
+        register_fs_write,
+    ));
 }
 
 fn register_fs_read(engine: &mut Engine, caps: &CapabilitySet) {

@@ -27,7 +27,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uni_sidecar::{SidecarIoError, SystemSidecar};
 
@@ -179,14 +178,4 @@ impl Persistence for JsonFilePersistence {
         let _guard = self.write_guard.lock().expect("persistence mutex poisoned");
         Ok(self.sidecar.load()?)
     }
-}
-
-/// Persistence record schema variant — used to attach a typed wrapper
-/// for round-trip tests.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistenceEnvelope {
-    /// Schema version. Bumped on incompatible changes.
-    pub schema_version: u32,
-    /// The plugin record.
-    pub plugin: DeclaredPlugin,
 }

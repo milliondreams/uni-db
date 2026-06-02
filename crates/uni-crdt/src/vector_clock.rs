@@ -44,10 +44,11 @@ impl VectorClock {
 
         // Check if all our entries are <= other's
         for (actor, &count) in &self.clocks {
-            if count > other.get(actor) {
+            let other_count = other.get(actor);
+            if count > other_count {
                 return false;
             }
-            if count < other.get(actor) {
+            if count < other_count {
                 strictly_less = true;
             }
         }
@@ -70,8 +71,13 @@ impl VectorClock {
         !self.happened_before(other) && !other.happened_before(self) && self != other
     }
 
-    /// Partial comparison for causal ordering.
-    pub fn partial_cmp(&self, other: &VectorClock) -> Option<Ordering> {
+    /// Compare two clocks for causal ordering.
+    ///
+    /// Returns `Less`/`Greater` when one clock causally happened before the
+    /// other, `Equal` when they match, and `None` when they are concurrent.
+    /// Named `causal_cmp` rather than implementing `PartialOrd` to keep the
+    /// concurrent-as-`None` semantics explicit at call sites.
+    pub fn causal_cmp(&self, other: &VectorClock) -> Option<Ordering> {
         if self == other {
             Some(Ordering::Equal)
         } else if self.happened_before(other) {
@@ -105,7 +111,7 @@ mod tests {
         // a < b
         assert!(a.happened_before(&b));
         assert!(!b.happened_before(&a));
-        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(a.causal_cmp(&b), Some(Ordering::Less));
 
         let mut c = a.clone();
         c.increment("node2"); // {node1: 1, node2: 1}
@@ -116,7 +122,7 @@ mod tests {
         assert!(!b.happened_before(&c));
         assert!(!c.happened_before(&b));
         assert!(b.is_concurrent(&c));
-        assert_eq!(b.partial_cmp(&c), None);
+        assert_eq!(b.causal_cmp(&c), None);
     }
 
     #[test]

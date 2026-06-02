@@ -4,6 +4,7 @@
 // Pushdown hydration analyzes which properties a query needs and loads them during
 // the initial scan, transforming property loading from O(N*M) to O(N) complexity.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// Specification of property requirements for a Cypher function.
@@ -28,7 +29,7 @@ pub struct FunctionPropertySpec {
 
 /// Static registry of function property specifications.
 /// Function names are uppercase for case-insensitive lookup.
-static FUNCTION_SPECS: LazyLock<std::collections::HashMap<&'static str, FunctionPropertySpec>> =
+static FUNCTION_SPECS: LazyLock<HashMap<&'static str, FunctionPropertySpec>> =
     LazyLock::new(|| {
         // Helper specs for common patterns
         let full_entity = FunctionPropertySpec {
@@ -47,7 +48,7 @@ static FUNCTION_SPECS: LazyLock<std::collections::HashMap<&'static str, Function
             needs_full_entity: false,
         };
 
-        std::collections::HashMap::from([
+        HashMap::from([
             // uni.temporal.validAt(entity, start_prop, end_prop, timestamp)
             (
                 "UNI.TEMPORAL.VALIDAT",

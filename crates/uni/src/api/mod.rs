@@ -106,6 +106,33 @@ pub(crate) fn plugin_err_to_uni(e: uni_plugin::PluginError) -> UniError {
     }
 }
 
+/// Run a plugin-loader pass under a freshly-built placeholder registrar.
+///
+/// Every loader (`load_wasm_extism` / `load_wasm_component` /
+/// `load_rhai_plugin` / `load_python_plugin`, plus the session-scoped
+/// Python add/finalize paths) follows the same three-step dance:
+/// construct a [`uni_plugin::PluginRegistrar`] under a placeholder plugin
+/// id (the loader rewrites the real id from the manifest into the returned
+/// `LoadOutcome`), run the loader's `load*` call, then atomically commit
+/// the staged registrations into `registry`.
+///
+/// `f` performs the loader-specific `load*` call and maps the loader's
+/// error enum to a [`UniError`] — that mapping stays at the call site so
+/// each loader preserves its exact error-variant handling. This helper
+/// only owns the placeholder/registrar construction and the final commit.
+pub(crate) fn with_loading_registrar<T>(
+    registry: &Arc<uni_plugin::PluginRegistry>,
+    placeholder: &str,
+    caps: &uni_plugin::CapabilitySet,
+    f: impl FnOnce(&mut uni_plugin::PluginRegistrar) -> Result<T>,
+) -> Result<T> {
+    use uni_plugin::{PluginId, PluginRegistrar};
+    let mut r = PluginRegistrar::new(PluginId::new(placeholder), caps, registry);
+    let outcome = f(&mut r)?;
+    r.commit_to_registry().map_err(plugin_err_to_uni)?;
+    Ok(outcome)
+}
+
 /// Register the framework-wide built-in plugins into a fresh
 /// `PluginRegistry`. Called once at `Uni::build()` time.
 ///
@@ -148,10 +175,7 @@ fn register_builtin_plugins(
     // `uni-store` / `uni-algo` types that the latter cannot reach
     // without inverting the crate layering.
     {
-        use uni_plugin::{
-            AbiRange, Capability, CapabilitySet, Determinism, PluginId, PluginManifest,
-            ProvidedSurfaces, Scope, SideEffects as PluginSideEffects,
-        };
+        use uni_plugin::{Capability, CapabilitySet, PluginId};
 
         let plugin_id = PluginId::new("uni");
         let caps = CapabilitySet::from_iter_of([
@@ -165,26 +189,6 @@ fn register_builtin_plugins(
             // `max_concurrent`.
             Capability::BackgroundJob { max_concurrent: 0 },
         ]);
-        let manifest = PluginManifest {
-            id: plugin_id.clone(),
-            version: env!("CARGO_PKG_VERSION")
-                .parse()
-                .unwrap_or_else(|_| "1.0.0".parse().expect("static version parses")),
-            abi: AbiRange::parse("^1").expect("manifest ABI range is valid"),
-            depends_on: vec![],
-            capabilities: caps.clone(),
-            determinism: Determinism::Pure,
-            side_effects: PluginSideEffects::ReadOnly,
-            scope: Scope::Instance,
-            hash: None,
-            signature: None,
-            provides: ProvidedSurfaces::default(),
-            docs: "Host-coupled built-in procedures (uni.schema.*, uni.vector.query, \
-                   uni.fts.query, uni.search, uni.algo.*) registered from uni-query."
-                .to_owned(),
-            metadata: std::collections::BTreeMap::new(),
-        };
-        let _ = manifest; // hold ownership for future verification logic; not yet consumed by registrar
         let mut caps = caps;
         // M5c.1: this block also registers `AlgorithmProvider`s so the
         // `Capability::Algorithm` must be in scope. The host's "uni"
@@ -236,6 +240,184 @@ fn register_builtin_plugins(
     }
 
     Ok(cypher_sink)
+}
+
+/// Join a storage base URI with a dataset name into a `*.lance` URI,
+/// inserting a `/` separator only when the base lacks a trailing slash.
+///
+/// Delegates to [`uni_store::fork::recovery::join_uri_with`] so the
+/// fork-op join sites (`drop_fork` / `tag_fork` / `untag_fork` /
+/// `list_fork_tags`) share one source of truth with the recovery path.
+fn dataset_uri(base_uri: &str, dataset: &str) -> String {
+    uni_store::fork::recovery::join_uri_with(base_uri.to_string())(dataset)
+}
+
+/// Whether a schema element (label or edge type) is present and `Active`.
+///
+/// Shared by `label_exists` / `edge_type_exists`; `state` is the looked-up
+/// element's state (`None` when the element is absent from the schema).
+fn element_active(state: Option<&uni_common::core::schema::SchemaElementState>) -> bool {
+    matches!(
+        state,
+        Some(uni_common::core::schema::SchemaElementState::Active)
+    )
+}
+
+/// Build the `PropertyInfo` projection for a label or edge type.
+///
+/// Shared by [`Uni::get_label_info`] and [`Uni::get_edge_type_info`];
+/// `is_indexed` is supplied per element kind because labels consult more
+/// index variants (vector / JSON-FTS) than edge types do — keeping the
+/// exact per-kind predicate preserves the original behavior.
+fn property_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    name: &str,
+    is_indexed: impl Fn(&uni_common::core::schema::IndexDefinition, &str, &str) -> bool,
+) -> Vec<crate::api::schema::PropertyInfo> {
+    let mut properties = Vec::new();
+    if let Some(props) = schema.properties.get(name) {
+        for (prop_name, prop_meta) in props {
+            properties.push(crate::api::schema::PropertyInfo {
+                name: prop_name.clone(),
+                data_type: format!("{:?}", prop_meta.r#type),
+                nullable: prop_meta.nullable,
+                is_indexed: schema
+                    .indexes
+                    .iter()
+                    .any(|idx| is_indexed(idx, name, prop_name)),
+                description: prop_meta.description.clone(),
+            });
+        }
+    }
+    properties
+}
+
+/// Build the `IndexInfo` projection for a label or edge type.
+///
+/// `descriptor` maps each index targeting `name` to its `(type, props)`
+/// pair, returning `None` to skip variants that do not apply to this
+/// element kind (e.g. edge types skip vector / JSON-FTS indexes).
+fn index_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    name: &str,
+    descriptor: impl Fn(
+        &uni_common::core::schema::IndexDefinition,
+    ) -> Option<(&'static str, Vec<String>)>,
+) -> Vec<crate::api::schema::IndexInfo> {
+    let mut indexes = Vec::new();
+    for idx in schema.indexes.iter().filter(|i| i.label() == name) {
+        let Some((idx_type, idx_props)) = descriptor(idx) else {
+            continue;
+        };
+        indexes.push(crate::api::schema::IndexInfo {
+            name: idx.name().to_string(),
+            index_type: idx_type.to_string(),
+            properties: idx_props,
+            status: "ONLINE".to_string(), // TODO: Check actual status
+        });
+    }
+    indexes
+}
+
+/// Build the `ConstraintInfo` projection for a label or edge type.
+///
+/// `target_matches` selects the constraints whose target matches `name`
+/// (`ConstraintTarget::Label` for labels, `EdgeType` for edge types).
+fn constraint_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    target_matches: impl Fn(&uni_common::core::schema::Constraint) -> bool,
+) -> Vec<crate::api::schema::ConstraintInfo> {
+    use uni_common::core::schema::ConstraintType;
+    let mut constraints = Vec::new();
+    for c in &schema.constraints {
+        if !target_matches(c) {
+            continue;
+        }
+        let (ctype, cprops) = match &c.constraint_type {
+            ConstraintType::Unique { properties } => ("UNIQUE", properties.clone()),
+            ConstraintType::Exists { property } => ("EXISTS", vec![property.clone()]),
+            ConstraintType::Check { expression } => ("CHECK", vec![expression.clone()]),
+            _ => ("UNKNOWN", vec![]),
+        };
+        constraints.push(crate::api::schema::ConstraintInfo {
+            name: c.name.clone(),
+            constraint_type: ctype.to_string(),
+            properties: cprops,
+            enabled: c.enabled,
+        });
+    }
+    constraints
+}
+
+/// `is_indexed` predicate for label properties (consults vector, scalar,
+/// full-text, inverted, and JSON-FTS index variants).
+fn label_property_is_indexed(
+    idx: &uni_common::core::schema::IndexDefinition,
+    name: &str,
+    prop_name: &str,
+) -> bool {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(v) => v.label == name && v.property.as_str() == prop_name,
+        IndexDefinition::Scalar(s) => {
+            s.label == name && s.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::FullText(f) => {
+            f.label == name && f.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::Inverted(inv) => inv.label == name && inv.property.as_str() == prop_name,
+        IndexDefinition::JsonFullText(j) => j.label == name,
+        _ => false,
+    }
+}
+
+/// `is_indexed` predicate for edge-type properties (scalar, full-text,
+/// and inverted only — edges carry no vector / JSON-FTS indexes).
+fn edge_property_is_indexed(
+    idx: &uni_common::core::schema::IndexDefinition,
+    name: &str,
+    prop_name: &str,
+) -> bool {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Scalar(s) => {
+            s.label == name && s.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::FullText(f) => {
+            f.label == name && f.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::Inverted(inv) => inv.label == name && inv.property.as_str() == prop_name,
+        _ => false,
+    }
+}
+
+/// Index `(type, props)` descriptor for labels (maps all five variants).
+fn label_index_descriptor(
+    idx: &uni_common::core::schema::IndexDefinition,
+) -> Option<(&'static str, Vec<String>)> {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(v) => Some(("VECTOR", vec![v.property.clone()])),
+        IndexDefinition::Scalar(s) => Some(("SCALAR", s.properties.clone())),
+        IndexDefinition::FullText(f) => Some(("FULLTEXT", f.properties.clone())),
+        IndexDefinition::Inverted(inv) => Some(("INVERTED", vec![inv.property.clone()])),
+        IndexDefinition::JsonFullText(j) => Some(("JSON_FTS", vec![j.column.clone()])),
+        _ => None,
+    }
+}
+
+/// Index `(type, props)` descriptor for edge types (skips vector /
+/// JSON-FTS variants).
+fn edge_index_descriptor(
+    idx: &uni_common::core::schema::IndexDefinition,
+) -> Option<(&'static str, Vec<String>)> {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Scalar(s) => Some(("SCALAR", s.properties.clone())),
+        IndexDefinition::FullText(f) => Some(("FULLTEXT", f.properties.clone())),
+        IndexDefinition::Inverted(inv) => Some(("INVERTED", vec![inv.property.clone()])),
+        _ => None,
+    }
 }
 
 /// Shared inner state of a Uni database instance.
@@ -561,6 +743,64 @@ impl UniInner {
         }
     }
 
+    /// Build a derived `UniInner` that shares most of `self`'s state but
+    /// swaps in a different storage view (a pinned snapshot or a fork
+    /// branch).
+    ///
+    /// The five arguments are the only fields that differ between a
+    /// snapshot/fork inner and `self`: `storage`, `schema`, `properties`,
+    /// `writer`, `locy_rule_registry`, and the `executor_template` built
+    /// from them. Everything else is either cloned from `self` (registries,
+    /// trust config, fork bookkeeping, …) or reset fresh per the spec's
+    /// per-view isolation contract (cancellation token, broadcast channel,
+    /// metrics counters). Used by both [`Self::at_snapshot`] and
+    /// [`Self::at_fork`] so a new field is added in exactly one place.
+    fn derived_clone(
+        &self,
+        storage: Arc<StorageManager>,
+        schema: Arc<SchemaManager>,
+        properties: Arc<PropertyManager>,
+        writer: Option<Arc<Writer>>,
+        locy_rule_registry: Arc<std::sync::RwLock<impl_locy::LocyRuleRegistry>>,
+        executor_template: Arc<uni_query::Executor>,
+    ) -> UniInner {
+        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+        UniInner {
+            storage,
+            schema,
+            properties,
+            writer,
+            xervo_runtime: self.xervo_runtime.clone(),
+            config: self.config.clone(),
+            procedure_registry: self.procedure_registry.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            plugins: self.plugins.clone(),
+            defer_queue: self.defer_queue.clone(),
+            scheduler_host: Arc::clone(&self.scheduler_host),
+            shutdown_handle: Arc::new(ShutdownHandle::new(Duration::from_secs(30))),
+            locy_rule_registry,
+            start_time: Instant::now(),
+            commit_tx,
+            write_lease: None,
+            plugin_trust: self.plugin_trust.clone(),
+            active_session_count: AtomicUsize::new(0),
+            total_queries: AtomicU64::new(0),
+            total_commits: AtomicU64::new(0),
+            custom_functions: self.custom_functions.clone(),
+            df_session_template: self.df_session_template.clone(),
+            executor_template,
+            fork_registry: self.fork_registry.clone(),
+            fork_inners: self.fork_inners.clone(),
+            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
+            active_connectors: Arc::new(DashMap::new()),
+            next_connector_seq: AtomicU64::new(1),
+            cached_l0_mutation_count: AtomicUsize::new(0),
+            cached_l0_estimated_size: AtomicUsize::new(0),
+            cached_wal_lsn: AtomicU64::new(0),
+            _temp_dir: None,
+        }
+    }
+
     /// Open a point-in-time view of the database at the given snapshot.
     ///
     /// Returns a new `UniInner` that is pinned to the specified snapshot state.
@@ -582,9 +822,6 @@ impl UniInner {
             self.plugin_registry.clone(),
         ));
 
-        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
-
-        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
         let executor_template = build_executor_template(
             pinned_storage.clone(),
             self.config.clone(),
@@ -594,42 +831,16 @@ impl UniInner {
             prop_manager.clone(),
             self.df_session_template.clone(),
         );
-        Ok(UniInner {
-            storage: pinned_storage,
-            schema: self.schema.clone(),
-            properties: prop_manager,
-            writer: None,
-            xervo_runtime: self.xervo_runtime.clone(),
-            config: self.config.clone(),
-            procedure_registry: self.procedure_registry.clone(),
-            plugin_registry: self.plugin_registry.clone(),
-            plugins: self.plugins.clone(),
-            defer_queue: self.defer_queue.clone(),
-            scheduler_host: Arc::clone(&self.scheduler_host),
-            shutdown_handle,
-            locy_rule_registry: Arc::new(std::sync::RwLock::new(
+        Ok(self.derived_clone(
+            pinned_storage,
+            self.schema.clone(),
+            prop_manager,
+            None,
+            Arc::new(std::sync::RwLock::new(
                 impl_locy::LocyRuleRegistry::default(),
             )),
-            start_time: Instant::now(),
-            commit_tx,
-            write_lease: None,
-            plugin_trust: self.plugin_trust.clone(),
-            active_session_count: AtomicUsize::new(0),
-            total_queries: AtomicU64::new(0),
-            total_commits: AtomicU64::new(0),
-            custom_functions: self.custom_functions.clone(),
-            df_session_template: self.df_session_template.clone(),
             executor_template,
-            fork_registry: self.fork_registry.clone(),
-            fork_inners: self.fork_inners.clone(),
-            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
-            active_connectors: Arc::new(DashMap::new()),
-            next_connector_seq: AtomicU64::new(1),
-            cached_l0_mutation_count: AtomicUsize::new(0),
-            cached_l0_estimated_size: AtomicUsize::new(0),
-            cached_wal_lsn: AtomicU64::new(0),
-            _temp_dir: None,
-        })
+        ))
     }
 
     /// Construct a fork-scoped clone of this `UniInner`.
@@ -670,9 +881,6 @@ impl UniInner {
             self.properties.cache_size(),
             self.plugin_registry.clone(),
         ));
-
-        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
-        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
 
         // Deep-copy the rule registry so fork-local rule registrations
         // do not bleed into primary. Mirrors today's `Session::clone`
@@ -728,40 +936,14 @@ impl UniInner {
             prop_manager.clone(),
             self.df_session_template.clone(),
         );
-        Ok(UniInner {
-            storage: forked_storage,
-            schema: merged_schema,
-            properties: prop_manager,
-            writer: Some(forked_writer_arc),
-            xervo_runtime: self.xervo_runtime.clone(),
-            config: self.config.clone(),
-            procedure_registry: self.procedure_registry.clone(),
-            plugin_registry: self.plugin_registry.clone(),
-            plugins: self.plugins.clone(),
-            defer_queue: self.defer_queue.clone(),
-            scheduler_host: Arc::clone(&self.scheduler_host),
-            shutdown_handle,
-            locy_rule_registry: rule_registry,
-            start_time: Instant::now(),
-            commit_tx,
-            write_lease: None,
-            plugin_trust: self.plugin_trust.clone(),
-            active_session_count: AtomicUsize::new(0),
-            total_queries: AtomicU64::new(0),
-            total_commits: AtomicU64::new(0),
-            custom_functions: self.custom_functions.clone(),
-            df_session_template: self.df_session_template.clone(),
+        Ok(self.derived_clone(
+            forked_storage,
+            merged_schema,
+            prop_manager,
+            Some(forked_writer_arc),
+            rule_registry,
             executor_template,
-            fork_registry: self.fork_registry.clone(),
-            fork_inners: self.fork_inners.clone(),
-            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
-            active_connectors: Arc::new(DashMap::new()),
-            next_connector_seq: AtomicU64::new(1),
-            cached_l0_mutation_count: AtomicUsize::new(0),
-            cached_l0_estimated_size: AtomicUsize::new(0),
-            cached_wal_lsn: AtomicU64::new(0),
-            _temp_dir: None,
-        })
+        ))
     }
 }
 
@@ -942,18 +1124,15 @@ impl Uni {
             uni_plugin::traits::connector::Credentials::MtlsCert(_) => "mtls",
         };
         let providers = self.inner.plugin_registry.auth_providers();
-        let matching: Vec<_> = providers.iter().filter(|p| p.scheme() == scheme).collect();
-        if matching.is_empty() {
-            return Err(UniError::AuthenticationFailed {
-                reason: format!("no AuthProvider registered for scheme `{scheme}`"),
-            });
-        }
-        // Try each matching provider in registration order; succeed
-        // on the first one that authenticates. This lets a host stack
-        // its own provider alongside the built-in one — either may
-        // hold the credentials.
+        // Try each matching provider in registration order; succeed on
+        // the first one that authenticates. This lets a host stack its
+        // own provider alongside the built-in one — either may hold the
+        // credentials. `matched_any` distinguishes "no provider for this
+        // scheme" from "providers were tried and all rejected".
+        let mut matched_any = false;
         let mut last_error: Option<String> = None;
-        for provider in matching {
+        for provider in providers.iter().filter(|p| p.scheme() == scheme) {
+            matched_any = true;
             match provider.authenticate(&creds) {
                 Ok(principal) => {
                     return Ok(self.session().with_principal(Arc::new(principal)));
@@ -962,6 +1141,11 @@ impl Uni {
                     last_error = Some(e.0);
                 }
             }
+        }
+        if !matched_any {
+            return Err(UniError::AuthenticationFailed {
+                reason: format!("no AuthProvider registered for scheme `{scheme}`"),
+            });
         }
         Err(UniError::AuthenticationFailed {
             reason: last_error.unwrap_or_else(|| "all matching providers rejected".to_owned()),
@@ -984,6 +1168,36 @@ impl Uni {
     /// Returns [`UniError::ForkNotFound`] when no fork has this name.
     pub async fn fork_info(&self, name: &str) -> Result<uni_common::core::fork::ForkInfo> {
         self.inner.fork_registry.get(name).await
+    }
+
+    /// Wait (bounded) for a fork's `holder_count` to drain to zero,
+    /// returning the final count.
+    ///
+    /// Under async-flush a fork's `FlushCoordinator` finalizer is an
+    /// orphan tokio task that transitively pins the fork's
+    /// `ForkHolderGuard`, so `holder_count_for` can sit briefly above
+    /// zero after the last session drops. This polls up to 100 times,
+    /// yielding to the runtime for the first 20 iterations (to let
+    /// pending destructors run) then sleeping 10 ms thereafter. Shared
+    /// by `drop_fork` (ignores the count) and `drop_fork_cascade` (uses
+    /// it to build the blocker message).
+    async fn wait_for_holders_drained(&self, fork_id: ForkId) -> usize {
+        let mut holders = self.inner.fork_registry.holder_count_for(fork_id).await;
+        if holders == 0 {
+            return 0;
+        }
+        for i in 0..100 {
+            if i < 20 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            holders = self.inner.fork_registry.holder_count_for(fork_id).await;
+            if holders == 0 {
+                break;
+            }
+        }
+        holders
     }
 
     /// Drop a fork by name (Phase 1: read-only forks only).
@@ -1092,16 +1306,7 @@ impl Uni {
         // task's destructor may still be pending in the scheduler
         // queue. yield_now repeatedly lets the runtime work through
         // those destructors before we check holder_count.
-        for i in 0..100 {
-            if self.inner.fork_registry.holder_count_for(preview.id).await == 0 {
-                break;
-            }
-            if i < 20 {
-                tokio::task::yield_now().await;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }
+        self.wait_for_holders_drained(preview.id).await;
         let info = self.inner.fork_registry.begin_drop(name).await?;
         // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)
         // before deleting branches. The registry has already
@@ -1113,11 +1318,7 @@ impl Uni {
         // Step 3: walk branches and force-delete each.
         let storage_uri = self.inner.storage.base_uri().to_string();
         for (dataset, branch) in &info.datasets {
-            let dataset_uri = if storage_uri.ends_with('/') {
-                format!("{storage_uri}{dataset}.lance")
-            } else {
-                format!("{storage_uri}/{dataset}.lance")
-            };
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
             if let Err(e) =
                 uni_store::backend::lance_branch::delete_branch(&dataset_uri, branch).await
             {
@@ -1188,20 +1389,7 @@ impl Uni {
                 continue;
             }
             // Wait briefly for orphan finalizer tasks to exit.
-            let mut holders = self.inner.fork_registry.holder_count_for(node.id).await;
-            if holders > 0 {
-                for i in 0..100 {
-                    if i < 20 {
-                        tokio::task::yield_now().await;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                    holders = self.inner.fork_registry.holder_count_for(node.id).await;
-                    if holders == 0 {
-                        break;
-                    }
-                }
-            }
+            let holders = self.wait_for_holders_drained(node.id).await;
             if holders > 0 {
                 blockers.push(format!("{}: {} live session(s)", node.name, holders));
             }
@@ -1423,11 +1611,7 @@ impl Uni {
         let info = self.inner.fork_registry.get(fork_name).await?;
         let storage_uri = self.inner.storage.base_uri().to_string();
         for (dataset, branch) in &info.datasets {
-            let dataset_uri = if storage_uri.ends_with('/') {
-                format!("{storage_uri}{dataset}.lance")
-            } else {
-                format!("{storage_uri}/{dataset}.lance")
-            };
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
             uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch)
                 .await
@@ -1452,11 +1636,7 @@ impl Uni {
         let info = self.inner.fork_registry.get(fork_name).await?;
         let storage_uri = self.inner.storage.base_uri().to_string();
         for dataset in info.datasets.keys() {
-            let dataset_uri = if storage_uri.ends_with('/') {
-                format!("{storage_uri}{dataset}.lance")
-            } else {
-                format!("{storage_uri}/{dataset}.lance")
-            };
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
             uni_store::backend::lance_branch::delete_tag(&dataset_uri, &lance_tag)
                 .await
@@ -1485,11 +1665,7 @@ impl Uni {
         let storage_uri = self.inner.storage.base_uri().to_string();
         let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for dataset in info.datasets.keys() {
-            let dataset_uri = if storage_uri.ends_with('/') {
-                format!("{storage_uri}{dataset}.lance")
-            } else {
-                format!("{storage_uri}/{dataset}.lance")
-            };
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let suffix = format!("_{dataset}");
             let prefix = "fork_";
             let on_disk = uni_store::backend::lance_branch::list_tags(&dataset_uri)
@@ -1923,30 +2099,32 @@ impl Uni {
         host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_extism::loader::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        // Construct the registrar under a *placeholder* plugin id; the
-        // loader rewrites the real id from the manifest into the
-        // returned LoadOutcome. We need a non-empty placeholder because
-        // QName::namespace() comparisons in `validate_qname` require a
-        // non-builtin namespace; we let the registrar accept any qname
-        // by leaning on `validate_qname`'s `is_builtin` short-circuit
-        // (M6a.2 expands this with a per-plugin namespace gate).
-        let placeholder = PluginId::new("extism.loading");
-        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
-        let outcome = loader
-            .load(bytes, host_grants, &mut r)
-            .map_err(|e| match e {
-                uni_plugin_extism::ExtismError::Instantiate(m)
-                | uni_plugin_extism::ExtismError::InvalidPlugin(m)
-                | uni_plugin_extism::ExtismError::ManifestInvalid(m)
-                | uni_plugin_extism::ExtismError::OutputDecode(m) => UniError::InvalidArgument {
-                    arg: "bytes".to_owned(),
-                    message: format!("extism plugin: {m}"),
-                },
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry().map_err(plugin_err_to_uni)?;
-        Ok(outcome)
+        // The placeholder plugin id is rewritten by the loader with the
+        // real id from the manifest into the returned LoadOutcome. We
+        // need a non-empty placeholder because QName::namespace()
+        // comparisons in `validate_qname` require a non-builtin
+        // namespace; we let the registrar accept any qname by leaning on
+        // `validate_qname`'s `is_builtin` short-circuit (M6a.2 expands
+        // this with a per-plugin namespace gate).
+        with_loading_registrar(
+            &self.inner.plugin_registry,
+            "extism.loading",
+            registrar_caps,
+            |r| {
+                loader.load(bytes, host_grants, r).map_err(|e| match e {
+                    uni_plugin_extism::ExtismError::Instantiate(m)
+                    | uni_plugin_extism::ExtismError::InvalidPlugin(m)
+                    | uni_plugin_extism::ExtismError::ManifestInvalid(m)
+                    | uni_plugin_extism::ExtismError::OutputDecode(m) => {
+                        UniError::InvalidArgument {
+                            arg: "bytes".to_owned(),
+                            message: format!("extism plugin: {m}"),
+                        }
+                    }
+                    other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                })
+            },
+        )
     }
 
     /// Load a Component Model WASM plugin from raw bytes.
@@ -1982,28 +2160,23 @@ impl Uni {
         host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_wasm::loader::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        let placeholder = PluginId::new("wasm.loading");
-        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
-        let outcome = loader
-            .load(bytes, host_grants, &mut r)
-            .map_err(|e| match e {
-                uni_plugin_wasm::WasmError::Instantiate(m)
-                | uni_plugin_wasm::WasmError::InvalidWasm(m)
-                | uni_plugin_wasm::WasmError::ResourceLimit(m) => UniError::InvalidArgument {
-                    arg: "bytes".to_owned(),
-                    message: format!("wasm component: {m}"),
-                },
-                uni_plugin_wasm::WasmError::MissingCapability { import } => {
-                    UniError::InvalidArgument {
-                        arg: "host_grants".to_owned(),
-                        message: format!("plugin imports `{import}` but capability not granted"),
-                    }
-                }
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry().map_err(plugin_err_to_uni)?;
-        Ok(outcome)
+        with_loading_registrar(
+            &self.inner.plugin_registry,
+            "wasm.loading",
+            registrar_caps,
+            |r| {
+                loader.load(bytes, host_grants, r).map_err(|e| match e {
+                    uni_plugin_wasm::WasmError::Instantiate(m)
+                    | uni_plugin_wasm::WasmError::Invoke(m)
+                    | uni_plugin_wasm::WasmError::InvalidWasm(m)
+                    | uni_plugin_wasm::WasmError::ResourceLimit(m) => UniError::InvalidArgument {
+                        arg: "bytes".to_owned(),
+                        message: format!("wasm component: {m}"),
+                    },
+                    other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                })
+            },
+        )
     }
 
     /// Load a Rhai-script plugin from source text.
@@ -2043,27 +2216,27 @@ impl Uni {
         script: &str,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_rhai::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        let placeholder = PluginId::new("rhai.loading");
-        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
-        let outcome = loader
-            .load(script, &mut r, registrar_caps)
-            .map_err(|e| match e {
-                uni_plugin_rhai::RhaiError::ParseFailed(m) => UniError::InvalidArgument {
-                    arg: "script".to_owned(),
-                    message: format!("rhai parse: {m}"),
-                },
-                uni_plugin_rhai::RhaiError::InvalidPlugin(m)
-                | uni_plugin_rhai::RhaiError::ManifestInvalid(m)
-                | uni_plugin_rhai::RhaiError::Conversion(m)
-                | uni_plugin_rhai::RhaiError::RuntimeError(m) => UniError::InvalidArgument {
-                    arg: "script".to_owned(),
-                    message: format!("rhai plugin: {m}"),
-                },
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry().map_err(plugin_err_to_uni)?;
-        Ok(outcome)
+        with_loading_registrar(
+            &self.inner.plugin_registry,
+            "rhai.loading",
+            registrar_caps,
+            |r| {
+                loader.load(script, r, registrar_caps).map_err(|e| match e {
+                    uni_plugin_rhai::RhaiError::ParseFailed(m) => UniError::InvalidArgument {
+                        arg: "script".to_owned(),
+                        message: format!("rhai parse: {m}"),
+                    },
+                    uni_plugin_rhai::RhaiError::InvalidPlugin(m)
+                    | uni_plugin_rhai::RhaiError::ManifestInvalid(m)
+                    | uni_plugin_rhai::RhaiError::Conversion(m)
+                    | uni_plugin_rhai::RhaiError::RuntimeError(m) => UniError::InvalidArgument {
+                        arg: "script".to_owned(),
+                        message: format!("rhai plugin: {m}"),
+                    },
+                    other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                })
+            },
+        )
     }
 
     /// Load a PyO3 (Python source) plugin into this Uni instance.
@@ -2104,32 +2277,38 @@ impl Uni {
         module_name: &str,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_pyo3::LoadOutcome> {
-        use uni_plugin::{PluginId, PluginRegistrar};
-        let placeholder = PluginId::new("pyo3.loading");
-        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
-        let outcome = loader
-            .load(py, module_src, module_name, &mut r, registrar_caps)
-            .map_err(|e| match e {
-                uni_plugin_pyo3::PyPluginError::PythonException {
-                    qname,
-                    message,
-                    traceback,
-                } => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python exception in {qname}: {message}\n{traceback}"),
-                },
-                uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python plugin manifest: {m}"),
-                },
-                uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => UniError::InvalidArgument {
-                    arg: "module_src".to_owned(),
-                    message: format!("python plugin arrow conversion: {m}"),
-                },
-                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-            })?;
-        r.commit_to_registry().map_err(plugin_err_to_uni)?;
-        Ok(outcome)
+        with_loading_registrar(
+            &self.inner.plugin_registry,
+            "pyo3.loading",
+            registrar_caps,
+            |r| {
+                loader
+                    .load(py, module_src, module_name, r, registrar_caps)
+                    .map_err(|e| match e {
+                        uni_plugin_pyo3::PyPluginError::PythonException {
+                            qname,
+                            message,
+                            traceback,
+                        } => UniError::InvalidArgument {
+                            arg: "module_src".to_owned(),
+                            message: format!("python exception in {qname}: {message}\n{traceback}"),
+                        },
+                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin manifest: {m}"),
+                            }
+                        }
+                        uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin arrow conversion: {m}"),
+                            }
+                        }
+                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                    })
+            },
+        )
     }
 
     // ── Connector lifecycle (M6a.3) ─────────────────────────────────
@@ -2327,34 +2506,16 @@ impl Uni {
 
     /// Check if a label exists in the schema.
     pub async fn label_exists(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .inner
-            .schema
-            .schema()
-            .labels
-            .get(name)
-            .is_some_and(|l| {
-                matches!(
-                    l.state,
-                    uni_common::core::schema::SchemaElementState::Active
-                )
-            }))
+        let schema = self.inner.schema.schema();
+        Ok(element_active(schema.labels.get(name).map(|l| &l.state)))
     }
 
     /// Check if an edge type exists in the schema.
     pub async fn edge_type_exists(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .inner
-            .schema
-            .schema()
-            .edge_types
-            .get(name)
-            .is_some_and(|e| {
-                matches!(
-                    e.state,
-                    uni_common::core::schema::SchemaElementState::Active
-                )
-            }))
+        let schema = self.inner.schema.schema();
+        Ok(element_active(
+            schema.edge_types.get(name).map(|e| &e.state),
+        ))
     }
 
     /// Get all label names.
@@ -2407,6 +2568,9 @@ impl Uni {
             .collect())
     }
 
+    // (schema-projection helpers `property_infos_for` / `index_infos_for`
+    //  / `constraint_infos_for` are free functions defined below this impl.)
+
     /// Get detailed information about a label.
     pub async fn get_label_info(
         &self,
@@ -2426,91 +2590,15 @@ impl Uni {
                 0
             };
 
-            let mut properties = Vec::new();
-            if let Some(props) = schema.properties.get(name) {
-                for (prop_name, prop_meta) in props {
-                    let is_indexed = schema.indexes.iter().any(|idx| match idx {
-                        uni_common::core::schema::IndexDefinition::Vector(v) => {
-                            v.label == name && v.property == *prop_name
-                        }
-                        uni_common::core::schema::IndexDefinition::Scalar(s) => {
-                            s.label == name && s.properties.contains(prop_name)
-                        }
-                        uni_common::core::schema::IndexDefinition::FullText(f) => {
-                            f.label == name && f.properties.contains(prop_name)
-                        }
-                        uni_common::core::schema::IndexDefinition::Inverted(inv) => {
-                            inv.label == name && inv.property == *prop_name
-                        }
-                        uni_common::core::schema::IndexDefinition::JsonFullText(j) => {
-                            j.label == name
-                        }
-                        _ => false,
-                    });
-
-                    properties.push(crate::api::schema::PropertyInfo {
-                        name: prop_name.clone(),
-                        data_type: format!("{:?}", prop_meta.r#type),
-                        nullable: prop_meta.nullable,
-                        is_indexed,
-                        description: prop_meta.description.clone(),
-                    });
-                }
-            }
-
-            let mut indexes = Vec::new();
-            for idx in schema.indexes.iter().filter(|i| i.label() == name) {
-                use uni_common::core::schema::IndexDefinition;
-                let (idx_type, idx_props) = match idx {
-                    IndexDefinition::Vector(v) => ("VECTOR", vec![v.property.clone()]),
-                    IndexDefinition::Scalar(s) => ("SCALAR", s.properties.clone()),
-                    IndexDefinition::FullText(f) => ("FULLTEXT", f.properties.clone()),
-                    IndexDefinition::Inverted(inv) => ("INVERTED", vec![inv.property.clone()]),
-                    IndexDefinition::JsonFullText(j) => ("JSON_FTS", vec![j.column.clone()]),
-                    _ => continue,
-                };
-
-                indexes.push(crate::api::schema::IndexInfo {
-                    name: idx.name().to_string(),
-                    index_type: idx_type.to_string(),
-                    properties: idx_props,
-                    status: "ONLINE".to_string(), // TODO: Check actual status
-                });
-            }
-
-            let mut constraints = Vec::new();
-            for c in &schema.constraints {
-                if let uni_common::core::schema::ConstraintTarget::Label(l) = &c.target
-                    && l == name
-                {
-                    let (ctype, cprops) = match &c.constraint_type {
-                        uni_common::core::schema::ConstraintType::Unique { properties } => {
-                            ("UNIQUE", properties.clone())
-                        }
-                        uni_common::core::schema::ConstraintType::Exists { property } => {
-                            ("EXISTS", vec![property.clone()])
-                        }
-                        uni_common::core::schema::ConstraintType::Check { expression } => {
-                            ("CHECK", vec![expression.clone()])
-                        }
-                        _ => ("UNKNOWN", vec![]),
-                    };
-
-                    constraints.push(crate::api::schema::ConstraintInfo {
-                        name: c.name.clone(),
-                        constraint_type: ctype.to_string(),
-                        properties: cprops,
-                        enabled: c.enabled,
-                    });
-                }
-            }
-
             Ok(Some(crate::api::schema::LabelInfo {
                 name: name.to_string(),
                 count,
-                properties,
-                indexes,
-                constraints,
+                properties: property_infos_for(&schema, name, label_property_is_indexed),
+                indexes: index_infos_for(&schema, name, label_index_descriptor),
+                constraints: constraint_infos_for(
+                    &schema,
+                    |c| matches!(&c.target, uni_common::core::schema::ConstraintTarget::Label(l) if l == name),
+                ),
                 description: label_meta.description.clone(),
             }))
         } else {
@@ -2545,85 +2633,17 @@ impl Uni {
         let source_labels = edge_meta.src_labels.clone();
         let target_labels = edge_meta.dst_labels.clone();
 
-        let mut properties = Vec::new();
-        if let Some(props) = schema.properties.get(name) {
-            for (prop_name, prop_meta) in props {
-                let is_indexed = schema.indexes.iter().any(|idx| match idx {
-                    uni_common::core::schema::IndexDefinition::Scalar(s) => {
-                        s.label == name && s.properties.contains(prop_name)
-                    }
-                    uni_common::core::schema::IndexDefinition::FullText(f) => {
-                        f.label == name && f.properties.contains(prop_name)
-                    }
-                    uni_common::core::schema::IndexDefinition::Inverted(inv) => {
-                        inv.label == name && inv.property == *prop_name
-                    }
-                    _ => false,
-                });
-
-                properties.push(crate::api::schema::PropertyInfo {
-                    name: prop_name.clone(),
-                    data_type: format!("{:?}", prop_meta.r#type),
-                    nullable: prop_meta.nullable,
-                    is_indexed,
-                    description: prop_meta.description.clone(),
-                });
-            }
-        }
-
-        let mut indexes = Vec::new();
-        for idx in schema.indexes.iter().filter(|i| i.label() == name) {
-            use uni_common::core::schema::IndexDefinition;
-            let (idx_type, idx_props) = match idx {
-                IndexDefinition::Scalar(s) => ("SCALAR", s.properties.clone()),
-                IndexDefinition::FullText(f) => ("FULLTEXT", f.properties.clone()),
-                IndexDefinition::Inverted(inv) => ("INVERTED", vec![inv.property.clone()]),
-                _ => continue,
-            };
-
-            indexes.push(crate::api::schema::IndexInfo {
-                name: idx.name().to_string(),
-                index_type: idx_type.to_string(),
-                properties: idx_props,
-                status: "ONLINE".to_string(),
-            });
-        }
-
-        let mut constraints = Vec::new();
-        for c in &schema.constraints {
-            if let uni_common::core::schema::ConstraintTarget::EdgeType(et) = &c.target
-                && et == name
-            {
-                let (ctype, cprops) = match &c.constraint_type {
-                    uni_common::core::schema::ConstraintType::Unique { properties } => {
-                        ("UNIQUE", properties.clone())
-                    }
-                    uni_common::core::schema::ConstraintType::Exists { property } => {
-                        ("EXISTS", vec![property.clone()])
-                    }
-                    uni_common::core::schema::ConstraintType::Check { expression } => {
-                        ("CHECK", vec![expression.clone()])
-                    }
-                    _ => ("UNKNOWN", vec![]),
-                };
-
-                constraints.push(crate::api::schema::ConstraintInfo {
-                    name: c.name.clone(),
-                    constraint_type: ctype.to_string(),
-                    properties: cprops,
-                    enabled: c.enabled,
-                });
-            }
-        }
-
         Ok(Some(crate::api::schema::EdgeTypeInfo {
             name: name.to_string(),
             count,
             source_labels,
             target_labels,
-            properties,
-            indexes,
-            constraints,
+            properties: property_infos_for(&schema, name, edge_property_is_indexed),
+            indexes: index_infos_for(&schema, name, edge_index_descriptor),
+            constraints: constraint_infos_for(
+                &schema,
+                |c| matches!(&c.target, uni_common::core::schema::ConstraintTarget::EdgeType(et) if et == name),
+            ),
             description: edge_meta.description.clone(),
         }))
     }
@@ -3114,18 +3134,11 @@ impl UniBuilder {
             .map_err(UniError::Internal)?,
         );
 
-        let wal = if !self.config.wal_enabled {
-            // WAL disabled by config
-            None
-        } else if is_remote_uri && !is_hybrid {
-            // Remote-only WAL (ObjectStoreWal)
-            Some(Arc::new(WriteAheadLog::new(
-                wal_store,
-                object_store::path::Path::from("wal"),
-            )))
-        } else if is_hybrid || !is_remote_uri {
-            // Local WAL (using local_store)
-            // Even if local_store uses ObjectStore trait, it maps to FS.
+        // When WAL is enabled the construction is identical for every
+        // storage layout (remote-only, hybrid, or local): the only
+        // difference is which `wal_store` was resolved above, and
+        // `local_store` maps to the FS even behind the ObjectStore trait.
+        let wal = if self.config.wal_enabled {
             Some(Arc::new(WriteAheadLog::new(
                 wal_store,
                 object_store::path::Path::from("wal"),

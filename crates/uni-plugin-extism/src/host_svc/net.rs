@@ -110,12 +110,10 @@ fn do_http(ctx: &HostSvcCtx, req: HttpReq, traceparent: Option<&str>) -> Result<
 /// Returns [`FnError`] when the request JSON is malformed, the underlying
 /// [`do_http`] dispatch fails, or the response cannot be serialized.
 fn http_dispatch_json(ctx: &HostSvcCtx, req_json: &str) -> Result<String, FnError> {
-    let req: HttpReq = serde_json::from_str(req_json)
-        .map_err(|e| FnError::new(0xC24, format!("uni.http: bad request json: {e}")))?;
     let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
-    let resp = do_http(ctx, req, traceparent.as_deref())?;
-    serde_json::to_string(&resp)
-        .map_err(|e| FnError::new(0xC25, format!("uni.http: response json: {e}")))
+    super::dispatch_json(ctx, req_json, "uni.http", |ctx, req: HttpReq| {
+        do_http(ctx, req, traceparent.as_deref())
+    })
 }
 
 extism::host_fn!(pub(crate) uni_http_get(ctx: HostSvcCtx; req_json: String) -> String {

@@ -201,45 +201,19 @@ impl ProcedureRegistry {
     }
 }
 
-/// Convert a [`uni_common::Value`] into a DataFusion
-/// [`datafusion::logical_expr::ColumnarValue`] scalar, suitable for
-/// passing to a plugin procedure's `invoke()`.
-fn value_to_columnar(
-    v: &Value,
-) -> std::result::Result<datafusion::logical_expr::ColumnarValue, String> {
-    use datafusion::logical_expr::ColumnarValue;
-    use datafusion::scalar::ScalarValue;
-
-    let scalar = match v {
-        Value::Null => ScalarValue::Null,
-        Value::Bool(b) => ScalarValue::Boolean(Some(*b)),
-        Value::Int(i) => ScalarValue::Int64(Some(*i)),
-        Value::Float(f) => ScalarValue::Float64(Some(*f)),
-        Value::String(s) => ScalarValue::Utf8(Some(s.clone())),
-        Value::Bytes(b) => ScalarValue::Binary(Some(b.clone())),
-        // Complex types (Map / List / etc.) are JSON-encoded into
-        // `LargeBinary` to match the convention the DataFusion
-        // procedure dispatcher (`procedure_call::value_to_columnar`)
-        // uses. The adapter on the receiving end decodes via
-        // `serde_json::from_slice`.
-        Value::List(_) | Value::Map(_) => {
-            let json = serde_json::Value::from(v.clone());
-            let bytes = serde_json::to_vec(&json)
-                .map_err(|e| format!("plugin procedure arg JSON encode failure: {e}"))?;
-            ScalarValue::LargeBinary(Some(bytes))
-        }
-        other => {
-            return Err(format!(
-                "unsupported Value variant for plugin procedure argument: {other:?}"
-            ));
-        }
-    };
-    Ok(ColumnarValue::Scalar(scalar))
-}
+use crate::query::df_graph::procedure_call::value_to_columnar;
 
 /// Convert one row of an Arrow array column into a [`uni_common::Value`].
 /// Used when draining a plugin's output `RecordBatch` back to the legacy
 /// row-shaped `Vec<HashMap<String, Value>>` the Executor returns.
+///
+/// This intentionally does **not** delegate to
+/// `uni_store::storage::arrow_convert::arrow_to_value`: that helper is
+/// driven by uni's logical `DataType` (which the plugin output schema
+/// does not carry here) and degrades to `Value::Null` with a `log::warn!`
+/// for shapes it cannot decode. The plugin-output contract instead
+/// requires a hard error on any unexpected Arrow type so the failure
+/// surfaces to the `CALL` site rather than silently producing nulls.
 fn arrow_scalar_to_value(
     arr: &dyn arrow_array::Array,
     row_idx: usize,
@@ -554,32 +528,35 @@ impl Executor {
                 .await?;
                 success_result(success)
             }
-            "uni.schema.dropLabel" => {
-                let name = self
-                    .eval_string_arg(&args[0], "Label name", prop_manager, params, ctx)
+            // The four `drop*` procedures share one shape: evaluate the
+            // single string argument, dispatch to the matching DDL helper,
+            // and report success. Only the argument label and the helper
+            // differ.
+            "uni.schema.dropLabel"
+            | "uni.schema.dropEdgeType"
+            | "uni.schema.dropIndex"
+            | "uni.schema.dropConstraint" => {
+                let description = match name {
+                    "uni.schema.dropLabel" => "Label name",
+                    "uni.schema.dropEdgeType" => "Edge type name",
+                    "uni.schema.dropIndex" => "Index name",
+                    _ => "Constraint name",
+                };
+                let target = self
+                    .eval_string_arg(&args[0], description, prop_manager, params, ctx)
                     .await?;
-                let success = super::ddl_procedures::drop_label(&self.storage, &name).await?;
-                success_result(success)
-            }
-            "uni.schema.dropEdgeType" => {
-                let name = self
-                    .eval_string_arg(&args[0], "Edge type name", prop_manager, params, ctx)
-                    .await?;
-                let success = super::ddl_procedures::drop_edge_type(&self.storage, &name).await?;
-                success_result(success)
-            }
-            "uni.schema.dropIndex" => {
-                let name = self
-                    .eval_string_arg(&args[0], "Index name", prop_manager, params, ctx)
-                    .await?;
-                let success = super::ddl_procedures::drop_index(&self.storage, &name).await?;
-                success_result(success)
-            }
-            "uni.schema.dropConstraint" => {
-                let name = self
-                    .eval_string_arg(&args[0], "Constraint name", prop_manager, params, ctx)
-                    .await?;
-                let success = super::ddl_procedures::drop_constraint(&self.storage, &name).await?;
+                let success = match name {
+                    "uni.schema.dropLabel" => {
+                        super::ddl_procedures::drop_label(&self.storage, &target).await?
+                    }
+                    "uni.schema.dropEdgeType" => {
+                        super::ddl_procedures::drop_edge_type(&self.storage, &target).await?
+                    }
+                    "uni.schema.dropIndex" => {
+                        super::ddl_procedures::drop_index(&self.storage, &target).await?
+                    }
+                    _ => super::ddl_procedures::drop_constraint(&self.storage, &target).await?,
+                };
                 success_result(success)
             }
             _ => {
@@ -699,10 +676,7 @@ impl Executor {
                         .map_err(|e| anyhow!("Procedure '{name}': output decode: {e}"))?;
                     row.insert(field.name().clone(), v);
                 }
-                if !yield_items.is_empty() {
-                    row.retain(|k, _| yield_items.iter().any(|y| y == k));
-                }
-                rows.push(row);
+                rows.push(filter_yield_items(row, yield_items));
             }
         }
         Ok(rows)
@@ -805,26 +779,22 @@ impl Executor {
         // Collect output column names
         let output_names: Vec<&str> = proc_def.outputs.iter().map(|o| o.name.as_str()).collect();
 
-        // Project output columns, applying yield_items filtering
+        // Project output columns, applying yield_items filtering. With no
+        // yield list, return every declared output column; otherwise route
+        // through `filter_yield_items` over the data row.
         let results = filtered
             .into_iter()
             .map(|row| {
-                let mut result = HashMap::new();
                 if yield_items.is_empty() {
-                    // Return all output columns
-                    for name in &output_names {
-                        if let Some(val) = row.get(*name) {
-                            result.insert((*name).to_string(), val.clone());
-                        }
-                    }
+                    output_names
+                        .iter()
+                        .filter_map(|name| {
+                            row.get(*name).map(|val| ((*name).to_string(), val.clone()))
+                        })
+                        .collect()
                 } else {
-                    for yield_name in yield_items {
-                        if let Some(val) = row.get(yield_name.as_str()) {
-                            result.insert(yield_name.clone(), val.clone());
-                        }
-                    }
+                    filter_yield_items(row.clone(), yield_items)
                 }
-                result
             })
             .collect();
 

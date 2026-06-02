@@ -3,14 +3,18 @@
 
 //! `uni.vector.query` — k-nearest-neighbor over a vector index.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::error::Result as DFResult;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
+use uni_common::Value;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
@@ -19,6 +23,7 @@ use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
 use crate::procedures_plugin::host_args::{columnar_args_to_values, require_host};
 use crate::query::df_graph::search_procedures::run_vector_query;
+use crate::query::executor::procedure_host::QueryProcedureHost;
 
 // Rust guideline compliant
 
@@ -138,30 +143,23 @@ impl ProcedurePlugin for VectorQueryProc {
         ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
-        let host = require_host(&ctx, "uni.vector.query")?.clone();
-        let uni_args = columnar_args_to_values(args);
-        let sig = signature();
-        let fallback_schema = Arc::new(Schema::new(sig.yields.clone()));
-        let (yield_items, output_schema) = resolve_yields_and_schema(&host, sig, &fallback_schema);
-        let target_properties = host.target_properties().clone();
-
-        let stream_schema = output_schema.clone();
-        let stream = stream::once(async move {
-            let batch = run_vector_query(
-                &host,
-                &uni_args,
-                &yield_items,
-                &target_properties,
-                &output_schema,
-            )
-            .await?
-            .unwrap_or_else(|| arrow_array::RecordBatch::new_empty(output_schema.clone()));
-            Ok::<_, datafusion::error::DataFusionError>(batch)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            stream_schema,
-            stream,
-        )))
+        run_search_procedure(
+            "uni.vector.query",
+            &ctx,
+            args,
+            signature(),
+            |host, uni_args, yield_items, output_schema| async move {
+                let target_properties = host.target_properties().clone();
+                run_vector_query(
+                    &host,
+                    &uni_args,
+                    &yield_items,
+                    &target_properties,
+                    &output_schema,
+                )
+                .await
+            },
+        )
     }
 }
 
@@ -190,6 +188,44 @@ pub(super) fn resolve_yields_and_schema(
             .unwrap_or_else(|| fallback_schema.clone());
         (host_yields.to_vec(), output_schema)
     }
+}
+
+/// Shared `ProcedurePlugin::invoke` body for the three host-coupled
+/// search procedures (`uni.vector.query`, `uni.fts.query`, `uni.search`).
+///
+/// They differ only in their procedure name, signature, and the `run_*`
+/// helper that produces the result batch; everything else (host
+/// down-cast, arg decode, yield/schema resolution, single-batch
+/// streaming) is identical.
+pub(super) fn run_search_procedure<F, Fut>(
+    proc_name: &'static str,
+    ctx: &ProcedureContext<'_>,
+    args: &[ColumnarValue],
+    sig: &'static ProcedureSignature,
+    run_fn: F,
+) -> Result<SendableRecordBatchStream, FnError>
+where
+    F: FnOnce(QueryProcedureHost, Vec<Value>, Vec<(String, Option<String>)>, SchemaRef) -> Fut
+        + Send
+        + 'static,
+    Fut: Future<Output = DFResult<Option<RecordBatch>>> + Send + 'static,
+{
+    let host = require_host(ctx, proc_name)?.clone();
+    let uni_args = columnar_args_to_values(args);
+    let fallback_schema = Arc::new(Schema::new(sig.yields.clone()));
+    let (yield_items, output_schema) = resolve_yields_and_schema(&host, sig, &fallback_schema);
+
+    let stream_schema = output_schema.clone();
+    let stream = stream::once(async move {
+        let batch = run_fn(host, uni_args, yield_items, output_schema.clone())
+            .await?
+            .unwrap_or_else(|| RecordBatch::new_empty(output_schema.clone()));
+        Ok::<_, datafusion::error::DataFusionError>(batch)
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        stream_schema,
+        stream,
+    )))
 }
 
 /// Register `uni.vector.query` into `r`.

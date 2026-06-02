@@ -415,12 +415,6 @@ fn sort_exprs_to_marker(sort: &[datafusion::logical_expr::SortExpr]) -> Vec<Mark
         .collect()
 }
 
-/// Try to downcast a `&dyn Any` (from `TableSource::as_any`) to a
-/// [`PushdownAwareTable`] and surface its [`PushdownMarkers`] bundle.
-///
-/// Path 1: source is itself a `PushdownAwareTable` (rare; users would
-/// have to implement `TableSource` directly).
-/// Path 2: `DefaultTableSource` → inner `TableProvider` → wrapper.
 /// Peel a single transparent `Projection` node above a `TableScan`.
 ///
 /// DataFusion injects an identity `Projection` for `SELECT *` queries
@@ -444,6 +438,12 @@ fn peel_transparent_projection(plan: &LogicalPlan) -> &LogicalPlan {
     plan
 }
 
+/// Try to downcast a `&dyn Any` (from `TableSource::as_any`) to a
+/// [`PushdownAwareTable`] and surface its [`PushdownMarkers`] bundle.
+///
+/// Path 1: source is itself a `PushdownAwareTable` (rare; users would
+/// have to implement `TableSource` directly).
+/// Path 2: `DefaultTableSource` → inner `TableProvider` → wrapper.
 fn downcast_markers(source_any: &dyn std::any::Any) -> Option<&PushdownMarkers> {
     if let Some(pa) = source_any.downcast_ref::<PushdownAwareTable>() {
         return Some(&pa.markers);

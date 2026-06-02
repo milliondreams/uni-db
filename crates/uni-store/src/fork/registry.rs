@@ -15,8 +15,6 @@
 //! `lance_branch::create_branch` or `delete_branch`. This preserves
 //! the spec §10 guarantee that fork creation does not block primary.
 
-// Rust guideline compliant
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

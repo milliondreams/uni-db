@@ -30,9 +30,8 @@ pub fn parse_vid_arg(value: &Value, name: &str) -> Result<Vid> {
         Value::Number(n) => n
             .as_u64()
             .ok_or_else(|| anyhow!("`{name}` must be a non-negative integer"))?,
-        Value::String(s) => s
-            .parse::<u64>()
-            .map_err(|_| anyhow!("`{name}` string must parse as a u64, got {s:?}"))?,
+        Value::String(s) => parse_vid_string(s)
+            .ok_or_else(|| anyhow!("`{name}` string must parse as a u64, got {s:?}"))?,
         other => {
             return Err(anyhow!(
                 "`{name}` must be an integer (or integer-string); got {other:?}"
@@ -40,6 +39,80 @@ pub fn parse_vid_arg(value: &Value, name: &str) -> Result<Vid> {
         }
     };
     Ok(Vid::from(raw))
+}
+
+/// Parse a string-encoded VID, accepting both the plain `u64` form and the
+/// legacy `"label:offset"` form (combined as `label << 48 | offset`) that
+/// older callers round-trip through Cypher parameter binding.
+fn parse_vid_string(s: &str) -> Option<u64> {
+    if let Ok(id) = s.parse::<u64>() {
+        return Some(id);
+    }
+    // Legacy "label:offset" — combine for backward compatibility.
+    let (label, offset) = s.split_once(':')?;
+    let label = label.parse::<u16>().ok()?;
+    let offset = offset.parse::<u64>().ok()?;
+    Some((label as u64) << 48 | offset)
+}
+
+/// Extract a required `f64` argument by index.
+///
+/// Arguments are validated against the procedure signature upstream, so a
+/// failure here indicates an internal contract violation rather than user
+/// error; surfacing it as an `Err` is strictly safer than the previous
+/// `unwrap()`, which would panic the executor.
+pub fn arg_f64(args: &[Value], i: usize, name: &str) -> Result<f64> {
+    args.get(i)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("`{name}` must be a number"))
+}
+
+/// Extract a required `u64` argument by index. See [`arg_f64`] for the
+/// rationale behind returning `Err` instead of panicking.
+pub fn arg_u64(args: &[Value], i: usize, name: &str) -> Result<u64> {
+    args.get(i)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("`{name}` must be a non-negative integer"))
+}
+
+/// Extract a required `bool` argument by index. See [`arg_f64`] for the
+/// rationale behind returning `Err` instead of panicking.
+pub fn arg_bool(args: &[Value], i: usize, name: &str) -> Result<bool> {
+    args.get(i)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("`{name}` must be a boolean"))
+}
+
+/// Extract a required string argument by index. See [`arg_f64`] for the
+/// rationale behind returning `Err` instead of panicking.
+pub fn arg_str<'a>(args: &'a [Value], i: usize, name: &str) -> Result<&'a str> {
+    args.get(i)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("`{name}` must be a string"))
+}
+
+/// Extract a required array argument as a `Vec<String>` by index. See
+/// [`arg_f64`] for the rationale behind returning `Err` instead of
+/// panicking on a malformed argument.
+pub fn arg_string_list(args: &[Value], i: usize, name: &str) -> Result<Vec<String>> {
+    args.get(i)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("`{name}` must be an array"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("`{name}` entries must be strings"))
+        })
+        .collect()
+}
+
+/// Wrap an error as a single-item failing result stream.
+///
+/// Used by native-terminal procedures to short-circuit argument parsing
+/// without duplicating the `stream::once(async { Err(e) }).boxed()` dance.
+pub fn err_stream(e: anyhow::Error) -> BoxStream<'static, Result<AlgoResultRow>> {
+    stream::once(async move { Err(e) }).boxed()
 }
 
 /// Adapter trait for specific graph algorithms.
@@ -72,14 +145,36 @@ pub trait GraphAlgoAdapter: Send + Sync + 'static {
     /// Convert algorithm result to output rows.
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>>;
 
-    /// Optional: Customize projection if needed (e.g., weights, directions).
-    fn customize_projection(builder: ProjectionBuilder, _args: &[Value]) -> ProjectionBuilder {
-        builder.include_reverse(Self::include_reverse())
-    }
-
-    /// Deprecated: use customize_projection instead.
+    /// Whether the projection should build reverse (in-neighbor) edges.
     fn include_reverse() -> bool {
         true
+    }
+
+    /// Index into the specific-args slice (`args[i]`) of an optional
+    /// string-valued edge-weight property. When `Some(i)` and that arg
+    /// is a string, the projection is built with that weight property.
+    ///
+    /// This covers the common "one weight-property arg" case so most
+    /// adapters need not override [`Self::customize_projection`].
+    fn weight_arg_index() -> Option<usize> {
+        None
+    }
+
+    /// Customize the projection (edge weights, reverse edges, …).
+    ///
+    /// The default applies [`Self::weight_arg_index`] (if any) then toggles
+    /// reverse edges per [`Self::include_reverse`]. Override only for
+    /// non-standard knobs (e.g. direction-derived reverse, as in
+    /// `degree_centrality`).
+    fn customize_projection(builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
+        let builder = match Self::weight_arg_index().and_then(|i| args.get(i)) {
+            Some(arg) => match arg.as_str() {
+                Some(prop) => builder.weight_property(prop),
+                None => builder,
+            },
+            None => builder,
+        };
+        builder.include_reverse(Self::include_reverse())
     }
 }
 

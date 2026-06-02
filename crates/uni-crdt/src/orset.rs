@@ -45,27 +45,28 @@ impl<T: Hash + Eq + Clone> ORSet<T> {
     /// All currently observed tags for this element are added to the tombstones.
     pub fn remove(&mut self, element: &T) {
         if let Some(tags) = self.elements.get(element) {
-            for tag in tags {
-                self.tombstones.insert(*tag);
-            }
+            self.tombstones.extend(tags.iter().copied());
         }
+    }
+
+    /// An element is visible if it has at least one tag that hasn't been tombstoned.
+    fn is_visible(&self, tags: &FxHashSet<Uuid>) -> bool {
+        tags.iter().any(|tag| !self.tombstones.contains(tag))
     }
 
     /// Check if an element is in the set.
     /// An element is present if it has at least one tag that hasn't been tombstoned.
     pub fn contains(&self, element: &T) -> bool {
-        if let Some(tags) = self.elements.get(element) {
-            tags.iter().any(|tag| !self.tombstones.contains(tag))
-        } else {
-            false
-        }
+        self.elements
+            .get(element)
+            .is_some_and(|tags| self.is_visible(tags))
     }
 
     /// Returns a vector of all visible elements in the set.
     pub fn elements(&self) -> Vec<T> {
         self.elements
             .iter()
-            .filter(|(_, tags)| tags.iter().any(|tag| !self.tombstones.contains(tag)))
+            .filter(|(_, tags)| self.is_visible(tags))
             .map(|(elem, _)| elem.clone())
             .collect()
     }
@@ -74,7 +75,7 @@ impl<T: Hash + Eq + Clone> ORSet<T> {
     pub fn len(&self) -> usize {
         self.elements
             .values()
-            .filter(|tags| tags.iter().any(|tag| !self.tombstones.contains(tag)))
+            .filter(|tags| self.is_visible(tags))
             .count()
     }
 
@@ -88,15 +89,13 @@ impl<T: Hash + Eq + Clone> CrdtMerge for ORSet<T> {
     fn merge(&mut self, other: &Self) {
         // Merge elements and their tags
         for (element, other_tags) in &other.elements {
-            let tags = self.elements.entry(element.clone()).or_default();
-            for tag in other_tags {
-                tags.insert(*tag);
-            }
+            self.elements
+                .entry(element.clone())
+                .or_default()
+                .extend(other_tags.iter().copied());
         }
         // Merge tombstones
-        for tag in &other.tombstones {
-            self.tombstones.insert(*tag);
-        }
+        self.tombstones.extend(other.tombstones.iter().copied());
     }
 }
 

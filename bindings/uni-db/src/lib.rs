@@ -9,6 +9,20 @@
 //! asynchronous database management, query execution, schema management,
 //! and bulk loading.
 
+/// Apply an optional builder setter: when `$opt` is `Some(v)`, rebind
+/// `$builder` to `$builder.$method(v)`; otherwise leave it untouched.
+///
+/// Collapses the repeated `if let Some(x) = opt { builder = builder.x(x); }`
+/// chains in the bulk-writer / appender `build` methods (sync + async).
+#[macro_export]
+macro_rules! apply_opt {
+    ($builder:ident, $opt:expr, $method:ident) => {
+        if let Some(value) = $opt {
+            $builder = $builder.$method(value);
+        }
+    };
+}
+
 pub mod async_api;
 pub mod btic;
 pub mod builders;

@@ -2073,12 +2073,10 @@ fn build_create_scalar_index(pair: Pair<Rule>) -> Result<SchemaCommand, ParseErr
     let mut where_clause = None;
     let mut options = HashMap::new();
 
+    // The OPTIONS keyword carries no data; the following map_literal holds it.
     for p in inner {
         match p.as_rule() {
             Rule::where_clause => where_clause = Some(extract_where_expr(p)?),
-            Rule::OPTIONS => {
-                // Next item should be map_literal
-            }
             Rule::map_literal => {
                 options = build_map_options(p)?;
             }
@@ -2293,69 +2291,27 @@ fn collect_property_refs_into(expr: &Expr, expected_var: &str, out: &mut Vec<Str
             }
             collect_property_refs_into(base, expected_var, out);
         }
-        Expr::List(items) => {
-            for e in items {
-                collect_property_refs_into(e, expected_var, out);
-            }
-        }
-        Expr::Map(entries) => {
-            for (_, e) in entries {
-                collect_property_refs_into(e, expected_var, out);
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for e in args {
-                collect_property_refs_into(e, expected_var, out);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_property_refs_into(left, expected_var, out);
-            collect_property_refs_into(right, expected_var, out);
-        }
-        Expr::UnaryOp { expr: inner, .. } => {
-            collect_property_refs_into(inner, expected_var, out);
-        }
-        Expr::Case {
-            expr: head,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(h) = head {
-                collect_property_refs_into(h, expected_var, out);
-            }
-            for (cond, branch) in when_then {
-                collect_property_refs_into(cond, expected_var, out);
-                collect_property_refs_into(branch, expected_var, out);
-            }
-            if let Some(e) = else_expr {
-                collect_property_refs_into(e, expected_var, out);
-            }
-        }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::IsUnique(inner) => {
-            collect_property_refs_into(inner, expected_var, out);
-        }
-        Expr::In { expr: e, list } => {
-            collect_property_refs_into(e, expected_var, out);
-            collect_property_refs_into(list, expected_var, out);
-        }
-        Expr::ArrayIndex { array, index } => {
-            collect_property_refs_into(array, expected_var, out);
-            collect_property_refs_into(index, expected_var, out);
-        }
-        Expr::ArraySlice { array, start, end } => {
-            collect_property_refs_into(array, expected_var, out);
-            if let Some(s) = start {
-                collect_property_refs_into(s, expected_var, out);
-            }
-            if let Some(e) = end {
-                collect_property_refs_into(e, expected_var, out);
-            }
-        }
         Expr::Quantifier { list, .. } => {
             // The bound variable inside a quantifier shadows `expected_var`;
             // we conservatively still descend into the list expression
-            // (which is evaluated in the outer scope).
+            // (which is evaluated in the outer scope) but not the predicate.
             collect_property_refs_into(list, expected_var, out);
+        }
+        // Compound forms whose direct children are all evaluated in the same
+        // scope: descend into each via `Expr::for_each_child`.
+        Expr::List(_)
+        | Expr::Map(_)
+        | Expr::FunctionCall { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::Case { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsUnique(_)
+        | Expr::In { .. }
+        | Expr::ArrayIndex { .. }
+        | Expr::ArraySlice { .. } => {
+            expr.for_each_child(&mut |child| collect_property_refs_into(child, expected_var, out));
         }
         // Leaf forms and subquery forms (Exists/CountSubquery/CollectSubquery)
         // do not contribute simple property references on `expected_var`.

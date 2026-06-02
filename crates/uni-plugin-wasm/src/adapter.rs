@@ -15,12 +15,11 @@ use datafusion::logical_expr::ColumnarValue;
 use uni_plugin::QName;
 use uni_plugin::errors::FnError;
 use uni_plugin::traits::scalar::{FnSignature, ScalarPluginFn};
-use uni_plugin_wasm_rt::IpcError;
 use uni_plugin_wasm_rt::ipc::{decode_batch, encode_batch};
 
-use crate::error::WasmError;
+use crate::adapter_common::{acquire, ipc_to_fn_err};
 use crate::loader::ScalarPluginInstance;
-use crate::pool::{PooledInstance, WasmInstancePool};
+use crate::pool::WasmInstancePool;
 
 /// Adapter that registers as `ScalarPluginFn` on the host's
 /// `PluginRegistrar`. Holds an `Arc` to the pool so multiple
@@ -87,12 +86,7 @@ impl ScalarPluginFn for ComponentScalarFn {
         let batch = self.args_to_batch(args, rows)?;
         let bytes = encode_batch(&batch).map_err(ipc_to_fn_err)?;
 
-        let mut leased = PooledInstance::acquire(Arc::clone(&self.pool)).map_err(|e| {
-            FnError::new(
-                FnError::CODE_RESOURCE_LIMIT,
-                format!("acquire plugin instance: {e}"),
-            )
-        })?;
+        let mut leased = acquire(&self.pool, "plugin")?;
         let qname_str = self.qname.to_string();
         let out_bytes: Vec<u8> =
             leased
@@ -126,13 +120,4 @@ impl ScalarPluginFn for ComponentScalarFn {
         }
         Ok(ColumnarValue::Array(out_batch.column(0).clone()))
     }
-}
-
-fn ipc_to_fn_err(e: IpcError) -> FnError {
-    FnError::new(FnError::CODE_TYPE_COERCION, format!("wasm IPC: {e}"))
-}
-
-#[allow(dead_code)]
-fn wasm_err_to_fn_err(e: WasmError) -> FnError {
-    FnError::new(FnError::CODE_UNEXPECTED_NULL, format!("wasm: {e}"))
 }

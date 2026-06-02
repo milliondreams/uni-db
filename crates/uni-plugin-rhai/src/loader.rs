@@ -170,9 +170,22 @@ impl RhaiLoader {
         // during manifest extraction. The manifest call doesn't invoke
         // host fns, but the script may reference them in other fns and
         // Rhai resolves all function calls at parse time.
-        let probe_engine = build_engine(registrar_caps, &self.host_fns);
-        let probe_ast = compile(&probe_engine, script)?;
-        let manifest = parse_manifest(&probe_engine, &probe_ast)?;
+        //
+        // Host-fn registration is gated by the host's GRANT set
+        // (`registrar_caps`), not by the manifest's declared capabilities —
+        // host fns like `uni.fs.read` aren't enumerated in the manifest, but
+        // the plugin can still call them if and only if the host granted the
+        // underlying capability. Extension-surface caps (ScalarFn etc.) are
+        // gated separately at registration time via the `effective` set.
+        //
+        // The same engine + AST become the runtime artifacts: phase 2's real
+        // engine would be built from the identical `(registrar_caps,
+        // host_fns)` inputs and the identical script, and `parse_manifest`
+        // only *calls* `uni_manifest()` against the AST (it never mutates it),
+        // so a second build+compile would be byte-for-byte redundant.
+        let engine = build_engine(registrar_caps, &self.host_fns);
+        let ast = compile(&engine, script)?;
+        let manifest = parse_manifest(&engine, &ast)?;
 
         let plugin_id = PluginId::new(manifest.id.clone());
 
@@ -185,15 +198,6 @@ impl RhaiLoader {
         let declared = derive_declared_capabilities(&manifest);
         let (effective, denied) = intersect_caps(&declared, registrar_caps);
 
-        // Build the real engine. Host-fn registration is gated by the
-        // host's GRANT set (`registrar_caps`), not by the manifest's
-        // declared capabilities — host fns like `uni.fs.read` aren't
-        // enumerated in the manifest, but the plugin can still call
-        // them if and only if the host granted the underlying
-        // capability. Extension-surface caps (ScalarFn etc.) are gated
-        // separately at registration time via the `effective` set.
-        let engine = build_engine(registrar_caps, &self.host_fns);
-        let ast = compile(&engine, script)?;
         let runtime = RhaiPluginRuntime::new(plugin_id.clone(), engine, ast);
 
         // Phase 3: register entries.
@@ -241,7 +245,7 @@ impl RhaiLoader {
         let mut procedures_registered = Vec::with_capacity(manifest.procedures.len());
         if effective.contains(&Capability::Procedure) {
             for entry in &manifest.procedures {
-                let sig = build_procedure_signature(entry, &manifest.determinism)?;
+                let sig = build_procedure_signature(entry)?;
                 let qname = QName::new(plugin_id.as_str(), entry.name.clone());
                 let adapter =
                     RhaiProcedure::new(Arc::clone(&runtime), entry.name.clone(), sig.clone());
@@ -265,10 +269,7 @@ impl RhaiLoader {
     }
 }
 
-fn build_procedure_signature(
-    entry: &ProcedureEntry,
-    _determinism: &str,
-) -> Result<ProcedureSignature, RhaiError> {
+fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignature, RhaiError> {
     let args: Vec<NamedArgType> = entry
         .args
         .iter()

@@ -43,6 +43,26 @@ pub const SUPPORTED_MAJORS: &[u64] = &[1, 2];
 /// deterministic concatenation of the sorted capability strings.
 type CacheKey = (u64, String);
 
+/// Resolve a plugin's declared [`AbiRange`] to the host major it links against.
+///
+/// Probes [`SUPPORTED_MAJORS`] in order; the first major whose `abi.matches`
+/// is `true` wins. Shared by [`MultiVersionLinker::linker_for`] and the
+/// loader's per-pool linker selection so both apply the same dispatch.
+///
+/// # Errors
+///
+/// Returns [`WasmError::AbiUnsupported`] when no supported major matches.
+pub(crate) fn major_for_abi(abi: &AbiRange) -> Result<u64, WasmError> {
+    SUPPORTED_MAJORS
+        .iter()
+        .copied()
+        .find(|m| abi.matches(*m))
+        .ok_or_else(|| WasmError::AbiUnsupported {
+            requested: abi.as_str().to_owned(),
+            supported: SUPPORTED_MAJORS.to_vec(),
+        })
+}
+
 /// Per-major `Linker` cache.
 ///
 /// Construct once at host startup (e.g., alongside the `Engine`),
@@ -87,12 +107,7 @@ impl MultiVersionLinker {
         abi: &AbiRange,
         effective_caps: &uni_plugin::CapabilitySet,
     ) -> Result<Arc<Linker<HostState>>, WasmError> {
-        let Some(major) = SUPPORTED_MAJORS.iter().copied().find(|m| abi.matches(*m)) else {
-            return Err(WasmError::AbiUnsupported {
-                requested: abi.as_str().to_owned(),
-                supported: SUPPORTED_MAJORS.to_vec(),
-            });
-        };
+        let major = major_for_abi(abi)?;
         let key: CacheKey = (major, caps_signature(effective_caps));
         if let Some(cached) = self.cache.read().get(&key) {
             return Ok(Arc::clone(cached));

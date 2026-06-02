@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 /// Result of committing a transaction.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CommitResult {
     /// Number of mutations committed.
     pub mutations_committed: usize,

@@ -113,7 +113,6 @@ impl BuiltinPlugin {
             Capability::Operator,
             Capability::Index,
             Capability::Storage,
-            Capability::Index,
             Capability::Algorithm,
             Capability::Crdt,
             Capability::Hook,

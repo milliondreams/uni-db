@@ -633,26 +633,17 @@ impl TriggerRouter {
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     plugin.fire(TriggerContext::new(&session_id, tx_id), &mb_inner)
                                 }));
-                            match result {
-                                Ok(Ok(TriggerOutcome::Defer { until })) => {
-                                    enqueue_deferral(
-                                        &queue,
-                                        Arc::clone(&plugin),
-                                        name.clone(),
-                                        mb_inner,
-                                        session_id.clone(),
-                                        tx_id,
-                                        until,
-                                    );
-                                }
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    warn!(trigger = %name, error = %e, "async trigger errored");
-                                }
-                                Err(_) => {
-                                    warn!(trigger = %name, "async trigger panicked");
-                                }
-                            }
+                            handle_fire_outcome(result, &name, "async trigger", |until| {
+                                enqueue_deferral(
+                                    &queue,
+                                    Arc::clone(&plugin),
+                                    name.clone(),
+                                    mb_inner,
+                                    session_id.clone(),
+                                    tx_id,
+                                    until,
+                                );
+                            });
                         });
                     }
                 }
@@ -696,6 +687,27 @@ fn enqueue_deferral(
     );
 }
 
+/// Dispatch the result of a `catch_unwind`-wrapped trigger fire.
+///
+/// All three fire paths (`dispatch_after`'s spawned task, [`fire_caught`], and
+/// [`DeferralQueue::tick`]) share the same four-way ladder:
+/// `Ok(Ok(Defer))` / `Ok(Ok(_))` (Continue/Reject/future) / `Ok(Err)` (the
+/// plugin errored) / `Err` (the plugin panicked). They differ only in the log
+/// `label` and what to do on a `Defer` — captured by `on_defer`.
+fn handle_fire_outcome<E: std::fmt::Display>(
+    outcome: Result<Result<TriggerOutcome, E>, Box<dyn std::any::Any + Send>>,
+    name: &str,
+    label: &str,
+    on_defer: impl FnOnce(uni_plugin::traits::trigger::TriggerDeferral),
+) {
+    match outcome {
+        Ok(Ok(TriggerOutcome::Defer { until })) => on_defer(until),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!(trigger = %name, error = %e, "{label} errored"),
+        Err(_) => warn!(trigger = %name, "{label} panicked"),
+    }
+}
+
 fn fire_caught(
     entry: &RouteEntry,
     session_id: &str,
@@ -710,26 +722,17 @@ fn fire_caught(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         plugin.fire(TriggerContext::new(&session_id_owned, tx_id), &mb_clone)
     }));
-    match result {
-        Ok(Ok(TriggerOutcome::Defer { until })) => {
-            enqueue_deferral(
-                defer_queue,
-                plugin,
-                name,
-                mb_clone,
-                session_id_owned,
-                tx_id,
-                until,
-            );
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            warn!(trigger = %name, error = %e, "after-phase trigger errored");
-        }
-        Err(_) => {
-            warn!(trigger = %name, "after-phase trigger panicked");
-        }
-    }
+    handle_fire_outcome(result, &name, "after-phase trigger", |until| {
+        enqueue_deferral(
+            defer_queue,
+            plugin,
+            name.clone(),
+            mb_clone,
+            session_id_owned,
+            tx_id,
+            until,
+        );
+    });
 }
 
 fn subscription_name(sub: &TriggerSubscription) -> String {
@@ -1275,9 +1278,11 @@ impl MutationEvents {
         if self.rows.is_empty() {
             return None;
         }
-        EventRowColumns::with_capacity(self.rows.len())
-            .extend(self.rows.iter())
-            .into_batch()
+        let mut cols = EventRowColumns::with_capacity(self.rows.len());
+        for row in &self.rows {
+            cols.push_row(row);
+        }
+        cols.into_batch()
     }
 
     /// Filter rows matching `entry`'s subscription selectors and
@@ -1364,13 +1369,6 @@ impl EventRowColumns {
         );
     }
 
-    fn extend<'a>(mut self, rows: impl IntoIterator<Item = &'a MutationRow>) -> Self {
-        for row in rows {
-            self.push_row(row);
-        }
-        self
-    }
-
     /// Materialize the columns into a `RecordBatch`. Returns `None`
     /// when zero rows were collected (callers skip the empty case).
     fn into_batch(self) -> Option<RecordBatch> {
@@ -1439,18 +1437,13 @@ fn apply_predicate(predicate: &Arc<dyn PhysicalExpr>, batch: RecordBatch) -> Opt
 }
 
 fn mask_to_discriminant(m: TriggerEventMask) -> u8 {
-    // Bit position of the (single) set bit; falls back to 0 if
-    // multiple bits are set (not expected for emitted rows).
-    let mut bits = m.0;
-    let mut idx: u8 = 0;
-    if bits == 0 {
+    // 1-based bit position of the lowest set bit (e.g. `0b001 → 1`,
+    // `0b100 → 3`); falls back to 0 when no bit is set. Emitted rows
+    // always carry exactly one bit, so the lowest set bit is *the* bit.
+    if m.0 == 0 {
         return 0;
     }
-    while bits & 1 == 0 {
-        bits >>= 1;
-        idx += 1;
-    }
-    idx + 1
+    m.0.trailing_zeros() as u8 + 1
 }
 
 fn vid_to_i64(vid: uni_common::Vid) -> i64 {
@@ -1719,37 +1712,25 @@ impl DeferralQueue {
                     &item.payload,
                 )
             }));
-            match outcome {
-                Ok(Ok(TriggerOutcome::Defer { until })) => {
-                    item.attempts += 1;
-                    if item.attempts >= DEFER_MAX_ATTEMPTS {
-                        warn!(
-                            trigger = %item.name,
-                            attempts = item.attempts,
-                            "deferred trigger exceeded DEFER_MAX_ATTEMPTS; dropping"
-                        );
-                        continue;
-                    }
-                    // FU-5: honor the new `delay` field when re-deferring.
-                    // `None` falls back to "next tick" — matches the
-                    // legacy semantics. The trigger may have updated
-                    // the payload on re-defer; propagate the new one.
-                    let fire_at = StdInstant::now() + until.delay.unwrap_or(Duration::ZERO);
-                    item.payload = until.payload;
-                    self.push(item, fire_at);
+            let name = item.name.clone();
+            handle_fire_outcome(outcome, &name, "deferred trigger", |until| {
+                item.attempts += 1;
+                if item.attempts >= DEFER_MAX_ATTEMPTS {
+                    warn!(
+                        trigger = %item.name,
+                        attempts = item.attempts,
+                        "deferred trigger exceeded DEFER_MAX_ATTEMPTS; dropping"
+                    );
+                    return;
                 }
-                Ok(Ok(_)) => {
-                    // Continue, Reject, or future variant — treat all
-                    // as "done" for queue purposes. Reject after the
-                    // fact has no commit to abort against.
-                }
-                Ok(Err(e)) => {
-                    warn!(trigger = %item.name, error = %e, "deferred trigger errored");
-                }
-                Err(_) => {
-                    warn!(trigger = %item.name, "deferred trigger panicked");
-                }
-            }
+                // FU-5: honor the new `delay` field when re-deferring.
+                // `None` falls back to "next tick" — matches the legacy
+                // semantics. The trigger may have updated the payload on
+                // re-defer; propagate the new one.
+                let fire_at = StdInstant::now() + until.delay.unwrap_or(Duration::ZERO);
+                item.payload = until.payload;
+                self.push(item, fire_at);
+            });
         }
     }
 }
@@ -1793,14 +1774,14 @@ struct PersistedDeferral {
 /// Atomic JSON-sidecar persistence handle for the deferral queue.
 #[derive(Clone, Debug)]
 struct DeferralSidecar {
-    sidecar: uni_sidecar::SystemSidecar<Vec<PersistedDeferral>>,
+    sidecar: uni_sidecar::VecSidecar<PersistedDeferral>,
 }
 
 impl DeferralSidecar {
     /// Construct rooted at `<data_path>/_system/deferred_triggers.json`.
     fn new(data_path: std::path::PathBuf) -> Self {
         Self {
-            sidecar: uni_sidecar::SystemSidecar::new(data_path, "deferred_triggers.json"),
+            sidecar: uni_sidecar::VecSidecar::new(data_path, "deferred_triggers.json"),
         }
     }
 
@@ -1814,9 +1795,7 @@ impl DeferralSidecar {
     }
 
     fn write_all(&self, rows: &[PersistedDeferral]) -> Result<(), String> {
-        self.sidecar
-            .store(&rows.to_vec())
-            .map_err(|e| e.to_string())
+        self.sidecar.store(rows).map_err(|e| e.to_string())
     }
 }
 

@@ -42,10 +42,6 @@ impl GraphAlgoAdapter for BipartiteCheckAdapter {
             values: vec![json!(result.is_bipartite), Value::Object(partition_map)],
         }])
     }
-
-    fn include_reverse() -> bool {
-        true
-    }
 }
 
 pub type BipartiteCheckProcedure = GenericAlgoProcedure<BipartiteCheckAdapter>;

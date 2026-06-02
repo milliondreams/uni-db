@@ -35,7 +35,7 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
     r.crdt_kind(CrdtKind::new("or-set"), Arc::new(OrSetProvider))?;
     r.crdt_kind(CrdtKind::new("g-counter"), Arc::new(GCounterProvider))?;
     r.crdt_kind(CrdtKind::new("mv-register"), Arc::new(MvRegisterProvider))?;
-    r.crdt_kind(CrdtKind::new("rga"), Arc::new(RgaProvider))?;
+    r.crdt_kind(CrdtKind::new("rga"), Arc::new(RgaProvider::new()))?;
     Ok(())
 }
 
@@ -77,8 +77,9 @@ impl CrdtState for LwwState {
         Ok(())
     }
     fn merge(&mut self, other: &dyn CrdtState) -> Result<(), FnError> {
-        // M5b scaffold: identity merge (other has same shape; M5b cutover
-        // adds proper trait-Any downcast).
+        // LWW merge: persist `other`'s (ts, value) and re-apply it. The
+        // `apply` path keeps whichever timestamp is greater-or-equal, so
+        // the later writer wins regardless of merge direction.
         let serialized = other.persist()?;
         self.apply(&CrdtOp { bytes: serialized })
     }
@@ -354,120 +355,26 @@ impl CrdtState for MvRegisterState {
 
 /// RGA (Replicated Growable Array) CRDT-kind provider over `String`.
 ///
-/// Ops are JSON-encoded [`RgaOp`]s carrying pre-generated
-/// [`uuid::Uuid`]s; that way two replicas applying the same op sequence
-/// reach byte-identical state via [`uni_crdt::CrdtMerge::merge`].
-#[derive(Debug)]
-pub struct RgaProvider;
+/// The built-in `rga` kind is the `String` instantiation of the generic
+/// [`TypedRgaProvider`]: `String`'s [`RgaElement`] impl pins the kind id
+/// to `"rga"` and renders the live sequence as the concatenated text
+/// (the typical "collaborative text" use case). Ops are JSON-encoded
+/// [`RgaOp`]s carrying pre-generated [`uuid::Uuid`]s, so two replicas
+/// applying the same op sequence reach byte-identical state via
+/// [`uni_crdt::CrdtMerge::merge`].
+pub type RgaProvider = TypedRgaProvider<String>;
 
-/// Operation type for [`RgaProvider`].
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum RgaOp {
-    /// Insert `elem` after `prev_id` (or at the head if `None`).
-    /// `id` is the caller-supplied stable identifier for this insertion.
-    Insert {
-        /// Stable identifier for the inserted node; must match across
-        /// replicas for convergent merge.
-        id: uuid::Uuid,
-        /// Identifier of the node this insertion follows; `None` for
-        /// the head of the sequence.
-        prev_id: Option<uuid::Uuid>,
-        /// The element value to insert.
-        elem: String,
-        /// Lamport-style logical timestamp; ties broken by `id`.
-        timestamp: i64,
-    },
-    /// Mark the node with `id` as tombstoned.
-    Delete {
-        /// Identifier of the node to tombstone.
-        id: uuid::Uuid,
-    },
-}
-
-impl CrdtKindProvider for RgaProvider {
-    fn kind(&self) -> CrdtKind {
-        CrdtKind::new("rga")
-    }
-    fn empty(&self) -> Box<dyn CrdtState> {
-        Box::new(RgaState {
-            inner: uni_crdt::Rga::new(),
-        })
-    }
-    fn from_persisted(&self, bytes: &[u8]) -> Result<Box<dyn CrdtState>, FnError> {
-        let inner: uni_crdt::Rga<String> = serde_json::from_slice(bytes)
-            .map_err(|e| FnError::new(0x840, format!("rga deserialize: {e}")))?;
-        Ok(Box::new(RgaState { inner }))
-    }
-}
-
-#[derive(Debug)]
-struct RgaState {
-    inner: uni_crdt::Rga<String>,
-}
-
-impl CrdtState for RgaState {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn apply(&mut self, op: &CrdtOp) -> Result<(), FnError> {
-        let op: RgaOp = serde_json::from_slice(&op.bytes)
-            .map_err(|e| FnError::new(0x841, format!("rga apply: {e}")))?;
-        match op {
-            RgaOp::Insert {
-                id,
-                prev_id,
-                elem,
-                timestamp,
-            } => {
-                // Synthesize a one-node Rga via JSON round-trip — `Rga`'s
-                // `insert()` generates a fresh Uuid, which would diverge
-                // across replicas. The merge path is the convergent route.
-                let snippet = serde_json::json!({
-                    "nodes": {
-                        id.to_string(): {
-                            "id": id,
-                            "elem": elem,
-                            "origin_left": prev_id,
-                            "tombstone": false,
-                            "timestamp": timestamp,
-                        }
-                    }
-                });
-                let one: uni_crdt::Rga<String> = serde_json::from_value(snippet)
-                    .map_err(|e| FnError::new(0x842, format!("rga insert encode: {e}")))?;
-                uni_crdt::CrdtMerge::merge(&mut self.inner, &one);
-            }
-            RgaOp::Delete { id } => {
-                self.inner.delete(id);
-            }
-        }
-        Ok(())
-    }
-    fn merge(&mut self, other: &dyn CrdtState) -> Result<(), FnError> {
-        let o = other
-            .as_any()
-            .downcast_ref::<RgaState>()
-            .ok_or_else(|| FnError::new(0x843, "rga: merge type mismatch"))?;
-        uni_crdt::CrdtMerge::merge(&mut self.inner, &o.inner);
-        Ok(())
-    }
-    fn value(&self) -> Result<ScalarValue, FnError> {
-        // Surface as the concatenated string of live elements — matches
-        // the typical "collaborative text" RGA use case.
-        Ok(ScalarValue::Utf8(Some(self.inner.to_vec().concat())))
-    }
-    fn persist(&self) -> Result<Vec<u8>, FnError> {
-        serde_json::to_vec(&self.inner)
-            .map_err(|e| FnError::new(0x844, format!("rga persist: {e}")))
-    }
-}
+/// Operation type for [`RgaProvider`] — the `String` instantiation of
+/// [`TypedRgaOp`].
+pub type RgaOp = TypedRgaOp<String>;
 
 // ============================================================================
 // M5d — Generic `Rga<T>` registration.
 //
-// `RgaProvider` above is hard-bound to `String`. To register `Rga<T>` for
-// arbitrary element types (i64, f64, custom user types) we expose
-// `TypedRgaProvider<T: RgaElement>`. The `RgaElement` trait bundles the
+// `TypedRgaProvider<T: RgaElement>` registers `Rga<T>` for arbitrary
+// element types (String, i64, f64, custom user types); the built-in
+// `rga` kind (`RgaProvider`) is just the `String` instantiation. The
+// `RgaElement` trait bundles the
 // serde bounds with two host-shaped operations: a stable `kind_id` for
 // `CrdtKind` lookup, and a `values_to_scalar` adapter that maps a
 // `Vec<T>` (the materialised RGA sequence) to a Cypher `ScalarValue`.
@@ -515,6 +422,18 @@ impl RgaElement for f64 {
             serde_json::to_string(values)
                 .map_err(|e| FnError::new(0x851, format!("typed-rga<f64> value: {e}")))?,
         )))
+    }
+}
+
+impl RgaElement for String {
+    fn kind_id() -> &'static str {
+        // The original built-in `rga` kind; backed by `Rga<String>`.
+        "rga"
+    }
+    fn values_to_scalar(values: &[Self]) -> Result<ScalarValue, FnError> {
+        // Concatenate the live elements — matches the typical
+        // "collaborative text" RGA use case.
+        Ok(ScalarValue::Utf8(Some(values.concat())))
     }
 }
 
@@ -608,10 +527,12 @@ impl<T: RgaElement> CrdtState for TypedRgaState<T> {
                 elem,
                 timestamp,
             } => {
-                // Same one-node snippet trick the String-bound provider
-                // uses (see `RgaProvider::apply`). `serde_json::to_value`
-                // works for any `T: Serialize`, so the round-trip into
-                // `Rga<T>::deserialize` lands a valid one-node Rga.
+                // Synthesize a one-node Rga via JSON round-trip — `Rga`'s
+                // `insert()` generates a fresh Uuid, which would diverge
+                // across replicas; the merge path is the convergent route.
+                // `serde_json::to_value` works for any `T: Serialize`, so
+                // the round-trip into `Rga<T>::deserialize` lands a valid
+                // one-node Rga.
                 let elem_value = serde_json::to_value(&elem)
                     .map_err(|e| FnError::new(0x854, format!("typed-rga elem encode: {e}")))?;
                 let snippet = serde_json::json!({
@@ -852,7 +773,7 @@ mod tests {
         // Replicas A and B start from the same root insert, then
         // concurrently append. After cross-merge (apply each other's
         // ops) both surface byte-identical state, regardless of order.
-        let p = RgaProvider;
+        let p = RgaProvider::new();
         let id_root = uuid::Uuid::new_v4();
         let id_a = uuid::Uuid::new_v4();
         let id_b = uuid::Uuid::new_v4();
@@ -904,7 +825,7 @@ mod tests {
 
     #[test]
     fn rga_persist_round_trip() {
-        let p = RgaProvider;
+        let p = RgaProvider::new();
         let id = uuid::Uuid::new_v4();
         let mut s = p.empty();
         s.apply(&CrdtOp {

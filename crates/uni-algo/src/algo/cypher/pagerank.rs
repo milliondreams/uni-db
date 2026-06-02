@@ -4,7 +4,7 @@
 //! uni.algo.pageRank procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, PageRank, PageRankConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, arg_f64, arg_u64};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -29,9 +29,9 @@ impl GraphAlgoAdapter for PageRankAdapter {
 
     fn to_config(args: Vec<Value>) -> Result<PageRankConfig> {
         Ok(PageRankConfig {
-            damping_factor: args[0].as_f64().unwrap(),
-            max_iterations: args[1].as_u64().unwrap() as usize,
-            tolerance: args[2].as_f64().unwrap(),
+            damping_factor: arg_f64(&args, 0, "dampingFactor")?,
+            max_iterations: arg_u64(&args, 1, "maxIterations")? as usize,
+            tolerance: arg_f64(&args, 2, "tolerance")?,
         })
     }
 
@@ -43,10 +43,6 @@ impl GraphAlgoAdapter for PageRankAdapter {
                 values: vec![json!(vid.as_u64()), json!(score)],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

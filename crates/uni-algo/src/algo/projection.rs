@@ -53,10 +53,6 @@ pub struct GraphProjection {
 
     /// Identity mapping
     pub(crate) id_map: IdMap,
-
-    /// Metadata
-    pub(crate) _node_labels: Vec<String>,
-    pub(crate) _edge_types: Vec<String>,
 }
 
 impl GraphProjection {
@@ -241,8 +237,6 @@ impl ProjectionBuilder {
             in_neighbors,
             out_weights,
             id_map,
-            _node_labels: self.config.node_labels,
-            _edge_types: self.config.edge_types,
         })
     }
 
@@ -458,15 +452,13 @@ impl ProjectionBuilder {
     }
 }
 
-/// Row shape carried back from an inner Cypher node query: an `id`
-/// column scalar (Int) plus arbitrary other columns that this builder
-/// ignores.
-pub type NodeRow = std::collections::HashMap<String, uni_common::Value>;
-
-/// Row shape from an inner Cypher edge query: `source`, `target`
-/// (required, Int), plus an optional weight column whose name the
-/// caller passes to [`GraphProjection::from_rows`].
-pub type EdgeRow = std::collections::HashMap<String, uni_common::Value>;
+/// Row shape carried back from an inner Cypher projection query.
+///
+/// Node rows carry an `id` column (Int) plus arbitrary other columns
+/// that this builder ignores; edge rows carry `source`, `target`
+/// (required, Int) plus an optional weight column whose name the caller
+/// passes to [`GraphProjection::from_rows`].
+pub type ProjectionRow = std::collections::HashMap<String, uni_common::Value>;
 
 impl GraphProjection {
     /// Build a [`GraphProjection`] from inner-query row data.
@@ -494,8 +486,8 @@ impl GraphProjection {
     /// has the wrong type. Edges referencing unknown ids are skipped
     /// (not an error — they may represent edges out of the projection).
     pub fn from_rows(
-        node_rows: &[NodeRow],
-        edge_rows: &[EdgeRow],
+        node_rows: &[ProjectionRow],
+        edge_rows: &[ProjectionRow],
         weight_column: Option<&str>,
         include_reverse: bool,
     ) -> Result<Self> {
@@ -568,8 +560,6 @@ impl GraphProjection {
             in_neighbors,
             out_weights,
             id_map,
-            _node_labels: Vec::new(),
-            _edge_types: Vec::new(),
         })
     }
 }

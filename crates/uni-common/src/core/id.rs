@@ -7,209 +7,133 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Internal Vertex ID (64 bits) - pure auto-increment
+/// Define a dense, auto-increment 64-bit id newtype (`Vid` / `Eid`).
 ///
-/// VIDs are dense, sequential identifiers assigned on vertex creation.
-/// Unlike the previous design, VIDs no longer embed label information.
-/// Label lookups are done via the VidLabelsIndex.
-///
-/// For O(1) array indexing during query execution, use DenseIdx via VidRemapper.
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct Vid(u64);
+/// Both ids are structurally identical — a `u64` with an `INVALID` sentinel and
+/// a top `EPHEMERAL_BIT` for transient, in-query identities minted by
+/// `host.allocate_transient_id()`. This macro keeps them as **distinct** types
+/// (a `Vid` cannot be passed where an `Eid` is expected) while sharing one
+/// source of truth for the impl, so the ephemeral-bit logic can never drift
+/// between them. `$label` drives the `Debug` / `FromStr` diagnostics.
+macro_rules! define_id_newtype {
+    ($(#[$meta:meta])* $name:ident, $label:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+        pub struct $name(u64);
 
-impl Vid {
-    /// Creates a new vertex ID from a raw u64 value.
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
+        impl $name {
+            /// Creates a new id from a raw u64 value.
+            pub fn new(id: u64) -> Self {
+                Self(id)
+            }
 
-    /// Returns the raw u64 value of this VID.
-    pub fn as_u64(&self) -> u64 {
-        self.0
-    }
+            /// Returns the raw u64 value of this id.
+            pub fn as_u64(&self) -> u64 {
+                self.0
+            }
 
-    /// Sentinel value representing an invalid/null VID.
-    pub const INVALID: Vid = Vid(u64::MAX);
+            /// Sentinel value representing an invalid/null id.
+            pub const INVALID: $name = $name(u64::MAX);
 
-    /// Check if this VID is the invalid sentinel.
-    pub fn is_invalid(&self) -> bool {
-        self.0 == u64::MAX
-    }
+            /// Check if this id is the invalid sentinel.
+            pub fn is_invalid(&self) -> bool {
+                self.0 == u64::MAX
+            }
 
-    /// Top bit reserved for ephemeral (transient, in-query) identities
-    /// allocated by `host.allocate_transient_id()` (M5g / proposal §4.13.1).
-    /// Storage write paths must reject any VID with this bit set.
-    pub const EPHEMERAL_BIT: u64 = 1u64 << 63;
+            /// Top bit reserved for ephemeral (transient, in-query) identities
+            /// allocated by `host.allocate_transient_id()` (M5g / proposal §4.13.1).
+            /// Storage write paths must reject any id with this bit set.
+            pub const EPHEMERAL_BIT: u64 = 1u64 << 63;
 
-    /// Construct an ephemeral VID from a `transient_id` (bottom 63 bits).
-    /// Returns `Vid::INVALID` if `transient_id` overflows the 63-bit range.
-    pub fn ephemeral(transient_id: u64) -> Self {
-        if transient_id >= Self::EPHEMERAL_BIT {
-            return Self::INVALID;
+            /// Construct an ephemeral id from a `transient_id` (bottom 63 bits).
+            /// Returns `INVALID` if `transient_id` overflows the 63-bit range.
+            pub fn ephemeral(transient_id: u64) -> Self {
+                if transient_id >= Self::EPHEMERAL_BIT {
+                    return Self::INVALID;
+                }
+                Self(Self::EPHEMERAL_BIT | transient_id)
+            }
+
+            /// True if this id's high bit is set, i.e. it was minted by
+            /// `host.allocate_transient_id()` and is *not* backed by storage.
+            /// `INVALID` (all bits set) also satisfies this; callers that care
+            /// about the distinction should check `is_invalid()` first.
+            pub fn is_ephemeral(&self) -> bool {
+                self.0 & Self::EPHEMERAL_BIT != 0 && !self.is_invalid()
+            }
+
+            /// Bottom 63 bits when `self` is ephemeral, else `None`.
+            pub fn transient_id(&self) -> Option<u64> {
+                self.is_ephemeral().then_some(self.0 & !Self::EPHEMERAL_BIT)
+            }
         }
-        Self(Self::EPHEMERAL_BIT | transient_id)
-    }
 
-    /// True if this VID's high bit is set, i.e. it was minted by
-    /// `host.allocate_transient_id()` and is *not* backed by storage.
-    /// `INVALID` (all bits set) also satisfies this; callers that care
-    /// about the distinction should check `is_invalid()` first.
-    pub fn is_ephemeral(&self) -> bool {
-        self.0 & Self::EPHEMERAL_BIT != 0 && !self.is_invalid()
-    }
-
-    /// Bottom 63 bits when `self` is ephemeral, else `None`.
-    pub fn transient_id(&self) -> Option<u64> {
-        self.is_ephemeral().then_some(self.0 & !Self::EPHEMERAL_BIT)
-    }
-}
-
-impl From<u64> for Vid {
-    fn from(val: u64) -> Self {
-        Self(val)
-    }
-}
-
-impl From<Vid> for u64 {
-    fn from(vid: Vid) -> Self {
-        vid.0
-    }
-}
-
-impl Default for Vid {
-    fn default() -> Self {
-        Self::INVALID
-    }
-}
-
-impl fmt::Debug for Vid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_invalid() {
-            write!(f, "Vid(INVALID)")
-        } else {
-            write!(f, "Vid({})", self.0)
+        impl From<u64> for $name {
+            fn from(val: u64) -> Self {
+                Self(val)
+            }
         }
-    }
-}
 
-impl fmt::Display for Vid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromStr for Vid {
-    type Err = anyhow::Error;
-
-    /// Parses a Vid from a numeric string.
-    fn from_str(s: &str) -> Result<Self> {
-        let id: u64 = s
-            .parse()
-            .map_err(|e| anyhow!("Invalid Vid '{}': {}", s, e))?;
-        Ok(Self::new(id))
-    }
-}
-
-/// Internal Edge ID (64 bits) - pure auto-increment
-///
-/// EIDs are dense, sequential identifiers assigned on edge creation.
-/// Unlike the previous design, EIDs no longer embed type information.
-/// Edge type lookups are done via the edge tables.
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct Eid(u64);
-
-impl Eid {
-    /// Creates a new edge ID from a raw u64 value.
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
-
-    /// Returns the raw u64 value of this EID.
-    pub fn as_u64(&self) -> u64 {
-        self.0
-    }
-
-    /// Sentinel value representing an invalid/null EID.
-    pub const INVALID: Eid = Eid(u64::MAX);
-
-    /// Check if this EID is the invalid sentinel.
-    pub fn is_invalid(&self) -> bool {
-        self.0 == u64::MAX
-    }
-
-    /// Top bit reserved for ephemeral (transient, in-query) identities
-    /// allocated by `host.allocate_transient_id()` (M5g / proposal §4.13.1).
-    /// Storage write paths must reject any EID with this bit set.
-    pub const EPHEMERAL_BIT: u64 = 1u64 << 63;
-
-    /// Construct an ephemeral EID from a `transient_id` (bottom 63 bits).
-    /// Returns `Eid::INVALID` if `transient_id` overflows the 63-bit range.
-    pub fn ephemeral(transient_id: u64) -> Self {
-        if transient_id >= Self::EPHEMERAL_BIT {
-            return Self::INVALID;
+        impl From<$name> for u64 {
+            fn from(id: $name) -> Self {
+                id.0
+            }
         }
-        Self(Self::EPHEMERAL_BIT | transient_id)
-    }
 
-    /// True if this EID's high bit is set, i.e. it was minted by
-    /// `host.allocate_transient_id()` and is *not* backed by storage.
-    /// `INVALID` (all bits set) also satisfies this; callers that care
-    /// about the distinction should check `is_invalid()` first.
-    pub fn is_ephemeral(&self) -> bool {
-        self.0 & Self::EPHEMERAL_BIT != 0 && !self.is_invalid()
-    }
-
-    /// Bottom 63 bits when `self` is ephemeral, else `None`.
-    pub fn transient_id(&self) -> Option<u64> {
-        self.is_ephemeral().then_some(self.0 & !Self::EPHEMERAL_BIT)
-    }
-}
-
-impl From<u64> for Eid {
-    fn from(val: u64) -> Self {
-        Self(val)
-    }
-}
-
-impl From<Eid> for u64 {
-    fn from(eid: Eid) -> Self {
-        eid.0
-    }
-}
-
-impl Default for Eid {
-    fn default() -> Self {
-        Self::INVALID
-    }
-}
-
-impl fmt::Debug for Eid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_invalid() {
-            write!(f, "Eid(INVALID)")
-        } else {
-            write!(f, "Eid({})", self.0)
+        impl Default for $name {
+            fn default() -> Self {
+                Self::INVALID
+            }
         }
-    }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                if self.is_invalid() {
+                    write!(f, concat!($label, "(INVALID)"))
+                } else {
+                    write!(f, concat!($label, "({})"), self.0)
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = anyhow::Error;
+
+            fn from_str(s: &str) -> Result<Self> {
+                let id: u64 = s
+                    .parse()
+                    .map_err(|e| anyhow!(concat!("Invalid ", $label, " '{}': {}"), s, e))?;
+                Ok(Self::new(id))
+            }
+        }
+    };
 }
 
-impl fmt::Display for Eid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+define_id_newtype!(
+    /// Internal Vertex ID (64 bits) — pure auto-increment.
+    ///
+    /// VIDs are dense, sequential identifiers assigned on vertex creation; they
+    /// no longer embed label information (label lookups go via the
+    /// VidLabelsIndex). For O(1) array indexing during query execution, use
+    /// `DenseIdx` via `VidRemapper`.
+    Vid,
+    "Vid"
+);
 
-impl FromStr for Eid {
-    type Err = anyhow::Error;
-
-    /// Parses an Eid from a numeric string.
-    fn from_str(s: &str) -> Result<Self> {
-        let id: u64 = s
-            .parse()
-            .map_err(|e| anyhow!("Invalid Eid '{}': {}", s, e))?;
-        Ok(Self::new(id))
-    }
-}
+define_id_newtype!(
+    /// Internal Edge ID (64 bits) — pure auto-increment.
+    ///
+    /// EIDs are dense, sequential identifiers assigned on edge creation; they no
+    /// longer embed type information (edge-type lookups go via the edge tables).
+    Eid,
+    "Eid"
+);
 
 /// Dense index for O(1) array access during query execution.
 ///

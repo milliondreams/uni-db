@@ -818,7 +818,7 @@ mod vector_clock {
 
         let b = a.clone();
 
-        assert_eq!(a.partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.causal_cmp(&b), Some(Ordering::Equal));
     }
 
     #[test]
@@ -829,7 +829,7 @@ mod vector_clock {
         let mut b = a.clone();
         b.increment("node1");
 
-        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(a.causal_cmp(&b), Some(Ordering::Less));
     }
 
     #[test]
@@ -840,7 +840,7 @@ mod vector_clock {
         let mut b = a.clone();
         b.increment("node1");
 
-        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(b.causal_cmp(&a), Some(Ordering::Greater));
     }
 
     #[test]
@@ -851,7 +851,7 @@ mod vector_clock {
         let mut b = VectorClock::new();
         b.increment("node2");
 
-        assert_eq!(a.partial_cmp(&b), None);
+        assert_eq!(a.causal_cmp(&b), None);
     }
 
     #[test]
@@ -1074,7 +1074,7 @@ mod crdt_wrapper {
     }
 
     #[test]
-    #[should_panic(expected = "Cannot merge different CRDT types")]
+    #[should_panic(expected = "CRDT merge failed: Type mismatch: cannot merge")]
     fn test_merge_panics_on_type_mismatch() {
         let mut crdt1 = Crdt::GCounter(GCounter::new());
         let crdt2 = Crdt::GSet(GSet::new());

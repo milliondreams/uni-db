@@ -4,7 +4,9 @@
 //! uni.algo.labelPropagation procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, LabelPropagation, LabelPropagationConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{
+    GenericAlgoProcedure, GraphAlgoAdapter, arg_bool, arg_str, arg_u64,
+};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -29,9 +31,9 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
 
     fn to_config(args: Vec<Value>) -> Result<LabelPropagationConfig> {
         Ok(LabelPropagationConfig {
-            max_iterations: args[0].as_u64().unwrap() as usize,
-            write: args[1].as_bool().unwrap(),
-            write_property: args[2].as_str().unwrap().to_string(),
+            max_iterations: arg_u64(&args, 0, "maxIterations")? as usize,
+            write: arg_bool(&args, 1, "write")?,
+            write_property: arg_str(&args, 2, "writeProperty")?.to_string(),
             seed_property: None,
         })
     }
@@ -44,10 +46,6 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
                 values: vec![json!(vid.as_u64()), json!(cid)],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

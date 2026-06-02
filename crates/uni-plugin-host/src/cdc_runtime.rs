@@ -48,7 +48,7 @@ use uni_plugin::traits::cdc::{CdcBatch, CdcLsn, CdcStartContext, CdcStream};
 
 use crate::notifications::CommitNotification;
 use crate::shutdown::ShutdownHandle;
-use uni_sidecar::SystemSidecar;
+use uni_sidecar::VecSidecar;
 
 /// Per-provider checkpoint row written to the JSON sidecar.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,7 +63,7 @@ pub struct PersistedCheckpoint {
 /// `<data_path>/_system/cdc_checkpoints.json`.
 #[derive(Clone, Debug)]
 pub struct CdcCheckpointSidecar {
-    sidecar: SystemSidecar<Vec<PersistedCheckpoint>>,
+    sidecar: VecSidecar<PersistedCheckpoint>,
 }
 
 impl CdcCheckpointSidecar {
@@ -71,7 +71,7 @@ impl CdcCheckpointSidecar {
     #[must_use]
     pub fn new(data_path: PathBuf) -> Self {
         Self {
-            sidecar: SystemSidecar::new(data_path, "cdc_checkpoints.json"),
+            sidecar: VecSidecar::new(data_path, "cdc_checkpoints.json"),
         }
     }
 
@@ -97,9 +97,7 @@ impl CdcCheckpointSidecar {
     ///
     /// Returns a free-form error string on I/O failure.
     pub fn write_all(&self, rows: &[PersistedCheckpoint]) -> Result<(), String> {
-        self.sidecar
-            .store(&rows.to_vec())
-            .map_err(|e| e.to_string())
+        self.sidecar.store(rows).map_err(|e| e.to_string())
     }
 
     /// Look up the persisted LSN for a single provider.
@@ -136,6 +134,42 @@ impl CdcCheckpointSidecar {
 struct ActiveStream {
     name: String,
     stream: Box<dyn CdcStream>,
+}
+
+/// Resume `provider` from its persisted LSN and start its stream.
+///
+/// Returns the [`ActiveStream`] on success, or `None` (logged) on failure so
+/// the caller skips it. Shared by [`CdcRuntime::spawn`] (`late = false`) and
+/// [`CdcRuntime::discover_new_providers`] (`late = true`); the only difference
+/// is the log wording.
+fn start_stream(
+    checkpoint: Option<&CdcCheckpointSidecar>,
+    name: &str,
+    provider: &Arc<dyn uni_plugin::traits::cdc::CdcOutputProvider>,
+    late: bool,
+) -> Option<ActiveStream> {
+    let from_lsn = checkpoint.and_then(|c| c.lookup(name));
+    match provider.start(CdcStartContext::new(from_lsn)) {
+        Ok(stream) => {
+            if late {
+                tracing::info!(provider = %name, from_lsn = ?from_lsn, "CdcRuntime: late-registered provider started");
+            } else {
+                tracing::info!(provider = %name, from_lsn = ?from_lsn, "CdcRuntime: provider started");
+            }
+            Some(ActiveStream {
+                name: name.to_owned(),
+                stream,
+            })
+        }
+        Err(e) => {
+            if late {
+                tracing::warn!(provider = %name, error = %e, "CdcRuntime: late-registered provider start failed");
+            } else {
+                tracing::warn!(provider = %name, error = %e, "CdcRuntime: provider start failed; skipping");
+            }
+            None
+        }
+    }
 }
 
 /// Host-side CDC runtime that drives every registered provider on
@@ -192,26 +226,9 @@ impl CdcRuntime {
 
         let mut active: Vec<ActiveStream> = Vec::new();
         for (name, provider) in registry.cdc_outputs_snapshot() {
-            let from_lsn = checkpoint.as_ref().and_then(|c| c.lookup(name.as_str()));
-            match provider.start(CdcStartContext::new(from_lsn)) {
-                Ok(stream) => {
-                    tracing::info!(
-                        provider = %name,
-                        from_lsn = ?from_lsn,
-                        "CdcRuntime: provider started",
-                    );
-                    active.push(ActiveStream {
-                        name: name.to_string(),
-                        stream,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = %name,
-                        error = %e,
-                        "CdcRuntime: provider start failed; skipping",
-                    );
-                }
+            if let Some(stream) = start_stream(checkpoint.as_ref(), name.as_str(), &provider, false)
+            {
+                active.push(stream);
             }
         }
 
@@ -277,27 +294,10 @@ impl CdcRuntime {
             if streams.iter().any(|s| s.name == name.as_str()) {
                 continue;
             }
-            let from_lsn = self
-                .checkpoint
-                .as_ref()
-                .and_then(|c| c.lookup(name.as_str()));
-            match provider.start(CdcStartContext::new(from_lsn)) {
-                Ok(stream) => {
-                    tracing::info!(
-                        provider = %name,
-                        from_lsn = ?from_lsn,
-                        "CdcRuntime: late-registered provider started",
-                    );
-                    streams.push(ActiveStream {
-                        name: name.to_string(),
-                        stream,
-                    });
-                }
-                Err(e) => tracing::warn!(
-                    provider = %name,
-                    error = %e,
-                    "CdcRuntime: late-registered provider start failed",
-                ),
+            if let Some(stream) =
+                start_stream(self.checkpoint.as_ref(), name.as_str(), &provider, true)
+            {
+                streams.push(stream);
             }
         }
     }

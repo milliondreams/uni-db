@@ -89,4 +89,4 @@ The plugin framework is shipped and test-verified, with an honestly bounded v1 s
 - **Non-Rust authoring beyond scalar / aggregate / procedure** — the other 20 surfaces are Rust-only in v1; some WIT worlds (e.g. CRDT, connector) are tractable but deferred, while in-process surfaces like operators and storage are infeasible across the Component Model boundary.
 
 !!! note "Honest by design"
-    This scope mirrors the implementation gap analysis in `docs/proposals/plugin_framework_gaps.md`. Where a capability is in place but not yet end-to-end, the documentation says so rather than implying completeness.
+    This scope mirrors the plugin-framework implementation gap analysis. Where a capability is in place but not yet end-to-end, the documentation says so rather than implying completeness.

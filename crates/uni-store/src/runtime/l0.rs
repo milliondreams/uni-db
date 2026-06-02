@@ -188,8 +188,7 @@ pub struct L0Buffer {
     /// (partial-column update) at flush time. Populated by
     /// `insert_vertex_partial`; cleared by full-row inserts and deletes.
     /// A VID present here at flush time is emitted to the partial batch;
-    /// absent VIDs flush via the existing full-row Append. See
-    /// `docs/proposals/partial_lance_writes.md`.
+    /// absent VIDs flush via the existing full-row Append.
     pub vertex_partial_keys: HashMap<Vid, HashSet<String>>,
     /// Edge analog of `vertex_partial_keys` (Round 12 §A). Populated by
     /// `insert_edge_partial_full`; cleared by full-row inserts and edge
@@ -208,8 +207,7 @@ pub struct L0Buffer {
     /// Optimistic-concurrency read sequence (SSI). Stamped on a transaction's
     /// private L0 at creation with the Writer's commit-sequence at that moment,
     /// and consulted at commit to detect intervening conflicting commits. `0`
-    /// for the main L0 and when SSI is disabled. See
-    /// `docs/proposals/serializable_snapshot_isolation.md`.
+    /// for the main L0 and when SSI is disabled.
     pub occ_read_seq: u64,
     /// Optimistic-concurrency read-set (SSI). `Some` on a read-write
     /// transaction's private L0 when SSI tracking is active; the read path
@@ -508,7 +506,7 @@ impl L0Buffer {
         self.vertex_tombstones.remove(&vid);
 
         // Full-row insert supersedes any pending partial-update state for
-        // this VID. See `docs/proposals/partial_lance_writes.md` Step 2.
+        // this VID.
         self.vertex_partial_keys.remove(&vid);
 
         let entry = self.vertex_properties.entry(vid).or_default();

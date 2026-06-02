@@ -310,9 +310,6 @@ jobs:
       # — bundling them produces 620+ MB wheels that exceed PyPI's per-file
       # limit and risk runtime conflicts with the user's NVIDIA driver
       # install. The post-build repair step below excludes them.
-      #
-      # See `docs/proposals/python-wheel-matrix.md` "What is not bundled"
-      # for the canonical list.
       - name: Build wheels (skip auditwheel)
         uses: PyO3/maturin-action@v1
         env:

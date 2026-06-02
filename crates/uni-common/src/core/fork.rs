@@ -6,9 +6,8 @@
 //! `Fork` = a named, durable, isolated branch of the graph. Each fork is
 //! backed by one Lance branch per dataset (vertex, edge-delta, adjacency).
 //! These types are persisted to `catalog/fork_registry.json` and
-//! `catalog/fork_schemas/{fork_id}.json`. See
-//! `docs/proposals/graph_fork_plan.md` §Phase 1 for the spec they
-//! implement and the 2PC state machines that govern their lifecycle.
+//! `catalog/fork_schemas/{fork_id}.json`. Their lifecycle is governed by
+//! 2PC state machines.
 //!
 //! `SchemaDelta` is wired through Phase 1 with all instances empty —
 //! the merge infrastructure exists so Phase 2's on-the-fly label

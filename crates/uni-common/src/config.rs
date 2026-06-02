@@ -493,8 +493,8 @@ pub struct UniConfig {
     /// to Lance via `MergeInsertBuilder` — skipping the read of (and write
     /// of) the unchanged columns. Wide-row schemas with vector indexes
     /// benefit most (~17 ms/row → ~3 ms/row on the issue #72 ingest
-    /// workload). See `docs/proposals/partial_lance_writes.md` and the
-    /// Round-11 plan section in `plan-and-implement-a-valiant-flame.md`.
+    /// workload). See the Round-11 plan section in
+    /// `plan-and-implement-a-valiant-flame.md`.
     pub partial_lance_writes: bool,
 
     /// When true, auto-embedding for vertex writes is deferred from the
@@ -536,8 +536,6 @@ pub struct UniConfig {
     /// When `false` (default for now), `check_flush` calls the original
     /// synchronous `flush_to_l1` and holds `flush_lock` across the full
     /// L1-streaming write. This is the kill-switch.
-    ///
-    /// See `docs/proposals/async_l0_to_l1_flush.md`.
     pub async_flush_enabled: bool,
 
     /// Maximum number of L0→L1 flushes that may be in-flight simultaneously

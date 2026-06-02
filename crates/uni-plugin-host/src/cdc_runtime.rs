@@ -32,8 +32,7 @@
 //! today — the LSN advancement, ordering, and checkpoint round-trip
 //! are the parts under test. Filling the batch with the actual
 //! mutation rows uses the same machinery as
-//! `crate::triggers::MutationEvents` and is tracked as a
-//! follow-up in `docs/plans/plugin_framework_implementation.md`.
+//! `crate::triggers::MutationEvents` and is tracked as a follow-up.
 
 // Rust guideline compliant
 
@@ -49,6 +48,7 @@ use uni_plugin::traits::cdc::{CdcBatch, CdcLsn, CdcStartContext, CdcStream};
 
 use crate::notifications::CommitNotification;
 use crate::shutdown::ShutdownHandle;
+use uni_sidecar::SystemSidecar;
 
 /// Per-provider checkpoint row written to the JSON sidecar.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,23 +63,22 @@ pub struct PersistedCheckpoint {
 /// `<data_path>/_system/cdc_checkpoints.json`.
 #[derive(Clone, Debug)]
 pub struct CdcCheckpointSidecar {
-    path: PathBuf,
+    sidecar: SystemSidecar<Vec<PersistedCheckpoint>>,
 }
 
 impl CdcCheckpointSidecar {
     /// Construct rooted at `<data_path>/_system/cdc_checkpoints.json`.
     #[must_use]
     pub fn new(data_path: PathBuf) -> Self {
-        let mut path = data_path;
-        path.push("_system");
-        path.push("cdc_checkpoints.json");
-        Self { path }
+        Self {
+            sidecar: SystemSidecar::new(data_path, "cdc_checkpoints.json"),
+        }
     }
 
     /// Borrow the sidecar path (for diagnostics).
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
-        &self.path
+        self.sidecar.path()
     }
 
     /// Load all persisted checkpoints. Returns an empty vec if the
@@ -89,14 +88,7 @@ impl CdcCheckpointSidecar {
     ///
     /// Returns a free-form error string on I/O or parse failure.
     pub fn load_all(&self) -> Result<Vec<PersistedCheckpoint>, String> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = std::fs::read(&self.path).map_err(|e| format!("read {:?}: {e}", self.path))?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse {:?}: {e}", self.path))
+        self.sidecar.load().map_err(|e| e.to_string())
     }
 
     /// Write the full checkpoint set atomically.
@@ -105,23 +97,9 @@ impl CdcCheckpointSidecar {
     ///
     /// Returns a free-form error string on I/O failure.
     pub fn write_all(&self, rows: &[PersistedCheckpoint]) -> Result<(), String> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
-        }
-        let json = serde_json::to_vec_pretty(rows).map_err(|e| format!("encode: {e}"))?;
-        let tmp = self.path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tmp:?}: {e}"))?;
-            f.write_all(&json)
-                .map_err(|e| format!("write {tmp:?}: {e}"))?;
-            f.sync_all().map_err(|e| format!("sync {tmp:?}: {e}"))?;
-        }
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| format!("rename {tmp:?}->{:?}: {e}", self.path))?;
-        Ok(())
+        self.sidecar
+            .store(&rows.to_vec())
+            .map_err(|e| e.to_string())
     }
 
     /// Look up the persisted LSN for a single provider.
@@ -184,7 +162,7 @@ impl std::fmt::Debug for CdcRuntime {
             .field("active_streams", &count)
             .field(
                 "checkpoint_path",
-                &self.checkpoint.as_ref().map(|c| c.path.clone()),
+                &self.checkpoint.as_ref().map(|c| c.path().to_path_buf()),
             )
             .finish()
     }

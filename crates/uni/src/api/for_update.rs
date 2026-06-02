@@ -8,8 +8,7 @@
 //! (`MATCH (n:Label {k: v}) FOR UPDATE`) are lockable — the RMW use case the
 //! escape hatch targets. Any other `FOR UPDATE` pattern (traversal, multi-node,
 //! non-literal properties) is flagged `unsupported` so the caller can surface a
-//! warning rather than silently ignore the lock hint. See
-//! `docs/proposals/serializable_snapshot_isolation.md` (Component C5).
+//! warning rather than silently ignore the lock hint.
 
 use std::collections::HashMap;
 

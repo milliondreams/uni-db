@@ -133,24 +133,10 @@ impl Drop for OtelGuard {
 /// via the host-net WIT import.
 #[must_use]
 pub fn current_traceparent() -> Option<String> {
-    use opentelemetry::trace::TraceContextExt as _;
-    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-
-    let span = tracing::Span::current();
-    let ctx = span.context();
-    let span_ref = ctx.span();
-    let sc = span_ref.span_context();
-    if !sc.is_valid() {
-        return None;
-    }
-    // W3C format: `<version>-<trace-id>-<span-id>-<flags>`
-    // version=00, flags=01 when sampled.
-    Some(format!(
-        "00-{}-{}-{:02x}",
-        sc.trace_id(),
-        sc.span_id(),
-        sc.trace_flags().to_u8(),
-    ))
+    // Delegates to the single source of truth in `uni-plugin` (built with the
+    // `otel` feature) so the host-side outbound-HTTP path and the plugin ABI
+    // share one extraction + formatting implementation.
+    uni_plugin::observability::current_trace_context().to_traceparent()
 }
 
 /// Perform an HTTP GET against `url` with the current span's

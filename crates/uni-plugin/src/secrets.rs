@@ -1,8 +1,6 @@
 //! Sealer/unsealer secret membrane.
 //!
-//! Per `docs/proposals/plugin_framework.md` §10.2b and
-//! `docs/plans/plugin_framework_implementation.md` §4 M11, plugins
-//! granted `Capability::Secret { ids }` acquire **opaque handles** to
+//! Plugins granted `Capability::Secret { ids }` acquire **opaque handles** to
 //! named secrets — never raw bytes. The handle can be passed to other
 //! capability-gated host imports (e.g., `host-net.http_get_with_secret`)
 //! but cannot be read, logged, or serialized.

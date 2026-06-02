@@ -1,7 +1,7 @@
 //! Built-in procedure registrations.
 //!
-//! Per `docs/plans/plugin_framework_implementation.md` §4 M4, the 50+
-//! hardcoded procedures in `crates/uni-query/src/query/df_graph/procedure_call.rs`
+//! The 50+ hardcoded procedures in
+//! `crates/uni-query/src/query/df_graph/procedure_call.rs`
 //! migrate into per-namespace submodules. APOC-equivalent namespaces
 //! (`apoc.bitwise`, `apoc.text`, `apoc.coll`, …) live in
 //! `uni-plugin-apoc-core` instead; this crate covers the closed-enum

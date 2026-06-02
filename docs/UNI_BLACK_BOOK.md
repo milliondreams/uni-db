@@ -5212,7 +5212,7 @@ graph TB
     Registry --> Exec
 ```
 
-> **Status note.** This Part documents what is shipped and test-verified today. Where the proposal's acceptance scorecard (`docs/proposals/plugin_framework.md` §19, 30 criteria: 19 ✅ / 6 ▶ / 6 ⏳) marks an item *substantively in place* (▶) or *pending* (⏳) — the CLI surface, OCI/Hub install, the Component-Model capability-gated host-fn body, GUC config parameters, and non-Rust authoring of surfaces beyond scalar/aggregate/procedure — it is called out explicitly in [§XVII.18](#whats-not-in-the-plugin-framework-current-scope).
+> **Status note.** This Part documents what is shipped and test-verified today. Where the proposal's acceptance scorecard (plugin-framework proposal §19, 30 criteria: 19 ✅ / 6 ▶ / 6 ⏳) marks an item *substantively in place* (▶) or *pending* (⏳) — the CLI surface, OCI/Hub install, the Component-Model capability-gated host-fn body, GUC config parameters, and non-Rust authoring of surfaces beyond scalar/aggregate/procedure — it is called out explicitly in [§XVII.18](#whats-not-in-the-plugin-framework-current-scope).
 
 ## What Is the Plugin Framework?
 

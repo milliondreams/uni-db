@@ -2,8 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 //! Tests T1–T9 for the partial-column Lance writes workstream
-//! (Round 11). See `docs/proposals/partial_lance_writes.md` and the
-//! Round-11 section of
+//! (Round 11). See the Round-11 section of
 //! `/home/rohit/.claude/plans/plan-and-implement-a-valiant-flame.md`.
 //!
 //! The soundness probe (`crates/uni-store/tests/common/storage/

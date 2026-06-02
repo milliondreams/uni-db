@@ -214,8 +214,7 @@ impl MainVertexDataset {
     /// Build a partial-column RecordBatch marking VIDs as deleted. Used
     /// by the DELETE flush path to skip the wide-row tombstone Append.
     /// Schema: `_vid`, `_deleted=true`, `_version`, `_updated_at`. Lance
-    /// MergeInsert leaves all other target columns untouched. See
-    /// `docs/proposals/partial_lance_writes.md` Round-12 §B.
+    /// MergeInsert leaves all other target columns untouched.
     pub fn build_tombstone_partial_batch(
         tombstones: &[(Vid, u64)],
         updated_at: Option<&HashMap<Vid, i64>>,

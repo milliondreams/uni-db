@@ -1,8 +1,6 @@
 //! Conformance test runner for uni-db plugin authors.
 //!
-//! Per `docs/proposals/plugin_framework.md` §16.4 and
-//! `docs/plans/plugin_framework_implementation.md` §4 M12, this crate
-//! publishes a portable test harness that plugin authors run against
+//! This crate publishes a portable test harness that plugin authors run against
 //! their built `.wasm` (or compile-time Rust) plugins to verify:
 //!
 //! - Manifest correctness (parses, capabilities declared match

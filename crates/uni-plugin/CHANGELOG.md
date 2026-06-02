@@ -5,6 +5,52 @@ the workspace version unless an entry is annotated otherwise — the
 workspace stays on `1.3.x` while individual crates publish additive
 v1.4 minor bumps when their ABI grows.
 
+## 1.9.0 — 2026-06-01 — always-on Ed25519 manifest verification + signing-payload fix (security)
+
+Hardens signed-manifest verification. Two changes, both security-relevant:
+
+### Changed
+
+- **`ed25519` Cargo feature removed; signature verification is now always
+  compiled.** `ed25519-dalek` and `base64` are non-optional dependencies. A
+  build could previously be configured (feature off) to skip the cryptographic
+  check and accept any signature whose `key_id` was merely *named* in the trust
+  root — a silent-acceptance footgun. Verification is a security primitive and
+  is no longer a build-time opt-out. This drops the `default`/`ed25519` features
+  entirely; consumers that set `default-features = false` on `uni-plugin` (none
+  in-tree) no longer disable crypto.
+- **Manifest signing payload now covers the whole manifest, not just the hash
+  pin.** `canonical_payload` previously signed only the blake3 hash string when
+  present, so an attacker could rewrite `capabilities` / `side_effects` while
+  preserving the hash and the signature still verified (capability escalation
+  via manifest substitution). The payload is now a domain-separated, versioned
+  (`uni-plugin-manifest-sig:v1`) canonical JSON serialization of the entire
+  manifest with the `signature` field excluded. **Pre-1.9.0 signatures no longer
+  verify and must be re-signed.**
+- **`verify_signed_manifest` is fail-closed**: a `key_id` present in the trust
+  root but without bound public-key bytes (the shape-only `TrustRoot::allow`
+  path) is now rejected rather than accepted.
+
+### Added
+
+- **`otel` Cargo feature** (default-off) wiring real OTel trace-context
+  extraction in `observability::current_trace_context()`: with the feature on
+  and a `tracing-opentelemetry` layer installed, it reads the current span's
+  `SpanContext`. Pulls only the lightweight `opentelemetry` API +
+  `tracing-opentelemetry` (not the OTLP exporter SDK), so loaders that never
+  emit OTel spans stay lean. `uni-plugin-host` enables it.
+- **`TraceContext::to_traceparent()`** renders a W3C `traceparent` header value,
+  and **`TraceContext` gains a `trace_flags: u8` field** and is now
+  `#[non_exhaustive]` (additive; future fields like `tracestate` won't break
+  downstream construction).
+- **`host_services` module** with the `KmsProvider` and `HttpEgress` traits
+  (+ `HttpResponse`) — the shared seam backing capability-gated `uni.kms.*` /
+  `uni.http.*` host functions, so every loader binds one abstraction. Re-exported
+  at the crate root.
+- **`Capability::network_allows` / `kms_allows` / `secret_allows`** — call-time
+  (layer-3) attenuation helpers matching a URL / key id / secret id against a
+  granted `Network` / `Kms` / `Secret` allow-list (anchored `*`/`**` globs).
+
 ## 1.8.0 — 2026-05-24 — arity-overloaded procedures + `AlgoProcedure::execute_with_projection` (M5 Batch 3)
 
 M5c.2 + M5c.3 land additive surface on the procedure registry and the

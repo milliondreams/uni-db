@@ -1,7 +1,7 @@
 //! Per-`(plugin_id, qname)` circuit breaker.
 //!
-//! Per `docs/proposals/plugin_framework.md` §11.4, plugins that fail
-//! repeatedly in a hot inner loop should fail fast for a cooldown
+//! Plugins that fail repeatedly in a hot inner loop should fail fast for
+//! a cooldown
 //! window rather than produce a deluge of identical errors. This
 //! breaker opens after `N` consecutive failures and stays open for
 //! `cooldown` before testing again.

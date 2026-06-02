@@ -107,8 +107,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// never INSERT (CREATE goes through `write` with `WriteMode::Append`).
     ///
     /// Used by `Writer::flush_stream_l1` when
-    /// `UniConfig::partial_lance_writes` is on. See
-    /// `docs/proposals/partial_lance_writes.md`.
+    /// `UniConfig::partial_lance_writes` is on.
     async fn merge_insert(
         &self,
         _table_name: &str,

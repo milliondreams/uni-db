@@ -13,7 +13,7 @@ lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linal
 # NOTE: SSI/OCC (snapshot-isolation reads, write/read-set conflict detection,
 # serializable MERGE, FOR UPDATE) is no longer a compile-time feature. It is
 # always compiled and toggled at runtime via `UniConfig::ssi_enabled`
-# (default `true`). See `docs/proposals/serializable_snapshot_isolation.md`.
+# (default `true`).
 # Test-only fault injection: activates the `fail::fail_point!` markers placed in
 # the commit path (`commit_transaction_l0`) so crash-recovery tests can simulate
 # a crash at a precise point. No-op and zero-cost unless enabled. The `fail`

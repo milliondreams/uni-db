@@ -27,9 +27,8 @@
 //!
 //! # Stability
 //!
-//! Until uni-plugin reaches `1.0.0` (planned for end of M5 in
-//! `docs/plans/plugin_framework_implementation.md`), trait shapes may change.
-//! The semver guarantees apply only to `0.x` major versions through M5.
+//! Until uni-plugin reaches `1.0.0`, trait shapes may change.
+//! The semver guarantees apply only to `0.x` major versions in the meantime.
 //!
 //! # Examples
 //!
@@ -62,6 +61,7 @@ pub mod capability;
 pub mod circuit_breaker;
 pub mod errors;
 pub mod host;
+pub mod host_services;
 pub mod lifecycle;
 pub mod manifest;
 pub mod observability;
@@ -77,9 +77,13 @@ pub mod traits;
 pub mod verify;
 
 #[doc(inline)]
-pub use crate::capability::{Capability, CapabilitySet, Determinism, Scope, SideEffects};
+pub use crate::capability::{
+    Capability, CapabilitySet, Determinism, ManifestCapability, Scope, SideEffects,
+};
 #[doc(inline)]
 pub use crate::errors::{FnError, PluginError, ReloadError};
+#[doc(inline)]
+pub use crate::host_services::{HttpEgress, HttpResponse, KmsProvider};
 #[doc(inline)]
 pub use crate::manifest::{AbiRange, PluginManifest, ProvidedSurfaces};
 #[doc(inline)]

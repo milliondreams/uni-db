@@ -1,18 +1,17 @@
 //! Manifest signing and hash-pinning verification.
 //!
-//! Per `docs/proposals/plugin_framework.md` §10.3 and
-//! `docs/plans/plugin_framework_implementation.md` §4 M11, production
-//! deployments can require:
+//! Production deployments can require:
 //!
 //! - **Ed25519 signed manifests** — the manifest's `signature` field is
 //!   verified against a trust root (configured per Uni instance).
 //! - **Blake3 hash pinning** — the manifest's `hash` field must match
 //!   a hash recorded at first install; reloads must reproduce.
 //!
-//! M11 scaffolding: this module ships the verification API surface +
-//! a hash-pin verifier that already works. Ed25519 cryptographic
-//! verification arrives behind an `ed25519` Cargo feature in M11
-//! cutover; the surface is in place so callers integrate today.
+//! Ed25519 signature verification is always compiled — it is a security
+//! primitive, so it is deliberately not a build-time opt-out. The signature
+//! covers the whole manifest (see `canonical_payload`), not just the hash
+//! pin, which closes a manifest-substitution attack: rewriting `capabilities`
+//! or `side_effects` while preserving the hash invalidates the signature.
 
 use crate::errors::PluginError;
 use crate::manifest::PluginManifest;
@@ -47,17 +46,22 @@ pub fn verify_hash_pin(manifest: &PluginManifest, payload: &[u8]) -> Result<(), 
 
 /// Verify a manifest's Ed25519 signature against the trust root.
 ///
-/// M11 scaffolding: validates the signature shape and trust-root
-/// membership. Cryptographic verification (the actual `ed25519-dalek`
-/// `verify` call) is enabled behind the `ed25519` feature in M11
-/// cutover. Until then, the function returns `Ok(())` if the signature
-/// shape is well-formed and the key id is in the trust root.
+/// Validates the signature algorithm, confirms the `key_id` is in the trust
+/// root, then cryptographically verifies the signature over the manifest's
+/// `canonical_payload` using the trust-root public key. An unsigned manifest
+/// passes — whether that is acceptable is the caller's policy decision (see
+/// [`verify_manifest_with_policy`]).
+///
+/// The verifier is fail-closed: a `key_id` present in the trust root but
+/// without bound public-key bytes (the [`TrustRoot::allow`] shape-only path) is
+/// rejected rather than waved through.
 ///
 /// # Errors
 ///
-/// Returns [`PluginError::SignatureInvalid`] when the signature's
-/// `algorithm` is not `"ed25519"`, the `key_id` is not in the trust
-/// root, or the cryptographic check fails (post-cutover).
+/// Returns [`PluginError::SignatureInvalid`] when the signature's `algorithm`
+/// is not `"ed25519"`, the `key_id` is not in the trust root, the trust-root
+/// entry has no public-key bytes, the manifest cannot be canonicalized, or the
+/// cryptographic check fails.
 pub fn verify_signed_manifest(
     manifest: &PluginManifest,
     trust_root: &TrustRoot,
@@ -68,6 +72,8 @@ pub fn verify_signed_manifest(
         // doesn't enforce that policy — the caller does.
         return Ok(());
     };
+    // `algorithm` is matched explicitly so the verifier is algorithm-agile:
+    // a future scheme adds an arm here without weakening the ed25519 path.
     if sig.algorithm != "ed25519" {
         return Err(PluginError::SignatureInvalid(format!(
             "unsupported algorithm `{}`",
@@ -80,45 +86,60 @@ pub fn verify_signed_manifest(
             sig.key_id
         )));
     }
-
-    #[cfg(feature = "ed25519")]
-    {
-        let public_key_bytes = trust_root.public_key(&sig.key_id).ok_or_else(|| {
-            PluginError::SignatureInvalid(format!(
-                "trust root for key `{}` has no public key bytes",
-                sig.key_id
-            ))
-        })?;
-        let signing_payload = canonical_payload(manifest);
-        verify_ed25519(public_key_bytes, &signing_payload, &sig.value)?;
-    }
-    // Without the `ed25519` feature, signature shape + trust-root
-    // membership are the verified properties (best-effort surface for
-    // builds that don't pull libsodium-class dependencies).
-    Ok(())
+    let public_key_bytes = trust_root.public_key(&sig.key_id).ok_or_else(|| {
+        PluginError::SignatureInvalid(format!(
+            "trust root for key `{}` has no public key bytes",
+            sig.key_id
+        ))
+    })?;
+    let signing_payload = canonical_payload(manifest)?;
+    verify_ed25519(public_key_bytes, &signing_payload, &sig.value)
 }
 
-/// Canonical signing payload — the manifest's serializable fields concatenated
-/// with the (optional) payload hash. Stable across `serde_json` versions
-/// because we sort keys via the canonical-JSON ordering.
-#[allow(
-    dead_code,
-    reason = "consumed by verify_signed_manifest under the ed25519 feature, and by tests"
-)]
-fn canonical_payload(manifest: &PluginManifest) -> Vec<u8> {
-    // For now, the canonical payload is the manifest's blake3 hash if
-    // present, else the manifest's serialized JSON. The M11 cutover
-    // formalizes this; this shape is sufficient for the round-trip test.
-    let mut bytes = Vec::new();
-    if let Some(h) = manifest.hash.as_ref() {
-        bytes.extend_from_slice(h.as_bytes());
-    } else {
-        let _ = serde_json::to_writer(&mut bytes, manifest);
-    }
-    bytes
+/// Domain-separation tag + format version prefixed to every signing payload.
+///
+/// Binding the signature to a tagged, versioned payload prevents cross-protocol
+/// signature reuse and gives a clean upgrade path: a future `:v2` encoding can
+/// never be confused with a `:v1` one. Changing this value invalidates every
+/// existing signature, so only bump the version suffix when the canonical
+/// encoding below changes.
+const MANIFEST_SIG_DOMAIN_V1: &[u8] = b"uni-plugin-manifest-sig:v1\0";
+
+/// Build the canonical bytes covered by a manifest's Ed25519 signature.
+///
+/// The payload is [`MANIFEST_SIG_DOMAIN_V1`] followed by the manifest
+/// serialized as JSON with its own `signature` field cleared. Clearing the
+/// signature avoids the self-reference paradox (a signature cannot cover
+/// itself), and every other field — `id`, `version`, `abi`, `capabilities`,
+/// `side_effects`, `determinism`, `scope`, `hash`, … — is included, so a
+/// manifest-substitution attack that preserves only the `hash` pin no longer
+/// verifies.
+///
+/// Serialization routes through [`serde_json::Value`] so object keys are
+/// emitted in sorted order independent of struct field declaration order: the
+/// encoding (and therefore existing signatures) stays stable across field
+/// reorderings. Determinism holds because every map in the manifest is a
+/// `BTreeMap` / `BTreeSet` and every list preserves authored order.
+///
+/// # Errors
+///
+/// Returns [`PluginError::SignatureInvalid`] if the manifest cannot be
+/// serialized to JSON (not expected for a well-formed manifest).
+fn canonical_payload(manifest: &PluginManifest) -> Result<Vec<u8>, PluginError> {
+    let mut unsigned = manifest.clone();
+    unsigned.signature = None;
+    let value = serde_json::to_value(&unsigned).map_err(|e| {
+        PluginError::SignatureInvalid(format!("manifest canonicalization failed: {e}"))
+    })?;
+    let json = serde_json::to_vec(&value).map_err(|e| {
+        PluginError::SignatureInvalid(format!("manifest canonicalization failed: {e}"))
+    })?;
+    let mut bytes = Vec::with_capacity(MANIFEST_SIG_DOMAIN_V1.len() + json.len());
+    bytes.extend_from_slice(MANIFEST_SIG_DOMAIN_V1);
+    bytes.extend_from_slice(&json);
+    Ok(bytes)
 }
 
-#[cfg(feature = "ed25519")]
 fn verify_ed25519(
     public_key_bytes: &[u8; 32],
     payload: &[u8],
@@ -344,7 +365,7 @@ mod tests {
         let mut m = empty_manifest();
         m.hash = Some(blake3::hash(b"plugin payload").to_hex().to_string());
 
-        let payload = canonical_payload(&m);
+        let payload = canonical_payload(&m).expect("canonicalize");
         let sig = signing_key.sign(&payload);
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
@@ -357,8 +378,8 @@ mod tests {
         let mut tr = TrustRoot::new();
         tr.allow_with_key("ops@example.com", public_key_bytes);
 
-        // Real cryptographic verification — this passes only if
-        // ed25519 is default-on AND the signature is valid.
+        // Real cryptographic verification — passes only if the signature
+        // is valid over the canonical payload.
         verify_signed_manifest(&m, &tr).expect("real Ed25519 verify must succeed");
 
         // Tampering with the manifest's hash invalidates the signature.
@@ -367,6 +388,70 @@ mod tests {
             verify_signed_manifest(&m, &tr).is_err(),
             "tampered manifest must fail verification"
         );
+    }
+
+    /// Regression for the manifest-substitution attack: the signature must
+    /// cover security-relevant fields, not just the hash pin. Mutating
+    /// `capabilities` while leaving `hash` unchanged must fail verification.
+    /// This is exactly the case the old hash-only payload accepted.
+    #[test]
+    fn verify_rejects_capability_substitution() {
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        // Sign a read-only manifest with a fixed hash pin.
+        let mut m = empty_manifest();
+        m.hash = Some(blake3::hash(b"plugin payload").to_hex().to_string());
+        let payload = canonical_payload(&m).expect("canonicalize");
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        m.signature = Some(ManifestSignature {
+            algorithm: "ed25519".to_owned(),
+            key_id: "ops@example.com".to_owned(),
+            value: sig_b64,
+        });
+
+        let mut tr = TrustRoot::new();
+        tr.allow_with_key("ops@example.com", public_key_bytes);
+        verify_signed_manifest(&m, &tr).expect("baseline signed manifest must verify");
+
+        // Attacker escalates capabilities + side-effects but keeps the hash
+        // pin (and signature) identical. Must now be rejected.
+        m.capabilities.insert(crate::Capability::ProcedureWrites);
+        m.side_effects = SideEffects::Writes;
+        assert!(
+            verify_signed_manifest(&m, &tr).is_err(),
+            "capability substitution under a constant hash must fail verification"
+        );
+    }
+
+    /// Fail-closed: a `key_id` present in the trust root but with no bound
+    /// public-key bytes (the shape-only `allow()` path) must be rejected, not
+    /// waved through.
+    #[test]
+    fn verify_fails_closed_without_public_key_bytes() {
+        let mut m = empty_manifest();
+        m.signature = Some(ManifestSignature {
+            algorithm: "ed25519".to_owned(),
+            key_id: "ops@example.com".to_owned(),
+            value: "AAAA".to_owned(),
+        });
+        let mut tr = TrustRoot::new();
+        tr.allow("ops@example.com"); // membership only, no key bytes
+        match verify_signed_manifest(&m, &tr) {
+            Err(PluginError::SignatureInvalid(msg)) => {
+                assert!(msg.contains("no public key bytes"), "msg: {msg}");
+            }
+            other => panic!("expected fail-closed SignatureInvalid, got {other:?}"),
+        }
     }
 
     #[test]
@@ -437,11 +522,9 @@ mod tests {
     /// payload, populates `TrustRoot` with the public key bytes,
     /// and verifies — proving the M11 cryptographic path works.
     ///
-    /// This test is unconditional (no `#[cfg(feature = "ed25519")]`)
-    /// because it only exercises the round-trip arithmetic; the
-    /// `verify_signed_manifest` *integration* with the feature gate
-    /// is tested via the `signature_verification_requires_trust_root_membership`
-    /// test above (which works regardless of the feature).
+    /// This test exercises the raw `ed25519-dalek` round-trip arithmetic
+    /// directly; the `verify_signed_manifest` integration is covered by
+    /// `verify_signed_manifest_real_ed25519_round_trip` above.
     #[test]
     fn ed25519_sign_and_verify_round_trip_manually() {
         use base64::Engine;
@@ -464,7 +547,7 @@ mod tests {
         m.hash = Some(blake3::hash(b"plugin payload").to_hex().to_string());
 
         // Sign the canonical payload.
-        let payload = canonical_payload(&m);
+        let payload = canonical_payload(&m).expect("canonicalize");
         let sig = signing_key.sign(&payload);
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 

@@ -4,9 +4,6 @@ This module is loaded into an in-process Uni by `Uni::load_python_plugin`.
 The `db` global is the host's decorator sink: every `@db.scalar_fn(...)`
 records a Python callable into the plugin's manifest builder, and the
 loader drains the builder into the host's `PluginRegistry`.
-
-See `docs/proposals/plugin_framework.md` §5.4 for the user-facing
-authoring contract.
 """
 
 import math

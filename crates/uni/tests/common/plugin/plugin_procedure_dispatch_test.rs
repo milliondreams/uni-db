@@ -11,9 +11,8 @@
 //! `ProcedureRegistry::resolve_user_procedure` (the namespace resolver
 //! that maps `uni.X.Y` → `<plugin>.X.Y`).
 //!
-//! Per `docs/plans/plugin_framework_implementation.md` §M4, these are
-//! the canary tests proving the plugin dispatch path works before more
-//! procedures port to the plugin framework.
+//! These are the canary tests proving the plugin dispatch path works
+//! before more procedures port to the plugin framework.
 
 use anyhow::Result;
 use uni_db::Uni;

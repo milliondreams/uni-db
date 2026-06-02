@@ -2,8 +2,6 @@
 // Copyright 2024-2026 Dragonscale Team
 
 //! Phase E acceptance: `FOR UPDATE` pessimistic row locking (SSI escape hatch).
-//!
-//! See `docs/proposals/serializable_snapshot_isolation.md` (Component C5).
 
 use std::sync::Arc;
 use std::time::Duration;

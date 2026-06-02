@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Concurrent fork creation — verification suite E4 from
-//! `docs/proposals/graph_fork_plan.md` §3.4.
+//! Concurrent fork creation — verification suite E4.
 //!
 //! Spec §10 invariant: fork creation does not serialize against
 //! itself (different names) or against primary writes. Threshold:

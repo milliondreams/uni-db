@@ -50,8 +50,7 @@ pub struct WriterConfig {
     /// for the first release; flip to `true` after telemetry on the
     /// issue #72 ingest workload confirms the win.
     ///
-    /// See `docs/proposals/partial_lance_writes.md` and the soundness
-    /// probe at
+    /// See the soundness probe at
     /// `crates/uni-store/tests/common/storage/lance_merge_insert_probe.rs`.
     pub partial_lance_writes: bool,
 }
@@ -173,8 +172,7 @@ pub struct Writer {
     /// semaphore, rotate-order sequence, single-finalizer task, and
     /// pending-flush counter. Always present even when async flush is
     /// disabled — the sync `flush_to_l1` path uses it for the future
-    /// `FlushInProgressGuard`/permit ownership model. See
-    /// `docs/proposals/async_l0_to_l1_flush.md` §3.3.
+    /// `FlushInProgressGuard`/permit ownership model.
     /// Coordinator is `None` when `async_flush_enabled = false`. The
     /// coordinator's finalizer task captures `SharedFlushCtx` which
     /// includes `Arc<StorageManager>`; on a fork-scoped Writer that
@@ -531,9 +529,8 @@ impl Writer {
     /// Returns `(wal_lsn, flush_pending)`. When `flush_pending == true`, the
     /// post-commit `should_flush()` predicate fired but no flush ran — the
     /// caller is expected to spawn a background `flush_to_l1`. This is the
-    /// shape used by `docs/proposals/async_l0_to_l1_flush.md` when
-    /// `UniConfig::async_flush_enabled` is set, so commits don't block on
-    /// L1-streaming I/O.
+    /// shape used when `UniConfig::async_flush_enabled` is set, so commits
+    /// don't block on L1-streaming I/O.
     pub async fn commit_transaction_l0(
         self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
@@ -2203,7 +2200,7 @@ impl Writer {
     /// emits them via Lance `MergeInsertBuilder` against a subset-of-
     /// schema source — preserving untouched columns (e.g., embeddings)
     /// byte-equal in Lance with no read at the caller and no write of
-    /// those columns. See `docs/proposals/partial_lance_writes.md`.
+    /// those columns.
     ///
     /// When the flag is `false`, this falls back to the existing
     /// `insert_vertex_with_labels` path after merging `touched` with
@@ -3192,8 +3189,7 @@ impl Writer {
     /// finalize's job, so the manifest doesn't get published until the
     /// next phase.
     ///
-    /// Today takes `&self`; in a follow-up commit (per
-    /// docs/proposals/async_l0_to_l1_flush.md §6.1(3)) this becomes a
+    /// Today takes `&self`; in a follow-up commit this becomes a
     /// static `Send + 'static` function over `SharedFlushCtx` so it can
     /// run on a spawned task while concurrent commits proceed.
     async fn flush_stream_l1(
@@ -4870,8 +4866,8 @@ mod tests {
         Ok(())
     }
 
-    /// Per docs/proposals/concurrent_writer.md §9.1: the hot-path mutators
-    /// must not write to any `Writer` struct field. Phase 2 of the refactor
+    /// The hot-path mutators must not write to any `Writer` struct field.
+    /// Phase 2 of the refactor
     /// gave them `&self` receivers, which the compiler enforces against
     /// direct `self.x = y` assignment — but interior-mutable writes
     /// (Mutex/Atomic/OnceLock) still compile. This regression test snapshots

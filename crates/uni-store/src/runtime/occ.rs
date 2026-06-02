@@ -8,7 +8,7 @@
 //! Writer's commit-sequence at begin (`L0Buffer::occ_read_seq`); at commit it
 //! checks its write-set (and, under SSI, read-set) against the write-sets of
 //! every transaction that committed since. A conflict aborts the committer with
-//! a retryable error. See `docs/proposals/serializable_snapshot_isolation.md`.
+//! a retryable error.
 
 use std::collections::{HashSet, VecDeque};
 

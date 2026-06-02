@@ -1,7 +1,6 @@
 //! Plugin-export readers — `manifest` and `register`.
 //!
-//! Per `docs/proposals/plugin_framework.md` §5.6 and §6.5, every Extism
-//! plugin exposes two canonical-JSON control-surface exports:
+//! Every Extism plugin exposes two canonical-JSON control-surface exports:
 //!
 //! - **`manifest`** — returns the plugin's [`ExtismPluginManifest`]
 //!   (id, version, declared capabilities, resource limits, …). Read once

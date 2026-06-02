@@ -19,8 +19,7 @@ use crate::host_fns::HostFnRegistry;
 /// Plugin manifest in the Extism plugin's canonical JSON form.
 ///
 /// Returned from the plugin's `manifest` export. Mirrors the shape of
-/// the proposal's §14 manifest, but on the Extism wire — see
-/// `docs/proposals/plugin_framework.md` §6.5.
+/// the §14 manifest, but on the Extism wire.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtismPluginManifest {

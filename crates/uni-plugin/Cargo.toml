@@ -11,8 +11,11 @@ name = "uni-plugin"
 # become arity-overloaded — same QName may register multiple times with
 # distinct positional-argument counts (`procedure_with_arity`,
 # `procedure_overloads`); `AlgoProcedure` grows
-# `execute_with_projection`. See CHANGELOG.md.
-version = "1.8.0"
+# `execute_with_projection`. v1.9.0 removes the `ed25519` Cargo feature:
+# Ed25519 signature verification is now always compiled (security primitive,
+# must not be a build-time opt-out), and the manifest signing payload now
+# covers the whole manifest rather than just its hash pin. See CHANGELOG.md.
+version = "1.9.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -52,21 +55,29 @@ blake3 = "1.5"
 toml = "0.8"
 dashmap = "6.1"
 smallvec = { version = "1.13", features = ["serde"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"], optional = true }
-base64 = { version = "0.21", optional = true }
+# Signed-manifest verification is a security primitive, so ed25519 + base64 are
+# non-optional: a build that could be configured to skip signature verification
+# is a footgun whose failure mode is silent acceptance of forged manifests. The
+# ~2 MB of ed25519-dalek + curve25519-dalek + base64 is negligible next to the
+# DataFusion / Arrow / Lance / wasmtime that uni-db already links.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+base64 = { version = "0.21" }
 # M11: cron-expression parsing for `Schedule::Cron(...)` background jobs.
 # Compute the next fire instant from a cron expression + current time.
 cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# `otel` feature only — the lightweight OTel API + tracing bridge needed to read
+# the current span context. Deliberately NOT the OTLP exporter SDK / tonic:
+# uni-plugin is the low-level ABI crate every loader depends on, so the heavy
+# exporter stack stays in uni-plugin-host behind `init_otel_subscriber`.
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [features]
-default = ["ed25519"]
-# M11: real Ed25519 cryptographic verification of signed plugin manifests.
-# Default-on because plugin loading is a one-time cost where ~200μs
-# verify is negligible. Library embedders who don't need signed-manifest
-# verification can disable to drop the ~2 MB of ed25519-dalek +
-# curve25519-dalek + base64.
-ed25519 = ["dep:ed25519-dalek", "dep:base64"]
+# Real OTel trace-context extraction in `observability::current_trace_context`.
+# Default-off so loaders that never emit OTel spans don't pull the bridge; the
+# host crate turns it on. Without it, `current_trace_context` returns empty.
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -75,3 +86,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 rand = { workspace = true }
 base64 = "0.21"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# For the `otel`-gated positive test: a real (no-exporter) tracer provider so
+# the current span carries a valid SpanContext, plus the registry to install
+# the tracing-opentelemetry layer. Dev-only; not in the production graph.
+opentelemetry_sdk = "0.27"
+tracing-subscriber = { workspace = true }

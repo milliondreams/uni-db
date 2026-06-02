@@ -5,8 +5,7 @@
 //!
 //! Bounds the number of in-flight L0→L1 flushes (via a semaphore),
 //! assigns rotate-order sequence numbers, and serializes finalize so
-//! the manifest parent-chain stays consistent (proposal
-//! `docs/proposals/async_l0_to_l1_flush.md` §5.3).
+//! the manifest parent-chain stays consistent.
 //!
 //! ## Architecture
 //!

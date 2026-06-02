@@ -50,8 +50,7 @@ pub trait CrdtKindProvider: Send + Sync {
     /// metadata (version stamps, replica id widths) should override and
     /// emit a richer compat check.
     ///
-    /// Per `docs/proposals/plugin_framework.md` §11.2.1 a CRDT hot-swap
-    /// requires that bytes produced by the **old** provider's
+    /// A CRDT hot-swap requires that bytes produced by the **old** provider's
     /// `persist()` are still readable by the **new** provider's
     /// `from_persisted()`. Failing this check is a hard reload error.
     ///

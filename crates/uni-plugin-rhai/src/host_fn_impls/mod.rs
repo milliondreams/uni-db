@@ -15,6 +15,17 @@ pub mod kms;
 pub mod net;
 pub mod secret;
 
+/// Build a Rhai runtime error from a message — the loud-failure path shared by
+/// every capability-gated host fn (denied attenuation, missing host service,
+/// or a service-level failure).
+pub(crate) fn rt_err(msg: impl Into<String>) -> Box<rhai::EvalAltResult> {
+    let msg: String = msg.into();
+    Box::new(rhai::EvalAltResult::ErrorRuntime(
+        msg.into(),
+        rhai::Position::NONE,
+    ))
+}
+
 /// Register the default capability-gated host fn surface on a loader.
 ///
 /// Equivalent to calling each module's `register` in sequence. Hosts

@@ -526,7 +526,6 @@ match_clause = { OPTIONAL? ~ MATCH ~ pattern ~ where_clause? ~ for_update_clause
 // token (so `!ident_char` checks the char right after "update", not after
 // trailing whitespace), but is only referenced here — it is not added to the
 // reserved-keyword set, so identifiers named "update" elsewhere are unaffected.
-// See docs/proposals/serializable_snapshot_isolation.md (C5).
 for_update_clause = { FOR ~ UPDATE }
 
 where_clause = { WHERE ~ expression }

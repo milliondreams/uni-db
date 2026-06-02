@@ -5,8 +5,7 @@
 //!
 //! These exercise the lost-update fix directly at the Writer commit boundary
 //! (`commit_transaction_l0`): two transactions that begin with the same read
-//! sequence and write the same vertex must not both commit. See
-//! `docs/proposals/serializable_snapshot_isolation.md` (Component C4, Request 1).
+//! sequence and write the same vertex must not both commit.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -376,7 +376,7 @@ impl Executor {
             // M5h: build a `SessionContext` that includes any
             // plugin-registered optimizer rules. The rule chain is
             // snapshotted at session-construction time; reload discipline
-            // is M10's problem (see `docs/proposals/plugin_framework.md`).
+            // is M10's problem.
             let session = if optimizer_providers.is_empty() {
                 SessionContext::new()
             } else {

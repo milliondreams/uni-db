@@ -313,8 +313,7 @@ impl VertexDataset {
     /// name appears in `touched_keys`. Untouched columns (including
     /// vector embeddings, overflow JSON, ext_id, _labels, _uid,
     /// _created_at) are omitted from the source — Lance leaves their
-    /// target values at the previous version. See
-    /// `docs/proposals/partial_lance_writes.md`.
+    /// target values at the previous version.
     pub fn build_partial_record_batch(
         &self,
         vertices: &[(Vid, Properties)],

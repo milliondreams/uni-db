@@ -23,6 +23,7 @@ pub mod cdc_runtime;
 pub mod commit_result;
 pub mod hooks;
 pub mod host;
+pub mod http_egress;
 pub mod notifications;
 pub mod observability;
 pub mod persistence;

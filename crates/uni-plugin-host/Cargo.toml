@@ -14,8 +14,9 @@ uni-common = { workspace = true }
 uni-query = { workspace = true }
 uni-store = { workspace = true }
 uni-cypher = { workspace = true }
-uni-plugin = { workspace = true }
+uni-plugin = { workspace = true, features = ["otel"] }
 uni-plugin-custom = { workspace = true }
+uni-sidecar = { workspace = true }
 datafusion = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -27,16 +28,17 @@ serde_bytes = "0.11"
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 futures = { workspace = true }
 smol_str = "0.3"
 # observability — OpenTelemetry tracing-subscriber layer + traceparent helpers
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

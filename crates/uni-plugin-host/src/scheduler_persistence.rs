@@ -31,6 +31,7 @@ use uni_plugin::scheduler::{
 use uni_plugin::traits::background::{CancellationToken, Schedule};
 
 use crate::persistence::LazyCypherSink;
+use uni_sidecar::SystemSidecar;
 
 /// JSON-encoded shape of a scheduler job row in the sidecar / system
 /// label. Stable across restarts so the on-disk + on-graph forms are
@@ -61,7 +62,7 @@ fn default_schedule() -> Schedule {
 /// The Cypher mirror is best-effort; failures are logged at debug.
 #[derive(Debug)]
 pub struct SystemLabelSchedulerPersistence {
-    sidecar_path: PathBuf,
+    sidecar: SystemSidecar<Vec<PersistedJob>>,
     write_guard: parking_lot::Mutex<()>,
     cypher_sink: Arc<LazyCypherSink>,
 }
@@ -70,11 +71,8 @@ impl SystemLabelSchedulerPersistence {
     /// Construct rooted at `data_path/_system/background_jobs.json`.
     #[must_use]
     pub fn new(data_path: impl Into<PathBuf>) -> Self {
-        let mut sidecar_path = data_path.into();
-        sidecar_path.push("_system");
-        sidecar_path.push("background_jobs.json");
         Self {
-            sidecar_path,
+            sidecar: SystemSidecar::new(data_path.into(), "background_jobs.json"),
             write_guard: parking_lot::Mutex::new(()),
             cypher_sink: Arc::new(LazyCypherSink::new()),
         }
@@ -88,33 +86,15 @@ impl SystemLabelSchedulerPersistence {
     }
 
     fn read_all(&self) -> Result<Vec<PersistedJob>, SchedulerPersistenceError> {
-        if !self.sidecar_path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = std::fs::read(&self.sidecar_path)
-            .map_err(|e| SchedulerPersistenceError::Backend(format!("read: {e}")))?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| SchedulerPersistenceError::Backend(format!("parse: {e}")))
+        self.sidecar
+            .load()
+            .map_err(|e| SchedulerPersistenceError::Backend(e.to_string()))
     }
 
     fn write_all(&self, rows: &[PersistedJob]) -> Result<(), SchedulerPersistenceError> {
-        if let Some(parent) = self.sidecar_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| SchedulerPersistenceError::Backend(format!("mkdir: {e}")))?;
-        }
-        let json = serde_json::to_vec_pretty(rows)
-            .map_err(|e| SchedulerPersistenceError::Backend(format!("encode: {e}")))?;
-        let tmp = self.sidecar_path.with_extension("tmp");
-        std::fs::write(&tmp, &json)
-            .map_err(|e| SchedulerPersistenceError::Backend(format!("tmp write: {e}")))?;
-        std::fs::rename(&tmp, &self.sidecar_path)
-            .map_err(|e| SchedulerPersistenceError::Backend(format!("rename: {e}")))?;
-        Ok(())
+        self.sidecar
+            .store(&rows.to_vec())
+            .map_err(|e| SchedulerPersistenceError::Backend(e.to_string()))
     }
 
     fn upsert(

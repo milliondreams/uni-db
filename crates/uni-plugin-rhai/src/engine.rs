@@ -67,7 +67,9 @@ pub fn build_engine(effective_caps: &CapabilitySet, host_fns: &RhaiHostFnRegistr
             Some(required) => caps_grant(effective_caps, required),
         };
         if granted {
-            (spec.register)(&mut engine);
+            // Pass the effective set so the registered fn can enforce
+            // call-time attenuation (URL allow-list, key-id match, …).
+            (spec.register)(&mut engine, effective_caps);
         }
     }
 
@@ -150,7 +152,7 @@ mod tests {
                 write: vec![],
             }),
             docs: String::new(),
-            register: Arc::new(|engine: &mut Engine| {
+            register: Arc::new(|engine: &mut Engine, _caps: &CapabilitySet| {
                 engine.register_fn("uni_fs_read", |_path: &str| "ok".to_string());
             }),
         });
@@ -170,7 +172,7 @@ mod tests {
             name: "uni.fs.read".to_owned(),
             required_capability: Some(cap.clone()),
             docs: String::new(),
-            register: Arc::new(|engine: &mut Engine| {
+            register: Arc::new(|engine: &mut Engine, _caps: &CapabilitySet| {
                 engine.register_fn("uni_fs_read", |_path: &str| "ok".to_string());
             }),
         });
@@ -208,7 +210,7 @@ mod tests {
             name: "uni.always".to_owned(),
             required_capability: None,
             docs: String::new(),
-            register: Arc::new(|engine: &mut Engine| {
+            register: Arc::new(|engine: &mut Engine, _caps: &CapabilitySet| {
                 engine.register_fn("uni_always", || 42_i64);
             }),
         });

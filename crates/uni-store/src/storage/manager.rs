@@ -69,7 +69,7 @@ pub struct StorageManager {
     /// Counter of in-flight `flush_to_l1` operations. Compaction skips
     /// delta-clear when this is non-zero to avoid wiping rows a flush is
     /// about to append. Counter (not bool) so multiple async flushes can
-    /// be in flight concurrently (see docs/proposals/async_l0_to_l1_flush.md).
+    /// be in flight concurrently.
     pub flush_in_progress: std::sync::atomic::AtomicUsize,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
@@ -136,8 +136,7 @@ impl Drop for FlushInProgressGuard {
 /// Source `batch` must contain the join columns in `on` plus any
 /// columns to update. Matched rows have `WhenMatched::UpdateAll`
 /// applied; unmatched source rows are dropped (partial writes never
-/// INSERT — see `docs/proposals/partial_lance_writes.md`). Returns
-/// an error if the target table does not exist.
+/// INSERT). Returns an error if the target table does not exist.
 pub async fn merge_insert_batch_with_lance_conflict_retry(
     backend: &dyn crate::backend::StorageBackend,
     table_name: &str,

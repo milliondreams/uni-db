@@ -1,8 +1,6 @@
 //! PyO3 live-callable plugin loader for uni-db.
 //!
-//! Per `docs/proposals/plugin_framework.md` §5.4 and
-//! `docs/plans/plugin_framework_implementation.md` §4 M8, this crate
-//! bridges Python callables held in the host process to the
+//! This crate bridges Python callables held in the host process to the
 //! [`uni_plugin`] trait surfaces. Plugins are **session-scoped by
 //! default** (`Scope::Session`) and run at host process privilege
 //! (**no sandbox**). Capabilities are declared metadata and enforced

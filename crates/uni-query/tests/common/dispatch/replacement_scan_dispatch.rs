@@ -54,8 +54,7 @@ fn replacement_scan_provider_reachable_via_registry() {
 /// Stub `CatalogTable` returned by the label-replacement provider; we
 /// only assert the registry consultation returns this table, not that
 /// the planner wires it into a real plan (that work is deferred —
-/// see the "Batch 3 prerequisite — virtual label-id allocation" note
-/// in `docs/plans/plugin_framework_implementation.md`).
+/// virtual label-id allocation is a prerequisite).
 #[derive(Debug)]
 struct StubCatalogTable;
 

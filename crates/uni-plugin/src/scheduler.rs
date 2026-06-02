@@ -2,8 +2,7 @@
 
 //! Background-job scheduler skeleton.
 //!
-//! Per `docs/plans/plugin_framework_implementation.md` §4 M11, the host
-//! owns a single scheduler that drives every registered
+//! The host owns a single scheduler that drives every registered
 //! [`crate::traits::background::BackgroundJobProvider`]. This module
 //! ships the scheduler's public API + persistent state record + a
 //! `SchedulerPersistence` trait. The host-side Tokio driver

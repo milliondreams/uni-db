@@ -14,8 +14,7 @@
 //! has no `mark_declared_inactive` hook today — it would reject the
 //! second registration with `DuplicateRegistration`, leaving the
 //! declared record `active=true`. Wiring that direction is net-new
-//! infrastructure outside M9 scope (see
-//! `docs/plans/plugin_framework_implementation.md` M9 status block).
+//! infrastructure outside M9 scope (see the M9 status block).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};

@@ -91,8 +91,8 @@ smol_str = "0.3"
 # opt in via `crate::observability::init_otel_subscriber(...)`; nothing
 # is auto-installed (would conflict with embedders' own subscribers).
 tracing-subscriber = { workspace = true }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # Jittered backoff for `Session::transact_with_retry` (api/retry.rs).
@@ -156,8 +156,7 @@ name = "l0_snapshot_bench"
 harness = false
 
 # SSI/OCC performance benches (Phase 5). SSI is always compiled; each bench
-# toggles `UniConfig::ssi_enabled` to compare the on/off arms. See
-# docs/proposals/serializable_snapshot_isolation.md.
+# toggles `UniConfig::ssi_enabled` to compare the on/off arms.
 [[bench]]
 name = "ssi_read_tax"
 harness = false

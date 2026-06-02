@@ -1,9 +1,7 @@
 // Rust guideline compliant
 //! Meta-plugin (`apoc.custom.declare*` analogue) for uni-db.
 //!
-//! Per `docs/proposals/plugin_framework.md` §8 and
-//! `docs/plans/plugin_framework_implementation.md` §4 M9, this crate
-//! ships a built-in plugin whose procedures (`uni.plugin.declareFunction`,
+//! This crate ships a built-in plugin whose procedures (`uni.plugin.declareFunction`,
 //! `declareProcedure`, `declareAggregate`, `declareTrigger`) accept
 //! Cypher source and persist new plugin registrations alongside the
 //! framework's [`uni_plugin::PluginRegistry`].

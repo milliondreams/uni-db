@@ -1,8 +1,6 @@
 //! Plugin lifecycle state machine.
 //!
-//! Per `docs/proposals/plugin_framework.md` §11.1 and
-//! `docs/plans/plugin_framework_implementation.md` §4 M10, each plugin
-//! moves through a defined lifecycle:
+//! Each plugin moves through a defined lifecycle:
 //!
 //! ```text
 //!   Loaded → Linked → Initialized → Active → Draining → Removed

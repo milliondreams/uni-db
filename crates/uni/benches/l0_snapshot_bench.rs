@@ -1,7 +1,7 @@
 //! Decision-driving microbenchmark for L0 snapshot-isolation strategies.
 //!
-//! The SSI/OCC proposal (`docs/proposals/serializable_snapshot_isolation.md`)
-//! needs reads to pin a consistent snapshot of the `L0Buffer`. The open question
+//! The SSI/OCC design needs reads to pin a consistent snapshot of the
+//! `L0Buffer`. The open question
 //! this bench answers: is a per-transaction snapshot affordable as a plain deep
 //! clone, or must it use structural sharing? See the plan
 //! `~/.claude/plans/plaan-the-prototype-phaase-tranquil-badger.md`.

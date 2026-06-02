@@ -1,8 +1,8 @@
 //! APOC-equivalent procedure registrations.
 //!
-//! Per the `docs/proposals/plugin_framework.md` APOC parity matrix, this
-//! module hosts the Rust-implemented `apoc.*` analogues. Each submodule
-//! covers one APOC namespace.
+//! Following the APOC parity matrix, this module hosts the
+//! Rust-implemented `apoc.*` analogues. Each submodule covers one APOC
+//! namespace.
 //!
 //! Currently shipped:
 //! - [`bitwise`] — `apoc.bitwise.*` analogue (and/or/xor/not/shiftLeft/shiftRight).

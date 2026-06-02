@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Concurrent-mutation benchmark for the writer-RwLock removal
-//! (docs/proposals/concurrent_writer.md §9.2).
+//! Concurrent-mutation benchmark for the writer-RwLock removal.
 //!
 //! Spawns `N` tokio tasks, each running 100 trivial `CREATE` statements
 //! through its own `Session`/`Transaction`. The wall time at `N=24` versus

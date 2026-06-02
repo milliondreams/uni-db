@@ -23,13 +23,13 @@
 //! cutover to `_DeclaredPlugin` (when write-enabled host execution
 //! lands) is a drop-in `impl Persistence for SystemLabelPersistence`.
 
-use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uni_sidecar::{SidecarIoError, SystemSidecar};
 
 use crate::DeclaredPlugin;
 
@@ -44,6 +44,14 @@ pub enum PersistenceError {
     /// JSON encode / decode failure.
     #[error("persistence serde: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+impl From<SidecarIoError> for PersistenceError {
+    fn from(e: SidecarIoError) -> Self {
+        // The sidecar's variants already carry path + cause in their Display;
+        // fold them into the I/O arm (the message preserves the detail).
+        PersistenceError::Io(io::Error::other(e.to_string()))
+    }
 }
 
 /// A persistence backend for declared-plugin records.
@@ -123,77 +131,53 @@ impl Persistence for NullPersistence {
 /// §9.7) leaves this struct unchanged — the wire schema is identical.
 #[derive(Debug)]
 pub struct JsonFilePersistence {
-    path: PathBuf,
+    /// Atomic JSON IO (temp + fsync + rename + parent-dir fsync), shared with
+    /// the `uni-plugin-host` persisters via [`uni_sidecar`].
+    sidecar: SystemSidecar<Vec<DeclaredPlugin>>,
+    /// Serializes the read-modify-write in `save` / `delete`.
     write_guard: Mutex<()>,
 }
 
 impl JsonFilePersistence {
-    /// Construct a persistence backend rooted at `path`.
+    /// Construct a persistence backend at the exact `path`.
     ///
     /// The file is created on first write. If it does not exist at
-    /// construction time, [`Self::load_all`] returns an empty vector.
+    /// construction time, [`Self::load_all`] returns an empty vector. The path
+    /// is used verbatim (via [`SystemSidecar::at_path`]) so existing
+    /// `declared_plugins.json` files keep loading across an upgrade.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path,
+            sidecar: SystemSidecar::at_path(path),
             write_guard: Mutex::new(()),
         }
-    }
-
-    /// Read the sidecar into a vector.
-    fn read_all_unlocked(&self) -> Result<Vec<DeclaredPlugin>, PersistenceError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = fs::read(&self.path)?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let plugins: Vec<DeclaredPlugin> = serde_json::from_slice(&bytes)?;
-        Ok(plugins)
-    }
-
-    /// Write the vector back to disk atomically (write-then-rename).
-    fn write_all_unlocked(&self, plugins: &[DeclaredPlugin]) -> Result<(), PersistenceError> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_vec_pretty(plugins)?;
-        let tmp = self.path.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&json)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
     }
 }
 
 impl Persistence for JsonFilePersistence {
     fn save(&self, plugin: &DeclaredPlugin) -> Result<(), PersistenceError> {
         let _guard = self.write_guard.lock().expect("persistence mutex poisoned");
-        let mut plugins = self.read_all_unlocked()?;
+        let mut plugins = self.sidecar.load()?;
         if let Some(slot) = plugins.iter_mut().find(|p| p.qname == plugin.qname) {
             *slot = plugin.clone();
         } else {
             plugins.push(plugin.clone());
         }
-        self.write_all_unlocked(&plugins)
+        self.sidecar.store(&plugins)?;
+        Ok(())
     }
 
     fn delete(&self, qname: &str) -> Result<(), PersistenceError> {
         let _guard = self.write_guard.lock().expect("persistence mutex poisoned");
-        let mut plugins = self.read_all_unlocked()?;
+        let mut plugins = self.sidecar.load()?;
         plugins.retain(|p| p.qname != qname);
-        self.write_all_unlocked(&plugins)
+        self.sidecar.store(&plugins)?;
+        Ok(())
     }
 
     fn load_all(&self) -> Result<Vec<DeclaredPlugin>, PersistenceError> {
         let _guard = self.write_guard.lock().expect("persistence mutex poisoned");
-        self.read_all_unlocked()
+        Ok(self.sidecar.load()?)
     }
 }
 

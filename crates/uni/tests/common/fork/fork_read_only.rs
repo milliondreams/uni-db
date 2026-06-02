@@ -3,8 +3,7 @@
 
 //! End-to-end Phase 1 fork tests through the public `Session::fork` API.
 //!
-//! Covers the Phase 1 exit criteria from
-//! `docs/proposals/graph_fork_plan.md`:
+//! Covers the Phase 1 exit criteria:
 //! - Read-only forks survive restart
 //! - Primary writes after fork creation are invisible to the fork
 //! - `forked.tx()` rejects with the typed error variant

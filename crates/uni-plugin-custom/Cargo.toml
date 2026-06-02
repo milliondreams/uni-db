@@ -15,6 +15,7 @@ categories = ["database"]
 uni-plugin = { workspace = true }
 uni-cypher = { workspace = true }
 uni-common = { workspace = true }
+uni-sidecar = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

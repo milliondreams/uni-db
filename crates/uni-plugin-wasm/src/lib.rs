@@ -1,8 +1,7 @@
 //! WASM Component Model loader for the uni-db plugin framework.
 //!
 //! `uni-plugin-wasm` provides the host-side machinery to load WASM
-//! plugins built against the `uni:plugin` WIT worlds. Per
-//! `docs/proposals/plugin_framework.md` §6, the boundary uses:
+//! plugins built against the `uni:plugin` WIT worlds. The boundary uses:
 //!
 //! - **WIT-typed contracts** for each plugin kind (scalar, aggregate,
 //!   procedure, locy-agg, hook, storage, …) — typed exports + capability-

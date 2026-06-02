@@ -8,7 +8,7 @@
 //! writer-level simulations in `uni-store`. They cover the two wishlist
 //! acceptance repros (atomic increment, serializable MERGE), the bounded-retry
 //! helper, and read-write antidependency detection across the scan and traversal
-//! read paths. See `docs/proposals/serializable_snapshot_isolation.md` (§10).
+//! read paths.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

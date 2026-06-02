@@ -15,11 +15,15 @@
 
 use std::sync::Arc;
 
-use uni_plugin::{Capability, CapabilitySet, PluginError, PluginId, PluginRegistrar, QName};
+use uni_plugin::{
+    Capability, CapabilitySet, HttpEgress, KmsProvider, PluginError, PluginId, PluginRegistrar,
+    QName,
+};
 
 use arrow_schema::Field;
 
 use uni_plugin::capability::SideEffects;
+use uni_plugin::secrets::SecretStore;
 use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
 
 use crate::adapter::RhaiScalarFn;
@@ -63,6 +67,13 @@ pub struct LoadOutcome {
 #[derive(Default, Clone)]
 pub struct RhaiLoader {
     host_fns: RhaiHostFnRegistry,
+    /// Optional KMS provider backing `uni.kms.*`. Absent → those fns error
+    /// loudly at call time ("no KMS provider configured").
+    kms: Option<Arc<dyn KmsProvider>>,
+    /// Optional secret store backing `uni.secret.acquire`.
+    secrets: Option<Arc<SecretStore>>,
+    /// Optional HTTP egress backing `uni.http.*`.
+    http: Option<Arc<dyn HttpEgress>>,
 }
 
 impl std::fmt::Debug for RhaiLoader {
@@ -96,6 +107,45 @@ impl RhaiLoader {
     #[must_use]
     pub fn host_fn_count(&self) -> usize {
         self.host_fns.len()
+    }
+
+    /// Attach a KMS provider backing `uni.kms.*` (builder style).
+    #[must_use]
+    pub fn with_kms(mut self, kms: Arc<dyn KmsProvider>) -> Self {
+        self.kms = Some(kms);
+        self
+    }
+
+    /// Attach a secret store backing `uni.secret.acquire` (builder style).
+    #[must_use]
+    pub fn with_secret_store(mut self, store: Arc<SecretStore>) -> Self {
+        self.secrets = Some(store);
+        self
+    }
+
+    /// Attach an HTTP egress backing `uni.http.*` (builder style).
+    #[must_use]
+    pub fn with_http(mut self, http: Arc<dyn HttpEgress>) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// Clone of the configured KMS provider handle, if any.
+    #[must_use]
+    pub fn kms(&self) -> Option<Arc<dyn KmsProvider>> {
+        self.kms.clone()
+    }
+
+    /// Clone of the configured secret store handle, if any.
+    #[must_use]
+    pub fn secret_store(&self) -> Option<Arc<SecretStore>> {
+        self.secrets.clone()
+    }
+
+    /// Clone of the configured HTTP egress handle, if any.
+    #[must_use]
+    pub fn http(&self) -> Option<Arc<dyn HttpEgress>> {
+        self.http.clone()
     }
 
     /// Load a Rhai script into a `PluginRegistrar`.

@@ -7,8 +7,7 @@
 //! enforced-denial path ("principal lacks `Capability::ProcedureWrites`
 //! → declareProcedure denied") needs Principal-side infrastructure
 //! that does not exist; that lane is **outside M9 scope** (the same
-//! constraint is noted in the M9 status block in
-//! `docs/plans/plugin_framework_implementation.md`).
+//! constraint is noted in the M9 status block).
 //!
 //! What M9 actually delivers is the *snapshot*: the declaring
 //! principal's `id` is recorded in `DeclaredPlugin.declared_by` so

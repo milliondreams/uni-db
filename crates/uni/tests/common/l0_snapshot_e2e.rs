@@ -6,8 +6,7 @@
 //! A read-write transaction pins an L0 snapshot at begin; its reads see that
 //! frozen view for its lifetime, isolated from concurrent commits (lazy
 //! clone-on-freeze in `commit_transaction_l0`). Read-your-writes is preserved
-//! because the transaction's private `tx_l0` stays live over the snapshot. See
-//! `docs/proposals/serializable_snapshot_isolation.md` (Component C1 / item F).
+//! because the transaction's private `tx_l0` stays live over the snapshot.
 //!
 //! SSI is always compiled and `UniConfig::ssi_enabled` defaults on, so these
 //! run unconditionally.

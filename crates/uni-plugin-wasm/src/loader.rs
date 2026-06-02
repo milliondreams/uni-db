@@ -490,103 +490,83 @@ impl WasmLoader {
             r
         };
 
-        let mut scalars_registered: Vec<String> = Vec::new();
-        let mut aggregates_registered: Vec<String> = Vec::new();
-        let mut procedures_registered: Vec<String> = Vec::new();
-        let mut agg_pool: Option<Arc<WasmInstancePool<AggregatePluginInstance>>> = None;
-        let mut proc_pool: Option<Arc<WasmInstancePool<ProcedurePluginInstance>>> = None;
-
-        for entry in registration.entries {
-            match entry {
-                RegistrationEntry::Scalar { qname, signature } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}"))
-                    })?;
-                    let sig = wire_fn_sig_to_internal(&signature)?;
-                    let adapter = Arc::new(ComponentScalarFn::new(
-                        Arc::clone(&pool),
-                        parsed_qname.clone(),
-                        sig.clone(),
-                    ));
-                    registrar
-                        .scalar_fn(parsed_qname, sig, adapter)
-                        .map_err(|e| {
-                            WasmError::Internal(format!("registrar.scalar_fn `{qname}`: {e}"))
-                        })?;
-                    scalars_registered.push(qname);
-                }
-                RegistrationEntry::Aggregate {
-                    qname,
-                    signature,
-                    state,
-                } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}"))
-                    })?;
-                    let sig = wire_agg_sig_to_internal(&signature, &state)?;
-                    let pool_ref = match &agg_pool {
-                        Some(p) => Arc::clone(p),
-                        None => {
-                            let p = build_aggregate_pool(bytes, &prepared)?;
-                            agg_pool = Some(Arc::clone(&p));
-                            p
-                        }
-                    };
-                    let adapter = Arc::new(ComponentAggregateFn::new(
-                        pool_ref,
-                        parsed_qname.clone(),
-                        sig.clone(),
-                    ));
-                    registrar
-                        .aggregate_fn(parsed_qname, sig, adapter)
-                        .map_err(|e| {
-                            WasmError::Internal(format!("registrar.aggregate_fn `{qname}`: {e}"))
-                        })?;
-                    aggregates_registered.push(qname);
-                }
-                RegistrationEntry::Procedure {
-                    qname,
-                    args,
-                    yields,
-                    mode,
-                } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}"))
-                    })?;
-                    let sig = wire_proc_sig_to_internal(&args, &yields, &mode)?;
-                    let pool_ref = match &proc_pool {
-                        Some(p) => Arc::clone(p),
-                        None => {
-                            let p = build_procedure_pool(bytes, &prepared)?;
-                            proc_pool = Some(Arc::clone(&p));
-                            p
-                        }
-                    };
-                    let adapter = Arc::new(ComponentProcedure::new(
-                        pool_ref,
-                        parsed_qname.clone(),
-                        sig.clone(),
-                    ));
-                    registrar
-                        .procedure(parsed_qname, sig, adapter)
-                        .map_err(|e| {
-                            WasmError::Internal(format!("registrar.procedure `{qname}`: {e}"))
-                        })?;
-                    procedures_registered.push(qname);
-                }
-            }
-        }
+        let names = apply_registration(bytes, &prepared, &pool, registration, registrar)?;
 
         Ok(LoadOutcome {
             plugin_id: prepared.manifest.id.clone(),
             version: prepared.manifest.version.clone(),
             effective_capabilities: prepared.effective_capabilities,
             denied_capabilities: prepared.denied_capabilities,
-            scalars_registered,
-            aggregates_registered,
-            procedures_registered,
+            scalars_registered: names.scalars,
+            aggregates_registered: names.aggregates,
+            procedures_registered: names.procedures,
             pool,
         })
+    }
+
+    /// Load a component and present it as a [`uni_plugin::Plugin`].
+    ///
+    /// Unlike [`Self::load`] — which registers adapters directly into a
+    /// caller-supplied registrar — this returns a self-contained `Plugin`
+    /// whose [`uni_plugin::Plugin::manifest`] is synthesized from the
+    /// component's manifest and whose [`uni_plugin::Plugin::register`] replays
+    /// the component's `register` entries. It is the bridge the conformance
+    /// harness (`uni_plugin_conformance::WasmConformanceLoader`) needs to run
+    /// the same probe suite against a real component as against a live-Rust
+    /// plugin.
+    ///
+    /// The returned plugin owns the warm scalar pool plus the component bytes
+    /// and negotiated capabilities, so `register` can rebuild
+    /// aggregate/procedure pools and is safely re-runnable (the conformance
+    /// idempotency probe registers twice).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load`] — manifest / register parse + instantiation failures,
+    /// plus [`WasmError::InvalidWasm`] if the manifest version is not semver.
+    pub fn load_as_plugin(
+        &self,
+        bytes: &[u8],
+        host_grants: &[String],
+    ) -> Result<Box<dyn uni_plugin::Plugin + Send + Sync>, WasmError> {
+        // Pass 1 — instantiate with no caps to read the manifest export.
+        let bootstrap = PreparedComponent {
+            manifest: ComponentManifest {
+                id: String::new(),
+                version: String::new(),
+                abi: None,
+                capabilities: Vec::new(),
+                determinism: None,
+                description: None,
+                fuel_per_call: None,
+                memory_max_pages: None,
+                timeout_ms: None,
+            },
+            effective_capabilities: Vec::new(),
+            denied_capabilities: Vec::new(),
+        };
+        let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
+        let parsed_manifest = bootstrap_inst.read_manifest()?;
+        drop(bootstrap_inst);
+
+        // Pass 2 — intersect caps, build the scalar pool, read register.
+        let prepared = self.prepare_parsed(parsed_manifest, host_grants);
+        let scalar_pool = build_scalar_pool(bytes, &prepared)?;
+        let registration = {
+            let mut leased = crate::pool::PooledInstance::acquire(Arc::clone(&scalar_pool))
+                .map_err(|e| WasmError::Instantiate(format!("acquire warm instance: {e}")))?;
+            let r = leased.get_mut().read_register()?;
+            drop(leased);
+            r
+        };
+        let manifest = synthesize_plugin_manifest(&prepared.manifest, &registration)?;
+        Ok(Box::new(ComponentPlugin {
+            manifest,
+            bytes: bytes.to_vec(),
+            prepared,
+            scalar_pool,
+            registration,
+        }))
     }
 }
 
@@ -737,6 +717,242 @@ where
 
     let pool = WasmInstancePool::new(crate::pool::PoolConfig::default(), factory)?;
     Ok(Arc::new(pool))
+}
+
+/// Qnames registered by [`apply_registration`], grouped by surface.
+struct RegisteredQNames {
+    scalars: Vec<String>,
+    aggregates: Vec<String>,
+    procedures: Vec<String>,
+}
+
+/// Replay a parsed `register` manifest into `registrar`.
+///
+/// Constructs one adapter per entry from `scalar_pool` and from
+/// aggregate/procedure pools built lazily from `bytes` + `prepared`. Shared by
+/// [`WasmLoader::load`] and [`ComponentPlugin::register`] so both register
+/// identically — no probe behaves differently against the two paths.
+fn apply_registration(
+    bytes: &[u8],
+    prepared: &PreparedComponent,
+    scalar_pool: &Arc<WasmInstancePool<ScalarPluginInstance>>,
+    registration: RegistrationManifest,
+    registrar: &mut uni_plugin::PluginRegistrar<'_>,
+) -> Result<RegisteredQNames, WasmError> {
+    let mut scalars = Vec::new();
+    let mut aggregates = Vec::new();
+    let mut procedures = Vec::new();
+    let mut agg_pool: Option<Arc<WasmInstancePool<AggregatePluginInstance>>> = None;
+    let mut proc_pool: Option<Arc<WasmInstancePool<ProcedurePluginInstance>>> = None;
+
+    for entry in registration.entries {
+        match entry {
+            RegistrationEntry::Scalar { qname, signature } => {
+                let parsed_qname = uni_plugin::QName::parse(&qname)
+                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let sig = wire_fn_sig_to_internal(&signature)?;
+                let adapter = Arc::new(ComponentScalarFn::new(
+                    Arc::clone(scalar_pool),
+                    parsed_qname.clone(),
+                    sig.clone(),
+                ));
+                registrar
+                    .scalar_fn(parsed_qname, sig, adapter)
+                    .map_err(|e| {
+                        WasmError::Internal(format!("registrar.scalar_fn `{qname}`: {e}"))
+                    })?;
+                scalars.push(qname);
+            }
+            RegistrationEntry::Aggregate {
+                qname,
+                signature,
+                state,
+            } => {
+                let parsed_qname = uni_plugin::QName::parse(&qname)
+                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let sig = wire_agg_sig_to_internal(&signature, &state)?;
+                let pool_ref = match &agg_pool {
+                    Some(p) => Arc::clone(p),
+                    None => {
+                        let p = build_aggregate_pool(bytes, prepared)?;
+                        agg_pool = Some(Arc::clone(&p));
+                        p
+                    }
+                };
+                let adapter = Arc::new(ComponentAggregateFn::new(
+                    pool_ref,
+                    parsed_qname.clone(),
+                    sig.clone(),
+                ));
+                registrar
+                    .aggregate_fn(parsed_qname, sig, adapter)
+                    .map_err(|e| {
+                        WasmError::Internal(format!("registrar.aggregate_fn `{qname}`: {e}"))
+                    })?;
+                aggregates.push(qname);
+            }
+            RegistrationEntry::Procedure {
+                qname,
+                args,
+                yields,
+                mode,
+            } => {
+                let parsed_qname = uni_plugin::QName::parse(&qname)
+                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let sig = wire_proc_sig_to_internal(&args, &yields, &mode)?;
+                let pool_ref = match &proc_pool {
+                    Some(p) => Arc::clone(p),
+                    None => {
+                        let p = build_procedure_pool(bytes, prepared)?;
+                        proc_pool = Some(Arc::clone(&p));
+                        p
+                    }
+                };
+                let adapter = Arc::new(ComponentProcedure::new(
+                    pool_ref,
+                    parsed_qname.clone(),
+                    sig.clone(),
+                ));
+                registrar
+                    .procedure(parsed_qname, sig, adapter)
+                    .map_err(|e| {
+                        WasmError::Internal(format!("registrar.procedure `{qname}`: {e}"))
+                    })?;
+                procedures.push(qname);
+            }
+        }
+    }
+
+    Ok(RegisteredQNames {
+        scalars,
+        aggregates,
+        procedures,
+    })
+}
+
+/// Synthesize a [`uni_plugin::PluginManifest`] from a component manifest.
+///
+/// The declared `CapabilitySet` includes the extension capabilities implied by
+/// the `register` entries (`Capability::ScalarFn` for a scalar, etc.), so a
+/// registrar built from this manifest permits exactly the registrations the
+/// component will perform — which is what the conformance registration probes
+/// rely on. ABI defaults to `^1` when the component omits it.
+///
+/// # Errors
+///
+/// Returns [`WasmError::InvalidWasm`] if the version is not valid semver or the
+/// ABI range is malformed.
+fn synthesize_plugin_manifest(
+    component: &ComponentManifest,
+    registration: &RegistrationManifest,
+) -> Result<uni_plugin::PluginManifest, WasmError> {
+    use uni_plugin::{
+        AbiRange, Capability, CapabilitySet, Determinism, PluginId, ProvidedSurfaces, Scope,
+        SideEffects,
+    };
+
+    let version = semver::Version::parse(&component.version).map_err(|e| {
+        WasmError::InvalidWasm(format!("manifest version `{}`: {e}", component.version))
+    })?;
+    let abi = AbiRange::parse(component.abi.as_deref().unwrap_or("^1"))
+        .map_err(|e| WasmError::InvalidWasm(format!("manifest abi: {e}")))?;
+
+    let mut capabilities = CapabilitySet::new();
+    let mut side_effects = SideEffects::ReadOnly;
+    for entry in &registration.entries {
+        match entry {
+            RegistrationEntry::Scalar { .. } => {
+                capabilities.insert(Capability::ScalarFn);
+            }
+            RegistrationEntry::Aggregate { .. } => {
+                capabilities.insert(Capability::AggregateFn);
+            }
+            RegistrationEntry::Procedure { mode, .. } => {
+                capabilities.insert(Capability::Procedure);
+                match mode.as_str() {
+                    "write" => {
+                        capabilities.insert(Capability::ProcedureWrites);
+                        side_effects = SideEffects::Writes;
+                    }
+                    "schema" => {
+                        capabilities.insert(Capability::ProcedureSchema);
+                        side_effects = SideEffects::Writes;
+                    }
+                    "dbms" => {
+                        capabilities.insert(Capability::ProcedureDbms);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let determinism = match component.determinism.as_deref() {
+        Some("pure") => Determinism::Pure,
+        Some("session-scoped" | "session_scoped") => Determinism::SessionScoped,
+        _ => Determinism::Nondeterministic,
+    };
+
+    Ok(uni_plugin::PluginManifest {
+        id: PluginId::new(component.id.clone()),
+        version,
+        abi,
+        depends_on: Vec::new(),
+        capabilities,
+        determinism,
+        side_effects,
+        scope: Scope::Instance,
+        hash: None,
+        signature: None,
+        provides: ProvidedSurfaces::default(),
+        docs: component.description.clone().unwrap_or_default(),
+        metadata: std::collections::BTreeMap::new(),
+    })
+}
+
+/// A loaded WASM component presented as a [`uni_plugin::Plugin`].
+///
+/// Produced by [`WasmLoader::load_as_plugin`]. Holds the warm scalar pool plus
+/// the component bytes and negotiated capabilities so its `register` impl can
+/// rebuild aggregate/procedure pools and replay registration on each call.
+pub struct ComponentPlugin {
+    manifest: uni_plugin::PluginManifest,
+    bytes: Vec<u8>,
+    prepared: PreparedComponent,
+    scalar_pool: Arc<WasmInstancePool<ScalarPluginInstance>>,
+    registration: RegistrationManifest,
+}
+
+impl std::fmt::Debug for ComponentPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComponentPlugin")
+            .field("id", &self.manifest.id.as_str())
+            .field("scalars", &self.registration.entries.len())
+            .finish()
+    }
+}
+
+impl uni_plugin::Plugin for ComponentPlugin {
+    fn manifest(&self) -> &uni_plugin::PluginManifest {
+        &self.manifest
+    }
+
+    fn register(
+        &self,
+        r: &mut uni_plugin::PluginRegistrar<'_>,
+    ) -> Result<(), uni_plugin::PluginError> {
+        apply_registration(
+            &self.bytes,
+            &self.prepared,
+            &self.scalar_pool,
+            self.registration.clone(),
+            r,
+        )
+        .map_err(|e| {
+            uni_plugin::PluginError::WasmInstantiate(format!("component register: {e}"))
+        })?;
+        Ok(())
+    }
 }
 
 fn build_scalar_pool(

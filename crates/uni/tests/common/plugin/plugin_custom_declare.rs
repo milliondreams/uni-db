@@ -1,9 +1,8 @@
 #![allow(dead_code, unused_imports, clippy::all)]
 // Rust guideline compliant
-//! M9 — end-to-end test for `uni.plugin.declareFunction`.
+//! End-to-end test for `uni.plugin.declareFunction`.
 //!
-//! Exercises the acceptance criterion from
-//! `docs/plans/plugin_framework_implementation.md` §4 M9:
+//! Exercises the acceptance criterion:
 //!
 //! 1. `CALL uni.plugin.declareFunction(...)` accepts a Cypher
 //!    expression body and registers a new scalar function.

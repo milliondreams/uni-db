@@ -21,13 +21,17 @@ use uni_plugin::Capability;
 
 /// Type-erased registrar closure invoked at engine-construction time.
 ///
-/// Each closure receives a mutable `rhai::Engine` and registers one or
-/// more host functions on it via `Engine::register_fn`. The closure is
-/// only invoked when the host fn's required capability is in the plugin's
-/// effective grant set — ungranted fns are never registered, achieving
-/// Engine-import absence.
+/// Each closure receives a mutable `rhai::Engine` and the plugin's effective
+/// [`uni_plugin::CapabilitySet`], then registers one or more host functions via
+/// `Engine::register_fn`. The closure is only invoked when the host fn's
+/// required capability is in the effective set — ungranted fns are never
+/// registered (layer-2, Engine-import absence). The capability set is passed in
+/// so a registered fn can additionally enforce **call-time attenuation**
+/// (layer 3): e.g. matching a requested URL against a granted
+/// `Network { allow }` allow-list, or a key id against `Kms { key_ids }`.
 #[cfg(feature = "rhai-runtime")]
-pub type RhaiHostFnRegister = Arc<dyn Fn(&mut rhai::Engine) + Send + Sync + 'static>;
+pub type RhaiHostFnRegister =
+    Arc<dyn Fn(&mut rhai::Engine, &uni_plugin::CapabilitySet) + Send + Sync + 'static>;
 
 #[cfg(not(feature = "rhai-runtime"))]
 pub type RhaiHostFnRegister = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -130,7 +134,7 @@ mod tests {
                 write: vec![],
             }),
             docs: "Read a file from the host filesystem.".to_owned(),
-            register: Arc::new(|_engine| { /* stub */ }),
+            register: Arc::new(|_engine, _caps| { /* stub */ }),
         });
         let spec = r.get("uni.fs.read").expect("registered");
         assert!(spec.required_capability.is_some());
@@ -145,7 +149,7 @@ mod tests {
             name: "uni.log".to_owned(),
             required_capability: None,
             docs: "Emit a tracing event.".to_owned(),
-            register: Arc::new(|_engine| {}),
+            register: Arc::new(|_engine, _caps| {}),
         });
         let spec = r.get("uni.log").expect("registered");
         assert!(spec.required_capability.is_none());

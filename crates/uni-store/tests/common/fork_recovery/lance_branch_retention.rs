@@ -6,8 +6,7 @@
 //! Spec §10 invariant: "Primary compaction doesn't break forks
 //! (retention honors branch references)." This is the single most
 //! important guarantee in the storage substrate; if it fails,
-//! Phase 1 stops (per the kill-switch in
-//! `docs/proposals/graph_fork_plan.md` §3.1).
+//! Phase 1 stops.
 //!
 //! Method: write rows on primary, branch off, write more rows on
 //! primary, force `cleanup_old_versions` with a zero-duration

@@ -5,8 +5,6 @@
 //! `uni-plugin-wasm` (Component Model WIT) but takes a fundamentally
 //! different shape: there is no WASM wrapper, no IPC, no instance pool —
 //! the Rhai [`rhai::Engine`] is embedded directly in the host process.
-//! See `docs/proposals/plugin_framework.md` §5.6 for the rationale and
-//! design.
 //!
 //! # Why Rhai
 //!
@@ -36,9 +34,9 @@
 //!
 //! # Crate status
 //!
-//! Implemented in phases per `docs/plans/plugin_framework_implementation.md`
-//! §M7. Phase 1 (this) ships the crate scaffold; phases 2+ wire the
-//! Engine factory, manifest parser, adapters, and `Uni::load_rhai_plugin`.
+//! Implemented in phases. Phase 1 (this) ships the crate scaffold;
+//! phases 2+ wire the Engine factory, manifest parser, adapters, and
+//! `Uni::load_rhai_plugin`.
 
 // Rust guideline compliant
 #![warn(missing_docs)]

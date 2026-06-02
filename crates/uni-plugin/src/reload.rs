@@ -8,8 +8,7 @@
 //!
 //! The dispatcher's job is to run the per-kind handoff each surface
 //! needs **before** committing the new plugin's registrations. The
-//! handoffs are spelled out in `docs/proposals/plugin_framework.md`
-//! §11.2.1:
+//! handoffs are spelled out below:
 //!
 //! | Surface                 | Discipline                                         |
 //! |-------------------------|----------------------------------------------------|

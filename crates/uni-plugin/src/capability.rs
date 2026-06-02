@@ -34,31 +34,40 @@ pub enum Capability {
     // ---- Host import surfaces (capability-gated host functions) ----
     /// HTTP / TCP egress; allow-list of URI patterns.
     Network {
-        /// Glob patterns of permitted URIs (`https://api.example/**`).
+        /// Glob patterns of permitted URIs (`https://api.example/**`). Defaults
+        /// to empty (deny-all) so a bare `"network"` declaration grants no
+        /// egress until patterns are specified.
+        #[serde(default)]
         allow: Vec<SmolStr>,
     },
     /// Filesystem read / write access with per-direction path patterns.
     Filesystem {
-        /// Glob patterns of readable paths.
+        /// Glob patterns of readable paths (empty = deny-all).
+        #[serde(default)]
         read: Vec<SmolStr>,
-        /// Glob patterns of writable paths.
+        /// Glob patterns of writable paths (empty = deny-all).
+        #[serde(default)]
         write: Vec<SmolStr>,
     },
     /// Invoking Cypher / Locy queries back into the host session.
     HostQuery {
         /// If `true`, only read queries are permitted.
+        #[serde(default)]
         read_only: bool,
         /// Optional scope-restriction (label / edge-type prefixes).
+        #[serde(default)]
         scopes: Vec<SmolStr>,
     },
     /// KMS access for sign / verify operations.
     Kms {
-        /// Permitted key identifiers.
+        /// Permitted key identifiers (empty = deny-all).
+        #[serde(default)]
         key_ids: Vec<SmolStr>,
     },
     /// Acquiring named secret handles (opaque to the plugin).
     Secret {
-        /// Permitted secret identifiers.
+        /// Permitted secret identifiers (empty = deny-all).
+        #[serde(default)]
         ids: Vec<SmolStr>,
     },
     /// Explicit lock primitives (`host.lock_nodes`, `host.lock_edges`).
@@ -68,7 +77,8 @@ pub enum Capability {
     },
     /// Scoped configuration K/V access (`host.config_get`).
     Config {
-        /// Patterns of permitted config keys.
+        /// Patterns of permitted config keys (empty = deny-all).
+        #[serde(default)]
         keys: Vec<SmolStr>,
     },
     /// Per-plugin K/V store (scoped namespace).
@@ -185,6 +195,13 @@ impl CapabilitySet {
         }
     }
 
+    /// Construct a capability set from guest-manifest declarations, each of
+    /// which may be a bare name or a structured [`ManifestCapability`].
+    #[must_use]
+    pub fn from_manifest(caps: impl IntoIterator<Item = ManifestCapability>) -> Self {
+        Self::from_iter_of(caps.into_iter().map(|m| m.0))
+    }
+
     /// Insert a capability; returns `true` if the capability was not already present.
     pub fn insert(&mut self, cap: Capability) -> bool {
         self.set.insert(cap)
@@ -245,6 +262,131 @@ impl CapabilitySet {
 
 fn variant_matches(a: &Capability, b: &Capability) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+impl Capability {
+    /// True if this is a [`Capability::Network`] grant whose allow-list
+    /// matches `url`.
+    ///
+    /// Used for layer-3 (call-time) attenuation of `uni.http.*` host fns: a
+    /// granted `Network { allow }` only permits URLs matching one of its
+    /// patterns. Non-`Network` capabilities never match.
+    #[must_use]
+    pub fn network_allows(&self, url: &str) -> bool {
+        matches!(self, Capability::Network { allow } if allow.iter().any(|p| wildcard_match(p, url)))
+    }
+
+    /// True if this is a [`Capability::Kms`] grant permitting `key_id`.
+    #[must_use]
+    pub fn kms_allows(&self, key_id: &str) -> bool {
+        matches!(self, Capability::Kms { key_ids } if key_ids.iter().any(|p| wildcard_match(p, key_id)))
+    }
+
+    /// True if this is a [`Capability::Secret`] grant permitting `id`.
+    #[must_use]
+    pub fn secret_allows(&self, id: &str) -> bool {
+        matches!(self, Capability::Secret { ids } if ids.iter().any(|p| wildcard_match(p, id)))
+    }
+
+    /// True if this is a [`Capability::Filesystem`] grant whose `read`
+    /// allow-list matches `path`.
+    ///
+    /// Patterns are matched with [`wildcard_match`] (path-opaque — `*` and `**`
+    /// both span `/`), which suits the `/data/**`-style grants in use.
+    #[must_use]
+    pub fn filesystem_read_allows(&self, path: &str) -> bool {
+        matches!(self, Capability::Filesystem { read, .. } if read.iter().any(|p| wildcard_match(p, path)))
+    }
+
+    /// True if this is a [`Capability::Filesystem`] grant whose `write`
+    /// allow-list matches `path`.
+    #[must_use]
+    pub fn filesystem_write_allows(&self, path: &str) -> bool {
+        matches!(self, Capability::Filesystem { write, .. } if write.iter().any(|p| wildcard_match(p, path)))
+    }
+}
+
+/// A capability as it appears in a **guest plugin manifest** (WASM / Extism) —
+/// either a bare capability name (`"network"`, `"scalar-fn"`) or a structured
+/// object carrying attenuation patterns
+/// (`{"kind":"network","allow":["https://api.example/**"]}`).
+///
+/// Bare names normalize to their **zero-attenuation** variant — e.g.
+/// `"network"` → `Network { allow: [] }` (deny-all egress) — so a guest must
+/// spell out patterns to gain real host-surface access. This lets guest
+/// manifests opt into the same rich [`Capability`] model the in-process Rhai /
+/// Rust paths use, while staying backward-compatible with manifests that listed
+/// bare capability names.
+#[derive(Clone, Debug)]
+pub struct ManifestCapability(pub Capability);
+
+impl<'de> Deserialize<'de> for ManifestCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// String-or-object shim. A JSON string is a bare name; a map is the
+        /// structured `Capability` form (internally tagged on `kind`).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Full(Capability),
+        }
+
+        let cap = match Repr::deserialize(deserializer)? {
+            Repr::Full(c) => c,
+            Repr::Bare(name) => {
+                // Reconstruct the internally-tagged object `{ "kind": <name> }`
+                // so unit variants and (defaulted-field) structured variants
+                // both round-trip through the canonical `Capability` serde.
+                let tagged = serde_json::json!({ "kind": name });
+                Capability::deserialize(tagged).map_err(serde::de::Error::custom)?
+            }
+        };
+        Ok(ManifestCapability(cap))
+    }
+}
+
+/// Anchored wildcard match where `*` (and `**`) match any run of characters.
+///
+/// Capability attenuation patterns (network URL allow-lists, KMS key ids,
+/// secret ids) are globs over opaque strings, not paths, so `**` is treated
+/// identically to `*` — both match any sequence including `/`. Uses the
+/// standard greedy two-pointer algorithm with backtracking; matching is
+/// anchored at both ends.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            // Collapse consecutive `*` so `**` behaves like `*`.
+            while pi < p.len() && p[pi] == b'*' {
+                pi += 1;
+            }
+            if pi == p.len() {
+                return true;
+            }
+            star = Some(pi);
+            mark = ti;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            pi = s;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Determinism characterization — drives planner caching and hoisting.
@@ -343,5 +485,83 @@ mod tests {
     #[test]
     fn determinism_default_is_nondeterministic() {
         assert_eq!(Determinism::default(), Determinism::Nondeterministic);
+    }
+
+    #[test]
+    fn wildcard_match_basics() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("**", "any/thing"));
+        assert!(wildcard_match(
+            "https://api.example/**",
+            "https://api.example/v1/x"
+        ));
+        assert!(wildcard_match("exact", "exact"));
+        assert!(!wildcard_match("exact", "other"));
+        assert!(!wildcard_match(
+            "https://api.example/**",
+            "https://evil.example/x"
+        ));
+        assert!(wildcard_match("a*c", "abbbc"));
+        assert!(!wildcard_match("a*c", "abbb"));
+    }
+
+    #[test]
+    fn network_allows_matches_only_network_variant() {
+        let net = Capability::Network {
+            allow: vec![SmolStr::new("https://api.example/**")],
+        };
+        assert!(net.network_allows("https://api.example/v1/data"));
+        assert!(!net.network_allows("https://evil.example/x"));
+        // A non-network capability never grants network access.
+        assert!(!Capability::ScalarFn.network_allows("https://api.example/x"));
+    }
+
+    #[test]
+    fn kms_and_secret_allow_wildcard_and_exact() {
+        let kms = Capability::Kms {
+            key_ids: vec![SmolStr::new("*")],
+        };
+        assert!(kms.kms_allows("signing-key-1"));
+        let secret = Capability::Secret {
+            ids: vec![SmolStr::new("db-password")],
+        };
+        assert!(secret.secret_allows("db-password"));
+        assert!(!secret.secret_allows("other"));
+    }
+
+    #[test]
+    fn manifest_capability_parses_bare_and_structured() {
+        // Bare name → zero-attenuation variant (deny-all egress).
+        let bare: ManifestCapability = serde_json::from_str("\"network\"").unwrap();
+        assert!(matches!(&bare.0, Capability::Network { allow } if allow.is_empty()));
+        assert!(!bare.0.network_allows("https://api.example/x"));
+        // Bare unit variant.
+        let scalar: ManifestCapability = serde_json::from_str("\"scalar-fn\"").unwrap();
+        assert_eq!(scalar.0, Capability::ScalarFn);
+        // Structured object → carries the allow-list.
+        let structured: ManifestCapability =
+            serde_json::from_str(r#"{"kind":"network","allow":["https://api.example/**"]}"#)
+                .unwrap();
+        assert!(structured.0.network_allows("https://api.example/v1/x"));
+        assert!(!structured.0.network_allows("https://evil.example/x"));
+        // A whole manifest list folds into a CapabilitySet.
+        let set = CapabilitySet::from_manifest([bare, scalar, structured]);
+        assert!(set.contains_variant(&Capability::Network { allow: vec![] }));
+        assert!(set.contains(&Capability::ScalarFn));
+    }
+
+    #[test]
+    fn filesystem_allows_read_and_write_separately() {
+        let fs = Capability::Filesystem {
+            read: vec![SmolStr::new("/data/**")],
+            write: vec![SmolStr::new("/tmp/out/**")],
+        };
+        assert!(fs.filesystem_read_allows("/data/x/y.txt"));
+        assert!(!fs.filesystem_read_allows("/etc/passwd"));
+        assert!(fs.filesystem_write_allows("/tmp/out/log"));
+        // read grant does not imply write grant for the same path
+        assert!(!fs.filesystem_write_allows("/data/x/y.txt"));
+        // a non-filesystem capability never matches
+        assert!(!Capability::ScalarFn.filesystem_read_allows("/data/x"));
     }
 }

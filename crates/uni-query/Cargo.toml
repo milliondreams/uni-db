@@ -62,8 +62,7 @@ default = []
 # NOTE: SSI/OCC is always compiled and toggled at runtime via
 # `UniConfig::ssi_enabled` (default `true`). The executor's pinned-read path
 # and read-set capture self-gate on whether the transaction carries a pinned
-# snapshot / `occ_read_set`. See
-# `docs/proposals/serializable_snapshot_isolation.md`.
+# snapshot / `occ_read_set`.
 
 [dev-dependencies]
 tempfile = { workspace = true }

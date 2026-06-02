@@ -1536,17 +1536,14 @@ impl DeferralQueue {
     #[must_use]
     pub fn with_persistence(data_path: std::path::PathBuf) -> Arc<Self> {
         let queue = Arc::new(Self::default());
-        let mut sidecar_path = data_path;
-        sidecar_path.push("_system");
-        sidecar_path.push("deferred_triggers.json");
-        *queue.sidecar.lock() = Some(DeferralSidecar { path: sidecar_path });
+        *queue.sidecar.lock() = Some(DeferralSidecar::new(data_path));
         queue
     }
 
     /// Borrow the sidecar path, if persistence is enabled.
     #[must_use]
     pub fn sidecar_path(&self) -> Option<std::path::PathBuf> {
-        self.sidecar.lock().as_ref().map(|s| s.path.clone())
+        self.sidecar.lock().as_ref().map(|s| s.path().to_path_buf())
     }
 
     /// Replay persisted items from the sidecar, re-binding each row's
@@ -1796,39 +1793,30 @@ struct PersistedDeferral {
 /// Atomic JSON-sidecar persistence handle for the deferral queue.
 #[derive(Clone, Debug)]
 struct DeferralSidecar {
-    path: std::path::PathBuf,
+    sidecar: uni_sidecar::SystemSidecar<Vec<PersistedDeferral>>,
 }
 
 impl DeferralSidecar {
+    /// Construct rooted at `<data_path>/_system/deferred_triggers.json`.
+    fn new(data_path: std::path::PathBuf) -> Self {
+        Self {
+            sidecar: uni_sidecar::SystemSidecar::new(data_path, "deferred_triggers.json"),
+        }
+    }
+
+    /// Borrow the resolved sidecar path (for diagnostics).
+    fn path(&self) -> &std::path::Path {
+        self.sidecar.path()
+    }
+
     fn read_all(&self) -> Result<Vec<PersistedDeferral>, String> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = std::fs::read(&self.path).map_err(|e| format!("read {:?}: {e}", self.path))?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse {:?}: {e}", self.path))
+        self.sidecar.load().map_err(|e| e.to_string())
     }
 
     fn write_all(&self, rows: &[PersistedDeferral]) -> Result<(), String> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
-        }
-        let json = serde_json::to_vec_pretty(rows).map_err(|e| format!("encode: {e}"))?;
-        let tmp = self.path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tmp:?}: {e}"))?;
-            f.write_all(&json)
-                .map_err(|e| format!("write {tmp:?}: {e}"))?;
-            f.sync_all().map_err(|e| format!("sync {tmp:?}: {e}"))?;
-        }
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| format!("rename {tmp:?}->{:?}: {e}", self.path))?;
-        Ok(())
+        self.sidecar
+            .store(&rows.to_vec())
+            .map_err(|e| e.to_string())
     }
 }
 

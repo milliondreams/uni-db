@@ -35,6 +35,7 @@ members = [
     "crates/uni-plugin-custom",
     "crates/uni-plugin-conformance",
     "crates/uni-plugin-host",
+    "crates/uni-sidecar",
     "crates/uni-bulk",
     "crates/uni-fork",
 ]
@@ -63,6 +64,7 @@ default-members = [
     "crates/uni-plugin-custom",
     "crates/uni-plugin-conformance",
     "crates/uni-plugin-host",
+    "crates/uni-sidecar",
     "crates/uni-bulk",
     "crates/uni-fork",
 ]
@@ -102,6 +104,7 @@ uni-plugin-pyo3 = { path = "crates/uni-plugin-pyo3", version = "1.3.0" }
 uni-plugin-custom = { path = "crates/uni-plugin-custom", version = "1.3.0" }
 uni-plugin-conformance = { path = "crates/uni-plugin-conformance", version = "1.3.0" }
 uni-plugin-host = { path = "crates/uni-plugin-host", version = "1.3.0" }
+uni-sidecar = { path = "crates/uni-sidecar", version = "1.3.0" }
 uni-bulk = { path = "crates/uni-bulk", version = "1.3.0" }
 uni-fork = { path = "crates/uni-fork", version = "1.3.0" }
 
@@ -119,6 +122,11 @@ futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OTel API + tracing bridge. These two are a tightly-coupled compatible pair
+# (tracing-opentelemetry 0.28 ↔ opentelemetry 0.27); pin them together here so
+# every crate shares one version and a bump happens in exactly one place.
+opentelemetry = "0.27"
+tracing-opentelemetry = "0.28"
 arc-swap = "1"
 log = "0.4"
 env_logger = "0.11"

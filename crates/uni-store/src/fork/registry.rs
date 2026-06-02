@@ -14,9 +14,6 @@
 //! single PUT for that mutation; it is *never* held across
 //! `lance_branch::create_branch` or `delete_branch`. This preserves
 //! the spec §10 guarantee that fork creation does not block primary.
-//!
-//! 2PC state machines and recovery semantics are detailed in
-//! `docs/proposals/graph_fork_plan.md` §Phase 1.
 
 // Rust guideline compliant
 

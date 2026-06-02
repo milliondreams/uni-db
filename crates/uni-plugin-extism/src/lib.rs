@@ -1,9 +1,8 @@
 //! Extism loader for the uni-db plugin framework.
 //!
 //! `uni-plugin-extism` is the **user-facing** WASM loader. It sits
-//! parallel to `uni-plugin-wasm` (the Component Model loader). Per the
-//! "Option C" hybrid pattern documented in
-//! `docs/proposals/plugin_framework.md` §5.6:
+//! parallel to `uni-plugin-wasm` (the Component Model loader). It follows
+//! the "Option C" hybrid pattern:
 //!
 //! - **Component Model** (`uni-plugin-wasm`) — typed WIT contracts,
 //!   capability gating by linker absence, used for the Lua-host, trusted

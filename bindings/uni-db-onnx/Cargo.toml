@@ -48,3 +48,11 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# This slim variant intentionally omits the WASM/Extism plugin loaders (no
+# wasmtime/extism deps). The shared `../uni-db/src/lib.rs` source still
+# references these cfgs, so declare them as empty (off-by-default, no deps) to
+# satisfy `unexpected_cfgs` under `-D warnings` — the gated methods compile out.
+wasm-plugins = []
+extism-plugins = []

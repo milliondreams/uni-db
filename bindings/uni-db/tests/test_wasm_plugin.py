@@ -56,7 +56,9 @@ class TestWasmPlugin(unittest.TestCase):
             outcome["scalars_registered"],
         )
 
-    @unittest.skipUnless(os.path.exists(_EXTISM_WASM), f"missing fixture: {_EXTISM_WASM}")
+    @unittest.skipUnless(
+        os.path.exists(_EXTISM_WASM), f"missing fixture: {_EXTISM_WASM}"
+    )
     def test_load_wasm_extism(self):
         with open(_EXTISM_WASM, "rb") as f:
             outcome = self.db.load_wasm_extism(f.read(), grants=["ScalarFn"])

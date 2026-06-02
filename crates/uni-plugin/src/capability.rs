@@ -291,7 +291,7 @@ impl Capability {
     /// True if this is a [`Capability::Filesystem`] grant whose `read`
     /// allow-list matches `path`.
     ///
-    /// Patterns are matched with [`wildcard_match`] (path-opaque — `*` and `**`
+    /// Patterns are matched with `wildcard_match` (path-opaque — `*` and `**`
     /// both span `/`), which suits the `/data/**`-style grants in use.
     #[must_use]
     pub fn filesystem_read_allows(&self, path: &str) -> bool {

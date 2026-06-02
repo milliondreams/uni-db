@@ -2,8 +2,8 @@
 //!
 //! Plugin trust (the signature-enforcement policy plus the trust root of
 //! allowed signing keys) is a per-instance, host-level concern — not a
-//! per-plugin capability and not part of the serializable [`UniConfig`].
-//! [`TrustRoot`](uni_plugin::verify::TrustRoot) holds raw Ed25519 public
+//! per-plugin capability and not part of the serializable `UniConfig`.
+//! `TrustRoot` (`uni_plugin::verify::TrustRoot`) holds raw Ed25519 public
 //! keys and is deliberately neither `Clone` nor `Serialize`, so it cannot
 //! live in `UniConfig` (which is cloned into every session). It also can
 //! not live in `uni-common` without a dependency cycle (`uni-plugin`

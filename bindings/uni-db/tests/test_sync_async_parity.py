@@ -54,7 +54,9 @@ SYNC_ASYNC_PAIRS = [
 
 
 def _public_methods(cls):
-    return {n for n in dir(cls) if not n.startswith("_") and callable(getattr(cls, n, None))}
+    return {
+        n for n in dir(cls) if not n.startswith("_") and callable(getattr(cls, n, None))
+    }
 
 
 @pytest.mark.parametrize("sync_name,async_name", SYNC_ASYNC_PAIRS)

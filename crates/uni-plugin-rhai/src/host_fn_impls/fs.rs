@@ -49,8 +49,7 @@ fn register_fs_read(engine: &mut Engine, caps: &CapabilitySet) {
                     "uni.fs.read: path `{path}` not in granted Filesystem read allow-list"
                 )));
             }
-            std::fs::read_to_string(path)
-                .map_err(|e| rt_err(format!("uni.fs.read({path}): {e}")))
+            std::fs::read_to_string(path).map_err(|e| rt_err(format!("uni.fs.read({path}): {e}")))
         },
     );
 }

@@ -83,6 +83,8 @@ pub mod pool {
 #[cfg(feature = "extism-runtime")]
 pub mod exports;
 #[cfg(feature = "extism-runtime")]
+pub mod host_svc;
+#[cfg(feature = "extism-runtime")]
 pub mod loader;
 #[cfg(feature = "extism-runtime")]
 pub mod wire_translate;
@@ -109,6 +111,9 @@ pub use exports::{
     RegistrationEntry, RegistrationManifest, WireArgType, WireFnSignature, parse_manifest_json,
     parse_registration_json, read_manifest_export, read_register_export,
 };
+#[cfg(feature = "extism-runtime")]
+#[doc(inline)]
+pub use host_svc::register_default_host_svc;
 #[cfg(feature = "extism-runtime")]
 #[doc(inline)]
 pub use loader::ExtismLoader;

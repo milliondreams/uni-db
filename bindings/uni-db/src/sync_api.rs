@@ -1009,7 +1009,8 @@ impl Database {
         grants: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
         let cap_set = crate::builders::build_capability_set(grants);
-        let loader = uni_plugin_extism::ExtismLoader::new();
+        let mut loader = uni_plugin_extism::ExtismLoader::new();
+        uni_plugin_extism::register_default_host_svc(&mut loader);
         let outcome = self
             .inner
             .load_wasm_extism(&loader, wasm_bytes, &cap_set, &cap_set)

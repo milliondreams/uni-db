@@ -166,7 +166,8 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let cap_set = crate::builders::build_capability_set(grants);
-            let loader = uni_plugin_extism::ExtismLoader::new();
+            let mut loader = uni_plugin_extism::ExtismLoader::new();
+            uni_plugin_extism::register_default_host_svc(&mut loader);
             let outcome = inner
                 .load_wasm_extism(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;

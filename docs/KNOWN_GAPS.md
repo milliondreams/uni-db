@@ -52,13 +52,23 @@ updated, `list[str]` Python surface preserved via `build_capability_set`);
 `PreparedComponent` carry the rich effective set + an `Option<Arc<dyn HttpEgress>>`;
 `HttpEgress::{get,post}` take a `traceparent` (Rhai already injects it).
 
+**Extism host fns — DONE** (Phase C): `ExtismLoader::with_{kms,secret_store,http}`
+plus `register_default_host_svc` now expose `uni_kms_{sign,verify}`,
+`uni_secret_acquire`, and `uni_http_{get,post}`, binding the shared
+`uni_plugin::{KmsProvider, HttpEgress}` traits and `SecretStore` with full
+call-time attenuation (key-id / secret-id / URL matched against the granted
+allow-list) and host-trace-context (`current_trace_context().to_traceparent()`)
+injection into outbound HTTP. The concrete `extism::Function`s are built **per
+load** (`ExtismLoader::runtime_fns_for_load`) with that load's effective
+`CapabilitySet` + service `Arc`s baked into `UserData`; the JSON wire envelope is
+auto-marshaled by `extism::host_fn!` (no manual `CurrentPlugin` memory code). The
+dispatch/attenuation logic lives in unit-tested `do_*` fns
+(`src/host_svc/{kms,secret,net}.rs`); link-time gating is covered in
+`tests/host_svc.rs`. End-to-end *guest invocation* is still unexercised (no guest
+fixture imports these host fns — the same fixture gap as the WASM item below).
+
 **Remaining (host-fn bodies — the feature layer on the C0 foundation):**
 
-- **Extism** `uni.{kms,secret,http}`: add `ExtismLoader::with_{kms,secret_store,http}`
-  handles; have `build_plugin_from_parts` construct **per-build** cap-aware
-  `extism::Function`s (capturing `prepared.effective` + the service `Arc`s in
-  `UserData`) when the capability variant is granted, with a JSON wire envelope +
-  `CurrentPlugin` memory marshaling. Reference: the Rhai `host_fn_impls`.
 - **WASM** `host-net` + `host-trace-context`: declare the WIT interfaces, add
   cap-gated `add_host_net` / `add_host_trace_context` to `linker.rs` (func_wrap
   reading `HostState.{http,effective}`), and add a guest fixture that *imports*

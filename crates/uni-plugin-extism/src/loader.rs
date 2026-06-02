@@ -101,6 +101,13 @@ pub struct ExtismLoader {
     // `extism::Function` doesn't implement Debug, so we hand-roll Debug
     // for the enclosing type below.
     runtime_fns: BTreeMap<String, extism::Function>,
+    /// Optional KMS provider backing `uni_kms_*`. Absent → those fns error
+    /// loudly at call time ("no KMS provider configured").
+    kms: Option<std::sync::Arc<dyn uni_plugin::KmsProvider>>,
+    /// Optional secret store backing `uni_secret_acquire`.
+    secrets: Option<std::sync::Arc<uni_plugin::secrets::SecretStore>>,
+    /// Optional HTTP egress backing `uni_http_*`.
+    http: Option<std::sync::Arc<dyn uni_plugin::HttpEgress>>,
 }
 
 impl std::fmt::Debug for ExtismLoader {
@@ -152,6 +159,67 @@ impl ExtismLoader {
     #[must_use]
     pub fn runtime_fn_count(&self) -> usize {
         self.runtime_fns.len()
+    }
+
+    /// Attach a KMS provider backing `uni_kms_*` (builder style).
+    ///
+    /// Pair with [`crate::host_svc::register_default_host_svc`] to register the
+    /// metadata specs; the concrete functions are built per load with the
+    /// effective grant set so call-time attenuation is enforced.
+    #[must_use]
+    pub fn with_kms(mut self, kms: std::sync::Arc<dyn uni_plugin::KmsProvider>) -> Self {
+        self.kms = Some(kms);
+        self
+    }
+
+    /// Attach a secret store backing `uni_secret_acquire` (builder style).
+    #[must_use]
+    pub fn with_secret_store(
+        mut self,
+        store: std::sync::Arc<uni_plugin::secrets::SecretStore>,
+    ) -> Self {
+        self.secrets = Some(store);
+        self
+    }
+
+    /// Attach an HTTP egress backing `uni_http_*` (builder style).
+    #[must_use]
+    pub fn with_http(mut self, http: std::sync::Arc<dyn uni_plugin::HttpEgress>) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// The host-fn map for a single load: the static `runtime_fns` plus the
+    /// per-load capability-gated service functions (`uni_kms_*`,
+    /// `uni_secret_acquire`, `uni_http_*`).
+    ///
+    /// Each service function is built with `prepared.effective` and the loader's
+    /// service handles baked into its [`extism::UserData`], so it enforces *this*
+    /// load's attenuation patterns. Only the names this plugin is actually
+    /// allowed (`prepared.allowed_host_fns`) are materialized, so a plugin
+    /// without the matching capability variant never pays the build cost.
+    fn runtime_fns_for_load(
+        &self,
+        prepared: &PreparedExtismPlugin,
+    ) -> BTreeMap<String, extism::Function> {
+        let mut fns = self.runtime_fns.clone();
+        // Build the per-load context once; cloned (cheaply, Arc handles) into
+        // each materialized service function.
+        let ctx = crate::host_svc::HostSvcCtx {
+            effective: prepared.effective.clone(),
+            kms: self.kms.clone(),
+            secrets: self.secrets.clone(),
+            http: self.http.clone(),
+        };
+        for name in &prepared.allowed_host_fns {
+            if fns.contains_key(name) {
+                continue;
+            }
+            if let Some(function) = crate::host_svc::build_service_fn(name, &ctx) {
+                fns.insert(name.clone(), function);
+            }
+        }
+        fns
     }
 
     /// Parse a manifest JSON blob (as the plugin's `manifest` export
@@ -256,7 +324,7 @@ impl ExtismLoader {
         bytes: &[u8],
         prepared: &PreparedExtismPlugin,
     ) -> Result<extism::Plugin, ExtismError> {
-        build_plugin_from_parts(bytes, prepared, &self.runtime_fns)
+        build_plugin_from_parts(bytes, prepared, &self.runtime_fns_for_load(prepared))
     }
 
     /// Instantiate the plugin via the extism-sdk.
@@ -353,11 +421,12 @@ impl ExtismLoader {
         let prepared = self.prepare_parsed(parsed_manifest, host_grants);
 
         // Build the instance pool: factory closes over owned bytes,
-        // prepared (cap-filtered), and a clone of the loader's
-        // runtime_fns map. Pre-warm count is from `PoolConfig::default`
-        // (proposal §5.3.1 — `min_warm = 1`); future commits surface
-        // this through the plugin manifest.
-        let pool = build_pool(bytes, &prepared, &self.runtime_fns)?;
+        // prepared (cap-filtered), and the per-load host-fn map (static
+        // `runtime_fns` plus the capability-gated `uni_kms_*` / `uni_secret_*`
+        // / `uni_http_*` service fns built with this load's effective grant
+        // set). Pre-warm count is from `PoolConfig::default` (proposal §5.3.1 —
+        // `min_warm = 1`); future commits surface this through the manifest.
+        let pool = build_pool(bytes, &prepared, &self.runtime_fns_for_load(&prepared))?;
 
         // Lease one warm instance, read the register export once, and
         // drop the lease. A previous two-pass shape re-read the same

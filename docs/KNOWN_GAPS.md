@@ -64,8 +64,19 @@ load** (`ExtismLoader::runtime_fns_for_load`) with that load's effective
 auto-marshaled by `extism::host_fn!` (no manual `CurrentPlugin` memory code). The
 dispatch/attenuation logic lives in unit-tested `do_*` fns
 (`src/host_svc/{kms,secret,net}.rs`); link-time gating is covered in
-`tests/host_svc.rs`. End-to-end *guest invocation* is still unexercised (no guest
-fixture imports these host fns — the same fixture gap as the WASM item below).
+`tests/host_svc.rs`. End-to-end *guest invocation* is now exercised too: the
+`examples/example-extism-net` fixture (built by `scripts/build-wasm-fixtures.sh`)
+imports and *calls* `uni_http_get`, and `tests/example_extism_net_e2e.rs` drives
+the same three gates as the WASM path (granted round-trip / unconfigured-egress
+loud failure / ungranted link-time failure). Building that fixture surfaced and
+fixed a latent loader bug: pass-1 (manifest read) instantiated with no host fns,
+so a host-fn-importing guest could not link — wasm resolves *all* imports at
+instantiate time. Pass-1 now bootstraps with the host's *offered* grants (real
+attenuation still uses pass-2 `declared ∩ grants`), mirroring the WASM loader.
+One boundary nuance: an Extism host-fn `Err` aborts the guest call as a wasm
+trap, so the host-side message (e.g. "no HTTP egress configured") is wrapped
+rather than surfaced verbatim — the WASM Component path's typed `fn-error`
+preserves it.
 
 **WASM host-net + host-trace-context — DONE** (Phase D + E): `world.wit` declares
 the capability-gated `interface host-net` (`http-get`/`http-post` →
@@ -85,9 +96,40 @@ unconfigured-egress loud failure, and ungranted link-time failure end to end.
 
 **The cutover is complete** (C0 + C + D + E). Both guest loaders now bind the
 shared host-service traits with full capability attenuation and trace
-propagation. (Note: the Extism path still has no guest fixture that *imports* its
-host fns, so its end-to-end guest invocation is proven only at the linker/gate +
-unit-dispatch level — the wasm path above has the full e2e.)
+propagation, and **both** have an end-to-end fixture that imports and calls a
+host fn (`example-wasm-net` for the Component path, `example-extism-net` for the
+Extism path).
+
+### Filesystem capability path traversal — CLOSED (security)
+
+The Rhai `uni.fs.{read,write}` host fns previously matched the granted
+`Capability::Filesystem` glob allow-list against the **raw** path string and then
+called `std::fs::read_to_string` / `write` on that same string. Because the
+matcher (`wildcard_match`) is path-opaque (no `.`/`..` semantics), a guest granted
+`read: ["/data/**"]` could read `/etc/passwd` via
+`uni_fs_read("/data/../../etc/passwd")`: the string matched `/data/**`, and the
+kernel resolved the `..` *after* the check — a capability-sandbox escape.
+
+Fixed by making the checked path identical to the acted-upon path, in two layers:
+
+- **Lexical (shared, IO-free):** `uni_plugin::normalize_capability_path`
+  (`crates/uni-plugin/src/fs_guard.rs`) requires an absolute path and resolves
+  `.`/`..`, returning `None` on a root escape or a relative path. Loaders match
+  the **normalized** path against the allow-list *before* any filesystem access
+  (so a disallowed path cannot even probe existence via `canonicalize` errors).
+- **Symlink hardening (loader, defense-in-depth):**
+  `crates/uni-plugin-rhai/src/host_fn_impls/fs.rs` then `canonicalize`s the target
+  (for writes, the parent dir, so a symlinked parent can't redirect a create) and
+  re-matches the **resolved** path against the allow-list, defeating a symlink
+  inside an allowed tree that points outside it. The syscall acts on the resolved
+  path.
+
+Regression tests in `crates/uni-plugin-rhai/tests/sandbox.rs` cover `..`
+traversal (read + write) and symlink escape; `fs_guard`'s normalizer has its own
+unit tests. The helper lives in `uni-plugin` so the Extism / WASM loaders inherit
+it when they add filesystem host fns (today they expose only kms/secret/net).
+`wildcard_match` is deliberately left path-opaque — correct for the URL / key-id
+/ secret-id globs, which are not paths.
 
 ### Conformance harness — WASM target — marker arm is intentional
 
@@ -123,6 +165,15 @@ so an outbound call from an isolated Rhai / Extism / wasm guest continues the
 host's trace. With the `otel` feature off the value is `None` (no fabricated ids).
 The wasm `host-trace-context.get-traceparent` import additionally lets a guest SDK
 read the same value to start a child span.
+
+This is now backed by **positive** end-to-end assertions, not just the
+extraction unit test: with the `otel` feature on and an active span,
+`uni-plugin-rhai`'s `host_services_e2e::http_get_injects_active_traceparent`
+drives a real guest script through `uni_http_get` and asserts the egress received
+a valid 55-char W3C traceparent, and `uni-plugin-extism`'s
+`host_svc::net::tests::dispatch_injects_active_traceparent` asserts the same for
+the Extism dispatch. Each has a companion `…without_active_context` test holding
+the no-leak invariant (no layer ⇒ `None`). Run with `--features otel`.
 
 ### Sidecar IO consolidation (`CODE_SIMPLIFIER_FEEDBACK.md` §1.5) — CLOSED
 

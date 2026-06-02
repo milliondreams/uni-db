@@ -37,6 +37,20 @@ if [[ ! -f "$EXTISM_WASM" ]]; then
 fi
 echo "    extism plugin size: $(du -h "$EXTISM_WASM" | cut -f1)"
 
+echo "==> Building example-extism-net (wasm32-unknown-unknown)"
+(
+    cd examples/example-extism-net
+    cargo build --target wasm32-unknown-unknown --release
+)
+
+EXTISM_NET_WASM="examples/example-extism-net/target/wasm32-unknown-unknown/release/example_extism_net.wasm"
+if [[ ! -f "$EXTISM_NET_WASM" ]]; then
+    echo "ERROR: expected $EXTISM_NET_WASM after build" >&2
+    exit 1
+fi
+echo "    extism-net plugin size: $(du -h "$EXTISM_NET_WASM" | cut -f1)"
+echo "    (imports + calls the capability-gated uni_http_get host fn)"
+
 echo "==> Building example-wasm-geo (wasm32-wasip2)"
 (
     cd examples/example-wasm-geo
@@ -68,5 +82,6 @@ echo "    (imports the capability-gated uni:plugin/host-net interface)"
 
 echo "==> Done. Run tests with:"
 echo "    cargo nextest run -p uni-plugin-extism --test example_extism_geo_e2e"
+echo "    cargo nextest run -p uni-plugin-extism --test example_extism_net_e2e"
 echo "    cargo nextest run -p uni-plugin-wasm   --test example_wasm_geo_e2e"
 echo "    cargo nextest run -p uni-plugin-wasm   --test example_wasm_net_e2e"

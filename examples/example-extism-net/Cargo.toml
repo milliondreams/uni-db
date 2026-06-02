@@ -1,0 +1,45 @@
+# Standalone example Extism plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-extism-net
+#   cargo build --target wasm32-unknown-unknown --release
+#
+# Produces target/wasm32-unknown-unknown/release/example_extism_net.wasm.
+#
+# Unlike example-extism-geo (which imports nothing), this plugin *imports and
+# calls* the capability-gated host fn `uni_http_get`, giving the Extism
+# host-service path true end-to-end guest-invocation coverage (parity with the
+# Component-Model `example-wasm-net`). Load with a `Network`-granting
+# `CapabilitySet` and an `HttpEgress` wired via `ExtismLoader::with_http`.
+
+# Declaring its own [workspace] = {} opts this crate out of the outer `uni`
+# workspace — `cargo build --workspace` from the repo root won't try to build
+# this for the host target.
+[workspace]
+
+[package]
+name = "example-extism-net"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Extism plugin: imports + calls the host-net uni_http_get host fn"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde_json = "1"
+# Arrow IPC on wasm32-unknown-unknown — only `ipc` is needed for the
+# StreamReader / StreamWriter used by the scalar invoke ABI.
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

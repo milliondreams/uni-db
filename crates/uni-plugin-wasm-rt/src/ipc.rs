@@ -38,9 +38,10 @@ const ARROW_EXTENSION_KEY: &str = "ARROW:extension:name";
 /// [`IpcError::SecretLeakAttempt`] if any field carries the
 /// `uni-db.secret-handle` extension marker.
 ///
-/// Called by both [`encode_batch`] and [`decode_batches`] so neither
-/// direction can carry a secret-handle column across the wasm
-/// boundary. Nested children (struct fields, list items) are walked
+/// Called on every encode and decode path ([`encode_batch`],
+/// [`encode_batches`], [`decode_batch`], [`decode_batches`]) via
+/// [`reject_all`] so neither direction can carry a secret-handle column across
+/// the wasm boundary. Nested children (struct fields, list items) are walked
 /// recursively.
 fn reject_secret_handles(batch: &RecordBatch) -> Result<(), IpcError> {
     fn walk(field: &arrow_schema::Field) -> Result<(), IpcError> {
@@ -71,6 +72,13 @@ fn reject_secret_handles(batch: &RecordBatch) -> Result<(), IpcError> {
         .try_for_each(|f| walk(f.as_ref()))
 }
 
+/// Run [`reject_secret_handles`] over every batch — the FU-2 membrane shared by
+/// all encode/decode paths so a secret-handle column is rejected regardless of
+/// single- vs multi-batch shape.
+fn reject_all(batches: &[RecordBatch]) -> Result<(), IpcError> {
+    batches.iter().try_for_each(reject_secret_handles)
+}
+
 /// Encode a `RecordBatch` as Arrow IPC stream bytes.
 ///
 /// Output: schema header + one record batch + end-of-stream marker —
@@ -99,9 +107,7 @@ pub fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, IpcError> {
 /// - [`IpcError::Arrow`] if the writer rejects the batches.
 pub fn encode_batches(batches: &[RecordBatch]) -> Result<Vec<u8>, IpcError> {
     let first = batches.first().ok_or(IpcError::EmptyBatchInput)?;
-    for b in batches {
-        reject_secret_handles(b)?;
-    }
+    reject_all(batches)?;
     let mut buf: Vec<u8> = Vec::with_capacity(estimate_size(first).saturating_mul(batches.len()));
     write_stream(&mut buf, first.schema(), batches)?;
     Ok(buf)
@@ -142,6 +148,10 @@ fn write_stream(
 /// documentation promised.
 pub fn decode_batch(bytes: &[u8]) -> Result<Option<RecordBatch>, IpcError> {
     let batches = read_stream(bytes, "read batch")?;
+    // FU-2: a single-batch stream is still an inbound boundary — reject any
+    // secret-handle column, symmetric with `decode_batches` / `encode_batch`.
+    // (decode_batch is the hot path used by every scalar/aggregate adapter.)
+    reject_all(&batches)?;
     match batches.len() {
         0 => Ok(None),
         1 => Ok(batches.into_iter().next()),
@@ -158,12 +168,10 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Option<RecordBatch>, IpcError> {
 /// Returns [`IpcError::Arrow`] if the bytes are malformed.
 pub fn decode_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, IpcError> {
     let batches = read_stream(bytes, "read batches")?;
-    // FU-2: reject any incoming batch that carries a secret-handle
-    // column. Symmetric with the encode path so a malicious plugin
-    // can't smuggle a handle back across the boundary either.
-    for b in &batches {
-        reject_secret_handles(b)?;
-    }
+    // FU-2: reject any incoming batch that carries a secret-handle column.
+    // Symmetric with the encode path so a malicious plugin can't smuggle a
+    // handle back across the boundary either.
+    reject_all(&batches)?;
     Ok(batches)
 }
 
@@ -449,6 +457,33 @@ mod tests {
         }
         // Sanity-check: encoding the *un-tagged* version works.
         assert!(!encoded.is_empty());
+    }
+
+    /// FU-2 regression: the single-batch `decode_batch` path (the hot path for
+    /// every scalar/aggregate adapter) must reject a smuggled secret-handle
+    /// column too — not just the multi-batch `decode_batches`.
+    #[test]
+    fn decode_batch_rejects_secret_handle_column() {
+        use arrow::array::FixedSizeBinaryArray;
+        let tagged_schema = Arc::new(Schema::new(vec![secret_tagged_field("api_key_handle")]));
+        let arr =
+            FixedSizeBinaryArray::try_from_iter([[0u8; 8]].iter().map(|b| b.as_slice())).unwrap();
+        let tagged = RecordBatch::try_new(tagged_schema, vec![Arc::new(arr)]).unwrap();
+        // Build a single-batch tagged stream directly (bypassing `encode_batch`,
+        // which would have rejected it on the way out).
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut buf, tagged.schema().as_ref()).unwrap();
+            w.write(&tagged).unwrap();
+            w.finish().unwrap();
+        }
+        match decode_batch(&buf) {
+            Ok(_) => panic!("decode_batch must reject secret-handle columns"),
+            Err(IpcError::SecretLeakAttempt { column }) => {
+                assert_eq!(column, "api_key_handle");
+            }
+            Err(other) => panic!("expected SecretLeakAttempt, got {other:?}"),
+        }
     }
 
     /// FU-2 acceptance: nested struct/list fields are walked, so a

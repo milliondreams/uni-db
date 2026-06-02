@@ -622,14 +622,6 @@ impl TxAppenderBuilder {
 /// Default grant set for the WASM loaders when the caller passes none:
 /// surface registration for scalar / aggregate / procedure plugins.
 #[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
-pub(crate) fn default_surface_grants() -> Vec<String> {
-    vec![
-        "ScalarFn".to_owned(),
-        "AggregateFn".to_owned(),
-        "Procedure".to_owned(),
-    ]
-}
-
 /// Marshal a WASM / Extism `LoadOutcome` into the dict shape the Python
 /// plugin-load APIs return (the WASM/Extism outcomes already carry
 /// `Vec<String>` capability lists, so no `Debug`-formatting is needed).
@@ -980,12 +972,14 @@ impl Database {
         wasm_bytes: &[u8],
         grants: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
-        let cap_set = crate::builders::build_capability_set(grants.clone());
-        let host_grants = grants.unwrap_or_else(default_surface_grants);
+        // `cap_set` is the rich capability set derived from `grants` (names →
+        // attenuated `Capability`; None → default scalar/agg/proc). It drives
+        // both the registration gate and the guest host-fn grant set.
+        let cap_set = crate::builders::build_capability_set(grants);
         let loader = uni_plugin_wasm::WasmLoader::new();
         let outcome = self
             .inner
-            .load_wasm_component(&loader, wasm_bytes, &host_grants, &cap_set)
+            .load_wasm_component(&loader, wasm_bytes, &cap_set, &cap_set)
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         wasm_outcome_to_pydict(
             py,
@@ -1014,12 +1008,11 @@ impl Database {
         wasm_bytes: &[u8],
         grants: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
-        let cap_set = crate::builders::build_capability_set(grants.clone());
-        let host_grants = grants.unwrap_or_else(default_surface_grants);
+        let cap_set = crate::builders::build_capability_set(grants);
         let loader = uni_plugin_extism::ExtismLoader::new();
         let outcome = self
             .inner
-            .load_wasm_extism(&loader, wasm_bytes, &host_grants, &cap_set)
+            .load_wasm_extism(&loader, wasm_bytes, &cap_set, &cap_set)
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         wasm_outcome_to_pydict(
             py,

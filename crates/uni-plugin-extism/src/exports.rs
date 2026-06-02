@@ -236,7 +236,7 @@ mod tests {
         let json = br#"{
             "id": "a.b",
             "version": "0.0.1",
-            "capabilities": ["Filesystem"],
+            "capabilities": ["filesystem"],
             "fuel_per_call": 1000,
             "memory_max_pages": 4,
             "timeout_ms": 500
@@ -245,7 +245,12 @@ mod tests {
         assert_eq!(m.fuel_per_call, Some(1000));
         assert_eq!(m.memory_max_pages, Some(4));
         assert_eq!(m.timeout_ms, Some(500));
-        assert_eq!(m.capabilities, vec!["Filesystem".to_owned()]);
+        assert!(m.declared_capability_set().contains_variant(
+            &uni_plugin::Capability::Filesystem {
+                read: vec![],
+                write: vec![],
+            }
+        ));
     }
 
     #[test]

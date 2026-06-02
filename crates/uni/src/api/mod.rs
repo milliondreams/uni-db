@@ -1898,12 +1898,12 @@ impl Uni {
     /// surface kind a plugin entry will use, or registration will
     /// fail with [`uni_plugin::PluginError::CapabilityRequired`].
     ///
-    /// `host_grants` is the list of capability **names** (strings) the
-    /// host grants the plugin for **host-fn access** (e.g.,
-    /// `"Filesystem"`, `"Network"`). The set is intersected with the
-    /// plugin manifest's declared capabilities to compute the
-    /// effective grant set; only host fns whose
-    /// `required_capability` is in that set become part of the plugin's
+    /// `host_grants` is the [`uni_plugin::CapabilitySet`] the host grants the
+    /// plugin for **host-fn access** (e.g. `Capability::Network { allow }` with
+    /// an attenuation allow-list). It is intersected with the plugin manifest's
+    /// declared capabilities to compute the effective grant set; only host fns
+    /// whose `required_capability` variant is in that set become part of the
+    /// plugin's
     /// import table.
     ///
     /// # Errors
@@ -1920,7 +1920,7 @@ impl Uni {
         &self,
         loader: &uni_plugin_extism::ExtismLoader,
         bytes: &[u8],
-        host_grants: &[String],
+        host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_extism::loader::LoadOutcome> {
         use uni_plugin::{PluginId, PluginRegistrar};
@@ -1979,7 +1979,7 @@ impl Uni {
         &self,
         loader: &uni_plugin_wasm::WasmLoader,
         bytes: &[u8],
-        host_grants: &[String],
+        host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_wasm::loader::LoadOutcome> {
         use uni_plugin::{PluginId, PluginRegistrar};

@@ -91,9 +91,14 @@ fn http_request(
             _ => None,
         })
         .unwrap_or(DEFAULT_TIMEOUT);
+    // Propagate the host's trace context (W3C traceparent) into the outbound
+    // call when one is active (real value only in `otel`-enabled builds; `None`
+    // otherwise — no fabricated trace ids).
+    let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
+    let tp = traceparent.as_deref();
     let response = match body {
-        Some(b) => egress.post(url, b, timeout, MAX_RESPONSE_BYTES),
-        None => egress.get(url, timeout, MAX_RESPONSE_BYTES),
+        Some(b) => egress.post(url, b, timeout, MAX_RESPONSE_BYTES, tp),
+        None => egress.get(url, timeout, MAX_RESPONSE_BYTES, tp),
     }
     .map_err(|e| rt_err(format!("uni.http(`{url}`): {e}")))?;
     if response.status >= 400 {

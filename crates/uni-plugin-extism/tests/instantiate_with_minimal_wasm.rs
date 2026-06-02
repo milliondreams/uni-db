@@ -7,6 +7,7 @@
 //! use `wat::parse_str` to compile minimal WAT to bytes so the test
 //! has no external fixture.
 
+use uni_plugin::{Capability, CapabilitySet};
 use uni_plugin_extism::{ExtismLoader, error::ExtismError, host_fns::HostFnSpec};
 
 const MIN_MANIFEST_NO_CAPS: &str = r#"{"id":"ai.example.minwasm","version":"0.0.1"}"#;
@@ -30,7 +31,7 @@ fn trivial_wasm() -> Vec<u8> {
 fn instantiate_succeeds_on_valid_wasm_with_no_caps() {
     let loader = ExtismLoader::new();
     let prepared = loader
-        .prepare(MIN_MANIFEST_NO_CAPS.as_bytes(), &[])
+        .prepare(MIN_MANIFEST_NO_CAPS.as_bytes(), &CapabilitySet::new())
         .expect("manifest prepares");
 
     let plugin = loader
@@ -47,7 +48,7 @@ fn instantiate_succeeds_on_valid_wasm_with_no_caps() {
 fn instantiate_fails_on_invalid_wasm() {
     let loader = ExtismLoader::new();
     let prepared = loader
-        .prepare(MIN_MANIFEST_NO_CAPS.as_bytes(), &[])
+        .prepare(MIN_MANIFEST_NO_CAPS.as_bytes(), &CapabilitySet::new())
         .expect("manifest prepares");
 
     let err = loader
@@ -93,7 +94,10 @@ fn instantiate_filters_host_fns_through_effective_capabilities() {
     loader.register_host_function(
         HostFnSpec {
             name: "host_fs_read".to_owned(),
-            required_capability: Some("Filesystem".to_owned()),
+            required_capability: Some(Capability::Filesystem {
+                read: vec![],
+                write: vec![],
+            }),
             docs: "Filesystem-gated".to_owned(),
         },
         fs_fn,
@@ -101,12 +105,15 @@ fn instantiate_filters_host_fns_through_effective_capabilities() {
     assert_eq!(loader.runtime_fn_count(), 2);
 
     // Plugin declares Filesystem but host doesn't grant it.
-    let manifest = r#"{"id":"a.b","version":"0.0.1","capabilities":["Filesystem"]}"#;
-    let prepared = loader.prepare(manifest.as_bytes(), &[]).unwrap();
+    let manifest = r#"{"id":"a.b","version":"0.0.1","capabilities":["filesystem"]}"#;
+    let prepared = loader
+        .prepare(manifest.as_bytes(), &CapabilitySet::new())
+        .unwrap();
 
     // Only host_log survives the filter — Filesystem wasn't granted.
     assert_eq!(prepared.allowed_host_fns, vec!["host_log".to_owned()]);
-    assert_eq!(prepared.denied_capabilities, vec!["Filesystem".to_owned()]);
+    assert_eq!(prepared.denied_capabilities.len(), 1);
+    assert!(prepared.denied_capabilities[0].contains("Filesystem"));
 
     // build_plugin must succeed — it sees one allowed fn and the rest
     // are absent from the import table (Extism analogue of linker absence).
@@ -128,7 +135,9 @@ fn instantiate_honors_manifest_resource_limits() {
         "memory_max_pages": 4,
         "timeout_ms": 5000
     }"#;
-    let prepared = loader.prepare(manifest.as_bytes(), &[]).unwrap();
+    let prepared = loader
+        .prepare(manifest.as_bytes(), &CapabilitySet::new())
+        .unwrap();
     let _plugin = loader
         .instantiate(&trivial_wasm(), &prepared)
         .expect("instantiation honors resource limits");

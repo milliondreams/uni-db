@@ -38,7 +38,7 @@ impl WasmConformanceLoader for PathLoader {
         // functions, whose registration is gated by the synthesized manifest's
         // `Capability::ScalarFn`, not by host grants.
         WasmLoader::new()
-            .load_as_plugin(&bytes, &[])
+            .load_as_plugin(&bytes, &uni_plugin::CapabilitySet::new())
             .map_err(|e| format!("load_as_plugin: {e}"))
     }
 }
@@ -52,7 +52,10 @@ fn garbage_bytes_yield_failing_load_check() {
     impl WasmConformanceLoader for GarbageLoader {
         fn load(&self, _path: &Path) -> Result<Box<dyn uni_plugin::Plugin + Send + Sync>, String> {
             WasmLoader::new()
-                .load_as_plugin(b"definitely not a wasm component", &[])
+                .load_as_plugin(
+                    b"definitely not a wasm component",
+                    &uni_plugin::CapabilitySet::new(),
+                )
                 .map_err(|e| e.to_string())
         }
     }

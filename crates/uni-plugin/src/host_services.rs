@@ -57,13 +57,23 @@ pub struct HttpResponse {
 /// timeout, and response-size limits are enforced by the caller against the
 /// plugin's granted [`crate::Capability::Network`]; the `timeout` and
 /// `max_bytes` arguments carry those decisions into the request.
+///
+/// `traceparent`, when `Some`, is injected as the W3C `traceparent` request
+/// header so the host's trace context propagates across the plugin boundary
+/// into the outbound call (see [`crate::observability::TraceContext::to_traceparent`]).
 pub trait HttpEgress: Send + Sync {
     /// Perform a blocking HTTP GET, reading at most `max_bytes` of the body.
     ///
     /// # Errors
     ///
     /// Returns [`FnError`] on connection, timeout, or transport failure.
-    fn get(&self, url: &str, timeout: Duration, max_bytes: usize) -> Result<HttpResponse, FnError>;
+    fn get(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_bytes: usize,
+        traceparent: Option<&str>,
+    ) -> Result<HttpResponse, FnError>;
 
     /// Perform a blocking HTTP POST of `body`, reading at most `max_bytes` of
     /// the response body.
@@ -77,5 +87,6 @@ pub trait HttpEgress: Send + Sync {
         body: &[u8],
         timeout: Duration,
         max_bytes: usize,
+        traceparent: Option<&str>,
     ) -> Result<HttpResponse, FnError>;
 }

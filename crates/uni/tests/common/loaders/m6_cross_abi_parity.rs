@@ -56,12 +56,21 @@ async fn cross_abi_haversine_results_match() -> anyhow::Result<()> {
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
 
     let ext_bytes = read_artifact(EXTISM_WASM);
-    let ext_outcome = uni_extism.load_wasm_extism(&ExtismLoader::new(), &ext_bytes, &[], &caps)?;
+    let ext_outcome = uni_extism.load_wasm_extism(
+        &ExtismLoader::new(),
+        &ext_bytes,
+        &CapabilitySet::new(),
+        &caps,
+    )?;
     assert_eq!(ext_outcome.plugin_id, "ai.example.geo");
 
     let comp_bytes = read_artifact(COMPONENT_WASM);
-    let comp_outcome =
-        uni_component.load_wasm_component(&WasmLoader::new(), &comp_bytes, &[], &caps)?;
+    let comp_outcome = uni_component.load_wasm_component(
+        &WasmLoader::new(),
+        &comp_bytes,
+        &CapabilitySet::new(),
+        &caps,
+    )?;
     assert_eq!(comp_outcome.plugin_id, "ai.example.geo");
 
     // Look up adapters from each registry.

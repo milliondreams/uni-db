@@ -41,7 +41,7 @@ use crate::host_state::HostState;
 ///   (e.g., interface mismatch with the bindings).
 pub fn build_scalar_linker_v1(
     engine: &Engine,
-    effective_caps: &[String],
+    effective_caps: &uni_plugin::CapabilitySet,
 ) -> Result<Linker<HostState>, WasmError> {
     let mut linker = Linker::<HostState>::new(engine);
     // Wire WASI Preview 2 imports. The standard Rust→wasm32-wasip2
@@ -69,7 +69,7 @@ pub fn build_scalar_linker_v1(
 /// the major selection reflects the plugin's declared `abi` range.
 pub fn build_scalar_linker(
     engine: &Engine,
-    effective_caps: &[String],
+    effective_caps: &uni_plugin::CapabilitySet,
 ) -> Result<Linker<HostState>, WasmError> {
     build_scalar_linker_v1(engine, effective_caps)
 }
@@ -86,7 +86,7 @@ pub fn build_scalar_linker(
 /// - [`WasmError::Instantiate`] if host-fn registration fails.
 pub fn build_scalar_linker_v2(
     engine: &Engine,
-    effective_caps: &[String],
+    effective_caps: &uni_plugin::CapabilitySet,
 ) -> Result<Linker<HostState>, WasmError> {
     let mut linker = build_scalar_linker_v1(engine, effective_caps)?;
     // v2 differentiation marker: an additional `host-log-v2` interface

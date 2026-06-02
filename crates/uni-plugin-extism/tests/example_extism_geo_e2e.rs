@@ -48,7 +48,9 @@ fn loads_and_invokes_geo_haversine_end_to_end() {
     let registry = PluginRegistry::new();
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
     let mut r = PluginRegistrar::new(PluginId::new("extism.test"), &caps, &registry);
-    let outcome = loader.load(&bytes, &[], &mut r).expect("load");
+    let outcome = loader
+        .load(&bytes, &CapabilitySet::new(), &mut r)
+        .expect("load");
     r.commit_to_registry().expect("commit");
 
     assert_eq!(outcome.plugin_id, "ai.example.geo");
@@ -97,7 +99,9 @@ fn invokes_handle_multi_row_batches() {
     let registry = PluginRegistry::new();
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
     let mut r = PluginRegistrar::new(PluginId::new("extism.batch"), &caps, &registry);
-    loader.load(&bytes, &[], &mut r).expect("load");
+    loader
+        .load(&bytes, &CapabilitySet::new(), &mut r)
+        .expect("load");
     r.commit_to_registry().expect("commit");
 
     let qname = QName::parse("ai.example.geo.haversine").expect("valid qname");

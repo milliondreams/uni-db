@@ -131,11 +131,10 @@ impl AsyncDatabase {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let cap_set = crate::builders::build_capability_set(grants.clone());
-            let host_grants = grants.unwrap_or_else(crate::sync_api::default_surface_grants);
+            let cap_set = crate::builders::build_capability_set(grants);
             let loader = uni_plugin_wasm::WasmLoader::new();
             let outcome = inner
-                .load_wasm_component(&loader, &wasm_bytes, &host_grants, &cap_set)
+                .load_wasm_component(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Python::attach(|py| {
                 crate::sync_api::wasm_outcome_to_pydict(
@@ -166,11 +165,10 @@ impl AsyncDatabase {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let cap_set = crate::builders::build_capability_set(grants.clone());
-            let host_grants = grants.unwrap_or_else(crate::sync_api::default_surface_grants);
+            let cap_set = crate::builders::build_capability_set(grants);
             let loader = uni_plugin_extism::ExtismLoader::new();
             let outcome = inner
-                .load_wasm_extism(&loader, &wasm_bytes, &host_grants, &cap_set)
+                .load_wasm_extism(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Python::attach(|py| {
                 crate::sync_api::wasm_outcome_to_pydict(

@@ -31,7 +31,13 @@ impl KmsProvider for FakeKms {
 /// Fake egress echoing the request — no real socket.
 struct FakeHttp;
 impl HttpEgress for FakeHttp {
-    fn get(&self, url: &str, _t: Duration, _m: usize) -> Result<HttpResponse, FnError> {
+    fn get(
+        &self,
+        url: &str,
+        _t: Duration,
+        _m: usize,
+        _tp: Option<&str>,
+    ) -> Result<HttpResponse, FnError> {
         Ok(HttpResponse {
             status: 200,
             body: format!("GET {url}").into_bytes(),
@@ -43,6 +49,7 @@ impl HttpEgress for FakeHttp {
         body: &[u8],
         _t: Duration,
         _m: usize,
+        _tp: Option<&str>,
     ) -> Result<HttpResponse, FnError> {
         Ok(HttpResponse {
             status: 200,

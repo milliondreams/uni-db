@@ -53,7 +53,7 @@ use crate::host_fns::HostFnRegistry;
 /// [`HostFnSpec`]: crate::host_fns::HostFnSpec
 pub fn checked_call<F, R>(
     registry: &HostFnRegistry,
-    grants: &[String],
+    grants: &uni_plugin::CapabilitySet,
     host_fn: &str,
     body: F,
 ) -> Result<R, ExtismError>
@@ -64,11 +64,11 @@ where
         .get(host_fn)
         .ok_or_else(|| ExtismError::InvalidPlugin(format!("unknown host fn `{host_fn}`")))?;
     if let Some(cap) = &spec.required_capability
-        && !grants.iter().any(|g| g == cap)
+        && !grants.contains_variant(cap)
     {
         return Err(ExtismError::CapabilityDenied {
             host_fn: host_fn.to_owned(),
-            capability: cap.clone(),
+            capability: format!("{cap:?}"),
         });
     }
     body()
@@ -78,12 +78,20 @@ where
 mod tests {
     use super::*;
     use crate::host_fns::HostFnSpec;
+    use uni_plugin::{Capability, CapabilitySet};
+
+    fn fs_cap() -> Capability {
+        Capability::Filesystem {
+            read: vec![],
+            write: vec![],
+        }
+    }
 
     fn fs_registry() -> HostFnRegistry {
         let mut r = HostFnRegistry::new();
         r.register(HostFnSpec {
             name: "host_fs_read".to_owned(),
-            required_capability: Some("Filesystem".to_owned()),
+            required_capability: Some(fs_cap()),
             docs: "Read file.".to_owned(),
         });
         r.register(HostFnSpec {
@@ -97,14 +105,16 @@ mod tests {
     #[test]
     fn always_available_fn_runs_without_grants() {
         let r = fs_registry();
-        let result = checked_call(&r, &[], "host_log", || Ok::<_, ExtismError>(42));
+        let result = checked_call(&r, &CapabilitySet::new(), "host_log", || {
+            Ok::<_, ExtismError>(42)
+        });
         assert_eq!(result.unwrap(), 42);
     }
 
     #[test]
     fn gated_fn_with_matching_grant_runs_body() {
         let r = fs_registry();
-        let grants = vec!["Filesystem".to_owned()];
+        let grants = CapabilitySet::from_iter_of([fs_cap()]);
         let out = checked_call(&r, &grants, "host_fs_read", || {
             Ok::<_, ExtismError>(vec![0_u8, 1, 2])
         })
@@ -116,7 +126,7 @@ mod tests {
     fn gated_fn_without_grant_denies_without_running_body() {
         let r = fs_registry();
         let mut body_ran = false;
-        let err = checked_call(&r, &[], "host_fs_read", || {
+        let err = checked_call(&r, &CapabilitySet::new(), "host_fs_read", || {
             body_ran = true;
             Ok::<_, ExtismError>(())
         })
@@ -127,7 +137,10 @@ mod tests {
                 capability,
             } => {
                 assert_eq!(host_fn, "host_fs_read");
-                assert_eq!(capability, "Filesystem");
+                assert!(
+                    capability.contains("Filesystem"),
+                    "capability: {capability}"
+                );
             }
             other => panic!("expected CapabilityDenied, got: {other:?}"),
         }
@@ -137,7 +150,10 @@ mod tests {
     #[test]
     fn unregistered_fn_returns_invalid_plugin_not_denied() {
         let r = fs_registry();
-        let err = checked_call(&r, &[], "host_mystery", || Ok::<_, ExtismError>(())).unwrap_err();
+        let err = checked_call(&r, &CapabilitySet::new(), "host_mystery", || {
+            Ok::<_, ExtismError>(())
+        })
+        .unwrap_err();
         assert!(
             matches!(err, ExtismError::InvalidPlugin(_)),
             "expected InvalidPlugin (host bug), got: {err:?}"
@@ -147,7 +163,7 @@ mod tests {
     #[test]
     fn body_error_propagates_through_helper() {
         let r = fs_registry();
-        let grants = vec!["Filesystem".to_owned()];
+        let grants = CapabilitySet::from_iter_of([fs_cap()]);
         let err = checked_call(&r, &grants, "host_fs_read", || {
             Err::<(), _>(ExtismError::MemoryExchange("simulated".to_owned()))
         })
@@ -159,11 +175,11 @@ mod tests {
     fn extra_grants_dont_change_outcome() {
         // Plugin granted superset of what host fn needs — still passes.
         let r = fs_registry();
-        let grants = vec![
-            "Filesystem".to_owned(),
-            "Network".to_owned(),
-            "Kms".to_owned(),
-        ];
+        let grants = CapabilitySet::from_iter_of([
+            fs_cap(),
+            Capability::Network { allow: vec![] },
+            Capability::Kms { key_ids: vec![] },
+        ]);
         let res = checked_call(&r, &grants, "host_fs_read", || Ok::<_, ExtismError>(7));
         assert_eq!(res.unwrap(), 7);
     }

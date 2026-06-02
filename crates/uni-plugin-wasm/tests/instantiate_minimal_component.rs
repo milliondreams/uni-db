@@ -36,7 +36,10 @@ fn build_echo_component_wasm() -> Vec<u8> {
 fn instantiate_rejects_garbage_bytes_as_invalid_wasm() {
     let l = WasmLoader::new();
     let prep = l
-        .prepare(b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}", &[])
+        .prepare(
+            b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}",
+            &CapabilitySet::new(),
+        )
         .unwrap();
     let err = l
         .instantiate(&build_echo_component_wasm(), &prep)
@@ -54,7 +57,11 @@ fn load_rejects_garbage_bytes() {
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
     let mut registrar = PluginRegistrar::new(PluginId::new("wasm.test"), &caps, &registry);
     let err = loader
-        .load(b"definitely not wasm", &[], &mut registrar)
+        .load(
+            b"definitely not wasm",
+            &CapabilitySet::new(),
+            &mut registrar,
+        )
         .expect_err("garbage must fail");
     assert!(
         matches!(err, WasmError::InvalidWasm(_)),
@@ -69,7 +76,7 @@ fn load_rejects_empty_bytes() {
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
     let mut registrar = PluginRegistrar::new(PluginId::new("wasm.test"), &caps, &registry);
     let err = loader
-        .load(&[], &[], &mut registrar)
+        .load(&[], &CapabilitySet::new(), &mut registrar)
         .expect_err("empty bytes must fail");
     assert!(
         matches!(err, WasmError::InvalidWasm(_)),
@@ -83,7 +90,7 @@ fn prepare_then_instantiate_garbage_yields_invalid_wasm() {
     let prep = l
         .prepare(
             br#"{"id":"a.b","version":"0.0.0","fuel_per_call":10000,"timeout_ms":1000}"#,
-            &[],
+            &CapabilitySet::new(),
         )
         .unwrap();
     assert_eq!(prep.manifest.fuel_per_call, Some(10000));

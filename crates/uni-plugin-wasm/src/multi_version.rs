@@ -85,7 +85,7 @@ impl MultiVersionLinker {
     pub fn linker_for(
         &self,
         abi: &AbiRange,
-        effective_caps: &[String],
+        effective_caps: &uni_plugin::CapabilitySet,
     ) -> Result<Arc<Linker<HostState>>, WasmError> {
         let Some(major) = SUPPORTED_MAJORS.iter().copied().find(|m| abi.matches(*m)) else {
             return Err(WasmError::AbiUnsupported {
@@ -125,14 +125,14 @@ impl MultiVersionLinker {
     }
 }
 
-/// Build a deterministic signature for a caps slice.
+/// Build a deterministic signature for an effective capability set (linker
+/// cache key).
 ///
-/// Sorted, comma-separated. Cheap enough to compute on every lookup
-/// because cap sets are short (single digits in practice).
-fn caps_signature(caps: &[String]) -> String {
-    let mut sorted: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-    sorted.sort_unstable();
-    sorted.join(",")
+/// `CapabilitySet` is backed by a `BTreeSet`, so its serialization is sorted
+/// and stable — including the attenuation patterns, so two grants that differ
+/// only in (say) their network allow-list key distinct linkers.
+fn caps_signature(caps: &uni_plugin::CapabilitySet) -> String {
+    serde_json::to_string(caps).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -150,7 +150,9 @@ mod tests {
     fn linker_for_v1_matches_caret_one() {
         let mv = MultiVersionLinker::new(engine());
         let abi = AbiRange::parse("^1").unwrap();
-        let l = mv.linker_for(&abi, &[]).expect("v1 selected");
+        let l = mv
+            .linker_for(&abi, &uni_plugin::CapabilitySet::new())
+            .expect("v1 selected");
         assert!(Arc::strong_count(&l) >= 2, "cache holds an Arc clone");
     }
 
@@ -158,14 +160,16 @@ mod tests {
     fn linker_for_v2_matches_caret_two() {
         let mv = MultiVersionLinker::new(engine());
         let abi = AbiRange::parse("^2").unwrap();
-        let _ = mv.linker_for(&abi, &[]).expect("v2 selected");
+        let _ = mv
+            .linker_for(&abi, &uni_plugin::CapabilitySet::new())
+            .expect("v2 selected");
     }
 
     #[test]
     fn linker_for_rejects_unsupported_major() {
         let mv = MultiVersionLinker::new(engine());
         let abi = AbiRange::parse("^99").unwrap();
-        let err = match mv.linker_for(&abi, &[]) {
+        let err = match mv.linker_for(&abi, &uni_plugin::CapabilitySet::new()) {
             Ok(_) => panic!("expected AbiUnsupported"),
             Err(e) => e,
         };
@@ -185,15 +189,33 @@ mod tests {
     fn cache_returns_same_arc_on_repeat_lookup() {
         let mv = MultiVersionLinker::new(engine());
         let abi = AbiRange::parse("^1").unwrap();
-        let a = mv.linker_for(&abi, &[]).unwrap();
-        let b = mv.linker_for(&abi, &[]).unwrap();
+        let a = mv
+            .linker_for(&abi, &uni_plugin::CapabilitySet::new())
+            .unwrap();
+        let b = mv
+            .linker_for(&abi, &uni_plugin::CapabilitySet::new())
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &b), "expected cache hit to return same Arc");
     }
 
     #[test]
-    fn caps_signature_is_sort_invariant() {
-        let a = caps_signature(&["b".to_owned(), "a".to_owned(), "c".to_owned()]);
-        let b = caps_signature(&["c".to_owned(), "a".to_owned(), "b".to_owned()]);
-        assert_eq!(a, b);
+    fn caps_signature_is_order_invariant() {
+        use uni_plugin::{Capability, CapabilitySet};
+        // CapabilitySet is a BTreeSet, so insertion order can't change the
+        // signature; distinct attenuation must, though.
+        let a = CapabilitySet::from_iter_of([Capability::ScalarFn, Capability::Procedure]);
+        let b = CapabilitySet::from_iter_of([Capability::Procedure, Capability::ScalarFn]);
+        assert_eq!(caps_signature(&a), caps_signature(&b));
+        let net1 = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec!["https://a/**".into()],
+        }]);
+        let net2 = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec!["https://b/**".into()],
+        }]);
+        assert_ne!(
+            caps_signature(&net1),
+            caps_signature(&net2),
+            "different allow-lists must key distinct linkers"
+        );
     }
 }

@@ -14,12 +14,19 @@
 //! - **Effective capability set** — so capability-gated host fns
 //!   can dispatch on the granted set.
 
+use std::sync::Arc;
+
+use uni_plugin::{CapabilitySet, HttpEgress};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// State threaded through every wasmtime `Store<HostState>`.
 pub struct HostState {
-    /// Effective capability set granted to the plugin instance.
-    pub effective_caps: Vec<String>,
+    /// Effective capability set (rich, with attenuation patterns) granted to
+    /// the plugin instance — capability-gated host fns dispatch + enforce
+    /// call-time attenuation against it.
+    pub effective: CapabilitySet,
+    /// HTTP egress backing the `host-net` interface, when granted + configured.
+    pub http: Option<Arc<dyn HttpEgress>>,
     /// WASI context — minimal, no preopens, no inherited stdio.
     /// Plugins requesting filesystem / network access go through
     /// capability-gated host fns, not raw WASI preopens.
@@ -29,15 +36,16 @@ pub struct HostState {
 }
 
 impl HostState {
-    /// Construct a fresh `HostState` with the given effective caps.
+    /// Construct a fresh `HostState` with the given effective caps + egress.
     ///
     /// The WASI context starts minimal — no preopens, no inherited
     /// stdio, no environment.
     #[must_use]
-    pub fn new(effective_caps: Vec<String>) -> Self {
+    pub fn new(effective: CapabilitySet, http: Option<Arc<dyn HttpEgress>>) -> Self {
         let wasi = WasiCtxBuilder::new().build();
         Self {
-            effective_caps,
+            effective,
+            http,
             wasi,
             table: ResourceTable::new(),
         }
@@ -47,7 +55,8 @@ impl HostState {
 impl std::fmt::Debug for HostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostState")
-            .field("effective_caps", &self.effective_caps)
+            .field("effective", &self.effective)
+            .field("http", &self.http.is_some())
             .finish_non_exhaustive()
     }
 }

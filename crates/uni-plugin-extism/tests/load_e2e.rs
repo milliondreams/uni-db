@@ -38,7 +38,7 @@ fn load_rejects_plugin_without_manifest_export() {
     let mut registrar = PluginRegistrar::new(PluginId::new("extism.test"), &caps, &registry);
 
     let err = loader
-        .load(&trivial_wasm(), &[], &mut registrar)
+        .load(&trivial_wasm(), &CapabilitySet::new(), &mut registrar)
         .expect_err("trivial plugin has no `manifest` export — load must fail");
 
     assert!(
@@ -55,7 +55,7 @@ fn load_rejects_garbage_bytes_with_instantiate_error() {
     let mut registrar = PluginRegistrar::new(PluginId::new("extism.test"), &caps, &registry);
 
     let err = loader
-        .load(b"obviously not wasm", &[], &mut registrar)
+        .load(b"obviously not wasm", &CapabilitySet::new(), &mut registrar)
         .expect_err("garbage bytes can't compile — load must fail");
     assert!(
         matches!(err, ExtismError::Instantiate(_)),

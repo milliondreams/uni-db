@@ -40,8 +40,14 @@ impl BlockingHttpEgress {
 }
 
 impl HttpEgress for BlockingHttpEgress {
-    fn get(&self, url: &str, timeout: Duration, max_bytes: usize) -> Result<HttpResponse, FnError> {
-        run_on_dedicated_thread(url, None, timeout, max_bytes)
+    fn get(
+        &self,
+        url: &str,
+        timeout: Duration,
+        max_bytes: usize,
+        traceparent: Option<&str>,
+    ) -> Result<HttpResponse, FnError> {
+        run_on_dedicated_thread(url, None, timeout, max_bytes, traceparent)
     }
 
     fn post(
@@ -50,8 +56,9 @@ impl HttpEgress for BlockingHttpEgress {
         body: &[u8],
         timeout: Duration,
         max_bytes: usize,
+        traceparent: Option<&str>,
     ) -> Result<HttpResponse, FnError> {
-        run_on_dedicated_thread(url, Some(body), timeout, max_bytes)
+        run_on_dedicated_thread(url, Some(body), timeout, max_bytes, traceparent)
     }
 }
 
@@ -62,9 +69,10 @@ fn run_on_dedicated_thread(
     body: Option<&[u8]>,
     timeout: Duration,
     max_bytes: usize,
+    traceparent: Option<&str>,
 ) -> Result<HttpResponse, FnError> {
     std::thread::scope(|scope| {
-        let handle = scope.spawn(|| do_request(url, body, timeout, max_bytes));
+        let handle = scope.spawn(|| do_request(url, body, timeout, max_bytes, traceparent));
         match handle.join() {
             Ok(result) => result,
             Err(_) => Err(FnError::new(
@@ -81,15 +89,20 @@ fn do_request(
     body: Option<&[u8]>,
     timeout: Duration,
     max_bytes: usize,
+    traceparent: Option<&str>,
 ) -> Result<HttpResponse, FnError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
         .map_err(|e| FnError::new(ERR_CLIENT_BUILD, format!("http client build: {e}")))?;
-    let request = match body {
+    let mut request = match body {
         Some(b) => client.post(url).body(b.to_vec()),
         None => client.get(url),
     };
+    // Propagate the host's trace context across the plugin boundary when present.
+    if let Some(tp) = traceparent {
+        request = request.header("traceparent", tp);
+    }
     let response = request
         .send()
         .map_err(|e| FnError::new(ERR_TRANSPORT, format!("http send `{url}`: {e}")))?;
@@ -124,7 +137,12 @@ mod tests {
         // under a Tokio-capable context.
         let egress = BlockingHttpEgress::new();
         let err = egress
-            .get("http://127.0.0.1:1/", Duration::from_millis(200), 1024)
+            .get(
+                "http://127.0.0.1:1/",
+                Duration::from_millis(200),
+                1024,
+                None,
+            )
             .expect_err("connection to a dead port must fail");
         assert_eq!(err.code, ERR_TRANSPORT);
     }

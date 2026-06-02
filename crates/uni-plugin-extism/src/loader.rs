@@ -9,7 +9,7 @@
 
 // Rust guideline compliant
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
@@ -30,9 +30,11 @@ pub struct ExtismPluginManifest {
     /// Extism ABI range the plugin was built against.
     #[serde(default, rename = "abi-extism")]
     pub abi_extism: Option<String>,
-    /// Capabilities the plugin declares it needs.
+    /// Capabilities the plugin declares it needs — each a bare name
+    /// (`"network"`) or a structured object with attenuation patterns
+    /// (`{"kind":"network","allow":[...]}`); see [`uni_plugin::ManifestCapability`].
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<uni_plugin::ManifestCapability>,
     /// Determinism class (`"pure"`, `"session-scoped"`, `"nondeterministic"`).
     #[serde(default)]
     pub determinism: Option<String>,
@@ -55,15 +57,23 @@ pub struct ExtismPluginManifest {
     pub timeout_ms: Option<u64>,
 }
 
+impl ExtismPluginManifest {
+    /// The declared capabilities as a rich [`uni_plugin::CapabilitySet`].
+    #[must_use]
+    pub fn declared_capability_set(&self) -> uni_plugin::CapabilitySet {
+        uni_plugin::CapabilitySet::from_manifest(self.capabilities.iter().cloned())
+    }
+}
+
 /// Result of [`ExtismLoader::prepare`] — everything the host needs to
 /// instantiate the plugin once the SDK integration is wired.
 #[derive(Debug, Clone)]
 pub struct PreparedExtismPlugin {
     /// Parsed manifest.
     pub manifest: ExtismPluginManifest,
-    /// Capabilities granted to the plugin: intersection of declared
-    /// (manifest) and granted (host).
-    pub effective_capabilities: Vec<String>,
+    /// Capabilities granted to the plugin (rich, with attenuation patterns):
+    /// intersection of declared (manifest) and granted (host).
+    pub effective: uni_plugin::CapabilitySet,
     /// Host fns the plugin is allowed to import (post-capability filter).
     pub allowed_host_fns: Vec<String>,
     /// Capabilities the plugin requested but the host did not grant —
@@ -161,7 +171,7 @@ impl ExtismLoader {
     pub fn prepare(
         &self,
         manifest_json: &[u8],
-        grants: &[String],
+        grants: &uni_plugin::CapabilitySet,
     ) -> Result<PreparedExtismPlugin, ExtismError> {
         let manifest: ExtismPluginManifest = serde_json::from_slice(manifest_json)
             .map_err(|e| ExtismError::ManifestInvalid(format!("json parse: {e}")))?;
@@ -183,36 +193,33 @@ impl ExtismLoader {
     pub fn prepare_parsed(
         &self,
         manifest: ExtismPluginManifest,
-        grants: &[String],
+        grants: &uni_plugin::CapabilitySet,
     ) -> PreparedExtismPlugin {
-        // Effective capabilities = intersection of declared ∩ granted.
-        let granted_set: HashSet<&str> = grants.iter().map(String::as_str).collect();
-        let mut effective: Vec<String> = Vec::new();
-        let mut denied: Vec<String> = Vec::new();
-        for cap in &manifest.capabilities {
-            if granted_set.contains(cap.as_str()) {
-                effective.push(cap.clone());
-            } else {
-                denied.push(cap.clone());
-            }
-        }
-        let effective_set: HashSet<&str> = effective.iter().map(String::as_str).collect();
+        // Effective = declared ∩ granted (retains per-variant attenuation).
+        let declared = manifest.declared_capability_set();
+        let effective = declared.intersect(grants);
+        let denied: Vec<String> = declared
+            .iter()
+            .filter(|c| !effective.contains_variant(c))
+            .map(|c| format!("{c:?}"))
+            .collect();
 
-        // Host-fn filter: only fns whose required_capability is in
-        // `effective_set` (or has no required_capability — always-available).
+        // Host-fn filter: only fns whose required_capability *variant* is in
+        // the effective set (or which have no required_capability — always
+        // available). Pattern attenuation is enforced in the host-fn body.
         let allowed: Vec<String> = self
             .host_fns
             .iter()
             .filter(|spec| match &spec.required_capability {
                 None => true,
-                Some(req) => effective_set.contains(req.as_str()),
+                Some(req) => effective.contains_variant(req),
             })
             .map(|s| s.name.clone())
             .collect();
 
         PreparedExtismPlugin {
             manifest,
-            effective_capabilities: effective,
+            effective,
             allowed_host_fns: allowed,
             denied_capabilities: denied,
         }
@@ -305,7 +312,7 @@ impl ExtismLoader {
     pub fn load(
         &self,
         bytes: &[u8],
-        host_grants: &[String],
+        host_grants: &uni_plugin::CapabilitySet,
         registrar: &mut uni_plugin::PluginRegistrar<'_>,
     ) -> Result<LoadOutcome, ExtismError> {
         // Pass 1: build with no caps (empty allowed_host_fns) to read
@@ -324,7 +331,7 @@ impl ExtismLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective_capabilities: Vec::new(),
+            effective: uni_plugin::CapabilitySet::new(),
             allowed_host_fns: Vec::new(),
             denied_capabilities: Vec::new(),
         };
@@ -436,7 +443,11 @@ impl ExtismLoader {
         Ok(LoadOutcome {
             plugin_id: prepared.manifest.id.clone(),
             version: prepared.manifest.version.clone(),
-            effective_capabilities: prepared.effective_capabilities,
+            effective_capabilities: prepared
+                .effective
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect(),
             denied_capabilities: prepared.denied_capabilities,
             scalars_registered,
             aggregates_registered,
@@ -556,6 +567,7 @@ impl std::fmt::Debug for LoadOutcome {
 mod tests {
     use super::*;
     use crate::host_fns::HostFnSpec;
+    use uni_plugin::{Capability, CapabilitySet};
 
     fn manifest_json(caps: &[&str]) -> String {
         let caps_json: Vec<String> = caps.iter().map(|c| format!("\"{c}\"")).collect();
@@ -576,12 +588,19 @@ mod tests {
     // real plugin lives in tests/instantiate_with_minimal_wasm.rs and
     // (T#7) tests/example_extism_geo_e2e.rs.
 
+    fn fs_cap() -> Capability {
+        Capability::Filesystem {
+            read: vec![],
+            write: vec![],
+        }
+    }
+
     #[test]
     fn loader_accepts_host_fn_registrations() {
         let mut l = ExtismLoader::new();
         l.host_fns_mut().register(HostFnSpec {
             name: "host_fs_read".to_owned(),
-            required_capability: Some("Filesystem".to_owned()),
+            required_capability: Some(fs_cap()),
             docs: "Read file.".to_owned(),
         });
         assert_eq!(l.host_fns().len(), 1);
@@ -591,10 +610,10 @@ mod tests {
     fn prepare_parses_minimal_manifest() {
         let l = ExtismLoader::new();
         let json = manifest_json(&[]);
-        let prep = l.prepare(json.as_bytes(), &[]).unwrap();
+        let prep = l.prepare(json.as_bytes(), &CapabilitySet::new()).unwrap();
         assert_eq!(prep.manifest.id, "ai.example.test");
         assert_eq!(prep.manifest.version, "1.0.0");
-        assert!(prep.effective_capabilities.is_empty());
+        assert!(prep.effective.is_empty());
         assert!(prep.denied_capabilities.is_empty());
         assert!(prep.allowed_host_fns.is_empty());
     }
@@ -602,18 +621,22 @@ mod tests {
     #[test]
     fn prepare_intersects_declared_and_granted_capabilities() {
         let l = ExtismLoader::new();
-        let json = manifest_json(&["Filesystem", "Network", "Kms"]);
-        let grants = vec!["Filesystem".to_owned(), "Network".to_owned()];
+        // Declared (kebab bare names → zero-attenuation variants).
+        let json = manifest_json(&["filesystem", "network", "kms"]);
+        let grants = CapabilitySet::from_iter_of([fs_cap(), Capability::Network { allow: vec![] }]);
         let prep = l.prepare(json.as_bytes(), &grants).unwrap();
         // Granted: Filesystem + Network. Denied: Kms.
-        assert_eq!(prep.effective_capabilities.len(), 2);
+        assert_eq!(prep.effective.len(), 2);
+        assert!(prep.effective.contains_variant(&fs_cap()));
         assert!(
-            prep.effective_capabilities
-                .iter()
-                .any(|c| c == "Filesystem")
+            prep.effective
+                .contains_variant(&Capability::Network { allow: vec![] })
         );
-        assert!(prep.effective_capabilities.iter().any(|c| c == "Network"));
-        assert_eq!(prep.denied_capabilities, vec!["Kms"]);
+        assert!(
+            !prep
+                .effective
+                .contains_variant(&Capability::Kms { key_ids: vec![] })
+        );
     }
 
     #[test]
@@ -621,12 +644,12 @@ mod tests {
         let mut l = ExtismLoader::new();
         l.host_fns_mut().register(HostFnSpec {
             name: "host_fs_read".to_owned(),
-            required_capability: Some("Filesystem".to_owned()),
+            required_capability: Some(fs_cap()),
             docs: "Read file.".to_owned(),
         });
         l.host_fns_mut().register(HostFnSpec {
             name: "host_net_http_get".to_owned(),
-            required_capability: Some("Network".to_owned()),
+            required_capability: Some(Capability::Network { allow: vec![] }),
             docs: "HTTP GET.".to_owned(),
         });
         l.host_fns_mut().register(HostFnSpec {
@@ -635,10 +658,10 @@ mod tests {
             docs: "Log a message.".to_owned(),
         });
 
-        // Plugin requests Filesystem only; host grants Filesystem only.
-        let json = manifest_json(&["Filesystem"]);
+        // Plugin requests filesystem only; host grants filesystem only.
+        let json = manifest_json(&["filesystem"]);
         let prep = l
-            .prepare(json.as_bytes(), &["Filesystem".to_owned()])
+            .prepare(json.as_bytes(), &CapabilitySet::from_iter_of([fs_cap()]))
             .unwrap();
 
         // host_log is always-available; host_fs_read enabled by grant;
@@ -657,7 +680,7 @@ mod tests {
     #[test]
     fn prepare_rejects_malformed_manifest() {
         let l = ExtismLoader::new();
-        let err = l.prepare(b"not json", &[]).unwrap_err();
+        let err = l.prepare(b"not json", &CapabilitySet::new()).unwrap_err();
         assert!(matches!(err, ExtismError::ManifestInvalid(_)));
     }
 
@@ -668,7 +691,10 @@ mod tests {
         // `ExtismError::Instantiate`, not the old `NotYetImplemented`.
         let l = ExtismLoader::new();
         let prep = l
-            .prepare(b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}", &[])
+            .prepare(
+                b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}",
+                &CapabilitySet::new(),
+            )
             .unwrap();
         let err = l.instantiate(b"not real wasm", &prep).unwrap_err();
         assert!(

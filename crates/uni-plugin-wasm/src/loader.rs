@@ -19,7 +19,6 @@
 
 // Rust guideline compliant
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,9 +49,11 @@ pub struct ComponentManifest {
     /// Component Model ABI range (e.g., `"^1.2"`).
     #[serde(default)]
     pub abi: Option<String>,
-    /// Capabilities the plugin declares it needs.
+    /// Capabilities the plugin declares it needs. Each is a bare name
+    /// (`"network"`) or a structured object with attenuation patterns
+    /// (`{"kind":"network","allow":[...]}`) — see [`uni_plugin::ManifestCapability`].
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<uni_plugin::ManifestCapability>,
     /// Determinism class.
     #[serde(default)]
     pub determinism: Option<String>,
@@ -68,6 +69,14 @@ pub struct ComponentManifest {
     /// Wall-clock per-call timeout in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+impl ComponentManifest {
+    /// The declared capabilities as a rich [`uni_plugin::CapabilitySet`].
+    #[must_use]
+    pub fn declared_capability_set(&self) -> uni_plugin::CapabilitySet {
+        uni_plugin::CapabilitySet::from_manifest(self.capabilities.iter().cloned())
+    }
 }
 
 /// Wire-level scalar signature shipped by a plugin's `register` export.
@@ -154,14 +163,30 @@ pub struct RegistrationManifest {
 
 /// Outcome of [`WasmLoader::prepare`] — everything the host needs to
 /// decide whether to instantiate the component (and what to plumb in).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedComponent {
     /// Parsed manifest.
     pub manifest: ComponentManifest,
-    /// Granted ∩ declared capabilities — what the plugin actually gets.
-    pub effective_capabilities: Vec<String>,
-    /// Declared-but-not-granted capabilities — used for diagnostics.
+    /// Granted ∩ declared capabilities (rich, with attenuation patterns) —
+    /// what the plugin actually gets. Threaded into [`HostState`] so
+    /// capability-gated host fns can enforce call-time attenuation.
+    pub effective: uni_plugin::CapabilitySet,
+    /// Declared-but-not-granted capability variants — used for diagnostics.
     pub denied_capabilities: Vec<String>,
+    /// HTTP egress backing `host-net`, carried so pool factories (and the
+    /// `ComponentPlugin` re-register path) can install it on each `HostState`.
+    pub http: Option<Arc<dyn uni_plugin::HttpEgress>>,
+}
+
+impl std::fmt::Debug for PreparedComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedComponent")
+            .field("manifest", &self.manifest)
+            .field("effective", &self.effective)
+            .field("denied_capabilities", &self.denied_capabilities)
+            .field("http", &self.http.is_some())
+            .finish()
+    }
 }
 
 /// Concrete instance type pooled by [`WasmInstancePool`].
@@ -341,9 +366,20 @@ impl ProcedurePluginInstance {
 }
 
 /// Top-level WASM Component Model plugin loader.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WasmLoader {
-    _marker: (),
+    /// Optional HTTP egress backing the `host-net` interface. Threaded into
+    /// each instance's [`HostState`]; the linker only exposes `host-net` when
+    /// the plugin is granted `Capability::Network`.
+    http: Option<Arc<dyn uni_plugin::HttpEgress>>,
+}
+
+impl std::fmt::Debug for WasmLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmLoader")
+            .field("http", &self.http.is_some())
+            .finish()
+    }
 }
 
 impl WasmLoader {
@@ -351,6 +387,13 @@ impl WasmLoader {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach an HTTP egress backing the `host-net` interface (builder style).
+    #[must_use]
+    pub fn with_http(mut self, http: Arc<dyn uni_plugin::HttpEgress>) -> Self {
+        self.http = Some(http);
+        self
     }
 
     /// Parse a CM-plugin manifest and intersect declared/granted
@@ -362,7 +405,7 @@ impl WasmLoader {
     pub fn prepare(
         &self,
         manifest_json: &[u8],
-        grants: &[String],
+        grants: &uni_plugin::CapabilitySet,
     ) -> Result<PreparedComponent, WasmError> {
         let manifest: ComponentManifest = serde_json::from_slice(manifest_json)
             .map_err(|e| WasmError::InvalidWasm(format!("manifest json parse: {e}")))?;
@@ -382,22 +425,22 @@ impl WasmLoader {
     pub fn prepare_parsed(
         &self,
         manifest: ComponentManifest,
-        grants: &[String],
+        grants: &uni_plugin::CapabilitySet,
     ) -> PreparedComponent {
-        let granted_set: HashSet<&str> = grants.iter().map(String::as_str).collect();
-        let mut effective: Vec<String> = Vec::new();
-        let mut denied: Vec<String> = Vec::new();
-        for cap in &manifest.capabilities {
-            if granted_set.contains(cap.as_str()) {
-                effective.push(cap.clone());
-            } else {
-                denied.push(cap.clone());
-            }
-        }
+        let declared = manifest.declared_capability_set();
+        // Effective = declared ∩ granted (retains per-variant attenuation).
+        let effective = declared.intersect(grants);
+        // Declared variants the host did not grant — diagnostics only.
+        let denied: Vec<String> = declared
+            .iter()
+            .filter(|c| !effective.contains_variant(c))
+            .map(|c| format!("{c:?}"))
+            .collect();
         PreparedComponent {
             manifest,
-            effective_capabilities: effective,
+            effective,
             denied_capabilities: denied,
+            http: self.http.clone(),
         }
     }
 
@@ -418,14 +461,11 @@ impl WasmLoader {
         let engine = build_engine(&prepared.manifest)?;
         let component = Component::from_binary(&engine, bytes)
             .map_err(|e| WasmError::InvalidWasm(format!("component compile: {e}")))?;
-        let linker: Linker<HostState> = select_linker_for_manifest(
-            &engine,
-            &prepared.manifest,
-            &prepared.effective_capabilities,
-        )?;
+        let linker: Linker<HostState> =
+            select_linker_for_manifest(&engine, &prepared.manifest, &prepared.effective)?;
         let mut store = Store::new(
             &engine,
-            HostState::new(prepared.effective_capabilities.clone()),
+            HostState::new(prepared.effective.clone(), prepared.http.clone()),
         );
         apply_resource_limits(&mut store, &prepared.manifest);
         let bindings = ScalarPlugin::instantiate(&mut store, &component, &linker)
@@ -443,7 +483,7 @@ impl WasmLoader {
     pub fn load(
         &self,
         bytes: &[u8],
-        host_grants: &[String],
+        host_grants: &uni_plugin::CapabilitySet,
         registrar: &mut uni_plugin::PluginRegistrar<'_>,
     ) -> Result<LoadOutcome, WasmError> {
         // Pass 1 — minimal prepared state (no caps yet), instantiate
@@ -460,8 +500,9 @@ impl WasmLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective_capabilities: Vec::new(),
+            effective: uni_plugin::CapabilitySet::new(),
             denied_capabilities: Vec::new(),
+            http: None,
         };
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;
@@ -495,7 +536,7 @@ impl WasmLoader {
         Ok(LoadOutcome {
             plugin_id: prepared.manifest.id.clone(),
             version: prepared.manifest.version.clone(),
-            effective_capabilities: prepared.effective_capabilities,
+            effective_capabilities: capability_names(&prepared.effective),
             denied_capabilities: prepared.denied_capabilities,
             scalars_registered: names.scalars,
             aggregates_registered: names.aggregates,
@@ -527,7 +568,7 @@ impl WasmLoader {
     pub fn load_as_plugin(
         &self,
         bytes: &[u8],
-        host_grants: &[String],
+        host_grants: &uni_plugin::CapabilitySet,
     ) -> Result<Box<dyn uni_plugin::Plugin + Send + Sync>, WasmError> {
         // Pass 1 — instantiate with no caps to read the manifest export.
         let bootstrap = PreparedComponent {
@@ -542,8 +583,9 @@ impl WasmLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective_capabilities: Vec::new(),
+            effective: uni_plugin::CapabilitySet::new(),
             denied_capabilities: Vec::new(),
+            http: None,
         };
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;
@@ -604,6 +646,12 @@ impl std::fmt::Debug for LoadOutcome {
     }
 }
 
+/// Render a capability set as variant-name strings for the `LoadOutcome`
+/// reporting surface (diagnostics only).
+fn capability_names(caps: &uni_plugin::CapabilitySet) -> Vec<String> {
+    caps.iter().map(|c| format!("{c:?}")).collect()
+}
+
 /// Pick the right per-major scalar linker for `manifest.abi`.
 ///
 /// Bridges the loader to [`crate::multi_version::SUPPORTED_MAJORS`]. A
@@ -613,7 +661,7 @@ impl std::fmt::Debug for LoadOutcome {
 fn select_linker_for_manifest(
     engine: &Engine,
     manifest: &ComponentManifest,
-    effective_caps: &[String],
+    effective_caps: &uni_plugin::CapabilitySet,
 ) -> Result<Linker<HostState>, WasmError> {
     use crate::linker::{build_scalar_linker_v1, build_scalar_linker_v2};
     use crate::multi_version::SUPPORTED_MAJORS;
@@ -701,14 +749,11 @@ where
             let engine = build_engine(&prepared.manifest)?;
             let component = Component::from_binary(&engine, &bytes)
                 .map_err(|e| WasmError::InvalidWasm(format!("component compile: {e}")))?;
-            let linker: Linker<HostState> = select_linker_for_manifest(
-                &engine,
-                &prepared.manifest,
-                &prepared.effective_capabilities,
-            )?;
+            let linker: Linker<HostState> =
+                select_linker_for_manifest(&engine, &prepared.manifest, &prepared.effective)?;
             let mut store = Store::new(
                 &engine,
-                HostState::new(prepared.effective_capabilities.clone()),
+                HostState::new(prepared.effective.clone(), prepared.http.clone()),
             );
             apply_resource_limits(&mut store, &prepared.manifest);
             build_instance(store, &component, &linker)
@@ -1156,6 +1201,9 @@ fn epoch_timeout_marker() -> Duration {
 mod tests {
     use super::*;
 
+    use uni_plugin::{Capability, CapabilitySet};
+
+    /// Build a manifest JSON declaring the given (kebab-case) capability names.
     fn manifest_json(caps: &[&str]) -> String {
         let caps_json: Vec<String> = caps.iter().map(|c| format!("\"{c}\"")).collect();
         format!(
@@ -1173,25 +1221,65 @@ mod tests {
     fn prepare_parses_minimal_manifest() {
         let l = WasmLoader::new();
         let json = manifest_json(&[]);
-        let prep = l.prepare(json.as_bytes(), &[]).unwrap();
+        let prep = l.prepare(json.as_bytes(), &CapabilitySet::new()).unwrap();
         assert_eq!(prep.manifest.id, "ai.example.test");
-        assert!(prep.effective_capabilities.is_empty());
+        assert!(prep.effective.is_empty());
     }
 
     #[test]
     fn prepare_intersects_capabilities() {
         let l = WasmLoader::new();
-        let json = manifest_json(&["Filesystem", "Network", "Kms"]);
-        let grants = vec!["Filesystem".to_owned(), "Network".to_owned()];
+        // Declared: filesystem + network + kms (bare names → zero-attenuation).
+        let json = manifest_json(&["filesystem", "network", "kms"]);
+        // Host grants only filesystem + network.
+        let grants = CapabilitySet::from_iter_of([
+            Capability::Filesystem {
+                read: vec![],
+                write: vec![],
+            },
+            Capability::Network { allow: vec![] },
+        ]);
         let prep = l.prepare(json.as_bytes(), &grants).unwrap();
-        assert_eq!(prep.effective_capabilities.len(), 2);
-        assert_eq!(prep.denied_capabilities, vec!["Kms"]);
+        assert_eq!(prep.effective.len(), 2);
+        assert!(
+            prep.effective
+                .contains_variant(&Capability::Network { allow: vec![] })
+        );
+        assert!(
+            !prep
+                .effective
+                .contains_variant(&Capability::Kms { key_ids: vec![] })
+        );
+    }
+
+    #[test]
+    fn prepare_carries_structured_network_allowlist() {
+        let l = WasmLoader::new();
+        // Structured declaration with an allow-list; grant the same.
+        let json = r#"{ "id": "a.b", "version": "1.0.0",
+            "capabilities": [{"kind":"network","allow":["https://api.example/**"]}] }"#;
+        let grants = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec!["https://api.example/**".into()],
+        }]);
+        let prep = l.prepare(json.as_bytes(), &grants).unwrap();
+        // The intersected grant retains the host's allow-list patterns.
+        assert!(
+            prep.effective
+                .iter()
+                .any(|c| c.network_allows("https://api.example/v1/x"))
+        );
+        assert!(
+            !prep
+                .effective
+                .iter()
+                .any(|c| c.network_allows("https://evil.example/x"))
+        );
     }
 
     #[test]
     fn prepare_rejects_malformed_manifest() {
         let l = WasmLoader::new();
-        let err = l.prepare(b"not json", &[]).unwrap_err();
+        let err = l.prepare(b"not json", &CapabilitySet::new()).unwrap_err();
         assert!(matches!(err, WasmError::InvalidWasm(_)));
     }
 
@@ -1199,7 +1287,10 @@ mod tests {
     fn instantiate_rejects_garbage_bytes() {
         let l = WasmLoader::new();
         let prep = l
-            .prepare(b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}", &[])
+            .prepare(
+                b"{\"id\":\"a.b\",\"version\":\"0.0.0\"}",
+                &CapabilitySet::new(),
+            )
             .unwrap();
         let err = l.instantiate(b"not real wasm", &prep).unwrap_err();
         assert!(matches!(err, WasmError::InvalidWasm(_)));

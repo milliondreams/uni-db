@@ -44,8 +44,10 @@ pub struct HostFnSpec {
     /// Name plugins use to import this fn (e.g., `"host_fs_read"`).
     pub name: String,
     /// Capability required for this fn to be visible to a plugin. `None`
-    /// means always-available (e.g., `host_log`).
-    pub required_capability: Option<String>,
+    /// means always-available (e.g., `host_log`). Matched by *variant* against
+    /// the plugin's effective set (attenuation patterns are enforced in the
+    /// host-fn body, not at the visibility gate).
+    pub required_capability: Option<uni_plugin::Capability>,
     /// Human-readable description; surfaced via `uni plugin info`.
     pub docs: String,
 }
@@ -102,11 +104,17 @@ mod tests {
         let mut r = HostFnRegistry::new();
         r.register(HostFnSpec {
             name: "host_fs_read".to_owned(),
-            required_capability: Some("Filesystem".to_owned()),
+            required_capability: Some(uni_plugin::Capability::Filesystem {
+                read: vec![],
+                write: vec![],
+            }),
             docs: "Read a file from the host filesystem.".to_owned(),
         });
         let spec = r.get("host_fs_read").expect("registered");
-        assert_eq!(spec.required_capability.as_deref(), Some("Filesystem"));
+        assert!(matches!(
+            spec.required_capability,
+            Some(uni_plugin::Capability::Filesystem { .. })
+        ));
         assert_eq!(r.len(), 1);
     }
 
@@ -132,7 +140,7 @@ mod tests {
         });
         r.register(HostFnSpec {
             name: "b".to_owned(),
-            required_capability: Some("Network".to_owned()),
+            required_capability: Some(uni_plugin::Capability::Network { allow: vec![] }),
             docs: String::new(),
         });
         let names: Vec<&str> = r.iter().map(|s| s.name.as_str()).collect();

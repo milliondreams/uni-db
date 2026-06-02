@@ -500,9 +500,16 @@ impl WasmLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective: uni_plugin::CapabilitySet::new(),
+            // Bootstrap with the host's *offered* grants (not empty) so a
+            // plugin importing a capability-gated interface (e.g. host-net)
+            // can be instantiated far enough to read its manifest. This is the
+            // tightest safe upper bound — the plugin can never exceed what the
+            // host offered, and the execution pool (pass 2) further restricts
+            // to `declared ∩ grants`. A plugin importing an interface the host
+            // did NOT offer still fails here at instantiate (link absence).
+            effective: host_grants.clone(),
             denied_capabilities: Vec::new(),
-            http: None,
+            http: self.http.clone(),
         };
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;
@@ -583,9 +590,16 @@ impl WasmLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective: uni_plugin::CapabilitySet::new(),
+            // Bootstrap with the host's *offered* grants (not empty) so a
+            // plugin importing a capability-gated interface (e.g. host-net)
+            // can be instantiated far enough to read its manifest. This is the
+            // tightest safe upper bound — the plugin can never exceed what the
+            // host offered, and the execution pool (pass 2) further restricts
+            // to `declared ∩ grants`. A plugin importing an interface the host
+            // did NOT offer still fails here at instantiate (link absence).
+            effective: host_grants.clone(),
             denied_capabilities: Vec::new(),
-            http: None,
+            http: self.http.clone(),
         };
         let mut bootstrap_inst = self.instantiate(bytes, &bootstrap)?;
         let parsed_manifest = bootstrap_inst.read_manifest()?;

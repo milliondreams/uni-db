@@ -43,6 +43,43 @@ interface host-log {
     log: func(level: string, message: string);
 }
 
+/// Capability-gated network egress.
+///
+/// Added to the `Linker` by the host **only** when the plugin is granted
+/// `Capability::Network`; a plugin importing this interface without the grant
+/// fails at link time (the structural half of capability enforcement). The
+/// host additionally enforces the granted URL allow-list at call time, before
+/// any socket is opened, and clamps `timeout-ms` / `max-bytes` to the granted
+/// ceiling. The host's active W3C trace context is injected into the outbound
+/// request automatically (see `host-trace-context`).
+interface host-net {
+    use types.{fn-error};
+
+    /// HTTP response: status code plus the (size-capped) body bytes.
+    record http-response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    /// HTTP GET. `timeout-ms` (0 = host default) and `max-bytes` (0 = host
+    /// cap) are upper bounds the host clamps to its granted ceiling.
+    http-get: func(url: string, timeout-ms: u64, max-bytes: u32)
+        -> result<http-response, fn-error>;
+
+    /// HTTP POST of `body`. Bounds behave as for `http-get`.
+    http-post: func(url: string, body: list<u8>, timeout-ms: u64, max-bytes: u32)
+        -> result<http-response, fn-error>;
+}
+
+/// Host trace-context propagation.
+///
+/// Always added to the `Linker` (no capability required — it leaks nothing).
+/// Returns the host's active W3C `traceparent`, or `none` when no trace is
+/// active (e.g. the host's `otel` feature is off — no fabricated ids).
+interface host-trace-context {
+    get-traceparent: func() -> option<string>;
+}
+
 /// Scalar plugin world.
 ///
 /// Implements one or more Cypher scalar functions. The wire shape:

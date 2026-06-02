@@ -1,0 +1,57 @@
+// uni-db plugin framework — host-net example world.
+//
+// Mirrors the host's `crates/uni-plugin-wasm/wit/world.wit` package so the
+// guest can import the capability-gated `host-net` + `host-trace-context`
+// interfaces. The `scalar-net-plugin` world below is export-compatible with
+// the host's `scalar-plugin` world (same manifest/register/invoke-scalar
+// shape) but additionally imports host-net, so the host can load it through
+// the normal scalar path while exercising the network host fns.
+
+package uni:plugin@0.1.0;
+
+interface types {
+    record fn-error {
+        code: u32,
+        message: string,
+        retryable: bool,
+    }
+}
+
+interface host-log {
+    log: func(level: string, message: string);
+}
+
+interface host-net {
+    use types.{fn-error};
+
+    record http-response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    http-get: func(url: string, timeout-ms: u64, max-bytes: u32)
+        -> result<http-response, fn-error>;
+
+    http-post: func(url: string, body: list<u8>, timeout-ms: u64, max-bytes: u32)
+        -> result<http-response, fn-error>;
+}
+
+interface host-trace-context {
+    get-traceparent: func() -> option<string>;
+}
+
+/// Scalar plugin world that additionally imports the capability-gated
+/// network + trace-context host interfaces. Export shape matches the host's
+/// `scalar-plugin` world exactly.
+world scalar-net-plugin {
+    use types.{fn-error};
+
+    import host-log;
+    import host-net;
+    import host-trace-context;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+    export invoke-scalar: func(qname: string, ipc-bytes: list<u8>)
+        -> result<list<u8>, fn-error>;
+}

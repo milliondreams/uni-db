@@ -29,7 +29,7 @@ Format: one entry per gap, with the source anchor and the gap's nature.
 
 ## Open gaps
 
-### Extism / WASM host-fn cutover — remaining (binds the same traits, full attenuation)
+### Extism / WASM host-fn cutover — CLOSED (binds the same traits, full attenuation)
 
 The Rhai loader's `uni.{kms,secret,http,fs}.*` host fns are fully wired with
 call-time (layer-3) attenuation — KMS key ids, secret ids, HTTP URLs, and now
@@ -67,14 +67,27 @@ dispatch/attenuation logic lives in unit-tested `do_*` fns
 `tests/host_svc.rs`. End-to-end *guest invocation* is still unexercised (no guest
 fixture imports these host fns — the same fixture gap as the WASM item below).
 
-**Remaining (host-fn bodies — the feature layer on the C0 foundation):**
+**WASM host-net + host-trace-context — DONE** (Phase D + E): `world.wit` declares
+the capability-gated `interface host-net` (`http-get`/`http-post` →
+`result<http-response, fn-error>`) and the always-available `host-trace-context`
+(`get-traceparent`). `linker.rs` adds `host-trace-context` unconditionally and
+`host-net` only when `Capability::Network` is in the effective set — a guest
+importing `uni:plugin/host-net@0.1.0` without the grant fails at `instantiate`
+(structural gating). The `func_wrap` bodies read egress + caps from `HostState`,
+enforce the URL allow-list, clamp timeout/size to the granted ceiling, and inject
+`current_trace_context().to_traceparent()` into the outbound call (Phase E for the
+wasm path; the Rhai/Extism paths already inject). The two-pass loader bootstraps
+with the host's *offered* grants so a `host-net`-importing guest's manifest can be
+read (execution still uses `declared ∩ grants`). A real guest fixture
+(`examples/example-wasm-net`, built by `scripts/build-wasm-fixtures.sh`) imports
+and *calls* host-net; `tests/example_wasm_net_e2e.rs` covers granted-round-trip,
+unconfigured-egress loud failure, and ungranted link-time failure end to end.
 
-- **WASM** `host-net` + `host-trace-context`: declare the WIT interfaces, add
-  cap-gated `add_host_net` / `add_host_trace_context` to `linker.rs` (func_wrap
-  reading `HostState.{http,effective}`), and add a guest fixture that *imports*
-  host-net to exercise it end-to-end (the geo fixtures don't).
-- **E**: the host-net bodies inject `current_trace_context().to_traceparent()`.
-- Full design: `/home/rohit/.claude/plans/squishy-hatching-cupcake.md` Phases C–E.
+**The cutover is complete** (C0 + C + D + E). Both guest loaders now bind the
+shared host-service traits with full capability attenuation and trace
+propagation. (Note: the Extism path still has no guest fixture that *imports* its
+host fns, so its end-to-end guest invocation is proven only at the linker/gate +
+unit-dispatch level — the wasm path above has the full e2e.)
 
 ### Conformance harness — WASM target — marker arm is intentional
 
@@ -94,21 +107,22 @@ dep-graph design, the conformance crate cannot depend on wasmtime to construct a
 loader itself. The test asserting the marker (`wasm_target_returns_runner_pointer`)
 must not be "simplified" away.
 
-### M11 observability — guest-boundary propagation (follow-up)
+### M11 observability — guest-boundary propagation — CLOSED
 
-`current_trace_context()` (`crates/uni-plugin/src/observability.rs`) now performs
-real OTel extraction behind the default-off `otel` feature (enabled by
+`current_trace_context()` (`crates/uni-plugin/src/observability.rs`) performs real
+OTel extraction behind the default-off `otel` feature (enabled by
 `uni-plugin-host`): it reads the `SpanContext` bridged onto the current `tracing`
 span and `to_traceparent()` renders the W3C header. The host's
-`current_traceparent()` delegates to it, so host outbound HTTP and the plugin
-ABI share one implementation.
+`current_traceparent()` delegates to it, so host outbound HTTP and the plugin ABI
+share one implementation.
 
-Remaining follow-up — **injecting the traceparent into guest plugins** so an
-isolated wasm/extism guest can continue the trace. This is blocked on the
-host-net host-fn cutover that has not landed yet (the extism `host_fns.rs`
-registry and the wasm `host-net` WIT interface are still scaffolding). When that
-lands, the host-fn body injects `current_trace_context().to_traceparent()` into
-guest HTTP, identical to `http_get_with_traceparent`.
+Guest-boundary injection has now landed across **all** loaders: every `uni.http.*`
+/ `host-net` host-fn body computes `current_trace_context().to_traceparent()` and
+hands it to the shared `HttpEgress` (which sets the `traceparent` request header),
+so an outbound call from an isolated Rhai / Extism / wasm guest continues the
+host's trace. With the `otel` feature off the value is `None` (no fabricated ids).
+The wasm `host-trace-context.get-traceparent` import additionally lets a guest SDK
+read the same value to start a child span.
 
 ### Sidecar IO consolidation (`CODE_SIMPLIFIER_FEEDBACK.md` §1.5) — CLOSED
 

@@ -52,6 +52,21 @@ fi
 echo "    wasm-geo component size: $(du -h "$WASM_COMPONENT" | cut -f1)"
 echo "    (wasm32-wasip2 produces a Component Model binary directly; no wasm-tools wrap needed)"
 
+echo "==> Building example-wasm-net (wasm32-wasip2)"
+(
+    cd examples/example-wasm-net
+    cargo build --target wasm32-wasip2 --release
+)
+
+WASM_NET_COMPONENT="examples/example-wasm-net/target/wasm32-wasip2/release/example_wasm_net.wasm"
+if [[ ! -f "$WASM_NET_COMPONENT" ]]; then
+    echo "ERROR: expected $WASM_NET_COMPONENT after build" >&2
+    exit 1
+fi
+echo "    wasm-net component size: $(du -h "$WASM_NET_COMPONENT" | cut -f1)"
+echo "    (imports the capability-gated uni:plugin/host-net interface)"
+
 echo "==> Done. Run tests with:"
 echo "    cargo nextest run -p uni-plugin-extism --test example_extism_geo_e2e"
 echo "    cargo nextest run -p uni-plugin-wasm   --test example_wasm_geo_e2e"
+echo "    cargo nextest run -p uni-plugin-wasm   --test example_wasm_net_e2e"

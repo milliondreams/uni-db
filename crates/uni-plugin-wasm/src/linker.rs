@@ -20,11 +20,51 @@
 //! file gains a second `build_scalar_linker_v2` and the loader
 //! consults the plugin's declared `abi` field to choose.
 
+use std::time::Duration;
+
+use uni_plugin::Capability;
 use wasmtime::Engine;
-use wasmtime::component::Linker;
+use wasmtime::component::{ComponentType, Lift, Linker, Lower};
 
 use crate::error::WasmError;
 use crate::host_state::HostState;
+
+/// Default per-call HTTP timeout ceiling when the grant carries no
+/// `WallClockMillisPerCall`. The guest may request *less* via `timeout-ms`.
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// Maximum response body bytes the host will read — bounds host memory
+/// regardless of the guest's `max-bytes` request.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Host mirror of the WIT `host-net.http-response` record.
+///
+/// Hand-derived (rather than bindgen-generated) so the capability-gated
+/// `host-net` interface stays out of the always-linked plugin worlds; the
+/// canonical ABI matches the WIT structurally (field names + order + types).
+#[derive(ComponentType, Lower, Lift)]
+#[component(record)]
+struct WasmHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// Host mirror of the shared WIT `types.fn-error` record.
+#[derive(ComponentType, Lower, Lift)]
+#[component(record)]
+struct WasmFnError {
+    code: u32,
+    message: String,
+    retryable: bool,
+}
+
+fn fn_err(code: u32, message: impl Into<String>) -> WasmFnError {
+    WasmFnError {
+        code,
+        message: message.into(),
+        retryable: false,
+    }
+}
 
 /// Build the `Linker<HostState>` for the `scalar-plugin` world.
 ///
@@ -53,11 +93,19 @@ pub fn build_scalar_linker_v1(
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
         .map_err(|e| WasmError::Instantiate(format!("link wasi: {e}")))?;
     add_host_log(&mut linker)?;
-    // Capability-gated host fns would be added here based on
-    // effective_caps. M6b ships scalar/aggregate/procedure with
-    // only host-log; future commits add host-fs / host-net / …
-    // gated on caps.
-    let _ = effective_caps;
+    // `host-trace-context` is always available — it returns only the host's
+    // own W3C traceparent (or none), leaking no capability-gated state.
+    add_host_trace_context(&mut linker)?;
+    // `host-net` is added only when `Capability::Network` is granted. A plugin
+    // importing `uni:plugin/host-net` without the grant therefore fails at
+    // `instantiate` (linker absence) — the structural half of enforcement; the
+    // URL allow-list is the call-time half, checked inside the host fn body.
+    if effective_caps
+        .iter()
+        .any(|c| matches!(c, Capability::Network { .. }))
+    {
+        add_host_net(&mut linker)?;
+    }
     Ok(linker)
 }
 
@@ -127,6 +175,126 @@ fn add_host_log(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
         )
         .map_err(|e| WasmError::Instantiate(format!("link host-log: {e}")))?;
     Ok(())
+}
+
+/// Add the capability-gated `uni:plugin/host-net` interface.
+///
+/// Both functions read the egress + effective caps from `store.data()`
+/// (`HostState`), enforce the URL allow-list, clamp the timeout / size to the
+/// granted ceiling, inject the host traceparent, and dispatch through the
+/// shared [`uni_plugin::HttpEgress`]. Unlike the Rhai/Extism loaders this
+/// returns the response (incl. a `>= 400` status) to the guest rather than
+/// erroring — the typed `http-response.status` field exists precisely so the
+/// guest can branch on it.
+fn add_host_net(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    // The instance name MUST carry the package version: a guest that actually
+    // *calls* host-net imports `uni:plugin/host-net@0.1.0` (an unused import is
+    // tree-shaken away, which is why host-log's unversioned name never had to
+    // match a real import).
+    let mut instance = linker
+        .instance("uni:plugin/host-net@0.1.0")
+        .map_err(|e| WasmError::Instantiate(format!("link host-net instance: {e}")))?;
+    instance
+        .func_wrap(
+            "http-get",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (url, timeout_ms, max_bytes): (String, u64, u32)|
+             -> wasmtime::Result<(Result<WasmHttpResponse, WasmFnError>,)> {
+                Ok((host_http(store.data(), &url, None, timeout_ms, max_bytes),))
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(format!("link host-net http-get: {e}")))?;
+    instance
+        .func_wrap(
+            "http-post",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (url, body, timeout_ms, max_bytes): (String, Vec<u8>, u64, u32)|
+             -> wasmtime::Result<(Result<WasmHttpResponse, WasmFnError>,)> {
+                Ok((host_http(
+                    store.data(),
+                    &url,
+                    Some(body),
+                    timeout_ms,
+                    max_bytes,
+                ),))
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(format!("link host-net http-post: {e}")))?;
+    Ok(())
+}
+
+/// Add the always-available `uni:plugin/host-trace-context` interface.
+fn add_host_trace_context(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    let mut instance = linker
+        .instance("uni:plugin/host-trace-context@0.1.0")
+        .map_err(|e| WasmError::Instantiate(format!("link host-trace-context instance: {e}")))?;
+    instance
+        .func_wrap(
+            "get-traceparent",
+            |_store: wasmtime::StoreContextMut<'_, HostState>,
+             (): ()|
+             -> wasmtime::Result<(Option<String>,)> {
+                Ok((uni_plugin::observability::current_trace_context().to_traceparent(),))
+            },
+        )
+        .map_err(|e| {
+            WasmError::Instantiate(format!("link host-trace-context get-traceparent: {e}"))
+        })?;
+    Ok(())
+}
+
+/// Shared `host-net` GET/POST body: enforce the allow-list, resolve bounds,
+/// inject the traceparent, and dispatch to the host's [`uni_plugin::HttpEgress`].
+fn host_http(
+    state: &HostState,
+    url: &str,
+    body: Option<Vec<u8>>,
+    timeout_ms: u64,
+    max_bytes: u32,
+) -> Result<WasmHttpResponse, WasmFnError> {
+    if !state.effective.iter().any(|c| c.network_allows(url)) {
+        return Err(fn_err(
+            0xD20,
+            format!("host-net: url `{url}` not in granted Network allow-list"),
+        ));
+    }
+    let Some(egress) = state.http.as_ref() else {
+        return Err(fn_err(0xD21, "host-net: no HTTP egress configured"));
+    };
+    // Host-authoritative bounds: the granted ceiling (cap `WallClockMillisPerCall`
+    // else default) caps the guest-requested timeout; the response size is hard
+    // capped regardless of the guest's request.
+    let ceiling_ms = state
+        .effective
+        .iter()
+        .find_map(|c| match c {
+            Capability::WallClockMillisPerCall(ms) => Some(*ms),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    let timeout = Duration::from_millis(if timeout_ms == 0 {
+        ceiling_ms
+    } else {
+        timeout_ms.min(ceiling_ms)
+    });
+    let max = if max_bytes == 0 {
+        MAX_RESPONSE_BYTES
+    } else {
+        (max_bytes as usize).min(MAX_RESPONSE_BYTES)
+    };
+    // Propagate the host's trace context (real only in `otel`-enabled builds;
+    // `None` otherwise — no fabricated trace ids).
+    let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
+    let tp = traceparent.as_deref();
+    let response = match body {
+        Some(b) => egress.post(url, &b, timeout, max, tp),
+        None => egress.get(url, timeout, max, tp),
+    }
+    .map_err(|e| fn_err(0xD22, format!("host-net(`{url}`): {e}")))?;
+    Ok(WasmHttpResponse {
+        status: response.status,
+        body: response.body,
+    })
 }
 
 fn emit_log(level: &str, message: &str) {

@@ -1,0 +1,37 @@
+# Standalone example Component Model plugin exercising host-net — NOT a
+# workspace member.
+#
+# Build:
+#   cd examples/example-wasm-net
+#   cargo build --target wasm32-wasip2 --release
+#
+# Produces target/wasm32-wasip2/release/example_wasm_net.wasm — a Component
+# Model binary that imports the capability-gated uni:plugin/host-net interface.
+# The host e2e (crates/uni-plugin-wasm/tests/example_wasm_net_e2e.rs) loads it
+# with Network granted + a fake egress and asserts the call round-trips.
+
+[workspace]
+
+[package]
+name = "example-wasm-net"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Component Model plugin: scalar fn that calls host-net"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

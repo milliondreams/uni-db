@@ -40,24 +40,31 @@ and an unconfigured host service fails loudly. KMS / HTTP bind the shared
 on a dedicated OS thread to avoid a Tokio-runtime panic); secrets reuse
 `uni_plugin::secrets::SecretStore`.
 
-**Foundation for full parity (landed):** guest manifests can now declare the
-rich capability vocabulary — `uni_plugin::ManifestCapability` deserializes a bare
-name (`"network"` → zero-attenuation `Network { allow: [] }`) *or* a structured
-object (`{"kind":"network","allow":[…]}`), and `Capability`'s pattern fields are
-`#[serde(default)]`. This is what lets the wasm/extism guest paths reach the same
-attenuation the Rhai path has, instead of their current name-only `Vec<String>`.
+**Capability-model unification — DONE** (cutover phases C0 + E-seam,
+CI-green): the WASM + Extism loaders now run on the rich
+`uni_plugin::Capability`/`CapabilitySet` instead of name-only `Vec<String>`.
+`ComponentManifest`/`ExtismPluginManifest` parse `uni_plugin::ManifestCapability`
+(bare name | structured `{"kind":…,"allow":[…]}`); `prepare_parsed` intersects
+declared ∩ granted with attenuation retained; the guest-grant API is
+`&CapabilitySet` (breaking — `crates/uni::load_wasm_*` + the Python binding
+updated, `list[str]` Python surface preserved via `build_capability_set`);
+`HostFnSpec.required_capability` is `Option<Capability>`; `HostState` /
+`PreparedComponent` carry the rich effective set + an `Option<Arc<dyn HttpEgress>>`;
+`HttpEgress::{get,post}` take a `traceparent` (Rhai already injects it).
 
-**Remaining:**
+**Remaining (host-fn bodies — the feature layer on the C0 foundation):**
 
-- Adopt `CapabilitySet`/`ManifestCapability` in the Extism + WASM loaders
-  (`ComponentManifest`/`ExtismPluginManifest` `capabilities`, the guest-grant API
-  `&[String]` → `&CapabilitySet`, `HostFnSpec.required_capability`, per-plugin
-  threading onto `HostState` / prepared state).
-- Wire `uni.{kms,secret,http}` host fns in Extism (per-build `extism::Function`s
-  capturing the effective `CapabilitySet`) and `host-net` / `host-trace-context`
-  WIT interfaces + linker functions in WASM (cap-gated), binding the same traits.
-- See `/home/rohit/.claude/plans/squishy-hatching-cupcake.md` Phases C0–E for the
-  full design.
+- **Extism** `uni.{kms,secret,http}`: add `ExtismLoader::with_{kms,secret_store,http}`
+  handles; have `build_plugin_from_parts` construct **per-build** cap-aware
+  `extism::Function`s (capturing `prepared.effective` + the service `Arc`s in
+  `UserData`) when the capability variant is granted, with a JSON wire envelope +
+  `CurrentPlugin` memory marshaling. Reference: the Rhai `host_fn_impls`.
+- **WASM** `host-net` + `host-trace-context`: declare the WIT interfaces, add
+  cap-gated `add_host_net` / `add_host_trace_context` to `linker.rs` (func_wrap
+  reading `HostState.{http,effective}`), and add a guest fixture that *imports*
+  host-net to exercise it end-to-end (the geo fixtures don't).
+- **E**: the host-net bodies inject `current_trace_context().to_traceparent()`.
+- Full design: `/home/rohit/.claude/plans/squishy-hatching-cupcake.md` Phases C–E.
 
 ### Conformance harness — WASM target — marker arm is intentional
 

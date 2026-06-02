@@ -95,19 +95,35 @@ fn do_http(ctx: &HostSvcCtx, req: HttpReq, traceparent: Option<&str>) -> Result<
     })
 }
 
+/// Parse the JSON request, inject the host's **live** W3C trace context,
+/// dispatch through [`do_http`], and re-encode the response as JSON.
+///
+/// Shared by both `uni_http_get` and `uni_http_post` macro shells (a GET vs
+/// POST is distinguished purely by `body_hex` in the request). Factored out of
+/// the `extism::host_fn!` shells so the trace-context injection — the only part
+/// the shells add over `do_http` — is unit-testable under an OTel layer without
+/// the `CurrentPlugin` marshaling. The traceparent is real only in
+/// `otel`-enabled builds; `None` otherwise (no fabricated trace ids).
+///
+/// # Errors
+///
+/// Returns [`FnError`] when the request JSON is malformed, the underlying
+/// [`do_http`] dispatch fails, or the response cannot be serialized.
+fn http_dispatch_json(ctx: &HostSvcCtx, req_json: &str) -> Result<String, FnError> {
+    let req: HttpReq = serde_json::from_str(req_json)
+        .map_err(|e| FnError::new(0xC24, format!("uni.http: bad request json: {e}")))?;
+    let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
+    let resp = do_http(ctx, req, traceparent.as_deref())?;
+    serde_json::to_string(&resp)
+        .map_err(|e| FnError::new(0xC25, format!("uni.http: response json: {e}")))
+}
+
 extism::host_fn!(pub(crate) uni_http_get(ctx: HostSvcCtx; req_json: String) -> String {
     let bundle = ctx.get()?;
     let bundle = bundle
         .lock()
         .map_err(|_| extism::Error::msg("uni.http.get: host service ctx poisoned"))?;
-    let req: HttpReq = serde_json::from_str(&req_json)
-        .map_err(|e| extism::Error::msg(format!("uni.http.get: bad request json: {e}")))?;
-    // Propagate the host's trace context (real only in `otel`-enabled builds;
-    // `None` otherwise — no fabricated trace ids).
-    let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
-    let resp = do_http(&bundle, req, traceparent.as_deref())
-        .map_err(|e| extism::Error::msg(e.to_string()))?;
-    serde_json::to_string(&resp).map_err(|e| extism::Error::msg(e.to_string()))
+    http_dispatch_json(&bundle, &req_json).map_err(|e| extism::Error::msg(e.to_string()))
 });
 
 extism::host_fn!(pub(crate) uni_http_post(ctx: HostSvcCtx; req_json: String) -> String {
@@ -115,12 +131,7 @@ extism::host_fn!(pub(crate) uni_http_post(ctx: HostSvcCtx; req_json: String) -> 
     let bundle = bundle
         .lock()
         .map_err(|_| extism::Error::msg("uni.http.post: host service ctx poisoned"))?;
-    let req: HttpReq = serde_json::from_str(&req_json)
-        .map_err(|e| extism::Error::msg(format!("uni.http.post: bad request json: {e}")))?;
-    let traceparent = uni_plugin::observability::current_trace_context().to_traceparent();
-    let resp = do_http(&bundle, req, traceparent.as_deref())
-        .map_err(|e| extism::Error::msg(e.to_string()))?;
-    serde_json::to_string(&resp).map_err(|e| extism::Error::msg(e.to_string()))
+    http_dispatch_json(&bundle, &req_json).map_err(|e| extism::Error::msg(e.to_string()))
 });
 
 #[cfg(test)]
@@ -254,6 +265,54 @@ mod tests {
         )
         .expect_err("4xx");
         assert!(err.message.contains("HTTP status 404"));
+    }
+
+    /// End-to-end proof that the macro-shell dispatch injects the host's
+    /// **live** W3C trace context (not just that `do_http` threads an explicit
+    /// param): under a real OTel layer + active span, `http_dispatch_json`
+    /// computes a valid traceparent via `current_trace_context()` and the
+    /// egress receives it. Run with `--features otel`.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn dispatch_injects_active_traceparent() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::prelude::*;
+
+        let egress = Arc::new(RecordingHttp::new(200));
+        let ctx = ctx_with(net_caps("https://api.example.com/**"), Some(egress.clone()));
+
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let tracer = provider.tracer("uni-plugin-extism-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("extism-http-e2e");
+            let _enter = span.enter();
+            let out = http_dispatch_json(&ctx, r#"{"url":"https://api.example.com/v1/x"}"#)
+                .expect("dispatch");
+            assert!(out.contains("\"status\":200"), "out: {out}");
+        });
+
+        let tp = egress
+            .last_traceparent
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("an active OTel context must inject a traceparent");
+        assert!(tp.starts_with("00-"), "traceparent: {tp}");
+        assert_eq!(tp.len(), 55, "traceparent: {tp}");
+    }
+
+    /// No-leak invariant: `otel` compiled in but no active layer ⇒ no
+    /// fabricated traceparent.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn dispatch_injects_no_traceparent_without_active_context() {
+        let egress = Arc::new(RecordingHttp::new(200));
+        let ctx = ctx_with(net_caps("**"), Some(egress.clone()));
+        http_dispatch_json(&ctx, r#"{"url":"https://x/"}"#).expect("dispatch");
+        assert_eq!(*egress.last_traceparent.lock().unwrap(), None);
     }
 
     #[test]

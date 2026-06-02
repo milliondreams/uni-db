@@ -159,7 +159,7 @@ impl TraceContext {
 
 /// Return the current trace context, or an empty context when none is active.
 ///
-/// With the `otel` feature enabled, this reads the [`opentelemetry`]
+/// With the `otel` feature enabled, this reads the `opentelemetry`
 /// `SpanContext` bridged onto the current `tracing` span by a
 /// `tracing-opentelemetry` layer. It returns an empty context (no leak) when
 /// the feature is off, no such layer is installed, or the current span has no

@@ -33,9 +33,19 @@ extism = { version = "1", optional = true }
 [features]
 default = ["extism-runtime"]
 extism-runtime = ["dep:extism"]
+# Turns on real OTel trace-context extraction in `uni-plugin` so the host-fn
+# dispatch injects a live W3C `traceparent`; gates the positive injection test
+# (`host_svc::net::tests::dispatch_injects_active_traceparent`). Default-off.
+otel = ["uni-plugin/otel"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 # `wat` assembles minimal valid WASM from text for instantiation tests
 # without committing binary fixtures.
 wat = "1"
+# For the `otel`-gated positive injection test: a real (no-exporter) tracer
+# provider + the tracing-opentelemetry layer. Dev-only.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = "0.27"
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

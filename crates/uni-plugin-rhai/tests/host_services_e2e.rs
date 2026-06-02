@@ -208,6 +208,108 @@ fn fs_read_write_enforce_glob_allowlist() {
     );
 }
 
+/// Egress that records the `traceparent` it was handed, for the injection test.
+#[cfg(feature = "otel")]
+#[derive(Default)]
+struct RecordingHttp {
+    last_traceparent: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(feature = "otel")]
+impl HttpEgress for RecordingHttp {
+    fn get(
+        &self,
+        url: &str,
+        _t: Duration,
+        _m: usize,
+        traceparent: Option<&str>,
+    ) -> Result<HttpResponse, FnError> {
+        *self.last_traceparent.lock().unwrap() = traceparent.map(str::to_owned);
+        Ok(HttpResponse {
+            status: 200,
+            body: format!("GET {url}").into_bytes(),
+        })
+    }
+    fn post(
+        &self,
+        url: &str,
+        _body: &[u8],
+        _t: Duration,
+        _m: usize,
+        traceparent: Option<&str>,
+    ) -> Result<HttpResponse, FnError> {
+        *self.last_traceparent.lock().unwrap() = traceparent.map(str::to_owned);
+        Ok(HttpResponse {
+            status: 200,
+            body: format!("GET {url}").into_bytes(),
+        })
+    }
+}
+
+/// End-to-end proof of guest-boundary trace propagation: with a real OTel layer
+/// installed and a span active, a Rhai guest's `uni_http_get` call carries the
+/// host's W3C `traceparent` through to the egress. Backs the
+/// `docs/KNOWN_GAPS.md` "continues the host's trace" claim with a positive
+/// assertion (the prior coverage only proved extraction in isolation).
+///
+/// Run with `cargo nextest run -p uni-plugin-rhai --features otel`.
+#[cfg(feature = "otel")]
+#[test]
+fn http_get_injects_active_traceparent() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::prelude::*;
+
+    let egress = Arc::new(RecordingHttp::default());
+    let mut loader = RhaiLoader::new().with_http(egress.clone());
+    register_default_host_fns(&mut loader);
+    let caps = CapabilitySet::from_iter_of([Capability::Network {
+        allow: vec!["https://api.example/**".into()],
+    }]);
+
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+    let tracer = provider.tracer("uni-plugin-rhai-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("rhai-http-e2e");
+        let _enter = span.enter();
+        let engine = build_engine(&caps, loader.host_fns());
+        let body: String = engine
+            .eval(r#"uni_http_get("https://api.example/v1/x")"#)
+            .expect("allowed GET");
+        assert_eq!(body, "GET https://api.example/v1/x");
+    });
+
+    let tp = egress
+        .last_traceparent
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("an active OTel context must inject a traceparent");
+    // W3C format: 00- (3) + trace (32) + - (1) + span (16) + - (1) + flags (2).
+    assert!(tp.starts_with("00-"), "traceparent: {tp}");
+    assert_eq!(tp.len(), 55, "traceparent: {tp}");
+}
+
+/// No-leak invariant: with the `otel` bridge compiled in but **no** layer
+/// installed, no fabricated `traceparent` is injected.
+#[cfg(feature = "otel")]
+#[test]
+fn http_get_injects_no_traceparent_without_active_context() {
+    let egress = Arc::new(RecordingHttp::default());
+    let mut loader = RhaiLoader::new().with_http(egress.clone());
+    register_default_host_fns(&mut loader);
+    let caps = CapabilitySet::from_iter_of([Capability::Network {
+        allow: vec!["https://api.example/**".into()],
+    }]);
+    let engine = build_engine(&caps, loader.host_fns());
+    let _: String = engine
+        .eval(r#"uni_http_get("https://api.example/v1/x")"#)
+        .expect("allowed GET");
+    assert_eq!(*egress.last_traceparent.lock().unwrap(), None);
+}
+
 #[test]
 fn http_absent_egress_errors_loudly() {
     let mut loader = RhaiLoader::new();

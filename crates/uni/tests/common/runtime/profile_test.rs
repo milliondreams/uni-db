@@ -689,6 +689,10 @@ async fn diag_72_set_data_scale_with_hnsw_impl(
     let temp_dir = tempdir()?;
     let cfg = UniConfig {
         partial_lance_writes,
+        // The warmup commits 500 mutations in a single transaction to build L0
+        // version history; that one large commit can exceed the default 5s guard
+        // in unoptimized debug builds (it is sub-second in release). Give it room.
+        commit_timeout: std::time::Duration::from_secs(30),
         ..UniConfig::default()
     };
     let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())

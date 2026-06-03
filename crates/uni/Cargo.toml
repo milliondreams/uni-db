@@ -58,7 +58,7 @@ uni-plugin-pyo3 = { workspace = true, optional = true, features = ["pyo3"] }
 # `pyo3-plugins` enabled, Cargo unifies features — bindings still
 # applies `extension-module` from its own pyo3 dep, and
 # `auto-initialize` becomes a no-op there.
-pyo3 = { version = "0.27", optional = true, features = ["abi3-py310", "auto-initialize"] }
+pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "auto-initialize"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -69,9 +69,9 @@ log = { workspace = true }
 metrics = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-ipc = "58.0.0"
+arrow-ipc = "58.3.0"
 serde_bytes = "0.11"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 uuid = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
@@ -85,7 +85,7 @@ datafusion = { workspace = true }
 tokio-util = { workspace = true }
 scopeguard = "1"
 tempfile = { workspace = true }
-dashmap = "6.0"
+dashmap = "6.2"
 smol_str = "0.3"
 # M11: OpenTelemetry layer for the `observability` module. Embedders
 # opt in via `crate::observability::init_otel_subscriber(...)`; nothing
@@ -93,8 +93,8 @@ smol_str = "0.3"
 tracing-subscriber = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 # Jittered backoff for `Session::transact_with_retry` (api/retry.rs).
 rand = { workspace = true }
 # Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
@@ -102,7 +102,7 @@ rand = { workspace = true }
 # access flows through uni-xervo's provider facades.
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 mimalloc = { version = "0.1", default-features = false }
 rand = { workspace = true }
 arrow = { workspace = true }
@@ -117,10 +117,10 @@ tracing-subscriber = { workspace = true }
 smol_str = "0.3"
 # Dev-only: structural-sharing map for the L0 snapshot strategy bench. Not a
 # production dependency until the benchmark decision selects strategy B.
-imbl = "3"
+imbl = "7"
 # Capture emitted `metrics` counters in-process so SSI resilience/stress tests
 # can assert on freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
-metrics-util = "0.16"
+metrics-util = "0.20"
 # Configure the commit-path `fail_point!` markers from crash-recovery tests
 # (`fail::cfg` / `FailScenario`). Only has effect under `--features failpoints`.
 fail = "0.5"

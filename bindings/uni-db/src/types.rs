@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Query performance metrics returned with every query result.
-#[pyclass(get_all, name = "QueryMetrics")]
+#[pyclass(get_all, name = "QueryMetrics", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueryMetrics {
     /// Time spent parsing the query in milliseconds.
@@ -51,7 +51,7 @@ impl PyQueryMetrics {
 }
 
 /// A query warning emitted during execution (e.g., missing index).
-#[pyclass(get_all, name = "QueryWarning")]
+#[pyclass(get_all, name = "QueryWarning", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueryWarning {
     /// Warning code string (e.g., "index_unavailable", "no_index_for_filter").
@@ -630,7 +630,7 @@ impl PyProfileOutput {
 }
 
 /// Typed output from `session.explain_locy()`.
-#[pyclass(get_all, name = "LocyExplainOutput")]
+#[pyclass(get_all, name = "LocyExplainOutput", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyLocyExplainOutput {
     /// Human-readable evaluation plan text.
@@ -660,7 +660,7 @@ impl PyLocyExplainOutput {
 }
 
 /// Information about a vertex label in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct LabelInfo {
     /// Label name.
@@ -691,7 +691,7 @@ impl LabelInfo {
 }
 
 /// Information about a property in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PropertyInfo {
     /// Property name.
@@ -717,7 +717,7 @@ impl PropertyInfo {
 }
 
 /// Information about an index in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
     /// Index name.
@@ -741,7 +741,7 @@ impl IndexInfo {
 }
 
 /// Information about a constraint in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ConstraintInfo {
     /// Constraint name.
@@ -765,7 +765,7 @@ impl ConstraintInfo {
 }
 
 /// Information about an edge type in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct EdgeTypeInfo {
     /// Edge type name.
@@ -864,7 +864,7 @@ impl From<::uni_db::api::schema::EdgeTypeInfo> for EdgeTypeInfo {
 }
 
 /// Statistics from a bulk loading operation.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct BulkStats {
     /// Number of vertices inserted.
@@ -894,7 +894,7 @@ impl BulkStats {
 }
 
 /// Progress callback data during bulk loading.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct BulkProgress {
     /// Current phase of bulk loading.
@@ -920,7 +920,7 @@ impl BulkProgress {
 }
 
 /// Statistics from a Locy program evaluation.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct LocyStats {
     /// Number of strata evaluated.
@@ -1102,7 +1102,7 @@ impl PyCompiledProgram {
 // ============================================================================
 
 /// A message in a conversation (role + text content).
-#[pyclass(get_all, name = "Message")]
+#[pyclass(get_all, name = "Message", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyMessage {
     /// Role: "user", "assistant", or "system".
@@ -1151,7 +1151,7 @@ impl PyMessage {
 }
 
 /// Token usage statistics from a generation call.
-#[pyclass(get_all, name = "TokenUsage")]
+#[pyclass(get_all, name = "TokenUsage", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyTokenUsage {
     pub prompt_tokens: usize,
@@ -1194,7 +1194,7 @@ impl PyGenerationResult {
 // ============================================================================
 
 /// Information about a database snapshot.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
     /// Unique snapshot identifier.
@@ -1218,7 +1218,7 @@ impl SnapshotInfo {
 }
 
 /// Status of a background index rebuild task.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct IndexRebuildTaskInfo {
     pub id: String,
@@ -1242,7 +1242,7 @@ impl IndexRebuildTaskInfo {
 }
 
 /// Definition of an index in the schema.
-#[pyclass(get_all)]
+#[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct IndexDefinitionInfo {
     pub name: String,
@@ -1267,7 +1267,7 @@ impl IndexDefinitionInfo {
 // ============================================================================
 
 /// A commit notification describing the effects of a committed transaction.
-#[pyclass(get_all, name = "CommitNotification")]
+#[pyclass(get_all, name = "CommitNotification", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyCommitNotification {
     /// Database version after commit.
@@ -1317,7 +1317,7 @@ impl From<::uni_db::CommitNotification> for PyCommitNotification {
 }
 
 /// Session capabilities snapshot.
-#[pyclass(get_all, name = "SessionCapabilities")]
+#[pyclass(get_all, name = "SessionCapabilities", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySessionCapabilities {
     /// Whether the session can create transactions and execute writes.
@@ -1333,7 +1333,7 @@ pub struct PySessionCapabilities {
 }
 
 /// Metadata about a registered Locy rule.
-#[pyclass(get_all, name = "RuleInfo")]
+#[pyclass(get_all, name = "RuleInfo", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyRuleInfo {
     /// Rule name.
@@ -1345,7 +1345,7 @@ pub struct PyRuleInfo {
 }
 
 /// Statistics from a compaction operation.
-#[pyclass(get_all, name = "CompactionStats")]
+#[pyclass(get_all, name = "CompactionStats", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyCompactionStats {
     /// Number of files compacted.
@@ -1385,7 +1385,7 @@ impl PySessionCapabilities {
 // ============================================================================
 
 /// A rule promotion error from a transaction commit.
-#[pyclass(get_all, name = "RulePromotionError")]
+#[pyclass(get_all, name = "RulePromotionError", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyRulePromotionError {
     /// The rule text that failed.
@@ -1573,7 +1573,7 @@ impl PyExecuteResult {
 // ============================================================================
 
 /// Result of applying a DerivedFactSet to a transaction.
-#[pyclass(get_all, name = "ApplyResult")]
+#[pyclass(get_all, name = "ApplyResult", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyApplyResult {
     pub facts_applied: usize,
@@ -1727,7 +1727,7 @@ impl PyDerivedFactSet {
 // ============================================================================
 
 /// Metrics for a session's lifetime.
-#[pyclass(get_all, name = "SessionMetrics")]
+#[pyclass(get_all, name = "SessionMetrics", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySessionMetrics {
     pub session_id: String,
@@ -1840,7 +1840,7 @@ impl PyPreparedLocy {
 ///
 /// Call `cancel()` to request cancellation; operations holding a reference
 /// to the same token will observe the cancellation and terminate early.
-#[pyclass(name = "CancellationToken")]
+#[pyclass(name = "CancellationToken", from_py_object)]
 #[derive(Clone)]
 pub struct PyCancellationToken {
     pub(crate) inner: tokio_util::sync::CancellationToken,
@@ -1962,7 +1962,7 @@ impl PyPreparedLocyBinder {
 // ============================================================================
 
 /// Write lease configuration for multi-agent coordination.
-#[pyclass(name = "WriteLease")]
+#[pyclass(name = "WriteLease", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyWriteLease {
     pub(crate) variant: WriteLeaseVariant,
@@ -2009,7 +2009,7 @@ impl PyWriteLease {
 // ============================================================================
 
 /// Database-wide metrics snapshot.
-#[pyclass(get_all, name = "DatabaseMetrics")]
+#[pyclass(get_all, name = "DatabaseMetrics", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyDatabaseMetrics {
     pub l0_mutation_count: usize,
@@ -2184,7 +2184,7 @@ impl PyWatchBuilder {
 // ============================================================================
 
 /// Vertex identifier (64-bit sequential ID).
-#[pyclass(name = "Vid", frozen)]
+#[pyclass(name = "Vid", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyVid {
     pub(crate) inner: uni_common::Vid,
@@ -2232,7 +2232,7 @@ impl PyVid {
 }
 
 /// Edge identifier (64-bit sequential ID).
-#[pyclass(name = "Eid", frozen)]
+#[pyclass(name = "Eid", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyEid {
     pub(crate) inner: uni_common::Eid,
@@ -2280,7 +2280,7 @@ impl PyEid {
 }
 
 /// Universal content-addressed identifier (SHA3-256, multibase-encoded).
-#[pyclass(name = "UniId", frozen)]
+#[pyclass(name = "UniId", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyUniId {
     pub(crate) inner: uni_common::UniId,
@@ -2331,7 +2331,7 @@ impl PyUniId {
 // ============================================================================
 
 /// CRDT type for conflict-free replicated data.
-#[pyclass(name = "CrdtType", frozen)]
+#[pyclass(name = "CrdtType", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyCrdtType {
     pub(crate) inner: uni_common::CrdtType,
@@ -2428,7 +2428,7 @@ impl PyCrdtType {
 // ============================================================================
 
 /// Data type for schema property definitions.
-#[pyclass(name = "DataType", frozen)]
+#[pyclass(name = "DataType", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyDataType {
     pub(crate) inner: uni_common::DataType,
@@ -2626,7 +2626,7 @@ impl PyDataType {
 ///
 /// Query results still return native Python types by default. Use `Value` for
 /// explicit type tagging in parameters or custom logic.
-#[pyclass(name = "Value", frozen)]
+#[pyclass(name = "Value", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyValue {
     pub(crate) inner: ::uni_db::Value,
@@ -2851,7 +2851,7 @@ impl PyRow {
 /// Configuration for Locy program evaluation.
 ///
 /// All parameters are optional — unset values use engine defaults.
-#[pyclass(name = "LocyConfig")]
+#[pyclass(name = "LocyConfig", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyLocyConfig {
     pub(crate) inner: ::uni_locy::LocyConfig,
@@ -3051,7 +3051,7 @@ impl PyLocyConfig {
 // ============================================================================
 
 /// A read-only snapshot of the database schema.
-#[pyclass(name = "Schema", frozen)]
+#[pyclass(name = "Schema", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PySchema {
     pub(crate) inner: std::sync::Arc<uni_common::core::schema::Schema>,
@@ -3343,7 +3343,7 @@ impl PyCalibrator {
 // ============================================================================
 
 /// Context passed to session hooks before/after query execution.
-#[pyclass(name = "HookContext", frozen, get_all)]
+#[pyclass(name = "HookContext", frozen, get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyHookContext {
     pub session_id: String,
@@ -3362,7 +3362,7 @@ impl PyHookContext {
 }
 
 /// Context passed to session hooks before/after transaction commit.
-#[pyclass(name = "CommitHookContext", frozen, get_all)]
+#[pyclass(name = "CommitHookContext", frozen, get_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyCommitHookContext {
     pub session_id: String,
@@ -3381,7 +3381,7 @@ impl PyCommitHookContext {
 }
 
 /// Query type discriminator for hook contexts.
-#[pyclass(name = "QueryType", frozen)]
+#[pyclass(name = "QueryType", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueryType;
 
@@ -3409,7 +3409,7 @@ impl PyQueryType {
 // ============================================================================
 
 /// Stable identifier for a fork (ULID-backed).
-#[pyclass(name = "ForkId", frozen)]
+#[pyclass(name = "ForkId", frozen, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyForkId {
     pub(crate) inner: uni_common::core::fork::ForkId,
@@ -3448,7 +3448,7 @@ impl PyForkId {
 }
 
 /// Lifecycle status of a fork in the registry.
-#[pyclass(eq, eq_int, name = "ForkStatus")]
+#[pyclass(eq, eq_int, name = "ForkStatus", from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyForkStatus {
     Pending,
@@ -3471,7 +3471,7 @@ impl PyForkStatus {
 /// Registry record for a single fork.
 ///
 /// All fields are exposed as Python attributes via `#[pyo3(get)]`.
-#[pyclass(name = "ForkInfo")]
+#[pyclass(name = "ForkInfo", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyForkInfo {
     #[pyo3(get)]
@@ -3554,7 +3554,7 @@ impl PyForkInfo {
 // ============================================================================
 
 /// A single property's before/after pair within a diff.
-#[pyclass(name = "PropertyChange")]
+#[pyclass(name = "PropertyChange", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPropertyChange {
     inner: uni_db::PropertyChange,
@@ -3600,7 +3600,7 @@ impl PyPropertyChange {
 }
 
 /// A vertex row from one side of a diff.
-#[pyclass(name = "DiffVertex")]
+#[pyclass(name = "DiffVertex", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyDiffVertex {
     inner: uni_db::DiffVertex,
@@ -3646,7 +3646,7 @@ impl PyDiffVertex {
 }
 
 /// A vertex property change (paired across both sides by UID).
-#[pyclass(name = "VertexPropertyChange")]
+#[pyclass(name = "VertexPropertyChange", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyVertexPropertyChange {
     inner: uni_db::VertexPropertyChange,
@@ -3685,7 +3685,7 @@ impl PyVertexPropertyChange {
 }
 
 /// An edge row from one side of a diff.
-#[pyclass(name = "DiffEdge")]
+#[pyclass(name = "DiffEdge", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyDiffEdge {
     inner: uni_db::DiffEdge,
@@ -3736,7 +3736,7 @@ impl PyDiffEdge {
 
 /// An edge property change (paired across both sides by `(src_uid,
 /// dst_uid, edge_type)`).
-#[pyclass(name = "EdgePropertyChange")]
+#[pyclass(name = "EdgePropertyChange", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyEdgePropertyChange {
     inner: uni_db::EdgePropertyChange,
@@ -3778,7 +3778,7 @@ impl PyEdgePropertyChange {
 }
 
 /// Vertex-side of [`PyForkDiff`].
-#[pyclass(name = "VertexDiff")]
+#[pyclass(name = "VertexDiff", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyVertexDiff {
     inner: uni_db::VertexDiff,
@@ -3838,7 +3838,7 @@ impl PyVertexDiff {
 }
 
 /// Edge-side of [`PyForkDiff`].
-#[pyclass(name = "EdgeDiff")]
+#[pyclass(name = "EdgeDiff", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyEdgeDiff {
     inner: uni_db::EdgeDiff,
@@ -3897,7 +3897,7 @@ impl PyEdgeDiff {
 /// Structural delta between two fork views (or a fork and primary).
 ///
 /// Build via [`PyUni.diff_fork_primary`] or [`PyUni.diff_forks`].
-#[pyclass(name = "ForkDiff")]
+#[pyclass(name = "ForkDiff", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyForkDiff {
     inner: uni_db::ForkDiff,
@@ -3958,7 +3958,7 @@ impl PyForkDiff {
 /// Construct via the class methods:
 ///   - `PromotePattern.label("Person", where_clause="n.age > 30")`
 ///   - `PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020")`
-#[pyclass(name = "PromotePattern")]
+#[pyclass(name = "PromotePattern", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPromotePattern {
     pub(crate) inner: uni_db::PromotePattern,
@@ -4019,7 +4019,7 @@ impl PyPromotePattern {
 }
 
 /// Outcome of [`PyUni.promote_from_fork`].
-#[pyclass(get_all, name = "PromoteReport")]
+#[pyclass(get_all, name = "PromoteReport", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPromoteReport {
     pub vertices_inserted: usize,

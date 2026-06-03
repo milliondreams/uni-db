@@ -22,7 +22,7 @@ uni-plugin = { workspace = true }
 arrow = { workspace = true, features = ["ffi"] }
 arrow-array = { workspace = true, features = ["ffi"] }
 arrow-schema = { workspace = true, features = ["ffi"] }
-arrow-data = { version = "58.0.0", features = ["ffi"] }
+arrow-data = { version = "58.3.0", features = ["ffi"] }
 datafusion = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
@@ -44,7 +44,7 @@ semver = "1"
 # embedder is the host process. `auto-initialize` causes pyo3 to call
 # `Py_Initialize` on first `Python::attach`, which is required for
 # `cargo test -p uni-plugin-pyo3` to link.
-pyo3 = { version = "0.27", optional = true, features = ["abi3-py310", "auto-initialize"] }
+pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "auto-initialize"] }
 
 [features]
 default = []

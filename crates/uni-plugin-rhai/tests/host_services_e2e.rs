@@ -266,7 +266,7 @@ fn http_get_injects_active_traceparent() {
         allow: vec!["https://api.example/**".into()],
     }]);
 
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
     let tracer = provider.tracer("uni-plugin-rhai-test");
     let subscriber =
         tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));

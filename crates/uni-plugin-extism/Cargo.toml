@@ -46,6 +46,6 @@ wat = "1"
 # For the `otel`-gated positive injection test: a real (no-exporter) tracer
 # provider + the tracing-opentelemetry layer. Dev-only.
 opentelemetry = { workspace = true }
-opentelemetry_sdk = "0.27"
+opentelemetry_sdk = "0.32"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }

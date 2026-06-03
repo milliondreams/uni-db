@@ -67,7 +67,7 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
                     // Link to random previous node
                     if i > 1 {
                         let prev = {
-                            use rand::Rng;
+                            use rand::RngExt;
                             let mut rng = rand::rng();
                             rng.random_range(1..i)
                         };
@@ -102,7 +102,7 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
                 let max = max_vid_clone.load(std::sync::atomic::Ordering::Relaxed);
                 if max > 10 {
                     let start_node = {
-                        use rand::Rng;
+                        use rand::RngExt;
                         let mut rng = rand::rng();
                         rng.random_range(1..max)
                     };

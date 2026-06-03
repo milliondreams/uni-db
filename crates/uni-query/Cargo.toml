@@ -50,7 +50,7 @@ metrics = { workspace = true }
 csv = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
-base64 = "0.21"
+base64 = "0.22"
 datafusion = { workspace = true }
 bitvec = "1"
 fxhash = { workspace = true }

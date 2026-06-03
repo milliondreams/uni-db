@@ -7,7 +7,7 @@
 //! cargo bench --bench algo_benchmarks
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;

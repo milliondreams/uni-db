@@ -31,7 +31,7 @@ fxhash = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
-base64 = "0.21"
+base64 = "0.22"
 
 [features]
 default = []

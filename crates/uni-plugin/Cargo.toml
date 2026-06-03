@@ -51,20 +51,20 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # Direct dependencies (not in workspace.dependencies)
 semver = { version = "1.0", features = ["serde"] }
 smol_str = { version = "0.3", features = ["serde"] }
-blake3 = "1.5"
-toml = "0.8"
-dashmap = "6.1"
-smallvec = { version = "1.13", features = ["serde"] }
+blake3 = "1.8"
+toml = "1"
+dashmap = "6.2"
+smallvec = { version = "1.15", features = ["serde"] }
 # Signed-manifest verification is a security primitive, so ed25519 + base64 are
 # non-optional: a build that could be configured to skip signature verification
 # is a footgun whose failure mode is silent acceptance of forged manifests. The
 # ~2 MB of ed25519-dalek + curve25519-dalek + base64 is negligible next to the
 # DataFusion / Arrow / Lance / wasmtime that uni-db already links.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
-base64 = { version = "0.21" }
+base64 = { version = "0.22" }
 # M11: cron-expression parsing for `Schedule::Cron(...)` background jobs.
 # Compute the next fire instant from a cron expression + current time.
-cron = "0.12"
+cron = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # `otel` feature only — the lightweight OTel API + tracing bridge needed to read
 # the current span context. Deliberately NOT the OTLP exporter SDK / tonic:
@@ -84,10 +84,10 @@ proptest = { workspace = true }
 serde_test = "1.0"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "rand_core"] }
 rand = { workspace = true }
-base64 = "0.21"
+base64 = "0.22"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # For the `otel`-gated positive test: a real (no-exporter) tracer provider so
 # the current span carries a valid SpanContext, plus the registry to install
 # the tracing-opentelemetry layer. Dev-only; not in the production graph.
-opentelemetry_sdk = "0.27"
+opentelemetry_sdk = "0.32"
 tracing-subscriber = { workspace = true }

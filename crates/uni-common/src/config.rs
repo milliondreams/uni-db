@@ -457,6 +457,13 @@ pub struct UniConfig {
     /// Default query execution timeout (default: 30s)
     pub query_timeout: Duration,
 
+    /// Maximum wall time a transaction commit may take before it is aborted with
+    /// `CommitTimeout` (default: 5s). This guards against a commit blocking on the
+    /// writer/flush lock, but it also bounds the commit's own compute time — so
+    /// workloads that commit very large transactions in a single shot (bulk-history
+    /// backfills, or unoptimized debug builds) may need to raise it.
+    pub commit_timeout: Duration,
+
     /// Default maximum memory per query (default: 1GB)
     pub max_query_memory: usize,
 
@@ -635,6 +642,7 @@ impl Default for UniConfig {
             throttle: WriteThrottleConfig::default(),
             file_sandbox: FileSandboxConfig::default(),
             query_timeout: Duration::from_secs(30),
+            commit_timeout: Duration::from_secs(5),
             max_query_memory: 1024 * 1024 * 1024,       // 1GB
             max_transaction_memory: 1024 * 1024 * 1024, // 1GB
             max_compaction_rows: 5_000_000,             // 5M rows

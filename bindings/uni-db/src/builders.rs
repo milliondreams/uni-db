@@ -163,7 +163,7 @@ pub(crate) fn load_outcome_to_pydict(
 // ============================================================================
 
 /// Builder for creating and configuring a Uni instance.
-#[pyclass(name = "UniBuilder")]
+#[pyclass(name = "UniBuilder", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DatabaseBuilder {
     pub(crate) uri: String,
@@ -463,7 +463,7 @@ impl DatabaseBuilder {
 // ============================================================================
 
 /// Builder for defining and modifying the graph schema.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct SchemaBuilder {
     pub(crate) inner: Arc<Uni>,
@@ -588,7 +588,7 @@ pub(crate) fn parse_index_config(
 }
 
 /// Builder for defining a label with its properties and indexes.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct LabelBuilder {
     parent_inner: Arc<Uni>,
@@ -718,7 +718,7 @@ impl LabelBuilder {
 }
 
 /// Builder for defining an edge type with its properties.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct EdgeTypeBuilder {
     parent_inner: Arc<Uni>,

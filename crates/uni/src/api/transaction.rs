@@ -893,7 +893,7 @@ impl Transaction {
         // can pass `Arc<Writer>` into the spawned stream task. We pass the
         // Arc directly (no deref to &Writer).
         let (wal_lsn, _flush_pending) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            self.db.config.commit_timeout,
             writer_lock.commit_transaction_l0(self.tx_l0.clone()),
         )
         .await

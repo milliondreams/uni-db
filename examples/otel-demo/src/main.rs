@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -37,7 +37,7 @@ use uni_db::observability::{current_traceparent, http_get_with_traceparent};
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Step 1: install the OTel layer with an in-memory tracer.
-    let provider = TracerProvider::builder().build();
+    let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("otel-demo");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     tracing_subscriber::registry()

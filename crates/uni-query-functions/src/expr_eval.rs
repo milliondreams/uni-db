@@ -1426,7 +1426,7 @@ fn eval_math_function(name: &str, args: &[Value]) -> Result<Value> {
             if !args.is_empty() {
                 return Err(anyhow!("RAND takes no arguments"));
             }
-            use rand::Rng;
+            use rand::RngExt;
             let mut rng = rand::rng();
             Ok(Value::Float(rng.random_range(0.0..1.0)))
         }

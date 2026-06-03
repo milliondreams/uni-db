@@ -846,7 +846,7 @@ impl AsyncIndexes {
 // ============================================================================
 
 /// Async builder for creating and configuring an AsyncUni instance.
-#[pyclass(name = "AsyncUniBuilder")]
+#[pyclass(name = "AsyncUniBuilder", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct AsyncDatabaseBuilder {
     uri: String,
@@ -3814,7 +3814,7 @@ impl AsyncApplyBuilder {
 // ============================================================================
 
 /// Async builder for defining and modifying the graph schema.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct AsyncSchemaBuilder {
     inner: Arc<Uni>,
@@ -3912,7 +3912,7 @@ impl AsyncSchemaBuilder {
 }
 
 /// Async builder for defining a label with its properties and indexes.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct AsyncLabelBuilder {
     parent_inner: Arc<Uni>,
@@ -4035,7 +4035,7 @@ impl AsyncLabelBuilder {
 }
 
 /// Async builder for defining an edge type with its properties.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct AsyncEdgeTypeBuilder {
     parent_inner: Arc<Uni>,

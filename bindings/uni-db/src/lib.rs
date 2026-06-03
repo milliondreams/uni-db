@@ -44,7 +44,12 @@ use pyo3::prelude::*;
 static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
 
 /// Python module for the Uni embedded graph database.
-#[pymodule]
+///
+/// `gil_used = true`: pyo3 0.28 defaults modules to advertising free-threaded
+/// (no-GIL) support, but this extension holds the GIL throughout (`Python::attach`
+/// everywhere) and is not audited for free-threaded safety, so it must keep
+/// requiring the GIL.
+#[pymodule(gil_used = true)]
 fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialise the tokio runtime used by pyo3-async-runtimes with an 8 MB
     // worker-thread stack.  The query executor builds deeply nested async state

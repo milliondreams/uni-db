@@ -48,6 +48,6 @@ tempfile = { workspace = true }
 # provider + the tracing-opentelemetry layer, mirroring uni-plugin's own otel
 # unit test. Dev-only; not in the production graph.
 opentelemetry = { workspace = true }
-opentelemetry_sdk = "0.27"
+opentelemetry_sdk = "0.32"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }

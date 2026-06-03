@@ -4,8 +4,8 @@ use nom::{
     character::complete::{char, digit1, multispace0, one_of},
     combinator::{map, opt, recognize},
     multi::separated_list0,
-    sequence::{delimited, preceded, tuple},
-    IResult,
+    sequence::{delimited, preceded},
+    IResult, Parser,
 };
 use std::collections::HashMap;
 use uni_common::core::id::{Eid, Vid};
@@ -48,7 +48,8 @@ fn value(input: &str) -> IResult<&str, Value> {
         map(string, Value::String),
         special_float,
         number,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn special_float(input: &str) -> IResult<&str, Value> {
@@ -57,18 +58,20 @@ fn special_float(input: &str) -> IResult<&str, Value> {
         map(tag("-Infinity"), |_| Value::Float(f64::NEG_INFINITY)),
         map(tag("Infinity"), |_| Value::Float(f64::INFINITY)),
         map(tag("NaN"), |_| Value::Float(f64::NAN)),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn number(input: &str) -> IResult<&str, Value> {
     let (input, _) = multispace0(input)?;
 
-    let (input, num_str) = recognize(tuple((
+    let (input, num_str) = recognize((
         opt(char('-')),
         digit1,
-        opt(tuple((char('.'), digit1))),
-        opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-    )))(input)?;
+        opt((char('.'), digit1)),
+        opt((one_of("eE"), opt(one_of("+-")), digit1)),
+    ))
+    .parse(input)?;
 
     if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
         match num_str.parse::<f64>() {
@@ -85,7 +88,7 @@ fn number(input: &str) -> IResult<&str, Value> {
 
 fn string(input: &str) -> IResult<&str, String> {
     let (input, _) = multispace0(input)?;
-    let (input, _) = char('\'')(input)?;
+    let (input, _) = char('\'').parse(input)?;
 
     let mut result = String::new();
     let mut chars = input.chars();
@@ -128,7 +131,8 @@ fn list(input: &str) -> IResult<&str, Vec<Value>> {
             preceded(multispace0, value),
         ),
         preceded(multispace0, char(']')),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn map_parser(input: &str) -> IResult<&str, HashMap<String, Value>> {
@@ -136,7 +140,8 @@ fn map_parser(input: &str) -> IResult<&str, HashMap<String, Value>> {
         preceded(multispace0, char('{')),
         separated_list0(preceded(multispace0, char(',')), map_entry),
         preceded(multispace0, char('}')),
-    )(input)?;
+    )
+    .parse(input)?;
 
     Ok((input, pairs.into_iter().collect()))
 }
@@ -145,7 +150,7 @@ fn map_entry(input: &str) -> IResult<&str, (String, Value)> {
     let (input, _) = multispace0(input)?;
     let (input, key) = identifier(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = char(':')(input)?;
+    let (input, _) = char(':').parse(input)?;
     let (input, _) = multispace0(input)?;
     let (input, val) = value(input)?;
 
@@ -153,16 +158,17 @@ fn map_entry(input: &str) -> IResult<&str, (String, Value)> {
 }
 
 fn identifier(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)
+    take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)
 }
 
 /// Parse multiple labels like `:A:B:C` and return as a vector
 fn labels(input: &str) -> IResult<&str, Vec<String>> {
-    let (input, first_label) = preceded(char(':'), identifier)(input)?;
+    let (input, first_label) = preceded(char(':'), identifier).parse(input)?;
     let mut label_list = vec![first_label.to_string()];
 
     let mut remaining = input;
-    while let Ok((rest, label)) = preceded(multispace0, preceded(char(':'), identifier))(remaining)
+    while let Ok((rest, label)) =
+        preceded(multispace0, preceded(char(':'), identifier)).parse(remaining)
     {
         label_list.push(label.to_string());
         remaining = rest;
@@ -173,13 +179,13 @@ fn labels(input: &str) -> IResult<&str, Vec<String>> {
 
 fn node(input: &str) -> IResult<&str, Node> {
     let (input, _) = multispace0(input)?;
-    let (input, _) = char('(')(input)?;
+    let (input, _) = char('(').parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, label_list) = opt(labels)(input)?;
+    let (input, label_list) = opt(labels).parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, properties) = opt(map_parser)(input)?;
+    let (input, properties) = opt(map_parser).parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = char(')')(input)?;
+    let (input, _) = char(')').parse(input)?;
 
     let labels = label_list.unwrap_or_default();
 
@@ -231,20 +237,20 @@ fn build_edge(edge_type: Option<&str>, properties: Option<HashMap<String, Value>
 /// Shared bracket parsing for edge functions.
 fn parse_edge_brackets(input: &str) -> IResult<&str, EdgeBracketResult<'_>> {
     let (input, _) = multispace0(input)?;
-    let (input, _) = char('[')(input)?;
+    let (input, _) = char('[').parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, edge_type) = opt(preceded(char(':'), identifier))(input)?;
+    let (input, edge_type) = opt(preceded(char(':'), identifier)).parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, properties) = opt(map_parser)(input)?;
+    let (input, properties) = opt(map_parser).parse(input)?;
     let (input, _) = multispace0(input)?;
-    let (input, _) = char(']')(input)?;
+    let (input, _) = char(']').parse(input)?;
     Ok((input, (edge_type, properties)))
 }
 
 /// Parse a path `<node-edge-node-edge-node>` with proper direction handling
 fn path(input: &str) -> IResult<&str, Path> {
     let (input, _) = multispace0(input)?;
-    let (input, _) = char('<')(input)?;
+    let (input, _) = char('<').parse(input)?;
     let (input, _) = multispace0(input)?;
 
     // Parse first node
@@ -258,13 +264,14 @@ fn path(input: &str) -> IResult<&str, Path> {
         let (input, _) = multispace0(remaining)?;
 
         // Try to parse edge: <-[edge]- or -[edge]->
-        match tuple((
+        match (
             opt(char('<')),
             char('-'),
             edge_in_path,
             char('-'),
             opt(char('>')),
-        ))(input)
+        )
+            .parse(input)
         {
             Ok((input, (left_arrow, _, mut edge_val, _, right_arrow))) => {
                 // Determine direction: -> is outgoing, <- is incoming
@@ -291,7 +298,7 @@ fn path(input: &str) -> IResult<&str, Path> {
     }
 
     let (input, _) = multispace0(remaining)?;
-    let (input, _) = char('>')(input)?;
+    let (input, _) = char('>').parse(input)?;
 
     Ok((input, Path { nodes, edges }))
 }

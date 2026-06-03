@@ -17,7 +17,7 @@ uni-plugin-wasm-rt = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-ipc = "58.0.0"
+arrow-ipc = "58.3.0"
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -31,8 +31,8 @@ semver = "1.0"
 # wasmtime is the heaviest dep; gated by the `wasmtime-runtime` feature so
 # embedders that only want the trait surface (e.g., for compile-time
 # Rust-only plugins via uni-plugin-builtin) can opt out.
-wasmtime = { version = "41", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
-wasmtime-wasi = { version = "41", optional = true }
+wasmtime = { version = "45", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
+wasmtime-wasi = { version = "45", optional = true }
 datafusion = { workspace = true, optional = true }
 
 [features]

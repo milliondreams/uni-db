@@ -21,7 +21,7 @@ use uni_common::uni_btic::{self, Btic};
 /// Or from raw fields::
 ///
 ///     Btic.from_raw(lo_ms, hi_ms, meta)
-#[pyclass(name = "Btic", frozen, eq, ord, hash)]
+#[pyclass(name = "Btic", frozen, eq, ord, hash, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PyBtic {
     pub(crate) inner: Btic,

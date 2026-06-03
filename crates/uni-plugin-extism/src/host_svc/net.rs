@@ -279,7 +279,7 @@ mod tests {
         let egress = Arc::new(RecordingHttp::new(200));
         let ctx = ctx_with(net_caps("https://api.example.com/**"), Some(egress.clone()));
 
-        let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let tracer = provider.tracer("uni-plugin-extism-test");
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));

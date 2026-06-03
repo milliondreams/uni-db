@@ -237,7 +237,7 @@ mod tests {
         use opentelemetry::trace::TracerProvider as _;
         use tracing_subscriber::prelude::*;
 
-        let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let tracer = provider.tracer("uni-plugin-test");
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));

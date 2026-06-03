@@ -156,7 +156,6 @@ mod tests {
 
     fn engine() -> Engine {
         let mut cfg = wasmtime::Config::new();
-        cfg.async_support(false);
         cfg.wasm_component_model(true);
         Engine::new(&cfg).expect("engine")
     }

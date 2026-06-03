@@ -42,11 +42,10 @@
 
 use std::error::Error as StdError;
 
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -81,13 +80,12 @@ pub fn init_otel_subscriber(cfg: OtelConfig) -> Result<OtelGuard, Box<dyn StdErr
         .with_tonic()
         .with_endpoint(&cfg.otlp_endpoint)
         .build()?;
-    let resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        cfg.service_name.clone(),
-    )]);
-    let provider = TracerProvider::builder()
+    let resource = Resource::builder()
+        .with_service_name(cfg.service_name.clone())
+        .build();
+    let provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_batch_exporter(exporter)
         .build();
     let tracer = provider.tracer("uni-db");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -109,7 +107,7 @@ pub fn init_otel_subscriber(cfg: OtelConfig) -> Result<OtelGuard, Box<dyn StdErr
 /// process; dropping it tears down the OTel pipeline.
 #[derive(Debug)]
 pub struct OtelGuard {
-    provider: TracerProvider,
+    provider: SdkTracerProvider,
 }
 
 impl Drop for OtelGuard {

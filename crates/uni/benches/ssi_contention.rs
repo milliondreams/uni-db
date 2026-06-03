@@ -18,6 +18,11 @@
 //! note it silently loses updates); with `ssi` on the gap is the
 //! conflict-and-retry overhead that buys correctness.
 
+// Lance 7's `lance_io::uring` moka cache introduces a deeply nested type whose
+// `Send` auto-trait evaluation exceeds the default recursion limit inside the
+// `tokio::spawn` futures below. Raise the limit per the compiler's suggestion.
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

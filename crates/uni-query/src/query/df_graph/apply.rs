@@ -99,7 +99,7 @@ pub struct GraphApplyExec {
     kept_input_overrides: Arc<[Option<(String, String)>]>,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Outer mutation context, threaded into the per-row sub-planner so that
     /// `CALL { ... SET/CREATE/MERGE/DELETE ... }` writes route through the
@@ -183,7 +183,7 @@ impl ExecutionPlan for GraphApplyExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -13,6 +13,7 @@ use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

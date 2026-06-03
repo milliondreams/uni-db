@@ -252,7 +252,7 @@ pub struct GraphTraverseExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -454,7 +454,7 @@ impl ExecutionPlan for GraphTraverseExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1547,7 +1547,7 @@ pub struct GraphTraverseMainExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -1716,7 +1716,7 @@ impl ExecutionPlan for GraphTraverseMainExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -2531,7 +2531,7 @@ pub struct GraphVariableLengthTraverseExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -2711,7 +2711,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -3811,7 +3811,7 @@ pub struct GraphVariableLengthTraverseMainExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -3969,7 +3969,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

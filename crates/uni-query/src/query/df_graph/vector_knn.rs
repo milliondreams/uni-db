@@ -119,7 +119,7 @@ pub struct GraphVectorKnnExec {
     schema: SchemaRef,
 
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Vector-retrieval source. `Native` for the built-in path;
     /// `Plugin { handle, .. }` when the planner found a registered
@@ -313,7 +313,7 @@ impl ExecutionPlan for GraphVectorKnnExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

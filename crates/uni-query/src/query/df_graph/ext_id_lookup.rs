@@ -56,7 +56,7 @@ pub struct GraphExtIdLookupExec {
     schema: SchemaRef,
 
     /// Plan properties (cached).
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -142,7 +142,7 @@ impl ExecutionPlan for GraphExtIdLookupExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

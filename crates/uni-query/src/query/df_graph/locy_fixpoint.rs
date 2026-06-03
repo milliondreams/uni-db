@@ -1067,6 +1067,11 @@ async fn arrow_left_anti_dedup(
         None,
         PartitionMode::CollectLeft,
         datafusion::common::NullEquality::NullEqualsNull,
+        // null_aware = false: this is a set-difference dedup (NOT EXISTS), not a
+        // SQL NOT-IN. `NullEqualsNull` already makes NULL keys dedup against NULL
+        // keys; enabling null-aware semantics would wrongly annihilate all rows
+        // whenever the existing-fact side contains a NULL key.
+        false,
     )?;
 
     let join_arc: Arc<dyn ExecutionPlan> = Arc::new(join);
@@ -4663,7 +4668,7 @@ fn update_derived_scan_handles(
 pub struct DerivedScanExec {
     data: Arc<RwLock<Vec<RecordBatch>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DerivedScanExec {
@@ -4701,7 +4706,7 @@ impl ExecutionPlan for DerivedScanExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -4745,7 +4750,7 @@ impl ExecutionPlan for DerivedScanExec {
 struct InMemoryExec {
     batches: Vec<RecordBatch>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl InMemoryExec {
@@ -4784,7 +4789,7 @@ impl ExecutionPlan for InMemoryExec {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -5082,7 +5087,7 @@ pub struct FixpointExec {
     params: HashMap<String, Value>,
     derived_scan_registry: Arc<DerivedScanRegistry>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     max_derived_bytes: usize,
     /// Optional provenance tracker populated during fixpoint iteration.
@@ -5421,7 +5426,7 @@ impl ExecutionPlan for FixpointExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

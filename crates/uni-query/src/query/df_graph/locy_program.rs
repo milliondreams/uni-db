@@ -111,7 +111,7 @@ pub struct LocyProgramExec {
     schema_info: Arc<UniSchema>,
     params: HashMap<String, Value>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     max_iterations: usize,
     timeout: Duration,
@@ -551,7 +551,7 @@ impl ExecutionPlan for LocyProgramExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

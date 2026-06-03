@@ -41,7 +41,7 @@ pub struct BestByExec {
     key_indices: Vec<usize>,
     sort_criteria: Vec<SortCriterion>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// When true, apply a secondary sort on remaining columns for deterministic
     /// tie-breaking. When false, tied rows are selected non-deterministically.
@@ -99,7 +99,7 @@ impl ExecutionPlan for BestByExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -334,7 +334,7 @@ mod tests {
     struct TestMemoryExec {
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for TestMemoryExec {
@@ -353,7 +353,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -9,6 +9,7 @@ use crate::sync::{acquire_read, acquire_write};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use serde::{Deserialize, Serialize};

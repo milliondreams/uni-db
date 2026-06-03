@@ -156,7 +156,7 @@ pub struct LocyModelInvokeExec {
     /// `Float64`, the output schema equals the input schema with
     /// each invocation's `output_column` retyped to `Float64`.
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl LocyModelInvokeExec {
@@ -217,17 +217,20 @@ fn compute_output_schema(input_schema: SchemaRef, invocations: &[ModelInvocation
     Arc::new(Schema::new(fields))
 }
 
-fn compute_plan_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+fn compute_plan_properties(
+    input: &Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+) -> Arc<PlanProperties> {
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 
     let eq = EquivalenceProperties::new(schema);
-    PlanProperties::new(
+    Arc::new(PlanProperties::new(
         eq,
         input.properties().output_partitioning().clone(),
         EmissionType::Final,
         Boundedness::Bounded,
-    )
+    ))
 }
 
 impl DisplayAs for LocyModelInvokeExec {
@@ -253,7 +256,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

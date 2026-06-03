@@ -119,7 +119,7 @@ pub struct GraphScanExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Metrics for execution tracking.
     metrics: ExecutionPlanMetricsSet,
@@ -525,7 +525,7 @@ impl ExecutionPlan for GraphScanExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

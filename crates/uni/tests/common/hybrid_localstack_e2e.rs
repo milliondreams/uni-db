@@ -4,6 +4,7 @@
 use anyhow::Result;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjPath;
 use tempfile::tempdir;

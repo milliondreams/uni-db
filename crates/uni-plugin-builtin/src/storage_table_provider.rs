@@ -227,7 +227,7 @@ pub struct StorageScanExec {
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for StorageScanExec {
@@ -254,12 +254,12 @@ impl StorageScanExec {
         limit: Option<usize>,
     ) -> Self {
         let eq_props = EquivalenceProperties::new(Arc::clone(&projected_schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_props,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             storage,
             table,
@@ -298,7 +298,7 @@ impl ExecutionPlan for StorageScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -366,7 +366,7 @@ impl ExecutionPlan for StorageScanExec {
         )))
     }
 
-    fn statistics(&self) -> DfResult<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Statistics> {
         Ok(Statistics::new_unknown(&self.projected_schema))
     }
 }

@@ -4072,6 +4072,7 @@ impl Executor {
     /// Streams data from source to destination, supporting cross-cloud backups.
     async fn backup_to_cloud(&self, dest_url: &str, _snapshot_id: &str) -> Result<()> {
         use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as ObjPath;
 
@@ -4529,7 +4530,7 @@ impl Executor {
         &self,
         source_url: &str,
     ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
 
         let (store, path) = build_store_from_url(source_url)?;
 
@@ -5297,7 +5298,7 @@ impl Executor {
         rows: &[HashMap<String, uni_common::Value>],
         arrow_schema: &arrow_schema::Schema,
     ) -> Result<()> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
 
         let (store, path) = build_store_from_url(dest_url)?;
 

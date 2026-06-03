@@ -86,7 +86,7 @@ pub struct OptionalFilterExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -242,7 +242,7 @@ impl ExecutionPlan for OptionalFilterExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

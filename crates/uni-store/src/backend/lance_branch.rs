@@ -242,7 +242,8 @@ pub async fn create_scalar_index_on_branch(
     column: &str,
     index_name: &str,
 ) -> Result<()> {
-    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    use lance::index::DatasetIndexExt;
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     let mut on_branch = open_branch(uri, branch).await?;
     on_branch
         .create_index_builder(&[column], IndexType::Scalar, &ScalarIndexParams::default())
@@ -359,8 +360,9 @@ pub async fn create_vector_index_on_branch(
     column: &str,
     index_name: &str,
 ) -> Result<()> {
+    use lance::index::DatasetIndexExt;
     use lance::index::vector::VectorIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
 
     let mut on_branch = open_branch(uri, branch).await?;
@@ -398,7 +400,8 @@ pub async fn create_fts_index_on_branch(
     column: &str,
     index_name: &str,
 ) -> Result<()> {
-    use lance_index::{DatasetIndexExt, IndexType, scalar::InvertedIndexParams};
+    use lance::index::DatasetIndexExt;
+    use lance_index::{IndexType, scalar::InvertedIndexParams};
 
     let mut on_branch = open_branch(uri, branch).await?;
     // Mirrors `IndexManager::create_fts_index`: uses
@@ -916,8 +919,9 @@ mod tests {
     async fn phase5b_spike_per_branch_vector() {
         use arrow_array::{Float32Array, RecordBatch as Batch, UInt64Array};
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use lance::index::DatasetIndexExt;
         use lance::index::vector::VectorIndexParams;
-        use lance_index::{DatasetIndexExt, IndexType};
+        use lance_index::IndexType;
         use lance_linalg::distance::MetricType;
 
         let dir = TempDir::new().unwrap();
@@ -1069,7 +1073,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "phase-5a spike: documents Lance per-branch index semantics; run with --run-ignored ignored-only"]
     async fn phase5a_spike_per_branch_index() {
-        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+        use lance::index::DatasetIndexExt;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
 
         let (_dir, uri) = seed_dataset().await;
         let v_main = current_version(&uri).await.unwrap();

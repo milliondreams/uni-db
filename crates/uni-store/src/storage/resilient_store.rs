@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
 };
 use std::fmt::{Debug, Display};
@@ -163,27 +163,6 @@ impl Display for ResilientObjectStore {
 
 #[async_trait]
 impl ObjectStore for ResilientObjectStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> StoreResult<PutResult> {
-        let timeout = self.config.write_timeout;
-        // Non-retryable
-        // We still check CB logic?
-        if !self.cb.allow_request() {
-            return Err(object_store::Error::Generic {
-                store: "ResilientObjectStore",
-                source: Box::new(std::io::Error::other("Circuit breaker open")),
-            });
-        }
-
-        let res = self
-            .timeout(|| self.inner.put(location, payload), timeout)
-            .await;
-        match res {
-            Ok(_) => self.cb.report_success(),
-            Err(_) => self.cb.report_failure(), // Count timeout/error as failure
-        }
-        res
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -207,11 +186,6 @@ impl ObjectStore for ResilientObjectStore {
         res
     }
 
-    async fn put_multipart(&self, location: &Path) -> StoreResult<Box<dyn MultipartUpload>> {
-        self.put_multipart_opts(location, PutMultipartOptions::default())
-            .await
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -231,10 +205,6 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    async fn get(&self, location: &Path) -> StoreResult<GetResult> {
-        self.get_opts(location, GetOptions::default()).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
         let timeout = self.config.read_timeout;
         self.retry(
@@ -243,18 +213,6 @@ impl ObjectStore for ResilientObjectStore {
                     .await
             },
             "get_opts",
-        )
-        .await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> StoreResult<Bytes> {
-        let timeout = self.config.read_timeout;
-        self.retry(
-            || async {
-                self.timeout(|| self.inner.get_range(location, range.clone()), timeout)
-                    .await
-            },
-            "get_range",
         )
         .await
     }
@@ -271,22 +229,20 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    async fn head(&self, location: &Path) -> StoreResult<ObjectMeta> {
-        let timeout = self.config.read_timeout;
-        self.retry(
-            || async { self.timeout(|| self.inner.head(location), timeout).await },
-            "head",
-        )
-        .await
-    }
-
-    async fn delete(&self, location: &Path) -> StoreResult<()> {
-        let timeout = self.config.write_timeout;
-        self.retry(
-            || async { self.timeout(|| self.inner.delete(location), timeout).await },
-            "delete",
-        )
-        .await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, StoreResult<Path>>,
+    ) -> BoxStream<'static, StoreResult<Path>> {
+        if !self.cb.allow_request() {
+            return futures::stream::once(async {
+                Err(object_store::Error::Generic {
+                    store: "ResilientObjectStore",
+                    source: Box::new(std::io::Error::other("Circuit breaker open")),
+                })
+            })
+            .boxed();
+        }
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
@@ -339,32 +295,14 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> StoreResult<()> {
-        let timeout = self.config.write_timeout;
-        self.retry(
-            || async { self.timeout(|| self.inner.copy(from, to), timeout).await },
-            "copy",
-        )
-        .await
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> StoreResult<()> {
-        let timeout = self.config.write_timeout;
-        self.retry(
-            || async { self.timeout(|| self.inner.rename(from, to), timeout).await },
-            "rename",
-        )
-        .await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> StoreResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> StoreResult<()> {
         let timeout = self.config.write_timeout;
         self.retry(
             || async {
-                self.timeout(|| self.inner.copy_if_not_exists(from, to), timeout)
+                self.timeout(|| self.inner.copy_opts(from, to, options.clone()), timeout)
                     .await
             },
-            "copy_if_not_exists",
+            "copy_opts",
         )
         .await
     }
@@ -373,6 +311,7 @@ impl ObjectStore for ResilientObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
     // ── CircuitBreaker unit tests ────────────────────────────────────

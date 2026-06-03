@@ -44,13 +44,13 @@ pub fn arrow_err(e: arrow::error::ArrowError) -> datafusion::error::DataFusionEr
 /// - Unknown partitioning with 1 partition
 /// - Incremental emission type
 /// - Bounded execution
-pub fn compute_plan_properties(schema: SchemaRef) -> PlanProperties {
-    PlanProperties::new(
+pub fn compute_plan_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
         Partitioning::UnknownPartitioning(1),
         datafusion::physical_plan::execution_plan::EmissionType::Incremental,
         datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-    )
+    ))
 }
 
 /// Return the Arrow `DataType` for `_labels` columns: `List<Utf8>`.

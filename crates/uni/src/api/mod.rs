@@ -74,6 +74,7 @@ pub mod triggers {
 pub mod xervo;
 
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
 use tracing::info;
 use uni_common::core::snapshot::SnapshotManifest;

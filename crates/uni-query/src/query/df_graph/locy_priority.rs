@@ -36,7 +36,7 @@ pub struct PriorityExec {
     key_indices: Vec<usize>,
     priority_col_index: usize,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -98,7 +98,7 @@ impl ExecutionPlan for PriorityExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -296,7 +296,7 @@ mod tests {
     struct TestMemoryExec {
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for TestMemoryExec {
@@ -315,7 +315,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

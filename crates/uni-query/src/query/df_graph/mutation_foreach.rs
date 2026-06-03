@@ -56,7 +56,7 @@ pub struct ForeachExec {
     schema: SchemaRef,
 
     /// Plan properties for DataFusion optimizer.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -105,7 +105,7 @@ impl ExecutionPlan for ForeachExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -123,7 +123,7 @@ pub struct VidLookupJoinExec {
     join_kind: VidJoinKind,
     /// Output schema = `left.schema() ++ right.schema()` in plan order.
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -225,7 +225,7 @@ impl ExecutionPlan for VidLookupJoinExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

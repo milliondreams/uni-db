@@ -69,7 +69,7 @@ log = { workspace = true }
 metrics = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-ipc = "57.2.0"
+arrow-ipc = "58.0.0"
 serde_bytes = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { workspace = true }

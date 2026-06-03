@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use bytes::Bytes;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -122,7 +123,6 @@ async fn test_build_store_from_file_url() -> Result<()> {
 
 #[tokio::test]
 async fn test_copy_store_prefix() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
@@ -193,7 +193,6 @@ async fn test_copy_store_prefix() -> Result<()> {
 
 #[tokio::test]
 async fn test_inmemory_store_basic_operations() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -229,7 +228,6 @@ use futures::StreamExt;
 
 #[tokio::test]
 async fn test_copy_store_prefix_inmemory() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -310,7 +308,6 @@ async fn test_copy_store_prefix_inmemory() -> Result<()> {
 
 #[tokio::test]
 async fn test_copy_store_prefix_empty_source() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -333,7 +330,6 @@ async fn test_copy_store_prefix_empty_source() -> Result<()> {
 
 #[tokio::test]
 async fn test_copy_store_prefix_to_root() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -363,7 +359,6 @@ async fn test_copy_store_prefix_to_root() -> Result<()> {
 
 #[tokio::test]
 async fn test_copy_store_prefix_large_files() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -402,7 +397,6 @@ async fn test_copy_store_prefix_large_files() -> Result<()> {
 
 #[tokio::test]
 async fn test_inmemory_simulated_backup_flow() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
     use object_store::path::Path;
 
@@ -478,7 +472,6 @@ async fn test_inmemory_simulated_backup_flow() -> Result<()> {
 
 #[tokio::test]
 async fn test_inmemory_cross_store_copy() -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -677,7 +670,6 @@ async fn test_s3_copy_prefix() -> Result<()> {
 
 /// Helper to create a bucket in LocalStack
 async fn create_localstack_bucket(bucket: &str) -> Result<()> {
-    use object_store::ObjectStore;
     use object_store::aws::AmazonS3Builder;
 
     // LocalStack accepts unsigned PUT /{bucket} for bucket creation in test env.

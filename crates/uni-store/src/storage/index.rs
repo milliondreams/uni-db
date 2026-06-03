@@ -7,7 +7,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Ar
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance_index::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::core::id::{UniId, Vid};

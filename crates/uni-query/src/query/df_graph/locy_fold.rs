@@ -173,7 +173,7 @@ pub struct FoldExec {
     /// for legacy callers.
     body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -330,7 +330,7 @@ impl ExecutionPlan for FoldExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -817,7 +817,7 @@ mod tests {
     struct TestMemoryExec {
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for TestMemoryExec {
@@ -836,7 +836,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

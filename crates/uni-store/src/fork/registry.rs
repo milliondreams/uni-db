@@ -632,6 +632,7 @@ impl ForkRegistryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
     use uni_common::core::fork::ForkId;

@@ -78,7 +78,7 @@ pub struct RecursiveCTEExec {
     output_schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Outer mutation context, threaded into each iteration's sub-planner
     /// so that writes inside the recursive body (rare but supported by the
@@ -156,7 +156,7 @@ impl ExecutionPlan for RecursiveCTEExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -12,9 +12,9 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::core::snapshot::SnapshotManifest;

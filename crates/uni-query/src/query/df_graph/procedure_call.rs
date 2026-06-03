@@ -189,7 +189,7 @@ pub struct GraphProcedureCallExec {
     schema: SchemaRef,
 
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -404,7 +404,7 @@ impl ExecutionPlan for GraphProcedureCallExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -85,7 +85,7 @@ impl ExecutionPlan for ReadSetRecordingExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 

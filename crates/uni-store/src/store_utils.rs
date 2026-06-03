@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
-use object_store::{GetResult, ObjectMeta, ObjectStore, PutOptions, PutResult};
+use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutOptions, PutResult};
 use std::sync::Arc;
 use std::time::Duration;
 

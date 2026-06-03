@@ -90,7 +90,7 @@ pub struct GraphShortestPathExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -210,7 +210,7 @@ impl ExecutionPlan for GraphShortestPathExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

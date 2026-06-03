@@ -9,7 +9,11 @@ use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "lance-backend")]
+use lance::index::DatasetIndexExt;
+#[cfg(feature = "lance-backend")]
 use lance::index::vector::VectorIndexParams;
+#[cfg(feature = "lance-backend")]
+use lance_index::IndexType;
 #[cfg(feature = "lance-backend")]
 use lance_index::progress::IndexBuildProgress;
 #[cfg(feature = "lance-backend")]
@@ -24,8 +28,6 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 #[cfg(feature = "lance-backend")]
 use lance_index::vector::sq::builder::SQBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::{DatasetIndexExt, IndexType};
 #[cfg(feature = "lance-backend")]
 use lance_linalg::distance::MetricType;
 use serde::{Deserialize, Serialize};

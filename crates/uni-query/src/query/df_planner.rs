@@ -2684,6 +2684,7 @@ impl HybridPhysicalPlanner {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )?;
         Ok(Arc::new(join))
     }
@@ -2768,6 +2769,7 @@ impl HybridPhysicalPlanner {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )?;
         let join_plan: Arc<dyn ExecutionPlan> = Arc::new(join);
 
@@ -2905,6 +2907,7 @@ impl HybridPhysicalPlanner {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )?;
         let join_plan: Arc<dyn ExecutionPlan> = Arc::new(join);
 
@@ -4029,6 +4032,7 @@ impl HybridPhysicalPlanner {
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         // Apply mixed-non-equi residual (predicates referencing both sides

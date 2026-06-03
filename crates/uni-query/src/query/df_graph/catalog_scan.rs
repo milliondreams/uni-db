@@ -103,7 +103,7 @@ pub struct CatalogVertexScanExec {
     pushdown_limit: Option<usize>,
     /// Output schema with graph-row convention.
     schema: SchemaRef,
-    properties_plan: PlanProperties,
+    properties_plan: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -222,7 +222,7 @@ impl ExecutionPlan for CatalogVertexScanExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties_plan
     }
 
@@ -395,7 +395,7 @@ pub struct CatalogEdgeScanExec {
     pushdown_filters: Vec<DfExpr>,
     pushdown_limit: Option<usize>,
     schema: SchemaRef,
-    properties_plan: PlanProperties,
+    properties_plan: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -513,7 +513,7 @@ impl ExecutionPlan for CatalogEdgeScanExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties_plan
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

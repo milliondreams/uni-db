@@ -1113,7 +1113,6 @@ impl BulkWriter {
                     let idx_mgr = IndexManager::new(
                         self.backend.storage.base_path(),
                         self.backend.storage.schema_manager_arc(),
-                        self.backend.storage.backend_arc(),
                     );
                     idx_mgr
                         .rebuild_indexes_for_label(label)

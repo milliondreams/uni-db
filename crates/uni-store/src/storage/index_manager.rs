@@ -7,7 +7,6 @@
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
-use arrow_array::UInt64Array;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "lance-backend")]
 use lance::index::vector::VectorIndexParams;
@@ -30,7 +29,6 @@ use lance_index::{DatasetIndexExt, IndexType};
 #[cfg(feature = "lance-backend")]
 use lance_linalg::distance::MetricType;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(feature = "lance-backend")]
 use std::collections::HashSet;
@@ -46,14 +44,6 @@ use uni_common::core::schema::{
     DistanceMetric, FullTextIndexConfig, InvertedIndexConfig, JsonFtsIndexConfig,
     ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, VectorIndexType,
 };
-
-/// Validates that a column name contains only safe characters to prevent SQL injection.
-///
-/// Issue #8: Column names must be sanitized before interpolation in SQL queries.
-/// Allows only alphanumeric characters and underscores.
-fn is_valid_column_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
 
 /// Tracing-based progress reporter for Lance index builds.
 ///
@@ -146,7 +136,6 @@ pub struct IndexRebuildTask {
 pub struct IndexManager {
     base_uri: String,
     schema_manager: Arc<SchemaManager>,
-    backend: Arc<dyn crate::backend::StorageBackend>,
 }
 
 impl std::fmt::Debug for IndexManager {
@@ -158,16 +147,11 @@ impl std::fmt::Debug for IndexManager {
 }
 
 impl IndexManager {
-    /// Create a new `IndexManager` bound to `base_uri` and the given schema and backend.
-    pub fn new(
-        base_uri: &str,
-        schema_manager: Arc<SchemaManager>,
-        backend: Arc<dyn crate::backend::StorageBackend>,
-    ) -> Self {
+    /// Create a new `IndexManager` bound to `base_uri` and the given schema.
+    pub fn new(base_uri: &str, schema_manager: Arc<SchemaManager>) -> Self {
         Self {
             base_uri: base_uri.to_string(),
             schema_manager,
-            backend,
         }
     }
 
@@ -688,77 +672,6 @@ impl IndexManager {
         }
 
         Ok(())
-    }
-
-    /// Lookup by composite key
-    pub async fn composite_lookup(
-        &self,
-        label: &str,
-        key_values: &HashMap<String, Value>,
-    ) -> Result<Option<Vid>> {
-        use crate::backend::types::ScanRequest;
-
-        let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
-
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
-        let table_name = ds_wrapper.table_name();
-        let backend = self.backend.as_ref();
-
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
-            return Ok(None);
-        }
-
-        // Build filter from key values
-        let filter = key_values
-            .iter()
-            .map(|(k, v)| {
-                // Issue #8: Validate column name to prevent SQL injection
-                if !is_valid_column_name(k) {
-                    anyhow::bail!("Invalid column name '{}': must contain only alphanumeric characters and underscores", k);
-                }
-
-                let val_str = match v {
-                    Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                    Value::Number(n) => n.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    Value::Null => "null".to_string(),
-                    _ => v.to_string(),
-                };
-                // Quote column name for case sensitivity
-                Ok(format!("\"{}\" = {}", k, val_str))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .join(" AND ");
-
-        let request = ScanRequest::all(&table_name)
-            .with_filter(filter)
-            .with_limit(1)
-            .with_columns(vec!["_vid".to_string()]);
-
-        let batches = match backend.scan(request).await {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-
-        for batch in batches {
-            if batch.num_rows() > 0 {
-                let vid_col = batch
-                    .column_by_name("_vid")
-                    .ok_or_else(|| anyhow!("Missing _vid column"))?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| anyhow!("Invalid _vid column type"))?;
-
-                let vid = vid_col.value(0);
-                return Ok(Some(Vid::from(vid)));
-            }
-        }
-
-        Ok(None)
     }
 
     /// Applies incremental updates to an inverted index.

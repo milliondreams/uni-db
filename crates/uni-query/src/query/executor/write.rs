@@ -1462,25 +1462,6 @@ impl Executor {
         Ok(())
     }
 
-    fn get_composite_constraint(&self, label: &str) -> Option<Constraint> {
-        let schema = self.storage.schema_manager().schema();
-        schema
-            .constraints
-            .iter()
-            .find(|c| {
-                if !c.enabled {
-                    return false;
-                }
-                match &c.target {
-                    ConstraintTarget::Label(l) if l == label => {
-                        matches!(c.constraint_type, ConstraintType::Unique { .. })
-                    }
-                    _ => false,
-                }
-            })
-            .cloned()
-    }
-
     /// Returns `true` if `prop` has a scalar index on `label`.
     ///
     /// Scalar indexes (hash/btree/bitmap) make a property-equality lookup an
@@ -1942,126 +1923,23 @@ impl Executor {
                 // Non-scalar key value: fall through to the general path below.
             }
 
-            // Optimization: Check for single node pattern with unique constraint
-            let mut optimized_vid = None;
-            if pattern.paths.len() == 1 {
-                let path = &pattern.paths[0];
-                if path.elements.len() == 1
-                    && let PatternElement::Node(n) = &path.elements[0]
-                    && n.labels.len() == 1
-                    && let Some(constraint) = self.get_composite_constraint(&n.labels[0])
-                    && let ConstraintType::Unique { properties } = constraint.constraint_type
-                {
-                    let label = &n.labels[0];
-                    // Evaluate pattern properties
-                    let mut pattern_props = HashMap::new();
-                    if let Some(props_expr) = &n.properties {
-                        let val = self
-                            .evaluate_expr(props_expr, &row, prop_manager, params, ctx)
-                            .await?;
-                        if let Value::Map(map) = val {
-                            for (k, v) in map {
-                                pattern_props.insert(k, v);
-                            }
-                        }
-                    }
+            // General execution: match-or-create per row. (The index fast path
+            // above already handles single-node, single-label, scalar-indexed
+            // MERGE — including unique-constrained labels, whose keys are
+            // indexed — so there is no separate constraint-only fast path.)
+            let matches = self
+                .execute_merge_match(pattern, &row, prop_manager, params, ctx)
+                .await?;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
 
-                    // Check if all constraint properties are present
-                    let has_all_keys = properties.iter().all(|p| pattern_props.contains_key(p));
-                    if has_all_keys {
-                        // Extract key properties and convert to serde_json::Value for index lookup
-                        let key_props: HashMap<String, serde_json::Value> = properties
-                            .iter()
-                            .filter_map(|p| {
-                                pattern_props.get(p).map(|v| (p.clone(), v.clone().into()))
-                            })
-                            .collect();
-
-                        // Use optimized lookup
-                        if let Ok(Some(vid)) = self
-                            .storage
-                            .index_manager()
-                            .composite_lookup(label, &key_props)
-                            .await
-                        {
-                            optimized_vid = Some((vid, pattern_props));
-                        }
-                    }
-                }
-            }
-
-            if let Some((vid, _pattern_props)) = optimized_vid {
-                // Optimized Path: Node found via index
-                let writer: &uni_store::Writer = writer_lock.as_ref();
-
-                let mut match_row = row.clone();
-                if let PatternElement::Node(n) = &pattern.paths[0].elements[0]
-                    && let Some(var) = &n.variable
-                {
-                    match_row.insert(var.clone(), Value::Int(vid.as_u64() as i64));
-                }
-
-                let result = if let Some(set) = on_match {
-                    self.execute_set_items_locked(
-                        &set.items,
-                        &mut match_row,
-                        writer,
-                        prop_manager,
-                        params,
-                        ctx,
-                        tx_l0_override,
-                        &Prefetch::default(),
-                    )
-                    .await
-                } else {
-                    Ok(())
-                };
-                result?;
-
-                Self::bind_path_variables(&path_pattern, &mut match_row, &temp_vars);
-                results.push(match_row);
-            } else {
-                // Fallback to standard execution
-                let matches = self
-                    .execute_merge_match(pattern, &row, prop_manager, params, ctx)
-                    .await?;
-                let writer: &uni_store::Writer = writer_lock.as_ref();
-
-                let result: Result<Vec<HashMap<String, Value>>> = async {
-                    let mut batch = Vec::new();
-                    if !matches.is_empty() {
-                        for mut m in matches {
-                            if let Some(set) = on_match {
-                                self.execute_set_items_locked(
-                                    &set.items,
-                                    &mut m,
-                                    writer,
-                                    prop_manager,
-                                    params,
-                                    ctx,
-                                    tx_l0_override,
-                                    &Prefetch::default(),
-                                )
-                                .await?;
-                            }
-                            Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
-                            batch.push(m);
-                        }
-                    } else {
-                        self.execute_create_pattern(
-                            &path_pattern,
-                            &mut row,
-                            writer,
-                            prop_manager,
-                            params,
-                            ctx,
-                            tx_l0_override,
-                        )
-                        .await?;
-                        if let Some(set) = on_create {
+            let result: Result<Vec<HashMap<String, Value>>> = async {
+                let mut batch = Vec::new();
+                if !matches.is_empty() {
+                    for mut m in matches {
+                        if let Some(set) = on_match {
                             self.execute_set_items_locked(
                                 &set.items,
-                                &mut row,
+                                &mut m,
                                 writer,
                                 prop_manager,
                                 params,
@@ -2071,15 +1949,41 @@ impl Executor {
                             )
                             .await?;
                         }
-                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
-                        batch.push(row);
+                        Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
+                        batch.push(m);
                     }
-                    Ok(batch)
+                } else {
+                    self.execute_create_pattern(
+                        &path_pattern,
+                        &mut row,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0_override,
+                    )
+                    .await?;
+                    if let Some(set) = on_create {
+                        self.execute_set_items_locked(
+                            &set.items,
+                            &mut row,
+                            writer,
+                            prop_manager,
+                            params,
+                            ctx,
+                            tx_l0_override,
+                            &Prefetch::default(),
+                        )
+                        .await?;
+                    }
+                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                    batch.push(row);
                 }
-                .await;
-
-                results.extend(result?);
+                Ok(batch)
             }
+            .await;
+
+            results.extend(result?);
         }
         Ok(results)
     }

@@ -191,7 +191,11 @@ async fn merge_on_match_after_flush() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    assert_eq!(count_by_id(&db, "fe").await?, 1, "must match the flushed row");
+    assert_eq!(
+        count_by_id(&db, "fe").await?,
+        1,
+        "must match the flushed row"
+    );
     assert_eq!(freq_by_id(&db, "fe").await?, 15);
     Ok(())
 }
@@ -224,7 +228,11 @@ async fn merge_multi_match_updates_all() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    assert_eq!(count_by_id(&db, "dup").await?, 2, "must not create a 3rd node");
+    assert_eq!(
+        count_by_id(&db, "dup").await?,
+        2,
+        "must not create a 3rd node"
+    );
     let freqs = db
         .session()
         .query_with("MATCH (n:Entity) WHERE n.entity_id = $id RETURN n.freq AS freq")
@@ -232,7 +240,11 @@ async fn merge_multi_match_updates_all() -> Result<()> {
         .fetch_all()
         .await?;
     for row in freqs.rows() {
-        assert_eq!(row.get::<i64>("freq")?, 7, "ON MATCH SET must hit every match");
+        assert_eq!(
+            row.get::<i64>("freq")?,
+            7,
+            "ON MATCH SET must hit every match"
+        );
     }
     Ok(())
 }
@@ -374,6 +386,55 @@ async fn merge_return_preserves_input_order() -> Result<()> {
         .map(|r| r.get::<String>("id").unwrap())
         .collect();
     assert_eq!(ids, vec!["a", "b", "c"]);
+    Ok(())
+}
+
+// ============================================================================
+// Removal guard: a UNIQUE-constrained label still dedups on repeated MERGE
+// after the dead `composite_lookup` "optimized" branch was removed. Single-key
+// MERGE on the (indexed) unique key now flows through the issue-#69 fast path;
+// this confirms the unique-constraint case end-to-end.
+// ============================================================================
+
+#[tokio::test]
+async fn merge_unique_constraint_dedups() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("U")
+        .property("code", DataType::String)
+        .property_nullable("hits", DataType::Int64)
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE CONSTRAINT u_code ON (u:U) ASSERT u.code IS UNIQUE")
+        .await?;
+    tx.commit().await?;
+
+    // MERGE the same unique key three times across separate transactions.
+    for _ in 0..3 {
+        let tx = db.session().tx().await?;
+        tx.execute_with(
+            "MERGE (u:U {code: $code}) \
+             ON CREATE SET u.hits = 1 \
+             ON MATCH SET u.hits = u.hits + 1",
+        )
+        .param("code", "k")
+        .run()
+        .await?;
+        tx.commit().await?;
+    }
+
+    let res = db
+        .session()
+        .query("MATCH (u:U) WHERE u.code = 'k' RETURN count(u) AS c")
+        .await?;
+    assert_eq!(res.rows()[0].get::<i64>("c")?, 1, "unique key must dedup");
+    let hits = db
+        .session()
+        .query("MATCH (u:U) WHERE u.code = 'k' RETURN u.hits AS h")
+        .await?;
+    assert_eq!(hits.rows()[0].get::<i64>("h")?, 3);
     Ok(())
 }
 

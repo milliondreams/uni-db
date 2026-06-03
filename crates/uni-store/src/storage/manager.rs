@@ -1138,11 +1138,7 @@ impl StorageManager {
     }
 
     pub fn index_manager(&self) -> IndexManager {
-        IndexManager::new(
-            &self.base_uri,
-            self.schema_manager.clone(),
-            self.backend.clone(),
-        )
+        IndexManager::new(&self.base_uri, self.schema_manager.clone())
     }
 
     // ========================================================================

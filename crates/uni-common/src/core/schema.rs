@@ -207,6 +207,93 @@ impl DataType {
             ))),
         }
     }
+
+    /// Returns `true` if `value` is directly storable in this column type without loss.
+    ///
+    /// This is the schema-level type guard used by the write path. `Value::Null` is
+    /// always accepted — column nullability is enforced separately by the `nullable`
+    /// flag, not here. `CypherValue`, `Crdt`, and `Point` columns accept any value.
+    /// For every other declared type, only the `Value` variants that the storage layer
+    /// persists *without silently nulling* are accepted (see the per-type converters in
+    /// `uni-store`'s `arrow_convert`), plus the intentional lossless widenings
+    /// `Int`→`Float`, `Int`→`Int32`, and `Temporal`→`Timestamp`.
+    ///
+    /// A `Value::String` destined for a `Date`/`Time`/`DateTime`/`Duration` column is
+    /// intentionally *not* accepted here: the write path first coerces such strings into
+    /// the proper `Temporal` value (matching the Cypher temporal constructors), then the
+    /// coerced value passes this check. This keeps `accepts` a pure, allocation-free
+    /// predicate.
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::core::schema::DataType;
+    /// use uni_common::Value;
+    ///
+    /// assert!(DataType::Float64.accepts(&Value::Int(3))); // Int widens to Float
+    /// assert!(DataType::Bool.accepts(&Value::Null)); // Null always accepted
+    /// assert!(!DataType::DateTime.accepts(&Value::String("2026-01-01T00:00:00Z".into())));
+    /// ```
+    pub fn accepts(&self, value: &crate::value::Value) -> bool {
+        use crate::value::{TemporalValue, Value};
+
+        // Null is universally accepted; nullability is a separate concern.
+        if matches!(value, Value::Null) {
+            return true;
+        }
+
+        match self {
+            // Opaque / dynamically-typed columns accept any value.
+            DataType::CypherValue | DataType::Crdt(_) | DataType::Point(_) => true,
+
+            DataType::String => matches!(value, Value::String(_)),
+            DataType::Int32 | DataType::Int64 => matches!(value, Value::Int(_)),
+            // Int widens to Float losslessly for the ranges we care about.
+            DataType::Float32 | DataType::Float64 => {
+                matches!(value, Value::Int(_) | Value::Float(_))
+            }
+            DataType::Bool => matches!(value, Value::Bool(_)),
+
+            // Non-struct timestamp column: storage parses strings and accepts ints,
+            // so both are lossless here (unlike the DateTime struct column below).
+            DataType::Timestamp => matches!(
+                value,
+                Value::String(_)
+                    | Value::Int(_)
+                    | Value::Temporal(
+                        TemporalValue::DateTime { .. } | TemporalValue::LocalDateTime { .. }
+                    )
+            ),
+            DataType::DateTime => matches!(
+                value,
+                Value::Temporal(
+                    TemporalValue::DateTime { .. } | TemporalValue::LocalDateTime { .. }
+                )
+            ),
+            DataType::Date => {
+                matches!(
+                    value,
+                    Value::Int(_) | Value::Temporal(TemporalValue::Date { .. })
+                )
+            }
+            DataType::Time => matches!(
+                value,
+                Value::Int(_)
+                    | Value::Temporal(TemporalValue::Time { .. } | TemporalValue::LocalTime { .. })
+            ),
+            DataType::Duration => {
+                matches!(value, Value::Temporal(TemporalValue::Duration { .. }))
+            }
+            DataType::Bytes => matches!(value, Value::Bytes(_)),
+            // FixedSizeBinary(24) converter accepts the Btic temporal, raw strings, and lists.
+            DataType::Btic => matches!(
+                value,
+                Value::String(_) | Value::List(_) | Value::Temporal(TemporalValue::Btic { .. })
+            ),
+            DataType::Vector { .. } => matches!(value, Value::Vector(_) | Value::List(_)),
+            DataType::List(_) => matches!(value, Value::List(_)),
+            DataType::Map(_, _) => matches!(value, Value::Map(_)),
+        }
+    }
 }
 
 fn default_created_at() -> DateTime<Utc> {
@@ -1538,8 +1625,64 @@ fn validate_reserved_property_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::{TemporalValue, Value};
     use object_store::local::LocalFileSystem;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_datatype_accepts_matrix() {
+        let dt = || TemporalValue::DateTime {
+            nanos_since_epoch: 0,
+            offset_seconds: 0,
+            timezone_name: None,
+        };
+
+        // Null is accepted by every type (nullability checked separately).
+        for ty in [
+            DataType::String,
+            DataType::Int64,
+            DataType::Bool,
+            DataType::DateTime,
+            DataType::Float64,
+        ] {
+            assert!(ty.accepts(&Value::Null), "{ty:?} must accept Null");
+        }
+
+        // Exact-type matches.
+        assert!(DataType::String.accepts(&Value::String("x".into())));
+        assert!(DataType::Int64.accepts(&Value::Int(1)));
+        assert!(DataType::Bool.accepts(&Value::Bool(true)));
+        assert!(DataType::DateTime.accepts(&Value::Temporal(dt())));
+
+        // Intentional lossless widenings remain allowed.
+        assert!(
+            DataType::Float64.accepts(&Value::Int(3)),
+            "Int widens to Float"
+        );
+        assert!(DataType::Int32.accepts(&Value::Int(3)), "Int fits Int32");
+        assert!(DataType::Timestamp.accepts(&Value::Temporal(dt())));
+        assert!(
+            DataType::Timestamp.accepts(&Value::String("2026-01-01T00:00:00Z".into())),
+            "storage parses strings for non-struct Timestamp columns"
+        );
+
+        // The #68 data-loss cases must be rejected (coercion handles strings separately).
+        assert!(
+            !DataType::DateTime.accepts(&Value::String("2026-01-01T00:00:00Z".into())),
+            "String into a DateTime struct column nulls silently — reject here"
+        );
+        assert!(!DataType::Bool.accepts(&Value::Int(1)));
+        assert!(!DataType::Int64.accepts(&Value::Bool(true)));
+        assert!(!DataType::Int64.accepts(&Value::Float(1.5)));
+        assert!(
+            !DataType::String.accepts(&Value::Int(10)),
+            "no implicit stringification"
+        );
+        assert!(!DataType::Duration.accepts(&Value::String("P1D".into())));
+
+        // Opaque columns accept anything.
+        assert!(DataType::CypherValue.accepts(&Value::Map(Default::default())));
+    }
 
     #[tokio::test]
     async fn test_schema_management() -> Result<()> {

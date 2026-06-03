@@ -1223,14 +1223,16 @@ async fn h4b_set_violates_unique_rolls_back() -> Result<()> {
     Ok(())
 }
 
-/// H4c — SET violates `validate_property_value` (complex value into scalar
+/// H4c — SET violates the declared-type guard (complex value into scalar
 /// column). Expect error; rows unchanged.
 ///
-/// Note: primitive coercion (e.g. String → Int) is NOT validated at SET
-/// time — Cypher is dynamically typed, and uni defers primitive coercion
-/// errors to Lance-flush time. What IS validated at SET time is the
-/// shape check in `validate_property_value` (write.rs:1700): Map / Node /
-/// Edge / Path values (or nested-List shapes) into a scalar column.
+/// Since issue #68, `coerce_and_validate_property_value` checks every written
+/// value against the column's declared `DataType` at SET/CREATE time: a Map /
+/// Node / Edge / Path (or nested-List) into a scalar column is rejected, as is
+/// a genuine primitive mismatch (e.g. String → Int). A `Value::String` into a
+/// temporal column is the one coercion (parsed like `datetime()`); everything
+/// else that can't be stored losslessly errors at the call site rather than
+/// being silently nulled at Lance-flush time.
 #[tokio::test]
 async fn h4c_set_violates_complex_value_into_scalar_rolls_back() -> Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -1244,7 +1246,7 @@ async fn h4c_set_violates_complex_value_into_scalar_rolls_back() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    // Assigning a Map to a scalar INT column trips validate_property_value.
+    // Assigning a Map to a scalar INT column trips the declared-type guard.
     let tx = db.session().tx().await?;
     let res = tx
         .execute("MATCH (n:Entity) SET n.name = 'after', n.count = {nested: 1}")

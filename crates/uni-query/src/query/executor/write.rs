@@ -85,6 +85,26 @@ fn reject_if_ephemeral_vid(vid: Vid) -> Result<()> {
     Ok(())
 }
 
+/// Returns a short variant name for a `Value`, used in type-mismatch error messages.
+fn value_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::String(_) => "String",
+        Value::Bytes(_) => "Bytes",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::Node(_) => "Node",
+        Value::Edge(_) => "Edge",
+        Value::Path(_) => "Path",
+        Value::Vector(_) => "Vector",
+        Value::Temporal(_) => "Temporal",
+        _ => "value",
+    }
+}
+
 /// Refuse to mutate an ephemeral edge (M5g / proposal §4.13.1).
 fn reject_if_ephemeral_eid(eid: Eid) -> Result<()> {
     if eid.is_ephemeral() {
@@ -271,6 +291,10 @@ impl Executor {
         // Clone the target so we can hold &row references elsewhere.
         let target = row.get(variable).cloned();
 
+        // Declared-type guard for the whole-entity `SET n = map` / `SET n += map`
+        // forms, mirroring the per-property SET path (issue #68).
+        let schema = self.storage.schema_manager().schema();
+
         match target {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
@@ -289,6 +313,7 @@ impl Executor {
                     )
                     .await?;
                 }
+                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
                 let _ = writer
                     .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
@@ -314,6 +339,7 @@ impl Executor {
                     )
                     .await?;
                 }
+                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
                 let _ = writer
                     .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
@@ -339,6 +365,11 @@ impl Executor {
                 let current =
                     read_edge_props_with_prefetch(eid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
+                let write_props = Self::coerce_and_validate_props(
+                    write_props,
+                    &schema,
+                    std::slice::from_ref(&edge.edge_type),
+                )?;
                 writer
                     .insert_edge(
                         src,
@@ -376,6 +407,14 @@ impl Executor {
                             .schema_manager()
                             .edge_type_name_by_id_unified(ei.edge_type_id)
                     });
+                let write_props = match &edge_type_name {
+                    Some(name) => Self::coerce_and_validate_props(
+                        write_props,
+                        &schema,
+                        std::slice::from_ref(name),
+                    )?,
+                    None => write_props,
+                };
                 writer
                     .insert_edge(
                         ei.src,
@@ -1684,6 +1723,11 @@ impl Executor {
                                 }
                             }
 
+                            // Validate/coerce against declared types AFTER enrichment, so
+                            // a type mismatch is rejected here rather than silently nulled
+                            // (and the row dropped) at flush — issue #68.
+                            let props = Self::coerce_and_validate_props(props, &schema, &n.labels)?;
+
                             // Insert vertex and get back final properties (includes auto-generated embeddings)
                             let final_props = writer
                                 .insert_vertex_with_labels(new_vid, props, &n.labels, tx_l0)
@@ -1723,6 +1767,14 @@ impl Executor {
                                         rel_props.extend(map);
                                     }
                                 }
+                                // Validate/coerce edge properties against the declared
+                                // edge-type schema before storing — issue #68.
+                                let edge_schema = self.storage.schema_manager().schema();
+                                let rel_props = Self::coerce_and_validate_props(
+                                    rel_props,
+                                    &edge_schema,
+                                    std::slice::from_ref(&type_name),
+                                )?;
                                 let eid = match &self.id_reservoir {
                                     Some(r) => r.next_eid().await?,
                                     None => writer.next_eid(type_id).await?,
@@ -1824,25 +1876,15 @@ impl Executor {
         Ok(())
     }
 
-    /// Validates that a value is a valid property type per OpenCypher.
-    /// Rejects maps, nodes, edges, paths, and lists containing those types or nested lists.
-    /// Skips validation for CypherValue-typed properties which accept any value.
-    fn validate_property_value(
-        prop_name: &str,
-        val: &Value,
-        schema: &uni_common::core::schema::Schema,
-        labels: &[String],
-    ) -> Result<()> {
-        // CypherValue-typed properties accept any value (including Maps)
-        for label in labels {
-            if let Some(props) = schema.properties.get(label)
-                && let Some(prop_meta) = props.get(prop_name)
-                && prop_meta.r#type == uni_common::core::schema::DataType::CypherValue
-            {
-                return Ok(());
-            }
-        }
-
+    /// Rejects structural values (maps, nodes, edges, paths, nested lists) in a property.
+    ///
+    /// These are never valid OpenCypher property values regardless of the declared column
+    /// type. A `CypherValue` column is the sole exception and is handled by the caller
+    /// before this is reached.
+    ///
+    /// # Errors
+    /// Returns an error if `val` is a map/node/edge/path, or a list containing one.
+    fn validate_structural_property_value(prop_name: &str, val: &Value) -> Result<()> {
         match val {
             Value::Map(_) | Value::Node(_) | Value::Edge(_) | Value::Path(_) => {
                 anyhow::bail!(
@@ -1852,24 +1894,142 @@ impl Executor {
             }
             Value::List(items) => {
                 for item in items {
-                    match item {
+                    if matches!(
+                        item,
                         Value::Map(_)
-                        | Value::Node(_)
-                        | Value::Edge(_)
-                        | Value::Path(_)
-                        | Value::List(_) => {
-                            anyhow::bail!(
-                                "TypeError: InvalidPropertyType - Property '{}' has an invalid type",
-                                prop_name
-                            );
-                        }
-                        _ => {}
+                            | Value::Node(_)
+                            | Value::Edge(_)
+                            | Value::Path(_)
+                            | Value::List(_)
+                    ) {
+                        anyhow::bail!(
+                            "TypeError: InvalidPropertyType - Property '{}' has an invalid type",
+                            prop_name
+                        );
                     }
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Validates and coerces `val` against the declared schema type for `prop_name`.
+    ///
+    /// Returns the value to actually persist. Beyond the structural checks in
+    /// [`Self::validate_structural_property_value`], this compares the value against the
+    /// column's declared `DataType` and:
+    ///
+    /// - returns it unchanged when directly storable (including the intentional
+    ///   `Int`→`Float`/`Int32` and `Temporal`→`Timestamp` widenings);
+    /// - coerces a `Value::String` written into a `Date`/`Time`/`DateTime`/`Duration`
+    ///   column into the proper `Temporal` value, using the same parser as the Cypher
+    ///   `date()`/`time()`/`datetime()`/`duration()` constructors;
+    /// - otherwise returns an error, so a type mismatch is surfaced at the call site
+    ///   rather than silently nulled — and the row dropped at flush. See issue #68.
+    ///
+    /// Undeclared (schemaless) properties and `CypherValue` columns keep their permissive
+    /// behavior.
+    ///
+    /// # Errors
+    /// Returns an error if the value's type is incompatible with the declared column type,
+    /// or if a string destined for a temporal column is not a valid temporal literal.
+    fn coerce_and_validate_property_value(
+        prop_name: &str,
+        val: Value,
+        schema: &uni_common::core::schema::Schema,
+        labels: &[String],
+    ) -> Result<Value> {
+        use uni_common::core::schema::DataType;
+
+        // Resolve the declared type from the first label that declares this property.
+        let declared = labels.iter().find_map(|label| {
+            schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(prop_name))
+                .map(|meta| &meta.r#type)
+        });
+
+        // CypherValue columns accept any value (including maps) — skip all checks.
+        if matches!(declared, Some(DataType::CypherValue)) {
+            return Ok(val);
+        }
+
+        let Some(dt) = declared else {
+            // Schemaless property: reject structural values (maps/nodes/edges/paths and
+            // lists containing them), otherwise store as-is.
+            Self::validate_structural_property_value(prop_name, &val)?;
+            return Ok(val);
+        };
+
+        // Directly storable: scalars, the intentional `Int`→`Float`/`Int32` and
+        // `Temporal`→`Timestamp` widenings, declared composite columns (`Map`/`List`/
+        // `Vector`) receiving their matching value, and `Null` (always accepted).
+        if dt.accepts(&val) {
+            return Ok(val);
+        }
+
+        // Known-safe coercion: a string into a temporal column is parsed as if it had
+        // been wrapped in the matching Cypher temporal constructor.
+        if matches!(val, Value::String(_)) {
+            let ctor = match dt {
+                DataType::DateTime => Some("DATETIME"),
+                DataType::Date => Some("DATE"),
+                DataType::Time => Some("TIME"),
+                DataType::Duration => Some("DURATION"),
+                _ => None,
+            };
+            if let Some(name) = ctor {
+                return uni_query_functions::datetime::eval_datetime_function(
+                    name,
+                    std::slice::from_ref(&val),
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "TypeError: property '{}' is declared {:?} but the string value could \
+                         not be parsed as a {} literal: {}",
+                        prop_name,
+                        dt,
+                        name,
+                        e
+                    )
+                });
+            }
+        }
+
+        // Not storable and not coercible. Prefer the structural message when the value
+        // is itself structural (e.g. a map into a scalar column), preserving prior
+        // behavior; otherwise report the scalar type mismatch.
+        Self::validate_structural_property_value(prop_name, &val)?;
+        anyhow::bail!(
+            "TypeError: property '{}' is declared {:?} but got an incompatible value of type {}",
+            prop_name,
+            dt,
+            value_type_name(&val)
+        );
+    }
+
+    /// Coerces and validates every property in `props` against the declared types for `labels`.
+    ///
+    /// Applies [`Self::coerce_and_validate_property_value`] to each entry, returning the map
+    /// with known-safe coercions applied. Use this at every user-facing CREATE/SET write site
+    /// before handing properties to the writer, so a type mismatch is rejected up front rather
+    /// than silently nulled — and the row dropped — at flush (issue #68).
+    ///
+    /// # Errors
+    /// Returns an error on the first property whose value is incompatible with its declared type.
+    fn coerce_and_validate_props(
+        props: HashMap<String, Value>,
+        schema: &uni_common::core::schema::Schema,
+        labels: &[String],
+    ) -> Result<HashMap<String, Value>> {
+        let mut out = HashMap::with_capacity(props.len());
+        for (k, v) in props {
+            let cv = Self::coerce_and_validate_property_value(&k, v, schema, labels)?;
+            out.insert(k, cv);
+        }
+        Ok(out)
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1959,7 +2119,9 @@ impl Executor {
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            Self::validate_property_value(prop_name, &val, &schema, &labels)?;
+                            let val = Self::coerce_and_validate_property_value(
+                                prop_name, val, &schema, &labels,
+                            )?;
 
                             let pv = pending_v
                                 .get_mut(var_name)
@@ -2024,9 +2186,9 @@ impl Executor {
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            Self::validate_property_value(
+                            let val = Self::coerce_and_validate_property_value(
                                 prop_name,
-                                &val,
+                                val,
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;
@@ -2083,9 +2245,9 @@ impl Executor {
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            Self::validate_property_value(
+                            let val = Self::coerce_and_validate_property_value(
                                 prop_name,
-                                &val,
+                                val,
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;

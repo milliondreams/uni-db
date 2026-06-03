@@ -12,6 +12,7 @@ pub mod issue47_profile;
 pub mod issue47_repro_standalone;
 pub mod issue49_datetime_autoembed_latency;
 pub mod issue53_unwind_match_perf;
+pub mod issue69_unwind_merge_perf;
 pub mod issue_41_pattern_exists_perf;
 pub mod issue_55_batch_edge_patterns;
 pub mod issue_55_cross_match_pushdown;

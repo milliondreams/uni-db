@@ -595,6 +595,8 @@ Output: `total_time_ms`, `rows_scanned`, `peak_memory_bytes`, per-operator `time
 | **Prefer MERGE over CREATE + existence check** | Single atomic upsert |
 | **Named paths** | Use `p = (a)-->(b)` when you need path functions |
 | **Index WHERE-clause properties** | Avoids full table scans |
+| **Index MERGE key properties** | `MERGE (n:L {key: ...})` and `UNWIND ... MERGE` take a batched fast path (no per-row planning); a scalar index on the key makes the match an index point-lookup instead of a label scan |
+| **Batch upserts with `UNWIND ... MERGE`** | One statement per batch of rows beats one MERGE statement per row; the single-node MERGE fast path handles intra-batch dedup |
 | **Max 2-3 labels per vertex** | Prevents data duplication across tables |
 
 ### Anti-Patterns
@@ -608,6 +610,8 @@ Output: `total_time_ms`, `rows_scanned`, `peak_memory_bytes`, per-operator `time
 | **String concatenation for filters** | Injection risk, no plan caching | Use `$param` parameters |
 | **Schemaless everything** | Loses columnar benefits | Define frequent properties in schema |
 | **CREATE without variable binding** | Creates duplicate nodes per expression | Bind variable: `(a:Node)...(a)-[:REL]->...` |
+| **MERGE on an un-indexed key** | Per-row match degrades to a full label scan (O(N x label_size) for large on-disk labels) | Add a scalar index on the MERGE key |
+| **Multi-node/edge MERGE in a hot loop** | `MERGE (a)-[:R]->(b)` uses the per-row general path (builds a plan per row) | MERGE the node single-node, then batched `CREATE`/`MATCH` for edges |
 | **Over-indexing** | Write performance cost | Only index queried properties |
 
 ---

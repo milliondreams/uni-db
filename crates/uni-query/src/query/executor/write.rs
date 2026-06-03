@@ -9,9 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::DataType;
 use uni_common::core::id::{Eid, Vid};
-use uni_common::core::schema::{
-    Constraint, ConstraintTarget, ConstraintType, IndexDefinition, SchemaManager,
-};
+use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType, SchemaManager};
 use uni_common::{Path, Value};
 use uni_cypher::ast::{
     AlterAction, AlterEdgeType, AlterLabel, BinaryOp, ConstraintType as AstConstraintType,
@@ -1462,34 +1460,17 @@ impl Executor {
         Ok(())
     }
 
-    /// Returns `true` if `prop` has a scalar index on `label`.
-    ///
-    /// Scalar indexes (hash/btree/bitmap) make a property-equality lookup an
-    /// index point-scan rather than a full label scan.
-    fn is_label_prop_scalar_indexed(&self, label: &str, prop: &str) -> bool {
-        self.storage
-            .schema_manager()
-            .schema()
-            .indexes
-            .iter()
-            .any(|idx| {
-                matches!(
-                    idx,
-                    IndexDefinition::Scalar(cfg)
-                        if cfg.label == label && cfg.properties.iter().any(|p| p == prop)
-                )
-            })
-    }
-
-    /// Detects the single-node, single-label, fully-indexed MERGE shape.
+    /// Detects the single-node, single-label MERGE shape the fast path serves.
     ///
     /// Returns the node pattern and its label when `pattern` is one path with
     /// one node element, exactly one label, and a static map-literal property
-    /// set whose every key is scalar-indexed on that label — the shape the
-    /// index fast path ([`Self::execute_merge_row_indexed`]) can serve without
-    /// per-row query planning. Any other shape returns `None` so the caller
-    /// uses the general per-row path.
-    fn merge_indexed_fastpath<'p>(
+    /// set — the shape [`Self::execute_merge_row_indexed`] can serve without
+    /// per-row query planning. The keys do NOT need to be indexed: the persisted
+    /// lookup degrades to a (single, filtered) label scan when no scalar index
+    /// exists, which is still far cheaper than building a `LogicalPlan` per row.
+    /// Any other shape (edges, multiple labels, non-literal properties) returns
+    /// `None` so the caller uses the general per-row path.
+    fn merge_single_node_fastpath<'p>(
         &self,
         pattern: &'p Pattern,
     ) -> Option<(&'p NodePattern, String)> {
@@ -1507,7 +1488,6 @@ impl Executor {
         if labels.len() != 1 {
             return None;
         }
-        let label = &labels[0];
         // The key must be a static map literal so the key names are known.
         let Some(Expr::Map(entries)) = n.properties.as_ref() else {
             return None;
@@ -1515,13 +1495,7 @@ impl Executor {
         if entries.is_empty() {
             return None;
         }
-        if !entries
-            .iter()
-            .all(|(k, _)| self.is_label_prop_scalar_indexed(label, k))
-        {
-            return None;
-        }
-        Some((n, label.clone()))
+        Some((n, labels[0].clone()))
     }
 
     /// Build the persisted-scan filter for a MERGE key, or `None` if any value
@@ -1860,11 +1834,12 @@ impl Executor {
         // names to unnamed relationships in paths that have path variables.
         let (path_pattern, temp_vars) = Self::prepare_pattern_for_path_binding(pattern);
 
-        // Issue #69: a single-node, single-label MERGE on scalar-indexed keys
-        // takes the index fast path, skipping the per-row query planning that
-        // made batched MERGE no faster than a per-entity loop. The shape is the
-        // same for every row, so it is detected once.
-        let fastpath = self.merge_indexed_fastpath(pattern);
+        // Issue #69: a single-node, single-label MERGE takes the fast path,
+        // skipping the per-row query planning that made batched MERGE no faster
+        // than a per-entity loop. Indexed keys get an index point-lookup;
+        // un-indexed keys still skip planning (the lookup is a filtered scan).
+        // The shape is the same for every row, so it is detected once.
+        let fastpath = self.merge_single_node_fastpath(pattern);
 
         // Build the per-batch L0 snapshot once (issue #69 Phase C): the per-row
         // fast path then resolves L0/intra-batch matches with an O(1) lookup

@@ -1740,6 +1740,17 @@ MERGE (a)-[r:KNOWS]->(b)
 ON CREATE SET r.since = date()
 ```
 
+**Performance.** A single-node, single-label `MERGE (n:Label {key: ...})` with a
+literal key map takes a batched fast path: the existing-node lookup is resolved
+from one per-statement L0 snapshot plus a persisted lookup, with no per-row query
+planning. This is what makes `UNWIND $rows AS e MERGE (n:Label {key: e.key}) ...`
+scale (it also handles intra-batch duplicate keys correctly). Put a **scalar
+index** on the MERGE key so the persisted lookup is an index point-lookup rather
+than a full label scan. Multi-node/edge MERGE (`MERGE (a)-[:R]->(b)`) and
+non-literal property maps (`MERGE (n:Label $props)`) use the slower per-row
+general path — prefer a single-node MERGE for the node and batched
+`CREATE`/`MATCH` for edges.
+
 ### WITH
 
 Intermediate result projection — acts as a pipeline stage:
@@ -1805,6 +1816,13 @@ Expand a list into rows:
 UNWIND [1, 2, 3] AS x RETURN x
 UNWIND $names AS name MATCH (n:Person {name: name}) RETURN n
 ```
+
+`UNWIND`-driven operations are batched rather than run per row: `CREATE`,
+property-/id-correlated `MATCH` (index IN-list pushdown when the property is
+indexed), `SET`, `REMOVE`, `DELETE`, and single-node `MERGE` (see MERGE above)
+all process the whole batch in one statement. For bulk upserts, prefer one
+`UNWIND $batch AS e MERGE (n:Label {key: e.key}) ON CREATE SET ... ON MATCH SET ...`
+over a MERGE-per-row loop, and scalar-index the key.
 
 ### DELETE
 
@@ -2182,6 +2200,8 @@ RETURN btic_span_agg(e.period) AS total_span
 | **Filter early** | Put WHERE close to MATCH — enables predicate pushdown |
 | **Use LIMIT with ORDER BY** | Enables top-K optimization |
 | **Prefer MERGE** | Over manual CREATE + existence check |
+| **Index MERGE keys** | A scalar index on the MERGE key turns the batched-MERGE lookup into an index point-lookup (vs a full label scan) |
+| **Bulk upsert with `UNWIND ... MERGE`** | One single-node MERGE statement per batch beats one statement per row |
 | **Named paths** | Use `p = (a)-->(b)` when you need path functions |
 
 ## Cypher Anti-Patterns
@@ -2193,6 +2213,8 @@ RETURN btic_span_agg(e.period) AS total_span
 | **COLLECT without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **WITH \*** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk | Use `$param` parameters |
+| **MERGE on an un-indexed key** | Per-row match degrades to a full label scan | Add a scalar index on the MERGE key |
+| **MERGE-per-row loop** | Misses the batched fast path | Use `UNWIND $batch AS e MERGE (n:L {key: e.key}) ...` |
 
 ---
 

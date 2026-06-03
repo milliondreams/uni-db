@@ -319,8 +319,10 @@ async fn merge_mixed_batch() -> Result<()> {
 }
 
 // ============================================================================
-// C-d: a MERGE key with no scalar index must still be correct (falls back to
-// the per-row path). Uses the unindexed `tag` property.
+// C-d: a MERGE on a NON-indexed key takes the fast path too (the gate no longer
+// requires an index — it only skips per-row planning; the persisted lookup
+// degrades to a filtered scan). Must dedup + accumulate correctly. Uses the
+// unindexed `tag` property.
 // ============================================================================
 
 #[tokio::test]

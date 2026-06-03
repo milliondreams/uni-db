@@ -439,6 +439,8 @@ MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
 
 15. **Locy DERIVE in a transaction** -- When `locy()` is called on a Transaction, DERIVE commands automatically apply mutations to the transaction. On a Session (read-only), DERIVE returns a `DerivedFactSet` that must be explicitly applied via `tx.apply(derived)`.
 
+16. **Index your MERGE keys for batched upserts** -- A single-node, single-label `MERGE (n:Label {key: ...})` with a literal `{...}` key map takes a batched fast path (one L0 snapshot per statement, no per-row query planning) -- this is what makes `UNWIND $rows AS e MERGE (n:Label {key: e.key}) ...` fast. For the per-row match to be an index point-lookup rather than a filtered label scan, put a **scalar index** on the key (`db.schema().label("Label").index("key", IndexType::Scalar(ScalarType::Hash))` or `CREATE INDEX`); without one the lookup is a full label scan (fine in-memory, O(N x label_size) for large on-disk labels). **Multi-node/edge MERGE** (e.g. `MERGE (a)-[:R]->(b)`) and **non-literal property maps** (`MERGE (n:Label $props)`) fall back to the slower per-row general path -- prefer a single-node MERGE for the node, then batched `CREATE`/`MATCH` for edges.
+
 ---
 
 ## Tuning for Ingest-Heavy Workloads

@@ -18,7 +18,7 @@ class TestUniBuilderOpenModes:
 
     def test_create_new_database(self):
         """Test creating a new database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = uni_db.UniBuilder.create(path).build()
             assert db is not None
@@ -54,7 +54,7 @@ class TestUniBuilderOpenModes:
 
     def test_open_existing_database(self):
         """Test opening an existing database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             # Create and add data
             db1 = uni_db.UniBuilder.create(path).build()
@@ -82,14 +82,14 @@ class TestUniBuilderOpenModes:
 
     def test_open_existing_fails_if_not_exists(self):
         """Test that open_existing() fails if database doesn't exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "nonexistent")
             with pytest.raises(uni_db.UniNotFoundError):
                 uni_db.UniBuilder.open_existing(path).build()
 
     def test_open_creates_if_needed(self):
         """Test that open() creates database if it doesn't exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = uni_db.UniBuilder.open(path).build()
             assert db is not None
@@ -106,7 +106,7 @@ class TestUniBuilderOpenModes:
 
     def test_open_reuses_existing(self):
         """Test that open() reuses existing database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             # Create and add data
             db1 = uni_db.UniBuilder.create(path).build()
@@ -152,7 +152,7 @@ class TestUniBuilderConfiguration:
 
     def test_cache_size(self):
         """Test setting cache size."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = (
                 uni_db.UniBuilder.create(path)
@@ -166,7 +166,7 @@ class TestUniBuilderConfiguration:
 
     def test_parallelism(self):
         """Test setting parallelism level."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = uni_db.UniBuilder.create(path).parallelism(4).build()
             assert db is not None
@@ -176,7 +176,7 @@ class TestUniBuilderConfiguration:
 
     def test_chained_configuration(self):
         """Test chaining multiple configuration options."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = (
                 uni_db.UniBuilder.create(path)
@@ -205,7 +205,7 @@ class TestBackwardCompatibility:
 
     def test_database_constructor(self):
         """Test that Uni.open(path) static factory works."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = uni_db.Uni.open(tmpdir)
             assert db is not None
             db.schema().label("Legacy").apply()

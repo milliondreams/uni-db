@@ -3,8 +3,6 @@
 
 """Tests for SchemaBuilder API."""
 
-import tempfile
-
 import pytest
 
 import uni_db
@@ -15,9 +13,16 @@ class TestSchemaBuilder:
 
     @pytest.fixture
     def db(self):
-        """Create a temporary database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield uni_db.UniBuilder.open(tmpdir).build()
+        """Create a temporary database.
+
+        Uses ``UniBuilder.temporary()`` (Rust-owned temp dir) rather than an
+        external ``tempfile.TemporaryDirectory``: the latter races the database's
+        background flush/index-build threads, which keep writing after the test
+        body returns, so ``rmtree`` can hit "Directory not empty". With
+        ``temporary()`` the Rust side stops those threads on drop and removes its
+        own temp dir, so teardown is race-free.
+        """
+        return uni_db.UniBuilder.temporary().build()
 
     def test_label_builder_basic(self, db):
         """Test creating a label with basic properties."""
@@ -91,22 +96,21 @@ class TestSchemaQueries:
     @pytest.fixture
     def db_with_schema(self):
         """Create a database with a predefined schema."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            (
-                db.schema()
-                .label("Person")
-                .property("name", "string")
-                .property("age", "int")
-                .done()
-                .label("Company")
-                .property("name", "string")
-                .done()
-                .edge_type("WORKS_AT", ["Person"], ["Company"])
-                .done()
-                .apply()
-            )
-            yield db
+        db = uni_db.UniBuilder.temporary().build()
+        (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .property("age", "int")
+            .done()
+            .label("Company")
+            .property("name", "string")
+            .done()
+            .edge_type("WORKS_AT", ["Person"], ["Company"])
+            .done()
+            .apply()
+        )
+        return db
 
     def test_label_exists(self, db_with_schema):
         """Test checking if a label exists."""
@@ -143,9 +147,16 @@ class TestDataTypes:
 
     @pytest.fixture
     def db(self):
-        """Create a temporary database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield uni_db.UniBuilder.open(tmpdir).build()
+        """Create a temporary database.
+
+        Uses ``UniBuilder.temporary()`` (Rust-owned temp dir) rather than an
+        external ``tempfile.TemporaryDirectory``: the latter races the database's
+        background flush/index-build threads, which keep writing after the test
+        body returns, so ``rmtree`` can hit "Directory not empty". With
+        ``temporary()`` the Rust side stops those threads on drop and removes its
+        own temp dir, so teardown is race-free.
+        """
+        return uni_db.UniBuilder.temporary().build()
 
     def test_string_type(self, db):
         """Test string data type."""

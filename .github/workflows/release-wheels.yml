@@ -96,12 +96,14 @@ jobs:
             bindings/uni-db-onnx-cuda/pyproject.toml \
             bindings/uni-db-onnx-metal/pyproject.toml \
             bindings/uni-pydantic/pyproject.toml; do
-            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            if [ "$VERSION" != "$PYPI_VERSION" ]; then
-              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+            # Python versions are single-sourced from the workspace Cargo version
+            # (maturin wheels use `dynamic = ["version"]`). Assert none
+            # reintroduced a hardcoded literal that would drift from the source.
+            if grep -qE '^version = ' "$pyproject"; then
+              echo "Error: $pyproject hardcodes a version; use 'dynamic = [\"version\"]' so the single source ([workspace.package] version) is reused."
               exit 1
             fi
-            echo "OK: $pyproject = $PYPI_VERSION"
+            echo "OK: $pyproject derives its version from the workspace"
           done
 
   # CPU-only Linux wheels: the default-everything `uni-db` and the slim

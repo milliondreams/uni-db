@@ -77,27 +77,33 @@ jobs:
             exit 1
           fi
 
-          # Every wheel-matrix sibling pyproject + uni-pydantic shares the
-          # same lock-step version. Keep this list in sync with workspace
-          # members under `bindings/uni-db*/`. The wheel build workflow
-          # (`release-wheels.yml`) runs the same check independently.
+          # The maturin wheels single-source their version from the workspace
+          # Cargo version via `dynamic = ["version"]` (maturin reads the crate's
+          # Cargo.toml). Assert none reintroduced a hardcoded literal that would
+          # silently drift from the single source.
           for pyproject in \
             bindings/uni-db/pyproject.toml \
             bindings/uni-db-onnx/pyproject.toml \
             bindings/uni-db-cuda/pyproject.toml \
             bindings/uni-db-metal/pyproject.toml \
             bindings/uni-db-onnx-cuda/pyproject.toml \
-            bindings/uni-db-onnx-metal/pyproject.toml \
-            bindings/uni-pydantic/pyproject.toml; do
-            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            if [ "$VERSION" != "$PYPI_VERSION" ]; then
-              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+            bindings/uni-db-onnx-metal/pyproject.toml; do
+            if grep -qE '^version = ' "$pyproject"; then
+              echo "Error: $pyproject hardcodes a version; use 'dynamic = [\"version\"]' so the single source ([workspace.package] version) is reused."
               exit 1
             fi
-            echo "OK: $pyproject = $PYPI_VERSION"
+            echo "OK: $pyproject derives its version from the workspace"
           done
 
-          echo "All versions match: $VERSION"
+          # uni-pydantic is pure-Python (hatchling); it carries the one version
+          # literal outside Cargo.toml. Assert it stays in lock-step.
+          PYDANTIC_VERSION=$(grep '^version = ' bindings/uni-pydantic/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$PYDANTIC_VERSION" ]; then
+            echo "Error: bindings/uni-pydantic/pyproject.toml version ($PYDANTIC_VERSION) does not match the workspace version ($VERSION)"
+            exit 1
+          fi
+
+          echo "All versions consistent at: $VERSION"
 
       - name: Assert CI passed
         if: inputs.dry_run != true

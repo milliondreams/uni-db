@@ -7,7 +7,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uni-pydantic"
-version = "2.0.2"
+# The one version literal outside the workspace Cargo.toml: uni-pydantic is
+# pure-Python (hatchling) with no Cargo manifest, and its isolated build can't
+# reliably read the workspace version. Keep this in lock-step with
+# [workspace.package] version in the root Cargo.toml (the release validate step
+# asserts they match).
+version = "2.0.3"
 description = "Pydantic-based OGM (Object-Graph Mapping) for Uni Graph Database"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }

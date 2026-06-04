@@ -4,9 +4,9 @@
 
 #[path = "it/declare_aggregate_unit.rs"]
 mod declare_aggregate_unit;
-#[path = "it/declared_by.rs"]
-mod declared_by;
 #[path = "it/declare_persistence.rs"]
 mod declare_persistence;
+#[path = "it/declared_by.rs"]
+mod declared_by;
 #[path = "it/shadow_native.rs"]
 mod shadow_native;

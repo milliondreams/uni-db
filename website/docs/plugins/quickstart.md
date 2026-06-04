@@ -95,7 +95,7 @@ registers a scalar function, so `["ScalarFn"]` is sufficient. (Omitting
 === "Rust"
 
     ```rust
-    use uni::Uni;
+    use uni_db::Uni;
     use uni_plugin::{Capability, CapabilitySet};
     use uni_plugin_wasm::WasmLoader;
 

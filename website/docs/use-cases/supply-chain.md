@@ -56,7 +56,11 @@ When inserting parts, store variable specs as JSON in the `spec` property.
 use serde_json::json;
 
 // Rust Example
-db.query_with(
+// CREATE is a mutation, so run it inside a transaction; the read-only
+// `query_with` path rejects writes with `UniError::ReadOnly`.
+let session = db.session();
+let tx = session.tx().await?;
+tx.query_with(
     "CREATE (p:Part {sku: $sku, cost: $cost, spec: $spec})"
 )
     .param("sku", "RES-10K")
@@ -68,6 +72,7 @@ db.query_with(
     }))
     .fetch_all()
     .await?;
+tx.commit().await?;
 ```
 
 ### 3. Query: BOM Explosion

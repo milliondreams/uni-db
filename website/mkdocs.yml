@@ -26,8 +26,10 @@ nav:
       - Hybrid Search: features/hybrid-search.md
       - Schema & Indexing: features/schema-indexing.md
       - Graph Algorithms: features/graph-algorithms.md
+      - Neural Predicates: features/neural-predicates.md
       - Transactions & Consistency: features/transactions-consistency.md
       - Snapshots & Time Travel: features/snapshots-time-travel.md
+      - Forks & Branches: features/forks.md
       - Bulk Ingest: features/bulk-ingest.md
       - Storage & Cloud Durability: features/storage-cloud.md
       - APIs & Tooling: features/apis-tooling.md
@@ -61,6 +63,7 @@ nav:
           - DERIVE / ASSUME / ABDUCE: locy/advanced/derive-assume-abduce.md
           - Modules / PRIORITY / QUERY: locy/advanced/modules-priority-query.md
           - Probabilistic Logic: locy/advanced/probabilistic-logic.md
+          - Neural Predicates: locy/advanced/neural-predicates.md
       - API Integration:
           - Rust API: locy/api/rust.md
           - Python API: locy/api/python.md
@@ -147,6 +150,15 @@ nav:
           - "Locy: Regulatory Impact":
               - Overview: examples/python/locy_regulatory_impact_overview.md
               - Notebook: examples/python/locy_regulatory_impact.md
+          - "Locy: Adverse Drug Reaction":
+              - Overview: examples/python/locy_adverse_drug_reaction_overview.md
+              - Notebook: examples/python/locy_adverse_drug_reaction.md
+          - "Locy: Drug-Drug Interaction":
+              - Overview: examples/python/locy_drug_drug_interaction_overview.md
+              - Notebook: examples/python/locy_drug_drug_interaction.md
+          - "Locy: Predictive Maintenance":
+              - Overview: examples/python/locy_predictive_maintenance_overview.md
+              - Notebook: examples/python/locy_predictive_maintenance.md
       - Pydantic OGM:
           - Supply Chain: examples/pydantic/supply_chain.md
           - Recommendation: examples/pydantic/recommendation.md

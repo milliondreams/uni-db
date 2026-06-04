@@ -137,9 +137,12 @@ names are:
 - **Extism** — the host-function set is filtered at load: only the host functions
   for granted capabilities are linked into the plugin.
 - **WASM Component Model** — the loader computes the effective set and reports it
-  as `effective_capabilities` / `denied_capabilities`. Effectful host imports
-  (filesystem, network, …) are not yet wired; the only host import today is
-  `host-log`.
+  as `effective_capabilities` / `denied_capabilities`. The capability-gated
+  `host-net` import (HTTP GET/POST) is added to the linker only when `Network` is
+  granted — a plugin importing it without the grant fails at link time. The
+  always-available `host-log` and `host-trace-context` imports are linked
+  unconditionally. (`host-fs` is not yet exposed on the Component Model; on Extism
+  filesystem/query/KMS/secret host functions are wired — see below.)
 
 === "Python"
 

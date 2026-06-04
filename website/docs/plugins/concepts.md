@@ -106,7 +106,7 @@ The manifest *declares* the capabilities the plugin wants; the host *grants* a s
 How that absence takes effect differs by loader:
 
 - **Extism filters host functions at load.** Only the host functions for *granted* capabilities are linked into the plugin; an ungranted host function is never installed.
-- **WASM Component Model** records the effective set and surfaces it as `effective_capabilities` / `denied_capabilities`. The only host import wired today is `host-log`; effectful host imports (filesystem, network, …) are not yet present.
+- **WASM Component Model** records the effective set and surfaces it as `effective_capabilities` / `denied_capabilities`. Alongside the always-available `host-log` and `host-trace-context`, the capability-gated `host-net` (HTTP GET/POST, added to the linker only when `Network` is granted) is wired today; `host-fs` is not yet exposed on the Component Model. Extism wires a wider set — `host_net_http_get`, `host_fs_read`, `host_query_run`, `host_kms_sign`, `host_secrets_acquire` — each filtered in by its granting capability.
 
 Either way, a registrar call that needs a capability outside the effective set fails the whole `register()` — partial registration is never observable, and the load outcome surfaces a `denied_capabilities` list.
 

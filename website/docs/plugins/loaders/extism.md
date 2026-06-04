@@ -268,7 +268,7 @@ they differ in interface shape, build target, and how capabilities are enforced.
 | Interface | Raw host-fn ABI (call by bytes) | Typed WIT worlds |
 | Build target | `wasm32-unknown-unknown` | `wasm32-wasip2` |
 | Tooling | `extism-pdk`, `crate-type = ["cdylib"]` | WIT bindings + component build |
-| Capability gating | Load-time host-fn filter | `declared ∩ granted`, reported (effectful host imports not yet wired) |
+| Capability gating | Load-time host-fn filter (net/fs/query/kms/secret wired) | `declared ∩ granted`, reported (host-net + host-trace-context wired; host-fs not yet) |
 | Wire format | Arrow IPC | Arrow IPC |
 | Output | Byte-identical across both ABIs | Byte-identical across both ABIs |
 

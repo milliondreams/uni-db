@@ -1,6 +1,6 @@
 # Vector Search
 
-Uni provides native vector search over embedding properties with 8 ANN index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) featuring scalar, product, and RaBitQ quantization. Use it for semantic search, RAG, and similarity-based retrieval.
+Uni provides native vector search over embedding properties with 9 ANN index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW, HNSW-Flat/SQ/PQ) featuring scalar, product, and RaBitQ quantization. Use it for semantic search, RAG, and similarity-based retrieval.
 
 ## What It Provides
 
@@ -132,14 +132,14 @@ Beyond auto-embedding, the `Uni::xervo()` facade gives direct access to embeddin
 
 === "Embedding"
     ```rust
-    let xervo = db.xervo()?;
+    let xervo = db.xervo();
     let vectors = xervo.embed("embed/default", &["query text"]).await?;
     ```
 
 === "Text Generation"
     ```rust
     use uni_db::xervo::{Message, GenerationOptions};
-    let xervo = db.xervo()?;
+    let xervo = db.xervo();
 
     // Structured messages with roles
     let result = xervo.generate("llm/default", &[

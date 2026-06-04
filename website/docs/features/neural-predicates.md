@@ -10,8 +10,8 @@ Locy can invoke neural classifiers inline as part of a rule body. Declare a mode
     - **Embedding similarity** — `similar_to(s.profile, $query)` and `semantic_match(s, $query)`.
     - **Path-context features** — `FEATURES (subject, column) FROM source_rule` pulls a column from a prior rule's derivation, keyed by `subject`.
     - **Graph-structural features** — `degree_centrality(n)`, `pagerank_score(n)`, `closeness_centrality(n)`, `betweenness_centrality(n)`, `eigenvector_centrality(n)`, `harmonic_centrality(n)`, `katz_centrality(n)`, `avg_neighbor(n, 'prop')`, `max_neighbor(n, 'prop')`, `sum_neighbor(n, 'prop')`.
-- **`CALIBRATE rule USING method`** — fit a calibrator (Platt scaling, isotonic regression, temperature scaling, beta, Dirichlet) against held-out labels. Returns `CalibrateCommandResult` with `raw_brier` / `raw_ece` / `calibrated_brier` / `calibrated_ece` so you can show the calibration delta.
-- **`VALIDATE rule USING brier, ece`** — score a rule's predictions against ground-truth labels. Returns `ValidateCommandResult` with per-metric values.
+- **`CALIBRATE rule USING method`** — fit a calibrator (Platt scaling, isotonic regression, temperature scaling, beta, Dirichlet) against held-out labels. Returns `CalibrationResult` with `raw_brier` / `raw_ece` / `calibrated_brier` / `calibrated_ece` so you can show the calibration delta.
+- **`VALIDATE rule USING brier, ece`** — score a rule's predictions against ground-truth labels. Returns `ValidationResult` with per-metric values.
 - **`EXPLAIN` with neural provenance** — every derivation that crossed a classifier carries a `NeuralProvenance` record with `model_name`, `raw_probability`, `calibrated_probability`, `confidence_band`, and `ConfidenceSource` so an auditor can reproduce the score.
 - **Three semirings** — `AddMultProb` (the default; noisy-OR / product), `MaxMinProb` (Viterbi-style fuzzy truth), `TopKProofs(k)` (DNF inclusion-exclusion over shared base facts). Pick per-call via `LocyConfig`.
 
@@ -121,7 +121,7 @@ VALIDATE  failure_likelihood USING brier, ece
 EXPLAIN RULE at_risk
 ```
 
-`CalibrateCommandResult` returns both raw and calibrated metrics so the improvement is concrete. `EXPLAIN` traces every derivation back through the classifier invocations, surfacing raw + calibrated probabilities and a confidence band per call — the artifact regulators ask for when a learned score drove a decision.
+`CalibrationResult` returns both raw and calibrated metrics so the improvement is concrete. `EXPLAIN` traces every derivation back through the classifier invocations, surfacing raw + calibrated probabilities and a confidence band per call — the artifact regulators ask for when a learned score drove a decision.
 
 ## Worked Examples
 

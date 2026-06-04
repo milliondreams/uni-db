@@ -72,7 +72,12 @@ functions, so a plugin in any language can produce them.
 
 ### Identity and capabilities
 
-The manifest fields mirror `PluginManifest` in `crates/uni-plugin/src/manifest.rs`.
+The sandboxed loaders parse a loader-specific manifest — `ComponentManifest`
+(`crates/uni-plugin-wasm/src/loader.rs`) for the Component Model and
+`ExtismPluginManifest` (`crates/uni-plugin-extism/src/loader.rs`) for Extism —
+both of which carry the `description` field shown below. These mirror, but are
+distinct from, the in-process `PluginManifest` in
+`crates/uni-plugin/src/manifest.rs` (which has no `description`).
 For the geo plugin:
 
 ```json

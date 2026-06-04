@@ -11,8 +11,8 @@ MATCH ...
 [WHERE agg_condition]               -- post-FOLD filter (HAVING)
 [BEST BY expr ASC|DESC]
 YIELD KEY a, value AS alias, prob_expr AS PROB
--- OR, for graph mutation rules:
-DERIVE (src)-[:TYPE]->(dst) [SET property = expr]
+-- OR, for graph mutation rules (edge/node props are inline maps, no SET):
+DERIVE (src)-[:TYPE {prop: expr}]->(dst)
 ```
 
 The second `WHERE` (after `FOLD`) filters on aggregated values — equivalent to SQL's `HAVING`. It can reference FOLD output columns and KEY columns.
@@ -75,14 +75,14 @@ CREATE MODEL name AS
   [FEATURES (subject, column) FROM source_rule]
   OUTPUT (PROB | SCORE | LABEL | VECTOR) result_name
   USING xervo('provider_alias' [, embedder = 'embed_alias'])
-  [CALIBRATION (platt_scaling | isotonic_regression | temperature_scaling | beta_calibration | dirichlet_calibration)]
+  [CALIBRATION (platt_scaling | isotonic_regression | temperature_scaling | beta_calibration | dirichlet | conformal | conformal(alpha) | none)]
   [VERSION 'string']
 
-CALIBRATE model_name USING calibration_method
-VALIDATE  model_name USING metric (, metric)*
+CALIBRATE model_name ON MATCH pattern [WHERE expr] TARGET expr METHOD calibration_method [HOLDOUT n]
+VALIDATE  model_name ON MATCH pattern [WHERE expr] TARGET expr METRICS metric (, metric)*
 ```
 
-`metric` ∈ `brier | ece | accuracy | log_loss | auroc`. The classifier-registry key is the `CREATE MODEL <name>`, not the `USING xervo('alias')` provider hint. The feature dict the callable receives is keyed by the `INPUT` binding name; values are the evaluated argument expressions at the call site. See [Neural Predicates](../advanced/neural-predicates.md).
+`metric` ∈ `brier_score | ece | debiased_ece | accuracy | log_loss | auc`. The classifier-registry key is the `CREATE MODEL <name>`, not the `USING xervo('alias')` provider hint. The feature dict the callable receives is keyed by the `INPUT` binding name; values are the evaluated argument expressions at the call site. See [Neural Predicates](../advanced/neural-predicates.md).
 
 ## Modules
 

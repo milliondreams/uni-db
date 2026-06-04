@@ -166,10 +166,16 @@ Without a registered classifier, the program fails at the first invocation with 
 Calibration rescales a classifier's raw outputs so they line up with empirical frequencies. Useful when raw scores are over-confident in the tails (typical of boosted trees and many softmax heads).
 
 ```text
-CALIBRATE failure_likelihood USING platt_scaling
+CALIBRATE failure_likelihood
+  ON MATCH (a:Asset)
+  TARGET a.actually_failed
+  METHOD platt_scaling
+  HOLDOUT 0.2
 ```
 
-Five built-in methods:
+`CALIBRATE <model> ON MATCH <pattern> [WHERE ...] TARGET <expr> METHOD <method> [HOLDOUT n]` — the MATCH pattern collects the rows the model is invoked over, `TARGET` is the ground-truth label expression, `METHOD` picks the calibrator, and the optional `HOLDOUT` reserves a fraction for fitting.
+
+Built-in methods:
 
 | Method | Parameters | When to use |
 |---|---|---|
@@ -177,7 +183,8 @@ Five built-in methods:
 | `isotonic_regression` | Non-parametric | Non-monotonic miscalibration. Requires more held-out data than Platt. |
 | `temperature_scaling` | 1 (temperature) | Multi-class softmax models trained with cross-entropy. |
 | `beta_calibration` | 3 | Binary heads when Platt produces a misshapen calibration curve. |
-| `dirichlet_calibration` | Multi-class | True multi-class outputs (e.g. severity-tier predictions). |
+| `dirichlet` | Multi-class | True multi-class outputs (e.g. severity-tier predictions). |
+| `conformal` / `conformal(alpha)` | Split-conformal | Distribution-free confidence bands; bare `conformal` defaults to `alpha = 0.1`. |
 
 The `CALIBRATE` command runs against the same data the rule already binds (the rule's own derived facts plus the `params` you pass), then fits the calibrator and returns a `CalibrateCommandResult`:
 
@@ -200,8 +207,13 @@ Calibrated probabilities are what the rule emits on subsequent invocations. The 
 `VALIDATE` scores a rule's predictions against ground-truth labels without modifying the classifier:
 
 ```text
-VALIDATE failure_likelihood USING brier, ece
+VALIDATE failure_likelihood
+  ON MATCH (a:Asset)
+  TARGET a.actually_failed
+  METRICS brier_score, ece
 ```
+
+`VALIDATE <model> ON MATCH <pattern> [WHERE ...] TARGET <expr> METRICS <metric_list>` — the rule's `PROB` output is joined against the `TARGET` ground-truth expression over the MATCH rows, and the requested metrics are computed on the resulting `(prediction, label)` pairs.
 
 Returns a `ValidateCommandResult`:
 
@@ -212,9 +224,9 @@ Returns a `ValidateCommandResult`:
 | `n_samples` | Number of label-prediction pairs scored |
 | `metrics` | Dict mapping metric name to value |
 
-Supported metrics: `brier`, `ece`, `accuracy`, `log_loss`, `auroc`. Multi-metric validation in one call.
+Supported metrics: `brier_score`, `log_loss`, `ece`, `debiased_ece`, `accuracy`, `auc`. Multi-metric validation in one call.
 
-ECE is more informative than AUROC for safety-critical applications: AUROC measures ranking quality only; ECE measures whether the probabilities themselves are honest.
+ECE is more informative than `auc` for safety-critical applications: `auc` measures ranking quality only; ECE measures whether the probabilities themselves are honest. Prefer `debiased_ece` in the small-sample regime — equal-width-binned `ece` is biased there.
 
 ## EXPLAIN with NeuralProvenance
 
@@ -243,17 +255,32 @@ The semiring controls how probabilities compose through `MNOR`, `MPROD`, and sha
 
 Set via `LocyConfig.semiring` (Rust) or by string name in the Python `with_config({"semiring": "TopKProofs(8)"})`.
 
-## Runtime Warnings
+## Warnings
 
-Five warning codes surface at evaluation time. They're informational; programs continue to evaluate. Each appears in `result.warnings` with a structured payload.
+Locy distinguishes two warning channels. **Compile-time warnings** (`WarningCode`) are raised when the program is compiled and surface in `compile_warnings`. **Runtime warnings** (`RuntimeWarningCode`) surface at evaluation time in `result.warnings`. Both are informational; the program continues regardless.
+
+### Runtime warnings (`result.warnings`)
 
 | Code | When it fires | What it means |
 |---|---|---|
-| `FuzzyNotProbabilistic` | `MaxMinProb` semiring is active and a rule emits `PROB` | You're using fuzzy-truth math on a column declared as a probability. Pick one. |
-| `SharedNeuralInput` | Two or more models in the same rule receive the same input value | Their outputs may be correlated; downstream `MNOR` will under-estimate joint risk. Marking either model `@independent` suppresses. |
-| `SharedRetrievalContext` | Multiple `similar_to`/`semantic_match` features in the same rule share the same query embedding | The features are not independent of each other; the rule's joint composition over them may be biased. |
-| `CrossGroupCorrelationNotExact` | `MNOR`/`MPROD` is composing rule outputs that share base facts across `key_group`s | The independence assumption is violated cross-group; the runtime computed the independence answer but flagged it. Switching to `TopKProofs(k)` resolves. |
+| `FuzzyNotProbabilistic` | `MaxMinProb` semiring is active and a rule emits `PROB` | You're using fuzzy-truth math on a column declared as a probability. Pick one. (Unsuppressible.) |
+| `SharedProbabilisticDependency` | Two or more proof paths inside one `MNOR`/`MPROD` group reuse shared evidence | The independence assumption is violated; the aggregate over-/under-states joint probability. |
+| `BddLimitExceeded` | Exact mode was on but the group exceeded `max_bdd_variables` | The BDD fell back to the independence-mode result. |
+| `CrossGroupCorrelationNotExact` | `MNOR`/`MPROD` composes rule outputs sharing base facts across KEY groups | Each group is exact internally, but cross-group correlation is still approximate. Switching to `TopKProofs(k)` helps. |
 | `TopKPruningCrossedDependency` | `TopKProofs(k)` pruning dropped a proof that shared a base fact with a kept proof | The kept set is an approximation; bump `k` for exactness. |
+
+### Compile-time warnings (`compile_warnings`)
+
+| Code | When it fires | What it means |
+|---|---|---|
+| `SharedNeuralInputArgument` | Two or more model invocations in the same rule share the same INPUT variable argument | Their outputs may be correlated; downstream `MNOR` will under-estimate joint risk. Marking the models `@independent` suppresses. |
+| `SharedNeuralFeatureValue` | Two or more model invocations in the same rule share an equivalent feature value expression | Same correlation concern even when binding variables differ. `@independent` suppresses. |
+| `SharedRetrievalContext` | Multiple `similar_to`/`semantic_match` features in the same rule share the same query embedding | The features are not independent of each other; the rule's joint composition over them may be biased. `@independent` suppresses. |
+| `UncalibratedNeuralPredicate` | A rule invokes a PROB model that declares no `CALIBRATION` (or `CALIBRATION none`) | The uncalibrated probability flows into the probabilistic stack, compounding miscalibration. Run a `CALIBRATE` statement or acknowledge with `CALIBRATION none`. |
+| `UncalibratedLLMLogprobs` | An uncalibrated `CREATE MODEL` whose `xervo_alias` looks like an LLM provider | Raw LLM logprobs are not calibrated probabilities. |
+| `ProbabilityDomainViolation` | A probability input falls outside `[0, 1]` | The value was clamped (or rejected under `strict_probability_domain`). |
+| `FoldInRecursivePath` | A clause has a recursive IS-ref and a FOLD aggregate but no ALONG | Almost always a semantic mistake — FOLD groups by KEY columns, not by path. |
+| `EceBinningBias` | `VALIDATE METRICS ece` was requested | Equal-width-binning ECE is biased in the small-sample regime; prefer `debiased_ece`. |
 
 ## Errors
 

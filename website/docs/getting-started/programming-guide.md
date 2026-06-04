@@ -86,9 +86,14 @@ Configure cache size, parallelism, and other options:
 === "Rust"
 
     ```rust
+    use uni_db::UniConfig;
+
     let db = Uni::open("./my-graph")
-        .cache_size(2 * 1024 * 1024 * 1024)  // 2 GB cache
-        .parallelism(8)                       // 8 worker threads
+        .config(UniConfig {
+            cache_size: 2 * 1024 * 1024 * 1024,  // 2 GB cache
+            parallelism: 8,                       // 8 worker threads
+            ..Default::default()
+        })
         .build()
         .await?;
     ```
@@ -1319,7 +1324,10 @@ Here's a complete example building a simple social network application.
     async fn main() -> Result<()> {
         // Create database
         let db = Uni::open("./social-network")
-            .cache_size(512 * 1024 * 1024)
+            .config(UniConfig {
+                cache_size: 512 * 1024 * 1024,
+                ..Default::default()
+            })
             .build()
             .await?;
 

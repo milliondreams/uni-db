@@ -17,7 +17,10 @@ checked at the ABI boundary rather than discovered at runtime.
 Choose the Component Model loader when you want:
 
 - **The strongest sandbox.** Plugins run in a wasmtime instance with no
-  ambient host access; the only host import wired today is `host-log`.
+  ambient host access. Host services are reached only through explicitly
+  linked WIT imports: `host-log` and `host-trace-context` are always
+  available, and the capability-gated `host-net` (HTTP GET/POST) is linked
+  in only when `Network` is granted.
 - **A typed contract.** The WIT worlds pin down the exports a plugin
   must provide; binding generators (`wit-bindgen` on the guest side)
   keep guest and host in sync.
@@ -33,9 +36,15 @@ produce **byte-identical results** for the same plugin logic (see
 
 The loader intersects the capabilities a plugin's manifest declares with the
 host's grants and reports the result as `effective_capabilities` /
-`denied_capabilities` on the load outcome. The only host import wired today is
-`host-log` (plugin-side tracing); effectful host imports (filesystem, network,
-…) are not yet present.
+`denied_capabilities` on the load outcome. The always-available host imports are
+`host-log` (plugin-side tracing) and `host-trace-context` (W3C `traceparent`
+propagation). The capability-gated `host-net` interface (HTTP GET/POST) is added
+to the linker only when `Network` is granted — a plugin importing it without the
+grant fails at link time, and the host additionally enforces the granted URL
+allow-list and byte/timeout ceilings at call time. (`host-fs` is not yet exposed
+on the Component Model; on [Extism](extism.md) the filesystem/query/KMS/secret
+host functions are wired.) See `examples/example-wasm-net/` for a worked
+`host-net` consumer.
 
 ## The WIT worlds
 
@@ -72,8 +81,11 @@ interface types {
     }
 }
 
-// The only host import wired today. Effectful host imports
-// (host-fs, host-net, …) are not yet present.
+// Always-available host import (plugin-side tracing). The
+// capability-gated host-net interface (HTTP GET/POST) and the
+// always-on host-trace-context interface are also declared in the
+// full world.wit; host-net is linked only when Network is granted.
+// host-fs is not yet exposed on the Component Model.
 interface host-log {
     log: func(level: string, message: string);
 }

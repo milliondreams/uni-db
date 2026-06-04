@@ -96,7 +96,11 @@ Use the **embedded Rust API** to ingest transactions as they happen.
 
 ```rust
 // Rust API Example (parameterized Cypher)
-db.query_with(
+// Mutations run inside a transaction; the read-only `query_with`
+// path rejects CREATE with `UniError::ReadOnly`.
+let session = db.session();
+let tx = session.tx().await?;
+tx.query_with(
     "MATCH (a:User {id: $src}), (b:User {id: $dst})
      CREATE (a)-[:SENT_MONEY {amount: $amount, ts: $ts}]->(b)"
 )
@@ -106,6 +110,7 @@ db.query_with(
     .param("ts", current_time)
     .fetch_all()
     .await?;
+tx.commit().await?;
 ```
 
 ### 4. Real-time Detection Query

@@ -87,7 +87,7 @@ CREATE RULE at_risk AS
   YIELD KEY a, failure_likelihood(a.score) AS risk
 ```
 
-Register a Python callable (or Rust `NeuralClassifier` impl) under the model name in `LocyConfig.classifier_registry` before running. Calibrate against held-out labels with `CALIBRATE failure_likelihood USING platt_scaling`; validate with `VALIDATE failure_likelihood USING brier, ece`. `EXPLAIN` traces every classifier invocation with raw and calibrated probabilities, a confidence band, and the feature dict that produced the score.
+Register a Python callable (or Rust `NeuralClassifier` impl) under the model name in `LocyConfig.classifier_registry` before running. Calibrate against held-out labels with `CALIBRATE failure_likelihood ON MATCH (a:Asset) TARGET a.actually_failed METHOD platt_scaling`; validate with `VALIDATE failure_likelihood ON MATCH (a:Asset) TARGET a.actually_failed METRICS brier_score, auc`. `EXPLAIN` traces every classifier invocation with raw and calibrated probabilities, a confidence band, and the feature dict that produced the score.
 
 See [Neural Predicates](advanced/neural-predicates.md) for the full reference (every FEATURES source, every calibration method, every warning).
 

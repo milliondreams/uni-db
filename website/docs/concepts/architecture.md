@@ -12,7 +12,7 @@ Before diving into the architecture, understand the key principles that guided U
 | **Multi-Model Unity** | Graph, vector, document, and columnar in one engine, not bolted together |
 | **Object-Store Native** | Designed for cloud storage (S3/GCS/Azure) with local caching for low-latency |
 | **Vectorized Execution** | Batch processing with Apache Arrow for 100x+ speedups |
-| **Commit-Time Serialization** | No distributed consensus; multiple transactions coexist, writer lock only at commit |
+| **Serializable Snapshot Isolation (OCC)** | No distributed consensus; transactions read a pinned snapshot and validate read/write-sets at commit, aborting on conflict (retry via `transact_with_retry`) |
 | **Late Materialization** | Load properties only when needed to minimize I/O |
 | **Time-Based Durability** | Auto-flush ensures data reaches storage within configurable intervals |
 
@@ -224,7 +224,7 @@ The Runtime Layer manages in-memory state, caching, and write coordination.
 
 ### L0 Buffer
 
-Per-transaction private buffer for uncommitted mutations. Each transaction gets its own L0 buffer, providing isolation between concurrent transactions. Buffers are merged into shared storage at commit time via a serialization lock.
+Per-transaction private buffer for uncommitted mutations. Each transaction gets its own L0 buffer, providing isolation between concurrent transactions. At commit time the buffer is merged into shared storage under the writer lock, which (with SSI enabled, the default) also runs OCC validation of the transaction's read/write-set and aborts the commit on a conflict.
 
 ```mermaid
 flowchart TB
@@ -246,7 +246,7 @@ flowchart TB
 **Characteristics:**
 - Per-transaction private buffers for write isolation
 - Row-oriented for fast single-record inserts
-- Commit-time serialization (writer lock acquired only at commit, not at write time)
+- Commit-time validation (writer lock acquired only at commit; with SSI on, read/write-sets are validated and conflicting commits abort and retry)
 - Read-your-writes semantics within the transaction
 - Flushed to L1 (Lance) when size threshold reached
 

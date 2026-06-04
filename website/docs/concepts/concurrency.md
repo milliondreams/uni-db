@@ -1,6 +1,6 @@
 # Concurrency Model
 
-Uni uses a commit-time serialization model with snapshot-based isolation. Multiple sessions and transactions can coexist, each with its own plan cache and private write buffers. A writer lock is acquired only at commit time, allowing concurrent transaction preparation while serializing the actual commits.
+Uni provides snapshot isolation with **Serializable Snapshot Isolation (SSI)** via optimistic concurrency control (OCC) as the default. Multiple sessions and transactions can coexist, each with its own plan cache and private write buffers. Read-write transactions read from a pinned L0 snapshot and track an item-level read/write-set; the writer lock acquired at commit time is the *validation* point, where a transaction whose reads or writes conflict with a commit that landed since its snapshot is **aborted** and must be **retried**. SSI is controlled by `UniConfig.ssi_enabled` (default `true`); setting it to `false` reverts to the older last-writer-wins behavior.
 
 ## Design Philosophy
 
@@ -8,10 +8,10 @@ Traditional distributed databases require complex consensus protocols (Raft, Pax
 
 | Traditional Distributed | Uni's Approach |
 |------------------------|----------------|
-| Multiple writers | Commit-time serialization |
+| Multiple writers | Optimistic concurrency (commit-time validation) |
 | Network consensus | Local coordination |
-| Eventual consistency | Snapshot isolation |
-| Complex conflict resolution | Serialized commits |
+| Eventual consistency | Snapshot isolation (SSI) |
+| Complex conflict resolution | Abort-and-retry on conflict |
 | Operational complexity | Embedded simplicity |
 
 This model is ideal for:
@@ -65,41 +65,83 @@ let session2 = session.clone();          // Shares plan cache, independent param
 // Sessions are read-only — mutations require a transaction
 let tx = session.tx().await?;            // Start a transaction
 tx.execute("CREATE (:User {name: 'Alice'})").await?;
-tx.commit().await?;                      // Writer lock acquired here
+tx.commit().await?;                      // Writer lock + OCC validation (may abort → retry)
 
 // session.query("CREATE ...") would return an error
 ```
 
-### Commit-Time Serialization
+### Optimistic Concurrency & Commit-Time Validation
 
-Multiple transactions can prepare writes concurrently in their private L0 buffers. The writer lock is only acquired at commit time:
+Multiple transactions can prepare writes concurrently in their private L0 buffers. When SSI is enabled (the default), a read-write transaction also pins an L0 snapshot at start and records the items it reads and writes. The writer lock acquired at commit is where Uni **validates** that read/write-set against any commits that landed since the snapshot:
 
 ```mermaid
 flowchart TB
     A["1. Application calls<br/>tx.execute(mutation)"]
-    B["2. Write to private<br/>L0 buffer (no lock)"]
-    C["3. On tx.commit():<br/>acquire writer lock"]
-    D["4. Merge private buffer<br/>into shared storage"]
-    E["5. Append to WAL<br/>(durability)"]
-    F["6. Release writer lock,<br/>return CommitResult"]
+    B["2. Read from pinned snapshot;<br/>track read/write-set;<br/>buffer writes in private L0 (no lock)"]
+    C["3. On tx.commit():<br/>acquire writer lock (flush_lock)"]
+    D["4. OCC validate under flush_lock:<br/>read-write or write-write conflict?"]
+    E["5a. Conflict → ABORT<br/>(SerializationConflict /<br/>ConstraintConflict)"]
+    F["5b. No conflict → merge private<br/>buffer into shared storage"]
+    G["6. Append to WAL (durability)"]
+    H["7. Release writer lock,<br/>return CommitResult"]
+    R["Caller retries via<br/>transact_with_retry"]
 
-    A --> B --> C --> D --> E --> F
+    A --> B --> C --> D
+    D -->|conflict| E --> R
+    D -->|clean| F --> G --> H
 ```
 
-### Why Commit-Time Serialization?
+The commit (including the `flush_lock` acquisition and validation) is bounded by `UniConfig.commit_timeout` (default 5s); exceeding it returns `UniError::CommitTimeout`. Pure CRDT-mergeable property writes are excluded from the write-set (the CRDT carve-out), so they never cause a spurious conflict.
+
+### Why Optimistic Concurrency?
 
 | Benefit | Explanation |
 |---------|-------------|
 | **Concurrent preparation** | Multiple transactions can prepare writes in parallel |
-| **No conflicts** | Commits are serialized, no concurrent modification issues |
+| **Conflicts are detected** | Write-write and read-write conflicts abort with `SerializationConflict` (duplicate unique `MERGE` → `ConstraintConflict`); no silent lost updates |
+| **Automatic retry** | Wrap contended writes in `transact_with_retry` / `execute_with_retry`; `is_retriable()` identifies retriable conflicts |
 | **Simple recovery** | WAL replay is deterministic |
-| **Predictable latency** | No lock contention during write preparation |
-| **Easier reasoning** | No need to reason about interleaved commits |
+| **No spurious CRDT conflicts** | CRDT-mergeable writes are carved out of the write-set |
 | **Efficient batching** | Buffer many writes before flush |
 
 ### WriteLease
 
 For distributed or multi-agent deployments, Uni supports a `WriteLease` mechanism to coordinate write access across processes. This ensures only one process holds the write lease at a time, preventing conflicting commits from separate instances.
+
+### Handling Conflicts: Abort and Retry
+
+With SSI enabled, a conflicting commit fails fast rather than silently overwriting. Callers should wrap contended read-modify-write logic in a retry helper, which re-runs the closure on a retriable conflict (`is_retriable()` classifies `SerializationConflict`, `ConstraintConflict`, and `CommitTimeout`):
+
+```rust
+// Retries the whole transaction body on a retriable conflict.
+session.transact_with_retry(RetryOptions::default(), |tx| async move {
+    let n: i64 = tx.query_scalar("MATCH (c:Counter {id:'x'}) RETURN c.n").await?;
+    tx.execute("MATCH (c:Counter {id:'x'}) SET c.n = $v", params).await?;
+    Ok(())
+}).await?;
+
+// Single-statement convenience wrapper:
+session.execute_with_retry("MERGE (u:User {email:'a@b.com'})").await?;
+```
+
+### `FOR UPDATE` Row Locks
+
+For read-modify-write hotspots, `FOR UPDATE` provides pessimistic per-key row locks held from `MATCH` until commit, serializing contending writers on those keys instead of letting them race to validation:
+
+```cypher
+MATCH (c:Counter {id: 'x'}) FOR UPDATE
+SET c.n = c.n + 1
+```
+
+`FOR UPDATE` requires SSI; with `ssi_enabled = false` it is a no-op (a `tracing::warn!` is emitted when a query requests it).
+
+### CRDT Carve-Out
+
+Pure CRDT-mergeable property writes (e.g. counters, LWW registers/maps, OR-sets — see [CRDT Types](crdt-types.md)) are excluded from a transaction's write-set. Because their merge semantics are commutative, concurrent CRDT writes can be combined deterministically and therefore never trigger a spurious `SerializationConflict`.
+
+### Disabling SSI
+
+Setting `UniConfig.ssi_enabled = false` reverts to the legacy **last-writer-wins (LWW)** model: read-write transactions read the live L0 with no snapshot pinning, no read/write-set is tracked, and commits are not validated. This reproduces the pre-2.0 behavior and skips the (near-zero) validation overhead, but concurrent read-modify-write transactions can **silently lose updates** and concurrent `MERGE` can create duplicate unique keys. Use it only for single-writer workloads or when read-modify-write is guarded externally.
 
 ---
 
@@ -240,7 +282,7 @@ flowchart TB
 |----------|-----------|
 | **Atomicity** | Flush is all-or-nothing (manifest written last) |
 | **Consistency** | Schema validated on write, constraints enforced |
-| **Isolation** | Snapshot isolation for readers |
+| **Isolation** | Snapshot isolation for readers; Serializable Snapshot Isolation (OCC) for read-write transactions by default |
 | **Durability** | WAL ensures writes survive crashes |
 
 ### Isolation Level Comparison
@@ -249,8 +291,10 @@ flowchart TB
 |-------|----------------|---------------------|
 | Read Uncommitted | With L0 access | None |
 | Read Committed | N/A | Dirty reads |
-| Repeatable Read | Snapshot isolation | Dirty reads, non-repeatable reads |
-| Serializable | Single writer | All anomalies |
+| Repeatable Read | Snapshot isolation (`ssi_enabled = false`, LWW) | Dirty reads, non-repeatable reads |
+| Serializable | SSI / OCC (default, `ssi_enabled = true`) | All anomalies (write skew and lost updates prevented by commit-time conflict detection) |
+
+Serializability comes from the SSI/OCC conflict detection described above — read/write-sets validated under the writer lock at commit, not from forcing writes through a single writer. With `ssi_enabled = false`, snapshot pinning and validation are disabled, so the engine offers snapshot-isolation-style reads but is subject to lost updates (LWW).
 
 ---
 

@@ -138,16 +138,51 @@ uni snapshot <SUBCOMMAND> [--path <PATH>]
 uni snapshot list --path ./storage
 ```
 
-**`create`** — Create a new named snapshot.
+**`create`** — Create a new named snapshot. The `<NAME>` argument is required.
 ```bash
-uni snapshot create --path ./storage
-# or
+uni snapshot create <NAME> --path ./storage
+# e.g.
 uni snapshot create "nightly" --path ./storage
 ```
 
 **`restore`** — Restore the database to a specific snapshot ID.
 ```bash
 uni snapshot restore <ID> --path ./storage
+```
+
+---
+
+### `plugin` — Manage Runtime-Loaded Plugins
+
+Install runtime-loaded plugins into a database.
+
+#### Synopsis
+
+```bash
+uni plugin <SUBCOMMAND> [--path <PATH>]
+```
+
+#### Subcommands
+
+**`install`** — Install a plugin from a local file or URL.
+
+```bash
+uni plugin install <SOURCE> [--grants <NAMES>] --path ./storage
+```
+
+| Argument / Option | Description | Default |
+|-------------------|-------------|---------|
+| `<SOURCE>` | Local path or URL to install from. Dispatched by extension: `*.rhai` is loaded today; `*.wasm`, `oci://…`, and `extism://…` are reserved for a later milestone. | — |
+| `--grants <NAMES>` | Comma-separated capability grant names (e.g. `ScalarFn,Filesystem,Network`). | `ScalarFn,AggregateFn,Procedure` |
+
+Available grant names include `ScalarFn`, `AggregateFn`, `Procedure`, `Filesystem`, `Network`, `HostQuery`, `Kms`, and `Secret`.
+
+```bash
+# Install a Rhai plugin with the default scalar/aggregate/procedure grants
+uni plugin install ./my_plugin.rhai --path ./storage
+
+# Grant filesystem and network access as well
+uni plugin install ./my_plugin.rhai --grants "ScalarFn,Filesystem,Network" --path ./storage
 ```
 
 ---

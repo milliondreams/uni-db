@@ -219,6 +219,11 @@ jobs:
           sleep 30
           publish_crate uni-plugin-apoc-core
           sleep 30
+          # Versioned dev-dependency of uni-plugin-pyo3 and uni-plugin-wasm:
+          # `cargo publish` keeps versioned dev-deps in the manifest, so it must
+          # be on crates.io before those two crates can be packaged.
+          publish_crate uni-plugin-conformance
+          sleep 30
           publish_crate uni-plugin-pyo3
           sleep 30
           publish_crate uni-plugin-rhai

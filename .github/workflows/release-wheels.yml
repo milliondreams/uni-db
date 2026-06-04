@@ -331,6 +331,12 @@ jobs:
           manylinux: 2_28
           before-script-linux: |
             yum install -y openssl-devel unzip
+            # Stage OpenSSL 1.1 libs for the host-side auditwheel repair. The
+            # ORT CUDA EP links libcrypto.so.1.1, but the repair runs on the
+            # ubuntu host runner (OpenSSL 3 only) and can't locate it to bundle.
+            # The workspace is bind-mounted, so libs copied here reach the host.
+            mkdir -p "$GITHUB_WORKSPACE/_cudahostlibs"
+            cp -av /usr/lib64/libcrypto.so.1.1* /usr/lib64/libssl.so.1.1* "$GITHUB_WORKSPACE/_cudahostlibs/" 2>/dev/null || true
             PROTOC_VERSION="28.3"
             curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
@@ -341,6 +347,10 @@ jobs:
           set -euo pipefail
           pip install auditwheel patchelf
           mkdir -p dist
+          # Let auditwheel find the OpenSSL 1.1 libs staged from the build
+          # container so it can bundle libcrypto/libssl (the host has only
+          # OpenSSL 3). CUDA driver/runtime libs stay excluded below.
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/_cudahostlibs:${LD_LIBRARY_PATH:-}"
           # CUDA driver, runtime, and math libs are host-supplied via the
           # user's NVIDIA driver / CUDA toolkit install. cuDNN is also
           # host-supplied (see uni-xervo build.rs warning). Exclude all of
@@ -405,7 +415,16 @@ jobs:
       - name: Build wheels (skip auditwheel)
         uses: PyO3/maturin-action@v1
         env:
-          RUSTFLAGS: ""
+          # Statically link the C++ runtime. The manylinux_2_34 image's default
+          # gcc-toolset-14 emits libstdc++ symbols (GLIBCXX_3.4.30+ / CXXABI_1.3.14+)
+          # newer than the manylinux_2_34 auditwheel policy allows (<= 3.4.29), and
+          # the nvcc/CUDA host-link path bypasses the toolset's static-"nonshared"
+          # trick — so `auditwheel repair` fails with "too-recent versioned symbols".
+          # Embedding libstdc++/libgcc keeps those symbols internal, so the wheel
+          # stays manylinux_2_34-compliant (glibc itself is fine at 2.34). Setting
+          # RUSTFLAGS here also overrides .cargo/config.toml's mold linker, which
+          # isn't available inside the manylinux container.
+          RUSTFLAGS: "-Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
           # candle/mistralrs CUDA kernels auto-detect the GPU compute
           # capability via nvidia-smi, which doesn't exist on GPU-less build
           # runners. Pin the target arch explicitly (SM 8.0 / Ampere). PTX is
@@ -421,6 +440,13 @@ jobs:
           before-script-linux: |
             set -euxo pipefail
             dnf install -y openssl-devel unzip dnf-plugins-core
+            # Stage OpenSSL 1.1 libs for the host-side auditwheel repair. The
+            # ORT CUDA EP links libcrypto.so.1.1; AlmaLinux 9 ships OpenSSL 3,
+            # so install the compat package and copy the 1.1 libs out to the
+            # bind-mounted workspace for the host repair step to bundle.
+            dnf install -y compat-openssl11 || true
+            mkdir -p "$GITHUB_WORKSPACE/_cudahostlibs"
+            cp -av /usr/lib64/libcrypto.so.1.1* /usr/lib64/libssl.so.1.1* "$GITHUB_WORKSPACE/_cudahostlibs/" 2>/dev/null || true
             PROTOC_VERSION="28.3"
             curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
@@ -441,6 +467,10 @@ jobs:
           set -euo pipefail
           pip install auditwheel patchelf
           mkdir -p dist
+          # Let auditwheel find the OpenSSL 1.1 libs staged from the container
+          # (host/runner have only OpenSSL 3) so libcrypto/libssl get bundled.
+          # CUDA driver/runtime libs stay excluded below.
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/_cudahostlibs:${LD_LIBRARY_PATH:-}"
           # Same exclude list as `build-cuda-linux`. Note: candle's CUDA
           # path uses `cudarc` which dlopens libcudart at runtime; that's
           # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in

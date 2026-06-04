@@ -230,3 +230,51 @@ jobs:
           cargo metadata --format-version=1 \
             --manifest-path bindings/uni-db-cuda/Cargo.toml \
             > /dev/null
+
+  # Release-path guards. `cargo clippy --workspace` (in the lint job) unifies
+  # features across all members, so the base wheel's plugin features leak onto
+  # `uni-db` and mask a variant that forgot to enable them — the deficiency
+  # only surfaces in the isolated, single-crate maturin wheel build at release
+  # time. These checks reproduce that isolation, plus verify the crates.io
+  # publish list is complete. See scripts/ci/.
+  release-guards:
+    name: Release Guards
+    runs-on: ubuntu-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Static check (no compile): every wheel variant must enable the plugin
+      # loader features its shared binding source calls unconditionally.
+      - name: Check wheel-variant plugin features
+        run: python3 scripts/ci/check_wheel_variant_features.py
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      # The crates.io publish list must be uni-db's full publishable
+      # dependency closure in topological order (uses `cargo metadata`).
+      - name: Check crates.io publish list
+        run: python3 scripts/ci/check_publish_list.py
+
+      # Compile guard for the slim `default-features = false` wheel path,
+      # built in ISOLATION (no --workspace) so feature unification can't mask
+      # a missing plugin feature. CUDA/Metal variants can't build on a plain
+      # Linux runner — the static check above covers their feature wiring.
+      - name: Compile-check slim ONNX wheel variant
+        run: cargo check -p uni-python-onnx

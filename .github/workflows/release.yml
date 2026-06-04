@@ -201,21 +201,55 @@ jobs:
             echo "$output" | grep -q "already exists" && echo "Skipping $crate: already published" && return 0
             return 1
           }
+          # Crates are published in dependency (topological) order: a crate may
+          # only be published after every workspace crate it depends on is on
+          # crates.io. This list is uni-db's full publishable dependency closure
+          # (normal + build deps; dev-deps are stripped by `cargo publish`).
+          # Keep it in sync when adding/removing workspace dependencies — a
+          # missing entry fails the release with "no matching package named ...".
           publish_crate uni-btic
           sleep 30
           publish_crate uni-common
           sleep 30
+          publish_crate uni-cypher
+          sleep 30
+          publish_crate uni-locy
+          sleep 30
+          publish_crate uni-plugin
+          sleep 30
+          publish_crate uni-plugin-apoc-core
+          sleep 30
+          publish_crate uni-plugin-pyo3
+          sleep 30
+          publish_crate uni-plugin-rhai
+          sleep 30
+          publish_crate uni-plugin-wasm-rt
+          sleep 30
+          publish_crate uni-sidecar
+          sleep 30
           publish_crate uni-crdt
           sleep 30
-          publish_crate uni-cypher
+          publish_crate uni-plugin-custom
+          sleep 30
+          publish_crate uni-plugin-extism
+          sleep 30
+          publish_crate uni-plugin-wasm
           sleep 30
           publish_crate uni-store
           sleep 30
           publish_crate uni-algo
           sleep 30
-          publish_crate uni-locy
+          publish_crate uni-plugin-builtin
+          sleep 30
+          publish_crate uni-query-functions
           sleep 30
           publish_crate uni-query
+          sleep 30
+          publish_crate uni-fork
+          sleep 30
+          publish_crate uni-plugin-host
+          sleep 30
+          publish_crate uni-bulk
           sleep 30
           publish_crate uni-db
         env:
@@ -260,14 +294,21 @@ jobs:
           else
             INDEX_ARGS=""
           fi
-          for i in 1 2 3 4 5; do
+          # uni-db wheels are published by `release-wheels.yml`, which runs in
+          # parallel and builds a multi-platform matrix that can take 30-60 min
+          # cold. This poll must outlast that build, otherwise build-pydantic
+          # loses the race on every from-scratch release. Wait up to ~30 min
+          # (30 attempts x 60s).
+          ATTEMPTS=30
+          for i in $(seq 1 "$ATTEMPTS"); do
             uv pip install $INDEX_ARGS "uni-db==${VERSION}" && break
-            if [ "$i" -eq 5 ]; then
-              echo "Failed to install uni-db==${VERSION} from ${REGISTRY} after retries"
+            if [ "$i" -eq "$ATTEMPTS" ]; then
+              echo "Failed to install uni-db==${VERSION} from ${REGISTRY} after ${ATTEMPTS} attempts (~30 min)"
+              echo "Check that release-wheels.yml published the uni-db wheel for ${VERSION}."
               exit 1
             fi
-            echo "uni-db not yet available on ${REGISTRY}, retrying in 30s..."
-            sleep 30
+            echo "uni-db==${VERSION} not yet on ${REGISTRY} (attempt ${i}/${ATTEMPTS}), retrying in 60s..."
+            sleep 60
           done
 
       - name: Build uni-pydantic package

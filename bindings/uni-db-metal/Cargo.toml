@@ -22,7 +22,10 @@ pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 # local providers, and ort?/coreml so the ORT CoreML EP reaches Apple
 # GPU/ANE. provider-onnx (in default) is what enables the optional ort
 # crate that gpu-metal's `ort?/coreml` then activates.
-uni-db = { workspace = true, default-features = true, features = ["gpu-metal", "mimalloc"] }
+# `pyo3-plugins` is opt-in (not in uni-db's default set) but the shared
+# binding source calls the PyO3 plugin loaders unconditionally, so it must
+# be enabled here. `rhai-plugins` already rides in via default-features.
+uni-db = { workspace = true, default-features = true, features = ["gpu-metal", "mimalloc", "pyo3-plugins"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

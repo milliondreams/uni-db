@@ -13,7 +13,7 @@ Forks are a sibling of [snapshots](snapshots-time-travel.md). Where a snapshot i
 
 Forks are **shipped and GA** in both Rust and Python. The full surface is available: writable and nestable forks; lifecycle controls (TTL, budget, Lance tags, parent→child cancellation, pin/refresh on forked sessions); and diff + promotion for write-audit-publish workflows. The Python bindings (`Session.fork`/`fork_schema`, `Uni.list_forks`/`drop_fork`/`drop_fork_cascade`/`tag_fork`/`diff_fork_primary`/`promote_from_fork`) mirror the Rust API one-to-one.
 
-Fork-local index fusion and fork compaction are the remaining planned enhancements; until they land, long-lived heavy-write forks should be `drop_fork`-and-recreate to bound fragment accumulation (see [Operational signals](#operational-signals)).
+Fork-local indexes and index fusion are **shipped** as a Rust API (see [Fork-local indexes](#fork-local-indexes)); they are not yet exposed in the Python bindings. Fork **compaction** is the remaining planned enhancement, so until it lands, long-lived heavy-write forks should be `drop_fork`-and-recreate to bound fragment accumulation (see [Operational signals](#operational-signals)).
 
 ## Quick start
 
@@ -99,16 +99,22 @@ Required only under `UniConfig { strict_schema: true, .. }`. In schemaless mode 
 
 ### Errors
 
-All fork-related errors are `UniError::Fork*` variants — `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkInflightTx { name }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
+All fork-related errors are `UniError::Fork*` variants. Each maps to a dedicated Python exception (a subclass of `UniError`):
 
-`ForkInflightTx` fires when `drop_fork` is called while at least one `Transaction` is alive on the fork. Commit or roll back the transaction first, then retry the drop.
+| Rust variant | Fields | Python exception | Raised when |
+|---|---|---|---|
+| `ForkNotFound` | `name` | `UniForkNotFoundError` | The named fork does not exist. |
+| `ForkAlreadyExists` | `name` | `UniForkAlreadyExistsError` | `ForkBuilder::new_()` on a name that is taken. |
+| `ForkInUse` | `name`, `holder_count` | `UniForkInUseError` | `drop_fork` while sessions still hold the fork. |
+| `ForkInflightTx` | `name` | `UniForkInflightTxError` | `drop_fork` while a `Transaction` is still open on the fork. |
+| `ForkHasChildren` | `name`, `children` | `UniForkHasChildrenError` | `drop_fork` while nested children exist — drop them first or use `drop_fork_cascade`. |
+| `ForkSubtreeInUse` | `blockers` | `UniForkSubtreeInUseError` | `drop_fork_cascade` blocked by live sessions / open transactions in the subtree. No branch is deleted. |
+| `ForkBudgetExceeded` | `current`, `max` | `UniForkBudgetExceededError` | Fork creation would exceed `UniConfig::max_forks`. |
+| `PendingFlushTimeout` | `name` | (timeout `UniError`) | `drop_fork` could not drain pending async flushes within `UniConfig::drop_fork_drain_timeout` (default `10s`). |
+| `ForkCorruptRegistry` | `message` | `UniForkCorruptRegistryError` | The on-disk fork registry failed to parse or validate. |
+| `ForkLifecycle` | `name`, `stage`, `source` | `UniForkLifecycleError` | A tag / untag / list-tags operation failed at the named `stage`. |
 
-`forked.tx()` is fully writable; there is no read-only-fork restriction.
-
-Nested-fork errors:
-
-- `ForkHasChildren { name, children }` — `drop_fork` refused because nested children exist. Drop them first or use `drop_fork_cascade`.
-- `ForkSubtreeInUse { blockers }` — `drop_fork_cascade` refused because at least one node in the subtree has live sessions or in-flight transactions. No branch is deleted; resolve the blockers and retry.
+`ForkInflightTx` fires when `drop_fork` is called while at least one `Transaction` is alive on the fork — commit or roll back first, then retry. `forked.tx()` is fully writable; there is no read-only-fork restriction.
 
 ## Nested forks
 
@@ -189,26 +195,51 @@ All inserts run inside a single primary transaction that commits at the end — 
 
 ### Python
 
-The same surface is available via `uni_db` in Python:
+The same surface is available via `uni_db` in Python, sync and async.
 
-```python
-import uni_db
+!!! note "Async parity"
+    Every `Uni` / `Session` fork method has an `AsyncUni` / `AsyncSession` twin with the same
+    name and signature — `await db.diff_fork_primary(...)`, `await db.promote_from_fork(...)`,
+    `await db.list_forks()`, `await session.fork(name).ttl(td).build()`, and so on.
 
-diff = db.diff_fork_primary("audit")
-print(diff)  # ForkDiff(vertices=added=2/deleted=0/changed=0, edges=...)
+=== "Python (sync)"
 
-for v in diff.vertices.added:
-    print(v.label, v.uid, v.properties)
+    ```python
+    import uni_db
 
-report = db.promote_from_fork(
-    "publish_q2",
-    [
-        uni_db.PromotePattern.label("Person"),
-        uni_db.PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020"),
-    ],
-)
-print(report)
-```
+    diff = db.diff_fork_primary("audit")
+    print(diff)  # ForkDiff(vertices=added=2/deleted=0/changed=0, edges=...)
+    for v in diff.vertices.added:
+        print(v.label, v.uid, v.properties)
+
+    report = db.promote_from_fork(
+        "publish_q2",
+        [
+            uni_db.PromotePattern.label("Person"),
+            uni_db.PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020"),
+        ],
+    )
+    print(report)
+    ```
+
+=== "Python (async)"
+
+    ```python
+    import uni_db
+
+    diff = await db.diff_fork_primary("audit")
+    for v in diff.vertices.added:
+        print(v.label, v.uid, v.properties)
+
+    report = await db.promote_from_fork(
+        "publish_q2",
+        [
+            uni_db.PromotePattern.label("Person"),
+            uni_db.PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020"),
+        ],
+    )
+    print(report)
+    ```
 
 ### Non-goals
 
@@ -246,6 +277,43 @@ On disk:
 - **Same-name fork sessions share a writer.** Two `session.fork("x")` calls on the same name resolve to the same `UniInner` (cached as `Weak<UniInner>` so the cache never extends a session's lifetime). A commit on session A is immediately visible to session B's reads — no flush required.
 - **Multiple sessions can hold the same fork.** A holder count is tracked and `drop_fork` refuses with `ForkInUse` while sessions are alive, or with `ForkInflightTx` when an open transaction has yet to commit or roll back.
 - **Lance compaction honors branch references.** Primary GC will not reclaim fragments that a live fork still references.
+
+## Fork-local indexes
+
+A fork accumulates its writes on its own Lance branches, so a query on a forked session has to consult both the parent's indexes and the fork-local rows. A **fork-local index** builds a secondary index over just the fork's branch and **fuses** it with the parent index at query time — keeping point lookups, range scans, vector ANN, and full-text search fast on a fork without rebuilding any of primary's indexes.
+
+!!! note "Rust-only today"
+    `build_fork_local_index` is a Rust API; it is not yet exposed in the Python bindings.
+
+```rust
+use uni_db::store::fork::ForkLocalIndexKind;
+
+let fork = session.fork("scenario").await?;
+// ... writes on the fork ...
+fork.build_fork_local_index("Person", "email", ForkLocalIndexKind::ScalarBtree).await?;
+```
+
+`build_fork_local_index(label, column, kind)` flushes the fork's pending L0 writes, then builds the index over the fork's branch. It errors with `UniError::InvalidArgument` on a non-forked session.
+
+`ForkLocalIndexKind` selects what is built and how it fuses with the parent:
+
+| Kind | Fuses via | Use for |
+|---|---|---|
+| `ScalarBtree` | `BtreeUnion` | Equality / `IN` point lookups on a scalar column. |
+| `Sorted` | `SortedKWayMerge` | Range scans and `ORDER BY`. |
+| `VidUid` | `VidUidForkFirst` | VID / UID identity lookups (fork-first, falls back to primary). |
+| `Vector` | `AnnRerank` | Vector ANN search (top-k merge + rerank). |
+| `FullText` | `Bm25Rrf` | BM25 full-text search (reciprocal-rank fusion). |
+
+**Automatic building.** A background builder also creates fork-local indexes once a fork's per-label row count crosses a threshold, so most workloads never call the API directly:
+
+| `UniConfig` field | Default | Purpose |
+|---|---|---|
+| `fork_index_build_threshold` | `10_000` | Per-fork, per-label row count that triggers an auto-build. |
+| `fork_index_builder_interval` | `30s` | Background builder poll interval. |
+| `disable_fork_index_builder` | `false` | Skip spawning the builder (e.g. in tests). |
+
+**Seeing fusion in a plan.** When a fork-local index is used, `explain()` shows a `FusedIndexScan` node whose `FusionKind` is one of `BtreeUnion`, `SortedKWayMerge`, `VidUidForkFirst`, `AnnRerank`, or `Bm25Rrf`. The lossy kinds (`Vector`, `FullText`) are additionally wrapped as `FusedIndexScanWrapped`, purely for observability — runtime behaviour is identical.
 
 ## Lifecycle admin
 
@@ -307,3 +375,9 @@ Recovery runs in `Uni::open` before any session is exposed.
 - **Tombstoned fork** (drop crashed mid-2PC) → completed. Branches deleted, registry entry removed, tombstone + overlay files cleaned.
 
 Recovery is idempotent — running it twice is a no-op the second time.
+
+## See also
+
+- [Snapshots & time travel](snapshots-time-travel.md) — the read-only, point-in-time sibling of forks.
+- Example notebooks — `bindings/uni-db/examples/forks.ipynb` (Python, sync), `bindings/uni-db/examples/forks_async.ipynb` (Python, async), `examples/rust/forks.ipynb` (Rust).
+- Example programs — `crates/uni/examples/fork_promote.rs` (write-audit-publish), `crates/uni/examples/fork_nested.rs` (nested forks), `crates/uni/examples/fork_rule_developer.rs` (rule development on a fork).

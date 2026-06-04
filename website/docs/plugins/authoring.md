@@ -16,7 +16,9 @@ We show the two WASM paths side by side — the **Component Model** (WASM-CM)
 and **Extism** — because they are the production sandboxed loaders. If you
 want the in-process scripting loaders instead, the same surface and manifest
 concepts apply; jump to [Rhai](loaders/rhai.md) or [PyO3](loaders/pyo3.md)
-once you've read this page.
+once you've read this page. To author the Rust-only surfaces — operators,
+index kinds, storage backends, CRDTs, hooks, triggers, and more — see
+[Authoring native (Rust) plugins](authoring-rust.md).
 
 The worked sources for this guide live in the repository:
 

@@ -1,6 +1,7 @@
 name: Build and Publish Wheels
 
-# Owns the uni-db Python wheel matrix.
+# Owns the entire Python side of a release: the uni-db wheel matrix AND the
+# uni-pydantic build/publish.
 #
 # Builds and publishes 6 wheels mirroring uni-xervo 0.9.0's three-axis
 # capability model (provider × linking × acceleration). See
@@ -14,10 +15,14 @@ name: Build and Publish Wheels
 # mistralrs, ONNX local + 8 remote APIs). The `*-onnx*` variants are slim:
 # ONNX local + 8 remote APIs only, no candle/mistralrs.
 #
-# Runs in parallel with `release.yml`. That file owns validate-for-non-wheel,
-# tag, GitHub release, crates.io publish, and the uni-pydantic chain.
-# `build-pydantic` in `release.yml` polls PyPI for the published `uni-db`
-# version, so it doesn't need a job-graph dependency on this workflow.
+# uni-pydantic depends on the uni-db *wheel* (not the crate), so it lives here
+# rather than in `release.yml`: its `build-pydantic` job `needs:` the wheel
+# publish job, an in-workflow dependency that guarantees the uni-db wheel is on
+# the index before pydantic builds/installs against it. (Previously it lived in
+# `release.yml` and polled PyPI across workflows, which raced the wheel build.)
+#
+# Runs in parallel with `release.yml`, which owns validation, tag, GitHub
+# release, and the crates.io publish.
 
 on:
   workflow_dispatch:
@@ -79,16 +84,18 @@ jobs:
             exit 1
           fi
 
-          # Every wheel-matrix sibling pyproject shares the same lock-step
-          # version. This list must be kept in sync with workspace members
-          # under `bindings/uni-db*/`.
+          # Every wheel-matrix sibling pyproject + uni-pydantic shares the same
+          # lock-step version. This workflow builds and publishes uni-pydantic
+          # too, so validate it here as well. Keep in sync with workspace
+          # members under `bindings/`.
           for pyproject in \
             bindings/uni-db/pyproject.toml \
             bindings/uni-db-onnx/pyproject.toml \
             bindings/uni-db-cuda/pyproject.toml \
             bindings/uni-db-metal/pyproject.toml \
             bindings/uni-db-onnx-cuda/pyproject.toml \
-            bindings/uni-db-onnx-metal/pyproject.toml; do
+            bindings/uni-db-onnx-metal/pyproject.toml \
+            bindings/uni-pydantic/pyproject.toml; do
             PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ "$VERSION" != "$PYPI_VERSION" ]; then
               echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
@@ -324,6 +331,12 @@ jobs:
           manylinux: 2_28
           before-script-linux: |
             yum install -y openssl-devel unzip
+            # Stage OpenSSL 1.1 libs for the host-side auditwheel repair. The
+            # ORT CUDA EP links libcrypto.so.1.1, but the repair runs on the
+            # ubuntu host runner (OpenSSL 3 only) and can't locate it to bundle.
+            # The workspace is bind-mounted, so libs copied here reach the host.
+            mkdir -p "$GITHUB_WORKSPACE/_cudahostlibs"
+            cp -av /usr/lib64/libcrypto.so.1.1* /usr/lib64/libssl.so.1.1* "$GITHUB_WORKSPACE/_cudahostlibs/" 2>/dev/null || true
             PROTOC_VERSION="28.3"
             curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
             unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
@@ -334,6 +347,10 @@ jobs:
           set -euo pipefail
           pip install auditwheel patchelf
           mkdir -p dist
+          # Let auditwheel find the OpenSSL 1.1 libs staged from the build
+          # container so it can bundle libcrypto/libssl (the host has only
+          # OpenSSL 3). CUDA driver/runtime libs stay excluded below.
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/_cudahostlibs:${LD_LIBRARY_PATH:-}"
           # CUDA driver, runtime, and math libs are host-supplied via the
           # user's NVIDIA driver / CUDA toolkit install. cuDNN is also
           # host-supplied (see uni-xervo build.rs warning). Exclude all of
@@ -398,7 +415,16 @@ jobs:
       - name: Build wheels (skip auditwheel)
         uses: PyO3/maturin-action@v1
         env:
-          RUSTFLAGS: ""
+          # Statically link the C++ runtime. The manylinux_2_34 image's default
+          # gcc-toolset-14 emits libstdc++ symbols (GLIBCXX_3.4.30+ / CXXABI_1.3.14+)
+          # newer than the manylinux_2_34 auditwheel policy allows (<= 3.4.29), and
+          # the nvcc/CUDA host-link path bypasses the toolset's static-"nonshared"
+          # trick — so `auditwheel repair` fails with "too-recent versioned symbols".
+          # Embedding libstdc++/libgcc keeps those symbols internal, so the wheel
+          # stays manylinux_2_34-compliant (glibc itself is fine at 2.34). Setting
+          # RUSTFLAGS here also overrides .cargo/config.toml's mold linker, which
+          # isn't available inside the manylinux container.
+          RUSTFLAGS: "-Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
           # candle/mistralrs CUDA kernels auto-detect the GPU compute
           # capability via nvidia-smi, which doesn't exist on GPU-less build
           # runners. Pin the target arch explicitly (SM 8.0 / Ampere). PTX is
@@ -434,6 +460,10 @@ jobs:
           set -euo pipefail
           pip install auditwheel patchelf
           mkdir -p dist
+          # uni-db-cuda links OpenSSL 3 (libcrypto.so.3), which the ubuntu
+          # runner provides host-native — so unlike the onnx-cuda job (ORT EP →
+          # libcrypto.so.1.1), no OpenSSL-1.1 staging is needed here. The real
+          # fix for this job is -static-libstdc++ in the build step above.
           # Same exclude list as `build-cuda-linux`. Note: candle's CUDA
           # path uses `cudarc` which dlopens libcudart at runtime; that's
           # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in
@@ -538,6 +568,131 @@ jobs:
 
       - name: Publish to PyPI
         if: inputs.dry_run != true
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --check-url https://pypi.org/simple/ dist/*
+
+  # uni-pydantic build + publish. Lives here (not in release.yml) because it
+  # depends on the uni-db *wheel* being on the index. `needs:` the wheel publish
+  # jobs so it can't start until the uni-db wheel is actually published — an
+  # in-workflow dependency that replaces the old cross-workflow PyPI polling.
+  build-pydantic:
+    name: Build uni-pydantic
+    needs: [validate, publish-pypi, publish-testpypi]
+    runs-on: ubuntu-latest
+    # The two wheel-publish jobs are mutually exclusive (pypi on push /
+    # target=pypi, testpypi on target=testpypi), so `always()` + gate on
+    # whichever one ran succeeding.
+    if: |
+      always() && inputs.dry_run != true && needs.validate.result == 'success'
+      && (needs.publish-pypi.result == 'success' || needs.publish-testpypi.result == 'success')
+    env:
+      # `push` events (tag) always go to pypi. `workflow_dispatch` honors the
+      # `target` input. Matches the wheel publish jobs above.
+      REGISTRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Create virtualenv
+        run: uv venv --python 3.12
+
+      - name: Install published uni-db (with retry)
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          if [ "$REGISTRY" == "testpypi" ]; then
+            INDEX_ARGS="--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/"
+          else
+            INDEX_ARGS=""
+          fi
+          # The uni-db wheel is already published (this job `needs:` the publish
+          # job), so we only wait on PyPI's brief upload->index propagation lag,
+          # not the multi-platform wheel build. A short retry suffices.
+          ATTEMPTS=10
+          for i in $(seq 1 "$ATTEMPTS"); do
+            uv pip install $INDEX_ARGS "uni-db==${VERSION}" && break
+            if [ "$i" -eq "$ATTEMPTS" ]; then
+              echo "uni-db==${VERSION} not visible on ${REGISTRY} after ${ATTEMPTS} attempts despite a successful publish job — check index status."
+              exit 1
+            fi
+            echo "uni-db==${VERSION} not yet on ${REGISTRY} (attempt ${i}/${ATTEMPTS}), retrying in 30s..."
+            sleep 30
+          done
+
+      - name: Build uni-pydantic package
+        run: uv build bindings/uni-pydantic
+
+      - name: Smoke test with published uni-db
+        run: |
+          if [ "$REGISTRY" == "testpypi" ]; then
+            INDEX_ARGS="--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/"
+          else
+            INDEX_ARGS=""
+          fi
+          # Install with deps so runtime requirements (e.g. pydantic) are present.
+          uv pip install $INDEX_ARGS --force-reinstall bindings/uni-pydantic/dist/*.whl
+          uv run python - <<'PY'
+          import uni_db
+          import uni_pydantic
+          print('uni_db:', getattr(uni_db, '__version__', 'unknown'))
+          print('uni_pydantic:', getattr(uni_pydantic, '__version__', 'unknown'))
+          PY
+
+      - name: Upload pydantic dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: pydantic-dist
+          path: bindings/uni-pydantic/dist
+
+  publish-pydantic-testpypi:
+    name: Publish uni-pydantic to TestPyPI
+    needs: [build-pydantic]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    if: |
+      needs.build-pydantic.result == 'success'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.target == 'testpypi'
+    steps:
+      - name: Download pydantic dist
+        uses: actions/download-artifact@v4
+        with:
+          name: pydantic-dist
+          path: dist
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to TestPyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: uv publish --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
+
+  publish-pydantic-pypi:
+    name: Publish uni-pydantic to PyPI
+    needs: [build-pydantic]
+    runs-on: ubuntu-latest
+    environment: pypi
+    if: |
+      needs.build-pydantic.result == 'success'
+      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi'))
+    steps:
+      - name: Download pydantic dist
+        uses: actions/download-artifact@v4
+        with:
+          name: pydantic-dist
+          path: dist
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: uv publish --check-url https://pypi.org/simple/ dist/*

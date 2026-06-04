@@ -38,11 +38,21 @@ def publishable_closure() -> tuple[set[str], dict[str, set[str]]]:
 
     graph: dict[str, set[str]] = {}
     for name, p in pkgs.items():
-        graph[name] = {
-            d["name"]
-            for d in p["dependencies"]
-            if d["name"] in internal and d["kind"] in (None, "build")
-        }
+        deps: set[str] = set()
+        for d in p["dependencies"]:
+            if d["name"] not in internal:
+                continue
+            # Normal + build deps always gate publishing. Dev-deps gate too IF
+            # they carry a version requirement: `cargo publish` keeps versioned
+            # dev-dependencies in the published manifest (so `cargo test` on the
+            # released crate can resolve them from the registry), and refuses to
+            # package until they exist on crates.io. Path-only dev-deps (req
+            # "*") are stripped and don't gate.
+            if d["kind"] in (None, "build") or (
+                d["kind"] == "dev" and d.get("req", "*") != "*"
+            ):
+                deps.add(d["name"])
+        graph[name] = deps
 
     seen: set[str] = set()
     stack = [ROOT_CRATE]

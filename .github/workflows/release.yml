@@ -1,16 +1,16 @@
 name: Release
 
-# Owns the non-wheel parts of a release:
+# Owns the crates.io side of a release:
 #   - version/CI validation
 #   - tag creation
 #   - GitHub release notes
 #   - crates.io publish (Rust crates)
-#   - uni-pydantic build + publish (depends on uni-db being on PyPI)
 #
-# Wheel build + publish lives in `release-wheels.yml`, which runs in parallel
-# on the same triggers. `build-pydantic` below polls PyPI for the published
-# `uni-db` version, so it doesn't need a job-graph dependency on the wheels
-# workflow — it just retries until the wheel lands on the index.
+# The Python side — the uni-db wheel matrix AND the uni-pydantic build/publish
+# — lives in `release-wheels.yml`, which runs in parallel on the same triggers.
+# uni-pydantic depends on the uni-db *wheel* (PyPI), not the crate, and now
+# uses an in-workflow `needs:` dependency on the wheel publish there instead of
+# polling across workflows.
 
 on:
   workflow_dispatch:
@@ -219,6 +219,11 @@ jobs:
           sleep 30
           publish_crate uni-plugin-apoc-core
           sleep 30
+          # Versioned dev-dependency of uni-plugin-pyo3 and uni-plugin-wasm:
+          # `cargo publish` keeps versioned dev-deps in the manifest, so it must
+          # be on crates.io before those two crates can be packaged.
+          publish_crate uni-plugin-conformance
+          sleep 30
           publish_crate uni-plugin-pyo3
           sleep 30
           publish_crate uni-plugin-rhai
@@ -254,133 +259,3 @@ jobs:
           publish_crate uni-db
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.UNI_CRATES_IO }}
-
-  build-pydantic:
-    name: Build uni-pydantic
-    needs: [validate]
-    runs-on: ubuntu-latest
-    # Wheels are published by `release-wheels.yml` running in parallel.
-    # `build-pydantic` waits for the wheel to land on PyPI/TestPyPI via the
-    # retry loop in the install step below, rather than via a job-graph
-    # dependency on the other workflow.
-    if: |
-      always() && inputs.dry_run != true && needs.validate.result == 'success'
-      && (
-        github.event_name == 'push'
-        || (github.event_name == 'workflow_dispatch' && (inputs.target == 'pypi' || inputs.target == 'testpypi'))
-      )
-    env:
-      # `push` events (tag) always go to pypi. `workflow_dispatch` honors the
-      # `target` input. Mirrors the same logic in `release-wheels.yml`.
-      REGISTRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
-      UV_PYTHON: "3.12"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
-
-      - name: Create virtualenv
-        run: uv venv --python 3.12
-
-      - name: Install published uni-db (with retry)
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          if [ "$REGISTRY" == "testpypi" ]; then
-            INDEX_ARGS="--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/"
-          else
-            INDEX_ARGS=""
-          fi
-          # uni-db wheels are published by `release-wheels.yml`, which runs in
-          # parallel and builds a multi-platform matrix that can take 30-60 min
-          # cold. This poll must outlast that build, otherwise build-pydantic
-          # loses the race on every from-scratch release. Wait up to ~30 min
-          # (30 attempts x 60s).
-          ATTEMPTS=30
-          for i in $(seq 1 "$ATTEMPTS"); do
-            uv pip install $INDEX_ARGS "uni-db==${VERSION}" && break
-            if [ "$i" -eq "$ATTEMPTS" ]; then
-              echo "Failed to install uni-db==${VERSION} from ${REGISTRY} after ${ATTEMPTS} attempts (~30 min)"
-              echo "Check that release-wheels.yml published the uni-db wheel for ${VERSION}."
-              exit 1
-            fi
-            echo "uni-db==${VERSION} not yet on ${REGISTRY} (attempt ${i}/${ATTEMPTS}), retrying in 60s..."
-            sleep 60
-          done
-
-      - name: Build uni-pydantic package
-        run: uv build bindings/uni-pydantic
-
-      - name: Smoke test with published uni-db
-        run: |
-          if [ "$REGISTRY" == "testpypi" ]; then
-            INDEX_ARGS="--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/"
-          else
-            INDEX_ARGS=""
-          fi
-          # Install with deps so runtime requirements (e.g. pydantic) are present.
-          uv pip install $INDEX_ARGS --force-reinstall bindings/uni-pydantic/dist/*.whl
-          uv run python - <<'PY'
-          import uni_db
-          import uni_pydantic
-          print('uni_db:', getattr(uni_db, '__version__', 'unknown'))
-          print('uni_pydantic:', getattr(uni_pydantic, '__version__', 'unknown'))
-          PY
-
-      - name: Upload pydantic dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: pydantic-dist
-          path: bindings/uni-pydantic/dist
-
-  publish-pydantic-testpypi:
-    name: Publish uni-pydantic to TestPyPI
-    needs: [build-pydantic]
-    runs-on: ubuntu-latest
-    environment: testpypi
-    # Mirrors the testpypi gate from `release-wheels.yml`'s `publish-testpypi`.
-    if: |
-      needs.build-pydantic.result == 'success'
-      && github.event_name == 'workflow_dispatch'
-      && inputs.target == 'testpypi'
-    steps:
-      - name: Download pydantic dist
-        uses: actions/download-artifact@v4
-        with:
-          name: pydantic-dist
-          path: dist
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Publish to TestPyPI
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
-        run: uv publish --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
-
-  publish-pydantic-pypi:
-    name: Publish uni-pydantic to PyPI
-    needs: [build-pydantic]
-    runs-on: ubuntu-latest
-    environment: pypi
-    # Mirrors the pypi gate from `release-wheels.yml`'s `publish-pypi`.
-    if: |
-      needs.build-pydantic.result == 'success'
-      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi'))
-    steps:
-      - name: Download pydantic dist
-        uses: actions/download-artifact@v4
-        with:
-          name: pydantic-dist
-          path: dist
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Publish to PyPI
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv publish --check-url https://pypi.org/simple/ dist/*

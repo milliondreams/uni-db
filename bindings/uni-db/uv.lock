@@ -1728,7 +1728,7 @@ wheels = [
 
 [[package]]
 name = "uni-db"
-version = "2.0.1"
+version = "2.0.2"
 source = { editable = "." }
 
 [package.optional-dependencies]

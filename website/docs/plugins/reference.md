@@ -207,9 +207,9 @@ Rust; as plain grant strings they request the variant.
 | `HostQuery` | `read_only`, `scopes` | Cypher / Locy queries back into the host session. |
 | `Kms` | `key_ids` | KMS sign / verify. |
 | `Secret` | `ids` | Acquiring named secret handles. |
-| `Lock` | `granularity` (`Nodes`/`Edges`/`Both`/`Global`) | Explicit node / edge lock primitives. |
+| `Lock` | `granularity` (`Nodes`/`Edges`/`Both`/`Global`) | Explicit node / edge lock primitives. **Reserved** — the capability is declared and intersected, but the host functions are not yet callable. |
 | `Config` | `keys` patterns | Scoped configuration K/V access. |
-| `PluginStorage` | — | Per-plugin scoped K/V store. |
+| `PluginStorage` | — | Per-plugin scoped K/V store. **Reserved** — declared and intersected, host functions not yet callable. |
 
 ### Extension surfaces
 

@@ -28,14 +28,23 @@ use super::types::*;
 pub struct LanceDbBackend {
     connection: Connection,
     base_uri: String,
-    /// Internal table cache keyed by `(table_name, branch_or_main)`.
-    ///
-    /// Branch reads are served by routing through the lower-level `lance`
-    /// crate (see [`super::lance_branch`]) since lancedb 0.27.1 does not
-    /// expose branches. The cache key is the table name on its own for
-    /// primary reads and `format!("{table}@@{branch}")` for branch reads,
-    /// so primary call sites are unchanged.
+    /// Legacy table cache. Kept as a field for binary-compatibility with
+    /// the existing invalidate_cache / clear_cache trait methods, but
+    /// NEVER populated by `get_or_open_table` — see that method's
+    /// doc-comment for why we open fresh every time under async-flush.
+    /// The remove()/clear() calls in this file are now no-ops.
+    #[allow(dead_code)]
     table_cache: DashMap<String, Table>,
+    /// Per-table write serialization mutex. Acquired by `write` and
+    /// `create_table` around the check-then-create. Without this, two
+    /// concurrent async-flush streams that both observe a table as
+    /// not-yet-existing can both succeed at `create_table`, and Lance's
+    /// CreateTableMode::Create (default) does NOT atomically reject
+    /// the second — observed under in-memory backend, where the
+    /// second Create writes a new dataset that REPLACES the first,
+    /// silently losing the first's batch. Per-table mutex preserves
+    /// parallelism across different tables (different labels).
+    table_write_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Existence cache populated lazily by [`Self::table_exists`].
     ///
     /// Avoids paying for [`Connection::table_names`] (which lists every
@@ -56,13 +65,10 @@ pub struct LanceDbBackend {
     schema_cache: DashMap<String, Arc<ArrowSchema>>,
 }
 
-/// Build the cache key for a `(table, branch)` pair.
-fn cache_key(table: &str, branch: Option<&str>) -> String {
-    match branch {
-        None => table.to_string(),
-        Some(b) => format!("{table}@@{b}"),
-    }
-}
+// `cache_key` removed alongside the `lancedb::Table` cache (see
+// `get_or_open_table` doc comment). The branch cache key form is no
+// longer needed because branch reads route through `lance_branch`
+// rather than via lancedb's `Table` type.
 
 impl LanceDbBackend {
     /// Connect to a LanceDB database at the given URI.
@@ -83,30 +89,47 @@ impl LanceDbBackend {
             connection,
             base_uri: uri.to_string(),
             table_cache: DashMap::new(),
+            table_write_locks: DashMap::new(),
             existence_cache: DashMap::new(),
             schema_cache: DashMap::new(),
         })
     }
 
-    /// Get or open a cached `lancedb::Table` by name (primary branch only).
+    /// Get or insert the per-table write mutex used to serialize
+    /// concurrent `write` / `create_table` against the same table.
+    /// See `table_write_locks` field doc for context.
+    fn write_lock_for(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.table_write_locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Open a `lancedb::Table` by name (primary branch only).
     ///
-    /// Branch reads bypass this cache and route through
+    /// Always opens fresh via `connection.open_table()` — does NOT use
+    /// a cache. A cached `lancedb::Table` handle is pinned to the
+    /// dataset version it was opened at (per `Table::checkout_latest`
+    /// docs in lancedb 0.27.1) and does NOT auto-refresh after
+    /// subsequent writes. Under async-flush, multiple stream phases
+    /// commit concurrent versions; a cached handle's reads then drop
+    /// rows committed after the handle was opened. Fix: open fresh
+    /// every time so each query sees the latest committed version.
+    ///
+    /// `connection.open_table()` is a cheap manifest-pointer read in
+    /// LanceDB; the previous DashMap cache was a micro-optimization
+    /// for sync workloads. Under async-flush it's a correctness
+    /// hazard, so we remove it.
+    ///
+    /// Branch reads still bypass this and route through
     /// [`super::lance_branch`] because lancedb 0.27.1 cannot open a
-    /// `Table` on a non-main branch. Any future fork-aware writes will
-    /// need to descend to `lance::Dataset` similarly.
+    /// `Table` on a non-main branch.
     async fn get_or_open_table(&self, name: &str) -> Result<Table> {
-        let key = cache_key(name, None);
-        if let Some(table) = self.table_cache.get(&key) {
-            return Ok(table.clone());
-        }
-        let table = self
-            .connection
+        self.connection
             .open_table(name)
             .execute()
             .await
-            .map_err(|e| anyhow!("Failed to open table '{}': {}", name, e))?;
-        self.table_cache.insert(key, table.clone());
-        Ok(table)
+            .map_err(|e| anyhow!("Failed to open table '{}': {}", name, e))
     }
 
     /// Build the on-disk URI for `name` (used for branch reads via lance).
@@ -117,6 +140,43 @@ impl LanceDbBackend {
         } else {
             format!("{}/{}.lance", self.base_uri, name)
         }
+    }
+
+    /// Fork `src_branch` of `table` into `dst_branch`.
+    ///
+    /// Returns `(parent_version, dst_branch.to_owned())` so callers
+    /// orchestrating nested forks can chain without re-querying.
+    ///
+    /// Dispatch matches the layered Lance contract: the main trunk
+    /// uses [`lance_branch::current_version`] +
+    /// [`lance_branch::create_branch`], named branches use
+    /// [`lance_branch::current_version_on_branch`] +
+    /// [`lance_branch::create_branch_from`]. The
+    /// `current_version_on_branch` doc explicitly notes nested forks
+    /// must read "the parent branch's tip, not main's".
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying anyhow error if either step fails
+    /// (`src_branch` missing, parent dataset missing, name collision,
+    /// or object-store I/O failure).
+    pub async fn fork_branch(
+        &self,
+        table: &str,
+        src_branch: &str,
+        dst_branch: &str,
+    ) -> Result<(u64, String)> {
+        let uri = self.dataset_uri(table);
+        let parent_version = if src_branch == "main" {
+            let v = lance_branch::current_version(&uri).await?;
+            lance_branch::create_branch(&uri, dst_branch, v).await?;
+            v
+        } else {
+            let v = lance_branch::current_version_on_branch(&uri, src_branch).await?;
+            lance_branch::create_branch_from(&uri, dst_branch, src_branch, v).await?;
+            v
+        };
+        Ok((parent_version, dst_branch.to_owned()))
     }
 
     /// Execute a scan query on the primary branch, returning a lancedb stream.
@@ -256,6 +316,29 @@ impl StorageBackend for LanceDbBackend {
                 name
             ));
         }
+        // Serialize concurrent create_table / write per-table. Without
+        // this, two threads that both observed "table doesn't exist"
+        // can both call create_table; CreateTableMode::Create's
+        // exists-error is not perfectly atomic on some backends
+        // (notably in-memory in lancedb 0.27.1), and the second Create
+        // overwrites the first's data. See `table_write_locks` field doc.
+        let lock = self.write_lock_for(name);
+        let _guard = lock.lock().await;
+        // Re-check existence under the lock. If a sibling stream
+        // created the table while we were waiting, fall back to Append
+        // (calling the inner machinery directly since we already hold
+        // the per-table write lock).
+        if self.table_exists(name).await? {
+            let table = self.get_or_open_table(name).await?;
+            table.add(batches).execute().await.map_err(|e| {
+                anyhow!(
+                    "Failed to append (fallback from create) to '{}': {}",
+                    name,
+                    e
+                )
+            })?;
+            return Ok(());
+        }
         self.connection
             .create_table(name, batches)
             .execute()
@@ -363,6 +446,16 @@ impl StorageBackend for LanceDbBackend {
             return Ok(());
         }
 
+        // Serialize per-table writes. Lance's optimistic concurrency on
+        // commit is sufficient for parallel Appends in theory, but
+        // under async-flush we observed two concurrent Append/Create
+        // mixes producing data loss on the in-memory backend. Holding
+        // a per-table mutex eliminates that whole class of races at a
+        // cost of serializing writes per-table (parallelism preserved
+        // across different tables).
+        let lock = self.write_lock_for(table_name);
+        let _guard = lock.lock().await;
+
         let table = self.get_or_open_table(table_name).await?;
 
         match mode {
@@ -384,6 +477,39 @@ impl StorageBackend for LanceDbBackend {
             }
         }
 
+        Ok(())
+    }
+
+    async fn merge_insert(
+        &self,
+        table_name: &str,
+        on: &[&str],
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Serialize per-table writes (same as `write`).
+        let lock = self.write_lock_for(table_name);
+        let _guard = lock.lock().await;
+
+        let table = self.get_or_open_table(table_name).await?;
+
+        // Build a reader for the partial-column source. The first batch's
+        // schema describes the source subschema; Lance compares it against
+        // the target via `allow_subschema=true` internally.
+        let schema = batches[0].schema();
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+
+        let mut mi = table.merge_insert(on);
+        mi.when_matched_update_all(None);
+        // Note: deliberately NOT calling `when_not_matched_insert_all`.
+        // Partial writes only update existing rows; CREATE goes through
+        // the full-row Append path. Unmatched source rows are dropped.
+        mi.execute(Box::new(reader))
+            .await
+            .map_err(|e| anyhow!("merge_insert on '{}': {}", table_name, e))?;
         Ok(())
     }
 
@@ -898,6 +1024,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_invalidation() {
+        // The `table_cache` was removed for async-flush correctness
+        // (see `get_or_open_table` doc comment). `invalidate_cache`
+        // and `clear_cache` are still public on the backend trait but
+        // are no-ops on `table_cache` now (they retain the legacy
+        // signature for callers). This test now just exercises that
+        // scan-then-invalidate doesn't error out.
         let (_dir, backend) = create_test_backend().await;
 
         backend
@@ -905,17 +1037,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Populate cache
         let _ = backend.scan(ScanRequest::all("test")).await.unwrap();
-        assert!(backend.table_cache.contains_key("test"));
-
-        // Invalidate
-        backend.invalidate_cache("test");
-        assert!(!backend.table_cache.contains_key("test"));
-
-        // Clear all
+        backend.invalidate_cache("test"); // no-op now, just check it doesn't panic
         let _ = backend.scan(ScanRequest::all("test")).await.unwrap();
         backend.clear_cache();
-        assert!(backend.table_cache.is_empty());
+        let _ = backend.scan(ScanRequest::all("test")).await.unwrap();
     }
 }

@@ -17,7 +17,7 @@ use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
     DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
 };
-use crate::query::df_graph::locy_fold::{FoldAggKind, FoldBinding};
+use crate::query::df_graph::locy_fold::{FoldBinding, resolve_locy_aggregate};
 use crate::query::planner_locy_types::{
     LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum, LocyYieldColumn,
 };
@@ -40,8 +40,10 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
-use uni_cypher::locy_ast::GoalQuery;
-use uni_locy::{CommandResult, FactRow, RuntimeWarning};
+use uni_locy::{
+    ClassifierRegistry, CommandResult, FactRow, ModelInvocationCache, RuntimeWarning, SemiringKind,
+};
+use uni_plugin::PluginRegistry;
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -102,13 +104,14 @@ pub struct LocyProgramExec {
     strata: Vec<LocyStratum>,
     commands: Vec<LocyCommand>,
     derived_scan_registry: Arc<DerivedScanRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
     graph_ctx: Arc<GraphExecutionContext>,
     session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
     storage: Arc<StorageManager>,
     schema_info: Arc<UniSchema>,
     params: HashMap<String, Value>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     max_iterations: usize,
     timeout: Duration,
@@ -118,6 +121,20 @@ pub struct LocyProgramExec {
     probability_epsilon: f64,
     exact_probability: bool,
     max_bdd_variables: usize,
+    /// Active probability semiring (rollout D-7). Defaults to `AddMultProb`
+    /// — the Phase 1/2 byte-identical behavior.
+    semiring_kind: SemiringKind,
+    /// Phase B Slice 3: runtime registry of `NeuralClassifier` impls
+    /// keyed by model name. Held by `Arc` so executor clones share the
+    /// same map.
+    classifier_registry: Arc<ClassifierRegistry>,
+    /// Phase B follow-up: optional memoization cache for classifier
+    /// outputs. `None` → no caching.
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
+    /// Phase C B1-B3 follow-up: per-query side-channel store for
+    /// (raw, calibrated, confidence_band) records. Threaded to
+    /// `FixpointExec` so EXPLAIN can read from it.
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     /// Shared slot for groups where BDD fell back to independence mode.
@@ -134,9 +151,49 @@ pub struct LocyProgramExec {
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
     top_k_proofs: usize,
-    /// Shared flag set to true when the evaluation is cut short by a timeout.
-    /// Checked after execution to populate `LocyResult.timed_out`.
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared interruption signal (see [`interruption`]): `interruption::NONE`
+    /// while running, non-zero once the stratum loop or fixpoint is cut short.
+    /// Decoded after execution to populate `incomplete_slot`.
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
+    /// Shared slot populated when evaluation stops before completing. Holds the
+    /// stop reason plus the skipped / unsound-complement rule lists; read after
+    /// execution to populate `LocyResult.incomplete`. `None` for a complete run.
+    incomplete_slot: Arc<StdRwLock<Option<uni_common::LocyIncomplete>>>,
+}
+
+/// Encoding for the shared interruption signal threaded through the stratum
+/// loop and the recursive fixpoint as an `Arc<AtomicU8>`.
+///
+/// A single atomic byte records *why* evaluation stopped so the two layers can
+/// agree on a reason without a second channel. `NONE` means "running or
+/// completed normally".
+pub(crate) mod interruption {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use uni_common::LocyIncompleteReason;
+
+    /// No interruption: evaluation is running or completed normally.
+    pub(crate) const NONE: u8 = 0;
+    /// The wall-clock `timeout` budget was exhausted.
+    pub(crate) const TIMEOUT: u8 = 1;
+    /// A recursive stratum hit `max_iterations` without converging.
+    pub(crate) const ITERATION_LIMIT: u8 = 2;
+
+    /// Decodes the current interruption reason, if any.
+    pub(crate) fn reason(flag: &AtomicU8) -> Option<LocyIncompleteReason> {
+        match flag.load(Ordering::Relaxed) {
+            TIMEOUT => Some(LocyIncompleteReason::Timeout),
+            ITERATION_LIMIT => Some(LocyIncompleteReason::IterationLimit),
+            _ => None,
+        }
+    }
+
+    /// Records an interruption reason. First reason wins: a later, lower-priority
+    /// signal (non-convergence) never overwrites an earlier wall-clock timeout,
+    /// preserving the original precedence.
+    pub(crate) fn set(flag: &AtomicU8, code: u8) {
+        let _ = flag.compare_exchange(NONE, code, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -157,10 +214,17 @@ impl LocyProgramExec {
         clippy::too_many_arguments,
         reason = "execution plan node requires full graph and session context"
     )]
+    #[deprecated(
+        note = "use `new_with_semiring_classifiers_and_cache` (or the lighter \
+                `new_with_semiring_and_classifiers` / `new_with_semiring`) — \
+                this legacy ctor defaults the semiring to AddMultProb and \
+                ships no classifier registry. To be removed after C0 Stage 2."
+    )]
     pub fn new(
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
         derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
         graph_ctx: Arc<GraphExecutionContext>,
         session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
         storage: Arc<StorageManager>,
@@ -177,11 +241,180 @@ impl LocyProgramExec {
         max_bdd_variables: usize,
         top_k_proofs: usize,
     ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            strata,
+            commands,
+            derived_scan_registry,
+            plugin_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            SemiringKind::AddMultProb,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Constructor accepting an explicit semiring. Empty classifier
+    /// registry; for the full Slice 3 variant call
+    /// [`Self::new_with_semiring_and_classifiers`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+    ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            strata,
+            commands,
+            derived_scan_registry,
+            plugin_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Phase B Slice 3 entry: accepts both the semiring kind and the
+    /// runtime classifier registry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring_and_classifiers(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+    ) -> Self {
+        Self::new_with_semiring_classifiers_and_cache(
+            strata,
+            commands,
+            derived_scan_registry,
+            plugin_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            None,
+            None,
+        )
+    }
+
+    /// Phase B follow-up: full constructor accepting the optional
+    /// memoization cache. Existing callers default to `None` (no
+    /// cache); `impl_locy.rs` threads `LocyConfig.classifier_cache`
+    /// here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring_classifiers_and_cache(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+        classifier_cache: Option<Arc<ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
             strata,
             commands,
             derived_scan_registry,
+            plugin_registry,
             graph_ctx,
             session_ctx,
             storage,
@@ -198,6 +431,10 @@ impl LocyProgramExec {
             probability_epsilon,
             exact_probability,
             max_bdd_variables,
+            semiring_kind,
+            classifier_registry,
+            classifier_cache,
+            classifier_provenance_store,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
             approximate_slot: Arc::new(StdRwLock::new(HashMap::new())),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
@@ -206,7 +443,8 @@ impl LocyProgramExec {
             warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
             command_results_slot: Arc::new(StdRwLock::new(Vec::new())),
             top_k_proofs,
-            timeout_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timeout_flag: Arc::new(std::sync::atomic::AtomicU8::new(interruption::NONE)),
+            incomplete_slot: Arc::new(StdRwLock::new(None)),
         }
     }
 
@@ -268,12 +506,22 @@ impl LocyProgramExec {
         Arc::clone(&self.command_results_slot)
     }
 
-    /// Returns the shared timeout flag.
+    /// Returns the shared interruption signal.
     ///
-    /// After execution, if this flag is true, the evaluation was cut short by
-    /// a timeout and the derived store contains partial results.
-    pub fn timeout_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    /// After execution, a non-zero value means the evaluation was cut short
+    /// (timeout or iteration limit) and the derived store holds partial results.
+    /// Prefer [`LocyProgramExec::incomplete_slot`] for the decoded diagnostics.
+    pub fn timeout_flag(&self) -> Arc<std::sync::atomic::AtomicU8> {
         Arc::clone(&self.timeout_flag)
+    }
+
+    /// Returns the shared incomplete-evaluation diagnostics slot.
+    ///
+    /// After execution, `Some(detail)` means evaluation stopped before
+    /// completing; `detail` names the skipped / unsound-complement rules and the
+    /// stop reason. `None` for a complete run.
+    pub fn incomplete_slot(&self) -> Arc<StdRwLock<Option<uni_common::LocyIncomplete>>> {
+        Arc::clone(&self.incomplete_slot)
     }
 }
 
@@ -303,7 +551,7 @@ impl ExecutionPlan for LocyProgramExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -332,6 +580,7 @@ impl ExecutionPlan for LocyProgramExec {
 
         let strata = self.strata.clone();
         let registry = Arc::clone(&self.derived_scan_registry);
+        let plugin_registry = Arc::clone(&self.plugin_registry);
         let graph_ctx = Arc::clone(&self.graph_ctx);
         let session_ctx = Arc::clone(&self.session_ctx);
         let storage = Arc::clone(&self.storage);
@@ -356,12 +605,18 @@ impl ExecutionPlan for LocyProgramExec {
         let command_results_slot = Arc::clone(&self.command_results_slot);
         let top_k_proofs = self.top_k_proofs;
         let timeout_flag = Arc::clone(&self.timeout_flag);
+        let incomplete_slot = Arc::clone(&self.incomplete_slot);
+        let semiring_kind = self.semiring_kind;
+        let classifier_registry = Arc::clone(&self.classifier_registry);
+        let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
+        let classifier_provenance_store = self.classifier_provenance_store.as_ref().map(Arc::clone);
 
         let fut = async move {
             run_program(
                 strata,
                 commands,
                 registry,
+                plugin_registry,
                 graph_ctx,
                 session_ctx,
                 storage,
@@ -385,6 +640,11 @@ impl ExecutionPlan for LocyProgramExec {
                 command_results_slot,
                 top_k_proofs,
                 timeout_flag,
+                incomplete_slot,
+                semiring_kind,
+                classifier_registry,
+                classifier_cache,
+                classifier_provenance_store,
             )
             .await
         };
@@ -422,6 +682,8 @@ impl Stream for ProgramStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        let metrics = this.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             match &mut this.state {
                 ProgramStreamState::Running(fut) => match fut.as_mut().poll(cx) {
@@ -464,46 +726,6 @@ impl RecordBatchStream for ProgramStream {
 // Inline command execution helpers
 // ---------------------------------------------------------------------------
 
-/// Execute QUERY by scanning converged DerivedStore directly (no SLG).
-///
-/// Strata have already converged all facts, so we can scan the DerivedStore
-/// without re-derivation. WHERE filtering and RETURN projection are applied
-/// in-memory.
-///
-/// NOTE: Currently unused because the DerivedStore uses inferred Arrow types
-/// (Float64 for all property-derived columns), so string property values are
-/// not preserved. Once `infer_expr_type` is improved to use actual schema types,
-/// this function can be re-enabled for QUERYs whose WHERE/RETURN only reference
-/// reliably-typed columns.
-#[allow(dead_code)]
-fn execute_query_inline(
-    query: &GoalQuery,
-    derived_store: &DerivedStore,
-    params: &HashMap<String, Value>,
-) -> DFResult<Vec<FactRow>> {
-    let rule_name = query.rule_name.to_string();
-    let batches = derived_store.get(&rule_name).cloned().unwrap_or_default();
-    let rows = super::locy_eval::record_batches_to_locy_rows(&batches);
-
-    // Apply WHERE filter
-    let filtered = if let Some(ref where_expr) = query.where_expr {
-        rows.into_iter()
-            .filter(|row| {
-                let merged = super::locy_query::merge_params(row, params);
-                super::locy_eval::eval_expr(where_expr, &merged)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
-    } else {
-        rows
-    };
-
-    // Apply RETURN (project, distinct, order, skip, limit)
-    super::locy_query::apply_return_clause(filtered, &query.return_clause, params)
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
-}
-
 /// Execute Cypher passthrough via execute_subplan.
 async fn execute_cypher_inline(
     query: &uni_cypher::ast::Query,
@@ -525,106 +747,10 @@ async fn execute_cypher_inline(
         session_ctx,
         storage,
         schema_info,
+        None, // Locy paths are read-only (queries + fact extraction)
     )
     .await?;
     Ok(super::locy_eval::record_batches_to_locy_rows(&batches))
-}
-
-/// Returns true if the WHERE or RETURN expressions contain property access
-/// (e.g. `a.name`) that requires full node objects not available in DerivedStore.
-#[allow(dead_code)]
-fn needs_node_enrichment(query: &GoalQuery) -> bool {
-    let where_has_property = query
-        .where_expr
-        .as_ref()
-        .is_some_and(expr_has_property_access);
-    let return_has_property = query.return_clause.as_ref().is_some_and(|rc| {
-        rc.items.iter().any(|item| match item {
-            uni_cypher::ast::ReturnItem::Expr { expr, .. } => expr_has_property_access(expr),
-            uni_cypher::ast::ReturnItem::All => false,
-        })
-    });
-    where_has_property || return_has_property
-}
-
-/// Recursively check whether an expression contains property access (`a.name`).
-#[allow(dead_code)]
-fn expr_has_property_access(expr: &Expr) -> bool {
-    match expr {
-        Expr::Property(..) => true,
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_property_access(left) || expr_has_property_access(right)
-        }
-        Expr::UnaryOp { expr, .. } => expr_has_property_access(expr),
-        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_property_access),
-        Expr::List(items) => items.iter().any(expr_has_property_access),
-        Expr::Map(entries) => entries.iter().any(|(_, e)| expr_has_property_access(e)),
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => {
-            case_expr
-                .as_ref()
-                .is_some_and(|e| expr_has_property_access(e))
-                || when_then
-                    .iter()
-                    .any(|(w, t)| expr_has_property_access(w) || expr_has_property_access(t))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
-        }
-        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsUnique(e) => expr_has_property_access(e),
-        Expr::In { expr, list } => expr_has_property_access(expr) || expr_has_property_access(list),
-        Expr::ArrayIndex { array, index } => {
-            expr_has_property_access(array) || expr_has_property_access(index)
-        }
-        Expr::ArraySlice { array, start, end } => {
-            expr_has_property_access(array)
-                || start.as_ref().is_some_and(|e| expr_has_property_access(e))
-                || end.as_ref().is_some_and(|e| expr_has_property_access(e))
-        }
-        Expr::Quantifier {
-            list, predicate, ..
-        } => expr_has_property_access(list) || expr_has_property_access(predicate),
-        Expr::Reduce {
-            init, list, expr, ..
-        } => {
-            expr_has_property_access(init)
-                || expr_has_property_access(list)
-                || expr_has_property_access(expr)
-        }
-        Expr::ListComprehension {
-            list,
-            where_clause,
-            map_expr,
-            ..
-        } => {
-            expr_has_property_access(list)
-                || where_clause
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
-                || expr_has_property_access(map_expr)
-        }
-        Expr::PatternComprehension {
-            where_clause,
-            map_expr,
-            ..
-        } => {
-            where_clause
-                .as_ref()
-                .is_some_and(|e| expr_has_property_access(e))
-                || expr_has_property_access(map_expr)
-        }
-        Expr::ValidAt {
-            entity, timestamp, ..
-        } => expr_has_property_access(entity) || expr_has_property_access(timestamp),
-        Expr::MapProjection { base, .. } => expr_has_property_access(base),
-        Expr::LabelCheck { expr, .. } => expr_has_property_access(expr),
-        // Leaf nodes (Literal, Parameter, Variable, Wildcard) and subqueries
-        // (Exists, CountSubquery, CollectSubquery) — no property access.
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +765,7 @@ async fn run_program(
     strata: Vec<LocyStratum>,
     commands: Vec<LocyCommand>,
     registry: Arc<DerivedScanRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
     graph_ctx: Arc<GraphExecutionContext>,
     session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
     storage: Arc<StorageManager>,
@@ -661,30 +788,77 @@ async fn run_program(
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     top_k_proofs: usize,
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
+    incomplete_slot: Arc<StdRwLock<Option<uni_common::LocyIncomplete>>>,
+    semiring_kind: SemiringKind,
+    classifier_registry: Arc<ClassifierRegistry>,
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
 
-    // Evaluate each stratum in topological order
-    for stratum in &strata {
+    // IMPORTANT: per rollout D-9 the FuzzyNotProbabilistic warning is
+    // unsuppressible. Emit one warning per PROB-bearing rule at program
+    // start under MaxMinProb. The recursive path in `run_fixpoint_loop`
+    // dedups against this set.
+    if semiring_kind == SemiringKind::MaxMinProb {
+        let mut warnings = warnings_slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut already: std::collections::HashSet<String> = warnings
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic)
+            .map(|w| w.rule_name.clone())
+            .collect();
+        for stratum in &strata {
+            for rule in &stratum.rules {
+                let has_prob = rule.yield_schema.iter().any(|c| c.is_prob);
+                if has_prob && !already.contains(&rule.name) {
+                    warnings.push(RuntimeWarning {
+                        code: uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic,
+                        message: format!(
+                            "rule '{}' carries a PROB column but is being evaluated under \
+                             the MaxMinProb (fuzzy / Viterbi) semiring; outputs are fuzzy \
+                             truth values, not probabilities",
+                            rule.name
+                        ),
+                        rule_name: rule.name.clone(),
+                        variable_count: None,
+                        key_group: None,
+                    });
+                    already.insert(rule.name.clone());
+                }
+            }
+        }
+    }
+
+    // Evaluate each stratum in topological order, tracking how far we get so an
+    // interruption can distinguish rules left incomplete (partial fixpoint) from
+    // rules never reached (skipped) — neither is "genuinely empty".
+    let total_strata = strata.len();
+    let mut completed_strata = 0usize;
+    let mut partial_stratum: Option<usize> = None;
+    for (stratum_idx, stratum) in strata.iter().enumerate() {
         // Write cross-stratum facts into registry handles for strata we depend on
         write_cross_stratum_facts(&registry, &derived_store, stratum);
 
         let remaining_timeout = timeout.saturating_sub(start.elapsed());
         if remaining_timeout.is_zero() {
             tracing::warn!("Locy program timeout exceeded during stratum evaluation");
-            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            interruption::set(&timeout_flag, interruption::TIMEOUT);
             break;
         }
 
         if stratum.is_recursive {
             // Convert LocyRulePlan → FixpointRulePlan and run fixpoint
-            let fixpoint_rules =
-                convert_to_fixpoint_plans(&stratum.rules, &registry, deterministic_best_by)?;
+            let fixpoint_rules = convert_to_fixpoint_plans(
+                &stratum.rules,
+                &registry,
+                &plugin_registry,
+                deterministic_best_by,
+            )?;
             let fixpoint_schema = build_fixpoint_output_schema(&stratum.rules);
 
-            let exec = FixpointExec::new(
+            let exec = FixpointExec::new_with_semiring_classifiers_and_cache(
                 fixpoint_rules,
                 max_iterations,
                 remaining_timeout,
@@ -706,6 +880,10 @@ async fn run_program(
                 Arc::clone(&approximate_slot),
                 top_k_proofs,
                 Arc::clone(&timeout_flag),
+                semiring_kind,
+                Arc::clone(&classifier_registry),
+                classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store.as_ref().map(Arc::clone),
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -755,8 +933,12 @@ async fn run_program(
             }
         } else {
             // Non-recursive: single-pass evaluation
-            let fixpoint_rules =
-                convert_to_fixpoint_plans(&stratum.rules, &registry, deterministic_best_by)?;
+            let fixpoint_rules = convert_to_fixpoint_plans(
+                &stratum.rules,
+                &registry,
+                &plugin_registry,
+                deterministic_best_by,
+            )?;
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
@@ -773,6 +955,9 @@ async fn run_program(
                 for (clause_idx, (clause, fp_clause)) in
                     rule.clauses.iter().zip(fp_rule.clauses.iter()).enumerate()
                 {
+                    // Phase B A4 follow-up: the planner inserts
+                    // `LocyModelInvoke` between body and `LocyProject`
+                    // when the clause has neural invocations.
                     let mut batches = execute_subplan(
                         &clause.body,
                         &params,
@@ -781,6 +966,7 @@ async fn run_program(
                         &session_ctx,
                         &storage,
                         &schema_info,
+                        None, // Locy clause body is read-only
                     )
                     .await?;
 
@@ -847,7 +1033,20 @@ async fn run_program(
                 }
 
                 // Record provenance and detect shared proofs for non-recursive rules.
-                let shared_info = if let Some(ref tracker) = derivation_tracker {
+                //
+                // TODO(C0-stage2): swap `record_and_detect_lineage_nonrecursive`
+                // for `TopKTag` DNF inspection when
+                // `semiring_kind == TopKProofs { k }`. Library-layer
+                // tag math landed in
+                // `crates/uni-locy/src/top_k_proofs.rs` (Phase C C0
+                // Stage 1); Stage 2 wires per-row tags through the
+                // runtime so dependencies are visible here.
+                //
+                // Under MaxMinProb, `plus = max` is idempotent so shared
+                // proofs don't double-count — skip the (misleading) warning.
+                let shared_info = if semiring_kind == SemiringKind::MaxMinProb {
+                    None
+                } else if let Some(ref tracker) = derivation_tracker {
                     super::locy_fixpoint::record_and_detect_lineage_nonrecursive(
                         fp_rule,
                         &tagged_clause_facts,
@@ -855,7 +1054,14 @@ async fn run_program(
                         &warnings_slot,
                         &registry,
                         top_k_proofs,
+                        super::locy_fixpoint::ClassifierRefs {
+                            registry: &classifier_registry,
+                            cache: classifier_cache.as_ref(),
+                            provenance_store: classifier_provenance_store.as_ref(),
+                        },
+                        semiring_kind,
                     )
+                    .await
                 } else {
                     None
                 };
@@ -889,6 +1095,10 @@ async fn run_program(
                     &task_ctx,
                     strict_probability_domain,
                     probability_epsilon,
+                    semiring_kind,
+                    derivation_tracker.as_ref().map(Arc::clone),
+                    top_k_proofs,
+                    Some(Arc::clone(&registry)),
                 )
                 .await?;
 
@@ -896,6 +1106,60 @@ async fn run_program(
                 write_facts_to_registry(&registry, &rule.name, &facts);
                 derived_store.insert(rule.name.clone(), facts);
             }
+        }
+
+        // The recursive fixpoint can set the interruption flag mid-stratum (the
+        // non-recursive branch cannot). Stop here either way so later strata are
+        // recorded as skipped rather than passed off as empty.
+        if interruption::reason(&timeout_flag).is_some() {
+            partial_stratum = Some(stratum_idx);
+            break;
+        }
+        completed_strata += 1;
+    }
+
+    // If evaluation was cut short, record which rules were left incomplete vs.
+    // never reached, flagging any complement (`IS NOT`) rules among them as
+    // unsound. Read by impl_locy to choose Err(LocyIncomplete) vs. Ok(partial).
+    if let Some(reason) = interruption::reason(&timeout_flag) {
+        let skipped_start = match partial_stratum {
+            Some(i) => i + 1,
+            None => completed_strata,
+        };
+        let incomplete_rules: Vec<String> = partial_stratum
+            .map(|i| strata[i].rules.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default();
+        let skipped_rules: Vec<String> = strata[skipped_start..]
+            .iter()
+            .flat_map(|s| s.rules.iter().map(|r| r.name.clone()))
+            .collect();
+        let mut complement_rules_affected = Vec::new();
+        for idx in partial_stratum
+            .into_iter()
+            .chain(skipped_start..total_strata)
+        {
+            for rule in &strata[idx].rules {
+                if rule
+                    .clauses
+                    .iter()
+                    .any(|c| c.is_refs.iter().any(|r| r.negated))
+                {
+                    complement_rules_affected.push(rule.name.clone());
+                }
+            }
+        }
+        if let Ok(mut slot) = incomplete_slot.write() {
+            *slot = Some(uni_common::LocyIncomplete {
+                reason,
+                elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                limit_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                max_iterations,
+                completed_strata,
+                total_strata,
+                incomplete_rules,
+                skipped_rules,
+                complement_rules_affected,
+            });
         }
     }
 
@@ -927,22 +1191,121 @@ async fn run_program(
         .position(|c| matches!(c, LocyCommand::Derive { .. }));
     let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
     for (cmd_idx, cmd) in commands.iter().enumerate() {
-        if let LocyCommand::Cypher { query } = cmd {
-            // Defer Cypher commands that follow a DERIVE to the dispatch loop
-            // so they can read from the ephemeral L0 overlay.
-            if first_derive_idx.is_some_and(|di| cmd_idx > di) {
-                continue;
+        match cmd {
+            LocyCommand::Cypher { query } => {
+                // Defer Cypher commands that follow a DERIVE to the dispatch loop
+                // so they can read from the ephemeral L0 overlay.
+                if first_derive_idx.is_some_and(|di| cmd_idx > di) {
+                    continue;
+                }
+                let rows = execute_cypher_inline(
+                    query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                inline_results.push((cmd_idx, CommandResult::Cypher(rows)));
             }
-            let rows = execute_cypher_inline(
-                query,
-                &schema_info,
-                &params,
-                &graph_ctx,
-                &session_ctx,
-                &storage,
-            )
-            .await?;
-            inline_results.push((cmd_idx, CommandResult::Cypher(rows)));
+            LocyCommand::Validate { validate } => {
+                // Phase C C3: collect ground-truth pairs via a
+                // MATCH+TARGET query, join with the rule's derived
+                // facts on KEY columns, compute metrics.
+                let rule_key_cols: Vec<String> = strata
+                    .iter()
+                    .flat_map(|s| s.rules.iter())
+                    .find(|r| r.name == validate.rule_name)
+                    .map(|r| {
+                        r.yield_schema
+                            .iter()
+                            .filter(|c| c.is_key)
+                            .map(|c| c.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let query =
+                    super::locy_validate::validate_collection_query(validate, &rule_key_cols);
+                let target_rows = execute_cypher_inline(
+                    &query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                let rule_facts: Vec<uni_locy::FactRow> = derived_store
+                    .get(&validate.rule_name)
+                    .map(|batches| super::locy_eval::record_batches_to_locy_rows(batches))
+                    .unwrap_or_default();
+                let result = super::locy_validate::run_validate(
+                    validate,
+                    &rule_key_cols,
+                    &rule_facts,
+                    target_rows,
+                )
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!("VALIDATE error: {e}"))
+                })?;
+                inline_results.push((cmd_idx, CommandResult::Validate(result)));
+            }
+            LocyCommand::Calibrate {
+                calibrate,
+                model_inputs,
+            } => {
+                // Phase C C2: dispatch a CALIBRATE command. Build a
+                // Cypher MATCH+RETURN query that projects the model's
+                // input variables + the TARGET expression, execute
+                // it, then drive `run_calibrate` over the collected
+                // rows. The fitted calibrator + holdout metrics
+                // surface as `CommandResult::Calibrate(...)`.
+                //
+                // Synthesize a CompiledModel snapshot from the carried
+                // model_inputs so we can build the collection query
+                // without lugging the full catalog through this call
+                // site. Other fields the runtime doesn't read are
+                // filled with defaults.
+                let model_snapshot = uni_locy::CompiledModel {
+                    name: calibrate.model_name.clone(),
+                    inputs: model_inputs.clone(),
+                    features: vec![],
+                    path_context: None,
+                    output_type: uni_cypher::locy_ast::OutputType::Prob,
+                    output_name: String::new(),
+                    xervo_alias: String::new(),
+                    embedder_alias: None,
+                    calibration: None,
+                    version: None,
+                    annotations: Default::default(),
+                };
+                let query =
+                    super::locy_calibrate::calibrate_collection_query(calibrate, &model_snapshot);
+                let rows = execute_cypher_inline(
+                    &query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                let mut catalog = std::collections::HashMap::new();
+                catalog.insert(calibrate.model_name.clone(), model_snapshot);
+                let result = super::locy_calibrate::run_calibrate(
+                    calibrate,
+                    &catalog,
+                    &classifier_registry,
+                    rows,
+                )
+                .await
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!("CALIBRATE error: {e}"))
+                })?;
+                inline_results.push((cmd_idx, CommandResult::Calibrate(result)));
+            }
+            _ => {}
         }
     }
     *command_results_slot.write().unwrap() = inline_results;
@@ -1010,6 +1373,7 @@ fn write_facts_to_registry(registry: &DerivedScanRegistry, rule_name: &str, fact
 fn convert_to_fixpoint_plans(
     rules: &[LocyRulePlan],
     registry: &DerivedScanRegistry,
+    plugin_registry: &PluginRegistry,
     deterministic_best_by: bool,
 ) -> DFResult<Vec<FixpointRulePlan>> {
     rules
@@ -1034,11 +1398,13 @@ fn convert_to_fixpoint_plans(
                         is_ref_bindings,
                         priority: clause.priority,
                         along_bindings: clause.along_bindings.clone(),
+                        model_invocations: clause.model_invocations.clone(),
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;
 
-            let fold_bindings = convert_fold_bindings(&rule.fold_bindings, &rule.yield_schema)?;
+            let fold_bindings =
+                convert_fold_bindings(&rule.fold_bindings, &rule.yield_schema, plugin_registry)?;
             let best_by_criteria =
                 convert_best_by_criteria(&rule.best_by_criteria, &rule.yield_schema)?;
 
@@ -1179,22 +1545,33 @@ fn convert_is_refs(
 ///
 /// The input column is looked up by the fold binding's output name (e.g., "total")
 /// in the yield schema, since the LocyProject aliases the aggregate input expression
-/// to the fold output name.
+/// to the fold output name. The aggregate name is resolved against
+/// `plugin_registry` to obtain the [`uni_plugin::traits::locy::LocyAggregate`]
+/// trait object at plan time.
 fn convert_fold_bindings(
     fold_bindings: &[(String, String, Expr)],
     yield_schema: &[LocyYieldColumn],
+    plugin_registry: &PluginRegistry,
 ) -> DFResult<Vec<FoldBinding>> {
     fold_bindings
         .iter()
         .map(|(name, yield_alias, expr)| {
-            let (kind, _input_col_name) = parse_fold_aggregate(expr)?;
+            let (agg_name, _input_col_name) = parse_fold_aggregate(expr)?;
+            let entry =
+                resolve_locy_aggregate(plugin_registry, agg_name.as_str()).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Unknown Locy aggregate '{agg_name}' — not registered in plugin registry"
+                    ))
+                })?;
+            let aggregate = Arc::clone(&entry.aggregate);
 
             // CountAll has no input column — LocyProject skips the output column
             // entirely, so there is nothing to look up.
-            if kind == FoldAggKind::CountAll {
+            if agg_name.as_str() == "COUNTALL" {
                 return Ok(FoldBinding {
                     output_name: yield_alias.clone(),
-                    kind,
+                    name: agg_name,
+                    aggregate,
                     input_col_index: 0, // unused for CountAll
                     input_col_name: None,
                 });
@@ -1210,7 +1587,8 @@ fn convert_fold_bindings(
                 .unwrap_or(0);
             Ok(FoldBinding {
                 output_name: yield_alias.clone(),
-                kind,
+                name: agg_name,
+                aggregate,
                 input_col_index,
                 input_col_name: Some(name.clone()),
             })
@@ -1218,8 +1596,12 @@ fn convert_fold_bindings(
         .collect()
 }
 
-/// Parse a fold aggregate expression into (kind, input_column_name).
-fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
+/// Parse a fold aggregate expression into (canonical_name, input_column_name).
+///
+/// Normalizes grammar aliases to canonical names: `MSUM`→`SUM`, `MMAX`→`MAX`,
+/// `MMIN`→`MIN`, `MCOUNT`→`COUNT`. The zero-arg `COUNT()`/`MCOUNT()` form
+/// returns the `COUNTALL` sentinel. `MNOR`/`MPROD` are already canonical.
+fn parse_fold_aggregate(expr: &Expr) -> DFResult<(smol_str::SmolStr, String)> {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
             let upper = name.to_uppercase();
@@ -1227,18 +1609,18 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
 
             // COUNT/MCOUNT with zero args → CountAll (like SQL COUNT(*))
             if is_count && args.is_empty() {
-                return Ok((FoldAggKind::CountAll, String::new()));
+                return Ok((smol_str::SmolStr::new_static("COUNTALL"), String::new()));
             }
 
-            let kind = match upper.as_str() {
-                "SUM" | "MSUM" => FoldAggKind::Sum,
-                "MAX" | "MMAX" => FoldAggKind::Max,
-                "MIN" | "MMIN" => FoldAggKind::Min,
-                "COUNT" | "MCOUNT" => FoldAggKind::Count,
-                "AVG" => FoldAggKind::Avg,
-                "COLLECT" => FoldAggKind::Collect,
-                "MNOR" => FoldAggKind::Nor,
-                "MPROD" => FoldAggKind::Prod,
+            let canonical = match upper.as_str() {
+                "SUM" | "MSUM" => smol_str::SmolStr::new_static("SUM"),
+                "MAX" | "MMAX" => smol_str::SmolStr::new_static("MAX"),
+                "MIN" | "MMIN" => smol_str::SmolStr::new_static("MIN"),
+                "COUNT" | "MCOUNT" => smol_str::SmolStr::new_static("COUNT"),
+                "AVG" => smol_str::SmolStr::new_static("AVG"),
+                "COLLECT" => smol_str::SmolStr::new_static("COLLECT"),
+                "MNOR" => smol_str::SmolStr::new_static("MNOR"),
+                "MPROD" => smol_str::SmolStr::new_static("MPROD"),
                 _ => {
                     return Err(datafusion::error::DataFusionError::Plan(format!(
                         "Unknown FOLD aggregate function: {}",
@@ -1256,7 +1638,7 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
                     ));
                 }
             };
-            Ok((kind, col_name))
+            Ok((canonical, col_name))
         }
         _ => Err(datafusion::error::DataFusionError::Plan(
             "FOLD binding must be a function call (e.g., SUM(x))".to_string(),
@@ -1550,7 +1932,7 @@ mod tests {
             window_spec: None,
         };
         let (kind, col) = parse_fold_aggregate(&expr).unwrap();
-        assert!(matches!(kind, FoldAggKind::Sum));
+        assert_eq!(kind.as_str(), "SUM");
         assert_eq!(col, "cost");
     }
 
@@ -1563,7 +1945,7 @@ mod tests {
             window_spec: None,
         };
         let (kind, col) = parse_fold_aggregate(&expr).unwrap();
-        assert!(matches!(kind, FoldAggKind::Max));
+        assert_eq!(kind.as_str(), "MAX");
         assert_eq!(col, "score");
     }
 

@@ -13,8 +13,8 @@
 //! YIELD node, score
 //! ```
 
-use arrow_array::builder::{Float32Builder, StringBuilder, UInt64Builder};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, StringBuilder, UInt64Builder};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -31,12 +31,54 @@ use uni_common::Value;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::{DistanceMetric, PropertyMeta};
 use uni_cypher::ast::Expr;
+use uni_plugin::traits::index::{IndexHandle, IndexKind};
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
 use crate::query::df_graph::scan::resolve_property_type;
+
+/// Vector-retrieval source for a [`GraphVectorKnnExec`].
+///
+/// The exec is kind-agnostic above the retrieval step: threshold filter,
+/// score normalization, label / vid emission, and property hydration all
+/// run identically on the `Vec<(Vid, f32)>` produced here. Only the
+/// retrieval call differs:
+///
+/// - [`VectorSource::Native`] dispatches to
+///   `StorageManager::vector_search`, which routes through the built-in
+///   vector backend (Lance / memory / etc.).
+/// - [`VectorSource::Plugin`] dispatches to
+///   [`IndexHandle::probe`] on a host-registered plugin handle (see
+///   `PluginRegistry::register_index_handle`). The planner picks this
+///   variant when an index-name lookup against the plugin registry
+///   succeeds; this preserves the "no behavior change for built-ins"
+///   invariant — native indexes never register a handle so the
+///   fall-through is `Native`.
+#[derive(Clone)]
+pub(crate) enum VectorSource {
+    /// Native built-in vector backend (default).
+    Native,
+    /// Plugin-supplied live handle.
+    Plugin {
+        /// Kind that produced the handle. Informational; kept so the
+        /// planner-level dispatch log can include it.
+        #[allow(dead_code)]
+        kind: IndexKind,
+        /// The handle to probe.
+        handle: Arc<dyn IndexHandle>,
+    },
+}
+
+impl fmt::Debug for VectorSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Native => f.write_str("Native"),
+            Self::Plugin { kind, .. } => f.debug_struct("Plugin").field("kind", kind).finish(),
+        }
+    }
+}
 
 /// Vector KNN search execution plan.
 ///
@@ -77,7 +119,12 @@ pub struct GraphVectorKnnExec {
     schema: SchemaRef,
 
     /// Plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
+
+    /// Vector-retrieval source. `Native` for the built-in path;
+    /// `Plugin { handle, .. }` when the planner found a registered
+    /// `IndexHandle` for this index's name in `PluginRegistry`.
+    source: VectorSource,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -146,8 +193,46 @@ impl GraphVectorKnnExec {
             target_properties,
             schema,
             properties,
+            source: VectorSource::Native,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Create a new vector KNN search execution plan that dispatches
+    /// retrieval through a plugin-registered [`IndexHandle`] instead of
+    /// the native storage path.
+    ///
+    /// All other behavior (threshold, scoring, property hydration) is
+    /// identical to [`Self::new`].
+    #[expect(clippy::too_many_arguments)]
+    pub fn with_plugin_source(
+        graph_ctx: Arc<GraphExecutionContext>,
+        label_id: u16,
+        label_name: impl Into<String>,
+        variable: impl Into<String>,
+        property: impl Into<String>,
+        query_expr: Expr,
+        k: usize,
+        threshold: Option<f32>,
+        params: HashMap<String, Value>,
+        target_properties: Vec<String>,
+        kind: IndexKind,
+        handle: Arc<dyn IndexHandle>,
+    ) -> Self {
+        let mut exec = Self::new(
+            graph_ctx,
+            label_id,
+            label_name,
+            variable,
+            property,
+            query_expr,
+            k,
+            threshold,
+            params,
+            target_properties,
+        );
+        exec.source = VectorSource::Plugin { kind, handle };
+        exec
     }
 
     /// Build the output schema.
@@ -228,7 +313,7 @@ impl ExecutionPlan for GraphVectorKnnExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -268,6 +353,7 @@ impl ExecutionPlan for GraphVectorKnnExec {
             self.threshold,
             self.target_properties.clone(),
             self.schema.clone(),
+            self.source.clone(),
             metrics,
         )))
     }
@@ -316,6 +402,9 @@ struct VectorKnnStream {
     /// Output schema.
     schema: SchemaRef,
 
+    /// Vector-retrieval source (native or plugin handle).
+    source: VectorSource,
+
     /// Stream state.
     state: VectorKnnState,
 
@@ -335,6 +424,7 @@ impl VectorKnnStream {
         threshold: Option<f32>,
         target_properties: Vec<String>,
         schema: SchemaRef,
+        source: VectorSource,
         metrics: BaselineMetrics,
     ) -> Self {
         Self {
@@ -347,6 +437,7 @@ impl VectorKnnStream {
             threshold,
             target_properties,
             schema,
+            source,
             state: VectorKnnState::Init,
             metrics,
         }
@@ -357,6 +448,8 @@ impl Stream for VectorKnnStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, VectorKnnState::Done);
 
@@ -372,6 +465,7 @@ impl Stream for VectorKnnStream {
                     let threshold = self.threshold;
                     let target_properties = self.target_properties.clone();
                     let schema = self.schema.clone();
+                    let source = self.source.clone();
 
                     let fut = async move {
                         // Check timeout
@@ -389,6 +483,7 @@ impl Stream for VectorKnnStream {
                             threshold,
                             &target_properties,
                             &schema,
+                            &source,
                         )
                         .await
                     };
@@ -438,22 +533,13 @@ async fn execute_vector_search(
     threshold: Option<f32>,
     target_properties: &[String],
     schema: &SchemaRef,
+    source: &VectorSource,
 ) -> DFResult<Option<RecordBatch>> {
     let storage = graph_ctx.storage();
-    let query_ctx = graph_ctx.query_context();
 
-    // Execute vector search
-    let results = storage
-        .vector_search(
-            label_name,
-            property,
-            query_vector,
-            k,
-            None,
-            Some(&query_ctx),
-        )
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    // Retrieve `(vid, distance)` pairs via the configured source.
+    let results =
+        retrieve_vid_scores(graph_ctx, label_name, property, query_vector, k, source).await?;
 
     // Look up the distance metric for this vector property so we can
     // convert raw distances into normalised similarity scores correctly.
@@ -497,6 +583,122 @@ async fn execute_vector_search(
     )
     .await?;
     Ok(Some(batch))
+}
+
+/// Retrieve `(Vid, distance)` pairs for the configured [`VectorSource`].
+///
+/// - [`VectorSource::Native`] delegates to `StorageManager::vector_search`,
+///   which routes through the built-in vector backend (Lance / memory).
+/// - [`VectorSource::Plugin`] builds a 1-row probe batch carrying the
+///   query vector as `FixedSizeList<Float32>`, calls
+///   [`IndexHandle::probe`], then extracts the `(vid: Int64, distance:
+///   Float32)` columns from the result. Plugin handles emit vids as
+///   `i64`; we widen via `as u64` because graph vids are stored as
+///   non-negative `u64` and test fixtures (and any sane real index) only
+///   produce non-negative integers.
+async fn retrieve_vid_scores(
+    graph_ctx: &GraphExecutionContext,
+    label_name: &str,
+    property: &str,
+    query_vector: &[f32],
+    k: usize,
+    source: &VectorSource,
+) -> DFResult<Vec<(Vid, f32)>> {
+    match source {
+        VectorSource::Native => {
+            let storage = graph_ctx.storage();
+            let query_ctx = graph_ctx.query_context();
+            storage
+                .vector_search(
+                    label_name,
+                    property,
+                    query_vector,
+                    k,
+                    None,
+                    Some(&query_ctx),
+                )
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        }
+        VectorSource::Plugin { handle, .. } => {
+            // Build a single-row query batch:
+            //     [ vector: FixedSizeList<Float32, dim> ]
+            let dim = i32::try_from(query_vector.len()).map_err(|_| {
+                datafusion::error::DataFusionError::Execution(
+                    "query vector exceeds i32::MAX dimensions".to_string(),
+                )
+            })?;
+            let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+            let mut fsl_builder =
+                FixedSizeListBuilder::new(Float32Builder::with_capacity(query_vector.len()), dim)
+                    .with_field(Arc::clone(&item_field));
+            for &v in query_vector {
+                fsl_builder.values().append_value(v);
+            }
+            fsl_builder.append(true);
+            let fsl: FixedSizeListArray = fsl_builder.finish();
+
+            let query_schema = Arc::new(Schema::new(vec![Field::new(
+                "vector",
+                DataType::FixedSizeList(item_field, dim),
+                false,
+            )]));
+            let query_batch =
+                RecordBatch::try_new(query_schema, vec![Arc::new(fsl)]).map_err(arrow_err)?;
+
+            let result = handle.probe(&query_batch, k).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "IndexHandle::probe failed: {e:?}"
+                ))
+            })?;
+
+            // Result schema is `[vid: Int64, distance: Float32]` per the
+            // `IndexHandle` trait contract.
+            let vid_col = result
+                .column_by_name("vid")
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "IndexHandle::probe result missing `vid` column".to_string(),
+                    )
+                })?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "IndexHandle::probe result `vid` column is not Int64".to_string(),
+                    )
+                })?;
+            let dist_col = result
+                .column_by_name("distance")
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "IndexHandle::probe result missing `distance` column".to_string(),
+                    )
+                })?
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "IndexHandle::probe result `distance` column is not Float32".to_string(),
+                    )
+                })?;
+
+            let mut pairs = Vec::with_capacity(result.num_rows());
+            for i in 0..result.num_rows() {
+                if vid_col.is_null(i) {
+                    continue;
+                }
+                let vid_i64 = vid_col.value(i);
+                let dist = if dist_col.is_null(i) {
+                    f32::INFINITY
+                } else {
+                    dist_col.value(i)
+                };
+                pairs.push((Vid::from(vid_i64 as u64), dist));
+            }
+            Ok(pairs)
+        }
+    }
 }
 
 /// Build a result batch from VIDs and scores, including hydrated properties.

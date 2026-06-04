@@ -1,6 +1,6 @@
 ---
 title: Forks
-status: phase-4a
+status: ga
 ---
 
 # Forks
@@ -11,13 +11,9 @@ Forks are a sibling of [snapshots](snapshots-time-travel.md). Where a snapshot i
 
 ## Status
 
-Phase 4a: **writable + nested + lifecycle**. Forks are writable (Phase 2), nestable (Phase 3), and now carry TTL, budget, Lance tags, parent→child cancellation, and pin/refresh on forked sessions (Phase 4a). Python bindings are pending (Phase 4b).
+Forks are **shipped and GA** in both Rust and Python. The full surface is available: writable and nestable forks; lifecycle controls (TTL, budget, Lance tags, parent→child cancellation, pin/refresh on forked sessions); and diff + promotion for write-audit-publish workflows. The Python bindings (`Session.fork`/`fork_schema`, `Uni.list_forks`/`drop_fork`/`drop_fork_cascade`/`tag_fork`/`diff_fork_primary`/`promote_from_fork`) mirror the Rust API one-to-one.
 
-Later phases land:
-
-- **Phase 4b** — Python bindings for the full fork surface.
-- **Phase 5** — fork-local index fusion + fork compaction.
-- **Phase 6** — diff and promotion.
+Fork-local index fusion and fork compaction are the remaining planned enhancements; until they land, long-lived heavy-write forks should be `drop_fork`-and-recreate to bound fragment accumulation (see [Operational signals](#operational-signals)).
 
 ## Quick start
 
@@ -107,14 +103,14 @@ All fork-related errors are `UniError::Fork*` variants — `ForkNotFound`, `Fork
 
 `ForkInflightTx` fires when `drop_fork` is called while at least one `Transaction` is alive on the fork. Commit or roll back the transaction first, then retry the drop.
 
-`ForkWritesNotYetSupported` is retired in Phase 2 — `forked.tx()` is now writable.
+`forked.tx()` is fully writable; there is no read-only-fork restriction.
 
-Phase 3 adds:
+Nested-fork errors:
 
 - `ForkHasChildren { name, children }` — `drop_fork` refused because nested children exist. Drop them first or use `drop_fork_cascade`.
 - `ForkSubtreeInUse { blockers }` — `drop_fork_cascade` refused because at least one node in the subtree has live sessions or in-flight transactions. No branch is deleted; resolve the blockers and retry.
 
-## Nested forks (Phase 3)
+## Nested forks
 
 `session.fork(name)` always parents the new fork on the *receiver* session — primary if the receiver is a primary session, the receiver's fork otherwise.
 
@@ -142,11 +138,11 @@ tx.commit().await?;
 
 **Drop semantics.** `drop_fork(name)` errors with `ForkHasChildren` while any descendant exists, listing the immediate children. `drop_fork_cascade(name)` walks the subtree, pre-validates every node for live sessions and open transactions, and only then drops deepest-first via the single-fork path. A crash mid-cascade resumes through the existing tombstone recovery — partial cascade state is safe.
 
-**Non-goals in Phase 3.** Hypothesis persistence (ASSUME-style snapshots) is *not* part of this. Re-parenting a fork is not supported and not planned. Cross-fork diff at depth > 1 lands in Phase 6.
+**Non-goals.** Hypothesis persistence (ASSUME-style snapshots) is *not* part of forks. Re-parenting a fork is not supported and not planned.
 
-## Promotion and diff (Phase 6 / 6b)
+## Promotion and diff
 
-Phase 6 closes the write-audit-publish loop. Identity is **content-addressed UID** for vertices (`SHA3-256(label, ext_id, properties)`) and `(src_uid, dst_uid)` scoped to the edge type for edges — so siblings off a shared parent, or two unrelated forks that happened to roll the same VIDs, compare correctly.
+Promotion and diff close the write-audit-publish loop. Identity is **content-addressed UID** for vertices (`SHA3-256(label, ext_id, properties)`) and `(src_uid, dst_uid)` scoped to the edge type for edges — so siblings off a shared parent, or two unrelated forks that happened to roll the same VIDs, compare correctly.
 
 ### Diff
 
@@ -238,7 +234,7 @@ At fork creation, every dataset that exists on disk gets branched: the main labe
 On disk:
 
 - `catalog/fork_registry.json` — the registry of all forks.
-- `catalog/fork_schemas/{fork_id}.json` — per-fork schema overlay (currently always empty under the default `strict_schema: false` mode; reserved for Phase 6 promotion semantics).
+- `catalog/fork_schemas/{fork_id}.json` — per-fork schema overlay written by `fork_schema()` (empty under the default `strict_schema: false` mode, where datasets are materialized on-the-fly without a schema entry).
 - `catalog/fork_tombstones/{fork_id}.json` — durable drop intent, removed on completion.
 - `catalog/forks/{fork_id}/id_allocator.json` — per-fork VID/EID allocator, bootstrapped from primary's HWM at fork creation.
 - `wal_forks/{fork_id}/` — per-fork WAL stream. Replayed in `at_fork`; primary's recovery never reads it.
@@ -251,7 +247,7 @@ On disk:
 - **Multiple sessions can hold the same fork.** A holder count is tracked and `drop_fork` refuses with `ForkInUse` while sessions are alive, or with `ForkInflightTx` when an open transaction has yet to commit or roll back.
 - **Lance compaction honors branch references.** Primary GC will not reclaim fragments that a live fork still references.
 
-## Lifecycle admin (Phase 4a)
+## Lifecycle admin
 
 **TTL.** Stamp a wall-clock expiry on the fork; a background sweeper reaps expired forks via `drop_fork_cascade`.
 

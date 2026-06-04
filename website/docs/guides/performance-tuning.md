@@ -469,6 +469,45 @@ let db = Uni::open("./graph")
 
 ## Memory Management
 
+### Use mimalloc as Global Allocator
+
+For allocation-heavy workloads (many small mutations, concurrent Cypher `CREATE`/`MERGE`, per-statement workloads), the **default glibc allocator becomes the dominant bottleneck** long before any uni-db lock does. Profile data at 24-session concurrency showed:
+
+- **~25%** of CPU time in `__memset_avx2_unaligned_erms` (zeroing fresh heap pages)
+- **~15%** in kernel `clear_page_erms` (zeroing anonymous pages on first touch)
+- **~4%** in kernel page-freelist bookkeeping
+- **~2%** in `glibc malloc_consolidate` (arena lock)
+
+Switching the global allocator to **mimalloc** sidesteps both — its thread-local arenas and heap recycling avoid most kernel-side page traffic.
+
+**Rust library consumers:**
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+**Python users:** every wheel already ships with mimalloc as the Rust-side global allocator. CPython's `PyMem_*` allocator is untouched; only Rust allocations route through mimalloc.
+
+**CLI users:** the `uni` CLI binary uses mimalloc by default.
+
+**Measured win** (`concurrent_mutations` benchmark, 24 sessions × 100 `CREATE` statements each):
+
+| N | Default glibc | With mimalloc | Speedup |
+|---|---|---|---|
+| 1 | 139.30 ms | 45.19 ms | 3.08× |
+| 4 | 186.18 ms | 63.06 ms | 2.95× |
+| 12 | 440.80 ms | 160.49 ms | 2.74× |
+| 24 | 984.21 ms | 393.78 ms | 2.50× |
+
+The 3× win at sess=1 reveals that glibc was bloated even single-threaded for this workload — the per-statement parse + logical plan + DataFusion physical plan churn outpaces glibc's arena allocator. mimalloc costs ~10 MB of additional RSS (its bookkeeping arenas) — negligible at production scale.
+
 ### Memory Budget
 
 Monitor and limit memory usage:

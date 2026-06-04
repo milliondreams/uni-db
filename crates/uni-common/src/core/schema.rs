@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::core::edge_type::{MAX_SCHEMA_TYPE_ID, is_schemaless_edge_type, make_schemaless_id};
+use crate::core::edge_type::{
+    MAX_SCHEMA_TYPE_ID, VIRTUAL_EDGE_TYPE_ID_SENTINEL, VIRTUAL_EDGE_TYPE_ID_START,
+    is_schemaless_edge_type, make_schemaless_id,
+};
 use crate::sync::{acquire_read, acquire_write};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use serde::{Deserialize, Serialize};
@@ -83,6 +87,33 @@ pub enum CrdtType {
     Rga,
     VectorClock,
     VCRegister,
+}
+
+impl CrdtType {
+    /// Returns the canonical variant name for this CRDT type.
+    ///
+    /// The returned strings must stay in sync with `uni_crdt::Crdt::type_name`,
+    /// so a written CRDT value can be validated against its schema-declared
+    /// variant (see uni-store's write-time CRDT enforcement).
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::core::schema::CrdtType;
+    /// assert_eq!(CrdtType::GCounter.type_name(), "GCounter");
+    /// ```
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            CrdtType::GCounter => "GCounter",
+            CrdtType::GSet => "GSet",
+            CrdtType::ORSet => "ORSet",
+            CrdtType::LWWRegister => "LWWRegister",
+            CrdtType::LWWMap => "LWWMap",
+            CrdtType::Rga => "Rga",
+            CrdtType::VectorClock => "VectorClock",
+            CrdtType::VCRegister => "VCRegister",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -175,6 +206,93 @@ impl DataType {
                 ])),
                 true,
             ))),
+        }
+    }
+
+    /// Returns `true` if `value` is directly storable in this column type without loss.
+    ///
+    /// This is the schema-level type guard used by the write path. `Value::Null` is
+    /// always accepted — column nullability is enforced separately by the `nullable`
+    /// flag, not here. `CypherValue`, `Crdt`, and `Point` columns accept any value.
+    /// For every other declared type, only the `Value` variants that the storage layer
+    /// persists *without silently nulling* are accepted (see the per-type converters in
+    /// `uni-store`'s `arrow_convert`), plus the intentional lossless widenings
+    /// `Int`→`Float`, `Int`→`Int32`, and `Temporal`→`Timestamp`.
+    ///
+    /// A `Value::String` destined for a `Date`/`Time`/`DateTime`/`Duration` column is
+    /// intentionally *not* accepted here: the write path first coerces such strings into
+    /// the proper `Temporal` value (matching the Cypher temporal constructors), then the
+    /// coerced value passes this check. This keeps `accepts` a pure, allocation-free
+    /// predicate.
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::core::schema::DataType;
+    /// use uni_common::Value;
+    ///
+    /// assert!(DataType::Float64.accepts(&Value::Int(3))); // Int widens to Float
+    /// assert!(DataType::Bool.accepts(&Value::Null)); // Null always accepted
+    /// assert!(!DataType::DateTime.accepts(&Value::String("2026-01-01T00:00:00Z".into())));
+    /// ```
+    pub fn accepts(&self, value: &crate::value::Value) -> bool {
+        use crate::value::{TemporalValue, Value};
+
+        // Null is universally accepted; nullability is a separate concern.
+        if matches!(value, Value::Null) {
+            return true;
+        }
+
+        match self {
+            // Opaque / dynamically-typed columns accept any value.
+            DataType::CypherValue | DataType::Crdt(_) | DataType::Point(_) => true,
+
+            DataType::String => matches!(value, Value::String(_)),
+            DataType::Int32 | DataType::Int64 => matches!(value, Value::Int(_)),
+            // Int widens to Float losslessly for the ranges we care about.
+            DataType::Float32 | DataType::Float64 => {
+                matches!(value, Value::Int(_) | Value::Float(_))
+            }
+            DataType::Bool => matches!(value, Value::Bool(_)),
+
+            // Non-struct timestamp column: storage parses strings and accepts ints,
+            // so both are lossless here (unlike the DateTime struct column below).
+            DataType::Timestamp => matches!(
+                value,
+                Value::String(_)
+                    | Value::Int(_)
+                    | Value::Temporal(
+                        TemporalValue::DateTime { .. } | TemporalValue::LocalDateTime { .. }
+                    )
+            ),
+            DataType::DateTime => matches!(
+                value,
+                Value::Temporal(
+                    TemporalValue::DateTime { .. } | TemporalValue::LocalDateTime { .. }
+                )
+            ),
+            DataType::Date => {
+                matches!(
+                    value,
+                    Value::Int(_) | Value::Temporal(TemporalValue::Date { .. })
+                )
+            }
+            DataType::Time => matches!(
+                value,
+                Value::Int(_)
+                    | Value::Temporal(TemporalValue::Time { .. } | TemporalValue::LocalTime { .. })
+            ),
+            DataType::Duration => {
+                matches!(value, Value::Temporal(TemporalValue::Duration { .. }))
+            }
+            DataType::Bytes => matches!(value, Value::Bytes(_)),
+            // FixedSizeBinary(24) converter accepts the Btic temporal, raw strings, and lists.
+            DataType::Btic => matches!(
+                value,
+                Value::String(_) | Value::List(_) | Value::Temporal(TemporalValue::Btic { .. })
+            ),
+            DataType::Vector { .. } => matches!(value, Value::Vector(_) | Value::List(_)),
+            DataType::List(_) => matches!(value, Value::List(_)),
+            DataType::Map(_, _) => matches!(value, Value::Map(_)),
         }
     }
 }
@@ -321,6 +439,21 @@ impl Default for SchemalessEdgeTypeRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// First virtual (catalog-resolved) label ID. Label IDs in
+/// `VIRTUAL_LABEL_ID_START..VIRTUAL_LABEL_ID_SENTINEL` are owned by
+/// plugin-registered `CatalogProvider`s and allocated lazily by the
+/// planner via `PluginRegistry::register_virtual_label`. Native label
+/// allocation (`SchemaManager::add_label`) refuses IDs in this range.
+pub const VIRTUAL_LABEL_ID_START: u16 = 0xFF00;
+/// Sentinel "no label" marker, kept distinct from any allocatable ID.
+pub const VIRTUAL_LABEL_ID_SENTINEL: u16 = 0xFFFF;
+
+/// Returns `true` if `id` is in the virtual (catalog-resolved) range.
+#[inline]
+pub fn is_virtual_label_id(id: u16) -> bool {
+    (VIRTUAL_LABEL_ID_START..VIRTUAL_LABEL_ID_SENTINEL).contains(&id)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1020,23 +1153,7 @@ impl SchemaManager {
     }
 
     pub fn add_label(&self, name: &str) -> Result<u16> {
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        if schema.labels.contains_key(name) {
-            return Err(anyhow!("Label '{}' already exists", name));
-        }
-
-        let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
-        schema.labels.insert(
-            name.to_string(),
-            LabelMeta {
-                id,
-                created_at: Utc::now(),
-                state: SchemaElementState::Active,
-                description: None,
-            },
-        );
-        Ok(id)
+        self.add_label_with_desc(name, None)
     }
 
     pub fn add_label_with_desc(&self, name: &str, description: Option<String>) -> Result<u16> {
@@ -1047,6 +1164,13 @@ impl SchemaManager {
         }
 
         let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
+        if id >= VIRTUAL_LABEL_ID_START {
+            return Err(anyhow!(
+                "Native label space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_LABEL_ID_START:#x}..{VIRTUAL_LABEL_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved labels)"
+            ));
+        }
         schema.labels.insert(
             name.to_string(),
             LabelMeta {
@@ -1065,30 +1189,7 @@ impl SchemaManager {
         src_labels: Vec<String>,
         dst_labels: Vec<String>,
     ) -> Result<u32> {
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        if schema.edge_types.contains_key(name) {
-            return Err(anyhow!("Edge type '{}' already exists", name));
-        }
-
-        let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
-
-        // Ensure we stay in schema'd ID space (bit 31 = 0)
-        if id >= MAX_SCHEMA_TYPE_ID {
-            return Err(anyhow!("Schema edge type ID exhaustion"));
-        }
-
-        schema.edge_types.insert(
-            name.to_string(),
-            EdgeTypeMeta {
-                id,
-                src_labels,
-                dst_labels,
-                state: SchemaElementState::Active,
-                description: None,
-            },
-        );
-        Ok(id)
+        self.add_edge_type_with_desc(name, src_labels, dst_labels, None)
     }
 
     pub fn add_edge_type_with_desc(
@@ -1106,8 +1207,16 @@ impl SchemaManager {
 
         let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
 
-        if id >= MAX_SCHEMA_TYPE_ID {
-            return Err(anyhow!("Schema edge type ID exhaustion"));
+        // Stay in the schema-defined sub-range (bit 31 = 0, and below the
+        // virtual reservation `VIRTUAL_EDGE_TYPE_ID_START`) — same bound as
+        // `add_edge_type`, so the two entry points cannot disagree on the
+        // legal ceiling.
+        if id >= VIRTUAL_EDGE_TYPE_ID_START {
+            return Err(anyhow!(
+                "Native edge type space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_EDGE_TYPE_ID_START:#x}..{VIRTUAL_EDGE_TYPE_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved edge types)"
+            ));
         }
 
         schema.edge_types.insert(
@@ -1145,34 +1254,7 @@ impl SchemaManager {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
-        let mut guard = acquire_write(&self.schema, "schema")?;
-        let schema = Arc::make_mut(&mut *guard);
-        let version = schema.schema_version;
-        let props = schema
-            .properties
-            .entry(label_or_type.to_string())
-            .or_default();
-
-        if props.contains_key(prop_name) {
-            return Err(anyhow!(
-                "Property '{}' already exists for '{}'",
-                prop_name,
-                label_or_type
-            ));
-        }
-
-        props.insert(
-            prop_name.to_string(),
-            PropertyMeta {
-                r#type: data_type,
-                nullable,
-                added_in: version,
-                state: SchemaElementState::Active,
-                generation_expression: None,
-                description: None,
-            },
-        );
-        Ok(())
+        self.add_property_with_desc(label_or_type, prop_name, data_type, nullable, None)
     }
 
     pub fn add_property_with_desc(
@@ -1183,6 +1265,7 @@ impl SchemaManager {
         nullable: bool,
         description: Option<String>,
     ) -> Result<()> {
+        validate_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1220,6 +1303,9 @@ impl SchemaManager {
         data_type: DataType,
         expr: String,
     ) -> Result<()> {
+        // System-generated `_gen_*` columns bypass the underscore-prefix rule
+        // but must still avoid storage-layer column-name collisions.
+        validate_reserved_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1481,11 +1567,123 @@ pub fn validate_identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject user-declared property names that collide with internal Arrow column
+/// names used by the storage layer.
+///
+/// Without this, declaring a property named e.g. `ext_id` produces an Arrow
+/// schema with two `ext_id` fields at flush time, which Lance rejects with
+/// "Duplicate field name" — silently losing all in-session writes on shutdown.
+pub fn validate_property_name(name: &str) -> Result<()> {
+    if name.starts_with('_') {
+        return Err(anyhow!(
+            "Property name '{}' is reserved: names starting with '_' are reserved by the storage layer",
+            name
+        ));
+    }
+    validate_reserved_property_name(name)
+}
+
+/// Reject names that collide with storage-layer Arrow column names.
+///
+/// Used both by `validate_property_name` (user-facing path) and directly by
+/// `add_generated_property` (system-generated `_gen_*` path) — the latter
+/// needs to bypass the underscore-prefix rule but must still reject the
+/// fixed-name collisions below.
+fn validate_reserved_property_name(name: &str) -> Result<()> {
+    // Unprefixed names that get appended alongside user properties in the
+    // per-label vertex (`storage/vertex.rs`), per-edge-type edge
+    // (`storage/edge.rs`), or per-edge-type delta (`storage/delta.rs`)
+    // Arrow schemas — declaring one of these as a user property produces a
+    // duplicate Arrow field and a Lance "Duplicate field name" error at
+    // flush time. Fixed-schema-only columns (`type`, `props_json`,
+    // `labels` in the main tables) are NOT listed: those tables don't
+    // append user properties, so no collision can occur.
+    const RESERVED_PROPS: &[&str] = &[
+        "ext_id",
+        "overflow_json",
+        "eid",
+        "src_vid",
+        "dst_vid",
+        "op",
+        // Internal planner sentinel: a column-name marker used by
+        // `mark_set_item_variables` (uni-query::query::planner) to request
+        // narrow structural projection without full-schema expansion.
+        // Reserved here defensively so an internal `add_generated_property`
+        // path can't accidentally create a colliding user-facing column.
+        // The user-facing `validate_property_name` already rejects this
+        // via the underscore-prefix rule, so this is belt-and-suspenders.
+        "__set_struct__",
+    ];
+    if RESERVED_PROPS.contains(&name) {
+        return Err(anyhow!(
+            "Property name '{}' is reserved by the storage layer; please choose a different name",
+            name
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::{TemporalValue, Value};
     use object_store::local::LocalFileSystem;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_datatype_accepts_matrix() {
+        let dt = || TemporalValue::DateTime {
+            nanos_since_epoch: 0,
+            offset_seconds: 0,
+            timezone_name: None,
+        };
+
+        // Null is accepted by every type (nullability checked separately).
+        for ty in [
+            DataType::String,
+            DataType::Int64,
+            DataType::Bool,
+            DataType::DateTime,
+            DataType::Float64,
+        ] {
+            assert!(ty.accepts(&Value::Null), "{ty:?} must accept Null");
+        }
+
+        // Exact-type matches.
+        assert!(DataType::String.accepts(&Value::String("x".into())));
+        assert!(DataType::Int64.accepts(&Value::Int(1)));
+        assert!(DataType::Bool.accepts(&Value::Bool(true)));
+        assert!(DataType::DateTime.accepts(&Value::Temporal(dt())));
+
+        // Intentional lossless widenings remain allowed.
+        assert!(
+            DataType::Float64.accepts(&Value::Int(3)),
+            "Int widens to Float"
+        );
+        assert!(DataType::Int32.accepts(&Value::Int(3)), "Int fits Int32");
+        assert!(DataType::Timestamp.accepts(&Value::Temporal(dt())));
+        assert!(
+            DataType::Timestamp.accepts(&Value::String("2026-01-01T00:00:00Z".into())),
+            "storage parses strings for non-struct Timestamp columns"
+        );
+
+        // The #68 data-loss cases must be rejected (coercion handles strings separately).
+        assert!(
+            !DataType::DateTime.accepts(&Value::String("2026-01-01T00:00:00Z".into())),
+            "String into a DateTime struct column nulls silently — reject here"
+        );
+        assert!(!DataType::Bool.accepts(&Value::Int(1)));
+        assert!(!DataType::Int64.accepts(&Value::Bool(true)));
+        assert!(!DataType::Int64.accepts(&Value::Float(1.5)));
+        assert!(
+            !DataType::String.accepts(&Value::Int(10)),
+            "no implicit stringification"
+        );
+        assert!(!DataType::Duration.accepts(&Value::String("P1D".into())));
+
+        // Opaque columns accept anything.
+        assert!(DataType::CypherValue.accepts(&Value::Map(Default::default())));
+    }
 
     #[tokio::test]
     async fn test_schema_management() -> Result<()> {
@@ -1524,6 +1722,79 @@ mod tests {
                 .get("Person")
                 .unwrap()
                 .contains_key("name")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reserved_property_names_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+
+        manager.add_label("Tiny")?;
+
+        // Unprefixed reserved names — these collide with internal Arrow
+        // columns in storage tables and previously caused Lance
+        // "Duplicate field name" errors at flush time.
+        for reserved in &["ext_id", "overflow_json", "eid", "src_vid", "dst_vid", "op"] {
+            let err = manager
+                .add_property("Tiny", reserved, DataType::String, true)
+                .expect_err(&format!("expected '{reserved}' to be rejected"));
+            assert!(
+                err.to_string().contains("reserved"),
+                "error for '{reserved}' should mention 'reserved', got: {err}"
+            );
+        }
+
+        // Planner sentinel — reserved in RESERVED_PROPS (belt-and-suspenders
+        // alongside the underscore-prefix rule). Confirms an internal
+        // `add_generated_property` path cannot accidentally create a column
+        // that collides with the SET-target structural-projection marker.
+        let err = manager
+            .add_property("Tiny", "__set_struct__", DataType::String, true)
+            .expect_err("expected '__set_struct__' to be rejected");
+        assert!(
+            err.to_string().contains("reserved"),
+            "__set_struct__ rejection should mention 'reserved', got: {err}"
+        );
+
+        // Leading-underscore pattern rule.
+        for reserved in &["_vid", "_uid", "_eid", "_version", "_created_at"] {
+            assert!(
+                manager
+                    .add_property("Tiny", reserved, DataType::String, true)
+                    .is_err(),
+                "expected '{reserved}' to be rejected"
+            );
+        }
+
+        // Names that merely contain a reserved substring should still be
+        // accepted.
+        manager.add_property("Tiny", "ext_id_foo", DataType::String, true)?;
+        manager.add_property("Tiny", "user_op", DataType::String, true)?;
+        manager.add_property("Tiny", "type_name", DataType::String, true)?;
+
+        // Same check applies to edge-type properties (single dispatch).
+        manager.add_edge_type("knows", vec!["Tiny".into()], vec!["Tiny".into()])?;
+        assert!(
+            manager
+                .add_property("knows", "src_vid", DataType::Int64, true)
+                .is_err()
+        );
+
+        // And to generated properties.
+        assert!(
+            manager
+                .add_generated_property(
+                    "Tiny",
+                    "ext_id",
+                    DataType::String,
+                    "concat('x', name)".into()
+                )
+                .is_err()
         );
 
         Ok(())

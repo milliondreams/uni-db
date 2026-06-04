@@ -310,9 +310,6 @@ jobs:
       # — bundling them produces 620+ MB wheels that exceed PyPI's per-file
       # limit and risk runtime conflicts with the user's NVIDIA driver
       # install. The post-build repair step below excludes them.
-      #
-      # See `docs/proposals/python-wheel-matrix.md` "What is not bundled"
-      # for the canonical list.
       - name: Build wheels (skip auditwheel)
         uses: PyO3/maturin-action@v1
         env:
@@ -481,8 +478,6 @@ jobs:
     needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
-    permissions:
-      id-token: write
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     steps:
       - name: Download all wheels
@@ -501,15 +496,15 @@ jobs:
 
       - name: Publish to TestPyPI
         if: inputs.dry_run != true
-        run: uv publish --trusted-publishing always --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: uv publish --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
 
   publish-pypi:
     name: Publish uni-db wheels to PyPI
     needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      id-token: write
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
     steps:
       - name: Download all wheels
@@ -528,4 +523,6 @@ jobs:
 
       - name: Publish to PyPI
         if: inputs.dry_run != true
-        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --check-url https://pypi.org/simple/ dist/*

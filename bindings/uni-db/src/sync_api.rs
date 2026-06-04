@@ -233,18 +233,19 @@ impl Transaction {
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<PyLocyResult> {
         let tx = self.check_active()?;
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
         let result = if let Some(p) = params {
             let mut builder = tx.locy_with(program);
             for (k, v) in p {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(tx.locy(program))
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.locy(program)))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)
@@ -523,38 +524,11 @@ impl TxBulkWriterBuilder {
             .defer_vector_indexes(self.defer_vector_indexes)
             .defer_scalar_indexes(self.defer_scalar_indexes)
             .async_indexes(self.async_indexes);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(vc) = self.validate_constraints {
-            builder = builder.validate_constraints(vc);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
+        crate::apply_opt!(builder, self.batch_size, batch_size);
+        crate::apply_opt!(builder, self.validate_constraints, validate_constraints);
+        crate::apply_opt!(builder, self.max_buffer_size_bytes, max_buffer_size_bytes);
         if let Some(ref callback) = self.on_progress {
-            struct PyProgressWrapper {
-                py_obj: Py<PyAny>,
-            }
-            unsafe impl Send for PyProgressWrapper {}
-
-            let wrapper = PyProgressWrapper {
-                py_obj: callback.clone_ref(py),
-            };
-            builder = builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
-                Python::attach(|py| {
-                    let py_progress = crate::types::BulkProgress {
-                        phase: format!("{:?}", progress.phase),
-                        rows_processed: progress.rows_processed,
-                        total_rows: progress.total_rows,
-                        current_label: progress.current_label.clone(),
-                        elapsed_secs: progress.elapsed.as_secs_f64(),
-                    };
-                    if let Ok(bound) = Py::new(py, py_progress) {
-                        let _ = wrapper.py_obj.call1(py, (bound,));
-                    }
-                });
-            });
+            builder = builder.on_progress(convert::make_progress_callback(callback.clone_ref(py)));
         }
         let real_writer = builder
             .build()
@@ -600,15 +574,9 @@ impl TxAppenderBuilder {
         let tx_ref = self.tx.borrow(py);
         let tx = tx_ref.check_active()?;
         let mut builder = tx.appender(&self.label);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(dvi) = self.defer_vector_indexes {
-            builder = builder.defer_vector_indexes(dvi);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
+        crate::apply_opt!(builder, self.batch_size, batch_size);
+        crate::apply_opt!(builder, self.defer_vector_indexes, defer_vector_indexes);
+        crate::apply_opt!(builder, self.max_buffer_size_bytes, max_buffer_size_bytes);
         let appender = builder
             .build()
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -616,6 +584,32 @@ impl TxAppenderBuilder {
             inner: std::sync::Mutex::new(Some(appender)),
         })
     }
+}
+
+/// Marshal a WASM / Extism `LoadOutcome` into the dict shape the Python
+/// plugin-load APIs return (the WASM/Extism outcomes already carry
+/// `Vec<String>` capability lists, so no `Debug`-formatting is needed).
+#[cfg(any(feature = "wasm-plugins", feature = "extism-plugins"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wasm_outcome_to_pydict(
+    py: Python<'_>,
+    plugin_id: String,
+    version: String,
+    scalars_registered: Vec<String>,
+    aggregates_registered: Vec<String>,
+    procedures_registered: Vec<String>,
+    effective_capabilities: Vec<String>,
+    denied_capabilities: Vec<String>,
+) -> PyResult<Py<PyAny>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("plugin_id", plugin_id)?;
+    dict.set_item("version", version)?;
+    dict.set_item("scalars_registered", scalars_registered)?;
+    dict.set_item("aggregates_registered", aggregates_registered)?;
+    dict.set_item("procedures_registered", procedures_registered)?;
+    dict.set_item("effective_capabilities", effective_capabilities)?;
+    dict.set_item("denied_capabilities", denied_capabilities)?;
+    Ok(dict.into())
 }
 
 // ============================================================================
@@ -771,42 +765,7 @@ impl Database {
             .block_on(core::get_label_info_core(&self.inner, name))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        Ok(info.map(|i| LabelInfo {
-            name: i.name,
-            count: i.count,
-            properties: i
-                .properties
-                .into_iter()
-                .map(|p| PropertyInfo {
-                    name: p.name,
-                    data_type: p.data_type,
-                    nullable: p.nullable,
-                    is_indexed: p.is_indexed,
-                    description: p.description,
-                })
-                .collect(),
-            indexes: i
-                .indexes
-                .into_iter()
-                .map(|idx| IndexInfo {
-                    name: idx.name,
-                    index_type: idx.index_type,
-                    properties: idx.properties,
-                    status: idx.status,
-                })
-                .collect(),
-            constraints: i
-                .constraints
-                .into_iter()
-                .map(|c| ConstraintInfo {
-                    name: c.name,
-                    constraint_type: c.constraint_type,
-                    properties: c.properties,
-                    enabled: c.enabled,
-                })
-                .collect(),
-            description: i.description,
-        }))
+        Ok(info.map(LabelInfo::from))
     }
 
     /// Get detailed information about an edge type.
@@ -815,44 +774,7 @@ impl Database {
             .block_on(core::get_edge_type_info_core(&self.inner, name))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        Ok(info.map(|i| crate::types::EdgeTypeInfo {
-            name: i.name,
-            count: i.count,
-            source_labels: i.source_labels,
-            target_labels: i.target_labels,
-            properties: i
-                .properties
-                .into_iter()
-                .map(|p| PropertyInfo {
-                    name: p.name,
-                    data_type: p.data_type,
-                    nullable: p.nullable,
-                    is_indexed: p.is_indexed,
-                    description: p.description,
-                })
-                .collect(),
-            indexes: i
-                .indexes
-                .into_iter()
-                .map(|idx| IndexInfo {
-                    name: idx.name,
-                    index_type: idx.index_type,
-                    properties: idx.properties,
-                    status: idx.status,
-                })
-                .collect(),
-            constraints: i
-                .constraints
-                .into_iter()
-                .map(|c| ConstraintInfo {
-                    name: c.name,
-                    constraint_type: c.constraint_type,
-                    properties: c.properties,
-                    enabled: c.enabled,
-                })
-                .collect(),
-            description: i.description,
-        }))
+        Ok(info.map(crate::types::EdgeTypeInfo::from))
     }
 
     /// Load schema from a JSON file.
@@ -870,8 +792,132 @@ impl Database {
     }
 
     // ========================================================================
-    // Index Methods
+    // Plugin Methods
     // ========================================================================
+
+    /// Load a Rhai-script plugin from source text.
+    ///
+    /// `script` is the Rhai source; the script must export a
+    /// `uni_manifest()` function returning a map declaring its scalar /
+    /// aggregate / procedure entries (see proposal §5.6).
+    ///
+    /// `grants` is a list of capability variant names the host is
+    /// willing to give the plugin. Recognised values:
+    /// `"ScalarFn"`, `"AggregateFn"`, `"Procedure"`, `"Filesystem"`,
+    /// `"Network"`, `"HostQuery"`, `"Kms"`, `"Secret"`. Pattern-
+    /// narrowed grants (specific paths / URLs) are not yet exposed
+    /// from Python; the variant grant gives the script's host fns
+    /// permission to call out, and the host's runtime enforcement
+    /// (e.g., glob validation) is unchanged.
+    ///
+    /// Returns a dict with keys `plugin_id`, `version`,
+    /// `scalars_registered`, `aggregates_registered`,
+    /// `procedures_registered`, `denied_capabilities`.
+    #[pyo3(signature = (script, grants=None))]
+    fn load_rhai_plugin(
+        &self,
+        py: Python<'_>,
+        script: &str,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let cap_set = crate::builders::build_capability_set_strict(grants)?;
+
+        let mut loader = uni_plugin_rhai::RhaiLoader::new();
+        uni_plugin_rhai::host_fn_impls::register_default_host_fns(&mut loader);
+        let outcome = self
+            .inner
+            .load_rhai_plugin(&loader, script, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("plugin_id", outcome.plugin_id.as_str())?;
+        dict.set_item("version", outcome.version)?;
+        dict.set_item("scalars_registered", outcome.scalars_registered)?;
+        dict.set_item("aggregates_registered", outcome.aggregates_registered)?;
+        dict.set_item("procedures_registered", outcome.procedures_registered)?;
+        let denied: Vec<String> = outcome
+            .denied_capabilities
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        dict.set_item("denied_capabilities", denied)?;
+        Ok(dict.into())
+    }
+
+    /// Load a WASM Component Model plugin from raw bytes.
+    ///
+    /// Thin passthrough to [`Uni::load_wasm_component`](uni_db::Uni). `grants`
+    /// uses the same variant names as [`Self::load_rhai_plugin`]
+    /// (`ScalarFn` / `AggregateFn` / `Procedure` / `Filesystem` / `Network`
+    /// / `HostQuery` / `Kms` / `Secret`) and drives both the surface
+    /// registration gate and the host-fn grant set. Defaults to
+    /// scalar / aggregate / procedure when omitted.
+    ///
+    /// Returns a dict with `plugin_id`, `version`, `scalars_registered`,
+    /// `aggregates_registered`, `procedures_registered`,
+    /// `effective_capabilities`, `denied_capabilities`.
+    #[cfg(feature = "wasm-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_component(
+        &self,
+        py: Python<'_>,
+        wasm_bytes: &[u8],
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        // `cap_set` is the rich capability set derived from `grants` (names →
+        // attenuated `Capability`; None → default scalar/agg/proc). It drives
+        // both the registration gate and the guest host-fn grant set.
+        let cap_set = crate::builders::build_capability_set(grants);
+        let loader = uni_plugin_wasm::WasmLoader::new();
+        let outcome = self
+            .inner
+            .load_wasm_component(&loader, wasm_bytes, &cap_set, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        wasm_outcome_to_pydict(
+            py,
+            outcome.plugin_id,
+            outcome.version,
+            outcome.scalars_registered,
+            outcome.aggregates_registered,
+            outcome.procedures_registered,
+            outcome.effective_capabilities,
+            outcome.denied_capabilities,
+        )
+    }
+
+    /// Load an Extism WASM plugin from raw bytes.
+    ///
+    /// Thin passthrough to [`Uni::load_wasm_extism`](uni_db::Uni); see
+    /// [`Self::load_wasm_component`] for the `grants` and return shape.
+    /// Extism host-grant-backed host functions require registered
+    /// implementations on the loader; this v1 wrapper covers surface-grant
+    /// plugins (scalar / aggregate / procedure).
+    #[cfg(feature = "extism-plugins")]
+    #[pyo3(signature = (wasm_bytes, grants=None))]
+    fn load_wasm_extism(
+        &self,
+        py: Python<'_>,
+        wasm_bytes: &[u8],
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let cap_set = crate::builders::build_capability_set(grants);
+        let mut loader = uni_plugin_extism::ExtismLoader::new();
+        uni_plugin_extism::register_default_host_svc(&mut loader);
+        let outcome = self
+            .inner
+            .load_wasm_extism(&loader, wasm_bytes, &cap_set, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        wasm_outcome_to_pydict(
+            py,
+            outcome.plugin_id,
+            outcome.version,
+            outcome.scalars_registered,
+            outcome.aggregates_registered,
+            outcome.procedures_registered,
+            outcome.effective_capabilities,
+            outcome.denied_capabilities,
+        )
+    }
 
     // ========================================================================
     // Session Methods
@@ -883,6 +929,7 @@ impl Database {
     fn session(&self) -> crate::builders::Session {
         crate::builders::Session {
             inner: self.inner.session(),
+            pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
         }
     }
 
@@ -1083,21 +1130,7 @@ impl Database {
 
     /// Get the configured write lease, if any.
     fn write_lease(&self) -> Option<crate::types::PyWriteLease> {
-        self.inner.write_lease().map(|wl| match wl {
-            ::uni_db::api::multi_agent::WriteLease::Local => crate::types::PyWriteLease {
-                variant: crate::types::WriteLeaseVariant::Local,
-            },
-            ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => {
-                crate::types::PyWriteLease {
-                    variant: crate::types::WriteLeaseVariant::DynamoDB {
-                        table: table.clone(),
-                    },
-                }
-            }
-            _ => crate::types::PyWriteLease {
-                variant: crate::types::WriteLeaseVariant::Local,
-            },
-        })
+        self.inner.write_lease().map(convert::write_lease_to_py)
     }
 }
 

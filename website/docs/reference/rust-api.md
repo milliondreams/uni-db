@@ -1,6 +1,6 @@
 # Rust API Reference
 
-Complete reference for the Uni 1.0.0 embedded graph database Rust API.
+Complete reference for the Uni 2.0.0 embedded graph database Rust API.
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ async fn main() -> uni_db::Result<()> {
 
 ## Architecture Overview
 
-Uni 1.0.0 uses a three-tier access model:
+Uni 2.0.0 uses a three-tier access model:
 
 ```
 Uni  (lifecycle / admin)
@@ -377,6 +377,19 @@ println!("Version: {}, Mutations: {}", result.version, result.mutations_committe
 | `params(iter)` | `Self` | Bind multiple parameters. |
 | `timeout(duration)` | `Self` | Set maximum execution time. |
 | `run()` | `Result<ExecuteResult>` | Execute the mutation. |
+| `profile()` | `Result<(ExecuteResult, ProfileOutput)>` | Execute the mutation with profiling. |
+
+```rust
+// Profile a transaction write end-to-end
+let tx = session.tx().await?;
+let (res, prof) = tx
+    .execute_with("CREATE (p:Person {name: $name}) RETURN p")
+    .param("name", "Alice")
+    .profile()
+    .await?;
+tx.commit().await?;
+println!("nodes_created = {}, total_time_ms = {}", res.nodes_created(), prof.total_time_ms);
+```
 
 ### DerivedFactSet Application
 
@@ -385,9 +398,16 @@ Apply Locy DERIVE results to the transaction.
 ```rust
 // Evaluate a Locy DERIVE at session level (collects derived facts)
 let result = session.locy("
-    reachable(X, Y) :- knows(X, Y).
-    reachable(X, Z) :- reachable(X, Y), knows(Y, Z).
-    ?DERIVE reachable(X, Y).
+    CREATE RULE reachable AS
+    MATCH (a:Node)-[:KNOWS]->(b:Node)
+    YIELD KEY a, KEY b
+
+    CREATE RULE reachable AS
+    MATCH (a:Node)-[:KNOWS]->(mid:Node)
+    WHERE mid IS reachable TO b
+    YIELD KEY a, KEY b
+
+    DERIVE reachable
 ").await?;
 
 // Apply the derived facts inside a transaction
@@ -777,8 +797,11 @@ Created by `session.locy_with(program)`. Fluent builder for Locy evaluation with
 
 ```rust
 let result = session.locy_with("
-    edge_rule(X, Y) :- knows(X, Y).
-    ?edge_rule(X, Y).
+    CREATE RULE edge_rule AS
+    MATCH (a:Node)-[:KNOWS]->(b:Node)
+    YIELD KEY a, KEY b
+
+    QUERY edge_rule RETURN a, b
 ")
     .param("threshold", 0.5)
     .timeout(Duration::from_secs(30))
@@ -812,7 +835,13 @@ Created by `tx.locy_with(program)`. Same API as `LocyBuilder` but sees the trans
 Wraps `uni_locy::LocyResult` with additional accessors.
 
 ```rust
-let result = session.locy("?QUERY knows(X, Y).").await?;
+let result = session.locy("
+    CREATE RULE edge_rule AS
+    MATCH (a:Node)-[:KNOWS]->(b:Node)
+    YIELD KEY a, KEY b
+
+    QUERY edge_rule RETURN a, b
+").await?;
 
 // Access rows (via Deref to inner LocyResult)
 for row in result.rows() { /* ... */ }
@@ -890,7 +919,13 @@ let shared = Arc::new(prepared);
 ### PreparedLocy
 
 ```rust
-let prepared = session.prepare_locy("edge_rule(X, Y) :- knows(X, Y). ?edge_rule(X, Y).").await?;
+let prepared = session.prepare_locy("
+    CREATE RULE edge_rule AS
+    MATCH (a:Node)-[:KNOWS]->(b:Node)
+    YIELD KEY a, KEY b
+
+    QUERY edge_rule RETURN a, b
+").await?;
 
 let result = prepared.execute(&[("threshold", Value::from(0.5))]).await?;
 
@@ -1139,7 +1174,7 @@ Mirrors the `Session` API, with all async methods wrapped in `block_on()`.
 | `query(cypher)` | `Result<QueryResult>` | |
 | `query_with(cypher)` | `TxQueryBuilderSync` | |
 | `execute(cypher)` | `Result<ExecuteResult>` | |
-| `execute_with(cypher)` | `ExecuteBuilderSync` | `.param().run()` |
+| `execute_with(cypher)` | `ExecuteBuilderSync` | `.param().run()`, `.param().profile()` |
 | `locy(program)` | `Result<LocyResult>` | |
 | `locy_with(program)` | `TxLocyBuilderSync` | `.param().run()` |
 | `apply(derived)` | `Result<ApplyResult>` | |
@@ -1164,7 +1199,7 @@ Pre-configured session factories for per-request session creation.
 ```rust
 let template = db.session_template()
     .param("tenant", 42)
-    .rules("edge_rule(X, Y) :- knows(X, Y).")?
+    .rules("CREATE RULE edge_rule AS MATCH (a:Node)-[:KNOWS]->(b:Node) YIELD KEY a, KEY b")?
     .hook("audit", AuditHook)
     .query_timeout(Duration::from_secs(30))
     .transaction_timeout(Duration::from_secs(60))
@@ -1441,11 +1476,16 @@ Manage pre-compiled Locy rules at database, session, or transaction scope. Rules
 
 ```rust
 // Database-level (global)
-db.rules().register("edge_rule(X, Y) :- knows(X, Y).")?;
+db.rules().register("CREATE RULE edge_rule AS MATCH (a:Node)-[:KNOWS]->(b:Node) YIELD KEY a, KEY b")?;
 
 // Session-level
 let session = db.session();
-session.rules().register("path_rule(X, Z) :- edge_rule(X, Y), edge_rule(Y, Z).")?;
+session.rules().register("
+    CREATE RULE path_rule AS
+    MATCH (a:Node)-[:KNOWS]->(mid:Node)
+    WHERE mid IS edge_rule TO c
+    YIELD KEY a, KEY c
+")?;
 
 // Query registered rules
 let names = session.rules().list();

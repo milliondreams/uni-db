@@ -3,8 +3,6 @@
 
 """Tests for BulkWriter API."""
 
-import tempfile
-
 import pytest
 
 import uni_db
@@ -16,22 +14,21 @@ class TestBulkWriter:
     @pytest.fixture
     def db(self):
         """Create a database with schema for bulk loading."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            (
-                db.schema()
-                .label("Person")
-                .property("name", "string")
-                .property("age", "int")
-                .done()
-                .label("Company")
-                .property("name", "string")
-                .done()
-                .edge_type("WORKS_AT", ["Person"], ["Company"])
-                .done()
-                .apply()
-            )
-            yield db
+        db = uni_db.UniBuilder.temporary().build()
+        (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .property("age", "int")
+            .done()
+            .label("Company")
+            .property("name", "string")
+            .done()
+            .edge_type("WORKS_AT", ["Person"], ["Company"])
+            .done()
+            .apply()
+        )
+        return db
 
     def test_bulk_writer_builder(self, db):
         """Test creating a bulk writer with builder."""
@@ -142,18 +139,17 @@ class TestBulkStats:
 
     def test_bulk_stats_attributes(self):
         """Test BulkStats has expected attributes."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Test").apply()
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Test").apply()
 
-            session = db.session()
-            tx = session.tx()
-            writer = tx.bulk_writer().build()
-            writer.insert_vertices("Test", [{"value": 1}])
-            stats = writer.commit()
-            tx.commit()
+        session = db.session()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
+        writer.insert_vertices("Test", [{"value": 1}])
+        stats = writer.commit()
+        tx.commit()
 
-            assert hasattr(stats, "vertices_inserted")
-            assert hasattr(stats, "edges_inserted")
-            assert hasattr(stats, "duration_secs")
-            assert stats.vertices_inserted == 1
+        assert hasattr(stats, "vertices_inserted")
+        assert hasattr(stats, "edges_inserted")
+        assert hasattr(stats, "duration_secs")
+        assert stats.vertices_inserted == 1

@@ -3,13 +3,11 @@
 
 //! uni.algo.maxFlow procedure implementation (using Dinic).
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, Dinic, DinicConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct DinicAdapter;
 
@@ -29,24 +27,25 @@ impl GraphAlgoAdapter for DinicAdapter {
         vec![("maxFlow", ValueType::Float), ("flowEdges", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> DinicConfig {
-        DinicConfig {
-            source: Vid::from(args[0].as_u64().unwrap_or(0)),
-            sink: Vid::from(args[1].as_u64().unwrap_or(0)),
-        }
+    fn to_config(args: Vec<Value>) -> Result<DinicConfig> {
+        Ok(DinicConfig {
+            source: parse_vid_arg(&args[0], "sourceNode")?,
+            sink: parse_vid_arg(&args[1], "sinkNode")?,
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
         Ok(vec![AlgoResultRow {
-            values: vec![json!(result.max_flow), json!(0)],
+            values: vec![json!(result.max_flow), json!(result.flow_edges)],
         }])
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

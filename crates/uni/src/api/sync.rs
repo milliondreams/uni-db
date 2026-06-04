@@ -179,26 +179,46 @@ impl<'a> SessionSync<'a> {
     // ── Hooks ─────────────────────────────────────────────────────────
 
     /// Add a named session hook for query/commit interception.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn add_hook(
         &mut self,
         name: impl Into<String>,
         hook: impl crate::api::hooks::SessionHook + 'static,
     ) {
+        #[expect(deprecated, reason = "wrapper around deprecated async method")]
         self.session.add_hook(name, hook)
     }
 
     /// Remove a hook by name. Returns true if it existed.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn remove_hook(&mut self, name: &str) -> bool {
+        #[expect(deprecated, reason = "wrapper around deprecated async method")]
         self.session.remove_hook(name)
     }
 
     /// List names of all registered hooks.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn list_hooks(&self) -> Vec<String> {
+        #[expect(deprecated, reason = "wrapper around deprecated async method")]
         self.session.list_hooks()
     }
 
     /// Remove all hooks.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn clear_hooks(&mut self) {
+        #[expect(deprecated, reason = "wrapper around deprecated async method")]
         self.session.clear_hooks()
     }
 

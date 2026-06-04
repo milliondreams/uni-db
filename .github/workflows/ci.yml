@@ -33,6 +33,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown, wasm32-wasip2
 
       - name: Install system dependencies
         run: |
@@ -75,10 +76,26 @@ jobs:
             --exclude uni-python-onnx-metal \
             --all-targets -- -D warnings
 
+      # The uni-plugin-extism / uni-plugin-wasm e2e tests load pre-built
+      # WASM plugin artifacts from the `examples/example-*-geo` crates
+      # (each its own workspace, built for wasm32 targets). They read the
+      # artifacts at runtime and panic if missing, so build them before
+      # the workspace test run. See scripts/build-wasm-fixtures.sh.
+      - name: Build WASM plugin fixtures
+        run: ./scripts/build-wasm-fixtures.sh
+
       - name: Run tests
+        # `uni-python` (bindings/uni-db) and `uni-python-onnx` are
+        # cdylib-only crates with zero Rust `#[test]` items — their tests
+        # are pytest in the python-tests job. We exclude them from the
+        # workspace cargo test because their `pyo3/extension-module` feature
+        # unifies with `uni-plugin-pyo3`'s test binaries and breaks the
+        # linker (no libpython linkage in extension-module mode).
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python \
+            --exclude uni-python-onnx \
             --exclude uni-python-cuda \
             --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
@@ -91,17 +108,35 @@ jobs:
         # `provider-onnx` statically links pyke's CPU libonnxruntime.a — no
         # ORT_DYLIB_PATH needed; the E2E `#[ignore]` real-ONNX tests run
         # because the lib is in the binary.
-        run: cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all
+        #
+        # `test_real_onnx_cross_encoder_reranks_by_relevance` is filtered out:
+        # `cross-encoder/ms-marco-MiniLM-L6-v2/onnx/model.onnx` is served only
+        # via a 302 to `cas-bridge.xethub.hf.co` (xet-bridge LFS). `hf-hub
+        # 0.5.0`'s `relative_redirect_client` (api/tokio.rs:368-388) refuses
+        # absolute redirects, so the download 404s. `hf-hub 1.0.0-rc.1` is
+        # a full API rewrite; we'll re-enable this test once `uni-xervo` /
+        # `hf-hub` ship a compatible fix. The other 3 real-ONNX tests
+        # (Qwen3, BGE, cross-encoder facade) still run.
+        run: |
+          cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all \
+            -E 'not test(=test_real_onnx_cross_encoder_reranks_by_relevance)'
 
       - name: Run reranker integration tests (load-dynamic ONNX)
         # `provider-onnx-dynamic` requires an ONNX Runtime tarball at
         # runtime. We download Microsoft's CPU build for CI; mock tests pass
         # without it but we set ORT_DYLIB_PATH to keep the dep symmetrical.
+        #
+        # `--no-default-features` is required: `uni-db`'s defaults include
+        # `provider-onnx` (bundled, statically linked). `provider-onnx` and
+        # `provider-onnx-dynamic` are mutually exclusive at the `ort` crate
+        # level, and `uni-xervo`'s `build.rs` hard-panics when both are
+        # active. We re-enable only the providers the reranker test path
+        # touches.
         run: |
           curl -sSL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
           tar xzf /tmp/ort.tgz -C /tmp
           export ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-1.20.1/lib/libonnxruntime.so
-          cargo nextest run -p uni-db --features provider-onnx-dynamic --test reranker_integration
+          cargo nextest run -p uni-db --no-default-features --features provider-onnx-dynamic --test reranker_integration
 
       - name: Run TCK (schemaless + schema)
         run: |
@@ -169,8 +204,12 @@ jobs:
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_ALLOW_HTTP: true
         run: |
-          cargo nextest run --test cloud_integration_test --run-ignored all
-          cargo nextest run -p uni-db --test hybrid_localstack_e2e --run-ignored all
+          # These suites were consolidated into each crate's single `integration`
+          # binary; filter to the original module by name.
+          cargo nextest run -p uni-store --test integration --run-ignored all \
+            -E 'test(/^cloud_integration_test::/)'
+          cargo nextest run -p uni-db --test integration --run-ignored all \
+            -E 'test(/^hybrid_localstack_e2e::/)'
 
   # Python bindings tests
   # Runs in parallel with test job (builds its own Rust extension via maturin)
@@ -202,7 +241,10 @@ jobs:
 
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
-        run: uv sync --group dev
+        # `notebook-runtime` extra (numpy / pyarrow / onnxruntime) is required
+        # by the flagship Locy notebook verifier steps below. They're opt-in so
+        # the default wheel stays lean; the verifier job installs them here.
+        run: uv sync --group dev --extra notebook-runtime
 
       - name: Build Python wheel (uni-db)
         working-directory: bindings/uni-db
@@ -220,6 +262,15 @@ jobs:
 
       - name: Execute flagship Locy notebook (cyber exposure twin)
         run: uv run --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (predictive maintenance)
+        run: uv run --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (adverse drug reaction)
+        run: uv run --project bindings/uni-db python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (drug-drug interaction)
+        run: uv run --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
 
       - name: Check Python formatting (uni-db)
         working-directory: bindings/uni-db

@@ -73,7 +73,7 @@ CREATE RULE exposure AS
 MATCH (a:Account)-[t:TRANSFER*]->(b:Account)
 WHERE b IS suspicious
 FOLD total = MSUM(t.amount)
-FOLD path_count = MCOUNT(*)
+FOLD path_count = MCOUNT()
 YIELD KEY a, total, path_count
 ```
 

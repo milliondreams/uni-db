@@ -22,6 +22,7 @@
 - [Part XIV: Python Bindings](#part-xiv-python-bindings)
 - [Part XV: Configuration Reference](#part-xv-configuration-reference)
 - [Part XVI: Forks](#part-xvi-forks)
+- [Part XVII: Plugin Framework](#part-xvii-plugin-framework)
 - [Appendices](#appendices)
 
 ---
@@ -59,6 +60,7 @@ Traditional graph databases force you to choose:
 8. **LSM-Style Storage** — Write-optimized 3-tier architecture (L0 memory → L1 sorted runs → L2 compacted base) with automatic background compaction.
 9. **Snapshot Isolation** — Single-writer, multi-reader with MVCC versioning. Time travel queries via `VERSION AS OF` and `TIMESTAMP AS OF`.
 10. **Python-Native** — PyO3 bindings (`uni-db`) plus a Pydantic OGM (`uni-pydantic`) with type-safe models, lifecycle hooks, and async support.
+11. **Polyglot Extensibility** — Five plugin loaders (Rust, WASM Component Model, Extism, Rhai, PyO3) share one capability-gated `PluginRegistry`. A scalar fn authored once runs byte-identically across Component Model + Extism; Rhai and PyO3 agree to ≤ 4 ULP. Every built-in (aggregates, CRDTs, indexes, storage, procedures) is itself a plugin. See [Part XVII](#part-xvii-plugin-framework).
 
 ## Target Use Cases
 
@@ -116,6 +118,8 @@ graph LR
 ## Layered Design
 
 Uni follows a strict three-layer architecture. Each layer has clear responsibilities and well-defined interfaces:
+
+> **Cross-cutting extensibility.** A fourth, cross-cutting concern — the **Extensibility Layer** (`uni-plugin` plus its loader and built-in-source crates) — sits beside these layers. It backs UDFs and aggregates in the Query Layer, CRDTs and storage backends in the Graph Runtime / Storage layers, and procedures, hooks, and triggers across all three. Every extension, built-in or user-supplied, resolves through one `PluginRegistry`. See [Part XVII: Plugin Framework](#part-xvii-plugin-framework).
 
 ```mermaid
 graph TB
@@ -193,7 +197,18 @@ crates/
 ├── uni-locy/       # Locy compiler (stratify, wardedness, typecheck, orchestrator)
 ├── uni-cli/        # CLI (import, query, repl, snapshot)
 ├── uni-tck/        # OpenCypher TCK compliance tests
-└── uni-locy-tck/   # Locy TCK tests
+├── uni-locy-tck/   # Locy TCK tests
+├── uni-plugin/             # Plugin framework foundation — traits, manifest, capability, registry, lifecycle
+├── uni-plugin-builtin/     # Built-ins as plugins (Locy aggregates, CRDTs, collations, vector index, storage)
+├── uni-plugin-apoc-core/   # APOC-analogue procedures (38 across 6 namespaces)
+├── uni-plugin-custom/      # Meta-plugin: uni.plugin.declare* from Cypher
+├── uni-plugin-host/        # Scheduler, declared-plugin persistence, OTel host layer
+├── uni-plugin-wasm/        # WASM Component Model loader (wasmtime) + MultiVersionLinker
+├── uni-plugin-wasm-rt/     # WASM instance pool / runtime
+├── uni-plugin-extism/      # WASM Extism loader
+├── uni-plugin-rhai/        # Rhai script loader
+├── uni-plugin-pyo3/        # PyO3 live-callable loader
+└── uni-plugin-conformance/ # 6-probe loader conformance suite
 bindings/
 ├── uni-db/         # PyO3 Python bindings (sync + async)
 └── uni-pydantic/   # Pydantic OGM layer
@@ -226,6 +241,11 @@ graph TB
     uni-db[uni-db<br/>Python PyO3] --> uni
     uni-pydantic[uni-pydantic<br/>Pydantic OGM] --> uni-db
     uni-cli[uni-cli<br/>CLI] --> uni
+
+    uni --> uni-plugin
+    uni-query --> uni-plugin
+    uni-plugin[uni-plugin<br/>Plugin Framework Foundation] --> uni-common
+    uni-plugin-builtin[uni-plugin-builtin + 8 loader/source crates] --> uni-plugin
 ```
 
 ## Key Dependencies
@@ -315,6 +335,8 @@ sequenceDiagram
     DF->>DF: ProjectionExec
     DF->>App: Result rows
 ```
+
+> **Plugin consultation.** When the planner meets an unknown function, aggregate, or procedure name it resolves it against the `PluginRegistry` (`scalar_fn(&QName)` / `aggregate(&QName)` / `procedure(&QName)`) rather than a hardcoded table. UDFs, Locy aggregates, and procedures from every loader enter the read path through this single lookup — see [Part XVII](#part-xvii-plugin-framework).
 
 ## Design Principles
 
@@ -1718,6 +1740,17 @@ MERGE (a)-[r:KNOWS]->(b)
 ON CREATE SET r.since = date()
 ```
 
+**Performance.** A single-node, single-label `MERGE (n:Label {key: ...})` with a
+literal key map takes a batched fast path: the existing-node lookup is resolved
+from one per-statement L0 snapshot plus a persisted lookup, with no per-row query
+planning. This is what makes `UNWIND $rows AS e MERGE (n:Label {key: e.key}) ...`
+scale (it also handles intra-batch duplicate keys correctly). Put a **scalar
+index** on the MERGE key so the persisted lookup is an index point-lookup rather
+than a full label scan. Multi-node/edge MERGE (`MERGE (a)-[:R]->(b)`) and
+non-literal property maps (`MERGE (n:Label $props)`) use the slower per-row
+general path — prefer a single-node MERGE for the node and batched
+`CREATE`/`MATCH` for edges.
+
 ### WITH
 
 Intermediate result projection — acts as a pipeline stage:
@@ -1783,6 +1816,13 @@ Expand a list into rows:
 UNWIND [1, 2, 3] AS x RETURN x
 UNWIND $names AS name MATCH (n:Person {name: name}) RETURN n
 ```
+
+`UNWIND`-driven operations are batched rather than run per row: `CREATE`,
+property-/id-correlated `MATCH` (index IN-list pushdown when the property is
+indexed), `SET`, `REMOVE`, `DELETE`, and single-node `MERGE` (see MERGE above)
+all process the whole batch in one statement. For bulk upserts, prefer one
+`UNWIND $batch AS e MERGE (n:Label {key: e.key}) ON CREATE SET ... ON MATCH SET ...`
+over a MERGE-per-row loop, and scalar-index the key.
 
 ### DELETE
 
@@ -1946,6 +1986,8 @@ RETURN n.name, n.salary, n.department,
 | Function | Returns | Description |
 |---|---|---|
 | `id(node)` | UInt64 | Internal VID or EID |
+| `created_at(node_or_rel)` | DateTime (UTC, ns) | Wall-clock time when the row was first inserted. Read-only, system-managed. |
+| `updated_at(node_or_rel)` | DateTime (UTC, ns) | Most-recent write-touch time. Advances on any CREATE/SET/MERGE that targets the row, including same-value writes. |
 | `type(rel)` | String | Edge type name |
 | `labels(node)` | List | Node labels |
 | `keys(map)` | List | Map keys or node property names |
@@ -1954,6 +1996,26 @@ RETURN n.name, n.salary, n.department,
 | `relationships(path)` | List | Edges in a path |
 | `startNode(rel)` | Node | Source vertex of edge |
 | `endNode(rel)` | Node | Destination vertex of edge |
+
+#### System-managed timestamps
+
+`created_at(n)` and `updated_at(n)` (and the edge-equivalent `created_at(r)` / `updated_at(r)`) surface storage-layer timestamps that uni-db automatically maintains on every vertex and edge — no schema declaration needed. They return `DateTime` in UTC at nanosecond precision.
+
+**Semantics:**
+
+- `created_at` is set when the row is first inserted and never changes afterward.
+- `updated_at` is set at creation and bumped on every subsequent write that touches the row — including label changes, property updates, and same-value `SET`s. Idempotent `MERGE ... ON MATCH SET` will keep advancing it.
+- Both columns are visible inside the writing transaction (uncommitted writes see their own timestamps).
+- Read-only: there is no Cypher syntax to overwrite these values. The bulk loader can supply explicit per-row values via its API.
+
+```cypher
+// Filter by recency
+MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01") RETURN n
+
+// Compare to a known cutoff
+MATCH (a)-[r:KNOWS]->(b) RETURN r, updated_at(r) AS last_touched
+ORDER BY last_touched DESC LIMIT 10
+```
 
 ### String Functions
 
@@ -2138,6 +2200,8 @@ RETURN btic_span_agg(e.period) AS total_span
 | **Filter early** | Put WHERE close to MATCH — enables predicate pushdown |
 | **Use LIMIT with ORDER BY** | Enables top-K optimization |
 | **Prefer MERGE** | Over manual CREATE + existence check |
+| **Index MERGE keys** | A scalar index on the MERGE key turns the batched-MERGE lookup into an index point-lookup (vs a full label scan) |
+| **Bulk upsert with `UNWIND ... MERGE`** | One single-node MERGE statement per batch beats one statement per row |
 | **Named paths** | Use `p = (a)-->(b)` when you need path functions |
 
 ## Cypher Anti-Patterns
@@ -2149,12 +2213,16 @@ RETURN btic_span_agg(e.period) AS total_span
 | **COLLECT without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **WITH \*** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk | Use `$param` parameters |
+| **MERGE on an un-indexed key** | Per-row match degrades to a full label scan | Add a scalar index on the MERGE key |
+| **MERGE-per-row loop** | Misses the batched fast path | Use `UNWIND $batch AS e MERGE (n:L {key: e.key}) ...` |
 
 ---
 
 # Part VIII: Cypher Extensions & Procedures
 
 Uni extends standard OpenCypher with procedures, DDL commands, time travel, and search capabilities, organized into hierarchical namespaces.
+
+> **Note:** Every procedure in this Part is registered through the plugin framework and resolved from the `PluginRegistry` at call time — there is no hardcoded procedure-dispatch table. See [Part XVII: Plugin Framework](#part-xvii-plugin-framework) for the `ProcedurePlugin` surface and the authoring path; the "Declared Plugins" and "Background Job Procedures" sections below cover defining procedures and scheduling jobs from Cypher.
 
 ```mermaid
 graph TB
@@ -2572,6 +2640,40 @@ YIELD snapshot_id, name, created_at, version_hwm
 CALL uni.admin.snapshot.restore($snapshot_id)
 YIELD status
 ```
+
+### Declared Plugins (`uni.plugin.declare*`)
+
+Define new extensions from inside Cypher (Uni's `apoc.custom` analogue). The definitions are persisted (`_DeclaredPlugin` node + JSON sidecar) and survive restart. Cycle detection, dependency-missing detection, and drop-with-dependents protection are enforced.
+
+```cypher
+// A scalar function whose body is Cypher:
+CALL uni.plugin.declareFunction(
+  'myco.discount', '(price: float, pct: float) -> float',
+  'cypher', 'RETURN price * (1.0 - pct)');
+
+// A procedure (WRITE mode requires Capability::ProcedureWrites):
+CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...');
+CALL uni.plugin.declareAggregate('myco.wmean', ...);
+CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...);
+
+CALL uni.plugin.listDeclared();              // enumerate declared extensions
+CALL uni.plugin.dropDeclared('myco.discount');
+```
+
+### Background Job Procedures (`uni.periodic.*`)
+
+Schedule recurring or one-shot maintenance jobs against registered `BackgroundJobProvider`s (see [Part XVII](#part-xvii-plugin-framework)). Schedules and job state are durable (`_BackgroundJob` node + `background_jobs.json`).
+
+```cypher
+CALL uni.periodic.schedule('uni.system.ttl_sweep', 'cron', '0 */5 * * * *');  // (qname, kind, schedule_arg)
+CALL uni.periodic.cancel('uni.system.ttl_sweep');                              // yields true if a job was removed
+CALL uni.periodic.list();                                                      // one row per known job
+CALL uni.periodic.submit('MATCH (n:Stale) DETACH DELETE n');                   // run one write-mode batch now
+CALL uni.periodic.iterate('MATCH (n:Big) RETURN n', 'DETACH DELETE n', '{}');  // (query, mutating_query, options_json)
+CALL uni.periodic.commit();                                                    // sync sentinel (v1 no-op)
+```
+
+Schedule kinds: `once` / `periodic` / `cron` / `manual`. Built-in jobs: `uni.system.ttl_sweep` and `uni.system.compaction` are wired to real host hooks; `uni.system.statistics_refresh` is a stub pending a planner statistics API. A `CircuitBreaker` opens a job after 10 consecutive failures (30 s cooldown). The Rust API exposes `Uni::periodic_schedule` / `periodic_cancel` / `periodic_list`.
 
 ## Schema Introspection
 
@@ -3446,7 +3548,8 @@ Session (read scope)
 
 Transaction (write scope)
   ├─ Reads: query() (sees uncommitted writes)
-  ├─ Writes: execute(), bulk_insert_*(), bulk_writer()
+  ├─ Writes: execute(), execute_with() → ExecuteBuilder, bulk_insert_*(), bulk_writer()
+  ├─ Analysis: execute_with().profile() → (ExecuteResult, ProfileOutput)
   ├─ Locy: locy() (DERIVE auto-applies to tx L0)
   ├─ Apply: apply(derived_fact_set)
   └─ Lifecycle: commit(), rollback(), drop (auto-rollback)
@@ -3533,6 +3636,17 @@ let result = session.query_with("MATCH (n:Person) WHERE n.age > $min_age RETURN 
 let plan = session.query_with("MATCH (n:Person) RETURN n").explain().await?;
 let (result, profile) = session.query_with("MATCH (n) RETURN n").profile().await?;
 
+// Profile also works on tx writes — `tx.execute_with(cypher).profile()`
+// returns (ExecuteResult, ProfileOutput): the mutation counters from the
+// tx's private L0 plus per-operator timings.
+let tx = session.tx().await?;
+let (exec_res, write_profile) = tx
+    .execute_with("CREATE (p:Person {name: $name})")
+    .param("name", "Alice")
+    .profile()
+    .await?;
+tx.commit().await?;
+
 // Get a parameter value
 let user_id = session.params().get("user_id");
 ```
@@ -3604,6 +3718,17 @@ WriteThrottleConfig {
     base_delay: Duration::from_millis(10),  // Backoff base
 }
 ```
+
+## Triggers
+
+Triggers react to mutations. A `TriggerPlugin` (see [Part XVII](#part-xvii-plugin-framework) for the trait) subscribes to label/event patterns and fires as commits flow through the writer. The interaction with the transaction lifecycle is what matters at the session level:
+
+- **Phase** (`TriggerPhase`) decides *when* a trigger fires: `BeforeMutation`, `AfterMutation`, `BeforeCommit`, or `AfterCommit`. A trigger that returns `Reject { reason }` from a *before* phase **aborts the commit** — this is how triggers enforce invariants.
+- **Fire mode** (`FireMode`) decides *how* it runs: `Synchronous` (blocks the writer), `Async` (spawned on the runtime, never blocks the commit), or `EventualConsistency` (best-effort through a durable retry queue).
+- **Outcome** (`TriggerOutcome`): `Continue` (allow), `Reject { reason }` (abort, before-phase only), or `Defer { until }` (re-enqueue for later).
+- The mutation payload is an Arrow `MutationBatch` with columns `event_kind | vid_or_eid | label | property | old_value | new_value`; event kinds are bit-flags (`NODE_CREATE` … `LABEL_REMOVED`).
+
+Triggers can be declared from Cypher via `CALL uni.plugin.declareTrigger(...)` (see Part VIII) or registered as a compiled `TriggerPlugin`.
 
 ## Transaction Best Practices
 
@@ -3933,6 +4058,17 @@ print(plan.index_usage)
 
 # PROFILE (execute + timing)
 result, stats = session.query_with("MATCH (n:Person) RETURN n").profile()
+
+# PROFILE a transaction write — returns (ExecuteResult, ProfileOutput).
+# The async equivalent on AsyncTxExecuteBuilder returns an awaitable.
+with session.tx() as tx:
+    exec_res, write_stats = (
+        tx.execute_with("CREATE (p:Person {name: $name})")
+        .param("name", "Alice")
+        .profile()
+    )
+    tx.commit()
+    print(exec_res.nodes_created, write_stats.total_time_ms)
 ```
 
 ### Schema Management
@@ -4117,6 +4253,37 @@ result.usage                       # TokenUsage | None
 result.usage.prompt_tokens         # int
 result.usage.completion_tokens     # int
 result.usage.total_tokens          # int
+```
+
+### Authoring & Loading Plugins
+
+Python can both *author* plugins in-process (decorator sink) and *load* external ones. The host injects a `db` object whose decorators accumulate registrations; `@session.*` variants register session-scoped, shadowing the global registry for the session's lifetime. See [Part XVII: Plugin Framework](#part-xvii-plugin-framework) for the full model.
+
+```python
+# In-process authoring — decorate functions/classes, then they register through the same
+# PluginRegistry as built-ins:
+@db.scalar_fn("haversine", args=["float", "float", "float", "float"],
+              returns="float", vectorized=False, determinism="pure")
+def haversine(lat1, lon1, lat2, lon2):
+    ...
+
+@db.aggregate_fn("wmean", args=["float", "float"], returns="float", determinism="pure")
+class WeightedMean:
+    ...
+
+@db.procedure("expand", ...)
+def expand(...):
+    ...
+
+# vectorized=True crosses the GIL once per Arrow RecordBatch (one batch in, one array out)
+# instead of once per row — prefer it for hot paths.
+
+# Loading external plugins — thin passthroughs to the Rust Uni methods. All four
+# loaders are wrapped; the default wheel bundles wasmtime for the WASM pair.
+db.load_rhai_plugin(open("geo.rhai").read(), grants=["ScalarFn"])
+db.load_python_plugin(open("geo.py").read(), "ai.dragonscale.geo", grants=["ScalarFn"])
+db.load_wasm_component(open("geo.wasm", "rb").read(), grants=["ScalarFn"])
+db.load_wasm_extism(open("geo_extism.wasm", "rb").read(), grants=["ScalarFn"])
 ```
 
 ### Async API
@@ -4442,6 +4609,43 @@ async def main():
 | **Use async for I/O-bound workloads** | Non-blocking for web servers |
 | **Register all models before sync_schema** | Schema generated from model definitions |
 
+## Allocator: mimalloc (built into every wheel)
+
+Every PyO3 wheel (CPU, CUDA, Metal, ONNX, ONNX-CUDA, ONNX-Metal) ships with
+**mimalloc as the Rust-side global allocator**. Python's own allocator
+(`PyMem_*`) is untouched — Python objects still go through CPython's heap.
+Only Rust allocations route through mimalloc, which is what matters because
+the entire Cypher pipeline (AST, logical plan, DataFusion physical plan,
+executor state, per-statement closures) is Rust-side.
+
+**Why it ships built-in**: profiling at 24-session concurrency showed ~50%
+of CPU time in `glibc malloc` and kernel page-fault zeroing under heavy
+concurrent allocation. mimalloc's thread-local arenas + heap recycling
+sidestep both. Measured ~3× throughput on the `concurrent_mutations`
+benchmark; the win applies directly to Python users running mutation-heavy
+workloads (`tx.execute("CREATE ...")` loops, multi-session writers).
+
+**Coexistence with CPython**:
+
+```text
++---------------------+  +------------------------+
+| Python objects      |  | Rust Vec/HashMap/Arc   |
+| (PyList, PyDict,..) |  | (AST, plan, executor)  |
++----------+----------+  +-----------+------------+
+           |                         |
+       PyMem_*                   mimalloc
+           |                         |
+           +------- same process ----+
+```
+
+Separate arenas; no sharing, no conflict. Slight RSS overhead (~10 MB)
+because each allocator maintains its own bookkeeping; negligible at
+production scale.
+
+**No configuration required.** Wheels work as-is. To override (e.g., to
+benchmark against jemalloc), build from source with a different allocator
+choice in `bindings/uni-db/src/lib.rs`.
+
 ---
 
 # Part XV: Configuration Reference
@@ -4647,6 +4851,45 @@ Prevents CWE-22 (path traversal) attacks in server mode.
 
 The `.cargo/config.toml` sets `RUST_MIN_STACK=8388608` (8 MB) to prevent stack overflows in debug builds. The algorithm execution path creates deeply nested async state machines that exceed the default 2 MB stack.
 
+### Global Allocator (mimalloc)
+
+Allocation-heavy workloads (many small mutations, concurrent Cypher
+`CREATE`/`MERGE`, per-statement parse + plan churn) bottleneck on the
+default glibc allocator long before they bottleneck on any uni-db lock.
+Profile at sess=24 showed ~50% of CPU time in `__memset_avx2_unaligned_erms`
+(zeroing fresh heap pages) and kernel `clear_page_erms` (zeroing anonymous
+pages on first touch). glibc's per-arena locks and the kernel's per-CPU
+page allocator both serialize under concurrent churn.
+
+uni-db ships an optional `mimalloc` feature that re-exports `MiMalloc`:
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+Measured: `concurrent_mutations` benchmark wall time at sess=24 drops
+from **1012 ms → 394 ms** (2.57× speedup). The win is roughly constant
+across N ∈ {1, 4, 12, 24} — glibc was bloated even single-threaded for
+this workload, and mimalloc's thread-local arenas avoid the serialization
+under concurrency.
+
+**Defaults**:
+
+- `uni-cli` binary (`cargo install uni-cli` or shipped binaries) uses
+  mimalloc by default.
+- All PyO3 wheels (uni-db, -cuda, -metal, -onnx, etc.) bundle mimalloc.
+- Rust library consumers opt in via the feature flag above.
+
+This is a library; we don't force an allocator on consumers — but if you
+don't have a strong reason to use a different one, turn it on.
+
 ## Deployment Scenarios
 
 ### Local Development
@@ -4695,6 +4938,16 @@ let db = Uni::open("./local-wal")
     .build()
     .await?;
 ```
+
+## Plugin Loading & Trust
+
+Plugins are **not** configured through `UniConfig` — there is no `PluginConfig` struct. A plugin's privileges and resource envelope are set per load through its **capability grant set** and **manifest verification**:
+
+- **Host grants.** Each `load_*` call (and `uni plugin install --grants …`, and Python `grants=…`) supplies the capabilities the host is willing to grant. The plugin's *effective* set is `declared ∩ granted`; anything denied is reported back (sandboxed loaders expose `denied_capabilities`) and the corresponding host functions are not linked. Grant the minimum — `[ScalarFn]` is enough for a pure-compute fn.
+- **Resource quotas** ride on the same capability mechanism: `FuelPerCall(n)`, `WallClockMillisPerCall(n)`, `MemoryBytes(n)`, `ConcurrentInstances(n)`, `MaxResultRows(n)`.
+- **Trust.** `verify_hash_pin` checks a Blake3 `hash` in the manifest; `verify_signed_manifest` performs Ed25519 verification against a `TrustRoot` (the `ed25519` cargo feature is **on by default**). The host policy — `SignaturePolicy ∈ { Disabled, WarnIfUnsigned, RequireSigned }` plus the trust root of allowed keys — is configured via `Uni::open(...).plugin_trust(PluginTrustConfig { signature_policy, trust_root })`, a builder-level runtime object (`TrustRoot` is neither `Clone` nor `Serialize`, so it can't live in `UniConfig`). The default is `Disabled` + empty root — accept everything, as before. It is **enforced today on the compile-time `add_plugin` path**: under `RequireSigned`, an unsigned manifest or an untrusted key is rejected. The sandboxed/scripted loader manifest formats (`ComponentManifest`, `ExtismPluginManifest`, …) do **not yet carry signature fields**, so enforcing the policy on WASM/Extism/Rhai/Python *loads* is the remaining plugin-signing work (tracked follow-up — the deferred Phase-D signing subsystem); for those, hash-pinning recorded at install is the durable control.
+
+There is intentionally **no global `PluginConfig` for grants or resource limits** — those are per-plugin capabilities resolved at load time (least privilege), not instance-wide defaults. The one instance-wide knob is the host **trust** policy (`plugin_trust`, above). See [Part XVII: Plugin Framework](#part-xvii-plugin-framework) for the capability model and manifest shape.
 
 ---
 
@@ -4956,6 +5209,324 @@ Carve-outs that have surfaced in user questions and are explicitly out of scope 
 
 ---
 
+# Part XVII: Plugin Framework
+
+Uni's extensibility is a single registry-backed plugin framework. Every extension — a scalar function, an aggregate, a Locy aggregate, a procedure, a storage backend, an index kind, a CRDT, a graph algorithm, a hook, a trigger, an auth provider — implements one of the surface traits in the foundation crate `uni-plugin`, is described by a `PluginManifest`, registers through a `PluginRegistrar`, and is resolved at call time from a shared `PluginRegistry`. The framework replaced roughly five separate ad-hoc registries (the old `CustomFunctionRegistry`, the closed `FoldAggKind` enum, the hardcoded procedure-dispatch match, the algorithm registry, and hardcoded index/storage dispatch) with one path. Built-in functionality is *dogfooded* through that same path: the built-in vector index is one `IndexKindProvider` among many, the Lance backend is one `StorageBackend` registration, and the Locy `MNOR`/`MPROD` aggregates are `LocyAggregate` registrations. If the framework cannot express a built-in, the framework is wrong and we fix the framework — that is the integrity invariant.
+
+```mermaid
+graph TB
+    subgraph Authoring["Five Loaders"]
+        Rust["Compile-time Rust<br/>uni-plugin-builtin / -apoc-core"]
+        CM["WASM Component Model<br/>uni-plugin-wasm"]
+        Extism["WASM Extism<br/>uni-plugin-extism"]
+        Rhai["Rhai<br/>uni-plugin-rhai"]
+        PyO3["PyO3<br/>uni-plugin-pyo3"]
+    end
+    Reg["PluginRegistrar<br/>(capability + namespace gate,<br/>staged, atomic commit)"]
+    Registry["PluginRegistry<br/>(DashMap point-lookups +<br/>ArcSwap list surfaces)"]
+    Exec["Executor / Planner / Writer<br/>resolve at call time"]
+    Rust --> Reg
+    CM --> Reg
+    Extism --> Reg
+    Rhai --> Reg
+    PyO3 --> Reg
+    Reg -->|commit_to_registry| Registry
+    Registry --> Exec
+```
+
+> **Status note.** This Part documents what is shipped and test-verified today. Where the proposal's acceptance scorecard (plugin-framework proposal §19, 30 criteria: 19 ✅ / 6 ▶ / 6 ⏳) marks an item *substantively in place* (▶) or *pending* (⏳) — the CLI surface, OCI/Hub install, the Component-Model capability-gated host-fn body, GUC config parameters, and non-Rust authoring of surfaces beyond scalar/aggregate/procedure — it is called out explicitly in [§XVII.18](#whats-not-in-the-plugin-framework-current-scope).
+
+## What Is the Plugin Framework?
+
+The unit of extension is a **plugin**: a type implementing the `Plugin` trait (`crates/uni-plugin/src/plugin.rs`), which exposes a `manifest(&self) -> &PluginManifest` and a `register(&self, r: &mut PluginRegistrar) -> Result<(), PluginError>`. Inside `register`, the plugin calls one registrar method per extension it provides. The registrar validates each call against the plugin's *effective capabilities* and its qualified-name namespace, stages the registration, and — only if every call in the batch succeeds — atomically commits them to the registry via `commit_to_registry`. A capability mismatch fails the whole `register()` call; partial registration is never observable.
+
+Names are `QName { plugin: SmolStr, local: SmolStr }` (`crates/uni-plugin/src/qname.rs`) — reverse-DNS plugin id plus a local name, e.g. `ai.dragonscale.geo` × `haversine`. The registry is consulted by the executor, planner, and writer through point-lookups; there are zero hardcoded dispatch arms left (the mechanical invariant: `grep` for `enum FoldAggKind` or a `match name { "MIN" | "MAX" | ... }` in `crates/uni-query/src/query/df_graph/` returns nothing).
+
+The foundation crate is `uni-plugin` (traits, manifest, capability, registry, registrar, lifecycle, verification, observability). Loader crates and built-in sources sit above it (see [§XVII.5](#five-loaders--the-loader-matrix)).
+
+## Why Plugins?
+
+- **Closing closed-enum dispatch.** Before the framework, adding an aggregate or procedure meant editing a `match` in the executor. That coupling is gone: a new `LocyAggregate` or `ProcedurePlugin` registers and is dispatched purely through its trait object. The non-recursive Locy `FOLD` executor, the last holdout, now dispatches through `LocyAggState` rather than a name match (`crates/uni-query/src/query/df_graph/locy_fold.rs`).
+- **Host-language extensibility.** Five loaders cover the spectrum: Rust for native performance, WASM (Component Model and Extism) for sandboxed polyglot third parties, PyO3 for data scientists authoring in-process, Rhai for sandboxed pure-Rust ops scripts.
+- **Capability gating as a security boundary.** A plugin gets only the host services its grant intersection permits. An untrusted WASM scalar fn that declared only `[ScalarFn]` cannot touch the filesystem, the network, or run a host query — the relevant host functions are not even linked into its instance.
+- **A measured perf path.** Scalar fns that declare a primitive Arrow return type (the native path) skip the `LargeBinary` `CypherValue` round-trip — the proposal's criterion #9 perf win.
+
+## Capability Model
+
+`CapabilitySet` (`crates/uni-plugin/src/capability.rs`) is the type that gates what a plugin may do. The `Capability` enum (`#[non_exhaustive]`, serde tag `kind`, kebab-case) has three families:
+
+**Extension surfaces** (gate which registrar method a plugin may call):
+`ScalarFn`, `AggregateFn`, `WindowFn`, `Procedure` (+ the finer `ProcedureWrites` / `ProcedureSchema` / `ProcedureDbms`), `LocyAggregate`, `LocyPredicate`, `Operator`, `Index`, `Storage`, `Algorithm`, `Crdt`, `Hook`, `Trigger`, `BackgroundJob { max_concurrent }`, `Type`, `Auth`, `Authz`, `Connector`, `Collation`, `Cdc`, `Catalog`, and the meta-capability `PluginDeclare`.
+
+**Host-import surfaces** (gate which host services the plugin may call):
+`Network { allow }`, `Filesystem { read, write }`, `HostQuery { read_only, scopes }`, `Kms { key_ids }`, `Secret { ids }`, `Lock { granularity }` (where `LockGranularity ∈ {Nodes, Edges, Both, Global}`), `Config { keys }`, `PluginStorage`.
+
+**Resource quotas:**
+`MemoryBytes(u64)`, `TotalMemoryBytes(u64)`, `FuelPerCall(u64)`, `WallClockMillisPerCall(u64)`, `ConcurrentInstances(u32)`, `MaxResultRows(u64)`.
+
+The **effective** capability set is `declared ∩ granted`, computed by `CapabilitySet::intersect` (`capability.rs`): every declared capability whose *variant* matches a granted one is retained (`contains_variant`); where the same variant carries different attenuations on each side, both are kept and the runtime enforces each. Denial is not silent — a registrar call that needs a capability absent from the effective set fails with `PluginError::CapabilityRequired`, and the sandboxed loaders surface a `denied_capabilities` list in their load outcome.
+
+```rust
+// Manifest declares [Filesystem, Network]; host grants only [Filesystem]:
+let effective = declared.intersect(&granted);
+// effective = [Filesystem]; Network is denied → host-net imports are not linked,
+// and any attempt to register a Network-requiring surface fails the register() call.
+```
+
+## Plugin Manifest, ABI & Signing
+
+`PluginManifest` (`crates/uni-plugin/src/manifest.rs`) is the plugin's self-description:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | `PluginId` | reverse-DNS, e.g. `ai.dragonscale.geo` |
+| `version` | `semver::Version` | plugin version |
+| `abi` | `AbiRange` | host-ABI semver range it targets |
+| `depends_on` | `Vec<PluginDep>` | `{id, version_req, optional}` |
+| `capabilities` | `CapabilitySet` | requested at load time |
+| `determinism` | `Determinism` | `Pure` / `SessionScoped` / `Nondeterministic` |
+| `side_effects` | `SideEffects` | `ReadOnly` / `Writes` / `ExternalIO` |
+| `scope` | `Scope` | `Instance` / `Session` |
+| `hash` | `Option<String>` | Blake3 hex, for hash-pinning |
+| `signature` | `Option<ManifestSignature>` | `{algorithm, key_id, value}` |
+| `provides` | `ProvidedSurfaces` | declared surface inventory |
+| `docs`, `metadata` | `String`, `BTreeMap` | free-form |
+
+- **ABI range.** `AbiRange::parse` (`manifest.rs`) delegates to semver `VersionReq`, so `^1`, `^2`, `>=1, <99` all parse; `matches(host_major)` probes whether a host major satisfies the range. The framework keys multi-version linking off the *major* (see [§XVII.13](#hot-reload--multi-version-abi)).
+- **Hash pinning.** `verify_hash_pin` (`crates/uni-plugin/src/verify.rs`) checks `manifest.hash == blake3(payload).to_hex()`. Unconditional, always available.
+- **Signed manifests.** `verify_signed_manifest` / `verify_ed25519` perform real Ed25519 verification (`ed25519_dalek`) against a `TrustRoot`. This lives behind the `ed25519` cargo feature, which is **on by default** (`default = ["ed25519"]`).
+- **`ProvidedSurfaces`** enumerates what `register()` will populate (`scalar_fns`, `aggregate_fns`, `procedures`, `locy_aggregates`, `storage_backends`, `index_kinds`, `crdt_kinds`, `logical_types`, `connectors` as name lists; `hooks` / `triggers` / `background_jobs` as bools) — used by the host to validate and route before registration runs.
+
+## Five Loaders — the Loader Matrix
+
+All five loaders converge on `PluginRegistrar`; the execution layer is loader-agnostic. A registered `Arc<dyn ScalarPluginFn>` looks identical to the executor regardless of origin.
+
+| Axis | Rust | CM (wasmtime) | Extism | Rhai | PyO3 |
+|---|---|---|---|---|---|
+| Crate | `uni-plugin-builtin` / `-apoc-core` | `uni-plugin-wasm` | `uni-plugin-extism` | `uni-plugin-rhai` | `uni-plugin-pyo3` |
+| Sandbox | none (trusted) | wasmtime + WIT | extism host-fn ABI | Rhai engine | none (trusted) |
+| Boundary | native trait | WIT bindings (Arrow IPC) | Arrow IPC / JSON over linear memory | `rhai::Engine` | PyCapsule (Arrow C Data Interface) |
+| Surfaces shipped | **all 23** | scalar / aggregate / procedure | scalar / aggregate / procedure | scalar / aggregate / procedure | scalar / aggregate / procedure |
+| Vectorized scalars | n/a | row/IPC-batch | row/IPC-batch | row | **yes** (`vectorized=True`) |
+| Cap. gating | compile-time | structural (linker omits imports) | runtime (host-fn filter) | runtime (engine factory) | manifest + runtime |
+| Parity tier | reference | byte-identical | byte-identical | ≤ 4 ULP | ≤ 4 ULP |
+| Reload | full | epoch-fenced | epoch-fenced | full | session-scope unregister |
+| Parity test | (reference) | `m6_cross_abi_parity.rs` | (same) | `m7_rhai_cross_loader_parity.rs` | `m8_pyo3_cross_loader_parity.rs` |
+
+> **Note:** Only the Rust path can author all 23 extension surfaces today. The WASM Component Model defines exactly three WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin` in `crates/uni-plugin-wasm/wit/world.wit`); Extism uses a host-fn ABI rather than WIT worlds; Rhai and PyO3 likewise author scalar/aggregate/procedure. Surfaces beyond those three are compile-time-Rust-only in v1 (proposal §19 criterion 30). Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
+
+## Loading a Plugin (Host API)
+
+### Rust
+
+```rust
+// In-process typed plugin (the path built-ins and most internal code use):
+uni.add_plugin(my_plugin)?;                       // -> Result<()>
+
+// Sandboxed / scripted loaders (each feature-gated; each returns its own
+// LoadOutcome carrying plugin_id, version, effective_capabilities,
+// denied_capabilities, scalars_registered, aggregates_registered,
+// procedures_registered, and a runtime/pool handle):
+uni.load_wasm_component(&WasmLoader::new(), &bytes, &host_grants, &registrar_caps)?;
+uni.load_wasm_extism(&ExtismLoader::new(),  &bytes, &host_grants, &registrar_caps)?;
+uni.load_rhai_plugin(&RhaiLoader::new(),    script,  &registrar_caps)?;
+uni.load_python_plugin(py, &loader,         module_src, module_name, &registrar_caps)?;
+```
+
+> **Note:** There is no single shared `LoadOutcome` type — each loader crate defines its own with the same conceptual fields. `add_plugin` returns `Result<()>` (the typed plugin self-reports through its manifest). The `load_*` methods are gated behind the `wasm-plugins`, `extism-plugins`, `rhai-plugins`, and `pyo3-plugins` features respectively.
+
+### Python
+
+```python
+# Host load APIs the Python wheel ships — each a thin passthrough to the Rust
+# `Uni` method (grants list -> CapabilitySet, build loader, call through, return a dict):
+db.load_rhai_plugin(script, grants=None)
+db.load_python_plugin(module_src, module_name, grants=None)
+db.load_wasm_component(wasm_bytes, grants=None)   # WASM Component Model (wasmtime)
+db.load_wasm_extism(wasm_bytes, grants=None)      # Extism
+# The default wheel bundles wasmtime; variant wheels (onnx/cuda/metal) that omit the
+# `wasm-plugins`/`extism-plugins` features compile these two methods out.
+
+# In-process authoring via the host-injected `db` decorator sink:
+@db.scalar_fn("haversine", args=["float","float","float","float"],
+              returns="float", determinism="pure")
+def haversine(lat1, lon1, lat2, lon2): ...
+
+@db.aggregate_fn("wmean", args=["float","float"], returns="float", determinism="pure")
+class WeightedMean: ...
+
+@db.procedure("expand", ...)
+def expand(...): ...
+# Session-scoped equivalents exist on `session` (@session.scalar_fn / aggregate_fn /
+# procedure), and shadow the global registry for the session's lifetime.
+```
+
+### CLI
+
+`uni plugin install foo.rhai` dispatches the Rhai install today. The broader `uni plugin {install,list,grant,remove,info,reload,verify}` surface and `oci://` / `extism://hub/` install are pending the M12 cutover (⏳).
+
+## Authoring — the `geo.haversine` reference
+
+The same scalar (great-circle distance, signature `(lat1, lon1, lat2, lon2: f64) -> f64`) ships as a worked example for every loader under `examples/`:
+
+| Loader | Example dir | Load path |
+|---|---|---|
+| Component Model | `examples/example-wasm-geo/` (has `wit/`) | `Uni::load_wasm_component` |
+| Extism | `examples/example-extism-geo/` | `Uni::load_wasm_extism` |
+| Rhai | `examples/example-rhai-geo/` (`geo.rhai`) | `Uni::load_rhai_plugin` |
+| PyO3 | `examples/example-pyo3-geo/` (`geo.py`) | `Uni::load_python_plugin` |
+
+Cross-loader byte-parity is a real test: `crates/uni/tests/m6_cross_abi_parity.rs::cross_abi_haversine_results_match` loads the CM and Extism artifacts into one `Uni` under different qnames and asserts `e.to_bits() == c.to_bits()` across all rows; the Rhai and PyO3 variants agree to ≤ 4 ULP (`m7_*` / `m8_*`).
+
+## Surface Traits Reference
+
+Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 'static`, and speaks Arrow at the boundary. The registrable provider traits, with their real names (several differ from older docs — `LogicalTypeProvider` not "TypePlugin", `CollationProvider` not "Collation", `OperatorProvider`, `PregelProgramProvider`):
+
+| Surface | Trait (file) | Key method(s) | Built-in impls shipped |
+|---|---|---|---|
+| Scalar fn | `ScalarPluginFn` (scalar.rs) | `signature`, `invoke` | APOC-core + examples |
+| Aggregate | `AggregatePluginFn` + `PluginAccumulator` (aggregate.rs) | `create_accumulator`; `update_batch`/`merge_batch`/`evaluate` | — |
+| Window fn | `WindowPluginFn` (window.rs) | `evaluate` | — |
+| Procedure | `ProcedurePlugin` + `ProcedureHost` (procedure.rs) | `signature`, `invoke` | 38 APOC + schema/algo/search |
+| Locy aggregate | `LocyAggregate` + `LocyAggState` (locy.rs) | `semilattice`, `create`, `ingest_indices`, `finalize` | **10** (MIN/MAX/SUM/MSUM/COUNT/COUNTALL/AVG/COLLECT/MNOR/MPROD) |
+| Locy predicate | `LocyPredicate` (locy.rs) | `evaluate` | — |
+| Operator | `OperatorProvider` (operator.rs) | `logical_name`, `plan`, `rule` | — |
+| Optimizer rule | `OptimizerRuleProvider` (operator.rs) | — | pushdown negotiation |
+| Pushdown markers | `SupportsFilter/Projection/Limit/TopN/AggregatePushdown` (pushdown.rs) | negotiation | (5 markers) |
+| Index kind | `IndexKindProvider` + `IndexBuild`/`IndexHandle` (index.rs) | `kind`, `build`, `open` | vector index |
+| Storage | `StorageBackend` + `Storage` (storage.rs) | `scheme`, `supports_branching`, async read/write/fork | Lance backend |
+| Algorithm | `AlgorithmProvider` + `AlgorithmHost` (algorithm.rs) | `signature`, `run` | label propagation + 36 via adapter |
+| Pregel | `PregelProgramProvider` (algorithm.rs) | program steps | — |
+| CRDT | `CrdtKindProvider` + `CrdtState` (crdt.rs) | `kind`, `empty`, `from_persisted` | 5 (LWW/OR-Set/G-Counter/MV-Register/RGA) |
+| Hook | `SessionHook` (hook.rs) | `on_parse`/`on_analyze`/`on_plan`/`on_execute_start` | phased + legacy bridge |
+| Trigger | `TriggerPlugin` (trigger.rs) | `subscription`, `fire`, `on_deferred` | — |
+| Background job | `BackgroundJobProvider` + `JobHost` (background.rs) | `definition`, `execute` | ttl_sweep / compaction / statistics_refresh |
+| Logical type | `LogicalTypeProvider` (types.rs) | `name`, `arrow_type`, `from_literal` | 5 (uri / geo.point / email / ipv4 / ipv6) |
+| Collation | `CollationProvider` (collation.rs) | `name`, `compare`, `normalize` | 5 (ascii ×2, unicode ×2, natural) |
+| Auth | `AuthProvider` (connector.rs) | `authenticate` | — |
+| Authz | `AuthzPolicy` (connector.rs) | `check` | — |
+| Connector | `Connector` (connector.rs) | `protocol`, `start`, `stop` | — |
+| CDC output | `CdcOutputProvider` + `CdcStream` (cdc.rs) | `name`, `start` | — |
+| Catalog | `CatalogProvider` + `CatalogTable` (catalog.rs) | `list_labels`, `resolve_label` | — |
+| Replacement scan | `ReplacementScanProvider` (catalog.rs) | — | — |
+
+The authoritative *surface count* is the `Capability` enum's 23 extension variants; the proposal's older "25 surfaces" prose predates that reconciliation.
+
+## The PluginRegistry — Read Side
+
+`PluginRegistry` (`crates/uni-plugin/src/registry.rs`) backs all reads. It uses two storage strategies:
+
+- **Keyed point-lookups via `DashMap`** for surfaces addressed by name/key: `scalar_fn(&QName)`, `aggregate(&QName)`, `procedure(&QName)` / `procedure_with_arity(&QName, usize)` / `procedure_overloads(&QName)`, `locy_aggregate(&QName)`, `index_kind(&IndexKind)`, `storage_backend(&str)` (scheme), `crdt_kind(&CrdtKind)`.
+- **Append/list surfaces via `ArcSwap<Vec<…>>`** for collections consulted in bulk — truly wait-free reads: `triggers()`, `auth_providers()`, `authz_policies()`, hooks, connectors, optimizer rules, background jobs. A reader gets a consistent `Arc` snapshot; a reload swaps a new `Arc` in without blocking readers.
+
+`remove_plugin(&PluginId)` clears every registration a plugin owns across all surfaces (tracked per-plugin), the basis for hot-reload and unload.
+
+Call sites consult the registry directly. The procedure dispatcher (`crates/uni-query/src/query/executor/procedure.rs`) collapses to a resolve-or-fallback: `resolve_user_procedure` maps a dotted call name (`uni.text.toUpper`) onto a registry entry — exact `ns.local` first, then stripping the `uni.` prefix and trying the `["uni","builtin","apoc-core","custom"]` namespaces — and invokes the entry if found. The M4 cutover removed the hardcoded dispatch match; `procedure_call.rs::execute_procedure` is now `if registry.resolve(...) { invoke } else { tck_mock_fallback }`.
+
+## Declared Plugins (`uni.plugin.declare*`)
+
+The meta-plugin path — Uni's analogue of `apoc.custom` — lets users define new extensions *from inside Cypher*. The `uni-plugin-custom` crate registers procedures in the `custom` namespace that, when executed, call `PluginRegistrar` themselves; users invoke them as `uni.plugin.*` (the `uni.` prefix is stripped during resolution):
+
+```cypher
+CALL uni.plugin.declareFunction(
+  'myco.discount', '(price: float, pct: float) -> float',
+  'cypher', 'RETURN price * (1.0 - pct)');
+
+CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...');  -- WRITE mode needs Capability::ProcedureWrites
+CALL uni.plugin.declareAggregate('myco.wmean', ...);
+CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...);
+CALL uni.plugin.listDeclared();
+CALL uni.plugin.dropDeclared('myco.discount');
+```
+
+- **Integrity.** `uni-plugin-custom` performs dependency-missing detection, cycle detection (`CustomError::DependencyCycle` raised on insert), and drop-with-dependents protection (cascade/leaves-first removal).
+- **Persistence.** Declarations are durable: a dual-write via `LazyCypherSink` (`crates/uni-plugin-host/src/persistence.rs`) materializes a `_DeclaredPlugin` system-label node (`MERGE (p:_DeclaredPlugin {qname:…})`) *and* a JSON sidecar, so declared extensions survive restart and re-register at startup. (Note: `crates/uni/src/persistence.rs` is a thin re-export of the host crate's module.)
+
+## Background Jobs & Scheduler
+
+The scheduler (M11) drives durable, recurring maintenance:
+
+- **`Schedule`** (`crates/uni-plugin/src/traits/background.rs`): `Once(SystemTime)`, `Periodic(Duration)`, `Cron(SmolStr)`, `Manual`.
+- **`BackgroundJobProvider`**: `execute(ctx) -> Result<JobOutcome, FnError>`, where `JobOutcome ∈ { Done, DoneAndReschedule(Duration), Failed { reason, retry } }`.
+- **`SchedulerHost`** (`crates/uni-plugin-host/src/scheduler.rs`): tokio-backed, polls every `DEFAULT_TICK_INTERVAL` (100 ms), dispatches due jobs via `spawn_blocking`.
+- **Cypher API:** `uni.periodic.{schedule, cancel, list, submit, iterate, commit}`. **Rust API:** `Uni::periodic_schedule`, `Uni::periodic_cancel`, `Uni::periodic_list`.
+- **Built-in jobs** (`uni.system.*`): `ttl_sweep` (real — runs `MATCH (n) WHERE n.__ttl < timestamp() DETACH DELETE n` via a host hook), `compaction` (real — `host.compact_storage()`), `statistics_refresh` (a tracing stub pending a planner statistics API).
+- **Persistence:** `SystemLabelSchedulerPersistence` dual-writes `<data_path>/_system/background_jobs.json` and `_BackgroundJob` graph nodes.
+- **Resilience:** a `CircuitBreaker` (`crates/uni-plugin/src/circuit_breaker.rs`) opens after 10 consecutive failures and cools down for 30 s with a half-open probe.
+
+## Triggers
+
+`TriggerPlugin` (`crates/uni-plugin/src/traits/trigger.rs`) reacts to mutations:
+
+- **`fire(ctx: TriggerContext, events: &MutationBatch) -> Result<TriggerOutcome, FnError>`** plus `subscription()` (what the trigger watches) and `on_deferred()` (durable-retry callback).
+- **`TriggerPhase`**: `BeforeMutation`, `AfterMutation`, `BeforeCommit`, `AfterCommit`. Independently, **`FireMode`** ∈ `{ Synchronous, Async, EventualConsistency }` controls whether firing blocks the writer, runs on the runtime, or goes through a durable best-effort retry queue.
+- **`TriggerOutcome`**: `Continue`, `Reject { reason }` (aborts the commit when fired in a *before* phase), `Defer { until }` (re-enqueue).
+- **`MutationBatch`** wraps an Arrow `RecordBatch` (`events: Arc<RecordBatch>`) with columns `event_kind | vid_or_eid | label | property | old_value | new_value`; event kinds are `TriggerEventMask` bit-constants (`NODE_CREATE` … `LABEL_REMOVED`).
+
+## Hot Reload & Multi-Version ABI
+
+A captured `Arc<dyn ScalarPluginFn>` keeps serving its version while a post-reload registry lookup returns the new one — long-running queries finish on the version they began with (the arc-swap invariant, tested in `crates/uni/tests/hot_reload_consistency.rs`).
+
+- **`LifecycleState`** (`crates/uni-plugin/src/lifecycle.rs`): `Loaded → Linked → Initialized → Active → Draining → Removed`.
+- **`EpochFencedReload`**: `begin_drain` / `wait_for_drain` / `finalize` — drains in-flight invocations before swapping.
+- **`MultiVersionLinker`** (`crates/uni-plugin-wasm/src/multi_version.rs`): per-major wasmtime linker map keyed by `(host_major, caps_signature)`, so two ABI majors can coexist; `AbiRange` selects the linker.
+
+## Observability
+
+- **`init_otel_subscriber(cfg: OtelConfig) -> Result<OtelGuard>`** (`crates/uni-plugin-host/src/observability.rs`): an opt-in OTLP/gRPC exporter over `opentelemetry 0.27` + `tracing-opentelemetry 0.28`. Opt-in so it does not conflict with an embedder's own subscriber; dropping the `OtelGuard` shuts the provider down.
+- **`host-log`** is the one host import available to every loader unconditionally — plugin tracing routes into the host's `tracing` macros at the matching level.
+- **`InvocationKind` + `record_invocation`** (`crates/uni-plugin/src/observability.rs`) emit per-plugin invocation telemetry (qname, kind, row count, elapsed, ok). Plugin-side `host.span_*` WIT imports are deferred (Phase D).
+
+## The Conformance Suite
+
+`uni-plugin-conformance` runs a fixed 6-probe suite against any plugin, asserting the manifest/registration contract every loader must honor:
+
+1. `manifest.parse` — manifest yields a non-empty id.
+2. `manifest.id_format` — id is reverse-DNS or a reserved id.
+3. `abi.in_range` — ABI matches some host major in `0..=63`.
+4. `capabilities.declared` — the `CapabilitySet` accessor is safe to read.
+5. `registration.commit` — `register()` + `commit_to_registry` on a fresh registry succeeds.
+6. `registration.idempotent` — remove + re-register round-trips.
+
+Probe ids are stability-tested (`conformance_probes_have_stable_ids`, in `crates/uni-plugin-pyo3/tests/conformance.rs`), and each loader has an end-to-end `…haversine…` load+invoke test. The suite is *registration*-focused — it validates that a plugin loads and registers cleanly, the foundation every higher-level invocation depends on.
+
+## Plugin Best Practices
+
+| Practice | Details |
+|---|---|
+| **Use Rust for hot paths** | Performance-critical scalars belong on the native path — no sandbox tax, no IPC framing. |
+| **Use PyO3/Rhai for ops & data science** | In-process authoring for notebooks (`@db.scalar_fn`) and sandboxed ops scripts. |
+| **Use CM/Extism for untrusted/polyglot code** | Capability-gated sandboxing; byte-identical parity with the Rust reference. |
+| **Declare minimum capabilities** | `[ScalarFn]` is enough for a pure-compute fn — fewer caps, smaller attack surface. |
+| **Mark determinism** | `determinism: Pure` lets the planner memoize. |
+| **Bound runaway scripts** | `FuelPerCall(N)` / `WallClockMillisPerCall(N)` for Rhai/WASM. |
+| **Batch in PyO3** | `@db.scalar_fn(vectorized=True)` crosses the GIL once per `RecordBatch`, not per row. |
+| **Sign & pin in production** | Ship a `hash` (Blake3) and an Ed25519 `signature` (verification is default-on). |
+
+## Plugin Anti-Patterns
+
+| Anti-Pattern | Problem | Solution |
+|---|---|---|
+| **Over-broad capabilities** | Reaching for `Filesystem`/`Network` when a `HostQuery` callback suffices | Declare only what you call; the conformance contract favors minimal sets |
+| **Per-row Python objects** | `vectorized=False` scalars synthesize objects per row → GIL thrash | Use `vectorized=True` or move to Rust |
+| **Holding WASM linear-memory pointers across calls** | The host owns those buffers between `invoke` calls | Treat each invocation as stateless over host memory |
+| **Unsigned production plugins** | No provenance / tamper-evidence | Hash-pin + Ed25519-sign |
+| **Declaring unused capabilities** | Inflated trust surface | Drop them — keep `declared == used` |
+
+## What's Not in the Plugin Framework (Current Scope)
+
+Explicit deferrals, matching the proposal §19 scorecard (▶ in place / ⏳ pending) so readers don't expect them yet:
+
+- **Plugin CLI** (`uni plugin {install,list,grant,remove,info,reload,verify}`) — M12 (⏳). Only `uni plugin install foo.rhai` ships today.
+- **`oci://…` install** (⏳) and **`extism://hub/…` install** (⏳) — M12.
+- **Component-Model capability-gated host-fn body** — the structural gating (linker omits host-fs/host-net/host-kms imports) is in place; an end-to-end `host-fs.read` body is the remaining half of criterion 6 (▶/⏳).
+- **GUC config parameters** (`config_param`, `SHOW`/`SET <plugin>.<name>`, `host.config_get`) — not implemented; tracked as criterion 29 (⏳), to be designed against the first plugin that needs a tunable.
+- **Non-Rust authoring of surfaces beyond scalar/aggregate/procedure** — the other 20 surfaces are Rust-only in v1; `operator`/`storage` are infeasible across the Component Model (in-process trait objects, `&Expr` trees, async streams), `crdt`/`connector` WIT worlds are tractable but deferred. Criterion 30 (⏳).
+- **Secrets WIT membrane** (`host-secrets`) and **plugin-side `host.span_*` OTel imports** — Phase D (▶).
+- **APOC long tail** — 38 procedures across 6 namespaces ship; the broader APOC surface (refactor/load/export/periodic/cypher.run/…) is open-ended.
+
+---
+
 # Appendices
 
 ## Appendix A: CLI Reference
@@ -4972,6 +5543,9 @@ The `uni` CLI provides command-line access to Uni databases.
 | `snapshot list` | List all snapshots | `uni snapshot list --path ./db` |
 | `snapshot create` | Create a snapshot | `uni snapshot create release-v1 --path ./db` |
 | `snapshot restore` | Restore to a snapshot | `uni snapshot restore abc-123 --path ./db` |
+| `plugin install` | Install a plugin by extension/scheme | `uni plugin install ./geo.rhai --grants ScalarFn` |
+
+> **Note:** `plugin install` dispatches by extension/scheme. The `.rhai` branch is shipped (requires the `rhai-plugins-cli` feature); `oci://…` and `http(s)://…` install land in M12. The broader `uni plugin {list, grant, remove, info, reload, verify}` surface is also M12. See [Part XVII](#part-xvii-plugin-framework).
 
 ### REPL Features
 
@@ -5122,6 +5696,8 @@ Quick reference of all anti-patterns from every chapter:
 | **Candle** | Native Rust ML inference library used for auto-embedding generation |
 | **CRDT** | Conflict-free Replicated Data Type — data structures that merge deterministically without coordination |
 | **CSR** | Compressed Sparse Row — graph adjacency format providing O(1) neighbor lookups |
+| **Capability / CapabilitySet** | The grant set gating what a plugin may do — extension surfaces, host imports, and resource quotas (`uni-plugin`) |
+| **Conformance Suite** | The 6-probe manifest/registration check (`uni-plugin-conformance`) every plugin loader must pass |
 | **Cypher** | OpenCypher graph query language (pattern matching, traversal, mutations) |
 | **DataFusion** | Apache DataFusion query engine used for physical plan execution |
 | **DeltaDataset** | L1 sorted runs storing edge mutations (inserts/deletes) with MVCC versions |
@@ -5129,6 +5705,8 @@ Quick reference of all anti-patterns from every chapter:
 | **EdgeDataset** | Per-type LanceDB tables storing edge data with properties |
 | **EID** | Edge ID — 64-bit auto-increment identifier for edges |
 | **ext_id** | External ID — user-provided string primary key, unique per label |
+| **Declared Plugin** | An extension defined from Cypher via `uni.plugin.declare*`, persisted as a `_DeclaredPlugin` node + JSON sidecar |
+| **Effective Capabilities** | declared ∩ granted — the capabilities a plugin actually receives after intersection |
 | **GCounter** | Grow-only Counter CRDT — monotonically increasing counter with per-actor tracking |
 | **GSet** | Grow-only Set CRDT — set that only supports add operations |
 | **GraphProjection** | Materialized dense CSR graph in memory for iterative algorithms |
@@ -5138,6 +5716,7 @@ Quick reference of all anti-patterns from every chapter:
 | **L1** | Level 1 — LanceDB sorted runs (delta tables) produced by L0 flushes |
 | **L2** | Level 2 — compacted base tables produced by background compaction |
 | **LanceDB** | Arrow-native columnar database used as Uni's storage engine |
+| **Loader (Plugin)** | One of five registration front-ends (Rust / WASM CM / Extism / Rhai / PyO3) converging on `PluginRegistry` |
 | **Locy** | Logic + Cypher — Datalog-inspired logic programming language extending Cypher |
 | **LSM** | Log-Structured Merge tree — write-optimized storage design pattern |
 | **LSN** | Log Sequence Number — monotonically increasing WAL entry identifier |
@@ -5145,14 +5724,20 @@ Quick reference of all anti-patterns from every chapter:
 | **LWWMap** | Last-Write-Wins Map CRDT — per-key timestamp-based conflict resolution |
 | **LWWRegister** | Last-Write-Wins Register CRDT — single-value timestamp-based conflict resolution |
 | **MainCsr** | Versioned CSR with per-edge MVCC metadata for snapshot queries |
+| **Manifest (Plugin)** | A plugin's self-description (id, version, ABI range, capabilities, hash, signature) — `PluginManifest` |
 | **MVCC** | Multi-Version Concurrency Control — each mutation creates a new version |
 | **ORSet** | Observed-Remove Set CRDT — set supporting add/remove with add-wins semantics |
+| **Plugin** | A type implementing the `Plugin` trait — the unit of extension, registered through `PluginRegistrar` |
+| **PluginRegistrar** | The capability-gated, namespace-validating builder a plugin's `register()` uses to stage registrations |
+| **PluginRegistry** | The shared registry (DashMap point-lookups + ArcSwap list surfaces) resolved at call time |
 | **PropertyManager** | Component handling lazy property loading with LRU cache and L0 overlay |
 | **Rga** | Replicated Growable Array CRDT — ordered sequence for collaborative editing |
 | **RRF** | Reciprocal Rank Fusion — score fusion method for hybrid search |
 | **SimpleGraph** | Custom in-memory graph data structure (in `uni-common`) used for L0 buffer and algorithms |
 | **Snapshot** | JSON manifest capturing a consistent point-in-time view of all datasets |
 | **Stratum** | Group of mutually-recursive Locy rules evaluated together in fixpoint |
+| **Surface Trait** | One of the ~23 extension-point traits in `uni-plugin/src/traits/` (ScalarPluginFn, LocyAggregate, …) |
+| **Trigger** | A `TriggerPlugin` that fires on mutations with phase + outcome (Continue / Reject / Defer) |
 | **UniId** | Content-addressed identifier — SHA3-256 hash of (label, ext_id, properties) |
 | **VCRegister** | Vector-Clock Register CRDT — causally consistent register |
 | **VectorClock** | Vector Clock CRDT — logical clocks for causal ordering |

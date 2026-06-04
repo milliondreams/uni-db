@@ -1,0 +1,22 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Customer": {
+      "id": 1
+    }
+  },
+  "properties": {
+    "Customer": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "score": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    }
+  },
+  "schema_version": 1
+}

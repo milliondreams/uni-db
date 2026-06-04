@@ -1,0 +1,48 @@
+{
+  "edge_types": {
+    "ASSESSED": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Customer": {
+      "id": 1
+    },
+    "Part": {
+      "id": 2
+    },
+    "Supplier": {
+      "id": 3
+    }
+  },
+  "properties": {
+    "ASSESSED": {
+      "base": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    },
+    "Customer": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Part": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Supplier": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

@@ -35,16 +35,6 @@ impl Btic {
         Ok(btic)
     }
 
-    /// Construct without validation. Caller must guarantee all invariants hold.
-    ///
-    /// # Safety (logical)
-    /// This is not `unsafe` in the Rust memory-safety sense, but producing an
-    /// invalid BTIC can cause incorrect comparison results and storage corruption.
-    #[allow(dead_code)]
-    pub(crate) fn new_unchecked(lo: i64, hi: i64, meta: u64) -> Self {
-        Self { lo, hi, meta }
-    }
-
     /// Validate all BTIC invariants on this value.
     pub fn validate(&self) -> Result<(), BticError> {
         // INV-1: lo < hi
@@ -133,11 +123,6 @@ impl Btic {
     /// Upper bound certainty.
     pub fn hi_certainty(&self) -> Certainty {
         Certainty::from_code(((self.meta >> 52) & 0x3) as u8).expect("validated on construction")
-    }
-
-    /// Version field (must be 0 in v1).
-    pub fn version(&self) -> u8 {
-        ((self.meta >> 48) & 0xF) as u8
     }
 
     // -----------------------------------------------------------------------
@@ -426,6 +411,5 @@ mod tests {
         assert_eq!(b.hi_granularity(), Granularity::Day);
         assert_eq!(b.lo_certainty(), Certainty::Approximate);
         assert_eq!(b.hi_certainty(), Certainty::Uncertain);
-        assert_eq!(b.version(), 0);
     }
 }

@@ -13,9 +13,11 @@ name = "uni"
 path = "src/main.rs"
 
 [dependencies]
-uni-db = { workspace = true, default-features = true }
+uni-db = { workspace = true, default-features = true, features = ["mimalloc"] }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+uni-plugin = { workspace = true }
+uni-plugin-rhai = { workspace = true, optional = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 rustyline = { workspace = true }
@@ -27,7 +29,10 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
-default = []
+default = ["rhai-plugins-cli"]
+# Enables `uni plugin install foo.rhai` — Rhai is pure-Rust, no extra
+# runtime cost; on by default.
+rhai-plugins-cli = ["dep:uni-plugin-rhai", "uni-db/rhai-plugins"]
 provider-candle = ["uni-db/provider-candle"]
 provider-mistralrs = ["uni-db/provider-mistralrs"]
 provider-onnx = ["uni-db/provider-onnx"]

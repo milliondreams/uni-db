@@ -35,7 +35,7 @@ pub struct ProjectionConfig {
 }
 
 /// Dense CSR representation optimized for algorithm execution.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphProjection {
     /// Number of vertices in the projection
     pub(crate) vertex_count: usize,
@@ -53,10 +53,6 @@ pub struct GraphProjection {
 
     /// Identity mapping
     pub(crate) id_map: IdMap,
-
-    /// Metadata
-    pub(crate) _node_labels: Vec<String>,
-    pub(crate) _edge_types: Vec<String>,
 }
 
 impl GraphProjection {
@@ -241,8 +237,6 @@ impl ProjectionBuilder {
             in_neighbors,
             out_weights,
             id_map,
-            _node_labels: self.config.node_labels,
-            _edge_types: self.config.edge_types,
         })
     }
 
@@ -455,6 +449,136 @@ impl ProjectionBuilder {
             .collect();
 
         Ok((out_edges, in_edges))
+    }
+}
+
+/// Row shape carried back from an inner Cypher projection query.
+///
+/// Node rows carry an `id` column (Int) plus arbitrary other columns
+/// that this builder ignores; edge rows carry `source`, `target`
+/// (required, Int) plus an optional weight column whose name the caller
+/// passes to [`GraphProjection::from_rows`].
+pub type ProjectionRow = std::collections::HashMap<String, uni_common::Value>;
+
+impl GraphProjection {
+    /// Build a [`GraphProjection`] from inner-query row data.
+    ///
+    /// Schema requirements:
+    /// - `node_rows`: every row must carry an `id` column (Int / UInt /
+    ///   any integer-typed value); other columns are ignored.
+    /// - `edge_rows`: every row must carry `source` and `target` (both
+    ///   Int) and may carry a column named `weight_column` (Float /
+    ///   convertible numeric) when the caller passes
+    ///   `weight_column = Some(name)`.
+    ///
+    /// Each `id` is mapped to a dense slot via [`IdMap`]; the same
+    /// `IdMap` resolves `source` / `target` ids to slots. Edges whose
+    /// endpoints are not in the node set are silently dropped (the
+    /// node query is the canonical projection of vertex membership).
+    ///
+    /// `include_reverse` mirrors the equivalent flag on
+    /// [`ProjectionConfig`]: when true, the in-CSR is built alongside
+    /// the out-CSR so PageRank-style algorithms can iterate in-neighbors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive error when a required column is missing or
+    /// has the wrong type. Edges referencing unknown ids are skipped
+    /// (not an error — they may represent edges out of the projection).
+    pub fn from_rows(
+        node_rows: &[ProjectionRow],
+        edge_rows: &[ProjectionRow],
+        weight_column: Option<&str>,
+        include_reverse: bool,
+    ) -> Result<Self> {
+        let mut id_map = IdMap::with_capacity(node_rows.len());
+        for (i, row) in node_rows.iter().enumerate() {
+            let vid_u = row
+                .get("id")
+                .and_then(value_as_u64)
+                .ok_or_else(|| anyhow!("node row {i} missing `id` (Int) column"))?;
+            id_map.insert(Vid::new(vid_u));
+        }
+        let vertex_count = id_map.len();
+
+        let mut out_edges: WeightedEdgeList = Vec::with_capacity(edge_rows.len());
+        let mut in_edges: WeightedEdgeList = if include_reverse {
+            Vec::with_capacity(edge_rows.len())
+        } else {
+            Vec::new()
+        };
+        for (i, row) in edge_rows.iter().enumerate() {
+            let src_u = row
+                .get("source")
+                .and_then(value_as_u64)
+                .ok_or_else(|| anyhow!("edge row {i} missing `source` (Int) column"))?;
+            let dst_u = row
+                .get("target")
+                .and_then(value_as_u64)
+                .ok_or_else(|| anyhow!("edge row {i} missing `target` (Int) column"))?;
+            let weight = if let Some(name) = weight_column {
+                row.get(name).and_then(value_as_f64).unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            let (Some(src_slot), Some(dst_slot)) = (
+                id_map.to_slot(Vid::new(src_u)),
+                id_map.to_slot(Vid::new(dst_u)),
+            ) else {
+                log::debug!(
+                    "from_rows: edge endpoint (src={src_u}, dst={dst_u}) not in node id map; dropping"
+                );
+                continue; // endpoint outside projection — drop silently
+            };
+            out_edges.push((src_slot, dst_slot, weight));
+            if include_reverse {
+                in_edges.push((dst_slot, src_slot, weight));
+            }
+        }
+
+        // NOTE: deliberately *not* calling `id_map.compact()` — the
+        // node-row insertion order is whatever the Cypher result
+        // returned, which is generally unsorted, and `compact`'s
+        // binary-search lookup assumes sorted insertion (see
+        // `IdMap::compact` warning). For Cypher / Named projections the
+        // memory overhead of keeping the hashmap is negligible relative
+        // to the actual algorithm working set.
+
+        let (out_offsets, out_neighbors, out_weights) =
+            build_csr(vertex_count, &out_edges, weight_column.is_some());
+        let (in_offsets, in_neighbors, _) = if include_reverse {
+            build_csr(vertex_count, &in_edges, false)
+        } else {
+            (vec![0; vertex_count + 1], Vec::new(), None)
+        };
+
+        Ok(GraphProjection {
+            vertex_count,
+            out_offsets,
+            out_neighbors,
+            in_offsets,
+            in_neighbors,
+            out_weights,
+            id_map,
+        })
+    }
+}
+
+fn value_as_u64(v: &uni_common::Value) -> Option<u64> {
+    use uni_common::Value;
+    match v {
+        Value::Int(i) if *i >= 0 => Some(*i as u64),
+        Value::Float(f) if f.is_finite() && *f >= 0.0 => Some(*f as u64),
+        _ => None,
+    }
+}
+
+fn value_as_f64(v: &uni_common::Value) -> Option<f64> {
+    use uni_common::Value;
+    match v {
+        Value::Float(f) => Some(*f),
+        Value::Int(i) => Some(*i as f64),
+        _ => None,
     }
 }
 

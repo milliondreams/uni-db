@@ -109,21 +109,15 @@ impl<'a> DirectTraversal<'a> {
                 visited.insert(neighbor, (current, eid, new_depth));
 
                 if neighbor == target {
-                    // Found target - check if path length is within bounds
-                    if new_depth >= min_hops && new_depth <= max_hops {
-                        return Some(self.reconstruct_path_from_visited(source, target, &visited));
-                    } else if new_depth < min_hops {
-                        // Path too short, but we found the shortest path
-                        // Since BFS finds shortest first, any other path will be longer
-                        // So if shortest is too short, we need to continue searching
-                        // Actually, in BFS the first path found IS the shortest, so we can't find
-                        // a longer path that still satisfies min_hops unless we use DFS or
-                        // enumerate all paths. For simplicity, return None if shortest is too short.
-                        return None;
+                    // Found target. We only expand while `depth < max_hops`,
+                    // so `new_depth <= max_hops` always holds here. BFS yields
+                    // the shortest path first, so if it is shorter than
+                    // `min_hops` no longer path can satisfy the bound either.
+                    return if new_depth >= min_hops {
+                        Some(self.reconstruct_path_from_visited(source, target, &visited))
                     } else {
-                        // Path too long (shouldn't happen since we stop at max_hops)
-                        return None;
-                    }
+                        None
+                    };
                 }
 
                 frontier.push_back((neighbor, new_depth));

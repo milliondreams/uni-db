@@ -47,8 +47,7 @@ Model excursion-driven failure triage in semiconductor manufacturing using real 
 Notebook:
 - Python: [Semiconductor Yield Excursion Triage](../examples/python/locy_semiconductor_yield_excursion.ipynb)
 
-Plan + Data:
-- Detailed notebook blueprint: [Semiconductor Yield Excursion Notebook Plan](semiconductor-yield-excursion-notebook-plan.md)
+Data:
 - Data bundle: [SECOM-derived notebook data](../examples/data/locy_semiconductor_yield_excursion/README.md)
 
 ## 7. Pharma Batch Genealogy Decisioning (Flagship #2)

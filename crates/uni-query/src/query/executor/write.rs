@@ -2,9 +2,10 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use super::core::*;
+use crate::query::df_graph::mutation_common::Prefetch;
 use crate::query::planner::LogicalPlan;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::DataType;
 use uni_common::core::id::{Eid, Vid};
@@ -13,11 +14,18 @@ use uni_common::{Path, Value};
 use uni_cypher::ast::{
     AlterAction, AlterEdgeType, AlterLabel, BinaryOp, ConstraintType as AstConstraintType,
     CreateConstraint, CreateEdgeType, CreateLabel, CypherLiteral, Direction, DropConstraint,
-    DropEdgeType, DropLabel, Expr, Pattern, PatternElement, RemoveItem, SetClause, SetItem,
+    DropEdgeType, DropLabel, Expr, NodePattern, Pattern, PatternElement, RemoveItem, SetClause,
+    SetItem,
 };
 use uni_store::QueryContext;
+use uni_store::runtime::l0_visibility;
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
+
+/// Canonical, hashable key for a single-node MERGE: the key properties as a
+/// `(name, value)` list sorted by name. Used to group existing vertices by key
+/// for the index fast path (issue #69).
+type MergeKey = Vec<(String, Value)>;
 
 /// Identity fields extracted from a map-encoded edge.
 struct EdgeIdentity {
@@ -25,6 +33,162 @@ struct EdgeIdentity {
     src: Vid,
     dst: Vid,
     edge_type_id: u32,
+}
+
+/// Per-variable accumulator for SetItem::Property items targeting a vertex.
+///
+/// Built lazily on the first SetItem touching each variable, then mutated
+/// in place across subsequent items. Flushed once at end of the SET
+/// clause (or earlier if a non-Property SetItem on the same var lands).
+struct PendingVertexSet {
+    vid: Vid,
+    labels: Vec<String>,
+    /// Full property map (storage union L0 from
+    /// `get_all_vertex_props_with_ctx` plus the touched values applied
+    /// in-order). Flushed to L0 whole; L0's `vertex_partial_keys` set
+    /// tells the flush which columns to send to Lance via MergeInsert.
+    props: HashMap<String, Value>,
+    /// `true` when the SET should flush via the partial-column MergeInsert
+    /// path: set when `UniConfig::partial_lance_writes` is on AND the
+    /// label has no generated columns. Generated-column labels still need
+    /// the full-row Append so the regenerated values land.
+    partial: bool,
+    /// Set of property keys touched by this statement. Threaded into L0
+    /// so the flush emits a `MergeInsertBuilder` source with exactly
+    /// these columns. Empty when `partial == false`.
+    touched: HashSet<String>,
+}
+
+/// Per-variable accumulator for SetItem::Property items targeting an edge.
+struct PendingEdgeSet {
+    src: Vid,
+    dst: Vid,
+    edge_type_id: u32,
+    eid: Eid,
+    edge_type_name: String,
+    /// `true` when the SET should flush via the partial-column
+    /// MergeInsert path on the per-edge-type delta tables (Round 12
+    /// §A). Set when `UniConfig::partial_lance_writes` is on.
+    partial: bool,
+    /// Property keys touched by this statement. Threaded into L0 so
+    /// the flush emits a `MergeInsertBuilder` source with exactly
+    /// these columns. Empty when `partial == false`.
+    touched: HashSet<String>,
+    props: HashMap<String, Value>,
+}
+
+/// Refuse to mutate an ephemeral node (M5g / proposal §4.13.1).
+/// Ephemeral entities are return-only — `Vid::EPHEMERAL_BIT` is set on
+/// any id minted by `host.allocate_transient_id()`.
+fn reject_if_ephemeral_vid(vid: Vid) -> Result<()> {
+    if vid.is_ephemeral() {
+        return Err(anyhow::Error::from(
+            uni_common::UniError::EphemeralWriteAttempt {
+                kind: "node",
+                id: vid.transient_id().unwrap_or(vid.as_u64()),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Returns a short variant name for a `Value`, used in type-mismatch error messages.
+fn value_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::String(_) => "String",
+        Value::Bytes(_) => "Bytes",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::Node(_) => "Node",
+        Value::Edge(_) => "Edge",
+        Value::Path(_) => "Path",
+        Value::Vector(_) => "Vector",
+        Value::Temporal(_) => "Temporal",
+        _ => "value",
+    }
+}
+
+/// Refuse to mutate an ephemeral edge (M5g / proposal §4.13.1).
+fn reject_if_ephemeral_eid(eid: Eid) -> Result<()> {
+    if eid.is_ephemeral() {
+        return Err(anyhow::Error::from(
+            uni_common::UniError::EphemeralWriteAttempt {
+                kind: "edge",
+                id: eid.transient_id().unwrap_or(eid.as_u64()),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a write whose target label is currently allocated as a
+/// virtual (catalog-backed) label.
+///
+/// Catalog tables are read-only from the host's perspective — there is
+/// no write-back path through `CatalogTable::scan` to the originating
+/// provider, so silently allowing SET/DELETE would leave ghosted state
+/// on the host side that diverges from the external catalog. The
+/// planner already rejects CREATE/MERGE on virtual labels via
+/// `Planner::reject_virtual_label_writes`; this helper is the
+/// equivalent gate on the runtime write path for SET-label-add and
+/// DELETE.
+///
+/// `op` names the offending operation for the error message (e.g.
+/// `"SET"`, `"DELETE"`).
+///
+/// # Errors
+///
+/// Returns an error if `registry` is `Some` and any name in `labels`
+/// is currently registered as a virtual label. Returns `Ok(())` when
+/// no plugin registry is wired (low-level callers without plugins).
+fn reject_virtual_label_write(
+    registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    labels: &[String],
+    op: &str,
+) -> Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    for label in labels {
+        if registry.virtual_label_by_name(label).is_some() {
+            return Err(anyhow!(
+                "Cannot {op} on virtual (catalog-resolved) label `{label}` — virtual \
+                 labels are read-only; write back via the originating catalog instead"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a write whose target edge-type ID is currently allocated as
+/// a virtual (catalog-backed) edge type. Runtime analog of
+/// [`reject_virtual_label_write`] for the edge path.
+///
+/// # Errors
+///
+/// Returns an error if `registry` is `Some` and `edge_type_id` resolves
+/// to a registered virtual edge type. Returns `Ok(())` when no plugin
+/// registry is wired.
+fn reject_virtual_edge_type_write(
+    registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    edge_type_id: u32,
+    op: &str,
+) -> Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    if let Some(entry) = registry.virtual_edge_type_by_id(edge_type_id) {
+        return Err(anyhow!(
+            "Cannot {op} on virtual (catalog-resolved) edge type `{}` — virtual edge \
+             types are read-only; write back via the originating catalog instead",
+            entry.name
+        ));
+    }
+    Ok(())
 }
 
 impl Executor {
@@ -124,23 +288,26 @@ impl Executor {
         new_props: HashMap<String, Value>,
         replace: bool,
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
         // Clone the target so we can hold &row references elsewhere.
         let target = row.get(variable).cloned();
+
+        // Declared-type guard for the whole-entity `SET n = map` / `SET n += map`
+        // forms, mirroring the per-property SET path (issue #68).
+        let schema = self.storage.schema_manager().schema();
 
         match target {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
                 let labels = node.labels.clone();
-                let current = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -153,6 +320,7 @@ impl Executor {
                     )
                     .await?;
                 }
+                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
                 let _ = writer
                     .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
@@ -164,10 +332,8 @@ impl Executor {
             Some(ref node_val) if Self::vid_from_value(node_val).is_ok() => {
                 let vid = Self::vid_from_value(node_val)?;
                 let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
-                let current = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -180,6 +346,7 @@ impl Executor {
                     )
                     .await?;
                 }
+                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
                 let _ = writer
                     .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
@@ -202,11 +369,14 @@ impl Executor {
                 let src = edge.src;
                 let dst = edge.dst;
                 let etype = self.resolve_edge_type_id(&Value::String(edge.edge_type.clone()))?;
-                let current = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_edge_props_with_prefetch(eid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
+                let write_props = Self::coerce_and_validate_props(
+                    write_props,
+                    &schema,
+                    std::slice::from_ref(&edge.edge_type),
+                )?;
                 writer
                     .insert_edge(
                         src,
@@ -232,10 +402,8 @@ impl Executor {
                     && map.contains_key("_dst") =>
             {
                 let ei = self.extract_edge_identity(map)?;
-                let current = prop_manager
-                    .get_all_edge_props_with_ctx(ei.eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_edge_props_with_prefetch(ei.eid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let edge_type_name = map
                     .get("_type")
@@ -246,6 +414,14 @@ impl Executor {
                             .schema_manager()
                             .edge_type_name_by_id_unified(ei.edge_type_id)
                     });
+                let write_props = match &edge_type_name {
+                    Some(name) => Self::coerce_and_validate_props(
+                        write_props,
+                        &schema,
+                        std::slice::from_ref(name),
+                    )?,
+                    None => write_props,
+                };
                 writer
                     .insert_edge(
                         ei.src,
@@ -335,7 +511,8 @@ impl Executor {
         );
         let edge_type_id = self.resolve_edge_type_id(
             map.get("_type")
-                .ok_or_else(|| anyhow!("Missing _type on edge map"))?,
+                .or_else(|| map.get("_type_name"))
+                .ok_or_else(|| anyhow!("Missing _type/_type_name on edge map"))?,
         )?;
         Ok(EdgeIdentity {
             eid,
@@ -386,7 +563,7 @@ impl Executor {
         if let Some(writer_arc) = &self.writer {
             // Flush first while holding the lock
             {
-                let mut writer = writer_arc.write().await;
+                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             } // Drop lock before compacting to avoid blocking reads/writes
 
@@ -419,7 +596,7 @@ impl Executor {
 
     pub(crate) async fn execute_checkpoint(&self) -> Result<()> {
         if let Some(writer_arc) = &self.writer {
-            let mut writer = writer_arc.write().await;
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             writer.flush_to_l1(Some("checkpoint".to_string())).await?;
         }
         Ok(())
@@ -674,11 +851,16 @@ impl Executor {
                 .and_then(|v| v.as_str())
                 .unwrap_or("dst");
 
+            // §5.7 of concurrent_writer.md: writer is hoisted above the row
+            // loop now that there is no per-row lock acquisition cost.
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
+                // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
+                let eids = writer.allocate_eids(num_rows).await?;
 
-                for row_idx in 0..num_rows {
+                for (row_idx, &eid) in eids.iter().enumerate().take(num_rows) {
                     let mut properties = HashMap::new();
                     let mut src_vid: Option<Vid> = None;
                     let mut dst_vid: Option<Vid> = None;
@@ -709,9 +891,6 @@ impl Executor {
                     let dst = dst_vid
                         .ok_or_else(|| anyhow!("Missing destination VID column '{}'", dst_col))?;
 
-                    // Generate EID and insert edge
-                    let mut writer = writer_arc.write().await;
-                    let eid = writer.next_eid(edge_type_id).await?;
                     writer
                         .insert_edge(
                             src,
@@ -737,7 +916,6 @@ impl Executor {
 
             // Flush to persist edges
             if total_rows > 0 {
-                let mut writer = writer_arc.write().await;
                 writer.flush_to_l1(None).await?;
             }
 
@@ -749,12 +927,17 @@ impl Executor {
                 .label_id_by_name_case_insensitive(label)
                 .ok_or_else(|| anyhow!("Label '{}' not found in schema", label))?;
 
+            // §5.7 of concurrent_writer.md: writer is hoisted above the row
+            // loop now that there is no per-row lock acquisition cost.
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
+                // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
+                let vids = writer.allocate_vids(num_rows).await?;
 
                 // Convert Arrow batch to rows
-                for row_idx in 0..num_rows {
+                for (row_idx, &vid) in vids.iter().enumerate().take(num_rows) {
                     let mut properties = HashMap::new();
 
                     // Extract properties from each column
@@ -774,9 +957,6 @@ impl Executor {
                         }
                     }
 
-                    // Generate VID and insert
-                    let mut writer = writer_arc.write().await;
-                    let vid = writer.next_vid().await?;
                     let _ = writer
                         .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
                         .await?;
@@ -794,7 +974,6 @@ impl Executor {
 
             // Flush to persist vertices
             if total_rows > 0 {
-                let mut writer = writer_arc.write().await;
                 writer.flush_to_l1(None).await?;
             }
 
@@ -1061,6 +1240,23 @@ impl Executor {
         Ok(())
     }
 
+    /// True if `key` is a generated property on any of the given labels.
+    /// Used by the partial-write flush path (Round 12 §C) to decide
+    /// whether the property should be added to `touched_keys` so that
+    /// Lance MergeInsert sends the recomputed value.
+    fn is_generated_key(&self, labels: &[String], key: &str) -> bool {
+        let schema = self.storage.schema_manager().schema();
+        for label in labels {
+            if let Some(props_meta) = schema.properties.get(label)
+                && let Some(meta) = props_meta.get(key)
+                && meta.generation_expression.is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) async fn enrich_properties_with_generated_columns(
         &self,
         label_name: &str,
@@ -1264,23 +1460,357 @@ impl Executor {
         Ok(())
     }
 
-    fn get_composite_constraint(&self, label: &str) -> Option<Constraint> {
-        let schema = self.storage.schema_manager().schema();
-        schema
-            .constraints
+    /// Detects the single-node, single-label MERGE shape the fast path serves.
+    ///
+    /// Returns the node pattern and its label when `pattern` is one path with
+    /// one node element, exactly one label, and a static map-literal property
+    /// set — the shape [`Self::execute_merge_row_indexed`] can serve without
+    /// per-row query planning. The keys do NOT need to be indexed: the persisted
+    /// lookup degrades to a (single, filtered) label scan when no scalar index
+    /// exists, which is still far cheaper than building a `LogicalPlan` per row.
+    /// Any other shape (edges, multiple labels, non-literal properties) returns
+    /// `None` so the caller uses the general per-row path.
+    fn merge_single_node_fastpath<'p>(
+        &self,
+        pattern: &'p Pattern,
+    ) -> Option<(&'p NodePattern, String)> {
+        if pattern.paths.len() != 1 {
+            return None;
+        }
+        let path = &pattern.paths[0];
+        if path.elements.len() != 1 {
+            return None;
+        }
+        let PatternElement::Node(n) = &path.elements[0] else {
+            return None;
+        };
+        let labels = n.labels.names();
+        if labels.len() != 1 {
+            return None;
+        }
+        // The key must be a static map literal so the key names are known.
+        let Some(Expr::Map(entries)) = n.properties.as_ref() else {
+            return None;
+        };
+        if entries.is_empty() {
+            return None;
+        }
+        Some((n, labels[0].clone()))
+    }
+
+    /// Build the persisted-scan filter for a MERGE key, or `None` if any value
+    /// is not a scalar this fast path can represent.
+    ///
+    /// Returning `None` makes the caller fall back to the general per-row path,
+    /// so unusual key value types (lists, maps, temporals, nulls) are never
+    /// silently mis-matched. The `_deleted = false` clause mirrors the
+    /// persisted-read predicate used elsewhere; the version high-water-mark
+    /// clause is added by [`uni_store::StorageManager::scan_vertex_table`].
+    fn merge_key_filter(key_props: &HashMap<String, Value>) -> Option<String> {
+        if key_props.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::with_capacity(key_props.len() + 1);
+        for (k, v) in key_props {
+            // Keys come from a static map literal, but validate anyway (issue #8).
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let lit = match v {
+                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::Int(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            // Unquoted identifier: the Lance filter parser does not resolve a
+            // double-quoted column name against the table here, so `"k" = v`
+            // silently matches nothing. Keys are validated above to be safe
+            // bare identifiers.
+            parts.push(format!("{k} = {lit}"));
+        }
+        parts.push("_deleted = false".to_string());
+        Some(parts.join(" AND "))
+    }
+
+    /// Canonical sorted `(name, value)` key tuple for a MERGE row's key map.
+    fn merge_key_tuple(key_props: &HashMap<String, Value>) -> MergeKey {
+        let mut tuple: MergeKey = key_props
             .iter()
-            .find(|c| {
-                if !c.enabled {
-                    return false;
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        tuple.sort_by(|a, b| a.0.cmp(&b.0));
+        tuple
+    }
+
+    /// Snapshot all live L0 vertices of `label`, grouped by their MERGE key.
+    ///
+    /// Walked once per MERGE statement (issue #69): the per-row fast path then
+    /// resolves L0/uncommitted matches with an O(1) map lookup instead of
+    /// re-enumerating L0 for every row. Captures committed-not-yet-persisted
+    /// rows and rows created earlier in the same transaction; rows created by
+    /// later rows of this same statement are folded in incrementally by
+    /// [`Self::execute_merge_row_indexed`]. `key_names` must be sorted to match
+    /// [`Self::merge_key_tuple`].
+    fn merge_l0_existing(
+        &self,
+        label: &str,
+        key_names: &[String],
+        ctx: Option<&QueryContext>,
+    ) -> HashMap<MergeKey, Vec<Vid>> {
+        let mut candidates: Vec<Vid> = Vec::new();
+        l0_visibility::visit_l0_buffers(ctx, |l0| {
+            if let Some(vids) = l0.label_to_vids.get(label) {
+                candidates.extend(vids.iter().copied());
+            }
+            false
+        });
+
+        let mut map: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        let mut seen: HashSet<Vid> = HashSet::new();
+        for vid in candidates {
+            if !seen.insert(vid) || l0_visibility::is_vertex_deleted(vid, ctx) {
+                continue;
+            }
+            // `lookup_vertex_prop` merges across L0 layers (newest wins).
+            let tuple: MergeKey = key_names
+                .iter()
+                .map(|k| {
+                    let v = l0_visibility::lookup_vertex_prop(vid, k, ctx).unwrap_or(Value::Null);
+                    (k.clone(), v)
+                })
+                .collect();
+            map.entry(tuple).or_default().push(vid);
+        }
+        map
+    }
+
+    /// Persisted (flushed) vertices of `label` matching `key_props`.
+    ///
+    /// Scans via [`uni_store::StorageManager::scan_vertex_table`] — the same
+    /// read path `MATCH` uses, so it honors the version high-water-mark and sees
+    /// flushed rows — then drops rows an L0 overlay deleted or whose key an L0
+    /// overlay rewrote. L0-only matches are supplied separately by the per-batch
+    /// snapshot ([`Self::merge_l0_existing`]).
+    ///
+    /// # Errors
+    /// Propagates persisted-scan failures.
+    async fn merge_lookup_persisted(
+        &self,
+        label: &str,
+        key_props: &HashMap<String, Value>,
+        filter: &str,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Vec<Vid>> {
+        let mut matches: Vec<Vid> = Vec::new();
+        let scanned = self
+            .storage
+            .scan_vertex_table(label, &["_vid"], Some(filter))
+            .await?;
+        if let Some(batch) = scanned
+            && let Some(col) = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+        {
+            for i in 0..col.len() {
+                let vid = Vid::from(col.value(i));
+                if l0_visibility::is_vertex_deleted(vid, ctx) {
+                    continue;
                 }
-                match &c.target {
-                    ConstraintTarget::Label(l) if l == label => {
-                        matches!(c.constraint_type, ConstraintType::Unique { .. })
-                    }
-                    _ => false,
+                if Self::vid_overrides_break_key(vid, key_props, ctx) {
+                    continue;
                 }
-            })
-            .cloned()
+                matches.push(vid);
+            }
+        }
+        Ok(matches)
+    }
+
+    /// True if an L0 override rewrote any key column of a persisted match away
+    /// from its requested value (so the persisted row no longer matches).
+    fn vid_overrides_break_key(
+        vid: Vid,
+        key_props: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> bool {
+        key_props.iter().any(|(k, want)| {
+            matches!(l0_visibility::lookup_vertex_prop(vid, k, ctx), Some(got) if &got != want)
+        })
+    }
+
+    /// Build a node Map value (`{_vid, _labels, ...props}`) for binding a MERGE
+    /// node variable.
+    ///
+    /// Matches the binding shape produced by `execute_create_pattern` and the
+    /// general MATCH path, so ON MATCH SET, RETURN, and downstream operators
+    /// resolve the variable identically — a bare `Value::Int(vid)` is not a
+    /// valid node binding for those consumers.
+    fn build_node_map(vid: Vid, label: &str, props: uni_common::Properties) -> Value {
+        let mut obj = HashMap::new();
+        obj.insert("_vid".to_string(), Value::Int(vid.as_u64() as i64));
+        obj.insert(
+            "_labels".to_string(),
+            Value::List(vec![Value::String(label.to_string())]),
+        );
+        for (k, v) in props {
+            obj.insert(k, v);
+        }
+        Value::Map(obj)
+    }
+
+    /// True if an L0-only vertex has every key column set to the requested
+    /// value. A missing column matches only a requested `Null`.
+    fn l0_vid_matches_key(
+        vid: Vid,
+        key_props: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> bool {
+        key_props.iter().all(
+            |(k, want)| match l0_visibility::lookup_vertex_prop(vid, k, ctx) {
+                Some(got) => &got == want,
+                None => *want == Value::Null,
+            },
+        )
+    }
+
+    /// Index fast-path execution for one MERGE row of the shape detected by
+    /// [`Self::merge_indexed_fastpath`].
+    ///
+    /// Resolves matches from the per-batch L0 snapshot `existing` (O(1) lookup,
+    /// no per-row L0 enumeration) plus a persisted index scan
+    /// ([`Self::merge_lookup_persisted`]); applies ON MATCH SET to every match,
+    /// or creates the node and applies ON CREATE SET when there is none. A newly
+    /// created vertex is folded into `existing` so a later row of the same batch
+    /// with the same key matches it (intra-batch dedup). Returns the RETURN rows
+    /// for this input row (one per match, or one for a create).
+    ///
+    /// # Errors
+    /// Propagates evaluation, lookup, create, and SET failures.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors execute_merge's threaded execution state"
+    )]
+    async fn execute_merge_row_indexed(
+        &self,
+        label: &str,
+        node: &NodePattern,
+        path_pattern: &Pattern,
+        temp_vars: &[String],
+        mut row: HashMap<String, Value>,
+        key_props: &HashMap<String, Value>,
+        filter: &str,
+        key_tuple: &MergeKey,
+        existing: &mut HashMap<MergeKey, Vec<Vid>>,
+        on_match: Option<&SetClause>,
+        on_create: Option<&SetClause>,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+        tx_l0_override: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        writer: &Writer,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        let mut seen: HashSet<Vid> = HashSet::new();
+        let mut matches: Vec<Vid> = Vec::new();
+        // Persisted (flushed) matches via the index scan.
+        for vid in self
+            .merge_lookup_persisted(label, key_props, filter, ctx)
+            .await?
+        {
+            if seen.insert(vid) {
+                matches.push(vid);
+            }
+        }
+        // L0 / intra-batch matches from the per-batch snapshot, re-verified live
+        // in case a prior row of this batch mutated or deleted the candidate.
+        if let Some(vids) = existing.get(key_tuple) {
+            for &vid in vids {
+                if seen.contains(&vid) || l0_visibility::is_vertex_deleted(vid, ctx) {
+                    continue;
+                }
+                if Self::l0_vid_matches_key(vid, key_props, ctx) && seen.insert(vid) {
+                    matches.push(vid);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        if matches.is_empty() {
+            // No match: create the node, then apply ON CREATE SET.
+            self.execute_create_pattern(
+                path_pattern,
+                &mut row,
+                writer,
+                prop_manager,
+                params,
+                ctx,
+                tx_l0_override,
+            )
+            .await?;
+            if let Some(set) = on_create {
+                self.execute_set_items_locked(
+                    &set.items,
+                    &mut row,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0_override,
+                    &Prefetch::default(),
+                )
+                .await?;
+            }
+            // Fold the new vertex into the batch snapshot for intra-batch dedup.
+            if let Some(var) = &node.variable
+                && let Some(val) = row.get(var)
+                && let Ok(vid) = Self::vid_from_value(val)
+            {
+                existing.entry(key_tuple.clone()).or_default().push(vid);
+            }
+            Self::bind_path_variables(path_pattern, &mut row, temp_vars);
+            out.push(row);
+        } else {
+            // Apply ON MATCH SET to every matched node (multi-match semantics),
+            // binding the node variable as a Map with _vid/_labels/props so
+            // RETURN and downstream operators resolve it as they would for the
+            // general MATCH and CREATE paths.
+            for vid in matches {
+                let mut m = row.clone();
+                if let Some(var) = &node.variable {
+                    // Minimal binding so ON MATCH SET resolves the node by _vid.
+                    m.insert(
+                        var.clone(),
+                        Self::build_node_map(vid, label, HashMap::new()),
+                    );
+                }
+                if let Some(set) = on_match {
+                    self.execute_set_items_locked(
+                        &set.items,
+                        &mut m,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0_override,
+                        &Prefetch::default(),
+                    )
+                    .await?;
+                }
+                if let Some(var) = &node.variable {
+                    // Rebind with full, post-SET properties for RETURN fidelity.
+                    let props = read_vertex_props_with_prefetch(
+                        vid,
+                        &Prefetch::default(),
+                        prop_manager,
+                        ctx,
+                    )
+                    .await?;
+                    m.insert(var.clone(), Self::build_node_map(vid, label, props));
+                }
+                Self::bind_path_variables(path_pattern, &mut m, temp_vars);
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1304,146 +1834,131 @@ impl Executor {
         // names to unnamed relationships in paths that have path variables.
         let (path_pattern, temp_vars) = Self::prepare_pattern_for_path_binding(pattern);
 
+        // Issue #69: a single-node, single-label MERGE takes the fast path,
+        // skipping the per-row query planning that made batched MERGE no faster
+        // than a per-entity loop. Indexed keys get an index point-lookup;
+        // un-indexed keys still skip planning (the lookup is a filtered scan).
+        // The shape is the same for every row, so it is detected once.
+        let fastpath = self.merge_single_node_fastpath(pattern);
+
+        // Build the per-batch L0 snapshot once (issue #69 Phase C): the per-row
+        // fast path then resolves L0/intra-batch matches with an O(1) lookup
+        // instead of re-walking L0 for every row. `key_names` is the sorted
+        // static key set, matching `merge_key_tuple`.
+        let mut fast_existing: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        if let Some((node, label)) = &fastpath {
+            let mut key_names: Vec<String> = match &node.properties {
+                Some(Expr::Map(entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
+                _ => Vec::new(),
+            };
+            key_names.sort();
+            fast_existing = self.merge_l0_existing(label, &key_names, ctx);
+        }
+
         let mut results = Vec::new();
         for mut row in rows {
-            // Optimization: Check for single node pattern with unique constraint
-            let mut optimized_vid = None;
-            if pattern.paths.len() == 1 {
-                let path = &pattern.paths[0];
-                if path.elements.len() == 1
-                    && let PatternElement::Node(n) = &path.elements[0]
-                    && n.labels.len() == 1
-                    && let Some(constraint) = self.get_composite_constraint(&n.labels[0])
-                    && let ConstraintType::Unique { properties } = constraint.constraint_type
+            if let Some((node, label)) = &fastpath {
+                // Evaluate the MERGE key for this row. Only take the fast path
+                // when every key value is a scalar the persisted scan can
+                // express; otherwise fall through to the general per-row path.
+                let mut key_props: HashMap<String, Value> = HashMap::new();
+                if let Some(props_expr) = &node.properties
+                    && let Value::Map(map) = self
+                        .evaluate_expr(props_expr, &row, prop_manager, params, ctx)
+                        .await?
                 {
-                    let label = &n.labels[0];
-                    // Evaluate pattern properties
-                    let mut pattern_props = HashMap::new();
-                    if let Some(props_expr) = &n.properties {
-                        let val = self
-                            .evaluate_expr(props_expr, &row, prop_manager, params, ctx)
-                            .await?;
-                        if let Value::Map(map) = val {
-                            for (k, v) in map {
-                                pattern_props.insert(k, v);
-                            }
-                        }
-                    }
-
-                    // Check if all constraint properties are present
-                    let has_all_keys = properties.iter().all(|p| pattern_props.contains_key(p));
-                    if has_all_keys {
-                        // Extract key properties and convert to serde_json::Value for index lookup
-                        let key_props: HashMap<String, serde_json::Value> = properties
-                            .iter()
-                            .filter_map(|p| {
-                                pattern_props.get(p).map(|v| (p.clone(), v.clone().into()))
-                            })
-                            .collect();
-
-                        // Use optimized lookup
-                        if let Ok(Some(vid)) = self
-                            .storage
-                            .index_manager()
-                            .composite_lookup(label, &key_props)
-                            .await
-                        {
-                            optimized_vid = Some((vid, pattern_props));
-                        }
-                    }
+                    key_props = map;
                 }
+                if let Some(filter) = Self::merge_key_filter(&key_props) {
+                    let key_tuple = Self::merge_key_tuple(&key_props);
+                    let writer: &uni_store::Writer = writer_lock.as_ref();
+                    let row_out = self
+                        .execute_merge_row_indexed(
+                            label,
+                            node,
+                            &path_pattern,
+                            &temp_vars,
+                            row,
+                            &key_props,
+                            &filter,
+                            &key_tuple,
+                            &mut fast_existing,
+                            on_match,
+                            on_create,
+                            prop_manager,
+                            params,
+                            ctx,
+                            tx_l0_override,
+                            writer,
+                        )
+                        .await?;
+                    results.extend(row_out);
+                    continue;
+                }
+                // Non-scalar key value: fall through to the general path below.
             }
 
-            if let Some((vid, _pattern_props)) = optimized_vid {
-                // Optimized Path: Node found via index
-                let mut writer = writer_lock.write().await;
+            // General execution: match-or-create per row. (The index fast path
+            // above already handles single-node, single-label, scalar-indexed
+            // MERGE — including unique-constrained labels, whose keys are
+            // indexed — so there is no separate constraint-only fast path.)
+            let matches = self
+                .execute_merge_match(pattern, &row, prop_manager, params, ctx)
+                .await?;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
 
-                let mut match_row = row.clone();
-                if let PatternElement::Node(n) = &pattern.paths[0].elements[0]
-                    && let Some(var) = &n.variable
-                {
-                    match_row.insert(var.clone(), Value::Int(vid.as_u64() as i64));
-                }
-
-                let result = if let Some(set) = on_match {
-                    self.execute_set_items_locked(
-                        &set.items,
-                        &mut match_row,
-                        &mut writer,
+            let result: Result<Vec<HashMap<String, Value>>> = async {
+                let mut batch = Vec::new();
+                if !matches.is_empty() {
+                    for mut m in matches {
+                        if let Some(set) = on_match {
+                            self.execute_set_items_locked(
+                                &set.items,
+                                &mut m,
+                                writer,
+                                prop_manager,
+                                params,
+                                ctx,
+                                tx_l0_override,
+                                &Prefetch::default(),
+                            )
+                            .await?;
+                        }
+                        Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
+                        batch.push(m);
+                    }
+                } else {
+                    self.execute_create_pattern(
+                        &path_pattern,
+                        &mut row,
+                        writer,
                         prop_manager,
                         params,
                         ctx,
                         tx_l0_override,
                     )
-                    .await
-                } else {
-                    Ok(())
-                };
-
-                drop(writer);
-                result?;
-
-                Self::bind_path_variables(&path_pattern, &mut match_row, &temp_vars);
-                results.push(match_row);
-            } else {
-                // Fallback to standard execution
-                let matches = self
-                    .execute_merge_match(pattern, &row, prop_manager, params, ctx)
                     .await?;
-                let mut writer = writer_lock.write().await;
-
-                let result: Result<Vec<HashMap<String, Value>>> = async {
-                    let mut batch = Vec::new();
-                    if !matches.is_empty() {
-                        for mut m in matches {
-                            if let Some(set) = on_match {
-                                self.execute_set_items_locked(
-                                    &set.items,
-                                    &mut m,
-                                    &mut writer,
-                                    prop_manager,
-                                    params,
-                                    ctx,
-                                    tx_l0_override,
-                                )
-                                .await?;
-                            }
-                            Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
-                            batch.push(m);
-                        }
-                    } else {
-                        self.execute_create_pattern(
-                            &path_pattern,
+                    if let Some(set) = on_create {
+                        self.execute_set_items_locked(
+                            &set.items,
                             &mut row,
-                            &mut writer,
+                            writer,
                             prop_manager,
                             params,
                             ctx,
                             tx_l0_override,
+                            &Prefetch::default(),
                         )
                         .await?;
-                        if let Some(set) = on_create {
-                            self.execute_set_items_locked(
-                                &set.items,
-                                &mut row,
-                                &mut writer,
-                                prop_manager,
-                                params,
-                                ctx,
-                                tx_l0_override,
-                            )
-                            .await?;
-                        }
-                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
-                        batch.push(row);
                     }
-                    Ok(batch)
+                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                    batch.push(row);
                 }
-                .await;
-
-                drop(writer);
-                results.extend(result?);
+                Ok(batch)
             }
+            .await;
+
+            results.extend(result?);
         }
         Ok(results)
     }
@@ -1454,7 +1969,7 @@ impl Executor {
         &self,
         pattern: &Pattern,
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -1511,8 +2026,14 @@ impl Executor {
                                 }
                             }
 
-                            // VID generation is label-independent
-                            let new_vid = writer.next_vid().await?;
+                            // VID generation is label-independent. Pull from the
+                            // per-tx reservoir if set (amortizes the global
+                            // IdAllocator mutex), else fall back to the direct
+                            // per-VID path.
+                            let new_vid = match &self.id_reservoir {
+                                Some(r) => r.next_vid().await?,
+                                None => writer.next_vid().await?,
+                            };
 
                             // Enrich with generated columns only for known labels
                             for label_name in &n.labels {
@@ -1527,6 +2048,11 @@ impl Executor {
                                     .await?;
                                 }
                             }
+
+                            // Validate/coerce against declared types AFTER enrichment, so
+                            // a type mismatch is rejected here rather than silently nulled
+                            // (and the row dropped) at flush — issue #68.
+                            let props = Self::coerce_and_validate_props(props, &schema, &n.labels)?;
 
                             // Insert vertex and get back final properties (includes auto-generated embeddings)
                             let final_props = writer
@@ -1567,7 +2093,18 @@ impl Executor {
                                         rel_props.extend(map);
                                     }
                                 }
-                                let eid = writer.next_eid(type_id).await?;
+                                // Validate/coerce edge properties against the declared
+                                // edge-type schema before storing — issue #68.
+                                let edge_schema = self.storage.schema_manager().schema();
+                                let rel_props = Self::coerce_and_validate_props(
+                                    rel_props,
+                                    &edge_schema,
+                                    std::slice::from_ref(&type_name),
+                                )?;
+                                let eid = match &self.id_reservoir {
+                                    Some(r) => r.next_eid().await?,
+                                    None => writer.next_eid(type_id).await?,
+                                };
 
                                 // For incoming edges like (a)<-[:R]-(b), swap so the edge points b -> a
                                 let (edge_src, edge_dst) = match dir {
@@ -1665,25 +2202,15 @@ impl Executor {
         Ok(())
     }
 
-    /// Validates that a value is a valid property type per OpenCypher.
-    /// Rejects maps, nodes, edges, paths, and lists containing those types or nested lists.
-    /// Skips validation for CypherValue-typed properties which accept any value.
-    fn validate_property_value(
-        prop_name: &str,
-        val: &Value,
-        schema: &uni_common::core::schema::Schema,
-        labels: &[String],
-    ) -> Result<()> {
-        // CypherValue-typed properties accept any value (including Maps)
-        for label in labels {
-            if let Some(props) = schema.properties.get(label)
-                && let Some(prop_meta) = props.get(prop_name)
-                && prop_meta.r#type == uni_common::core::schema::DataType::CypherValue
-            {
-                return Ok(());
-            }
-        }
-
+    /// Rejects structural values (maps, nodes, edges, paths, nested lists) in a property.
+    ///
+    /// These are never valid OpenCypher property values regardless of the declared column
+    /// type. A `CypherValue` column is the sole exception and is handled by the caller
+    /// before this is reached.
+    ///
+    /// # Errors
+    /// Returns an error if `val` is a map/node/edge/path, or a list containing one.
+    fn validate_structural_property_value(prop_name: &str, val: &Value) -> Result<()> {
         match val {
             Value::Map(_) | Value::Node(_) | Value::Edge(_) | Value::Path(_) => {
                 anyhow::bail!(
@@ -1693,18 +2220,18 @@ impl Executor {
             }
             Value::List(items) => {
                 for item in items {
-                    match item {
+                    if matches!(
+                        item,
                         Value::Map(_)
-                        | Value::Node(_)
-                        | Value::Edge(_)
-                        | Value::Path(_)
-                        | Value::List(_) => {
-                            anyhow::bail!(
-                                "TypeError: InvalidPropertyType - Property '{}' has an invalid type",
-                                prop_name
-                            );
-                        }
-                        _ => {}
+                            | Value::Node(_)
+                            | Value::Edge(_)
+                            | Value::Path(_)
+                            | Value::List(_)
+                    ) {
+                        anyhow::bail!(
+                            "TypeError: InvalidPropertyType - Property '{}' has an invalid type",
+                            prop_name
+                        );
                     }
                 }
             }
@@ -1713,17 +2240,158 @@ impl Executor {
         Ok(())
     }
 
+    /// Validates and coerces `val` against the declared schema type for `prop_name`.
+    ///
+    /// Returns the value to actually persist. Beyond the structural checks in
+    /// [`Self::validate_structural_property_value`], this compares the value against the
+    /// column's declared `DataType` and:
+    ///
+    /// - returns it unchanged when directly storable (including the intentional
+    ///   `Int`→`Float`/`Int32` and `Temporal`→`Timestamp` widenings);
+    /// - coerces a `Value::String` written into a `Date`/`Time`/`DateTime`/`Duration`
+    ///   column into the proper `Temporal` value, using the same parser as the Cypher
+    ///   `date()`/`time()`/`datetime()`/`duration()` constructors;
+    /// - otherwise returns an error, so a type mismatch is surfaced at the call site
+    ///   rather than silently nulled — and the row dropped at flush. See issue #68.
+    ///
+    /// Undeclared (schemaless) properties and `CypherValue` columns keep their permissive
+    /// behavior.
+    ///
+    /// # Errors
+    /// Returns an error if the value's type is incompatible with the declared column type,
+    /// or if a string destined for a temporal column is not a valid temporal literal.
+    fn coerce_and_validate_property_value(
+        prop_name: &str,
+        val: Value,
+        schema: &uni_common::core::schema::Schema,
+        labels: &[String],
+    ) -> Result<Value> {
+        use uni_common::core::schema::DataType;
+
+        // Resolve the declared type from the first label that declares this property.
+        let declared = labels.iter().find_map(|label| {
+            schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(prop_name))
+                .map(|meta| &meta.r#type)
+        });
+
+        // CypherValue columns accept any value (including maps) — skip all checks.
+        if matches!(declared, Some(DataType::CypherValue)) {
+            return Ok(val);
+        }
+
+        let Some(dt) = declared else {
+            // Schemaless property: reject structural values (maps/nodes/edges/paths and
+            // lists containing them), otherwise store as-is.
+            Self::validate_structural_property_value(prop_name, &val)?;
+            return Ok(val);
+        };
+
+        // Directly storable: scalars, the intentional `Int`→`Float`/`Int32` and
+        // `Temporal`→`Timestamp` widenings, declared composite columns (`Map`/`List`/
+        // `Vector`) receiving their matching value, and `Null` (always accepted).
+        if dt.accepts(&val) {
+            return Ok(val);
+        }
+
+        // Known-safe coercion: a string into a temporal column is parsed as if it had
+        // been wrapped in the matching Cypher temporal constructor.
+        if matches!(val, Value::String(_)) {
+            let ctor = match dt {
+                DataType::DateTime => Some("DATETIME"),
+                DataType::Date => Some("DATE"),
+                DataType::Time => Some("TIME"),
+                DataType::Duration => Some("DURATION"),
+                _ => None,
+            };
+            if let Some(name) = ctor {
+                return uni_query_functions::datetime::eval_datetime_function(
+                    name,
+                    std::slice::from_ref(&val),
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "TypeError: property '{}' is declared {:?} but the string value could \
+                         not be parsed as a {} literal: {}",
+                        prop_name,
+                        dt,
+                        name,
+                        e
+                    )
+                });
+            }
+        }
+
+        // Not storable and not coercible. Prefer the structural message when the value
+        // is itself structural (e.g. a map into a scalar column), preserving prior
+        // behavior; otherwise report the scalar type mismatch.
+        Self::validate_structural_property_value(prop_name, &val)?;
+        anyhow::bail!(
+            "TypeError: property '{}' is declared {:?} but got an incompatible value of type {}",
+            prop_name,
+            dt,
+            value_type_name(&val)
+        );
+    }
+
+    /// Coerces and validates every property in `props` against the declared types for `labels`.
+    ///
+    /// Applies [`Self::coerce_and_validate_property_value`] to each entry, returning the map
+    /// with known-safe coercions applied. Use this at every user-facing CREATE/SET write site
+    /// before handing properties to the writer, so a type mismatch is rejected up front rather
+    /// than silently nulled — and the row dropped — at flush (issue #68).
+    ///
+    /// # Errors
+    /// Returns an error on the first property whose value is incompatible with its declared type.
+    fn coerce_and_validate_props(
+        props: HashMap<String, Value>,
+        schema: &uni_common::core::schema::Schema,
+        labels: &[String],
+    ) -> Result<HashMap<String, Value>> {
+        let mut out = HashMap::with_capacity(props.len());
+        for (k, v) in props {
+            let cv = Self::coerce_and_validate_property_value(&k, v, schema, labels)?;
+            out.insert(k, cv);
+        }
+        Ok(out)
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_set_items_locked(
         &self,
         items: &[SetItem],
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
+        // Coalesce SetItem::Property items by target so we do ONE read + ONE
+        // write per (variable, target) instead of one read-modify-write cycle
+        // per item. For an UPDATE that sets N properties on the same vertex
+        // (e.g. the ingest hotpath `SET n.frequency = ..., n.last_seen = ...,
+        // n.confidence = ...`), this collapses N redundant
+        // `get_all_vertex_props_with_ctx` + `insert_vertex_with_labels` cycles
+        // into one. See profile_test.rs `diag_72_set_data_scale_with_hnsw` for
+        // the measurement, and the plan in
+        // /home/rohit/.claude/plans/plan-and-implement-a-valiant-flame.md
+        // for the rationale.
+        //
+        // RHS evaluation order is preserved: we evaluate each RHS inline and
+        // update the row binding immediately, so a later SetItem on the same
+        // variable that reads `n.<earlier-prop>` sees the new value.
+        //
+        // Non-Property variants (Labels, Variable, VariablePlus) are less
+        // common and have lower payoff; before processing one, we flush any
+        // pending updates for the same variable so it sees the latest L0
+        // state and ordering semantics are preserved.
+        let mut pending_v: HashMap<String, PendingVertexSet> = HashMap::new();
+        let mut pending_e: HashMap<String, PendingEdgeSet> = HashMap::new();
+
         for item in items {
             match item {
                 SetItem::Property { expr, value } => {
@@ -1732,36 +2400,64 @@ impl Executor {
                         && let Some(node_val) = row.get(var_name)
                     {
                         if let Ok(vid) = Self::vid_from_value(node_val) {
+                            reject_if_ephemeral_vid(vid)?;
                             let labels =
                                 Self::extract_labels_from_node(node_val).unwrap_or_default();
                             let schema = self.storage.schema_manager().schema().clone();
-                            let mut props = prop_manager
-                                .get_all_vertex_props_with_ctx(vid, ctx)
-                                .await?
-                                .unwrap_or_default();
-                            let val = self
-                                .evaluate_expr(value, row, prop_manager, params, ctx)
-                                .await?;
-                            Self::validate_property_value(prop_name, &val, &schema, &labels)?;
-                            props.insert(prop_name.clone(), val.clone());
 
-                            // Enrich with generated columns
-                            for label_name in &labels {
-                                self.enrich_properties_with_generated_columns(
-                                    label_name,
-                                    &mut props,
+                            // Lazy one-time read. Always read the full row
+                            // (preserves CRDT merge + constraint validation
+                            // + scan-side L0 visibility). The
+                            // partial-lance-writes optimization happens
+                            // PURELY AT FLUSH TIME via the per-VID
+                            // `vertex_partial_keys` set tracked in L0 — so
+                            // L0 holds the full row, scans see the full
+                            // row, and Lance only receives the touched
+                            // columns. Generated-column-bearing labels
+                            // ride the partial path too (Round 12 §C):
+                            // `enrich_properties_with_generated_columns`
+                            // runs at flush time over the merged-in-L0
+                            // full row, and the produced generator keys
+                            // are appended to `touched` so they land in
+                            // the MergeInsert source.
+                            if !pending_v.contains_key(var_name) {
+                                let storage_cfg = &self.storage.config;
+                                let partial = storage_cfg.partial_lance_writes;
+                                let read = read_vertex_props_with_prefetch(
+                                    vid,
+                                    prefetched,
                                     prop_manager,
-                                    params,
                                     ctx,
                                 )
                                 .await?;
+                                pending_v.insert(
+                                    var_name.clone(),
+                                    PendingVertexSet {
+                                        vid,
+                                        labels: labels.clone(),
+                                        props: read,
+                                        partial,
+                                        touched: HashSet::new(),
+                                    },
+                                );
                             }
 
-                            let _ = writer
-                                .insert_vertex_with_labels(vid, props, &labels, tx_l0)
+                            let val = self
+                                .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
+                            let val = Self::coerce_and_validate_property_value(
+                                prop_name, val, &schema, &labels,
+                            )?;
 
-                            // Update the row object so subsequent RETURN sees the new value
+                            let pv = pending_v
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pv.props.insert(prop_name.clone(), val.clone());
+                            if pv.partial {
+                                pv.touched.insert(prop_name.clone());
+                            }
+
+                            // Update the row binding so subsequent RHS sees the new value.
                             if let Some(Value::Map(node_map)) = row.get_mut(var_name) {
                                 node_map.insert(prop_name.clone(), val);
                             } else if let Some(Value::Node(node)) = row.get_mut(var_name) {
@@ -1771,12 +2467,17 @@ impl Executor {
                             && map.get("_eid").is_some_and(|v| !v.is_null())
                             && map.get("_src").is_some_and(|v| !v.is_null())
                             && map.get("_dst").is_some_and(|v| !v.is_null())
-                            && map.get("_type").is_some_and(|v| !v.is_null())
+                            && (map.get("_type").is_some_and(|v| !v.is_null())
+                                || map.get("_type_name").is_some_and(|v| !v.is_null()))
                         {
                             let ei = self.extract_edge_identity(map)?;
+                            reject_if_ephemeral_eid(ei.eid)?;
                             let schema = self.storage.schema_manager().schema().clone();
-                            // Handle _type as either String or Int (Int from CREATE, String from queries)
-                            let edge_type_name = match map.get("_type") {
+                            // Handle _type as either String or Int (Int from CREATE, String
+                            // from queries). UNWIND on VLP edge lists emits `_type_name`
+                            // instead of `_type`; accept either.
+                            let type_val = map.get("_type").or_else(|| map.get("_type_name"));
+                            let edge_type_name = match type_val {
                                 Some(Value::String(s)) => s.clone(),
                                 Some(Value::Int(id)) => schema
                                     .edge_type_name_by_id_unified(*id as u32)
@@ -1784,40 +2485,57 @@ impl Executor {
                                 _ => String::new(),
                             };
 
-                            let mut props = prop_manager
-                                .get_all_edge_props_with_ctx(ei.eid, ctx)
-                                .await?
-                                .unwrap_or_default();
+                            if !pending_e.contains_key(var_name) {
+                                let initial = read_edge_props_with_prefetch(
+                                    ei.eid,
+                                    prefetched,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
+                                let partial = self.storage.config.partial_lance_writes;
+                                pending_e.insert(
+                                    var_name.clone(),
+                                    PendingEdgeSet {
+                                        src: ei.src,
+                                        dst: ei.dst,
+                                        edge_type_id: ei.edge_type_id,
+                                        eid: ei.eid,
+                                        edge_type_name: edge_type_name.clone(),
+                                        props: initial,
+                                        partial,
+                                        touched: HashSet::new(),
+                                    },
+                                );
+                            }
+
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            Self::validate_property_value(
+                            let val = Self::coerce_and_validate_property_value(
                                 prop_name,
-                                &val,
+                                val,
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;
-                            props.insert(prop_name.clone(), val.clone());
-                            writer
-                                .insert_edge(
-                                    ei.src,
-                                    ei.dst,
-                                    ei.edge_type_id,
-                                    ei.eid,
-                                    props,
-                                    Some(edge_type_name.clone()),
-                                    tx_l0,
-                                )
-                                .await?;
 
-                            // Update the row object so subsequent RETURN sees the new value
+                            let pe = pending_e
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pe.props.insert(prop_name.clone(), val.clone());
+                            if pe.partial {
+                                pe.touched.insert(prop_name.clone());
+                            }
+
+                            // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Map(edge_map)) = row.get_mut(var_name) {
                                 edge_map.insert(prop_name.clone(), val);
                             } else if let Some(Value::Edge(edge)) = row.get_mut(var_name) {
                                 edge.properties.insert(prop_name.clone(), val);
                             }
                         } else if let Value::Edge(edge) = node_val {
-                            // Handle Value::Edge directly (when traverse returns Edge objects)
+                            // Handle Value::Edge directly (when traverse returns Edge objects).
+                            reject_if_ephemeral_eid(edge.eid)?;
                             let eid = edge.eid;
                             let src = edge.src;
                             let dst = edge.dst;
@@ -1826,33 +2544,49 @@ impl Executor {
                                 self.resolve_edge_type_id(&Value::String(edge_type_name.clone()))?;
                             let schema = self.storage.schema_manager().schema().clone();
 
-                            let mut props = prop_manager
-                                .get_all_edge_props_with_ctx(eid, ctx)
-                                .await?
-                                .unwrap_or_default();
+                            if !pending_e.contains_key(var_name) {
+                                let initial = read_edge_props_with_prefetch(
+                                    eid,
+                                    prefetched,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
+                                let partial = self.storage.config.partial_lance_writes;
+                                pending_e.insert(
+                                    var_name.clone(),
+                                    PendingEdgeSet {
+                                        src,
+                                        dst,
+                                        edge_type_id: etype,
+                                        eid,
+                                        edge_type_name: edge_type_name.clone(),
+                                        props: initial,
+                                        partial,
+                                        touched: HashSet::new(),
+                                    },
+                                );
+                            }
+
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            Self::validate_property_value(
+                            let val = Self::coerce_and_validate_property_value(
                                 prop_name,
-                                &val,
+                                val,
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;
-                            props.insert(prop_name.clone(), val.clone());
-                            writer
-                                .insert_edge(
-                                    src,
-                                    dst,
-                                    etype,
-                                    eid,
-                                    props,
-                                    Some(edge_type_name.clone()),
-                                    tx_l0,
-                                )
-                                .await?;
 
-                            // Update the row object so subsequent RETURN sees the new value
+                            let pe = pending_e
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pe.props.insert(prop_name.clone(), val.clone());
+                            if pe.partial {
+                                pe.touched.insert(prop_name.clone());
+                            }
+
+                            // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Edge(edge)) = row.get_mut(var_name) {
                                 edge.properties.insert(prop_name.clone(), val);
                             }
@@ -1860,9 +2594,32 @@ impl Executor {
                     }
                 }
                 SetItem::Labels { variable, labels } => {
+                    // Flush any pending writes for this var so the Labels op
+                    // sees latest L0 state. Other variables' pending writes
+                    // can keep waiting (they're independent).
+                    self.flush_pending_var(
+                        variable,
+                        &mut pending_v,
+                        &mut pending_e,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                        prefetched,
+                    )
+                    .await?;
+
                     if let Some(node_val) = row.get(variable)
                         && let Ok(vid) = Self::vid_from_value(node_val)
                     {
+                        reject_if_ephemeral_vid(vid)?;
+                        let registry = self
+                            .procedure_registry
+                            .as_ref()
+                            .and_then(|pr| pr.plugin_registry());
+                        reject_virtual_label_write(registry.as_ref(), labels, "SET")?;
+
                         // Get current labels from node value
                         let current_labels =
                             Self::extract_labels_from_node(node_val).unwrap_or_default();
@@ -1875,18 +2632,22 @@ impl Executor {
                             .collect();
 
                         if !labels_to_add.is_empty() {
-                            // Add labels via L0Buffer (schemaless: accept any label name,
-                            // matching CREATE behavior)
+                            // Resolve the FULL new label set and write it to the
+                            // TRANSACTION buffer (so the change is transactional
+                            // and OCC-conflictable), falling back to the context
+                            // (main) L0 for non-transactional callers. Replace
+                            // semantics via `set_vertex_labels`.
+                            let mut new_labels = current_labels;
+                            new_labels.extend(labels_to_add);
                             if let Some(ctx) = ctx {
-                                ctx.l0.write().add_vertex_labels(vid, &labels_to_add);
+                                let l0 = ctx.transaction_l0.as_ref().unwrap_or(&ctx.l0);
+                                l0.write().set_vertex_labels(vid, &new_labels);
                             }
 
-                            // Update the node value in the row with new labels
+                            // Update the node value in the row with the new labels.
                             if let Some(Value::Map(obj)) = row.get_mut(variable) {
-                                let mut updated_labels = current_labels;
-                                updated_labels.extend(labels_to_add);
                                 let labels_list =
-                                    updated_labels.into_iter().map(Value::String).collect();
+                                    new_labels.into_iter().map(Value::String).collect();
                                 obj.insert("_labels".to_string(), Value::List(labels_list));
                             }
                         }
@@ -1894,6 +2655,21 @@ impl Executor {
                 }
                 SetItem::Variable { variable, value }
                 | SetItem::VariablePlus { variable, value } => {
+                    // Flush this var's pending writes first so the
+                    // replace/merge op sees them as latest L0 state.
+                    self.flush_pending_var(
+                        variable,
+                        &mut pending_v,
+                        &mut pending_e,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                        prefetched,
+                    )
+                    .await?;
+
                     let replace = matches!(item, SetItem::Variable { .. });
                     let op_str = if replace { "=" } else { "+=" };
 
@@ -1923,9 +2699,175 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        prefetched,
                     )
                     .await?;
                 }
+            }
+        }
+
+        // Flush all remaining coalesced writes — one writer call per target.
+        // Partial entries (no generated columns) call
+        // `Writer::insert_vertex_partial_full` so L0 holds the FULL row
+        // but the touched-keys hint drives a MergeInsert at flush. Full
+        // entries continue through the legacy
+        // `insert_vertex_with_labels` (Append) path with
+        // generated-column enrichment.
+        for (_var_name, mut pv) in pending_v {
+            if pv.partial {
+                // Round 12 §C: run the generator enrichment over the
+                // merged-in-L0 full row, then add the produced generator
+                // keys to `touched` so they ride the MergeInsert source.
+                // Idempotent — generators always recompute against the
+                // post-merge property map.
+                let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                for k in pv.props.keys() {
+                    if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
+                        pv.touched.insert(k.clone());
+                    }
+                }
+                writer
+                    .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
+                    .await?;
+            } else {
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                let _ = writer
+                    .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
+            }
+        }
+        for (_var_name, pe) in pending_e {
+            if pe.partial {
+                writer
+                    .insert_edge_partial_full(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        pe.touched,
+                        tx_l0,
+                    )
+                    .await?;
+            } else {
+                writer
+                    .insert_edge(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        tx_l0,
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Flush pending SET state for a single variable to the writer.
+    ///
+    /// Called from the SET loop when about to process a Labels /
+    /// Variable / VariablePlus item on `var`, so the subsequent op
+    /// sees latest L0 state and ordering is preserved.
+    #[expect(clippy::too_many_arguments)]
+    async fn flush_pending_var(
+        &self,
+        var: &str,
+        pending_v: &mut HashMap<String, PendingVertexSet>,
+        pending_e: &mut HashMap<String, PendingEdgeSet>,
+        writer: &Writer,
+        prop_manager: &PropertyManager,
+        _params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        _prefetched: &Prefetch,
+    ) -> Result<()> {
+        if let Some(mut pv) = pending_v.remove(var) {
+            if pv.partial {
+                let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        _params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                for k in pv.props.keys() {
+                    if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
+                        pv.touched.insert(k.clone());
+                    }
+                }
+                writer
+                    .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
+                    .await?;
+            } else {
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        _params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                let _ = writer
+                    .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
+            }
+        }
+        if let Some(pe) = pending_e.remove(var) {
+            if pe.partial {
+                writer
+                    .insert_edge_partial_full(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        pe.touched,
+                        tx_l0,
+                    )
+                    .await?;
+            } else {
+                writer
+                    .insert_edge(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        tx_l0,
+                    )
+                    .await?;
             }
         }
         Ok(())
@@ -1938,14 +2880,16 @@ impl Executor {
     /// we read from storage once, null all specified properties, and write back
     /// once. This prevents the second removal from reading stale data that
     /// doesn't reflect the first removal's L0 write.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_remove_items_locked(
         &self,
         items: &[RemoveItem],
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
         // Collect property names to remove, grouped by variable.
         // Use Vec<(String, Vec<String>)> to preserve insertion order.
@@ -1978,10 +2922,8 @@ impl Executor {
 
             if let Ok(vid) = Self::vid_from_value(node_val) {
                 // Vertex property removal
-                let mut props = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let mut props =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
 
                 // Only write back if at least one property actually exists
                 let removed_count = prop_names
@@ -2022,10 +2964,9 @@ impl Executor {
                 let mut edge_effective: Option<HashMap<String, Value>> = None;
                 if map.get("_eid").is_some_and(|v| !v.is_null()) {
                     let ei = self.extract_edge_identity(map)?;
-                    let mut props = prop_manager
-                        .get_all_edge_props_with_ctx(ei.eid, ctx)
-                        .await?
-                        .unwrap_or_default();
+                    let mut props =
+                        read_edge_props_with_prefetch(ei.eid, prefetched, prop_manager, ctx)
+                            .await?;
 
                     let removed_count = prop_names
                         .iter()
@@ -2085,10 +3026,8 @@ impl Executor {
                 let dst = edge.dst;
                 let etype = self.resolve_edge_type_id(&Value::String(edge.edge_type.clone()))?;
 
-                let mut props = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let mut props =
+                    read_edge_props_with_prefetch(eid, prefetched, prop_manager, ctx).await?;
 
                 let removed_count = prop_names
                     .iter()
@@ -2134,6 +3073,13 @@ impl Executor {
         if let Some(node_val) = row.get(variable)
             && let Ok(vid) = Self::vid_from_value(node_val)
         {
+            reject_if_ephemeral_vid(vid)?;
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_label_write(registry.as_ref(), labels, "REMOVE")?;
+
             // Get current labels from node value
             let current_labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
 
@@ -2144,21 +3090,21 @@ impl Executor {
                 .collect();
 
             if !labels_to_remove.is_empty() {
-                // Remove labels via L0Buffer
+                // Resolve the FULL remaining label set and write it to the
+                // TRANSACTION buffer (transactional + OCC-conflictable), falling
+                // back to the context (main) L0 for non-transactional callers.
+                let remaining_labels: Vec<String> = current_labels
+                    .iter()
+                    .filter(|l| !labels_to_remove.contains(l))
+                    .cloned()
+                    .collect();
                 if let Some(ctx) = ctx {
-                    let mut l0 = ctx.l0.write();
-                    for label in &labels_to_remove {
-                        l0.remove_vertex_label(vid, label);
-                    }
+                    let l0 = ctx.transaction_l0.as_ref().unwrap_or(&ctx.l0);
+                    l0.write().set_vertex_labels(vid, &remaining_labels);
                 }
 
-                // Update the node value in the row with remaining labels
+                // Update the node value in the row with the remaining labels.
                 if let Some(Value::Map(obj)) = row.get_mut(variable) {
-                    let remaining_labels: Vec<_> = current_labels
-                        .iter()
-                        .filter(|l| !labels_to_remove.contains(l))
-                        .cloned()
-                        .collect();
                     let labels_list = remaining_labels.into_iter().map(Value::String).collect();
                     obj.insert("_labels".to_string(), Value::List(labels_list));
                 }
@@ -2194,7 +3140,7 @@ impl Executor {
         &self,
         val: &Value,
         detach: bool,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         match val {
@@ -2247,7 +3193,13 @@ impl Executor {
                     self.execute_delete_edge_from_map(map, writer, tx_l0)
                         .await?;
                 } else if let Value::Edge(edge) = val {
+                    reject_if_ephemeral_eid(edge.eid)?;
                     let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
+                    let registry = self
+                        .procedure_registry
+                        .as_ref()
+                        .and_then(|pr| pr.plugin_registry());
+                    reject_virtual_edge_type_write(registry.as_ref(), etype, "DELETE")?;
                     writer
                         .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
                         .await?;
@@ -2263,9 +3215,17 @@ impl Executor {
         vid: Vid,
         detach: bool,
         labels: Option<Vec<String>>,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
+        reject_if_ephemeral_vid(vid)?;
+        if let Some(ls) = labels.as_deref() {
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_label_write(registry.as_ref(), ls, "DELETE")?;
+        }
         if detach {
             self.detach_delete_vertex(vid, writer, tx_l0).await?;
         } else {
@@ -2342,12 +3302,18 @@ impl Executor {
     pub(crate) async fn execute_delete_edge_from_map(
         &self,
         map: &HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         // Check for non-null _eid to skip OPTIONAL MATCH null edges
         if map.get("_eid").is_some_and(|v| !v.is_null()) {
             let ei = self.extract_edge_identity(map)?;
+            reject_if_ephemeral_eid(ei.eid)?;
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_edge_type_write(registry.as_ref(), ei.edge_type_id, "DELETE")?;
             writer
                 .delete_edge(ei.eid, ei.src, ei.dst, ei.edge_type_id, tx_l0)
                 .await?;
@@ -3074,6 +4040,66 @@ impl Executor {
             }
             _ => None,
         }
+    }
+}
+
+/// Read a vertex's full property map, preferring `prefetched` over a fresh
+/// per-row `Backend::scan`.
+///
+/// `prefetched` is built once at the top of `apply_mutations` via
+/// `prefetch_set_targets` / `prefetch_remove_targets` (mutation_common.rs).
+/// On a hit, we layer in L0 from `ctx` so writes from earlier rows of the
+/// same `apply_mutations` invocation (counter increments, same-VID
+/// duplicates from UNWIND) take precedence — the prefetch only snapshots
+/// storage state at SET entry. On a miss, fall back to the existing
+/// per-row path; this preserves correctness for newly created VIDs,
+/// schemaless rows, multi-label corner cases, and non-Mutation callers
+/// that pass `&Prefetch::default()`.
+pub(crate) async fn read_vertex_props_with_prefetch(
+    vid: Vid,
+    prefetched: &Prefetch,
+    prop_manager: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<uni_common::Properties> {
+    match prefetched.vertex.get(&vid).cloned() {
+        Some(mut base) => {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx) {
+                for (k, v) in l0 {
+                    base.insert(k, v);
+                }
+            }
+            Ok(base)
+        }
+        None => Ok(prop_manager
+            .get_all_vertex_props_with_ctx(vid, ctx)
+            .await?
+            .unwrap_or_default()),
+    }
+}
+
+/// Edge equivalent of [`read_vertex_props_with_prefetch`]. On a hit, layer
+/// in L0 edge props so writes from earlier rows of the same
+/// `apply_mutations` invocation take precedence. On a miss, fall back to
+/// the per-EID storage path.
+pub(crate) async fn read_edge_props_with_prefetch(
+    eid: Eid,
+    prefetched: &Prefetch,
+    prop_manager: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<uni_common::Properties> {
+    match prefetched.edge.get(&eid).cloned() {
+        Some(mut base) => {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx) {
+                for (k, v) in l0 {
+                    base.insert(k, v);
+                }
+            }
+            Ok(base)
+        }
+        None => Ok(prop_manager
+            .get_all_edge_props_with_ctx(eid, ctx)
+            .await?
+            .unwrap_or_default()),
     }
 }
 

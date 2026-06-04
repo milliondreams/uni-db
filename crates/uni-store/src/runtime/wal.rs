@@ -57,6 +57,12 @@ pub enum Mutation {
         #[serde(default)]
         labels: Vec<String>,
     },
+    /// Replaces a vertex's full label set (a `SET n:Label` / `REMOVE n:Label`
+    /// that touched no properties). Carries the complete resolved label set so
+    /// replay can REPLACE (removals included). Added after the original four
+    /// variants — externally-tagged serde_json, so old WAL segments (which never
+    /// contain it) deserialize unchanged.
+    SetVertexLabels { vid: Vid, labels: Vec<String> },
 }
 
 /// WAL segment with LSN for idempotent recovery
@@ -186,7 +192,7 @@ impl WriteAheadLog {
 
         // Include LSN in filename for easy ordering and identification
         let filename = format!("{:020}_{}.wal", lsn, Uuid::new_v4());
-        let path = self.prefix.child(filename);
+        let path = self.prefix.clone().join(filename);
 
         // Attempt to write; restore buffer on failure to prevent data loss
         if let Err(e) = put_with_timeout(&self.store, &path, json.into(), DEFAULT_TIMEOUT).await {
@@ -360,6 +366,7 @@ impl WriteAheadLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::local::LocalFileSystem;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -839,7 +846,7 @@ mod tests {
             ]
         }"#;
 
-        let path = prefix.child("00000000000000000001_test.wal");
+        let path = prefix.clone().join("00000000000000000001_test.wal");
         store.put(&path, old_format_json.into()).await?;
 
         // Create WAL and replay

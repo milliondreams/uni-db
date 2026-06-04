@@ -162,10 +162,7 @@ impl crate::api::UniInner {
     /// Used to compute affected_rows for mutation queries that return no result rows.
     pub(crate) async fn get_mutation_count(&self) -> usize {
         match self.writer.as_ref() {
-            Some(w) => {
-                let writer = w.read().await;
-                writer.l0_manager.get_current().read().mutation_count
-            }
+            Some(writer) => writer.l0_manager.get_current().read().mutation_count,
             None => 0,
         }
     }
@@ -175,15 +172,12 @@ impl crate::api::UniInner {
     #[allow(dead_code)] // Reserved for future per-type affected_rows reporting
     pub(crate) async fn get_mutation_stats(&self) -> uni_store::runtime::l0::MutationStats {
         match self.writer.as_ref() {
-            Some(w) => {
-                let writer = w.read().await;
-                writer
-                    .l0_manager
-                    .get_current()
-                    .read()
-                    .mutation_stats
-                    .clone()
-            }
+            Some(writer) => writer
+                .l0_manager
+                .get_current()
+                .read()
+                .mutation_stats
+                .clone(),
             None => uni_store::runtime::l0::MutationStats::default(),
         }
     }
@@ -192,7 +186,8 @@ impl crate::api::UniInner {
     pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         // Phase 5a-impl: apply fork-aware fusion rewrite so explain
         // output reflects the operators the executor will actually
@@ -211,7 +206,8 @@ impl crate::api::UniInner {
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
@@ -276,8 +272,9 @@ impl crate::api::UniInner {
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
@@ -387,6 +384,8 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
+        read_snapshot: Option<uni_store::runtime::SnapshotView>,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -407,11 +406,119 @@ impl crate::api::UniInner {
         }
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = {
+            let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+                .with_params(params.clone())
+                .with_plugin_registry(Arc::clone(&self.plugin_registry));
+            let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+            uni_query::rewrite_for_fork_fusion(lp, &*self.storage)
+        };
+        let plan_time = plan_start.elapsed();
+
+        // Clone the cached executor template instead of running
+        // `Executor::new` + six session-constant setters every query.
+        // The manual `Clone` impl installs a fresh `warnings` Mutex so
+        // each query gets its own warnings accumulator.
+        let mut executor = (*self.executor_template).clone();
+        // Per-query state.
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        executor.set_transaction_l0(tx_l0);
+        executor.set_read_snapshot(read_snapshot);
+        if let Some(r) = id_reservoir {
+            executor.set_id_reservoir(r);
+        }
+
+        let projection_order = extract_projection_order(&logical_plan);
+
+        let exec_start = Instant::now();
+        let results = executor
+            .execute(logical_plan, &self.properties, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
+        let exec_time = exec_start.elapsed();
+
+        let columns = if results.is_empty() {
+            Arc::new(vec![])
+        } else if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            let mut cols: Vec<String> = results[0].keys().cloned().collect();
+            cols.sort();
+            Arc::new(cols)
+        };
+
+        let rows: Vec<Row> = {
+            results
+                .into_iter()
+                .map(|map| {
+                    let mut values = Vec::with_capacity(columns.len());
+                    for col in columns.iter() {
+                        let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                        let normalized =
+                            ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                        values.push(normalized);
+                    }
+                    Row::new(columns.clone(), values)
+                })
+                .collect()
+        };
+
+        let metrics = QueryMetrics {
+            parse_time,
+            plan_time,
+            exec_time,
+            total_time: total_start.elapsed(),
+            rows_returned: rows.len(),
+            ..Default::default()
+        };
+
+        Ok(QueryResult::new(
+            columns,
+            rows,
+            executor.take_warnings(),
+            metrics,
+        ))
+    }
+
+    /// Profile a Cypher query within a transaction's private L0 buffer.
+    ///
+    /// Parallel to [`Self::execute_internal_with_tx_l0`] but invokes
+    /// `Executor::profile`, returning per-operator timing/memory stats
+    /// alongside the result rows. The tx_l0 is installed on the executor
+    /// so mutations land in the caller's private L0 (commit-time
+    /// serialization) — this is what lets `ExecuteBuilder::profile()`
+    /// profile a transaction write end-to-end.
+    pub(crate) async fn profile_internal_with_tx_l0(
+        &self,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
+        read_snapshot: Option<uni_store::runtime::SnapshotView>,
+    ) -> Result<(QueryResult, ProfileOutput)> {
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+
+        let (ast, tt_spec) = match ast {
+            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+            other => (other, None),
+        };
+
+        if tt_spec.is_some() {
+            return Err(UniError::Query {
+                message: "Time-travel queries are not supported within transactions".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
@@ -426,15 +533,17 @@ impl crate::api::UniInner {
             executor.set_writer(w.clone());
         }
         executor.set_transaction_l0(tx_l0);
+        executor.set_read_snapshot(read_snapshot);
+        if let Some(r) = id_reservoir {
+            executor.set_id_reservoir(r);
+        }
 
         let projection_order = extract_projection_order(&logical_plan);
 
-        let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
+        let (results, profile_output) = executor
+            .profile(logical_plan, &params)
             .await
             .map_err(|e| into_execution_error(e, cypher))?;
-        let exec_time = exec_start.elapsed();
 
         let columns = if results.is_empty() {
             Arc::new(vec![])
@@ -460,20 +569,9 @@ impl crate::api::UniInner {
             })
             .collect();
 
-        let metrics = QueryMetrics {
-            parse_time,
-            plan_time,
-            exec_time,
-            total_time: total_start.elapsed(),
-            rows_returned: rows.len(),
-            ..Default::default()
-        };
-
-        Ok(QueryResult::new(
-            columns,
-            rows,
-            executor.take_warnings(),
-            metrics,
+        Ok((
+            QueryResult::new(columns, rows, executor.take_warnings(), Default::default()),
+            profile_output,
         ))
     }
 
@@ -679,8 +777,9 @@ impl crate::api::UniInner {
         let total_start = Instant::now();
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();
@@ -764,8 +863,9 @@ impl crate::api::UniInner {
         let deadline = total_start + config.query_timeout;
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();

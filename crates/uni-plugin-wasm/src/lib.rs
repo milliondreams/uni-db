@@ -1,0 +1,88 @@
+//! WASM Component Model loader for the uni-db plugin framework.
+//!
+//! `uni-plugin-wasm` provides the host-side machinery to load WASM
+//! plugins built against the `uni:plugin` WIT worlds. The boundary uses:
+//!
+//! - **WIT-typed contracts** for each plugin kind (scalar, aggregate,
+//!   procedure, locy-agg, hook, storage, …) — typed exports + capability-
+//!   gated host imports.
+//! - **Arrow IPC over linear memory** for `RecordBatch` exchange — host
+//!   calls plugin's `alloc(len)`, copies IPC bytes in, calls the work
+//!   export, reads IPC bytes back at the returned `(ptr, len)`.
+//! - **Pre-warmed instance pools** to amortize the 10–100 ms wasmtime
+//!   instantiation cost across hot-path UDF invocations.
+//!
+//! # Crate status
+//!
+//! [`WasmLoader::load`] is fully wired behind the `wasmtime-runtime`
+//! feature (default-on): it instantiates a component, negotiates
+//! capabilities against the host grants, and registers the plugin's
+//! scalar / aggregate / procedure adapters end-to-end through the
+//! respective WIT worlds.
+
+// Rust guideline compliant
+#![warn(missing_docs)]
+#![warn(rust_2018_idioms)]
+#![warn(missing_debug_implementations)]
+
+pub mod buffer;
+pub mod error;
+
+/// Arrow IPC bridge — re-exported from `uni-plugin-wasm-rt`.
+///
+/// Lifted to the shared crate in M6.shared. `WasmIpcBuffer` (the
+/// wasmtime-specific linear-memory RAII helper) stays here in
+/// [`crate::buffer`].
+pub mod ipc {
+    pub use uni_plugin_wasm_rt::ipc::{decode_batch, decode_batches, encode_batch, encode_batches};
+}
+
+/// Instance pool — re-exported from `uni-plugin-wasm-rt`.
+///
+/// Type-aliased so `WasmInstancePool<T>` keeps working unchanged
+/// downstream.
+pub mod pool {
+    pub use uni_plugin_wasm_rt::pool::{PoolConfig, PoolMetrics};
+
+    /// Type alias — generic `InstancePool` parameterized with
+    /// [`crate::WasmError`].
+    pub type WasmInstancePool<T> = uni_plugin_wasm_rt::pool::InstancePool<T, crate::WasmError>;
+
+    /// Type alias — generic `PooledInstance` parameterized with
+    /// [`crate::WasmError`].
+    pub type PooledInstance<T> = uni_plugin_wasm_rt::pool::PooledInstance<T, crate::WasmError>;
+}
+
+#[cfg(feature = "wasmtime-runtime")]
+pub mod adapter;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod adapter_aggregate;
+#[cfg(feature = "wasmtime-runtime")]
+pub(crate) mod adapter_common;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod adapter_procedure;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod bindings;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod host_state;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod linker;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod loader;
+#[cfg(feature = "wasmtime-runtime")]
+pub mod multi_version;
+
+#[doc(inline)]
+pub use buffer::WasmIpcBuffer;
+#[doc(inline)]
+pub use error::WasmError;
+#[doc(inline)]
+pub use pool::WasmInstancePool;
+
+#[cfg(feature = "wasmtime-runtime")]
+#[doc(inline)]
+pub use loader::WasmLoader;
+
+#[cfg(feature = "wasmtime-runtime")]
+#[doc(inline)]
+pub use multi_version::{MultiVersionLinker, SUPPORTED_MAJORS};

@@ -26,11 +26,11 @@ impl GraphAlgoAdapter for BetweennessAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> BetweennessConfig {
-        BetweennessConfig {
+    fn to_config(args: Vec<Value>) -> Result<BetweennessConfig> {
+        Ok(BetweennessConfig {
             normalize: args[0].as_bool().unwrap_or(true),
             sampling_size: args[1].as_u64().map(|v| v as usize),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

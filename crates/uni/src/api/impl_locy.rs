@@ -93,9 +93,10 @@ pub(crate) async fn evaluate_with_db_and_config(
         }
     };
     let mut compiled = if let Some(names) = external_names {
-        uni_locy::compile_with_external_rules(&ast, &names).map_err(map_compile_error)?
+        uni_locy::compile_with_external_rules_and_config(&ast, &names, config)
+            .map_err(map_compile_error)?
     } else {
-        compile(&ast).map_err(map_compile_error)?
+        uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)?
     };
 
     // Merge registered rules
@@ -124,12 +125,11 @@ pub(crate) async fn evaluate_with_db_and_config(
     // Always create an ephemeral locy_l0 for the evaluation scope — this provides:
     // - DERIVE visibility: trailing Cypher sees DERIVE mutations
     // - ASSUME/ABDUCE isolation: fork/restore from this buffer
-    let locy_l0 = if let Some(ref writer) = db.writer {
-        let w = writer.read().await;
-        Some(w.create_transaction_l0())
-    } else {
-        None // Read-only DB: degrade gracefully
-    };
+    // Read-only DB returns None and degrades gracefully.
+    let locy_l0 = db
+        .writer
+        .as_ref()
+        .map(|writer| writer.create_transaction_l0());
     let engine = LocyEngine {
         db,
         tx_l0_override: locy_l0.clone(),
@@ -299,13 +299,8 @@ impl<'a> LocyEngine<'a> {
 
         // Capture current version for staleness detection in DerivedFactSet
         let evaluated_at_version = if self.collect_derive {
-            if let Some(ref w) = self.db.writer {
-                w.read()
-                    .await
-                    .l0_manager
-                    .get_current()
-                    .read()
-                    .current_version
+            if let Some(writer) = self.db.writer.as_ref() {
+                writer.l0_manager.get_current().read().current_version
             } else {
                 0
             }
@@ -318,7 +313,7 @@ impl<'a> LocyEngine<'a> {
         let query_planner = uni_query::QueryPlanner::new(schema);
         let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
         let logical = plan_builder
-            .build_program_plan(
+            .build_program_plan_with_full_neural(
                 &compiled,
                 config.max_iterations,
                 config.timeout,
@@ -329,6 +324,23 @@ impl<'a> LocyEngine<'a> {
                 config.exact_probability,
                 config.max_bdd_variables,
                 config.top_k_proofs,
+                config
+                    .resolve()
+                    .map_err(|e| UniError::Query {
+                        message: format!("LocyConfigError: {e}"),
+                        query: None,
+                    })?
+                    .kind,
+                std::sync::Arc::new(config.classifier_registry.clone()),
+                config.classifier_cache.clone().or_else(|| {
+                    Some(std::sync::Arc::new(uni_locy::ModelInvocationCache::new(
+                        config.classifier_cache_max,
+                    )))
+                }),
+                config
+                    .classifier_provenance_store
+                    .clone()
+                    .or_else(|| Some(std::sync::Arc::new(uni_locy::NeuralProvenanceStore::new()))),
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -390,6 +402,7 @@ impl<'a> LocyEngine<'a> {
             approximate_slot,
             command_results_slot,
             timeout_flag,
+            incomplete_slot,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -405,6 +418,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.approximate_slot(),
                 program_exec.command_results_slot(),
                 program_exec.timeout_flag(),
+                program_exec.incomplete_slot(),
             )
         } else {
             (
@@ -414,7 +428,8 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
                 Arc::new(std::sync::RwLock::new(Vec::new())),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                Arc::new(std::sync::RwLock::new(None)),
             )
         };
 
@@ -486,9 +501,10 @@ impl<'a> LocyEngine<'a> {
 
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
-        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
-        // Skip command dispatch when evaluation timed out — the partial derived
-        // store may be incomplete and SLG/QUERY would hit the expired timeout.
+        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        // Skip command dispatch when evaluation was cut short — the partial
+        // derived store may be incomplete and SLG/QUERY would hit the expired
+        // budget.
         if !timed_out_early {
             for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
                 if let Some(result) = inline_map.get(&cmd_idx) {
@@ -579,7 +595,18 @@ impl<'a> LocyEngine<'a> {
 
         // 11. Build final LocyResult
         let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
-        let timed_out = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
+        let incomplete = incomplete_slot.read().ok().and_then(|g| g.clone());
+        // An over-budget evaluation is a hard error by default: partial,
+        // possibly-unsound facts must not be returned silently. Callers that
+        // want anytime / best-effort semantics opt in via `allow_partial`, which
+        // returns the partial result with its `incomplete` diagnostics populated.
+        if let Some(detail) = &incomplete
+            && !config.allow_partial
+        {
+            return Err(UniError::LocyIncomplete {
+                detail: Box::new(detail.clone()),
+            });
+        }
         Ok(build_locy_result(
             enriched_derived,
             command_results,
@@ -589,7 +616,7 @@ impl<'a> LocyEngine<'a> {
             warnings,
             approximate_groups,
             derived_fact_set,
-            timed_out,
+            incomplete,
         ))
     }
 
@@ -607,7 +634,7 @@ impl<'a> LocyEngine<'a> {
         let query_planner = uni_query::QueryPlanner::new(schema);
         let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
         let logical = plan_builder
-            .build_program_plan(
+            .build_program_plan_with_semiring(
                 compiled,
                 config.max_iterations,
                 config.timeout,
@@ -618,6 +645,13 @@ impl<'a> LocyEngine<'a> {
                 config.exact_probability,
                 config.max_bdd_variables,
                 config.top_k_proofs,
+                config
+                    .resolve()
+                    .map_err(|e| UniError::Query {
+                        message: format!("LocyConfigError: {e}"),
+                        query: None,
+                    })?
+                    .kind,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -729,6 +763,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),
+            None, // Locy fact-extraction path is read-only
         )
         .await
         .map_err(|e| LocyError::ExecutorError {
@@ -784,23 +819,19 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             .or_else(|| self.tx_l0_override.clone());
         let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
             if let Some(tx_l0) = tx_l0_for_ctx {
-                if let Some(writer_arc) = &self.db.writer {
-                    if let Ok(writer) = writer_arc.try_read() {
-                        let l0_ctx = uni_query::query::df_graph::L0Context {
-                            current_l0: Some(writer.l0_manager.get_current()),
-                            transaction_l0: Some(tx_l0),
-                            pending_flush_l0s: writer.l0_manager.get_pending_flush(),
-                        };
-                        Some(Arc::new(
-                            uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
-                                self.db.storage.clone(),
-                                l0_ctx,
-                                self.graph_ctx.property_manager().clone(),
-                            ),
-                        ))
-                    } else {
-                        None
-                    }
+                if let Some(writer) = self.db.writer.as_ref() {
+                    let l0_ctx = uni_query::query::df_graph::L0Context {
+                        current_l0: Some(writer.l0_manager.get_current()),
+                        transaction_l0: Some(tx_l0),
+                        pending_flush_l0s: writer.l0_manager.get_pending_flush(),
+                    };
+                    Some(Arc::new(
+                        uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                            self.db.storage.clone(),
+                            l0_ctx,
+                            self.graph_ctx.property_manager().clone(),
+                        ),
+                    ))
                 } else {
                     None
                 }
@@ -819,11 +850,44 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),
+            None, // Locy fixpoint path is read-only
         )
         .await
         .map_err(|e| LocyError::ExecutorError {
             message: e.to_string(),
         })
+    }
+
+    async fn lookup_nodes_by_vids(
+        &self,
+        vids: &[u64],
+    ) -> std::result::Result<HashMap<u64, Value>, LocyError> {
+        if vids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Mirror the existing `lookup_derived_enriched` pattern: build a
+        // `MATCH (n) WHERE id(n) IN [...]` Cypher AST and run it through
+        // execute_query_ast, then index the returned rows by their vid.
+        let vids_literal = vids
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query_str =
+            format!("MATCH (n) WHERE id(n) IN [{vids_literal}] RETURN id(n) AS _vid, n");
+        let mut out: HashMap<u64, Value> = HashMap::new();
+        if let Ok(ast) = uni_cypher::parse(&query_str)
+            && let Ok(batches) = self.execute_query_ast(ast).await
+        {
+            for row in record_batches_to_locy_rows(&batches) {
+                if let (Some(Value::Int(vid)), Some(node)) = (row.get("_vid"), row.get("n"))
+                    && *vid >= 0
+                {
+                    out.insert(*vid as u64, node.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1063,6 +1127,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         let strata_only = CompiledProgram {
             strata: program.strata.clone(),
             rule_catalog: program.rule_catalog.clone(),
+            model_catalog: program.model_catalog.clone(),
             warnings: vec![],
             commands: vec![],
         };
@@ -1206,6 +1271,35 @@ fn dispatch_native_command<'a>(
                 stats.queries_executed += 1;
                 Ok(CommandResult::Cypher(rows))
             }
+            CompiledCommand::Calibrate(cc) => {
+                // CALIBRATE runs inline inside LocyProgramExec::run_program
+                // and surfaces its result via the command_results_slot;
+                // by the time we get here that lookup has already
+                // succeeded. Reaching this arm is a programming
+                // error (the inline result was missing).
+                Err(LocyError::EvaluationError {
+                    message: format!(
+                        "internal: CALIBRATE '{}' missing inline result; \
+                         dispatch_native_command should not have been invoked \
+                         for a Calibrate command",
+                        cc.model_name
+                    ),
+                })
+            }
+            CompiledCommand::Validate(cv) => {
+                // VALIDATE, like CALIBRATE, runs inline inside
+                // LocyProgramExec::run_program and surfaces via
+                // command_results_slot. Reaching this arm is a
+                // programming error.
+                Err(LocyError::EvaluationError {
+                    message: format!(
+                        "internal: VALIDATE '{}' missing inline result; \
+                         dispatch_native_command should not have been invoked \
+                         for a Validate command",
+                        cv.rule_name
+                    ),
+                })
+            }
         }
     })
 }
@@ -1281,6 +1375,7 @@ async fn enrich_vids_with_nodes(
                     session_ctx,
                     &db.storage,
                     &db.schema.schema(),
+                    None, // Locy inline Cypher path is read-only
                 )
                 .await
             {
@@ -1324,10 +1419,14 @@ fn build_locy_result(
     warnings: Vec<RuntimeWarning>,
     approximate_groups: HashMap<String, Vec<String>>,
     derived_fact_set: Option<DerivedFactSet>,
-    timed_out: bool,
+    incomplete: Option<uni_common::LocyIncomplete>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
-    orchestrator_stats.strata_evaluated = compiled.strata.len();
+    // Reflect how far evaluation actually got: the full count for a complete
+    // run, or the recorded completed-strata count when it was cut short.
+    orchestrator_stats.strata_evaluated = incomplete
+        .as_ref()
+        .map_or(compiled.strata.len(), |d| d.completed_strata);
     orchestrator_stats.derived_nodes = total_facts;
     orchestrator_stats.evaluation_time = evaluation_time;
 
@@ -1336,9 +1435,10 @@ fn build_locy_result(
         stats: orchestrator_stats,
         command_results,
         warnings,
+        compile_warnings: compiled.warnings.clone(),
         approximate_groups,
         derived_fact_set,
-        timed_out,
+        incomplete,
     };
     let metrics = QueryMetrics {
         total_time: evaluation_time,

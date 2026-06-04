@@ -1,0 +1,32 @@
+# Example Rhai plugin — opts out of the parent workspace.
+#
+# Run:
+#   cd examples/example-rhai-geo
+#   cargo run --release
+#
+# Prints expected great-circle distances for a small fixture of city
+# pairs, exercising the full Uni::load_rhai_plugin → registry → invoke
+# path against an in-process Uni.
+
+[workspace]
+
+[package]
+name = "example-rhai-geo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Rhai plugin: geo.haversine via Uni::load_rhai_plugin"
+publish = false
+
+[[bin]]
+name = "example-rhai-geo"
+path = "src/main.rs"
+
+[dependencies]
+uni-db = { path = "../../crates/uni" }
+uni-plugin = { path = "../../crates/uni-plugin" }
+uni-plugin-rhai = { path = "../../crates/uni-plugin-rhai" }
+arrow-array = "57"
+datafusion = "52"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"

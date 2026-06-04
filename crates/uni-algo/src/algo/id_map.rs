@@ -117,10 +117,10 @@ impl IdMap {
     /// **Warning:** This assumes that VIDs were inserted in sorted order.
     /// If not, `to_slot` will return incorrect results (binary search fails).
     pub fn compact(&mut self) {
-        // Optional: verify sort?
-        // if !self.slot_to_vid.windows(2).all(|w| w[0] <= w[1]) {
-        //     log::warn!("Compacting unsorted IdMap - lookup will fail!");
-        // }
+        debug_assert!(
+            self.slot_to_vid.windows(2).all(|w| w[0] <= w[1]),
+            "compacting an unsorted IdMap: binary-search lookups will be incorrect"
+        );
         self.vid_to_slot = None;
     }
 

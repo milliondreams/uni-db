@@ -5,13 +5,13 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, AllSimplePaths, AllSimplePathsConfig};
+use crate::algo::procedure_template::{arg_string_list, arg_u64, err_stream, parse_vid_arg};
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::Result;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct AllSimplePathsProcedure;
 
@@ -33,7 +33,11 @@ impl AlgoProcedure for AllSimplePathsProcedure {
         }
     }
 
-    fn execute(
+    fn wants_native_terminals(&self) -> bool {
+        true
+    }
+
+    fn execute_with_native_terminals(
         &self,
         ctx: AlgoContext,
         args: Vec<Value>,
@@ -41,42 +45,28 @@ impl AlgoProcedure for AllSimplePathsProcedure {
         let signature = self.signature();
         let args = match signature.validate_args(args) {
             Ok(a) => a,
-            Err(e) => return stream::once(async { Err(e) }).boxed(),
+            Err(e) => return err_stream(e),
         };
 
-        let start_vid_u64 = match &args[0] {
-            Value::String(s) => s.parse::<u64>().unwrap_or(0),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid start node")) }).boxed(),
+        // Parse every terminal up front; bad input now surfaces a clear
+        // error instead of the old `unwrap_or(0)` / `unwrap()`.
+        let (start_vid, end_vid, edge_types, max_len, node_labels) = match (|| {
+            let node_labels = if args[4].is_null() {
+                Vec::new()
+            } else {
+                arg_string_list(&args, 4, "nodeLabels")?
+            };
+            Ok((
+                parse_vid_arg(&args[0], "startNode")?,
+                parse_vid_arg(&args[1], "endNode")?,
+                arg_string_list(&args, 2, "relationshipTypes")?,
+                arg_u64(&args, 3, "maxLength")? as usize,
+                node_labels,
+            ))
+        })() {
+            Ok(parsed) => parsed,
+            Err(e) => return err_stream(e),
         };
-
-        let end_vid_u64 = match &args[1] {
-            Value::String(s) => s.parse::<u64>().unwrap_or(0),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid end node")) }).boxed(),
-        };
-
-        let edge_types = args[2]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        let max_len = args[3].as_u64().unwrap() as usize;
-
-        let node_labels = if args[4].is_null() {
-            Vec::new()
-        } else {
-            args[4]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect::<Vec<_>>()
-        };
-
-        let start_vid = Vid::from(start_vid_u64);
-        let end_vid = Vid::from(end_vid_u64);
 
         let stream = async_stream::try_stream! {
             let schema = ctx.storage.schema_manager().schema();

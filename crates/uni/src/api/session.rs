@@ -7,6 +7,8 @@
 //! through sessions, and sessions are the factory for transactions (writes).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -19,9 +21,24 @@ use crate::api::UniInner;
 use crate::api::hooks::{HookContext, QueryType, SessionHook};
 use crate::api::impl_locy::LocyRuleRegistry;
 use crate::api::locy_result::LocyResult;
+use crate::api::retry::RetryOptions;
 use crate::api::transaction::{IsolationLevel, Transaction};
 use uni_common::{Result, UniError, Value};
-use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
+use uni_query::{ExecuteResult, ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
+
+/// Build the [`UniError::Query`] returned when a `session.query()` /
+/// `QueryBuilder::fetch_all` is rejected for containing mutation clauses.
+///
+/// Shared by `execute_cached` and `QueryBuilder::fetch_all` so the
+/// user-facing wording lives in exactly one place.
+fn read_only_violation(cypher: &str) -> UniError {
+    UniError::Query {
+        message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
+             REMOVE) require a transaction. Use session.tx() to start one."
+            .to_string(),
+        query: Some(cypher.to_string()),
+    }
+}
 
 /// Atomic counters for plan cache hits/misses, shared between Session and its
 /// query execution helpers.
@@ -154,6 +171,19 @@ pub struct Session {
     id: String,
     params: Arc<std::sync::RwLock<HashMap<String, Value>>>,
     rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
+    /// Per-session plugin registry — fresh-empty per `Session::new` /
+    /// `new_forked`, shared across `Clone` (M8 follow-up F1).
+    ///
+    /// `Uni::load_python_plugin` registers into `db.plugin_registry`
+    /// (instance scope). `Session::add_python_plugin` registers into
+    /// this session-local registry. Query / procedure / Locy-aggregate
+    /// resolution dual-consults both, with session entries shadowing
+    /// instance entries by name — see proposal §5.4.2 for the
+    /// session-scope contract.
+    ///
+    /// Backed by `PluginRegistry`'s wait-free internals
+    /// (`DashMap` + `ArcSwap`); no outer lock needed.
+    pub(crate) session_plugin_registry: Arc<uni_plugin::PluginRegistry>,
     /// Mutual exclusion for write contexts (transaction, bulk writer).
     /// Only one write context can be active per session.
     active_write_guard: Arc<AtomicBool>,
@@ -174,38 +204,82 @@ pub struct Session {
     pub(crate) query_timeout: Option<Duration>,
     /// Default transaction timeout (from template or explicit configuration).
     pub(crate) transaction_timeout: Option<Duration>,
+    /// When `true`, planner consults registered `ReplacementScanProvider`s
+    /// for unknown CALL / function / label identifiers and strict-mode
+    /// errors on unknown labels instead of returning empty rows. Default
+    /// `false`; flip with [`Self::set_replacement_scans`]. Shared across
+    /// session clones via `Arc<AtomicBool>`.
+    pub(crate) replacement_scans_enabled: Arc<AtomicBool>,
+    /// Authenticated principal (M5i). `None` means "anonymous" —
+    /// `AuthzPolicy::check` still runs and can grant or deny, but
+    /// `Principal { id: "anonymous", groups: [] }` is what it sees.
+    pub(crate) principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
 }
 
 impl Session {
-    /// Create a new session from a shared database reference.
-    pub(crate) fn new(db: Arc<UniInner>) -> Self {
-        // Clone the global rule registry into this session
-        let global_registry = db.locy_rule_registry.read().unwrap();
-        let session_registry = global_registry.clone();
-        drop(global_registry);
-
-        db.active_session_count.fetch_add(1, Ordering::Relaxed);
-
+    /// Shared base constructor for the three public-facing constructors
+    /// (`new` / `new_forked` / `new_from_template`).
+    ///
+    /// The arguments are exactly the fields those constructors differ in;
+    /// every other field is initialized identically (fresh id, fresh
+    /// session-local plugin registry, fresh metrics / plan cache / write
+    /// guard / cancellation token, no principal). Each caller is
+    /// responsible for incrementing `db.active_session_count` before
+    /// delegating here so the increment lives next to the matching
+    /// `Drop`-time decrement at each call site.
+    #[allow(clippy::too_many_arguments)]
+    fn new_base(
+        db: Arc<UniInner>,
+        fork_scope: Option<Arc<uni_store::fork::ForkScope>>,
+        params: HashMap<String, Value>,
+        rule_registry: LocyRuleRegistry,
+        cancellation_token: CancellationToken,
+        hooks: HashMap<String, Arc<dyn SessionHook>>,
+        query_timeout: Option<Duration>,
+        transaction_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             db,
             original_db: None,
-            fork_scope: None,
+            fork_scope,
             id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
+            params: Arc::new(std::sync::RwLock::new(params)),
+            rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
+            session_plugin_registry: Arc::new(uni_plugin::PluginRegistry::new()),
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            cancellation_token: Arc::new(std::sync::RwLock::new(cancellation_token)),
             plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
-            hooks: HashMap::new(),
-            query_timeout: None,
-            transaction_timeout: None,
+            hooks,
+            query_timeout,
+            transaction_timeout,
+            replacement_scans_enabled: Arc::new(AtomicBool::new(false)),
+            principal: None,
         }
+    }
+
+    /// Create a new session from a shared database reference.
+    pub(crate) fn new(db: Arc<UniInner>) -> Self {
+        // Clone the global rule registry into this session
+        let session_registry = db.locy_rule_registry.read().unwrap().clone();
+
+        db.active_session_count.fetch_add(1, Ordering::Relaxed);
+
+        Self::new_base(
+            db,
+            None,
+            HashMap::new(),
+            session_registry,
+            CancellationToken::new(),
+            HashMap::new(),
+            None,
+            None,
+        )
     }
 
     /// Create a forked session from a fork-scoped `UniInner`.
@@ -240,26 +314,16 @@ impl Session {
         // affecting the parent — exactly the spec §4.6 contract.
         let child_token = parent_token.child_token();
 
-        Self {
+        Self::new_base(
             db,
-            original_db: None,
-            fork_scope: Some(scope),
-            id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
-            active_write_guard: Arc::new(AtomicBool::new(false)),
-            metrics_inner: Arc::new(SessionMetricsInner::new()),
-            created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(child_token)),
-            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
-            plan_cache_metrics: Arc::new(PlanCacheMetrics {
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-            }),
-            hooks: HashMap::new(),
-            query_timeout: None,
-            transaction_timeout: None,
-        }
+            Some(scope),
+            HashMap::new(),
+            session_registry,
+            child_token,
+            HashMap::new(),
+            None,
+            None,
+        )
     }
 
     /// Open or create a fork by name.
@@ -301,26 +365,224 @@ impl Session {
     ) -> Self {
         db.active_session_count.fetch_add(1, Ordering::Relaxed);
 
-        Self {
+        Self::new_base(
             db,
-            original_db: None,
-            fork_scope: None,
-            id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(params)),
-            rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
-            active_write_guard: Arc::new(AtomicBool::new(false)),
-            metrics_inner: Arc::new(SessionMetricsInner::new()),
-            created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
-            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
-            plan_cache_metrics: Arc::new(PlanCacheMetrics {
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-            }),
+            None,
+            params,
+            rule_registry,
+            CancellationToken::new(),
             hooks,
             query_timeout,
             transaction_timeout,
+        )
+    }
+
+    /// Attach an authenticated [`Principal`] to this session.
+    ///
+    /// Called from [`crate::api::Uni::session_with_credentials`] after
+    /// a successful authentication round-trip. Authz policies will see
+    /// this principal; without one they see the anonymous fallback.
+    ///
+    /// [`Principal`]: uni_plugin::traits::connector::Principal
+    #[must_use]
+    pub fn with_principal(
+        mut self,
+        principal: Arc<uni_plugin::traits::connector::Principal>,
+    ) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    /// The principal authenticated to this session, if any. `None`
+    /// means anonymous.
+    #[must_use]
+    pub fn principal(&self) -> Option<&Arc<uni_plugin::traits::connector::Principal>> {
+        self.principal.as_ref()
+    }
+
+    /// Borrow the **session-local** plugin registry — fresh-empty
+    /// per `Session::new` / `new_forked` / `new_from_template`, shared
+    /// across `Clone`.
+    ///
+    /// Use this to add plugins that should be visible only to this
+    /// session (e.g., Python UDFs registered by a notebook user).
+    /// Resolution in the query path dual-consults this registry then
+    /// falls back to the instance registry.
+    #[must_use]
+    pub fn plugin_registry(&self) -> &Arc<uni_plugin::PluginRegistry> {
+        &self.session_plugin_registry
+    }
+
+    /// Borrow the **instance-level** plugin registry shared across all
+    /// sessions. Plugins added through `Uni::add_plugin`,
+    /// `Uni::load_rhai_plugin`, `Uni::load_python_plugin` etc. live
+    /// here and are visible to every session.
+    #[must_use]
+    pub fn instance_plugin_registry(&self) -> &Arc<uni_plugin::PluginRegistry> {
+        &self.db.plugin_registry
+    }
+
+    /// Load a PyO3 (Python source) plugin into this **session**'s
+    /// local plugin registry.
+    ///
+    /// Mirrors [`crate::Uni::load_python_plugin`] but registers
+    /// session-scoped per proposal §5.4.2 default: the plugin is not
+    /// visible to other sessions and is dropped when this session is
+    /// dropped.
+    ///
+    /// The supplied `loader` carries the default plugin id used when
+    /// the module doesn't call `db.set_plugin_id(...)`. `module_src` is
+    /// Python source code; `module_name` is the simulated `__name__`.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::InvalidArgument`] for plugin-side faults (parse,
+    ///   manifest, unknown type name).
+    /// - [`UniError::Internal`] for host-side faults.
+    ///
+    /// # Feature
+    ///
+    /// Requires the `pyo3-plugins` feature.
+    #[cfg(feature = "pyo3-plugins")]
+    pub fn add_python_plugin(
+        &self,
+        py: pyo3::Python<'_>,
+        loader: &uni_plugin_pyo3::PythonPluginLoader,
+        module_src: &str,
+        module_name: &str,
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_pyo3::LoadOutcome> {
+        crate::api::with_loading_registrar(
+            &self.session_plugin_registry,
+            "pyo3.session.loading",
+            registrar_caps,
+            |r| {
+                loader
+                    .load(py, module_src, module_name, r, registrar_caps)
+                    .map_err(|e| match e {
+                        uni_plugin_pyo3::PyPluginError::PythonException {
+                            qname,
+                            message,
+                            traceback,
+                        } => UniError::InvalidArgument {
+                            arg: "module_src".to_owned(),
+                            message: format!("python exception in {qname}: {message}\n{traceback}"),
+                        },
+                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin manifest: {m}"),
+                            }
+                        }
+                        uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => {
+                            UniError::InvalidArgument {
+                                arg: "module_src".to_owned(),
+                                message: format!("python plugin arrow conversion: {m}"),
+                            }
+                        }
+                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                    })
+            },
+        )
+    }
+
+    /// Commit accumulated decorator entries from a
+    /// [`uni_plugin_pyo3::ManifestBuilder`] into this session's local
+    /// registry.
+    ///
+    /// Used by the Python bindings layer to commit
+    /// `@db.scalar_fn(...)`-style incremental decorations.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::add_python_plugin`].
+    ///
+    /// # Feature
+    ///
+    /// Requires the `pyo3-plugins` feature.
+    #[cfg(feature = "pyo3-plugins")]
+    pub fn finalize_python_plugin(
+        &self,
+        loader: &uni_plugin_pyo3::PythonPluginLoader,
+        builder: &uni_plugin_pyo3::ManifestBuilder,
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_pyo3::LoadOutcome> {
+        crate::api::with_loading_registrar(
+            &self.session_plugin_registry,
+            "pyo3.session.loading",
+            registrar_caps,
+            |r| {
+                loader
+                    .load_from_builder(builder, r, registrar_caps)
+                    .map_err(|e| match e {
+                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
+                            UniError::InvalidArgument {
+                                arg: "decorators".to_owned(),
+                                message: format!("python plugin manifest: {m}"),
+                            }
+                        }
+                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                    })
+            },
+        )
+    }
+
+    /// Run every registered [`AuthzPolicy`] against the session's
+    /// principal (or anonymous if none) for the given `cypher` query
+    /// and `verb` action. Returns the first `Decision::Deny` as a
+    /// [`UniError::AuthorizationDenied`].
+    ///
+    /// v1 scope: `Resource::path` is the full cypher source (used by
+    /// policies that want regex / hash matching). Per-label /
+    /// per-edge-type resource extraction is a v1.1 follow-up.
+    ///
+    /// [`AuthzPolicy`]: uni_plugin::traits::connector::AuthzPolicy
+    fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
+        use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
+
+        let policies = self.db.plugin_registry.authz_policies();
+        if policies.is_empty() {
+            return Ok(());
         }
+        // Anonymous principal default — policies are responsible for
+        // rejecting if they require an authenticated principal.
+        let anon = Principal::anonymous();
+        let principal = self.principal.as_deref().unwrap_or(&anon);
+        let action = Action {
+            verb: verb.to_owned(),
+        };
+        let resource = Resource {
+            path: cypher.to_owned(),
+        };
+        for policy in policies.iter() {
+            match policy.check(principal, &action, &resource) {
+                Ok(Decision::Allow) => {}
+                Ok(Decision::Deny { reason }) => {
+                    return Err(UniError::AuthorizationDenied { reason });
+                }
+                Err(e) => {
+                    return Err(UniError::AuthorizationDenied { reason: e.0 });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether `ReplacementScanProvider` dispatch is enabled for
+    /// this session (default `false`). When true, the planner consults
+    /// registered providers for unknown CALL / function / label
+    /// identifiers, and label resolution becomes strict (unknown labels
+    /// error instead of returning empty rows).
+    #[must_use]
+    pub fn replacement_scans_enabled(&self) -> bool {
+        self.replacement_scans_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable `ReplacementScanProvider` dispatch for this
+    /// session. The flag is shared across session clones (Arc-backed).
+    pub fn set_replacement_scans(&self, enabled: bool) {
+        self.replacement_scans_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     // ── Scoped Parameters ─────────────────────────────────────────────
@@ -341,6 +603,7 @@ impl Session {
     /// changes.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
+        self.authorize(cypher, "read")?;
         let params = self.merge_params(HashMap::new());
         self.run_before_query_hooks(cypher, QueryType::Cypher, &params)?;
         let start = Instant::now();
@@ -448,6 +711,98 @@ impl Session {
         Transaction::new(self).await
     }
 
+    /// Runs `f` in a transaction, retrying on retriable conflicts.
+    ///
+    /// Each attempt opens a fresh transaction, passes it to `f`, and commits on
+    /// `Ok`. A retriable failure ([`UniError::is_retriable`]) from either `f` or
+    /// the commit rolls back and retries with jittered backoff, up to
+    /// `opts.max_attempts`; the final error is returned once attempts are
+    /// exhausted. Non-retriable errors return immediately. Because `commit`
+    /// consumes the transaction, `f` is re-run from scratch each attempt — it
+    /// must re-clone any captured input it consumes and re-read any value it
+    /// derives a write from, which is exactly what makes the retry observe the
+    /// winning transaction's committed state.
+    ///
+    /// The closure returns a boxed future borrowing the transaction; the
+    /// `Box::pin(async move { … })` wrapper at the call site is required.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(session: &uni_db::Session) -> uni_db::Result<()> {
+    /// use uni_db::RetryOptions;
+    /// session
+    ///     .transact_with_retry(RetryOptions::default(), |tx| {
+    ///         Box::pin(async move {
+    ///             tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1").await?;
+    ///             Ok(())
+    ///         })
+    ///     })
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns the last error once attempts are exhausted, or immediately for any
+    /// non-retriable error raised by `f`, by `tx()`, or by `commit()`.
+    pub async fn transact_with_retry<F, T>(&self, opts: RetryOptions, mut f: F) -> Result<T>
+    where
+        F: for<'a> FnMut(&'a Transaction) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+        T: Send,
+    {
+        let mut attempt: u32 = 1;
+        loop {
+            let tx = self.tx().await?;
+            match f(&tx).await {
+                Ok(value) => match tx.commit().await {
+                    Ok(_) => return Ok(value),
+                    // `commit` already consumed `tx`; nothing to roll back.
+                    Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                        metrics::counter!("uni_ssi_retries_total", "stage" => "commit")
+                            .increment(1);
+                        attempt += 1;
+                        opts.backoff(attempt).await;
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                    metrics::counter!("uni_ssi_retries_total", "stage" => "body").increment(1);
+                    tx.rollback();
+                    attempt += 1;
+                    opts.backoff(attempt).await;
+                }
+                Err(e) => {
+                    tx.rollback();
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Runs a single mutation with conflict retry, using default options.
+    ///
+    /// Convenience over [`Session::transact_with_retry`] for a self-contained
+    /// statement such as an atomic read-modify-write `SET`.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(session: &uni_db::Session) -> uni_db::Result<()> {
+    /// session
+    ///     .execute_with_retry("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1")
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Same as [`Session::transact_with_retry`].
+    pub async fn execute_with_retry(&self, cypher: &str) -> Result<ExecuteResult> {
+        let cypher = cypher.to_owned();
+        self.transact_with_retry(RetryOptions::default(), move |tx| {
+            let cypher = cypher.clone();
+            Box::pin(async move { tx.execute(&cypher).await })
+        })
+        .await
+    }
+
     /// `true` when this session was returned by `Session::fork(...)`.
     pub fn is_forked(&self) -> bool {
         self.fork_scope.is_some()
@@ -495,7 +850,7 @@ impl Session {
     /// (e.g. snapshot-pinned sessions).
     pub async fn flush(&self) -> Result<()> {
         if let Some(writer_lock) = &self.db.writer {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .flush_to_l1(None)
                 .await
@@ -539,7 +894,7 @@ impl Session {
         // no-op there — but for BTree/Sorted it ensures the Lance
         // index covers all rows the user has committed.
         if let Some(writer_lock) = &self.db.writer {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
         }
         uni_store::fork::index_builder::build_fork_local_index(
@@ -654,43 +1009,83 @@ impl Session {
     // ── Hooks ─────────────────────────────────────────────────────────
 
     /// Add a named session hook for query/commit interception.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn add_hook(&mut self, name: impl Into<String>, hook: impl SessionHook + 'static) {
         self.hooks.insert(name.into(), Arc::new(hook));
     }
 
     /// Remove a hook by name. Returns true if it existed.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn remove_hook(&mut self, name: &str) -> bool {
         self.hooks.remove(name).is_some()
     }
 
     /// List names of all registered hooks.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn list_hooks(&self) -> Vec<String> {
         self.hooks.keys().cloned().collect()
     }
 
     /// Remove all hooks.
+    #[deprecated(
+        since = "1.6.0",
+        note = "Use `Uni::add_plugin(BuiltinHookPlugin::new(...))` instead. Registry-iterating dispatch fires both per-session hooks and plugin hooks; this method will be removed in 2.0."
+    )]
     pub fn clear_hooks(&mut self) {
         self.hooks.clear();
     }
 
     /// Run before-query hooks. Returns `Err(HookRejected)` if any hook rejects.
+    ///
+    /// Iterates two dispatch tables: the legacy per-session
+    /// `HashMap<String, SessionHook>` (for backward compatibility with
+    /// `Session::add_hook`), and the phased
+    /// `uni_plugin::SessionHook` chain in the plugin registry (M5b — any
+    /// `BuiltinHookPlugin` registered via `Uni::add_plugin`). The two
+    /// dispatch paths are additive: registry hooks fire even if the
+    /// per-session map is empty.
     pub(crate) fn run_before_query_hooks(
         &self,
         query_text: &str,
         query_type: QueryType,
         params: &HashMap<String, Value>,
     ) -> Result<()> {
-        if self.hooks.is_empty() {
-            return Ok(());
-        }
-        let ctx = HookContext {
+        let legacy_ctx = HookContext {
             session_id: self.id.clone(),
             query_text: query_text.to_string(),
             query_type,
             params: params.clone(),
         };
         for hook in self.hooks.values() {
-            hook.before_query(&ctx)?;
+            hook.before_query(&legacy_ctx)?;
+        }
+
+        // Phased registry hooks (M5b): translate to `ParseContext` and
+        // fire `on_parse`. Any non-`Continue` outcome rejects the query
+        // and short-circuits the rest of the chain.
+        let registry_hooks = self.db.plugin_registry.hooks();
+        if !registry_hooks.is_empty() {
+            let parse_ctx = uni_plugin::traits::hook::ParseContext::new(query_text, &self.id)
+                .with_query_type(query_type_to_plugin(query_type));
+            for hook in registry_hooks.iter() {
+                use uni_plugin::errors::HookOutcome;
+                match hook.on_parse(&parse_ctx) {
+                    HookOutcome::Continue => {}
+                    HookOutcome::Reject { reason } => {
+                        return Err(UniError::HookRejected { message: reason });
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }
@@ -703,10 +1098,7 @@ impl Session {
         params: &HashMap<String, Value>,
         metrics: &uni_query::QueryMetrics,
     ) {
-        if self.hooks.is_empty() {
-            return;
-        }
-        let ctx = HookContext {
+        let legacy_ctx = HookContext {
             session_id: self.id.clone(),
             query_text: query_text.to_string(),
             query_type,
@@ -714,10 +1106,30 @@ impl Session {
         };
         for hook in self.hooks.values() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hook.after_query(&ctx, metrics);
+                hook.after_query(&legacy_ctx, metrics);
             }));
             if let Err(e) = result {
                 tracing::error!("after_query hook panicked: {:?}", e);
+            }
+        }
+
+        // Phased registry hooks (M5b): translate metrics + fire
+        // `on_execute_end`. Panics in registry hooks are also caught.
+        let registry_hooks = self.db.plugin_registry.hooks();
+        if !registry_hooks.is_empty() {
+            let exec_ctx = uni_plugin::traits::hook::ExecuteContext::new(&self.id);
+            let plugin_metrics = uni_plugin::traits::hook::QueryMetrics {
+                elapsed: metrics.total_time,
+                rows_out: metrics.rows_returned as u64,
+                bytes_read: metrics.bytes_read as u64,
+            };
+            for hook in registry_hooks.iter() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.on_execute_end(&exec_ctx, &plugin_metrics);
+                }));
+                if let Err(e) = result {
+                    tracing::error!("registry on_execute_end hook panicked: {:?}", e);
+                }
             }
         }
     }
@@ -803,16 +1215,27 @@ impl Session {
         let cached = self.plan_cache.lock().ok().and_then(|mut cache| {
             cache
                 .get(cache_key, schema_version)
-                .map(|entry| (entry.ast.clone(), entry.plan.clone()))
+                .map(|entry| entry.plan.clone())
         });
 
-        if let Some((_ast, plan)) = cached {
+        // Session-local plugin registry — threaded across the async
+        // executor scope via `tokio::task_local!` so the per-query
+        // UDF / procedure resolution path can consult it. See M8.6.
+        // FU-1: also thread the session's authenticated principal so
+        // procedure capability gates see the in-flight user.
+        let session_pr = Arc::clone(&self.session_plugin_registry);
+        let session_principal = self.principal.clone();
+
+        if let Some(plan) = cached {
             // Cache hit — skip parse and plan, execute the cached plan directly
             self.plan_cache_metrics.hits.fetch_add(1, Ordering::Relaxed);
-            return self
-                .db
-                .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None)
-                .await;
+            return uni_query::scoped_with_session_context(
+                session_pr,
+                session_principal,
+                self.db
+                    .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None),
+            )
+            .await;
         }
 
         // Cache miss — parse, plan, cache, execute via the normal path
@@ -825,26 +1248,26 @@ impl Session {
 
         // Enforce read-only semantics for session queries — mutations require
         // a transaction for isolation, WAL protection, and commit hooks.
-        uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-            message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
-                 REMOVE) require a transaction. Use session.tx() to start one."
-                .to_string(),
-            query: Some(cypher.to_string()),
-        })?;
+        uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(cypher))?;
 
         // Time-travel queries bypass the cache entirely
         if matches!(ast, uni_cypher::ast::Query::TimeTravel { .. }) {
-            return self
-                .db
-                .execute_internal_with_config(cypher, params, self.db.config.clone())
-                .await;
+            return uni_query::scoped_with_session_context(
+                Arc::clone(&session_pr),
+                session_principal.clone(),
+                self.db
+                    .execute_internal_with_config(cypher, params, self.db.config.clone()),
+            )
+            .await;
         }
 
         // Plan
         let planner = uni_query::QueryPlanner::new(self.db.schema.schema().clone())
-            .with_params(params.clone());
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.db.plugin_registry))
+            .with_replacement_scans(self.replacement_scans_enabled());
         let plan = planner
-            .plan(ast.clone())
+            .plan(ast)
             .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?;
 
         // Cache the entry
@@ -852,7 +1275,6 @@ impl Session {
             cache.insert(
                 cache_key,
                 PlanCacheEntry {
-                    ast,
                     plan: plan.clone(),
                     schema_version,
                     hit_count: 0,
@@ -861,9 +1283,13 @@ impl Session {
         }
 
         // Execute the freshly planned query
-        self.db
-            .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None)
-            .await
+        uni_query::scoped_with_session_context(
+            session_pr,
+            session_principal,
+            self.db
+                .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None),
+        )
+        .await
     }
 
     /// Get the database inner reference (for Transaction, LocyEngine, etc.)
@@ -1004,12 +1430,7 @@ impl<'a> QueryBuilder<'a> {
             // own validation). Parse is cheap relative to execution.
             let ast = uni_cypher::parse(&self.cypher)
                 .map_err(crate::api::impl_query::into_parse_error)?;
-            uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-                message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, \
-                     SET, REMOVE) require a transaction. Use session.tx() to start one."
-                    .to_string(),
-                query: Some(self.cypher.clone()),
-            })?;
+            uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(&self.cypher))?;
 
             // Custom config — bypass cache and use the config-aware path
             let mut db_config = self.session.db.config.clone();
@@ -1020,17 +1441,25 @@ impl<'a> QueryBuilder<'a> {
                 db_config.max_query_memory = m;
             }
             let params = self.session.merge_params(self.params);
-            self.session
-                .db
-                .execute_internal_with_config_and_token(
+            let session_pr = Arc::clone(&self.session.session_plugin_registry);
+            let session_principal = self.session.principal.clone();
+            uni_query::scoped_with_session_context(
+                session_pr,
+                session_principal,
+                self.session.db.execute_internal_with_config_and_token(
                     &self.cypher,
                     params,
                     db_config,
                     self.cancellation_token,
-                )
-                .await
+                ),
+            )
+            .await
         } else {
-            // Default config — use the plan cache
+            // Default config — use the plan cache.
+            // `execute_cached` already wraps with
+            // `scoped_with_session_plugin_registry` so the session
+            // registry is in scope through the cached / fresh-plan
+            // branches inside.
             let params = self.session.merge_params(self.params);
             self.session.execute_cached(&self.cypher, params).await
         }
@@ -1052,10 +1481,16 @@ impl<'a> QueryBuilder<'a> {
             db_config.max_query_memory = m;
         }
         let params = self.session.merge_params(self.params);
-        self.session
-            .db
-            .execute_cursor_internal_with_config(&self.cypher, params, db_config)
-            .await
+        let session_pr = Arc::clone(&self.session.session_plugin_registry);
+        let session_principal = self.session.principal.clone();
+        uni_query::scoped_with_session_context(
+            session_pr,
+            session_principal,
+            self.session
+                .db
+                .execute_cursor_internal_with_config(&self.cypher, params, db_config),
+        )
+        .await
     }
 
     /// Explain the query plan without executing it.
@@ -1066,7 +1501,14 @@ impl<'a> QueryBuilder<'a> {
     /// Profile the query execution, returning results with profiling output.
     pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
         let params = self.session.merge_params(self.params);
-        self.session.db.profile_internal(&self.cypher, params).await
+        let session_pr = Arc::clone(&self.session.session_plugin_registry);
+        let session_principal = self.session.principal.clone();
+        uni_query::scoped_with_session_context(
+            session_pr,
+            session_principal,
+            self.session.db.profile_internal(&self.cypher, params),
+        )
+        .await
     }
 }
 
@@ -1119,6 +1561,11 @@ impl Clone for Session {
             rule_registry: Arc::new(std::sync::RwLock::new(
                 self.rule_registry.read().unwrap().clone(),
             )),
+            // Clones are alternate handles to the same logical
+            // session — share the session-local plugin registry so
+            // plugins added through one handle are visible to all
+            // clones. Drop semantics are handled by `Arc` refcount.
+            session_plugin_registry: Arc::clone(&self.session_plugin_registry),
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
@@ -1128,6 +1575,8 @@ impl Clone for Session {
             hooks: self.hooks.clone(),
             query_timeout: self.query_timeout,
             transaction_timeout: self.transaction_timeout,
+            replacement_scans_enabled: self.replacement_scans_enabled.clone(),
+            principal: self.principal.clone(),
         }
     }
 }
@@ -1138,11 +1587,26 @@ impl Drop for Session {
     }
 }
 
+/// Read-side host for the `uni-fork` diff/promote engine.
+#[async_trait::async_trait]
+impl uni_fork::ForkQueryHost for Session {
+    async fn query(&self, cypher: &str) -> Result<QueryResult> {
+        Session::query(self, cypher).await
+    }
+
+    fn storage(&self) -> Arc<uni_store::storage::manager::StorageManager> {
+        self.db.storage.clone()
+    }
+
+    fn schema(&self) -> Arc<uni_common::core::schema::SchemaManager> {
+        self.db.schema.clone()
+    }
+}
+
 // ── Plan Cache (internal) ─────────────────────────────────────────────
 
 /// Entry in the transparent plan cache.
 struct PlanCacheEntry {
-    ast: uni_query::CypherQuery,
     plan: uni_query::LogicalPlan,
     schema_version: u32,
     hit_count: u64,
@@ -1190,6 +1654,18 @@ impl PlanCache {
     /// Number of cached plans.
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Translate the legacy host [`QueryType`] enum to the plugin-framework
+/// [`uni_plugin::traits::hook::QueryType`] used by phased
+/// `SessionHook`s. Mirrors the inverse helper in `api::hooks`.
+fn query_type_to_plugin(t: QueryType) -> uni_plugin::traits::hook::QueryType {
+    use uni_plugin::traits::hook::QueryType as P;
+    match t {
+        QueryType::Cypher => P::Cypher,
+        QueryType::Locy => P::Locy,
+        QueryType::Execute => P::Execute,
     }
 }
 

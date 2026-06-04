@@ -99,6 +99,24 @@ pub trait StorageBackend: Send + Sync + 'static {
         mode: WriteMode,
     ) -> Result<()>;
 
+    /// Upsert via Lance MergeInsert. Source rows are joined to the
+    /// target on the columns in `on`; matched rows have `UpdateAll`
+    /// applied (i.e. every column present in the source overrides the
+    /// target's value for that column; columns not in the source are
+    /// preserved). Unmatched source rows are DROPPED — partial writes
+    /// never INSERT (CREATE goes through `write` with `WriteMode::Append`).
+    ///
+    /// Used by `Writer::flush_stream_l1` when
+    /// `UniConfig::partial_lance_writes` is on.
+    async fn merge_insert(
+        &self,
+        _table_name: &str,
+        _on: &[&str],
+        _batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        anyhow::bail!("merge_insert not supported by this backend")
+    }
+
     /// Delete rows matching a filter expression.
     async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()>;
 

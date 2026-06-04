@@ -1,5 +1,6 @@
 pub mod dependency;
 pub mod errors;
+pub mod models;
 pub mod stratify;
 pub mod typecheck;
 pub mod warded;
@@ -10,12 +11,17 @@ use std::collections::HashMap;
 
 use uni_cypher::locy_ast::{LocyProgram, LocyStatement, RuleDefinition};
 
+use crate::config::LocyConfig;
 use crate::types::{CompiledAssume, CompiledCommand, CompiledProgram, Stratum};
 use errors::LocyCompileError;
+pub use typecheck::{MonotonicityOracle, default_monotonicity_oracle};
 
 /// Validate and stratify a parsed Locy program into a `CompiledProgram`.
 ///
 /// Pipeline: group_rules → dependency graph → stratify → wardedness → typecheck → assemble.
+/// Defaults to a config with `neural_predicates_preview = false` (use
+/// [`compile_with_config`] to opt into the Phase B preview surface) and
+/// [`default_monotonicity_oracle`] for the recursive-stratum FOLD check.
 pub fn compile(program: &LocyProgram) -> Result<CompiledProgram, LocyCompileError> {
     compile_with_modules(program, &HashMap::new())
 }
@@ -30,7 +36,32 @@ pub fn compile_with_external_rules(
     program: &LocyProgram,
     external_rules: &[String],
 ) -> Result<CompiledProgram, LocyCompileError> {
-    compile_with_context(program, &HashMap::new(), external_rules)
+    compile_with_context(
+        program,
+        &HashMap::new(),
+        external_rules,
+        false,
+        &default_monotonicity_oracle,
+    )
+}
+
+/// Compile with pre-registered external rule names AND a [`LocyConfig`].
+///
+/// The Phase B variant: surfaces the `neural_predicates_preview` flag
+/// through registries that wouldn't otherwise see it. Other config
+/// fields are ignored at compile time (they affect runtime only).
+pub fn compile_with_external_rules_and_config(
+    program: &LocyProgram,
+    external_rules: &[String],
+    config: &LocyConfig,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        &HashMap::new(),
+        external_rules,
+        config.neural_predicates_preview,
+        &default_monotonicity_oracle,
+    )
 }
 
 /// Compile a Locy program with module resolution context.
@@ -42,7 +73,50 @@ pub fn compile_with_modules(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
 ) -> Result<CompiledProgram, LocyCompileError> {
-    compile_with_context(program, available_modules, &[])
+    compile_with_context(
+        program,
+        available_modules,
+        &[],
+        false,
+        &default_monotonicity_oracle,
+    )
+}
+
+/// Phase B entry: compile with a [`LocyConfig`] so neural-predicate preview
+/// gates can fire. Equivalent to [`compile_with_modules`] when the config
+/// has `neural_predicates_preview = false`.
+pub fn compile_with_config(
+    program: &LocyProgram,
+    config: &LocyConfig,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        &HashMap::new(),
+        &[],
+        config.neural_predicates_preview,
+        &default_monotonicity_oracle,
+    )
+}
+
+/// Compile a Locy program with a host-supplied monotonicity oracle.
+///
+/// Hosts that hold a `uni_plugin::PluginRegistry` should pass a closure
+/// that resolves aggregate names through the registry and reads
+/// `Semilattice.monotone_join`, so user-registered aggregates participate
+/// in the recursive-stratum FOLD check.
+pub fn compile_with_oracle(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+    is_monotonic: MonotonicityOracle<'_>,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        available_modules,
+        external_rules,
+        false,
+        is_monotonic,
+    )
 }
 
 /// Compile a Locy program with module resolution and external rule context.
@@ -50,7 +124,11 @@ fn compile_with_context(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
     external_rules: &[String],
+    neural_predicates_preview: bool,
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<CompiledProgram, LocyCompileError> {
+    let (model_catalog, mut model_warnings) =
+        models::compile_models(program, neural_predicates_preview)?;
     let module_ctx = modules::resolve_modules(program, available_modules)?;
     let rule_groups = group_rules_with_context(program, &module_ctx);
     let mut rule_names: Vec<String> = rule_groups.keys().cloned().collect();
@@ -58,23 +136,41 @@ fn compile_with_context(
     rule_names.extend(external_rules.iter().cloned());
 
     if rule_groups.is_empty() {
-        let commands = extract_commands(program, &rule_names, &module_ctx)?;
+        let mut extra_warnings: Vec<crate::types::CompilerWarning> = Vec::new();
+        let empty_rule_catalog = HashMap::new();
+        let commands = extract_commands(
+            program,
+            &rule_names,
+            &module_ctx,
+            &model_catalog,
+            &empty_rule_catalog,
+            neural_predicates_preview,
+            &mut extra_warnings,
+        )?;
+        model_warnings.extend(extra_warnings);
         return Ok(CompiledProgram {
             strata: Vec::new(),
             rule_catalog: HashMap::new(),
-            warnings: Vec::new(),
+            model_catalog,
+            warnings: model_warnings,
             commands,
         });
     }
 
-    let dep_graph = dependency::build_dependency_graph_with_external(
+    let dep_graph = dependency::build_dependency_graph_with_models(
         &rule_groups,
         &module_ctx,
         external_rules,
+        &model_catalog,
     )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
-    let (compiled_rules, warnings) = typecheck::check(&rule_groups, &strat)?;
+    let (compiled_rules, mut warnings) =
+        typecheck::check(&rule_groups, &strat, &model_catalog, is_monotonic)?;
+    // Carry model-compilation warnings (e.g. G1-lite UncalibratedLLMLogprobs)
+    // into the final program. Append after typecheck so source order is
+    // preserved for `models -> rules` warning streams.
+    warnings.append(&mut model_warnings);
 
     // Assemble strata in topological order
     let mut strata = Vec::new();
@@ -98,21 +194,38 @@ fn compile_with_context(
         });
     }
 
-    let commands = extract_commands(program, &rule_names, &module_ctx)?;
+    let mut extra_command_warnings: Vec<crate::types::CompilerWarning> = Vec::new();
+    let commands = extract_commands(
+        program,
+        &rule_names,
+        &module_ctx,
+        &model_catalog,
+        &compiled_rules,
+        neural_predicates_preview,
+        &mut extra_command_warnings,
+    )?;
+    warnings.extend(extra_command_warnings);
 
     Ok(CompiledProgram {
         strata,
         rule_catalog: compiled_rules,
+        model_catalog,
         warnings,
         commands,
     })
 }
 
 /// Extract non-rule statements as compiled commands, validating rule references.
+/// Returns the commands and any extra warnings emitted by command
+/// compilation (e.g., Phase C C4 `EceBinningBias`).
 fn extract_commands(
     program: &LocyProgram,
     defined_rules: &[String],
     module_ctx: &modules::ModuleContext,
+    model_catalog: &HashMap<String, crate::types::CompiledModel>,
+    rule_catalog: &HashMap<String, crate::types::CompiledRule>,
+    neural_predicates_preview_flag: bool,
+    extra_warnings: &mut Vec<crate::types::CompilerWarning>,
 ) -> Result<Vec<CompiledCommand>, LocyCompileError> {
     let validate_rule = |raw_name: &str| -> Result<(), LocyCompileError> {
         let resolved = modules::resolve_rule_name(module_ctx, raw_name);
@@ -156,8 +269,17 @@ fn extract_commands(
                     .chain(body_rule_groups.keys())
                     .cloned()
                     .collect();
-                let body_commands =
-                    extract_commands(&body_program_ast, &all_rule_names, &body_module_ctx)?;
+                let mut body_extra_warnings: Vec<crate::types::CompilerWarning> = Vec::new();
+                let body_commands = extract_commands(
+                    &body_program_ast,
+                    &all_rule_names,
+                    &body_module_ctx,
+                    model_catalog,
+                    rule_catalog,
+                    neural_predicates_preview_flag,
+                    &mut body_extra_warnings,
+                )?;
+                extra_warnings.extend(body_extra_warnings);
 
                 // Compile body rules if any exist
                 let body_compiled = if !body_rule_groups.is_empty() {
@@ -166,6 +288,7 @@ fn extract_commands(
                     CompiledProgram {
                         strata: Vec::new(),
                         rule_catalog: HashMap::new(),
+                        model_catalog: HashMap::new(),
                         warnings: Vec::new(),
                         commands: Vec::new(),
                     }
@@ -180,12 +303,135 @@ fn extract_commands(
             LocyStatement::Cypher(query) => {
                 commands.push(CompiledCommand::Cypher(query.clone()));
             }
+            LocyStatement::Model(_) => {
+                // Models are catalog entries, not commands — handled by
+                // the model-compilation pipeline (see compiler/models.rs).
+            }
+            LocyStatement::Calibrate(cc) => {
+                // Phase C C2: validate + lower to CompiledCalibrate.
+                // Caller threads `neural_predicates_preview` so we can
+                // reject when the gate is off.
+                commands.push(CompiledCommand::Calibrate(compile_calibrate(
+                    cc,
+                    model_catalog,
+                    neural_predicates_preview_flag,
+                )?));
+            }
+            LocyStatement::Validate(vc) => {
+                // Phase C C3: validate rule existence + PROB column;
+                // Phase C C4 emits `EceBinningBias` when bare ECE is
+                // requested. Validation operates on the rule_catalog
+                // directly — the neural-predicates preview gate isn't
+                // re-required here (a rule that invokes models has
+                // already been compiled under it transitively).
+                let (cv, validate_warnings) = compile_validate(vc, rule_catalog)?;
+                extra_warnings.extend(validate_warnings);
+                commands.push(CompiledCommand::Validate(cv));
+            }
         }
     }
     Ok(commands)
 }
 
-/// Group `CREATE RULE` statements by rule name (qualified-name string form).
+// ─── Phase C C2: CALIBRATE compiler ──────────────────────────────────────
+
+/// Lower a `CalibrateCommand` AST to a `CompiledCalibrate`, validating
+/// against the model catalog and resolving the holdout default. Gated
+/// by `neural_predicates_preview` — `CALIBRATE` is a Phase B / C
+/// preview surface and rejected when the flag is off.
+fn compile_calibrate(
+    cc: &uni_cypher::locy_ast::CalibrateCommand,
+    model_catalog: &HashMap<String, crate::types::CompiledModel>,
+    neural_predicates_preview: bool,
+) -> Result<crate::types::CompiledCalibrate, LocyCompileError> {
+    let name = cc.model_name.to_string();
+    if !neural_predicates_preview {
+        return Err(LocyCompileError::CalibratePreviewDisabled { model_name: name });
+    }
+    let model = model_catalog
+        .get(&name)
+        .ok_or_else(|| LocyCompileError::CalibrateUnknownModel { name: name.clone() })?;
+    if model.output_type != uni_cypher::locy_ast::OutputType::Prob {
+        return Err(LocyCompileError::CalibrateOnNonProbModel {
+            name,
+            declared: format!("{:?}", model.output_type),
+        });
+    }
+    let holdout = cc.holdout.unwrap_or(0.2);
+    if !(0.0 < holdout && holdout < 1.0) {
+        return Err(LocyCompileError::CalibrateInvalidHoldout {
+            model_name: name,
+            holdout,
+        });
+    }
+    Ok(crate::types::CompiledCalibrate {
+        model_name: name,
+        pattern: cc.pattern.clone(),
+        where_expr: cc.where_expr.clone(),
+        target_expr: cc.target_expr.clone(),
+        method: cc.method,
+        holdout,
+    })
+}
+
+// ─── Phase C C3: VALIDATE compiler ───────────────────────────────────────
+
+/// Lower a `ValidateCommand` AST to a `CompiledValidate`. Validates
+/// rule existence, that the rule yields a PROB column, and emits a
+/// Phase C C4 `EceBinningBias` warning when bare `ECE` is requested.
+/// Returns `(compiled, warnings)`.
+fn compile_validate(
+    vc: &uni_cypher::locy_ast::ValidateCommand,
+    rule_catalog: &HashMap<String, crate::types::CompiledRule>,
+) -> Result<
+    (
+        crate::types::CompiledValidate,
+        Vec<crate::types::CompilerWarning>,
+    ),
+    LocyCompileError,
+> {
+    let name = vc.rule_name.to_string();
+    let rule = rule_catalog
+        .get(&name)
+        .ok_or_else(|| LocyCompileError::ValidateUnknownRule { name: name.clone() })?;
+    let prob_col = rule
+        .yield_schema
+        .iter()
+        .find(|c| c.is_prob)
+        .ok_or_else(|| LocyCompileError::ValidateRuleHasNoProbColumn { name: name.clone() })?
+        .name
+        .clone();
+    if vc.metrics.is_empty() {
+        return Err(LocyCompileError::ValidateNoMetrics { name });
+    }
+    let mut warnings = Vec::new();
+    if vc
+        .metrics
+        .contains(&uni_cypher::locy_ast::ValidationMetric::Ece)
+    {
+        warnings.push(crate::types::CompilerWarning {
+            code: crate::types::WarningCode::EceBinningBias,
+            message: format!(
+                "VALIDATE '{name}' requested bare `ECE` — the equal-width-binning \
+                 estimator is biased in the small-sample regime \
+                 (Kumar et al. NeurIPS 2019). Use `DEBIASED_ECE` instead."
+            ),
+            rule_name: name.clone(),
+        });
+    }
+    Ok((
+        crate::types::CompiledValidate {
+            rule_name: name,
+            pattern: vc.pattern.clone(),
+            where_expr: vc.where_expr.clone(),
+            target_expr: vc.target_expr.clone(),
+            metrics: vc.metrics.clone(),
+            prob_column: prob_col,
+        },
+        warnings,
+    ))
+}
+
 fn group_rules(program: &LocyProgram) -> HashMap<String, Vec<&RuleDefinition>> {
     let mut groups: HashMap<String, Vec<&RuleDefinition>> = HashMap::new();
     for stmt in &program.statements {
@@ -377,8 +623,18 @@ mod tests {
         .unwrap();
 
         let compiled = compile(&prog).unwrap();
-        assert_eq!(compiled.warnings.len(), 1);
-        assert_eq!(compiled.warnings[0].code, WarningCode::MsumNonNegativity);
+        // MSUM warning is the primary assertion. As of Phase B this rule
+        // ALSO trips F1 (FOLD + recursive IS-ref + no ALONG) — Stress
+        // Corpus B3 — which is a legitimate co-diagnosis; the recursive
+        // clause should use ALONG for per-path aggregation.
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::MsumNonNegativity),
+            "expected MsumNonNegativity warning, got: {:?}",
+            compiled.warnings
+        );
     }
 
     // ── Step 8: BEST BY + MSUM → BEST_BY_WITH_MONOTONIC_FOLD error ──────
@@ -648,5 +904,210 @@ mod tests {
             &compiled.commands[1],
             CompiledCommand::ExplainRule(_)
         ));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase B: CREATE MODEL preview-flag gating + reference validation + F1
+    // ══════════════════════════════════════════════════════════════════════
+
+    fn cfg_preview_on() -> crate::LocyConfig {
+        crate::LocyConfig {
+            neural_predicates_preview: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phase_b_preview_off_rejects_create_model() {
+        let prog =
+            parse_locy("CREATE MODEL m AS INPUT (s) OUTPUT PROB risk USING xervo('classify/m')")
+                .unwrap();
+        let result = compile(&prog);
+        match result {
+            Err(LocyCompileError::NeuralPreviewDisabled { model_name }) => {
+                assert_eq!(model_name, "m");
+            }
+            other => panic!("expected NeuralPreviewDisabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_b_preview_on_compiles_model() {
+        let prog = parse_locy(
+            "CREATE MODEL supplier_risk AS \
+             INPUT (s:Supplier) \
+             OUTPUT PROB risk \
+             USING xervo('classify/supplier-risk-v3') \
+             CALIBRATION platt_scaling \
+             VERSION '3.1.0'",
+        )
+        .unwrap();
+        let compiled = compile_with_config(&prog, &cfg_preview_on()).unwrap();
+        assert_eq!(compiled.model_catalog.len(), 1);
+        let m = &compiled.model_catalog["supplier_risk"];
+        assert_eq!(m.xervo_alias, "classify/supplier-risk-v3");
+        assert_eq!(m.version.as_deref(), Some("3.1.0"));
+        // No UncalibratedLLMLogprobs because (a) calibration is set, and
+        // (b) alias isn't LLM-shaped.
+        assert!(
+            !compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == crate::types::WarningCode::UncalibratedLLMLogprobs)
+        );
+    }
+
+    #[test]
+    fn phase_b_g1_uncalibrated_llm_warning() {
+        let prog = parse_locy(
+            "CREATE MODEL chatty AS \
+             INPUT (s) OUTPUT PROB out USING xervo('generate/gpt-4o')",
+        )
+        .unwrap();
+        let compiled = compile_with_config(&prog, &cfg_preview_on()).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::UncalibratedLLMLogprobs),
+            "expected UncalibratedLLMLogprobs warning, got: {:?}",
+            compiled.warnings
+        );
+    }
+
+    #[test]
+    fn phase_b_g1_uncalibrated_llm_suppressed_when_calibrated() {
+        let prog = parse_locy(
+            "CREATE MODEL chatty AS \
+             INPUT (s) OUTPUT PROB out USING xervo('generate/gpt-4o') \
+             CALIBRATION platt_scaling",
+        )
+        .unwrap();
+        let compiled = compile_with_config(&prog, &cfg_preview_on()).unwrap();
+        assert!(
+            !compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::UncalibratedLLMLogprobs)
+        );
+    }
+
+    #[test]
+    fn phase_b_model_name_collision() {
+        let prog = parse_locy(
+            "CREATE MODEL dup AS INPUT (s) OUTPUT PROB risk USING xervo('classify/a') \
+             CREATE MODEL dup AS INPUT (s) OUTPUT PROB risk USING xervo('classify/b')",
+        )
+        .unwrap();
+        let result = compile_with_config(&prog, &cfg_preview_on());
+        assert!(matches!(
+            result,
+            Err(LocyCompileError::ModelNameCollision { name }) if name == "dup"
+        ));
+    }
+
+    #[test]
+    fn phase_b_model_arity_mismatch_in_rule() {
+        // Rule body invokes the model with 2 args; declaration has 1
+        // input. Compile must reject with ModelArityMismatch.
+        let prog = parse_locy(
+            "CREATE MODEL scorer AS \
+             INPUT (s) OUTPUT PROB out USING xervo('classify/s') \
+             CREATE RULE r AS MATCH (s) WHERE scorer(s, s) > 0.5 YIELD s",
+        )
+        .unwrap();
+        let result = compile_with_config(&prog, &cfg_preview_on());
+        match result {
+            Err(LocyCompileError::ModelArityMismatch {
+                name,
+                rule,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(name, "scorer");
+                assert_eq!(rule, "r");
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("expected ModelArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_b_model_arity_correct_accepted() {
+        // YIELD-position invocation: the supported path; should compile.
+        let prog = parse_locy(
+            "CREATE MODEL scorer AS \
+             INPUT (s) OUTPUT PROB out USING xervo('classify/s') \
+             CREATE RULE r AS MATCH (s) YIELD KEY s, scorer(s) AS risk",
+        )
+        .unwrap();
+        let compiled = compile_with_config(&prog, &cfg_preview_on()).unwrap();
+        assert!(compiled.model_catalog.contains_key("scorer"));
+        assert!(compiled.rule_catalog.contains_key("r"));
+    }
+
+    #[test]
+    fn phase_b_where_model_invocation_rejected() {
+        // Phase B Slice 7: WHERE-position invocations error at compile
+        // time with a clear "use YIELD instead" message until the
+        // planner refactor that supports pre-filter invocation lands.
+        let prog = parse_locy(
+            "CREATE MODEL scorer AS \
+             INPUT (s) OUTPUT PROB out USING xervo('classify/s') \
+             CREATE RULE r AS MATCH (s) WHERE scorer(s) > 0.5 YIELD KEY s",
+        )
+        .unwrap();
+        match compile_with_config(&prog, &cfg_preview_on()) {
+            Err(LocyCompileError::WhereModelInvocationNotYetSupported { rule, model }) => {
+                assert_eq!(rule, "r");
+                assert_eq!(model, "scorer");
+            }
+            other => {
+                panic!("expected WhereModelInvocationNotYetSupported, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn phase_b_f1_fold_in_recursive_path_without_along() {
+        // The very same shape as step7_msum_warning — F1 must fire.
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD total = MSUM(a.weight) YIELD a, b, total",
+        )
+        .unwrap();
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::FoldInRecursivePath),
+            "expected FoldInRecursivePath, got: {:?}",
+            compiled.warnings
+        );
+    }
+
+    #[test]
+    fn phase_b_f1_suppressed_when_along_present() {
+        // Same recursive structure but with ALONG — F1 must NOT fire.
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[e:E]->(b) ALONG total = e.weight \
+             YIELD a, b, total \
+             CREATE RULE r AS MATCH (a)-[e:E]->(mid) WHERE mid IS r TO b \
+             ALONG total = prev.total + e.weight \
+             FOLD total = MSUM(total) YIELD a, b, total",
+        )
+        .unwrap();
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            !compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::FoldInRecursivePath),
+            "FoldInRecursivePath should be suppressed when ALONG is present, got: {:?}",
+            compiled.warnings
+        );
     }
 }

@@ -843,6 +843,16 @@ async fn test_hybrid_search_existing_options_unchanged() -> anyhow::Result<()> {
 /// ```bash
 /// cargo nextest run -p uni-db --features provider-onnx -- test_real_onnx_cross_encoder --run-ignored
 /// ```
+///
+/// NOTE (CI-skipped pending upstream fix): HuggingFace now serves
+/// `cross-encoder/ms-marco-MiniLM-L6-v2/onnx/model.onnx` exclusively via a
+/// 302 redirect to `cas-bridge.xethub.hf.co` (xet-bridge LFS). `hf-hub
+/// 0.5.0`'s `relative_redirect_client` (`src/api/tokio.rs:368-388`)
+/// refuses to follow absolute redirects, so the download fails with 404.
+/// `hf-hub 1.0.0-rc.1` is an API rewrite; not a drop-in patch. The CI
+/// workflow filters this test out by name until `uni-xervo` or `hf-hub`
+/// ship a compatible fix. The other 3 real-ONNX tests (Qwen3, BGE, the
+/// cross-encoder facade variant) are unaffected.
 #[cfg(feature = "provider-onnx")]
 #[tokio::test]
 #[ignore]

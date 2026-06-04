@@ -18,7 +18,7 @@ Uni supports point-in-time snapshots and time-travel queries. Snapshots are dura
     let db = Uni::open("./my_db").build().await?;
     let session = db.session();
 
-    let snap_id = db.create_snapshot(Some("daily")).await?;
+    let snap_id = db.create_snapshot("daily").await?;
     let rows = session.query(&format!(
         "MATCH (n) RETURN count(n) AS c VERSION AS OF '{}'",
         snap_id

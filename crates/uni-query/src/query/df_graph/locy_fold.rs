@@ -9,91 +9,132 @@
 use crate::query::df_graph::common::{
     ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
 };
-use arrow_array::builder::{Float64Builder, Int64Builder, LargeBinaryBuilder};
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow_array::builder::Float64Builder;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::scalar::ScalarValue;
 use futures::{Stream, TryStreamExt};
+use smol_str::SmolStr;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use uni_locy::SemiringKind;
+use uni_plugin::traits::locy::{FoldContext, FoldSemiring, LocyAggregate};
 
-/// Direction of monotonicity for a fold aggregate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MonotonicDirection {
-    /// Value can only stay the same or increase across iterations.
-    NonDecreasing,
-    /// Value can only stay the same or decrease across iterations.
-    NonIncreasing,
+use super::locy_explain::ProofTerm;
+
+/// Plugin-aware resolution of an aggregate name to a [`uni_plugin::traits::locy::LocyAggregate`].
+///
+/// Looks up `name` (case-folded) against the supplied [`uni_plugin::PluginRegistry`]
+/// under the reserved built-in namespace. Returns `None` if no plugin claims
+/// the aggregate.
+///
+/// Accepts legacy grammar aliases: the bare (`SUM`/`MAX`/`MIN`/`COUNT`) and
+/// `M`-prefixed (`MSUM`/`MMAX`/`MMIN`/`MCOUNT`) forms, plus `NOR`→`MNOR`,
+/// `PROD`→`MPROD`. `COUNTALL` (the zero-argument `COUNT()`/`MCOUNT()` form)
+/// resolves to its own dedicated aggregate, distinct from null-skipping
+/// `COUNT`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use uni_query::query::df_graph::locy_fold::{default_locy_plugin_registry, resolve_locy_aggregate};
+/// let r = default_locy_plugin_registry();
+/// let agg = resolve_locy_aggregate(&r, "SUM");
+/// assert!(agg.is_some());
+/// ```
+/// Returns the monotonicity verdict for an aggregate name resolved through
+/// the supplied [`uni_plugin::PluginRegistry`].
+///
+/// `Some(true)` — registered monotone aggregate (`Semilattice.monotone_join`
+/// is `true`), sound in recursive Locy strata. `Some(false)` — registered
+/// but non-monotone, must be rejected in recursion. `None` — unregistered.
+///
+/// Aliases (`MSUM`/`MMAX`/`MMIN`/`MCOUNT`/`NOR`/`PROD`/`COUNTALL`) are
+/// canonicalized by [`resolve_locy_aggregate`] before lookup.
+#[must_use]
+pub fn is_monotonic_aggregate(registry: &uni_plugin::PluginRegistry, name: &str) -> Option<bool> {
+    resolve_locy_aggregate(registry, name).map(|e| e.aggregate.semilattice().monotone_join)
 }
 
-/// Aggregate function kind for FOLD bindings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldAggKind {
-    Sum,
-    Max,
-    Min,
-    Count,
-    /// Count all rows in a group (like SQL `COUNT(*)`), ignoring nulls.
-    CountAll,
-    Avg,
-    Collect,
-    Nor,  // Noisy-OR: 1 − ∏(1 − pᵢ)
-    Prod, // Product:  ∏ pᵢ
+#[must_use]
+pub fn resolve_locy_aggregate(
+    registry: &uni_plugin::PluginRegistry,
+    name: &str,
+) -> Option<std::sync::Arc<uni_plugin::registry::LocyAggregateEntry>> {
+    let canonical = match name.to_uppercase().as_str() {
+        "MMAX" => "MAX".to_owned(),
+        "MMIN" => "MIN".to_owned(),
+        "MCOUNT" => "COUNT".to_owned(),
+        "NOR" => "MNOR".to_owned(),
+        "PROD" => "MPROD".to_owned(),
+        other => other.to_owned(),
+    };
+    let qname = uni_plugin::QName::builtin(canonical);
+    // M8.6 dual-consult: session-local first (if a Session has set the
+    // task-local via `scoped_with_session_plugin_registry`), then fall
+    // back to the caller-supplied (instance) registry. This makes
+    // session-scoped Locy aggregates visible without changing any
+    // caller of `resolve_locy_aggregate`.
+    if let Some(session_pr) = crate::current_session_plugin_registry()
+        && let Some(entry) = session_pr.locy_aggregate(&qname)
+    {
+        return Some(entry);
+    }
+    registry.locy_aggregate(&qname)
 }
 
-impl FoldAggKind {
-    /// Returns `true` if this aggregate is monotonic (safe for fixpoint iteration).
-    pub fn is_monotonic(&self) -> bool {
-        matches!(
-            self,
-            Self::Sum
-                | Self::Max
-                | Self::Min
-                | Self::Count
-                | Self::CountAll
-                | Self::Nor
-                | Self::Prod
-        )
-    }
-
-    /// Returns the monotonicity direction, or `None` for non-monotonic aggregates.
-    pub fn monotonicity_direction(&self) -> Option<MonotonicDirection> {
-        match self {
-            Self::Sum | Self::Max | Self::Count | Self::CountAll | Self::Nor => {
-                Some(MonotonicDirection::NonDecreasing)
-            }
-            Self::Min | Self::Prod => Some(MonotonicDirection::NonIncreasing),
-            Self::Avg | Self::Collect => None,
-        }
-    }
-
-    /// Returns the identity element for this aggregate, or `None` for non-monotonic aggregates.
-    pub fn identity(&self) -> Option<f64> {
-        match self {
-            Self::Sum | Self::Count | Self::CountAll | Self::Nor => Some(0.0),
-            Self::Max => Some(f64::NEG_INFINITY),
-            Self::Min => Some(f64::INFINITY),
-            Self::Prod => Some(1.0),
-            Self::Avg | Self::Collect => None,
-        }
-    }
+/// Returns a process-wide [`uni_plugin::PluginRegistry`] pre-populated with
+/// the built-in Locy aggregates from `uni-plugin-builtin`.
+///
+/// Used by [`crate::query::df_planner::HybridPhysicalPlanner`] as a default
+/// when the host has not supplied its own registry. Lazily initialized
+/// at first call and shared thereafter.
+///
+/// # Panics
+///
+/// Panics only on framework-internal invariants: capability gating, qname
+/// validation, or duplicate commit. The built-in registration set is fixed
+/// and cannot trigger any of these at runtime.
+#[must_use]
+pub fn default_locy_plugin_registry() -> Arc<uni_plugin::PluginRegistry> {
+    static REGISTRY: OnceLock<Arc<uni_plugin::PluginRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| {
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new(uni_plugin::QName::BUILTIN_NS);
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        uni_plugin_builtin::locy_aggregates::register_into(&mut r)
+            .expect("built-in locy aggregates register");
+        r.commit_to_registry().expect("commit built-in aggregates");
+        Arc::new(registry)
+    }))
 }
 
 /// A single FOLD binding: aggregate an input column into an output column.
+///
+/// Carries the canonical aggregate name (used as a sentinel for `COUNTALL`
+/// and for batch-path dispatch in [`FoldExec`]) alongside the resolved
+/// [`LocyAggregate`] trait object (used by the fixpoint runtime). The name
+/// is one of: `SUM`, `MIN`, `MAX`, `COUNT`, `COUNTALL`, `AVG`, `COLLECT`,
+/// `MNOR`, `MPROD`.
 #[derive(Debug, Clone)]
 pub struct FoldBinding {
     pub output_name: String,
-    pub kind: FoldAggKind,
+    /// Canonical uppercase aggregate name.
+    pub name: SmolStr,
+    /// Resolved aggregate trait object (registry-backed).
+    pub aggregate: Arc<dyn LocyAggregate>,
     pub input_col_index: usize,
     /// Column name for name-based resolution (more robust than positional index).
-    /// `None` for CountAll which has no input column.
+    /// `None` for `COUNTALL` which has no input column.
     pub input_col_name: Option<String>,
 }
 
@@ -108,8 +149,31 @@ pub struct FoldExec {
     fold_bindings: Vec<FoldBinding>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    /// Active probability semiring. `AddMultProb` (the default) preserves
+    /// byte-identical Phase 1/2 noisy-OR / product behavior. `MaxMinProb`
+    /// (Viterbi) is opt-in and produces fuzzy-truth values; callers up the
+    /// stack also emit `FuzzyNotProbabilistic` on PROB-bearing rules.
+    semiring_kind: SemiringKind,
+    /// Phase D D-C0: under `SemiringKind::TopKProofs`, MNOR aggregates use
+    /// DNF inclusion-exclusion over the row's support chain (lifted from
+    /// the provenance tracker) rather than independence-mode noisy-OR.
+    /// `None` for non-TopK semirings — keeps the byte-identical `f64`
+    /// path for AddMultProb / MaxMinProb.
+    provenance_tracker: Option<Arc<super::locy_explain::ProvenanceStore>>,
+    /// Phase D D-C0: top-k retention used for proof pruning. Mirrors the
+    /// fixpoint-loop config; passed through so per-group `TopKTag`
+    /// merges respect the same K as the in-loop accumulator.
+    top_k_proofs_k: usize,
+    /// Pre-computed map of body-row content hash → IS-ref support
+    /// (`Vec<ProofTerm>`) for use by `topk_dnf_disjunction`. Populated
+    /// in `apply_post_fixpoint_chain` *before* this `FoldExec` is
+    /// built, because at FOLD time the current rule's own facts are
+    /// not yet recorded in the `ProvenanceStore` (which is keyed by
+    /// post-YIELD hashes anyway). `None` for non-TopK semirings and
+    /// for legacy callers.
+    body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -127,6 +191,64 @@ impl FoldExec {
         strict_probability_domain: bool,
         probability_epsilon: f64,
     ) -> Self {
+        Self::new_with_semiring(
+            input,
+            key_indices,
+            fold_bindings,
+            strict_probability_domain,
+            probability_epsilon,
+            SemiringKind::AddMultProb,
+        )
+    }
+
+    /// Variant taking an explicit [`SemiringKind`]. Existing callers can
+    /// keep using [`FoldExec::new`] (which defaults to `AddMultProb`); the
+    /// fixpoint planner uses this form to thread the configured semiring
+    /// from [`uni_locy::LocyConfig::resolve`].
+    pub fn new_with_semiring(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        semiring_kind: SemiringKind,
+    ) -> Self {
+        Self::new_with_topk(
+            input,
+            key_indices,
+            fold_bindings,
+            strict_probability_domain,
+            probability_epsilon,
+            semiring_kind,
+            None,
+            0,
+            None,
+        )
+    }
+
+    /// Phase D D-C0: variant that threads the provenance tracker and
+    /// `top_k_proofs` config so MNOR under `SemiringKind::TopKProofs`
+    /// can resolve each row's IS-ref support chain into a `Proof` and
+    /// aggregate via DNF inclusion-exclusion.
+    ///
+    /// `body_support_map` (Phase D D-C0 follow-up) is a pre-computed
+    /// `body_row_hash → Vec<ProofTerm>` map, populated by
+    /// `apply_post_fixpoint_chain` for TopKProofs rules. The tracker
+    /// alone is insufficient — its entries are keyed by post-YIELD
+    /// row hashes and are only populated after FOLD runs; the pre-fold
+    /// body rows seen here would never hit. The map closes that gap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_topk(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        semiring_kind: SemiringKind,
+        provenance_tracker: Option<Arc<super::locy_explain::ProvenanceStore>>,
+        top_k_proofs_k: usize,
+        body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>>,
+    ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
         let properties = compute_plan_properties(Arc::clone(&schema));
@@ -137,6 +259,10 @@ impl FoldExec {
             fold_bindings,
             strict_probability_domain,
             probability_epsilon,
+            semiring_kind,
+            provenance_tracker,
+            top_k_proofs_k,
+            body_support_map,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -155,27 +281,21 @@ impl FoldExec {
             fields.push(Arc::new(input_schema.field(ki).clone()));
         }
 
-        // Fold output columns
+        // Fold output columns — type derived from the aggregate trait. The
+        // input column type is resolved first (name-then-index) so
+        // type-preserving aggregates (`MIN`/`MAX`) can return it.
         for binding in fold_bindings {
-            let output_type = match binding.kind {
-                FoldAggKind::Sum | FoldAggKind::Avg | FoldAggKind::Nor | FoldAggKind::Prod => {
-                    DataType::Float64
-                }
-                FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => {
-                    let idx = binding
-                        .input_col_name
-                        .as_ref()
-                        .and_then(|name| input_schema.index_of(name).ok())
-                        .unwrap_or(binding.input_col_index);
-                    if idx < input_schema.fields().len() {
-                        input_schema.field(idx).data_type().clone()
-                    } else {
-                        DataType::Float64
-                    }
-                }
-                FoldAggKind::Collect => DataType::LargeBinary,
+            let idx = binding
+                .input_col_name
+                .as_ref()
+                .and_then(|name| input_schema.index_of(name).ok())
+                .unwrap_or(binding.input_col_index);
+            let input_type = if idx < input_schema.fields().len() {
+                input_schema.field(idx).data_type().clone()
+            } else {
+                DataType::Float64
             };
+            let output_type = binding.aggregate.output_type_for_input(&input_type);
             fields.push(Arc::new(Field::new(
                 &binding.output_name,
                 output_type,
@@ -210,7 +330,7 @@ impl ExecutionPlan for FoldExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -227,12 +347,16 @@ impl ExecutionPlan for FoldExec {
                 "FoldExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::new_with_topk(
             Arc::clone(&children[0]),
             self.key_indices.clone(),
             self.fold_bindings.clone(),
             self.strict_probability_domain,
             self.probability_epsilon,
+            self.semiring_kind,
+            self.provenance_tracker.as_ref().map(Arc::clone),
+            self.top_k_proofs_k,
+            self.body_support_map.as_ref().map(Arc::clone),
         )))
     }
 
@@ -247,6 +371,10 @@ impl ExecutionPlan for FoldExec {
         let fold_bindings = self.fold_bindings.clone();
         let strict = self.strict_probability_domain;
         let epsilon = self.probability_epsilon;
+        let semiring_kind = self.semiring_kind;
+        let _provenance_tracker = self.provenance_tracker.as_ref().map(Arc::clone);
+        let top_k_proofs_k = self.top_k_proofs_k;
+        let body_support_map = self.body_support_map.as_ref().map(Arc::clone);
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -302,10 +430,24 @@ impl ExecutionPlan for FoldExec {
                 output_columns.push(taken);
             }
 
-            // Fold binding columns: compute aggregates per group
+            // Per-fold evaluation context. `TopKProofs` / `BddExact` are
+            // provenance specializations handled above the aggregate (see
+            // `compute_fold_aggregate`); the aggregate trait only sees the
+            // two value-level combinators.
+            let cx = FoldContext {
+                strict,
+                epsilon,
+                semiring: match semiring_kind {
+                    SemiringKind::MaxMinProb => FoldSemiring::MaxMin,
+                    _ => FoldSemiring::AddMult,
+                },
+            };
+
+            // Fold binding columns: compute aggregates per group via the
+            // resolved `LocyAggregate` trait object.
             for binding in &fold_bindings {
-                let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
-                    // CountAll doesn't need an input column — use a dummy
+                let col: Arc<dyn Array> = if binding.name.as_str() == "COUNTALL" {
+                    // COUNTALL has no input column — the aggregate ignores it.
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
                     // Resolve input column: prefer name-based lookup, fall back to index.
@@ -324,14 +466,25 @@ impl ExecutionPlan for FoldExec {
                         ]))
                     }
                 };
+                let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. }) {
+                    Some(TopKFoldCtx {
+                        k: top_k_proofs_k,
+                        batch: &batch,
+                        body_support_map: body_support_map.as_deref(),
+                    })
+                } else {
+                    None
+                };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
-                    &binding.kind,
-                    &ordered_keys,
-                    &groups,
-                    num_groups,
-                    strict,
-                    epsilon,
+                    &binding.aggregate,
+                    FoldGroups {
+                        ordered_keys: &ordered_keys,
+                        groups: &groups,
+                        num_groups,
+                    },
+                    &cx,
+                    topk_ctx.as_ref(),
                 )?;
                 output_columns.push(agg_col);
             }
@@ -355,345 +508,212 @@ impl ExecutionPlan for FoldExec {
 // Aggregate computation
 // ---------------------------------------------------------------------------
 
+/// Per-key-group data threaded into `compute_fold_aggregate` —
+/// bundled to keep the aggregator's signature under the
+/// too-many-arguments threshold.
+struct FoldGroups<'a> {
+    ordered_keys: &'a [Vec<ScalarKey>],
+    groups: &'a HashMap<Vec<ScalarKey>, Vec<usize>>,
+    num_groups: usize,
+}
+
+/// Phase D D-C0: per-call context for TopKProofs-aware aggregation.
+/// Carries the K config and a pre-computed body-row → IS-ref support
+/// map so MNOR / MPROD can build per-row `Proof`s and aggregate via
+/// DNF inclusion-exclusion. The map is built in
+/// `apply_post_fixpoint_chain` before `FoldExec` is constructed; the
+/// provenance tracker is *not* sufficient at this stage because its
+/// entries are keyed by post-YIELD row hashes and the current rule's
+/// facts have not been recorded yet.
+struct TopKFoldCtx<'a> {
+    k: usize,
+    batch: &'a RecordBatch,
+    body_support_map: Option<&'a HashMap<Vec<u8>, Vec<ProofTerm>>>,
+}
+
+/// Compute one fold-output column by dispatching through the resolved
+/// [`LocyAggregate`] trait object.
+///
+/// For each key group a fresh [`LocyAggState`](uni_plugin::traits::locy::LocyAggState)
+/// is created, fed the group's rows via `ingest_indices`, and finalized; the
+/// per-group [`ScalarValue`]s are assembled into the output array (whose type
+/// follows the finalized scalars — `Int64`/`Float64` for `MIN`/`MAX` over those
+/// inputs, `LargeBinary` for `COLLECT`, etc.).
+///
+/// `TopKProofs` noisy-OR is the one provenance specialization that sits
+/// *above* the aggregate: when a TopK context is threaded and the aggregate is
+/// noisy-OR, each group folds via DNF inclusion-exclusion over its support
+/// chains instead (degrading to plain noisy-OR when no support map exists).
+///
+/// # Errors
+///
+/// Returns a [`DFResult`] error if a plugin aggregate rejects a value (e.g., a
+/// strict probability-domain violation) or if the per-group scalars cannot be
+/// assembled into an Arrow array.
 fn compute_fold_aggregate(
     col: &dyn Array,
-    kind: &FoldAggKind,
-    ordered_keys: &[Vec<ScalarKey>],
-    groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
-    num_groups: usize,
-    strict: bool,
-    probability_epsilon: f64,
+    aggregate: &Arc<dyn LocyAggregate>,
+    groups_ctx: FoldGroups<'_>,
+    cx: &FoldContext,
+    topk_ctx: Option<&TopKFoldCtx<'_>>,
 ) -> DFResult<arrow_array::ArrayRef> {
-    match kind {
-        FoldAggKind::Sum => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                builder.append_option(sum_f64(col, &groups[key]));
-            }
-            Ok(Arc::new(builder.finish()))
+    let ordered_keys = groups_ctx.ordered_keys;
+    let groups = groups_ctx.groups;
+    let num_groups = groups_ctx.num_groups;
+
+    // Phase D D-C0: TopKProofs noisy-OR uses DNF inclusion-exclusion over each
+    // row's support chain. This is a provenance specialization layered above
+    // the MNOR aggregate; it falls back to independence-mode noisy-OR when no
+    // support map is present (the common / non-recursive case).
+    if let Some(ctx) = topk_ctx
+        && aggregate.is_noisy_or()
+    {
+        let mut builder = Float64Builder::with_capacity(num_groups);
+        for key in ordered_keys {
+            builder.append_option(topk_dnf_disjunction(col, &groups[key], cx.strict, ctx)?);
         }
-        FoldAggKind::Count => {
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
-                builder.append_value(count as i64);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        FoldAggKind::CountAll => {
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                builder.append_value(indices.len() as i64);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        FoldAggKind::Max => compute_minmax(col, ordered_keys, groups, num_groups, false),
-        FoldAggKind::Min => compute_minmax(col, ordered_keys, groups, num_groups, true),
-        FoldAggKind::Avg => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
-                let avg = sum_f64(col, indices)
-                    .filter(|_| count > 0)
-                    .map(|s| s / count as f64);
-                builder.append_option(avg);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        FoldAggKind::Collect => {
-            let mut builder = LargeBinaryBuilder::with_capacity(num_groups, num_groups * 32);
-            for key in ordered_keys {
-                let values: Vec<uni_common::Value> = groups[key]
-                    .iter()
-                    .filter(|&&i| !col.is_null(i))
-                    .map(|&i| scalar_to_value(col, i))
-                    .collect();
-                let encoded =
-                    uni_common::cypher_value_codec::encode(&uni_common::Value::List(values));
-                builder.append_value(&encoded);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        FoldAggKind::Nor => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                builder.append_option(noisy_or_f64(col, indices, strict)?);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        FoldAggKind::Prod => {
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                builder.append_option(product_f64(col, &groups[key], strict, probability_epsilon)?);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
+        return Ok(Arc::new(builder.finish()));
     }
+
+    // Generic trait dispatch: one aggregate state per key group.
+    let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_groups);
+    for key in ordered_keys {
+        let mut state = aggregate.create();
+        state
+            .ingest_indices(col, &groups[key], cx)
+            .map_err(fn_error_to_df)?;
+        scalars.push(state.finalize().map_err(fn_error_to_df)?);
+    }
+    ScalarValue::iter_to_array(scalars)
 }
 
-fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
-    let mut sum = 0.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            sum += arr.value(i);
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            sum += arr.value(i) as f64;
-        }
-    }
-    if has_value { Some(sum) } else { None }
+/// Map a plugin [`FnError`](uni_plugin::FnError) to a DataFusion error,
+/// preserving the message so strict-domain text survives to the caller.
+fn fn_error_to_df(e: uni_plugin::FnError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.message)
 }
 
-/// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1] unless strict.
-fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
-    let mut complement_product = 1.0;
-    let mut has_value = false;
-    for &i in indices {
-        if col.is_null(i) {
-            continue;
-        }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
-        };
-        if strict && !(0.0..=1.0).contains(&raw) {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
-            )));
-        }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MNOR input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        complement_product *= 1.0 - p;
-    }
-    if has_value {
-        Ok(Some(1.0 - complement_product))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Product: P = ∏ pᵢ. Inputs clamped to [0, 1] unless strict.
+/// Phase D D-C0: TopKProofs MNOR via DNF inclusion-exclusion over the
+/// rows' support chains. Each row contributes one `Proof` whose
+/// weight is the row's MNOR-input value and whose `base_rvs` are
+/// interned from the row's IS-ref support, resolved via
+/// `ctx.body_support_map` — a precomputed map of body-row content
+/// hash → `Vec<ProofTerm>`. The map is built in
+/// `apply_post_fixpoint_chain` before FOLD; the `ProvenanceStore`
+/// tracker cannot be used here because its entries are keyed by
+/// post-YIELD hashes and the rule's own facts haven't been recorded
+/// yet at FOLD time. Proofs are merged via `merge_top_k_runtime` (so
+/// the K config is respected and `CrossedDependency` notices ride
+/// the side-channel). The per-group output is
+/// `TopKTag.to_dnf().weight(&base_weights)` — exact when no
+/// dependency overlap exists, exact under inclusion-exclusion when
+/// shared base facts appear across proofs.
 ///
-/// Switches to log-space when the running product drops below
-/// `probability_epsilon` to prevent floating-point underflow.
-fn product_f64(
+/// Rows whose body-hash isn't in the support map (e.g. rules whose
+/// MNOR runs over plain columns with no IS-ref bindings) contribute
+/// empty-support Proofs — the math degrades to plain f64 noisy-OR
+/// (independence-mode), preserving the pre-D-C0 byte-identical
+/// AddMultProb behavior.
+fn topk_dnf_disjunction(
     col: &dyn Array,
     indices: &[usize],
     strict: bool,
-    probability_epsilon: f64,
+    ctx: &TopKFoldCtx<'_>,
 ) -> DFResult<Option<f64>> {
-    let mut product = 1.0;
-    let mut log_sum = 0.0;
-    let mut use_log = false;
-    let mut has_value = false;
+    use uni_locy::{BaseRv, BaseRvSet, Proof};
+
+    let batch = ctx.batch;
+    let all_indices: Vec<usize> = (0..batch.num_columns()).collect();
+    let mut interner: HashMap<Vec<u8>, BaseRv> = HashMap::new();
+    let mut next_rv: u32 = 0;
+    let mut base_weights: HashMap<BaseRv, f64> = HashMap::new();
+    let mut proofs: Vec<Proof> = Vec::with_capacity(indices.len());
+
     for &i in indices {
         if col.is_null(i) {
             continue;
         }
-        has_value = true;
-        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            arr.value(i) as f64
-        } else {
-            continue;
+        // Row's MNOR-input value (e.g. an IS-ref edge probability).
+        let val = match col.as_any().downcast_ref::<arrow_array::Float64Array>() {
+            Some(arr) => arr.value(i),
+            None => match col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                Some(arr) => arr.value(i) as f64,
+                None => continue,
+            },
         };
-        if strict && !(0.0..=1.0).contains(&raw) {
+        if strict && !(0.0..=1.0).contains(&val) {
             return Err(datafusion::error::DataFusionError::Execution(format!(
-                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
+                "strict_probability_domain: MNOR input {val} outside [0,1] under TopKProofs"
             )));
         }
-        if !strict && !(0.0..=1.0).contains(&raw) {
-            tracing::warn!(
-                "MPROD input {raw} outside [0,1], clamped to {}",
-                raw.clamp(0.0, 1.0)
-            );
-        }
-        let p = raw.clamp(0.0, 1.0);
-        if p == 0.0 {
-            return Ok(Some(0.0));
-        }
-        if use_log {
-            log_sum += p.ln();
-        } else {
-            product *= p;
-            if product < probability_epsilon {
-                // Switch to log-space to prevent underflow
-                log_sum = product.ln();
-                use_log = true;
+        let weight = val.clamp(0.0, 1.0);
+
+        // Resolve row's IS-ref support via the precomputed body-row map;
+        // intern base facts into BaseRvs.
+        let fact_hash = super::locy_fixpoint::fact_hash_key(batch, &all_indices, i);
+        let mut base_rvs = BaseRvSet::empty();
+        if let Some(support) = ctx.body_support_map.and_then(|m| m.get(&fact_hash)) {
+            for term in support {
+                let rv = *interner
+                    .entry(term.base_fact_id.clone())
+                    .or_insert_with(|| {
+                        let r = BaseRv(next_rv);
+                        next_rv += 1;
+                        r
+                    });
+                base_rvs.insert(rv);
             }
         }
+        // Single-row Proof. Base weights for the DNF: assign the row's
+        // weight to each base RV under it (when no support exists,
+        // base_rvs is empty and the proof's weight stands alone).
+        // When multiple rows share the same base RV (shared-proof case),
+        // take max — deterministic regardless of row visit order, and
+        // a conservative upper bound for the noisy-OR DNF.
+        if base_rvs.iter().count() > 0 {
+            for rv in base_rvs.iter() {
+                base_weights
+                    .entry(rv)
+                    .and_modify(|w| {
+                        if weight > *w {
+                            *w = weight;
+                        }
+                    })
+                    .or_insert(weight);
+            }
+        }
+        proofs.push(Proof {
+            weight,
+            base_rvs,
+            neural_calls: Vec::new(),
+        });
     }
-    if !has_value {
+    if proofs.is_empty() {
         return Ok(None);
     }
-    if use_log {
-        Ok(Some(log_sum.exp()))
-    } else {
-        Ok(Some(product))
+    // When NO proof carries base_rvs (no IS-ref support visible —
+    // the rule's MNOR runs over plain columns, not derived facts),
+    // fall back to independence-mode noisy-OR. Going through
+    // `merge_top_k` here is wrong: it dedupes by dependency_key,
+    // collapsing all empty-base_rvs proofs into one max-weight
+    // proof. Plain noisy-OR over each row's weight preserves the
+    // pre-D-C0 AddMultProb behavior byte-identically.
+    if base_weights.is_empty() {
+        let mut complement = 1.0;
+        for p in &proofs {
+            complement *= 1.0 - p.weight;
+        }
+        return Ok(Some((1.0 - complement).clamp(0.0, 1.0)));
     }
-}
-
-fn compute_minmax(
-    col: &dyn Array,
-    ordered_keys: &[Vec<ScalarKey>],
-    groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
-    num_groups: usize,
-    is_min: bool,
-) -> DFResult<arrow_array::ArrayRef> {
-    match col.data_type() {
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            let mut builder = Int64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let mut result: Option<i64> = None;
-                for &i in &groups[key] {
-                    if !arr.is_null(i) {
-                        let v = arr.value(i);
-                        result = Some(match result {
-                            None => v,
-                            Some(cur) if is_min => cur.min(v),
-                            Some(cur) => cur.max(v),
-                        });
-                    }
-                }
-                builder.append_option(result);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            let mut builder = Float64Builder::with_capacity(num_groups);
-            for key in ordered_keys {
-                let mut result: Option<f64> = None;
-                for &i in &groups[key] {
-                    if !arr.is_null(i) {
-                        let v = arr.value(i);
-                        result = Some(match result {
-                            None => v,
-                            Some(cur) if is_min => cur.min(v),
-                            Some(cur) => cur.max(v),
-                        });
-                    }
-                }
-                builder.append_option(result);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        dt => {
-            // Fallback: treat as string comparison.
-            // Use LargeStringBuilder for LargeUtf8 input to match the output schema
-            // (build_output_schema preserves the input type for MAX/MIN).
-            let use_large = matches!(dt, DataType::LargeUtf8);
-            let mut values: Vec<Option<String>> = Vec::with_capacity(num_groups);
-            for key in ordered_keys {
-                let indices = &groups[key];
-                let mut result: Option<String> = None;
-                for &i in indices {
-                    if col.is_null(i) {
-                        continue;
-                    }
-                    let v = format!("{:?}", scalar_to_value(col, i));
-                    result = Some(match result {
-                        None => v,
-                        Some(cur) if is_min && v < cur => v,
-                        Some(cur) if !is_min && v > cur => v,
-                        Some(cur) => cur,
-                    });
-                }
-                values.push(result);
-            }
-            Ok(build_optional_string_array(&values, use_large))
-        }
-    }
-}
-
-fn build_optional_string_array(
-    values: &[Option<String>],
-    use_large: bool,
-) -> arrow_array::ArrayRef {
-    if use_large {
-        let mut builder = arrow_array::builder::LargeStringBuilder::new();
-        for v in values {
-            match v {
-                Some(s) => builder.append_value(s),
-                None => builder.append_null(),
-            }
-        }
-        Arc::new(builder.finish())
-    } else {
-        let mut builder = arrow_array::builder::StringBuilder::new();
-        for v in values {
-            match v {
-                Some(s) => builder.append_value(s),
-                None => builder.append_null(),
-            }
-        }
-        Arc::new(builder.finish())
-    }
-}
-
-fn scalar_to_value(col: &dyn Array, row_idx: usize) -> uni_common::Value {
-    if col.is_null(row_idx) {
-        return uni_common::Value::Null;
-    }
-    match col.data_type() {
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            uni_common::Value::Int(arr.value(row_idx))
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            uni_common::Value::Float(arr.value(row_idx))
-        }
-        DataType::Utf8 => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .unwrap();
-            uni_common::Value::String(arr.value(row_idx).to_string())
-        }
-        DataType::LargeUtf8 => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::LargeStringArray>()
-                .unwrap();
-            uni_common::Value::String(arr.value(row_idx).to_string())
-        }
-        DataType::Boolean => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::BooleanArray>()
-                .unwrap();
-            uni_common::Value::Bool(arr.value(row_idx))
-        }
-        DataType::LargeBinary => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<arrow_array::LargeBinaryArray>()
-                .unwrap();
-            let bytes = arr.value(row_idx);
-            uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null)
-        }
-        _ => uni_common::Value::Null,
-    }
+    // At least one proof carries base_rvs — DNF inclusion-exclusion
+    // is meaningful. Merge top-K (which dedupes by dependency_key
+    // intentionally — shared bases ARE the same dependency) and
+    // compute exact (or top-K-approximated) probability via the
+    // DNF.
+    let k = if ctx.k == 0 { proofs.len() } else { ctx.k };
+    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), proofs, k);
+    let tag = uni_locy::TopKTag { proofs: kept };
+    Ok(Some(tag.to_dnf().weight(&base_weights)))
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +735,8 @@ impl Stream for FoldStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         match &mut self.state {
             FoldStreamState::Running(fut) => match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(batch)) => {
@@ -747,6 +769,24 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
 
+    /// Direct construction of a built-in `LocyAggregate` trait object for use
+    /// in `FoldBinding` test fixtures. Avoids registry plumbing in tests that
+    /// only need a working aggregate.
+    fn builtin_agg(name: &str) -> Arc<dyn LocyAggregate> {
+        use uni_plugin_builtin::locy_aggregates::*;
+        match name {
+            "SUM" | "MSUM" => Arc::new(SumAgg),
+            "MAX" | "MMAX" => Arc::new(MaxAgg),
+            "MIN" | "MMIN" => Arc::new(MinAgg),
+            "COUNT" | "COUNTALL" | "MCOUNT" => Arc::new(CountAgg),
+            "AVG" => Arc::new(AvgAgg),
+            "COLLECT" => Arc::new(CollectAgg),
+            "MNOR" | "NOR" => Arc::new(MnorAgg),
+            "MPROD" | "PROD" => Arc::new(MprodAgg),
+            other => panic!("unknown test aggregate `{other}`"),
+        }
+    }
+
     fn make_test_batch(names: Vec<&str>, values: Vec<f64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -777,7 +817,7 @@ mod tests {
     struct TestMemoryExec {
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for TestMemoryExec {
@@ -796,7 +836,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -849,7 +889,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -885,7 +926,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "cnt".to_string(),
-                kind: FoldAggKind::Count,
+                name: SmolStr::new_static("COUNT"),
+                aggregate: builtin_agg("COUNT"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -912,7 +954,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "mx".to_string(),
-                kind: FoldAggKind::Max,
+                name: SmolStr::new_static("MAX"),
+                aggregate: builtin_agg("MAX"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -923,7 +966,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "mn".to_string(),
-                kind: FoldAggKind::Min,
+                name: SmolStr::new_static("MIN"),
+                aggregate: builtin_agg("MIN"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -954,7 +998,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "average".to_string(),
-                kind: FoldAggKind::Avg,
+                name: SmolStr::new_static("AVG"),
+                aggregate: builtin_agg("AVG"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -982,7 +1027,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1023,7 +1069,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1043,19 +1090,22 @@ mod tests {
             vec![
                 FoldBinding {
                     output_name: "total".to_string(),
-                    kind: FoldAggKind::Sum,
+                    name: SmolStr::new_static("SUM"),
+                    aggregate: builtin_agg("SUM"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "cnt".to_string(),
-                    kind: FoldAggKind::Count,
+                    name: SmolStr::new_static("COUNT"),
+                    aggregate: builtin_agg("COUNT"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "mx".to_string(),
-                    kind: FoldAggKind::Max,
+                    name: SmolStr::new_static("MAX"),
+                    aggregate: builtin_agg("MAX"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
@@ -1100,7 +1150,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1126,7 +1177,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1151,7 +1203,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1176,7 +1229,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1218,7 +1272,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1244,7 +1299,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1269,7 +1325,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1296,7 +1353,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1347,7 +1405,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1371,7 +1430,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1395,7 +1455,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1419,7 +1480,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1447,7 +1509,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1471,7 +1534,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1495,7 +1559,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1519,7 +1584,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1553,7 +1619,8 @@ mod tests {
         let rev = make_test_batch(vec!["a", "a", "a"], vec![0.8, 0.5, 0.2]);
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
-            kind: FoldAggKind::Nor,
+            name: SmolStr::new_static("MNOR"),
+            aggregate: builtin_agg("MNOR"),
             input_col_index: 1,
             input_col_name: None,
         }];
@@ -1583,7 +1650,8 @@ mod tests {
         let rev = make_test_batch(vec!["a", "a"], vec![0.25, 0.5]);
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
-            kind: FoldAggKind::Prod,
+            name: SmolStr::new_static("MPROD"),
+            aggregate: builtin_agg("MPROD"),
             input_col_index: 1,
             input_col_name: None,
         }];
@@ -1616,7 +1684,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1646,7 +1715,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1676,7 +1746,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1708,7 +1779,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1727,7 +1799,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1751,7 +1824,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1775,7 +1849,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1799,7 +1874,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1823,7 +1899,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1848,7 +1925,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1873,7 +1951,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1897,7 +1976,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1923,7 +2003,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1943,61 +2024,64 @@ mod tests {
         );
     }
 
-    // ── FoldAggKind classification tests (Phase 1) ────────────────────────
+    // ── Aggregate-trait classification tests ──────────────────────────────
 
     #[test]
-    fn test_is_monotonic() {
-        assert!(FoldAggKind::Sum.is_monotonic());
-        assert!(FoldAggKind::Max.is_monotonic());
-        assert!(FoldAggKind::Min.is_monotonic());
-        assert!(FoldAggKind::Count.is_monotonic());
-        assert!(FoldAggKind::Nor.is_monotonic());
-        assert!(FoldAggKind::Prod.is_monotonic());
-        assert!(!FoldAggKind::Avg.is_monotonic());
-        assert!(!FoldAggKind::Collect.is_monotonic());
+    fn trait_dispatch_monotonicity() {
+        for name in [
+            "SUM", "MAX", "MIN", "COUNT", "AVG", "COLLECT", "MNOR", "MPROD",
+        ] {
+            let agg = builtin_agg(name);
+            let sl = agg.semilattice();
+            // MIN/MAX/MNOR/MPROD/COLLECT/COUNT are monotone; SUM/AVG are not.
+            let expect_monotone =
+                matches!(name, "MIN" | "MAX" | "MNOR" | "MPROD" | "COLLECT" | "COUNT");
+            assert_eq!(
+                sl.monotone_join, expect_monotone,
+                "monotone_join mismatch for {name}"
+            );
+        }
     }
 
     #[test]
-    fn test_monotonicity_direction() {
-        use super::MonotonicDirection;
+    fn trait_dispatch_initial_accumulator() {
+        // The row-level fast path uses `initial_accum_f64()`.
+        assert_eq!(builtin_agg("SUM").initial_accum_f64(), Some(0.0));
+        assert_eq!(builtin_agg("COUNT").initial_accum_f64(), Some(0.0));
+        assert_eq!(builtin_agg("MNOR").initial_accum_f64(), Some(0.0));
         assert_eq!(
-            FoldAggKind::Sum.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
+            builtin_agg("MAX").initial_accum_f64(),
+            Some(f64::NEG_INFINITY)
         );
-        assert_eq!(
-            FoldAggKind::Max.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Count.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Nor.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Min.monotonicity_direction(),
-            Some(MonotonicDirection::NonIncreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Prod.monotonicity_direction(),
-            Some(MonotonicDirection::NonIncreasing)
-        );
-        assert_eq!(FoldAggKind::Avg.monotonicity_direction(), None);
-        assert_eq!(FoldAggKind::Collect.monotonicity_direction(), None);
+        assert_eq!(builtin_agg("MIN").initial_accum_f64(), Some(f64::INFINITY));
+        assert_eq!(builtin_agg("MPROD").initial_accum_f64(), Some(1.0));
+        // AVG and COLLECT have no row-level fast path — return None.
+        assert_eq!(builtin_agg("AVG").initial_accum_f64(), None);
+        assert_eq!(builtin_agg("COLLECT").initial_accum_f64(), None);
     }
 
     #[test]
-    fn test_identity_values() {
-        assert_eq!(FoldAggKind::Sum.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Count.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Nor.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Max.identity(), Some(f64::NEG_INFINITY));
-        assert_eq!(FoldAggKind::Min.identity(), Some(f64::INFINITY));
-        assert_eq!(FoldAggKind::Prod.identity(), Some(1.0));
-        assert_eq!(FoldAggKind::Avg.identity(), None);
-        assert_eq!(FoldAggKind::Collect.identity(), None);
+    fn trait_dispatch_probability_predicate() {
+        // is_probability_aggregate is the trait predicate for probability-domain aggregates.
+        for name in ["MNOR", "MPROD"] {
+            assert!(
+                builtin_agg(name).is_probability_aggregate(),
+                "expected {name} to be probability-domain"
+            );
+        }
+        for name in ["SUM", "MAX", "MIN", "COUNT", "AVG", "COLLECT"] {
+            assert!(
+                !builtin_agg(name).is_probability_aggregate(),
+                "{name} should NOT be probability-domain"
+            );
+        }
+    }
+
+    #[test]
+    fn trait_dispatch_noisy_or_predicate() {
+        // is_noisy_or distinguishes MNOR from MPROD for semiring-op selection.
+        assert!(builtin_agg("MNOR").is_noisy_or());
+        assert!(!builtin_agg("MPROD").is_noisy_or());
     }
 
     // ── Strict mode tests (Phase 5) ──────────────────────────────────────
@@ -2029,7 +2113,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2054,7 +2139,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2079,7 +2165,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2104,7 +2191,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2129,7 +2217,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2162,7 +2251,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "cnt".to_string(),
-                kind: FoldAggKind::CountAll,
+                name: SmolStr::new_static("COUNTALL"),
+                aggregate: builtin_agg("COUNTALL"),
                 input_col_index: 0, // unused for CountAll
                 input_col_name: None,
             }],
@@ -2177,5 +2267,156 @@ mod tests {
             .unwrap();
         assert_eq!(counts.value(0), 2, "Group 'a' should have count 2");
         assert_eq!(counts.value(1), 1, "Group 'b' should have count 1");
+    }
+
+    // ── Registry-resolve sanity tests ────────────────────────────────────
+
+    /// A test-only `LocyAggregate` that's not in `uni-plugin-builtin`.
+    /// Used to prove `resolve_locy_aggregate` walks the registry rather
+    /// than dispatching from a hardcoded built-in table.
+    #[derive(Debug)]
+    struct IdentityAgg;
+
+    impl LocyAggregate for IdentityAgg {
+        fn semilattice(&self) -> uni_plugin::traits::locy::Semilattice {
+            uni_plugin::traits::locy::Semilattice::BOUNDED_MIN_MAX
+        }
+        fn output_type(&self) -> arrow_schema::DataType {
+            arrow_schema::DataType::Float64
+        }
+        fn create(&self) -> Box<dyn uni_plugin::traits::locy::LocyAggState> {
+            panic!("IdentityAgg::create not used in this sanity test")
+        }
+    }
+
+    #[test]
+    fn resolve_locy_aggregate_returns_registered_instance() {
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new(uni_plugin::QName::BUILTIN_NS);
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+
+        let registered: Arc<dyn LocyAggregate> = Arc::new(IdentityAgg);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        r.locy_aggregate(
+            uni_plugin::QName::builtin("TEST_IDENTITY"),
+            Arc::clone(&registered),
+        )
+        .expect("register");
+        r.commit_to_registry().expect("commit");
+
+        let resolved = resolve_locy_aggregate(&registry, "TEST_IDENTITY")
+            .expect("registered aggregate should resolve");
+        assert!(
+            Arc::ptr_eq(&registered, &resolved.aggregate),
+            "registry must return the exact Arc that was registered"
+        );
+
+        // Unknown name still returns None — the resolver does not fall back.
+        assert!(resolve_locy_aggregate(&registry, "NOT_REGISTERED").is_none());
+    }
+
+    #[test]
+    fn default_locy_plugin_registry_contains_all_builtins() {
+        let r = default_locy_plugin_registry();
+        for name in [
+            "MIN", "MAX", "SUM", "MSUM", "COUNT", "AVG", "COLLECT", "MNOR", "MPROD",
+        ] {
+            assert!(
+                resolve_locy_aggregate(&r, name).is_some(),
+                "default registry should contain built-in `{name}`"
+            );
+        }
+    }
+
+    // ── User-defined aggregate runs through the trait (G1 regression) ─────
+
+    /// A novel aggregate not in `uni-plugin-builtin`: per-group `max − min`.
+    ///
+    /// Requires real columnar state (two accumulators), so it is *not*
+    /// expressible via the `update_step` scalar fast path. Before the fold
+    /// executor dispatched through [`LocyAggState`], a binding like this hit
+    /// the closed-enum `_ => Err("unsupported aggregate")` arm at runtime;
+    /// now it executes through `create`/`ingest_indices`/`finalize`.
+    #[derive(Debug)]
+    struct RangeAgg;
+
+    impl LocyAggregate for RangeAgg {
+        fn semilattice(&self) -> uni_plugin::traits::locy::Semilattice {
+            uni_plugin::traits::locy::Semilattice::NON_MONOTONE
+        }
+        fn output_type(&self) -> DataType {
+            DataType::Float64
+        }
+        fn create(&self) -> Box<dyn uni_plugin::traits::locy::LocyAggState> {
+            Box::new(RangeState {
+                min: None,
+                max: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RangeState {
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    impl uni_plugin::traits::locy::LocyAggState for RangeState {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn ingest_indices(
+            &mut self,
+            col: &dyn Array,
+            indices: &[usize],
+            _cx: &FoldContext,
+        ) -> Result<(), uni_plugin::FnError> {
+            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+            for &i in indices {
+                if arr.is_null(i) {
+                    continue;
+                }
+                let v = arr.value(i);
+                self.min = Some(self.min.map_or(v, |m| m.min(v)));
+                self.max = Some(self.max.map_or(v, |m| m.max(v)));
+            }
+            Ok(())
+        }
+        fn merge(
+            &mut self,
+            _other: &dyn uni_plugin::traits::locy::LocyAggState,
+        ) -> Result<(), uni_plugin::FnError> {
+            Ok(())
+        }
+        fn finalize(&self) -> Result<ScalarValue, uni_plugin::FnError> {
+            match (self.min, self.max) {
+                (Some(lo), Some(hi)) => Ok(ScalarValue::Float64(Some(hi - lo))),
+                _ => Ok(ScalarValue::Float64(None)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_defined_aggregate_runs_in_non_recursive_fold() {
+        // group "a": [1.0, 5.0] → range 4.0 ; group "b": [3.0] → range 0.0
+        let batch = make_test_batch(vec!["a", "a", "b"], vec![1.0, 5.0, 3.0]);
+        let input = make_memory_exec(batch);
+        let binding = FoldBinding {
+            output_name: "r".into(),
+            name: SmolStr::new_static("RANGE"),
+            aggregate: Arc::new(RangeAgg),
+            input_col_index: 1,
+            input_col_name: Some("value".to_string()),
+        };
+        let out = execute_fold(input, vec![0], vec![binding]).await;
+        assert_eq!(out.num_rows(), 2);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("range output is Float64");
+        // ordered_keys preserves first-seen order: "a" then "b".
+        assert_eq!(col.value(0), 4.0);
+        assert_eq!(col.value(1), 0.0);
     }
 }

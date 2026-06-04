@@ -60,7 +60,7 @@ fn expects_identifier(e: &pest::error::Error<Rule>) -> bool {
     }
 }
 
-fn error_position(e: &pest::error::Error<Rule>) -> usize {
+fn error_position<R: pest::RuleType>(e: &pest::error::Error<R>) -> usize {
     match e.location {
         pest::error::InputLocation::Pos(p) => p,
         pest::error::InputLocation::Span((s, _)) => s,
@@ -257,13 +257,6 @@ fn reserved_keyword_at(input: &str, pos: usize, extra_keywords: &[&str]) -> Opti
     }
 }
 
-fn locy_error_position(e: &pest::error::Error<locy_parser::Rule>) -> usize {
-    match e.location {
-        pest::error::InputLocation::Pos(p) => p,
-        pest::error::InputLocation::Span((s, _)) => s,
-    }
-}
-
 /// Categorize a Locy parse error based on context before the error position.
 fn locy_context_category(input: &str, pos: usize) -> Option<&'static str> {
     let before = input[..pos].trim_end();
@@ -296,7 +289,7 @@ fn locy_context_category(input: &str, pos: usize) -> Option<&'static str> {
 }
 
 fn map_locy_pest_error(input: &str, e: pest::error::Error<locy_parser::Rule>) -> ParseError {
-    let pos = locy_error_position(&e);
+    let pos = error_position(&e);
 
     // Reuse input-based heuristics from the Cypher parser
     if is_invalid_relationship_pattern(input, pos) {

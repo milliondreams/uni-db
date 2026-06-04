@@ -39,6 +39,7 @@ fn match_query(pattern: Pattern, where_clause: Option<Expr>) -> Query {
             optional: false,
             pattern,
             where_clause,
+            for_update: false,
         })],
     })
 }
@@ -165,12 +166,23 @@ fn build_match_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
 
     let pattern = build_pattern(inner.next().unwrap())?;
 
-    let where_clause = inner.next().map(extract_where_expr).transpose()?;
+    // `where_clause` and `for_update_clause` are both optional and trailing, so
+    // dispatch the remaining pairs by rule rather than positionally.
+    let mut where_clause = None;
+    let mut for_update = false;
+    for p in inner {
+        match p.as_rule() {
+            Rule::where_clause => where_clause = Some(extract_where_expr(p)?),
+            Rule::for_update_clause => for_update = true,
+            _ => {}
+        }
+    }
 
     Ok(Clause::Match(MatchClause {
         optional,
         pattern,
         where_clause,
+        for_update,
     }))
 }
 
@@ -350,10 +362,23 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem, ParseError> {
                 Rule::node_labels => {
                     // `node_labels` now wraps `node_label_disjunction |
                     // node_label_conjunction`; drill one level deeper.
+                    //
+                    // SET only accepts conjunction (`SET n:A:B`). The
+                    // disjunction syntax `SET n:A|B` is not legal Cypher
+                    // — previously this code blindly flattened both into
+                    // a single label list, silently turning a parse-time
+                    // error into a semantic miscompile (acting as if the
+                    // user had written conjunction).
                     let inner_pair = next
                         .into_inner()
                         .next()
                         .expect("node_labels always wraps a child rule");
+                    if matches!(inner_pair.as_rule(), Rule::node_label_disjunction) {
+                        return Err(ParseError::new(format!(
+                            "SET `{}:A|B` is not valid Cypher; use `SET {0}:A:B` to assign multiple labels",
+                            first.as_str()
+                        )));
+                    }
                     let labels = inner_pair
                         .into_inner()
                         .filter(|t| {
@@ -1513,11 +1538,19 @@ fn build_parenthesized_pattern(pair: Pair<Rule>) -> Result<PatternElement, Parse
         shortest_path_mode: None,
     };
 
-    // For now, we'll store the WHERE clause in a comment or ignore it
-    // since the current AST doesn't support WHERE in parenthesized patterns
-    // TODO: Consider extending AST to support WHERE in parenthesized patterns
+    // Previously this branch emitted an `eprintln!` warning and then
+    // dropped the WHERE clause on the floor, producing wrong results
+    // for queries like `MATCH ((n)-[r]->(m) WHERE r.x > 0)+ ...`.
+    // Until the AST and executor support parenthesized-pattern WHERE
+    // end-to-end, refuse to parse the query rather than silently
+    // miscompile it. (Tracking issue: AST extension for
+    // `PatternElement::Parenthesized { where_clause }`.)
     if where_clause.is_some() {
-        eprintln!("Warning: WHERE clause in parenthesized pattern is not yet fully supported");
+        return Err(ParseError::new(
+            "WHERE inside a parenthesized path pattern is not yet supported; \
+             move the predicate to the enclosing MATCH or omit it"
+                .to_string(),
+        ));
     }
 
     Ok(PatternElement::Parenthesized {
@@ -2040,12 +2073,10 @@ fn build_create_scalar_index(pair: Pair<Rule>) -> Result<SchemaCommand, ParseErr
     let mut where_clause = None;
     let mut options = HashMap::new();
 
+    // The OPTIONS keyword carries no data; the following map_literal holds it.
     for p in inner {
         match p.as_rule() {
             Rule::where_clause => where_clause = Some(extract_where_expr(p)?),
-            Rule::OPTIONS => {
-                // Next item should be map_literal
-            }
             Rule::map_literal => {
                 options = build_map_options(p)?;
             }
@@ -2095,10 +2126,10 @@ fn build_drop_index(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> {
     inner.next(); // DROP_KW
     inner.next(); // INDEX
 
-    let _if_exists = consume_if_present(&mut inner, Rule::if_exists);
+    let if_exists = consume_if_present(&mut inner, Rule::if_exists);
     let name = inner.next().unwrap().as_str().to_string();
 
-    Ok(SchemaCommand::DropIndex(DropIndex { name }))
+    Ok(SchemaCommand::DropIndex(DropIndex { name, if_exists }))
 }
 
 fn build_create_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> {
@@ -2169,10 +2200,22 @@ fn build_constraint_assertion(
             Ok((ctype, props, None))
         }
         Rule::expression => {
-            // CHECK constraint with arbitrary expression
+            // CHECK constraint with arbitrary expression. Walk the AST
+            // for property accesses rooted at `var` so downstream
+            // constraint validators know which properties the predicate
+            // touches. Previously this returned `vec![]` with a TODO,
+            // which made the constraint's property dependency list
+            // empty — silent for the parser, but downstream constraint
+            // reasoning (e.g. delete-cascade impact analysis) treated
+            // the constraint as if it referenced no columns.
             let expr = build_expression(first)?;
-            // TODO: Extract property names from expression for properties vec
-            Ok((ConstraintType::Check, vec![], Some(expr)))
+            let mut props = Vec::new();
+            collect_property_refs_into(&expr, var, &mut props);
+            // Deduplicate while preserving first-seen order so the
+            // emitted list is stable for snapshot tests.
+            let mut seen = std::collections::HashSet::new();
+            props.retain(|p| seen.insert(p.clone()));
+            Ok((ConstraintType::Check, props, Some(expr)))
         }
         _ => {
             // Fallback to old syntax: (props) IS [NODE|RELATIONSHIP] [UNIQUE|KEY]
@@ -2229,15 +2272,65 @@ fn extract_property_names_from_expr(
     Ok(parts)
 }
 
+/// Collect every property name referenced on `expected_var` inside
+/// `expr`, in source order.
+///
+/// Walks the [`Expr`] AST recursively, descending through binary ops,
+/// function calls, lists, maps, case branches, quantifiers, and so on.
+/// Only `Property(Variable(expected_var), name)` accesses contribute;
+/// accesses rooted at other variables, parameters, or deeper nested
+/// property chains (`n.foo.bar`) are not included (the immediate property
+/// of `expected_var` in such a chain is still collected via recursion).
+fn collect_property_refs_into(expr: &Expr, expected_var: &str, out: &mut Vec<String>) {
+    match expr {
+        Expr::Property(base, name) => {
+            if let Expr::Variable(v) = base.as_ref()
+                && v == expected_var
+            {
+                out.push(name.clone());
+            }
+            collect_property_refs_into(base, expected_var, out);
+        }
+        Expr::Quantifier { list, .. } => {
+            // The bound variable inside a quantifier shadows `expected_var`;
+            // we conservatively still descend into the list expression
+            // (which is evaluated in the outer scope) but not the predicate.
+            collect_property_refs_into(list, expected_var, out);
+        }
+        // Compound forms whose direct children are all evaluated in the same
+        // scope: descend into each via `Expr::for_each_child`.
+        Expr::List(_)
+        | Expr::Map(_)
+        | Expr::FunctionCall { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::Case { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsUnique(_)
+        | Expr::In { .. }
+        | Expr::ArrayIndex { .. }
+        | Expr::ArraySlice { .. } => {
+            expr.for_each_child(&mut |child| collect_property_refs_into(child, expected_var, out));
+        }
+        // Leaf forms and subquery forms (Exists/CountSubquery/CollectSubquery)
+        // do not contribute simple property references on `expected_var`.
+        _ => {}
+    }
+}
+
 fn build_drop_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> {
     let mut inner = pair.into_inner().peekable();
     inner.next(); // DROP_KW
     inner.next(); // CONSTRAINT
 
-    let _if_exists = consume_if_present(&mut inner, Rule::if_exists);
+    let if_exists = consume_if_present(&mut inner, Rule::if_exists);
     let name = inner.next().unwrap().as_str().to_string();
 
-    Ok(SchemaCommand::DropConstraint(DropConstraint { name }))
+    Ok(SchemaCommand::DropConstraint(DropConstraint {
+        name,
+        if_exists,
+    }))
 }
 
 fn build_create_label(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> {

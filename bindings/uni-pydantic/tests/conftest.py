@@ -3,25 +3,26 @@
 
 """Pytest configuration and fixtures for uni-pydantic tests."""
 
-import tempfile
-
 import pytest
 
 
 @pytest.fixture
-def temp_db_path():
-    """Create a temporary directory for database storage."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+def db():
+    """Create a temporary database instance.
 
-
-@pytest.fixture
-def db(temp_db_path):
-    """Create a temporary database instance."""
+    Uses ``UniBuilder.temporary()`` (a Rust-owned temp dir) rather than opening
+    at an external ``tempfile.TemporaryDirectory``. The latter races the
+    database's background flush threads, which keep writing after the test body
+    returns, so the directory's ``rmtree`` can fail with
+    ``OSError: Directory not empty``. With ``temporary()`` the Rust side stops
+    those threads on drop and removes its own temp dir, so teardown is race-free
+    by construction. (Mirrors ``async_db`` below, which already uses
+    ``AsyncUni.temporary()``.)
+    """
     try:
         import uni_db
 
-        return uni_db.UniBuilder.open(temp_db_path).build()
+        return uni_db.UniBuilder.temporary().build()
     except ImportError:
         pytest.skip("uni_db not available")
 

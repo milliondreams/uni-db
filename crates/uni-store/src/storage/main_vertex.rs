@@ -17,7 +17,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, ScanRequest, WriteMode};
+use crate::backend::types::{ScalarIndexType, ScanRequest};
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
@@ -40,6 +40,80 @@ use uni_common::core::id::{UniId, Vid};
 #[derive(Debug)]
 pub struct MainVertexDataset {
     _base_uri: String,
+}
+
+/// Append the snapshot-isolation version bound to a scan `filter`.
+///
+/// When `version` is `Some(hwm)`, restricts the scan to rows at or below the
+/// high water mark via ` AND _version <= {hwm}`; `None` leaves the filter
+/// unchanged (global visibility). This suffix is SSI/OCC-critical and must
+/// stay byte-identical across all snapshot reads.
+fn with_version_bound(mut filter: String, version: Option<u64>) -> String {
+    if let Some(hwm) = version {
+        filter.push_str(&format!(" AND _version <= {}", hwm));
+    }
+    filter
+}
+
+/// Scan the main vertices table for `_vid`s matching `filter_body`.
+///
+/// `filter_body` is the predicate without the snapshot version bound, which
+/// is appended via [`with_version_bound`]. Returns an empty vec if the table
+/// does not exist. Shared by the `find_*_vids` lookups.
+async fn scan_vids(
+    backend: &dyn StorageBackend,
+    filter_body: String,
+    version: Option<u64>,
+) -> Result<Vec<Vid>> {
+    let table_name = table_names::main_vertex_table_name();
+
+    if !backend.table_exists(table_name).await? {
+        return Ok(Vec::new());
+    }
+
+    let filter = with_version_bound(filter_body, version);
+
+    let results = backend
+        .scan(
+            ScanRequest::all(table_name)
+                .with_filter(filter)
+                .with_columns(vec!["_vid".to_string()]),
+        )
+        .await?;
+
+    let mut vids = Vec::new();
+    for batch in results {
+        if let Some(vid_col) = batch.column_by_name("_vid")
+            && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
+        {
+            for i in 0..vid_arr.len() {
+                if !vid_arr.is_null(i) {
+                    vids.push(Vid::new(vid_arr.value(i)));
+                }
+            }
+        }
+    }
+
+    Ok(vids)
+}
+
+/// Extract a label vector from one row of a `List<Utf8>` labels column.
+///
+/// Returns `None` when the row's values are not a `StringArray`. Nulls within
+/// the list are skipped.
+fn list_array_to_labels(list_arr: &arrow_array::ListArray, row: usize) -> Option<Vec<String>> {
+    let values = list_arr.value(row);
+    let str_arr = values.as_any().downcast_ref::<arrow_array::StringArray>()?;
+    let labels: Vec<String> = (0..str_arr.len())
+        .filter_map(|i| {
+            if str_arr.is_null(i) {
+                None
+            } else {
+                Some(str_arr.value(i).to_string())
+            }
+        })
+        .collect();
+    Some(labels)
 }
 
 impl MainVertexDataset {
@@ -203,16 +277,65 @@ impl MainVertexDataset {
     /// Write a batch to the main vertices table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
+    /// Race-safe under async-flush concurrent writes — see
+    /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_batch(backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
         let table_name = table_names::main_vertex_table_name();
+        crate::storage::manager::write_batch_with_lance_conflict_retry(backend, table_name, batch)
+            .await
+    }
 
-        if backend.table_exists(table_name).await? {
-            backend
-                .write(table_name, vec![batch], WriteMode::Append)
-                .await
-        } else {
-            backend.create_table(table_name, vec![batch]).await
-        }
+    /// Build a partial-column RecordBatch marking VIDs as deleted. Used
+    /// by the DELETE flush path to skip the wide-row tombstone Append.
+    /// Schema: `_vid`, `_deleted=true`, `_version`, `_updated_at`. Lance
+    /// MergeInsert leaves all other target columns untouched.
+    pub fn build_tombstone_partial_batch(
+        tombstones: &[(Vid, u64)],
+        updated_at: Option<&HashMap<Vid, i64>>,
+    ) -> Result<RecordBatch> {
+        let fields = vec![
+            Field::new("_vid", DataType::UInt64, false),
+            Field::new("_deleted", DataType::Boolean, false),
+            Field::new("_version", DataType::UInt64, false),
+            Field::new(
+                "_updated_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+        let vids: Vec<u64> = tombstones.iter().map(|(v, _)| v.as_u64()).collect();
+        let deleted: Vec<bool> = vec![true; tombstones.len()];
+        let versions: Vec<u64> = tombstones.iter().map(|(_, v)| *v).collect();
+        let vids_iter = tombstones.iter().map(|(v, _)| *v);
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vids)),
+            Arc::new(BooleanArray::from(deleted)),
+            Arc::new(UInt64Array::from(versions)),
+            build_timestamp_column_from_vid_map(vids_iter, updated_at),
+        ];
+
+        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
+    }
+
+    /// MergeInsert a tombstone-partial batch into the main vertices
+    /// table. Join key is `_vid`. Matched rows have `_deleted` flipped
+    /// to true; unmatched source rows are dropped (deleting a non-
+    /// existent VID is a logical no-op).
+    pub async fn merge_insert_tombstone_batch(
+        backend: &dyn StorageBackend,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let table_name = table_names::main_vertex_table_name();
+        crate::storage::manager::merge_insert_batch_with_lance_conflict_retry(
+            backend,
+            table_name,
+            batch,
+            &["_vid"],
+        )
+        .await
     }
 
     /// Ensure default indexes exist on the main vertices table.
@@ -269,13 +392,13 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let mut filter = format!(
-            "ext_id = '{}' AND _deleted = false",
-            ext_id.replace('\'', "''")
+        let filter = with_version_bound(
+            format!(
+                "ext_id = '{}' AND _deleted = false",
+                ext_id.replace('\'', "''")
+            ),
+            version,
         );
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
 
         let results = backend
             .scan(
@@ -328,10 +451,10 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let mut filter = format!("_vid = {} AND _deleted = false", vid.as_u64());
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
+        let filter = with_version_bound(
+            format!("_vid = {} AND _deleted = false", vid.as_u64()),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -345,21 +468,9 @@ impl MainVertexDataset {
             if batch.num_rows() > 0
                 && let Some(labels_col) = batch.column_by_name("labels")
                 && let Some(list_arr) = labels_col.as_any().downcast_ref::<arrow_array::ListArray>()
+                && let Some(labels) = list_array_to_labels(list_arr, 0)
             {
-                // Labels is a List<Utf8> column
-                let values = list_arr.value(0);
-                if let Some(str_arr) = values.as_any().downcast_ref::<arrow_array::StringArray>() {
-                    let labels: Vec<String> = (0..str_arr.len())
-                        .filter_map(|i| {
-                            if str_arr.is_null(i) {
-                                None
-                            } else {
-                                Some(str_arr.value(i).to_string())
-                            }
-                        })
-                        .collect();
-                    return Ok(Some(labels));
-                }
+                return Ok(Some(labels));
             }
         }
 
@@ -380,39 +491,7 @@ impl MainVertexDataset {
         backend: &dyn StorageBackend,
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        let table_name = table_names::main_vertex_table_name();
-
-        if !backend.table_exists(table_name).await? {
-            return Ok(Vec::new());
-        }
-
-        let mut filter = "_deleted = false".to_string();
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
-
-        let results = backend
-            .scan(
-                ScanRequest::all(table_name)
-                    .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string()]),
-            )
-            .await?;
-
-        let mut vids = Vec::new();
-        for batch in results {
-            if let Some(vid_col) = batch.column_by_name("_vid")
-                && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
-            {
-                for i in 0..vid_arr.len() {
-                    if !vid_arr.is_null(i) {
-                        vids.push(Vid::new(vid_arr.value(i)));
-                    }
-                }
-            }
-        }
-
-        Ok(vids)
+        scan_vids(backend, "_deleted = false".to_string(), version).await
     }
 
     /// Find VIDs by label name in the main vertices table.
@@ -431,40 +510,9 @@ impl MainVertexDataset {
         label: &str,
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        let table_name = table_names::main_vertex_table_name();
-
-        if !backend.table_exists(table_name).await? {
-            return Ok(Vec::new());
-        }
-
         // Use SQL array_contains to filter by label
-        let mut filter = format!("_deleted = false AND array_contains(labels, '{}')", label);
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
-
-        let results = backend
-            .scan(
-                ScanRequest::all(table_name)
-                    .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string()]),
-            )
-            .await?;
-
-        let mut vids = Vec::new();
-        for batch in results {
-            if let Some(vid_col) = batch.column_by_name("_vid")
-                && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
-            {
-                for i in 0..vid_arr.len() {
-                    if !vid_arr.is_null(i) {
-                        vids.push(Vid::new(vid_arr.value(i)));
-                    }
-                }
-            }
-        }
-
-        Ok(vids)
+        let filter_body = format!("_deleted = false AND array_contains(labels, '{}')", label);
+        scan_vids(backend, filter_body, version).await
     }
 
     /// Find VIDs by multiple label names (intersection semantics).
@@ -479,9 +527,7 @@ impl MainVertexDataset {
         labels: &[&str],
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        let table_name = table_names::main_vertex_table_name();
-
-        if labels.is_empty() || !backend.table_exists(table_name).await? {
+        if labels.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -494,33 +540,8 @@ impl MainVertexDataset {
             })
             .collect();
 
-        let mut filter = format!("_deleted = false AND {}", label_conditions.join(" AND "));
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
-
-        let results = backend
-            .scan(
-                ScanRequest::all(table_name)
-                    .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string()]),
-            )
-            .await?;
-
-        let mut vids = Vec::new();
-        for batch in results {
-            if let Some(vid_col) = batch.column_by_name("_vid")
-                && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
-            {
-                for i in 0..vid_arr.len() {
-                    if !vid_arr.is_null(i) {
-                        vids.push(Vid::new(vid_arr.value(i)));
-                    }
-                }
-            }
-        }
-
-        Ok(vids)
+        let filter_body = format!("_deleted = false AND {}", label_conditions.join(" AND "));
+        scan_vids(backend, filter_body, version).await
     }
 
     /// Batch-fetch properties for multiple VIDs from the main vertices table.
@@ -548,10 +569,10 @@ impl MainVertexDataset {
 
         // Build IN clause for VIDs
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let mut filter = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
+        let filter = with_version_bound(
+            format!("_vid IN ({}) AND _deleted = false", vid_list.join(", ")),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -619,10 +640,10 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let mut filter = format!("_vid = {} AND _deleted = false", vid.as_u64());
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
+        let filter = with_version_bound(
+            format!("_vid = {} AND _deleted = false", vid.as_u64()),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -689,10 +710,10 @@ impl MainVertexDataset {
 
         // Build IN clause for VIDs
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let mut filter = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
-        if let Some(hwm) = version {
-            filter.push_str(&format!(" AND _version <= {}", hwm));
-        }
+        let filter = with_version_bound(
+            format!("_vid IN ({}) AND _deleted = false", vid_list.join(", ")),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -718,19 +739,7 @@ impl MainVertexDataset {
                     }
                     let vid = Vid::new(vid_arr.value(i));
 
-                    let values = labels_arr.value(i);
-                    if let Some(str_arr) =
-                        values.as_any().downcast_ref::<arrow_array::StringArray>()
-                    {
-                        let labels: Vec<String> = (0..str_arr.len())
-                            .filter_map(|j| {
-                                if str_arr.is_null(j) {
-                                    None
-                                } else {
-                                    Some(str_arr.value(j).to_string())
-                                }
-                            })
-                            .collect();
+                    if let Some(labels) = list_array_to_labels(labels_arr, i) {
                         label_map.insert(vid, labels);
                     }
                 }

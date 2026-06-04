@@ -41,7 +41,7 @@ pub struct BestByExec {
     key_indices: Vec<usize>,
     sort_criteria: Vec<SortCriterion>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// When true, apply a secondary sort on remaining columns for deterministic
     /// tie-breaking. When false, tied rows are selected non-deterministically.
@@ -99,7 +99,7 @@ impl ExecutionPlan for BestByExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -268,6 +268,8 @@ impl Stream for BestByStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         match &mut self.state {
             BestByStreamState::Running(fut) => match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(batch)) => {
@@ -332,7 +334,7 @@ mod tests {
     struct TestMemoryExec {
         batches: Vec<RecordBatch>,
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl DisplayAs for TestMemoryExec {
@@ -351,7 +353,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -1,0 +1,25 @@
+[package]
+name = "uni-plugin-wasm-rt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Shared Arrow IPC + instance-pool runtime for the uni-db plugin WASM loaders"
+keywords = ["plugin", "wasm", "graph", "database", "ipc"]
+categories = ["database", "wasm"]
+
+# Deliberately minimal — this crate sits BELOW `uni-plugin` in the dep
+# graph so the trait surface stays light. No `uni-plugin` dep, no
+# wasmtime, no extism. Pure Arrow + crossbeam + parking_lot.
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = "58.3.0"
+crossbeam-queue = "0.3"
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -18,13 +18,14 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Value;
-use uni_common::core::schema::{DistanceMetric, Schema as UniSchema};
+use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
 use uni_store::storage::manager::StorageManager;
 
 use super::GraphExecutionContext;
 use super::procedure_call::map_yield_to_canonical;
 use super::unwind::arrow_to_json_value;
+use crate::query::df_graph::MutationContext;
 use crate::query::df_planner::HybridPhysicalPlanner;
 use crate::query::planner::LogicalPlan;
 
@@ -43,13 +44,13 @@ pub fn arrow_err(e: arrow::error::ArrowError) -> datafusion::error::DataFusionEr
 /// - Unknown partitioning with 1 partition
 /// - Incremental emission type
 /// - Bounded execution
-pub fn compute_plan_properties(schema: SchemaRef) -> PlanProperties {
-    PlanProperties::new(
+pub fn compute_plan_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
         Partitioning::UnknownPartitioning(1),
         datafusion::physical_plan::execution_plan::EmissionType::Incremental,
         datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-    )
+    ))
 }
 
 /// Return the Arrow `DataType` for `_labels` columns: `List<Utf8>`.
@@ -892,6 +893,13 @@ pub async fn collect_all_partitions(
 /// Execute a logical plan using a fresh HybridPhysicalPlanner with the given params.
 ///
 /// Shared by `RecursiveCTEExec`, `GraphApplyExec`, and `ExistsExecExpr`.
+/// Pass `mutation_ctx = Some(...)` to enable writes inside the sub-plan
+/// (`CALL { ... SET/CREATE/MERGE/DELETE }`). `None` is appropriate for
+/// read-only sub-plans (Locy rule evaluation, EXISTS predicate).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threading mutation_ctx for CALL subquery writes"
+)]
 pub async fn execute_subplan(
     plan: &LogicalPlan,
     params: &HashMap<String, Value>,
@@ -900,6 +908,7 @@ pub async fn execute_subplan(
     session_ctx: &Arc<RwLock<SessionContext>>,
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<Vec<RecordBatch>> {
     execute_subplan_with_outer_vars(
         plan,
@@ -910,13 +919,14 @@ pub async fn execute_subplan(
         storage,
         schema_info,
         &std::collections::HashSet::new(),
+        mutation_ctx,
     )
     .await
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Threading outer_entity_vars for nested EXISTS"
+    reason = "Threading outer_entity_vars for nested EXISTS and mutation_ctx for CALL writes"
 )]
 /// Like `execute_subplan`, but with outer entity variable names for nested EXISTS.
 ///
@@ -932,6 +942,7 @@ pub async fn execute_subplan_with_outer_vars(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
     outer_entity_vars: &std::collections::HashSet<String>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
@@ -954,6 +965,13 @@ pub async fn execute_subplan_with_outer_vars(
     }
     if let Some(runtime) = graph_ctx.xervo_runtime() {
         planner = planner.with_xervo_runtime(runtime.clone());
+    }
+
+    // Propagate the outer MutationContext so writes inside CALL { ... }
+    // subqueries (SET, CREATE, MERGE, DELETE) and RecursiveCTE bodies can
+    // route through the same transaction's L0 buffer.
+    if let Some(mc) = mutation_ctx {
+        planner = planner.with_mutation_context(mc.clone());
     }
 
     let execution_plan = planner.plan(plan).map_err(|e| {
@@ -1009,15 +1027,12 @@ fn infer_procedure_call_schema(
                 "nullable" | "indexed" | "unique" => DataType::Boolean,
                 _ => DataType::Utf8,
             },
-            "uni.vector.query" | "uni.fts.query" | "uni.search" => {
-                // Search procedures: infer types via canonical yield mapping.
-                // Node expansion happens at execution time in GraphProcedureCallExec.
-                match map_yield_to_canonical(name).as_str() {
-                    "distance" => DataType::Float64,
-                    "score" | "vector_score" | "fts_score" | "raw_score" => DataType::Float32,
-                    "vid" => DataType::Int64,
-                    _ => DataType::Utf8,
-                }
+            // Node-yield procedures (search family): infer scalar yield
+            // types via the canonical yield-name → Arrow-type table.
+            // Node expansion happens at execution time in
+            // `GraphProcedureCallExec`.
+            n if super::procedure_call::is_node_yield_procedure_static(n) => {
+                super::procedure_call::canonical_search_type(map_yield_to_canonical(name))
             }
             // uni.schema.indexes, unknown procedures, and fallback: all Utf8
             _ => DataType::Utf8,
@@ -1351,19 +1366,10 @@ pub(crate) fn extract_scalar_key(
         .collect()
 }
 
-/// Convert a raw distance value into a normalised similarity score.
-///
-/// The conversion depends on the distance metric:
-/// - **Cosine**: `(2 - d) / 2` (LanceDB cosine distance ranges 0..2)
-/// - **Dot**: pass-through (already a similarity measure)
-/// - **L2** and others: `1 / (1 + d)`
-pub fn calculate_score(distance: f32, metric: &DistanceMetric) -> f32 {
-    match metric {
-        DistanceMetric::Cosine => (2.0 - distance) / 2.0,
-        DistanceMetric::Dot => distance,
-        _ => 1.0 / (1.0 + distance),
-    }
-}
+// `calculate_score` moved to `uni-query-functions::similar_to` (a pure
+// leaf module). Re-export for back-compat with code that imports it via
+// `df_graph::common::calculate_score`.
+pub use uni_query_functions::similar_to::calculate_score;
 
 #[cfg(test)]
 mod tests {

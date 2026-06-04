@@ -14,6 +14,22 @@ pub const SCHEMALESS_BIT: EdgeTypeId = 0x8000_0000;
 /// Maximum schema-defined edge type ID (2^31 - 1).
 pub const MAX_SCHEMA_TYPE_ID: EdgeTypeId = 0x7FFF_FFFF;
 
+/// First virtual (catalog-resolved) edge-type ID. Edge types in
+/// `VIRTUAL_EDGE_TYPE_ID_START..VIRTUAL_EDGE_TYPE_ID_SENTINEL` are owned by
+/// plugin-registered `CatalogProvider`s; allocated lazily by the planner
+/// when an unknown edge type resolves via the registry. Reserved high
+/// slice of the schema-defined space (bit 31 = 0) so they remain
+/// distinguishable from schemaless IDs (bit 31 = 1).
+pub const VIRTUAL_EDGE_TYPE_ID_START: EdgeTypeId = 0x7FFF_FF00;
+/// Sentinel "no edge type" marker, kept distinct from any allocatable ID.
+pub const VIRTUAL_EDGE_TYPE_ID_SENTINEL: EdgeTypeId = 0x7FFF_FFFF;
+
+/// Returns `true` if `type_id` is in the virtual (catalog-resolved) range.
+#[inline]
+pub fn is_virtual_edge_type(type_id: EdgeTypeId) -> bool {
+    (VIRTUAL_EDGE_TYPE_ID_START..VIRTUAL_EDGE_TYPE_ID_SENTINEL).contains(&type_id)
+}
+
 /// Returns `true` if the edge type ID was dynamically assigned (schemaless).
 #[inline]
 pub fn is_schemaless_edge_type(type_id: EdgeTypeId) -> bool {

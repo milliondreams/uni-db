@@ -3,13 +3,11 @@
 
 //! uni.algo.kShortestPaths procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, KShortestPaths, KShortestPathsConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct KShortestPathsAdapter;
 
@@ -34,12 +32,15 @@ impl GraphAlgoAdapter for KShortestPathsAdapter {
         ]
     }
 
-    fn to_config(args: Vec<Value>) -> KShortestPathsConfig {
-        KShortestPathsConfig {
-            source: Vid::from(args[0].as_u64().unwrap_or(0)),
-            target: Vid::from(args[1].as_u64().unwrap_or(0)),
+    fn to_config(args: Vec<Value>) -> Result<KShortestPathsConfig> {
+        // `k` is type-validated by `ProcedureSignature::validate_args` to be
+        // a `ValueType::Int`, so `as_u64` is safe; we keep `unwrap_or(1)` as
+        // a defensive fallback for the documented default.
+        Ok(KShortestPathsConfig {
+            source: parse_vid_arg(&args[0], "startNode")?,
+            target: parse_vid_arg(&args[1], "endNode")?,
             k: args[2].as_u64().unwrap_or(1) as usize,
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -56,11 +57,12 @@ impl GraphAlgoAdapter for KShortestPathsAdapter {
             .collect())
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[3].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(3)
     }
 }
 

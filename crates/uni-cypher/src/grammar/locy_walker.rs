@@ -82,35 +82,27 @@ fn build_locy_statement_block(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>
         debug_assert_eq!(clause_pair.as_rule(), LocyRule::locy_clause);
         let inner = clause_pair.into_inner().next().unwrap();
 
+        // Statement-producing clauses common to both top-level blocks and
+        // ASSUME bodies are dispatched here; anything it does not recognize is
+        // returned for the block-specific handling below.
+        let Some(inner) =
+            dispatch_common_locy_clause(inner, &mut statements, &mut cypher_clause_texts)?
+        else {
+            continue;
+        };
+
         match inner.as_rule() {
-            LocyRule::rule_definition => {
-                // Flush accumulated Cypher clauses first
+            LocyRule::model_definition => {
                 flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::Rule(build_rule_definition(inner)?));
+                statements.push(LocyStatement::Model(build_model_definition(inner)?));
             }
-            LocyRule::goal_query => {
+            LocyRule::calibrate_command => {
                 flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::GoalQuery(build_goal_query(inner)?));
+                statements.push(LocyStatement::Calibrate(build_calibrate_command(inner)?));
             }
-            LocyRule::derive_command => {
+            LocyRule::validate_command => {
                 flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::DeriveCommand(build_derive_command(inner)?));
-            }
-            LocyRule::assume_block => {
-                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::AssumeBlock(build_assume_block(inner)?));
-            }
-            LocyRule::abduce_query => {
-                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::AbduceQuery(build_abduce_query(inner)?));
-            }
-            LocyRule::explain_rule_query => {
-                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                statements.push(LocyStatement::ExplainRule(build_explain_rule_query(inner)?));
-            }
-            LocyRule::clause => {
-                // Standard Cypher clause — accumulate its text
-                cypher_clause_texts.push(inner.as_str().to_string());
+                statements.push(LocyStatement::Validate(build_validate_command(inner)?));
             }
             other => {
                 return Err(ParseError::new(format!(
@@ -124,6 +116,55 @@ fn build_locy_statement_block(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>
     flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
 
     Ok(statements)
+}
+
+/// Dispatch a single `locy_clause` inner pair for the kinds shared by both
+/// [`build_locy_statement_block`] and [`build_assume_body`]: rule definitions,
+/// GOAL / DERIVE / ABDUCE / EXPLAIN queries, nested ASSUME blocks, and standard
+/// Cypher `clause` text accumulation.
+///
+/// Returns `Ok(None)` if the pair was handled, or `Ok(Some(inner))` if its rule
+/// is not one of the shared kinds — letting each caller apply its own routing to
+/// the remainder (the top-level block recognizes MODEL/CALIBRATE/VALIDATE and
+/// errors on anything else, while the ASSUME body treats the remainder as Cypher).
+fn dispatch_common_locy_clause<'a>(
+    inner: Pair<'a, LocyRule>,
+    statements: &mut Vec<LocyStatement>,
+    cypher_clause_texts: &mut Vec<String>,
+) -> Result<Option<Pair<'a, LocyRule>>, ParseError> {
+    match inner.as_rule() {
+        LocyRule::rule_definition => {
+            // Flush accumulated Cypher clauses first
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::Rule(build_rule_definition(inner)?));
+        }
+        LocyRule::goal_query => {
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::GoalQuery(build_goal_query(inner)?));
+        }
+        LocyRule::derive_command => {
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::DeriveCommand(build_derive_command(inner)?));
+        }
+        LocyRule::assume_block => {
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::AssumeBlock(build_assume_block(inner)?));
+        }
+        LocyRule::abduce_query => {
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::AbduceQuery(build_abduce_query(inner)?));
+        }
+        LocyRule::explain_rule_query => {
+            flush_cypher_clauses(cypher_clause_texts, statements)?;
+            statements.push(LocyStatement::ExplainRule(build_explain_rule_query(inner)?));
+        }
+        LocyRule::clause => {
+            // Standard Cypher clause — accumulate its text
+            cypher_clause_texts.push(inner.as_str().to_string());
+        }
+        _ => return Ok(Some(inner)),
+    }
+    Ok(None)
 }
 
 /// Flush accumulated Cypher clause texts into a single Cypher statement.
@@ -148,6 +189,20 @@ fn flush_cypher_clauses(
 // CYPHER RE-PARSE BRIDGE
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Re-parse a text span under `rule`, then build the first resulting pair with
+/// `build`. On a pest failure the error is wrapped as `Cypher{label} re-parse
+/// error: {e}` (with `label` carrying its own leading space, e.g. `" expression"`).
+fn reparse<T>(
+    text: &str,
+    rule: CypherRule,
+    label: &str,
+    build: fn(Pair<CypherRule>) -> Result<T, ParseError>,
+) -> Result<T, ParseError> {
+    let pairs = CypherParser::parse(rule, text)
+        .map_err(|e| ParseError::new(format!("Cypher{label} re-parse error: {e}")))?;
+    build(pairs.into_iter().next().unwrap())
+}
+
 /// Re-parse a text span as a complete Cypher query.
 fn reparse_as_cypher_query(text: &str) -> Result<ast::Query, ParseError> {
     let pairs = CypherParser::parse(CypherRule::query, text)
@@ -157,56 +212,59 @@ fn reparse_as_cypher_query(text: &str) -> Result<ast::Query, ParseError> {
 
 /// Re-parse a text span as a Cypher expression.
 fn reparse_as_cypher_expression(text: &str) -> Result<ast::Expr, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::expression, text)
-        .map_err(|e| ParseError::new(format!("Cypher expression re-parse error: {e}")))?;
-    walker::build_expression(pairs.into_iter().next().unwrap())
+    reparse(
+        text,
+        CypherRule::expression,
+        " expression",
+        walker::build_expression,
+    )
 }
 
 /// Re-parse a text span as a Cypher pattern.
 fn reparse_as_cypher_pattern(text: &str) -> Result<ast::Pattern, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::pattern, text)
-        .map_err(|e| ParseError::new(format!("Cypher pattern re-parse error: {e}")))?;
-    walker::build_pattern(pairs.into_iter().next().unwrap())
+    reparse(text, CypherRule::pattern, " pattern", walker::build_pattern)
 }
 
 /// Re-parse a text span as a Cypher clause.
 fn reparse_as_cypher_clause(text: &str) -> Result<ast::Clause, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::clause, text)
-        .map_err(|e| ParseError::new(format!("Cypher clause re-parse error: {e}")))?;
-    walker::build_clause(pairs.into_iter().next().unwrap())
+    reparse(text, CypherRule::clause, " clause", walker::build_clause)
 }
 
 /// Re-parse a text span as Cypher return_items.
 fn reparse_as_cypher_return_items(text: &str) -> Result<Vec<ast::ReturnItem>, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::return_items, text)
-        .map_err(|e| ParseError::new(format!("Cypher return_items re-parse error: {e}")))?;
-    walker::build_return_items(pairs.into_iter().next().unwrap())
+    reparse(
+        text,
+        CypherRule::return_items,
+        " return_items",
+        walker::build_return_items,
+    )
 }
 
 /// Re-parse a text span as Cypher sort_items.
 fn reparse_as_cypher_sort_items(text: &str) -> Result<Vec<ast::SortItem>, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::sort_items, text)
-        .map_err(|e| ParseError::new(format!("Cypher sort_items re-parse error: {e}")))?;
-    walker::build_sort_items(pairs.into_iter().next().unwrap())
+    reparse(
+        text,
+        CypherRule::sort_items,
+        " sort_items",
+        walker::build_sort_items,
+    )
 }
 
 /// Re-parse a text span as Cypher properties (map literal or parameter).
 fn reparse_as_cypher_properties(text: &str) -> Result<ast::Expr, ParseError> {
-    let pairs = CypherParser::parse(CypherRule::properties, text)
-        .map_err(|e| ParseError::new(format!("Cypher properties re-parse error: {e}")))?;
-    walker::build_properties(pairs.into_iter().next().unwrap())
+    reparse(
+        text,
+        CypherRule::properties,
+        " properties",
+        walker::build_properties,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn normalize_locy_identifier(s: &str) -> String {
-    s.strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .unwrap_or(s)
-        .to_string()
-}
+use walker::normalize_identifier as normalize_locy_identifier;
 
 fn build_qualified_name(pair: Pair<LocyRule>) -> Result<QualifiedName, ParseError> {
     let parts = pair
@@ -330,6 +388,321 @@ fn build_rule_definition(pair: Pair<LocyRule>) -> Result<RuleDefinition, ParseEr
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL DEFINITION (Phase B neural-predicate preview)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, ParseError> {
+    let mut annotations = ModelAnnotations::default();
+    let mut name = None;
+    let mut inputs: Vec<InputBinding> = Vec::new();
+    let mut features: Vec<ast::Expr> = Vec::new();
+    let mut path_context: Option<PathContextFeature> = None;
+    let mut output: Option<OutputBinding> = None;
+    let mut xervo_alias: Option<String> = None;
+    let mut embedder_alias: Option<String> = None;
+    let mut calibration: Option<CalibrationMethod> = None;
+    let mut version: Option<String> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::model_annotations => {
+                for ann in child.into_inner() {
+                    if ann.as_rule() == LocyRule::model_annotation {
+                        // The annotation is `@` followed by INDEPENDENT or
+                        // an identifier. We only act on `@independent` in
+                        // Slice 1+2; other annotations parse and are ignored.
+                        let raw = ann.as_str();
+                        if raw
+                            .trim_start_matches('@')
+                            .trim()
+                            .eq_ignore_ascii_case("independent")
+                        {
+                            annotations.independent = true;
+                        }
+                    }
+                }
+            }
+            LocyRule::rule_name => {
+                let qn_pair = child.into_inner().next().unwrap();
+                name = Some(build_qualified_name(qn_pair)?);
+            }
+            LocyRule::model_input_clause => {
+                inputs = build_model_input_clause(child)?;
+            }
+            LocyRule::model_features_clause => {
+                let (exprs, ctx) = build_model_features_clause(child)?;
+                features = exprs;
+                path_context = ctx;
+            }
+            LocyRule::model_output_clause => {
+                output = Some(build_model_output_clause(child)?);
+            }
+            LocyRule::model_using_clause => {
+                let (xa, ea) = build_model_using_clause(child)?;
+                xervo_alias = Some(xa);
+                embedder_alias = ea;
+            }
+            LocyRule::model_calibration_clause => {
+                calibration = Some(build_model_calibration_clause(child)?);
+            }
+            LocyRule::model_version_clause => {
+                version = Some(build_model_version_clause(child)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ModelDefinition {
+        name: name.ok_or_else(|| ParseError::new("CREATE MODEL missing name".to_string()))?,
+        inputs,
+        features,
+        path_context,
+        output: output
+            .ok_or_else(|| ParseError::new("CREATE MODEL missing OUTPUT clause".to_string()))?,
+        xervo_alias: xervo_alias.ok_or_else(|| {
+            ParseError::new("CREATE MODEL missing USING xervo(...) clause".to_string())
+        })?,
+        embedder_alias,
+        calibration,
+        version,
+        annotations,
+    })
+}
+
+fn build_model_input_clause(pair: Pair<LocyRule>) -> Result<Vec<InputBinding>, ParseError> {
+    let mut bindings = Vec::new();
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::model_input_binding {
+            let idents: Vec<String> = child
+                .into_inner()
+                .filter(|p| p.as_rule() == LocyRule::locy_identifier)
+                .map(|p| normalize_locy_identifier(p.as_str()))
+                .collect();
+            // Grammar: `( var (: label)? )` — first identifier is variable,
+            // second (if present) is label.
+            let (variable, label) = match idents.len() {
+                0 => return Err(ParseError::new("empty INPUT binding".to_string())),
+                1 => (idents[0].clone(), None),
+                _ => (idents[0].clone(), Some(idents[1].clone())),
+            };
+            bindings.push(InputBinding { variable, label });
+        }
+    }
+    Ok(bindings)
+}
+
+fn build_model_features_clause(
+    pair: Pair<LocyRule>,
+) -> Result<(Vec<ast::Expr>, Option<PathContextFeature>), ParseError> {
+    let mut features = Vec::new();
+    let mut path_context = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::expression => {
+                features.push(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::model_features_path_context => {
+                path_context = Some(build_model_features_path_context(child)?);
+            }
+            _ => {}
+        }
+    }
+    Ok((features, path_context))
+}
+
+fn build_model_features_path_context(
+    pair: Pair<LocyRule>,
+) -> Result<PathContextFeature, ParseError> {
+    let mut idents: Vec<String> = Vec::new();
+    let mut source_rule: Option<String> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::locy_identifier => {
+                idents.push(normalize_locy_identifier(child.as_str()));
+            }
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().ok_or_else(|| {
+                    ParseError::new("FEATURES FROM rule_name missing identifier".to_string())
+                })?;
+                source_rule = Some(build_qualified_name(qn)?.to_string());
+            }
+            _ => {}
+        }
+    }
+    if idents.len() != 2 {
+        return Err(ParseError::new(
+            "FEATURES (subject, column) FROM rule_name requires exactly 2 identifiers".to_string(),
+        ));
+    }
+    Ok(PathContextFeature {
+        subject_var: idents[0].clone(),
+        column: idents[1].clone(),
+        source_rule: source_rule.ok_or_else(|| {
+            ParseError::new("FEATURES (subject, column) FROM rule_name missing rule".to_string())
+        })?,
+    })
+}
+
+fn build_model_output_clause(pair: Pair<LocyRule>) -> Result<OutputBinding, ParseError> {
+    let mut output_type: Option<OutputType> = None;
+    let mut name: Option<String> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::model_output_type => {
+                output_type = Some(parse_output_type(child.as_str()));
+            }
+            LocyRule::locy_identifier => {
+                name = Some(normalize_locy_identifier(child.as_str()));
+            }
+            _ => {}
+        }
+    }
+    Ok(OutputBinding {
+        output_type: output_type
+            .ok_or_else(|| ParseError::new("OUTPUT missing type".to_string()))?,
+        name: name.ok_or_else(|| ParseError::new("OUTPUT missing name".to_string()))?,
+    })
+}
+
+fn parse_output_type(raw: &str) -> OutputType {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "prob" => OutputType::Prob,
+        "score" => OutputType::Score,
+        "label" => OutputType::Label,
+        "vector" => OutputType::Vector,
+        _ => OutputType::Prob, // grammar guarantees one of the four
+    }
+}
+
+/// Returns `(xervo_alias, embedder_alias_opt)`. The grammar accepts an
+/// optional `embedder='alias'` named argument; when present we lift it
+/// into the second tuple slot, otherwise `None` lets the runtime use
+/// its `"default"` fallback.
+fn build_model_using_clause(pair: Pair<LocyRule>) -> Result<(String, Option<String>), ParseError> {
+    let mut xervo_alias: Option<String> = None;
+    let mut embedder_alias: Option<String> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::string if xervo_alias.is_none() => {
+                xervo_alias = Some(unquote_string_literal(child.as_str()));
+            }
+            LocyRule::model_using_embedder => {
+                for inner in child.into_inner() {
+                    if inner.as_rule() == LocyRule::string {
+                        embedder_alias = Some(unquote_string_literal(inner.as_str()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let xervo_alias = xervo_alias
+        .ok_or_else(|| ParseError::new("USING xervo() missing alias literal".to_string()))?;
+    Ok((xervo_alias, embedder_alias))
+}
+
+fn build_model_calibration_clause(pair: Pair<LocyRule>) -> Result<CalibrationMethod, ParseError> {
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::model_calibration_method {
+            return parse_calibration_method(child);
+        }
+    }
+    Err(ParseError::new("CALIBRATION missing method".to_string()))
+}
+
+/// Phase C C1a: shared between CREATE MODEL's CALIBRATION clause
+/// and CALIBRATE's METHOD clause. Recognizes the `conformal(alpha)`
+/// shape (and bare `conformal` with default alpha = 0.1) in
+/// addition to the existing four methods + `none`.
+fn parse_calibration_method(pair: Pair<LocyRule>) -> Result<CalibrationMethod, ParseError> {
+    // Look for a `conformal_with_alpha` child first; if present, parse the
+    // alpha from its inner float.
+    for inner in pair.clone().into_inner() {
+        if inner.as_rule() == LocyRule::conformal_with_alpha {
+            let alpha_pair = inner
+                .into_inner()
+                .find(|p| p.as_rule() == LocyRule::float)
+                .ok_or_else(|| {
+                    ParseError::new("conformal calibration expects a float alpha".to_string())
+                })?;
+            let alpha: f64 = alpha_pair
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::new(format!("invalid conformal alpha: {e}")))?;
+            if !(0.0..1.0).contains(&alpha) {
+                return Err(ParseError::new(format!(
+                    "conformal alpha must be in (0, 1); got {alpha}"
+                )));
+            }
+            return Ok(CalibrationMethod::Conformal { alpha });
+        }
+    }
+    let raw = pair.as_str().trim().to_ascii_lowercase();
+    Ok(match raw.as_str() {
+        "platt_scaling" => CalibrationMethod::PlattScaling,
+        "isotonic_regression" => CalibrationMethod::IsotonicRegression,
+        "temperature_scaling" => CalibrationMethod::TemperatureScaling,
+        "beta_calibration" => CalibrationMethod::BetaCalibration,
+        "conformal" => CalibrationMethod::Conformal { alpha: 0.1 },
+        "dirichlet" => CalibrationMethod::Dirichlet,
+        "none" => CalibrationMethod::None,
+        other => {
+            return Err(ParseError::new(format!(
+                "Unknown calibration method '{other}'"
+            )));
+        }
+    })
+}
+
+fn build_model_version_clause(pair: Pair<LocyRule>) -> Result<String, ParseError> {
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::string {
+            return Ok(unquote_string_literal(child.as_str()));
+        }
+    }
+    Err(ParseError::new("VERSION missing literal".to_string()))
+}
+
+/// Strip the surrounding quotes from a `string` rule's match text.
+/// Cypher `string` matches `'...'` or `"..."`. Escape handling is the
+/// minimal interpretation needed for model aliases / version strings —
+/// the same `\'` / `\"` / `\\` set the Cypher walker uses.
+fn unquote_string_literal(raw: &str) -> String {
+    let s = raw.trim();
+    if s.len() < 2 {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[s.len() - 1];
+    if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        '\'' | '"' | '\\' => out.push(next),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        s.to_string()
+    }
+}
+
 fn build_priority_clause(pair: Pair<LocyRule>) -> Result<i64, ParseError> {
     let int_pair = pair
         .into_inner()
@@ -358,12 +731,12 @@ fn build_rule_where_clause(pair: Pair<LocyRule>) -> Result<Vec<RuleCondition>, P
 fn build_rule_condition(pair: Pair<LocyRule>) -> Result<RuleCondition, ParseError> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        LocyRule::is_rule_reference => {
-            Ok(RuleCondition::IsReference(build_is_rule_reference(inner)?))
+        LocyRule::is_rule_reference => Ok(RuleCondition::IsReference(build_is_reference(
+            inner, false,
+        )?)),
+        LocyRule::is_not_rule_reference => {
+            Ok(RuleCondition::IsReference(build_is_reference(inner, true)?))
         }
-        LocyRule::is_not_rule_reference => Ok(RuleCondition::IsReference(
-            build_is_not_rule_reference(inner)?,
-        )),
         LocyRule::expression => {
             let expr = reparse_as_cypher_expression(inner.as_str())?;
             Ok(RuleCondition::Expression(expr))
@@ -374,7 +747,11 @@ fn build_rule_condition(pair: Pair<LocyRule>) -> Result<RuleCondition, ParseErro
     }
 }
 
-fn build_is_rule_reference(pair: Pair<LocyRule>) -> Result<IsReference, ParseError> {
+/// Build an [`IsReference`] from an `is_rule_reference` (`negated = false`) or
+/// `is_not_rule_reference` (`negated = true`) pair. Both grammar rules share the
+/// same child layout; only the negation flag and the presence of a `NOT` token
+/// differ.
+fn build_is_reference(pair: Pair<LocyRule>, negated: bool) -> Result<IsReference, ParseError> {
     let children: Vec<_> = pair.into_inner().collect();
 
     // Identify which form we have by looking at the children
@@ -405,43 +782,6 @@ fn build_is_rule_reference(pair: Pair<LocyRule>) -> Result<IsReference, ParseErr
             LocyRule::TO => {
                 saw_to = true;
             }
-            LocyRule::IS => {}
-            _ => {}
-        }
-    }
-
-    Ok(IsReference {
-        subjects: identifiers,
-        rule_name: rule_name.unwrap(),
-        target,
-        negated: false,
-    })
-}
-
-fn build_is_not_rule_reference(pair: Pair<LocyRule>) -> Result<IsReference, ParseError> {
-    let children: Vec<_> = pair.into_inner().collect();
-
-    let mut identifiers = Vec::new();
-    let mut rule_name = None;
-    let mut target = None;
-    let mut saw_to = false;
-
-    for child in &children {
-        match child.as_rule() {
-            LocyRule::locy_identifier => {
-                if rule_name.is_some() && saw_to {
-                    target = Some(normalize_locy_identifier(child.as_str()));
-                } else if rule_name.is_none() {
-                    identifiers.push(normalize_locy_identifier(child.as_str()));
-                }
-            }
-            LocyRule::rule_name => {
-                let qn = child.clone().into_inner().next().unwrap();
-                rule_name = Some(build_qualified_name(qn)?);
-            }
-            LocyRule::TO => {
-                saw_to = true;
-            }
             LocyRule::IS | LocyRule::NOT => {}
             _ => {}
         }
@@ -451,7 +791,7 @@ fn build_is_not_rule_reference(pair: Pair<LocyRule>) -> Result<IsReference, Pars
         subjects: identifiers,
         rule_name: rule_name.unwrap(),
         target,
-        negated: true,
+        negated,
     })
 }
 
@@ -498,70 +838,59 @@ fn build_along_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> 
     build_locy_or_expression(inner)
 }
 
-fn build_locy_or_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
+/// Left-fold the `operand_rule` children of `pair` into a left-associative chain
+/// of `LocyExpr::BinaryOp { op, .. }` nodes, building each operand with `build_operand`.
+///
+/// A single operand is returned directly (no wrapping `BinaryOp`), matching the
+/// per-precedence-level grammar shape.
+fn fold_binary(
+    pair: Pair<LocyRule>,
+    operand_rule: LocyRule,
+    op: LocyBinaryOp,
+    build_operand: fn(Pair<LocyRule>) -> Result<LocyExpr, ParseError>,
+) -> Result<LocyExpr, ParseError> {
     let mut children: Vec<_> = pair
         .into_inner()
-        .filter(|p| p.as_rule() == LocyRule::locy_xor_expression)
+        .filter(|p| p.as_rule() == operand_rule)
         .collect();
 
-    if children.len() == 1 {
-        return build_locy_xor_expression(children.remove(0));
-    }
-
-    let mut result = build_locy_xor_expression(children.remove(0))?;
+    let mut result = build_operand(children.remove(0))?;
     for child in children {
-        let right = build_locy_xor_expression(child)?;
+        let right = build_operand(child)?;
         result = LocyExpr::BinaryOp {
             left: Box::new(result),
-            op: LocyBinaryOp::Or,
+            op,
             right: Box::new(right),
         };
     }
     Ok(result)
+}
+
+fn build_locy_or_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
+    fold_binary(
+        pair,
+        LocyRule::locy_xor_expression,
+        LocyBinaryOp::Or,
+        build_locy_xor_expression,
+    )
 }
 
 fn build_locy_xor_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
-    let mut children: Vec<_> = pair
-        .into_inner()
-        .filter(|p| p.as_rule() == LocyRule::locy_and_expression)
-        .collect();
-
-    if children.len() == 1 {
-        return build_locy_and_expression(children.remove(0));
-    }
-
-    let mut result = build_locy_and_expression(children.remove(0))?;
-    for child in children {
-        let right = build_locy_and_expression(child)?;
-        result = LocyExpr::BinaryOp {
-            left: Box::new(result),
-            op: LocyBinaryOp::Xor,
-            right: Box::new(right),
-        };
-    }
-    Ok(result)
+    fold_binary(
+        pair,
+        LocyRule::locy_and_expression,
+        LocyBinaryOp::Xor,
+        build_locy_and_expression,
+    )
 }
 
 fn build_locy_and_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
-    let mut children: Vec<_> = pair
-        .into_inner()
-        .filter(|p| p.as_rule() == LocyRule::locy_not_expression)
-        .collect();
-
-    if children.len() == 1 {
-        return build_locy_not_expression(children.remove(0));
-    }
-
-    let mut result = build_locy_not_expression(children.remove(0))?;
-    for child in children {
-        let right = build_locy_not_expression(child)?;
-        result = LocyExpr::BinaryOp {
-            left: Box::new(result),
-            op: LocyBinaryOp::And,
-            right: Box::new(right),
-        };
-    }
-    Ok(result)
+    fold_binary(
+        pair,
+        LocyRule::locy_not_expression,
+        LocyBinaryOp::And,
+        build_locy_not_expression,
+    )
 }
 
 fn build_locy_not_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
@@ -1077,13 +1406,39 @@ fn build_derive_edge_spec(pair: Pair<LocyRule>) -> Result<DeriveEdgeSpec, ParseE
 // GOAL QUERY
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn build_goal_query(pair: Pair<LocyRule>) -> Result<GoalQuery, ParseError> {
+/// Common header shared by GOAL/ABDUCE/EXPLAIN RULE queries: a rule name, an
+/// optional bare-`expression` WHERE, an optional return clause, and a negation
+/// flag (only ABDUCE's grammar produces a `NOT` token; the others always parse
+/// `negated = false`).
+struct RuleQueryHeader {
+    rule_name: QualifiedName,
+    negated: bool,
+    where_expr: Option<ast::Expr>,
+    return_clause: Option<ast::ReturnClause>,
+}
+
+/// Extract the [`RuleQueryHeader`] from a GOAL/ABDUCE/EXPLAIN query pair.
+/// `return_rule` selects the command-specific return-clause rule
+/// (`goal_return_clause`, `abduce_return_clause`, `explain_rule_return_clause`).
+fn build_rule_query_header(
+    pair: Pair<LocyRule>,
+    return_rule: LocyRule,
+) -> Result<RuleQueryHeader, ParseError> {
     let mut rule_name = None;
+    let mut negated = false;
     let mut where_expr = None;
     let mut return_clause = None;
 
     for child in pair.into_inner() {
-        match child.as_rule() {
+        let rule = child.as_rule();
+        if rule == return_rule {
+            return_clause = Some(build_locy_return_clause(child)?);
+            continue;
+        }
+        match rule {
+            LocyRule::NOT => {
+                negated = true;
+            }
             LocyRule::rule_name => {
                 let qn = child.into_inner().next().unwrap();
                 rule_name = Some(build_qualified_name(qn)?);
@@ -1091,24 +1446,168 @@ fn build_goal_query(pair: Pair<LocyRule>) -> Result<GoalQuery, ParseError> {
             LocyRule::expression => {
                 where_expr = Some(reparse_as_cypher_expression(child.as_str())?);
             }
-            LocyRule::goal_return_clause => {
-                return_clause = Some(build_locy_return_clause(child)?);
-            }
-            LocyRule::QUERY_KW | LocyRule::WHERE => {}
             _ => {}
         }
     }
 
-    Ok(GoalQuery {
+    Ok(RuleQueryHeader {
         rule_name: rule_name.unwrap(),
+        negated,
         where_expr,
         return_clause,
+    })
+}
+
+fn build_goal_query(pair: Pair<LocyRule>) -> Result<GoalQuery, ParseError> {
+    let header = build_rule_query_header(pair, LocyRule::goal_return_clause)?;
+    Ok(GoalQuery {
+        rule_name: header.rule_name,
+        where_expr: header.where_expr,
+        return_clause: header.return_clause,
     })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DERIVE COMMAND (top-level)
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALIBRATE COMMAND (Phase C C2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_calibrate_command(pair: Pair<LocyRule>) -> Result<CalibrateCommand, ParseError> {
+    let mut model_name = None;
+    let mut pattern: Option<ast::Pattern> = None;
+    let mut where_expr: Option<ast::Expr> = None;
+    let mut target_expr: Option<ast::Expr> = None;
+    let mut method: Option<CalibrationMethod> = None;
+    let mut holdout: Option<f64> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().unwrap();
+                model_name = Some(build_qualified_name(qn)?);
+            }
+            LocyRule::pattern => {
+                pattern = Some(reparse_as_cypher_pattern(child.as_str())?);
+            }
+            LocyRule::where_clause => {
+                let expr_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == LocyRule::expression)
+                    .unwrap();
+                where_expr = Some(reparse_as_cypher_expression(expr_pair.as_str())?);
+            }
+            LocyRule::TARGET => {}
+            LocyRule::expression => {
+                // The grammar puts `TARGET ~ expression` after the
+                // optional WHERE; by the time the standalone
+                // `expression` arrives here we've already consumed
+                // the where_clause's inner expression. So this is the
+                // TARGET expression.
+                target_expr = Some(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::model_calibration_method => {
+                method = Some(parse_calibration_method(child)?);
+            }
+            LocyRule::holdout_clause => {
+                for n in child.into_inner() {
+                    match n.as_rule() {
+                        LocyRule::float | LocyRule::integer => {
+                            let parsed: f64 = n.as_str().parse().map_err(|_| {
+                                ParseError::new(format!("Invalid HOLDOUT value: '{}'", n.as_str()))
+                            })?;
+                            holdout = Some(parsed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CalibrateCommand {
+        model_name: model_name
+            .ok_or_else(|| ParseError::new("CALIBRATE missing model name".to_string()))?,
+        pattern: pattern
+            .ok_or_else(|| ParseError::new("CALIBRATE missing MATCH pattern".to_string()))?,
+        where_expr,
+        target_expr: target_expr
+            .ok_or_else(|| ParseError::new("CALIBRATE missing TARGET expression".to_string()))?,
+        method: method.ok_or_else(|| ParseError::new("CALIBRATE missing METHOD".to_string()))?,
+        holdout,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALIDATE COMMAND (Phase C C3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_validate_command(pair: Pair<LocyRule>) -> Result<ValidateCommand, ParseError> {
+    let mut rule_name = None;
+    let mut pattern: Option<ast::Pattern> = None;
+    let mut where_expr: Option<ast::Expr> = None;
+    let mut target_expr: Option<ast::Expr> = None;
+    let mut metrics: Vec<ValidationMetric> = Vec::new();
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().unwrap();
+                rule_name = Some(build_qualified_name(qn)?);
+            }
+            LocyRule::pattern => {
+                pattern = Some(reparse_as_cypher_pattern(child.as_str())?);
+            }
+            LocyRule::where_clause => {
+                let expr_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == LocyRule::expression)
+                    .unwrap();
+                where_expr = Some(reparse_as_cypher_expression(expr_pair.as_str())?);
+            }
+            LocyRule::expression => {
+                target_expr = Some(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::validate_metric => {
+                let raw = child.as_str().trim().to_ascii_lowercase();
+                metrics.push(match raw.as_str() {
+                    "brier_score" => ValidationMetric::BrierScore,
+                    "log_loss" => ValidationMetric::LogLoss,
+                    "debiased_ece" => ValidationMetric::DebiasedEce,
+                    "ece" => ValidationMetric::Ece,
+                    "accuracy" => ValidationMetric::Accuracy,
+                    "auc" => ValidationMetric::Auc,
+                    other => {
+                        return Err(ParseError::new(format!(
+                            "Unknown VALIDATE metric '{other}'"
+                        )));
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if metrics.is_empty() {
+        return Err(ParseError::new(
+            "VALIDATE requires at least one metric".to_string(),
+        ));
+    }
+
+    Ok(ValidateCommand {
+        rule_name: rule_name
+            .ok_or_else(|| ParseError::new("VALIDATE missing rule name".to_string()))?,
+        pattern: pattern
+            .ok_or_else(|| ParseError::new("VALIDATE missing MATCH pattern".to_string()))?,
+        where_expr,
+        target_expr: target_expr
+            .ok_or_else(|| ParseError::new("VALIDATE missing TARGET expression".to_string()))?,
+        metrics,
+    })
+}
 
 fn build_derive_command(pair: Pair<LocyRule>) -> Result<DeriveCommand, ParseError> {
     let mut rule_name = None;
@@ -1167,45 +1666,22 @@ fn build_assume_block(pair: Pair<LocyRule>) -> Result<AssumeBlock, ParseError> {
 
 fn build_assume_body(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, ParseError> {
     // assume_body = { "{" ~ locy_clause+ ~ "}" | locy_clause }
-    // Handles all locy_clause variants, mirroring build_locy_statement_block.
+    // Shares the statement-producing dispatch with build_locy_statement_block.
+    // Unlike that block, any clause the shared dispatch does not recognize
+    // (including MODEL/CALIBRATE/VALIDATE) is treated as Cypher rather than
+    // routed to a dedicated statement — preserving the prior assume-body
+    // behavior.
     let mut statements = Vec::new();
     let mut cypher_clause_texts: Vec<String> = Vec::new();
 
     for child in pair.into_inner() {
         if child.as_rule() == LocyRule::locy_clause {
             let inner = child.into_inner().next().unwrap();
-            match inner.as_rule() {
-                LocyRule::clause => {
-                    cypher_clause_texts.push(inner.as_str().to_string());
-                }
-                LocyRule::rule_definition => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::Rule(build_rule_definition(inner)?));
-                }
-                LocyRule::goal_query => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::GoalQuery(build_goal_query(inner)?));
-                }
-                LocyRule::derive_command => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::DeriveCommand(build_derive_command(inner)?));
-                }
-                LocyRule::assume_block => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::AssumeBlock(build_assume_block(inner)?));
-                }
-                LocyRule::abduce_query => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::AbduceQuery(build_abduce_query(inner)?));
-                }
-                LocyRule::explain_rule_query => {
-                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
-                    statements.push(LocyStatement::ExplainRule(build_explain_rule_query(inner)?));
-                }
-                _ => {
-                    // Treat as Cypher
-                    cypher_clause_texts.push(inner.as_str().to_string());
-                }
+            if let Some(inner) =
+                dispatch_common_locy_clause(inner, &mut statements, &mut cypher_clause_texts)?
+            {
+                // Treat as Cypher
+                cypher_clause_texts.push(inner.as_str().to_string());
             }
         }
     }
@@ -1219,36 +1695,12 @@ fn build_assume_body(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, ParseEr
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_abduce_query(pair: Pair<LocyRule>) -> Result<AbduceQuery, ParseError> {
-    let mut negated = false;
-    let mut rule_name = None;
-    let mut where_expr = None;
-    let mut return_clause = None;
-
-    for child in pair.into_inner() {
-        match child.as_rule() {
-            LocyRule::NOT => {
-                negated = true;
-            }
-            LocyRule::rule_name => {
-                let qn = child.into_inner().next().unwrap();
-                rule_name = Some(build_qualified_name(qn)?);
-            }
-            LocyRule::expression => {
-                where_expr = Some(reparse_as_cypher_expression(child.as_str())?);
-            }
-            LocyRule::abduce_return_clause => {
-                return_clause = Some(build_locy_return_clause(child)?);
-            }
-            LocyRule::ABDUCE | LocyRule::WHERE => {}
-            _ => {}
-        }
-    }
-
+    let header = build_rule_query_header(pair, LocyRule::abduce_return_clause)?;
     Ok(AbduceQuery {
-        negated,
-        rule_name: rule_name.unwrap(),
-        where_expr,
-        return_clause,
+        negated: header.negated,
+        rule_name: header.rule_name,
+        where_expr: header.where_expr,
+        return_clause: header.return_clause,
     })
 }
 
@@ -1257,31 +1709,11 @@ fn build_abduce_query(pair: Pair<LocyRule>) -> Result<AbduceQuery, ParseError> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_explain_rule_query(pair: Pair<LocyRule>) -> Result<ExplainRule, ParseError> {
-    let mut rule_name = None;
-    let mut where_expr = None;
-    let mut return_clause = None;
-
-    for child in pair.into_inner() {
-        match child.as_rule() {
-            LocyRule::rule_name => {
-                let qn = child.into_inner().next().unwrap();
-                rule_name = Some(build_qualified_name(qn)?);
-            }
-            LocyRule::expression => {
-                where_expr = Some(reparse_as_cypher_expression(child.as_str())?);
-            }
-            LocyRule::explain_rule_return_clause => {
-                return_clause = Some(build_locy_return_clause(child)?);
-            }
-            LocyRule::EXPLAIN | LocyRule::RULE | LocyRule::WHERE => {}
-            _ => {}
-        }
-    }
-
+    let header = build_rule_query_header(pair, LocyRule::explain_rule_return_clause)?;
     Ok(ExplainRule {
-        rule_name: rule_name.unwrap(),
-        where_expr,
-        return_clause,
+        rule_name: header.rule_name,
+        where_expr: header.where_expr,
+        return_clause: header.return_clause,
     })
 }
 

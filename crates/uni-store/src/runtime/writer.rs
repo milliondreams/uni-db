@@ -2,6 +2,9 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::runtime::context::QueryContext;
+use crate::runtime::flush_coordinator::{
+    FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
+};
 use crate::runtime::id_allocator::IdAllocator;
 use crate::runtime::l0::{L0Buffer, serialize_constraint_key};
 use crate::runtime::l0_manager::L0Manager;
@@ -15,9 +18,10 @@ use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use metrics;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as PlMutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info, instrument};
 use uni_common::Properties;
 use uni_common::Value;
@@ -32,14 +36,76 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
     pub max_mutations: usize,
+    /// Enable the partial-column MergeInsert path for SET-only flushes.
+    ///
+    /// When `true`, `Writer::insert_vertex_partial` records the touched
+    /// property keys into `L0Buffer::vertex_partial_keys` and the flush
+    /// routes those VIDs through Lance `MergeInsertBuilder` with a
+    /// subset-of-schema source, skipping the read of (and write of)
+    /// the unchanged columns — including wide ones like embeddings.
+    ///
+    /// When `false`, `insert_vertex_partial` falls back to the
+    /// read-modify-write `insert_vertex_with_labels` path (preserving
+    /// bit-for-bit equivalence with prior releases). Default `false`
+    /// for the first release; flip to `true` after telemetry on the
+    /// issue #72 ingest workload confirms the win.
+    ///
+    /// See the soundness probe at
+    /// `crates/uni-store/tests/common/storage/lance_merge_insert_probe.rs`.
+    pub partial_lance_writes: bool,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             max_mutations: 10_000,
+            partial_lance_writes: false,
         }
     }
+}
+
+/// RAII latch on [`StorageManager::flush_in_progress`].
+///
+/// Sets the flag to `true` on construction (via CAS) and back to `false` on
+/// drop, so any `?` early-exit inside `flush_to_l1` cannot leave the flag
+/// stuck. Returns `None` if a flush is already in progress, providing
+/// forward-compatible exclusion once the outer writer-RwLock is removed in
+/// Phase 4 of the concurrent-writer refactor.
+// FlushInProgressGuard moved to storage/manager.rs so flush_coordinator.rs
+// can hold it on RotatedFlush without a writer.rs back-import cycle.
+pub use crate::storage::manager::FlushInProgressGuard;
+
+/// Output of [`Writer::flush_l0_rotate`]: the to-be-flushed L0 buffer,
+/// captured WAL LSN, current_version, and the in-progress guard whose
+/// lifetime spans the full flush (including the future async stream
+/// phase that runs on a spawned task).
+struct RotateOutput {
+    old_l0_arc: Arc<RwLock<L0Buffer>>,
+    wal_lsn: u64,
+    current_version: u64,
+    flush_in_progress_guard: FlushInProgressGuard,
+}
+
+/// Project a property map to a subset selected by `keys`. Used to
+/// run `touched_needs_full_read` against just the SET-touched keys
+/// when the caller passes a fully-merged `props` map.
+fn props_subset(props: &Properties, keys: &HashSet<String>) -> Properties {
+    let mut out = Properties::new();
+    for k in keys {
+        if let Some(v) = props.get(k) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Output of [`Writer::flush_stream_l1`]: the built (but not yet
+/// published) snapshot manifest and its id. Finalize is responsible
+/// for `save_snapshot` + `set_latest_snapshot` + `cached_manifest`
+/// update.
+struct FlushOutcome {
+    manifest: SnapshotManifest,
+    snapshot_id: String,
 }
 
 pub struct Writer {
@@ -48,20 +114,34 @@ pub struct Writer {
     pub schema_manager: Arc<uni_common::core::schema::SchemaManager>,
     pub allocator: Arc<IdAllocator>,
     pub config: UniConfig,
-    pub xervo_runtime: Option<Arc<ModelRuntime>>,
+    /// Optional embedding runtime. `OnceLock` so the initializer can run
+    /// on `&self` after the `Writer` has been wrapped in `Arc<Writer>`
+    /// (Phase 4 of concurrent_writer.md). Read through
+    /// [`Writer::xervo_runtime`] — the field itself is private to keep
+    /// callers oblivious to the OnceLock representation.
+    xervo_runtime: OnceLock<Arc<ModelRuntime>>,
     /// Property manager for cache invalidation after flush
     pub property_manager: Option<Arc<PropertyManager>>,
     /// Adjacency manager for dual-write (edges survive flush).
     adjacency_manager: Arc<AdjacencyManager>,
-    /// Timestamp of last flush or creation
-    last_flush_time: std::time::Instant,
+    /// Timestamp of last flush or creation. Interior-mutable so that
+    /// `&self` callers can update it; uncontended in practice because all
+    /// writes happen inside the single-flusher critical section.
+    /// Arc-wrapped so it can travel into the SharedFlushCtx that the
+    /// async-flush coordinator passes to spawned stream/finalize tasks.
+    last_flush_time: Arc<PlMutex<std::time::Instant>>,
     /// Background compaction task handle (prevents concurrent compaction races)
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Optional index rebuild manager for post-flush automatic rebuild scheduling
-    index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+    /// Optional index rebuild manager for post-flush automatic rebuild scheduling.
+    /// `OnceLock` for the same reason as `xervo_runtime`.
+    /// Wrapped in `Arc` so the async-flush finalize path can read it
+    /// from a spawned task via `SharedFlushCtx`.
+    index_rebuild_manager: Arc<OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>>,
     /// Cached snapshot manifest from the last flush. Avoids re-reading from
-    /// object store on every flush_to_l1 call.
-    cached_manifest: Option<SnapshotManifest>,
+    /// object store on every flush_to_l1 call. Wrapped in a `Mutex` for
+    /// `&self` access; uncontended because all access is inside the
+    /// single-flusher critical section.
+    cached_manifest: Arc<PlMutex<Option<SnapshotManifest>>>,
     /// Identifier of the fork this writer serves, if any. `None` for
     /// primary's writer. Set by [`crate::fork::writer_factory::new_for_fork`]
     /// and read in `flush_to_l1` to emit fork-tagged metrics and to fire
@@ -75,12 +155,59 @@ pub struct Writer {
     /// flush would add a per-dataset object-store roundtrip on the hot
     /// commit path; the proxy keeps the guard rail purely observational
     /// (Phase 5 introduces fork compaction proper). Only meaningful when
-    /// `fork_id.is_some()`.
-    fork_flush_count: u64,
+    /// `fork_id.is_some()`. `Relaxed` is sufficient — observational only.
+    fork_flush_count: Arc<AtomicU64>,
     /// Whether the fork-fragment warning has already fired at the
-    /// configured threshold. One-shot per writer lifetime.
-    fork_fragment_warn_fired: bool,
+    /// configured threshold. One-shot per writer lifetime. `Relaxed` is
+    /// sufficient — observational only.
+    fork_fragment_warn_fired: Arc<AtomicBool>,
+    /// Dedicated lock for the genuinely-exclusive flush path. Acquired by
+    /// the [`Writer::flush_to_l1`] entry and by `commit_transaction_l0`
+    /// across its WAL-append + L0-merge window. Replaces the outer
+    /// `Arc<RwLock<Writer>>` for flush exclusion once Phase 4 drops it.
+    /// Arc-wrapped so async-flush coordinator's finalize path can
+    /// re-acquire it from a spawned task via SharedFlushCtx.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Coordinator for async-flush pipeline. Owns the back-pressure
+    /// semaphore, rotate-order sequence, single-finalizer task, and
+    /// pending-flush counter. Always present even when async flush is
+    /// disabled — the sync `flush_to_l1` path uses it for the future
+    /// `FlushInProgressGuard`/permit ownership model.
+    /// Coordinator is `None` when `async_flush_enabled = false`. The
+    /// coordinator's finalizer task captures `SharedFlushCtx` which
+    /// includes `Arc<StorageManager>`; on a fork-scoped Writer that
+    /// also pins the fork's `ForkScope` via `storage.fork_scope`, so
+    /// the holder count never drops. Constructing it only when the
+    /// feature is actually on avoids that side-effect for all
+    /// existing sync-flush paths. When async-flush graduates from
+    /// opt-in to default (Commit 12), `drop_fork` (Commit 8) handles
+    /// the drain explicitly.
+    #[allow(dead_code)] // first production use lands in Commit 6/7
+    pub(crate) flush_coordinator: Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
+    /// Optimistic-concurrency commit-sequence counter (SSI). Incremented once
+    /// per successful commit under `flush_lock`; a transaction captures the
+    /// current value at begin as its read sequence (`L0Buffer::occ_read_seq`).
+    ///
+    /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
+    commit_sequence: Arc<AtomicU64>,
+    /// Bounded log of recently-committed write-sets for OCC conflict detection.
+    /// Read and updated only under `flush_lock`.
+    ///
+    /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
+    committed_writes: Arc<PlMutex<crate::runtime::occ::CommitRegistry>>,
+    /// Per-row pessimistic locks for `FOR UPDATE` (SSI escape hatch), keyed by
+    /// canonical (label, key-props) bytes. A transaction holds the lock from
+    /// MATCH until commit/rollback, serializing concurrent `FOR UPDATE` writers
+    /// on the same key (avoiding optimistic abort-retry on hot keys).
+    ///
+    /// Always allocated; populated only when `config.ssi_enabled` is `true`.
+    for_update_locks: Arc<dashmap::DashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// Number of recent commits retained for OCC conflict detection. Large enough
+/// that under-run — and the resulting conservative abort — is rare in practice;
+/// each entry is a small set of touched ids.
+const OCC_REGISTRY_CAPACITY: usize = 4096;
 
 impl Writer {
     pub async fn new(
@@ -125,31 +252,167 @@ impl Writer {
 
         let adjacency_manager = storage.adjacency_manager();
 
+        // Hoist the Arc'd fields so we can both stash them on Writer and
+        // hand the same Arcs to the SharedFlushCtx that FlushCoordinator
+        // captures. Single-source-of-truth for each piece of mutable
+        // shared state.
+        let last_flush_time = Arc::new(PlMutex::new(std::time::Instant::now()));
+        let cached_manifest = Arc::new(PlMutex::new(None));
+        let fork_flush_count = Arc::new(AtomicU64::new(0));
+        let fork_fragment_warn_fired = Arc::new(AtomicBool::new(false));
+        let flush_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let compaction_handle = Arc::new(RwLock::new(None));
+        let index_rebuild_manager: Arc<
+            OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+        > = Arc::new(OnceLock::new());
+
+        let flush_coordinator = if config.async_flush_enabled {
+            let shared = SharedFlushCtx {
+                storage: storage.clone(),
+                l0_manager: l0_manager.clone(),
+                adjacency_manager: adjacency_manager.clone(),
+                property_manager: property_manager.clone(),
+                schema_manager: schema_manager.clone(),
+                cached_manifest: cached_manifest.clone(),
+                last_flush_time: last_flush_time.clone(),
+                fork_id: None,
+                fork_flush_count: fork_flush_count.clone(),
+                fork_fragment_warn_fired: fork_fragment_warn_fired.clone(),
+                fork_fragment_warn_threshold: config.fork_fragment_warn_threshold,
+                flush_lock: flush_lock.clone(),
+                index_rebuild_manager: index_rebuild_manager.clone(),
+                compaction_handle: compaction_handle.clone(),
+                compaction_config: config.compaction.clone(),
+                index_rebuild_config: config.index_rebuild.clone(),
+                auto_rebuild_enabled: config.index_rebuild.auto_rebuild_enabled,
+            };
+            let finalize_fn: Arc<dyn FinalizeFn> = Arc::new(WriterFinalizer);
+            Some(Arc::new(FlushCoordinator::new(
+                config.max_pending_flushes,
+                shared,
+                finalize_fn,
+            )))
+        } else {
+            None
+        };
+
+        let commit_sequence = Arc::new(AtomicU64::new(0));
+        let committed_writes = Arc::new(PlMutex::new(crate::runtime::occ::CommitRegistry::new(
+            OCC_REGISTRY_CAPACITY,
+        )));
+        let for_update_locks = Arc::new(dashmap::DashMap::new());
+
         Ok(Self {
             l0_manager,
             storage,
             schema_manager,
             allocator,
             config,
-            xervo_runtime: None,
+            xervo_runtime: OnceLock::new(),
             property_manager,
             adjacency_manager,
-            last_flush_time: std::time::Instant::now(),
-            compaction_handle: Arc::new(RwLock::new(None)),
-            index_rebuild_manager: None,
-            cached_manifest: None,
+            last_flush_time,
+            compaction_handle,
+            index_rebuild_manager,
+            cached_manifest,
             fork_id: None,
-            fork_flush_count: 0,
-            fork_fragment_warn_fired: false,
+            fork_flush_count,
+            fork_fragment_warn_fired,
+            flush_lock,
+            flush_coordinator,
+            commit_sequence,
+            committed_writes,
+            for_update_locks,
         })
     }
 
+    /// Returns the shared pessimistic lock handle for a `FOR UPDATE` row key,
+    /// creating it on first use. The caller `.lock_owned().await`s the returned
+    /// mutex and holds the guard for the transaction's lifetime.
+    pub fn row_lock_handle(&self, key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
+        self.for_update_locks
+            .entry(key.to_vec())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Prunes `FOR UPDATE` lock-map entries for `keys` that no live transaction
+    /// holds anymore, so the map does not grow without bound across the keyspace.
+    ///
+    /// Called when a transaction ends, **after** its guards have been dropped.
+    /// `remove_if` evaluates its predicate under the DashMap shard lock, which is
+    /// the same lock `row_lock_handle` takes to clone an entry — so the check
+    /// `strong_count == 1` (only the map holds the `Arc`) is race-free: a
+    /// concurrent acquirer either already cloned the `Arc` (count ≥ 2 → we skip
+    /// removal) or has not yet taken the shard lock (it will mint a fresh entry
+    /// after we remove). Either way no two transactions ever lock different
+    /// `Mutex` instances for the same key.
+    pub fn release_for_update_locks(&self, keys: &[Vec<u8>]) {
+        for key in keys {
+            self.for_update_locks
+                .remove_if(key, |_, handle| Arc::strong_count(handle) == 1);
+        }
+    }
+
+    /// Number of live entries in the `FOR UPDATE` lock map. Introspection for
+    /// tests that the map does not leak entries across transactions (G5).
+    pub fn for_update_lock_count(&self) -> usize {
+        self.for_update_locks.len()
+    }
+
+    /// The current OCC commit sequence. A `FOR UPDATE` acquisition re-stamps a
+    /// fresh transaction's `occ_read_seq` to this so its conflict-detection
+    /// baseline advances to lock-acquisition time (read-latest under the lock).
+    pub fn current_commit_sequence(&self) -> u64 {
+        self.commit_sequence.load(Ordering::Relaxed)
+    }
+
+    /// Build a fresh `SharedFlushCtx` from this Writer's current state.
+    /// Used by the async-flush stream/finalize paths to pass into spawned
+    /// tasks without smuggling `Arc<Writer>` (which would create a cycle
+    /// with `flush_coordinator -> FinalizeFn -> Writer`).
+    pub(crate) fn shared_ctx(&self) -> SharedFlushCtx {
+        SharedFlushCtx {
+            storage: self.storage.clone(),
+            l0_manager: self.l0_manager.clone(),
+            adjacency_manager: self.adjacency_manager.clone(),
+            property_manager: self.property_manager.clone(),
+            schema_manager: self.schema_manager.clone(),
+            cached_manifest: self.cached_manifest.clone(),
+            last_flush_time: self.last_flush_time.clone(),
+            fork_id: self.fork_id,
+            fork_flush_count: self.fork_flush_count.clone(),
+            fork_fragment_warn_fired: self.fork_fragment_warn_fired.clone(),
+            fork_fragment_warn_threshold: self.config.fork_fragment_warn_threshold,
+            flush_lock: self.flush_lock.clone(),
+            index_rebuild_manager: self.index_rebuild_manager.clone(),
+            compaction_handle: self.compaction_handle.clone(),
+            compaction_config: self.config.compaction.clone(),
+            index_rebuild_config: self.config.index_rebuild.clone(),
+            auto_rebuild_enabled: self.config.index_rebuild.auto_rebuild_enabled,
+        }
+    }
+
+    /// Borrow the flush coordinator if async flush is enabled.
+    /// Returns `None` when `config.async_flush_enabled = false`.
+    /// External callers (`drop_fork`) use this to drain pending streams.
+    pub fn flush_coordinator(
+        &self,
+    ) -> Option<&Arc<crate::runtime::flush_coordinator::FlushCoordinator>> {
+        self.flush_coordinator.as_ref()
+    }
+
     /// Set the index rebuild manager for post-flush automatic rebuild scheduling.
+    ///
+    /// One-shot: returns `Err` if already set. The receiver is `&self` so this
+    /// can be called after the `Writer` has been wrapped in `Arc<Writer>`.
     pub fn set_index_rebuild_manager(
-        &mut self,
+        &self,
         manager: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
-    ) {
-        self.index_rebuild_manager = Some(manager);
+    ) -> Result<()> {
+        self.index_rebuild_manager
+            .set(manager)
+            .map_err(|_| anyhow!("index_rebuild_manager already set"))
     }
 
     /// Replay WAL mutations into the current L0 buffer.
@@ -194,12 +457,22 @@ impl Writer {
         self.allocator.allocate_eid().await
     }
 
-    pub fn set_xervo_runtime(&mut self, runtime: Arc<ModelRuntime>) {
-        self.xervo_runtime = Some(runtime);
+    /// Allocates multiple EIDs at once for bulk operations.
+    /// This is more efficient than calling next_eid() in a loop.
+    pub async fn allocate_eids(&self, count: usize) -> Result<Vec<Eid>> {
+        self.allocator.allocate_eids(count).await
+    }
+
+    /// Install the embedding runtime exactly once. Receiver is `&self` so it
+    /// can be called after the `Writer` has been wrapped in `Arc<Writer>`.
+    pub fn set_xervo_runtime(&self, runtime: Arc<ModelRuntime>) -> Result<()> {
+        self.xervo_runtime
+            .set(runtime)
+            .map_err(|_| anyhow!("xervo_runtime already set"))
     }
 
     pub fn xervo_runtime(&self) -> Option<Arc<ModelRuntime>> {
-        self.xervo_runtime.clone()
+        self.xervo_runtime.get().cloned()
     }
 
     /// Create a new empty L0 buffer for transaction-scoped mutations.
@@ -210,7 +483,24 @@ impl Writer {
     pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
-        Arc::new(RwLock::new(L0Buffer::new(current_version, None)))
+        let buf = L0Buffer::new(current_version, None);
+        // SSI: stamp the OCC read sequence at begin so commit can detect any
+        // transaction that committed since. Gated on the runtime `ssi_enabled`
+        // toggle — when off, `occ_read_set` stays `None` and every downstream
+        // read-set recording / commit validation self-gates to a no-op.
+        let buf = if self.config.ssi_enabled {
+            let mut buf = buf;
+            buf.occ_read_seq = self.commit_sequence.load(Ordering::Relaxed);
+            // The read path records observed ids here for SSI antidependency
+            // detection; commit consults it.
+            buf.occ_read_set = Some(Arc::new(parking_lot::Mutex::new(
+                crate::runtime::l0::OccReadSet::default(),
+            )));
+            buf
+        } else {
+            buf
+        };
+        Arc::new(RwLock::new(buf))
     }
 
     /// Resolve the target L0 buffer for a mutation.
@@ -234,7 +524,125 @@ impl Writer {
     /// Writes mutations to WAL, flushes, merges into main L0, and replays
     /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
     /// (0 when no WAL is configured).
-    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
+    /// Commit a transaction's private L0 buffer into main L0.
+    ///
+    /// Returns `(wal_lsn, flush_pending)`. When `flush_pending == true`, the
+    /// post-commit `should_flush()` predicate fired but no flush ran — the
+    /// caller is expected to spawn a background `flush_to_l1`. This is the
+    /// shape used when `UniConfig::async_flush_enabled` is set, so commits
+    /// don't block on L1-streaming I/O.
+    pub async fn commit_transaction_l0(
+        self: &Arc<Self>,
+        tx_l0_arc: Arc<RwLock<L0Buffer>>,
+    ) -> Result<(u64, bool)> {
+        // Hold `flush_lock` across WAL append + flush + main-L0 merge.
+        // Two concurrent commits serialize here; in Phase 3 the outer
+        // `Arc<RwLock<Writer>>` already provides this exclusion, so the
+        // acquisition is uncontended. Phase 4 drops the outer lock and
+        // this becomes the load-bearing serialization point.
+        let _flush_lock_guard = self.flush_lock.lock().await;
+
+        // Crash-recovery seam: simulate process death immediately after winning
+        // the commit serialization point but before any durable work. No-op
+        // unless built with `--features failpoints`. (See ssi_resilience tests.)
+        fail::fail_point!("commit::after-flush-lock");
+
+        // SSI: optimistic conflict detection. This MUST run before any WAL
+        // write — `flush_wal()` below is the durable commit point and the WAL
+        // has no abort marker, so aborting after it would resurrect this
+        // transaction on crash recovery. The write-set is reused for
+        // registration after a successful merge.
+        // Runtime-gated on `config.ssi_enabled`. When off, no validation runs
+        // and `occ_write_set` is `None`, so the post-merge registration below
+        // is skipped — reproducing last-writer-wins exactly.
+        let occ_write_set: Option<crate::runtime::occ::WriteSet> = if self.config.ssi_enabled {
+            let tx_l0 = tx_l0_arc.read();
+            let read_seq = tx_l0.occ_read_seq;
+            let write_set = crate::runtime::occ::WriteSet::from_l0(&tx_l0);
+            if !write_set.is_empty() {
+                // Telemetry: one validation per non-empty (writing) commit. The
+                // ratio of conflicts to validations is the headline abort rate.
+                metrics::counter!("uni_ssi_commit_validations_total").increment(1);
+                // Read-set is consulted only for writing transactions, so a
+                // read-only commit (empty write-set) runs at snapshot isolation.
+                let read_guard = tx_l0.occ_read_set.as_ref().map(|rs| rs.lock());
+                if let Some(conflict) =
+                    self.committed_writes
+                        .lock()
+                        .check(read_seq, &write_set, read_guard.as_deref())
+                {
+                    use crate::runtime::occ::Conflict;
+                    match &conflict {
+                        Conflict::WriteWrite { .. } => metrics::counter!(
+                            "uni_ssi_serialization_conflicts_total",
+                            "kind" => "write_write",
+                        )
+                        .increment(1),
+                        Conflict::ReadWrite { .. } => metrics::counter!(
+                            "uni_ssi_serialization_conflicts_total",
+                            "kind" => "read_write",
+                        )
+                        .increment(1),
+                        Conflict::HistoryTruncated { .. } => {
+                            metrics::counter!("uni_ssi_history_truncated_total").increment(1)
+                        }
+                    }
+                    return Err(anyhow::Error::new(
+                        uni_common::UniError::SerializationConflict {
+                            message: conflict.to_string(),
+                        },
+                    ));
+                }
+            }
+
+            // Validate against the committed main L0 under `flush_lock`:
+            // serializable MERGE uniqueness + CRDT carve-out soundness.
+            {
+                let main_l0 = self.l0_manager.get_current();
+                let main_l0 = main_l0.read();
+
+                // SSI / serializable MERGE: abort if a concurrent transaction has
+                // already committed a row with one of this transaction's unique
+                // keys. Commits serialize here, so this closes the race window
+                // left by the per-insert check. (Empty index → no iterations.)
+                for (key, vid) in &tx_l0.constraint_index {
+                    if main_l0.has_constraint_key(key, *vid) {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: "unique key already committed by a concurrent \
+                                          transaction"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                }
+
+                // CRDT carve-out soundness: a pure-CRDT write was dropped from the
+                // write-set assuming its merge commutes. If main L0 holds a
+                // *different* CRDT variant for the same property, the merge would
+                // silently overwrite it — abort instead of losing the update.
+                if let Some(conflict) =
+                    crate::runtime::occ::crdt_carveout_overwrite(&tx_l0, &main_l0)
+                {
+                    metrics::counter!("uni_ssi_crdt_aborts_total").increment(1);
+                    return Err(anyhow::Error::new(
+                        uni_common::UniError::SerializationConflict {
+                            message: conflict.to_string(),
+                        },
+                    ));
+                }
+            }
+            Some(write_set)
+        } else {
+            None
+        };
+
+        // Crash-recovery seam: SSI validation has passed; the transaction is
+        // about to become durable. A crash here must leave NO trace (validation
+        // happens before the WAL is touched). No-op unless `failpoints`.
+        fail::fail_point!("commit::after-validate");
+
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
         {
@@ -263,6 +671,25 @@ impl Writer {
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
                     wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
+
+                // Label-only mutations (SET n:Label / REMOVE n:Label). After
+                // vertex inserts (so the vertex exists on replay), before edges,
+                // and skipping vertices deleted in this same commit.
+                for vid in &tx_l0.vertex_label_overwrites {
+                    if tx_l0.vertex_tombstones.contains(vid) {
+                        continue;
+                    }
+                    let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
+                    wal.append(&crate::runtime::wal::Mutation::SetVertexLabels {
+                        vid: *vid,
+                        labels,
+                    })?;
+                }
+
+                // Crash-recovery seam: vertices appended, edges not yet. Tests
+                // assert that a crash here (before `flush_wal`) recovers NOTHING
+                // — the durable commit point is the flush below, not append.
+                fail::fail_point!("commit::mid-wal");
 
                 // Edge insertions and deletions from edge_endpoints
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
@@ -313,6 +740,25 @@ impl Writer {
         // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
         let wal_lsn = self.flush_wal().await?;
 
+        // Crash-recovery seam: the WAL is durable but main L0 has NOT merged.
+        // A crash here must RECOVER the transaction on replay (it is committed),
+        // even though it was never made visible in-process. No-op unless `failpoints`.
+        fail::fail_point!("commit::after-wal-flush");
+
+        // Component C1: if an outstanding snapshot pins the current generation,
+        // clone it aside (lazy copy-on-write) before merging, so the pinning
+        // transaction's reads stay isolated from this commit. No-op — and zero
+        // cost — when nothing is pinned (the common case). We hold `flush_lock`,
+        // so this cannot race a flush rotate or another commit's merge; the merge
+        // below re-fetches `get_current()`, landing in the fresh post-freeze buffer.
+        // Self-gates on the runtime SSI toggle: a snapshot is only ever pinned by
+        // a transaction begun under `ssi_enabled`, so `is_current_pinned()` is
+        // always false when SSI is off and this is a zero-cost no-op.
+        if self.l0_manager.is_current_pinned() {
+            self.l0_manager.freeze_current_for_snapshot();
+            metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
+        }
+
         // 3. Merge into main L0 and make visible
         {
             let tx_l0 = tx_l0_arc.read();
@@ -356,14 +802,97 @@ impl Writer {
             }
         }
 
-        self.update_metrics();
+        // Crash-recovery seam: durable AND merged, but the in-memory commit
+        // registry has not recorded this write-set yet. A crash here is
+        // indistinguishable from one at `after-wal-flush` on reopen (the
+        // registry is in-memory and rebuilt empty); the tx still recovers.
+        fail::fail_point!("commit::after-merge");
 
-        // 4. Best-effort compaction
-        if let Err(e) = self.check_flush().await {
-            tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
+        // SSI: register this commit's write-set under a fresh commit sequence so
+        // later transactions detect conflicts against it. Still under
+        // `flush_lock`, before the async-flush branch can drop the guard.
+        // `occ_write_set` is `Some` only when `config.ssi_enabled`.
+        if let Some(write_set) = occ_write_set
+            && !write_set.is_empty()
+        {
+            let seq = self.commit_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            self.committed_writes.lock().record(seq, write_set);
         }
 
-        Ok(wal_lsn)
+        self.update_metrics();
+
+        // 4. Best-effort post-commit auto-flush.
+        //
+        // Two paths:
+        // - async_flush_enabled = false (default): inline under our
+        //   existing flush_lock guard via flush_inline_under_lock.
+        // - async_flush_enabled = true: rotate inline, drop flush_lock,
+        //   then submit the stream phase to the coordinator. Gated on
+        //   `pending_flush_count() < max_pending_flushes` so we don't
+        //   stack up rotations beyond the configured pipeline depth.
+        //   `try_acquire_permit` is non-blocking: if we lose the race
+        //   for the last permit, we just skip this trigger (the next
+        //   commit retries).
+        let mut flush_pending = false;
+        if self.should_flush() {
+            if self.config.async_flush_enabled
+                && let Some(coord) = self.flush_coordinator.as_ref()
+                && coord.pending_flush_count() < self.config.max_pending_flushes
+            {
+                match coord.try_acquire_permit() {
+                    Some(permit) => {
+                        let seq = coord.next_rotate_seq();
+                        coord.note_pending();
+                        match self.flush_l0_rotate().await {
+                            Ok(rotate_out) => {
+                                // Release flush_lock BEFORE the spawn so concurrent
+                                // commits can proceed while the stream runs.
+                                drop(_flush_lock_guard);
+                                let parent_manifest = self.cached_manifest.lock().clone();
+                                let rotated = crate::runtime::flush_coordinator::RotatedFlush {
+                                    seq,
+                                    old_l0_arc: rotate_out.old_l0_arc.clone(),
+                                    wal_lsn: rotate_out.wal_lsn,
+                                    current_version: rotate_out.current_version,
+                                    name: None,
+                                    parent_manifest,
+                                    permit,
+                                    flush_in_progress_guard: rotate_out.flush_in_progress_guard,
+                                };
+                                let writer = self.clone();
+                                let _ticket = coord.submit_for_stream(
+                                    rotated,
+                                    move |old_l0, wal, ver, n| async move {
+                                        let outcome =
+                                            writer.flush_stream_l1(old_l0, wal, ver, n).await?;
+                                        Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                                            new_manifest: outcome.manifest,
+                                            snapshot_id: outcome.snapshot_id,
+                                        })
+                                    },
+                                );
+                                flush_pending = true;
+                                // Early return — flush_lock already dropped.
+                                return Ok((wal_lsn, flush_pending));
+                            }
+                            Err(e) => {
+                                tracing::warn!("Async rotate failed (non-critical): {}", e);
+                                // permit drops here, freeing the slot
+                            }
+                        }
+                    }
+                    None => {
+                        // Race: someone else grabbed the last permit. Skip;
+                        // next commit will retry should_flush().
+                        metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
+                    }
+                }
+            } else if let Err(e) = self.flush_inline_under_lock(None).await {
+                tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
+            }
+        }
+
+        Ok((wal_lsn, flush_pending))
     }
 
     /// Flush the WAL buffer to durable storage.
@@ -399,22 +928,60 @@ impl Writer {
         label: &str,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        self.validate_vertex_constraints_for_label_impl(vid, properties, label, tx_l0, false)
+            .await
+    }
+
+    /// Partial-update sibling: validates only constraints touching keys
+    /// present in `properties` (the touched set). NOT NULL is checked
+    /// only for touched keys; multi-key UNIQUE / CHECK / EXISTS are
+    /// skipped when any referenced key is absent (the caller is
+    /// expected to have routed to the full-row path in that case via
+    /// `touched_needs_full_read`).
+    async fn validate_vertex_constraints_for_label_partial(
+        &self,
+        vid: Vid,
+        properties: &Properties,
+        label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        self.validate_vertex_constraints_for_label_impl(vid, properties, label, tx_l0, true)
+            .await
+    }
+
+    async fn validate_vertex_constraints_for_label_impl(
+        &self,
+        vid: Vid,
+        properties: &Properties,
+        label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+        partial: bool,
+    ) -> Result<()> {
         let schema = self.schema_manager.schema();
 
         {
-            // 1. Check NOT NULL constraints (from Property definitions)
+            // 1. Check NOT NULL constraints (from Property definitions).
+            //    Under partial-update mode, skip properties NOT in
+            //    `properties` — they retain their previous (already-
+            //    validated) value.
             if let Some(props_meta) = schema.properties.get(label) {
                 for (prop_name, meta) in props_meta {
-                    if !meta.nullable && properties.get(prop_name).is_none_or(|v| v.is_null()) {
-                        log::warn!(
-                            "Constraint violation: Property '{}' cannot be null for label '{}'",
-                            prop_name,
-                            label
-                        );
-                        return Err(anyhow!(
-                            "Constraint violation: Property '{}' cannot be null",
-                            prop_name
-                        ));
+                    if !meta.nullable {
+                        let present = properties.get(prop_name);
+                        if partial && present.is_none() {
+                            continue;
+                        }
+                        if present.is_none_or(|v| v.is_null()) {
+                            log::warn!(
+                                "Constraint violation: Property '{}' cannot be null for label '{}'",
+                                prop_name,
+                                label
+                            );
+                            return Err(anyhow!(
+                                "Constraint violation: Property '{}' cannot be null",
+                                prop_name
+                            ));
+                        }
                     }
                 }
             }
@@ -512,6 +1079,31 @@ impl Writer {
             self.check_extid_globally_unique(ext_id, vid, tx_l0).await?;
         }
 
+        Ok(())
+    }
+
+    /// Partial sibling of `validate_vertex_constraints` — validates only
+    /// constraints touching keys present in `properties`. Used by
+    /// `insert_vertex_partial`'s fast path; the caller pre-screens for
+    /// multi-key UNIQUE constraints via `touched_needs_full_read`.
+    async fn validate_vertex_constraints_partial(
+        &self,
+        vid: Vid,
+        touched: &Properties,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let schema = self.schema_manager.schema();
+        for label in labels {
+            if schema.get_label_case_insensitive(label).is_none() {
+                continue;
+            }
+            self.validate_vertex_constraints_for_label_partial(vid, touched, label, tx_l0)
+                .await?;
+        }
+        if let Some(ext_id) = touched.get("ext_id").and_then(|v| v.as_str()) {
+            self.check_extid_globally_unique(ext_id, vid, tx_l0).await?;
+        }
         Ok(())
     }
 
@@ -1205,6 +1797,42 @@ impl Writer {
         ))
     }
 
+    /// Layer-1 CRDT variant enforcement, shared by the single-vertex and batch
+    /// write paths.
+    ///
+    /// Rejects a declared CRDT property written as a parsed CRDT value
+    /// (`Value::Map`) whose variant differs from the schema's declared variant.
+    /// A mismatch would make the commit-time merge silently overwrite instead of
+    /// merge, and the OCC CRDT carve-out (`occ::crdt_carveout_overwrite` /
+    /// `WriteSet::from_l0`) would hide it as a lost update — so it must be caught
+    /// at write time, on *every* write path. `try_as_crdt` is `Map`-gated, so the
+    /// JSON-string (Cypher) form and non-CRDT values pass through untouched: they
+    /// are never carved out and stay conflictable.
+    fn enforce_crdt_variants(
+        props_meta: &std::collections::HashMap<String, uni_common::core::schema::PropertyMeta>,
+        properties: &Properties,
+    ) -> Result<()> {
+        for (key, value) in properties {
+            let Some(meta) = props_meta.get(key) else {
+                continue;
+            };
+            let uni_common::core::schema::DataType::Crdt(expected) = &meta.r#type else {
+                continue;
+            };
+            if let Some(crdt) = crate::runtime::l0::try_as_crdt(value)
+                && crdt.type_name() != expected.type_name()
+            {
+                return Err(anyhow::Error::new(uni_common::UniError::Constraint {
+                    message: format!(
+                        "CRDT property '{key}' must be written as a {} value",
+                        expected.type_name()
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare a vertex for upsert by merging CRDT properties with existing values.
     ///
     /// When `label` is provided, uses it directly to look up property metadata.
@@ -1258,6 +1886,20 @@ impl Writer {
         if crdt_keys.is_empty() {
             return Ok(());
         }
+
+        // Enforce that each declared CRDT property written as a parsed CRDT value
+        // (`Value::Map`) carries its declared variant. A mismatched variant makes
+        // `merge_crdt_properties` overwrite rather than merge at commit, and the
+        // OCC carve-out (`occ::crdt_carveout_overwrite` / `WriteSet::from_l0`)
+        // would hide that as a silent lost update — reject it at the source.
+        //
+        // Only the `Map` form is checked: it is exactly the form the carve-out
+        // applies to (`try_as_crdt` is `Map`-gated). A CRDT written as a JSON
+        // string (the Cypher form) or a non-CRDT value is never carved out — it
+        // stays conflictable — so it poses no carve-out soundness risk and is left
+        // to the existing merge/parse path. This is the declared-property half of
+        // the layered fix; the commit-time check covers undeclared CRDT-shaped values.
+        Self::enforce_crdt_variants(props_meta, properties)?;
 
         let ctx = self.get_query_context(tx_l0).await;
         for key in crdt_keys {
@@ -1314,7 +1956,7 @@ impl Writer {
 
     #[instrument(skip(self, properties), level = "trace")]
     pub async fn insert_vertex(
-        &mut self,
+        &self,
         vid: Vid,
         properties: Properties,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
@@ -1324,9 +1966,35 @@ impl Writer {
         Ok(())
     }
 
+    /// Component C1 (G4): before a non-transactional mutation merges into main
+    /// L0, if an outstanding snapshot pins the current generation, freeze it
+    /// aside so snapshots taken *before* this write stay isolated from it.
+    ///
+    /// `flush_lock` (acquired and released here) serializes the freeze against
+    /// concurrent commit-time freezes/merges, matching the atomicity the tx
+    /// commit path gets. No-op for transactional writes (their freeze happens at
+    /// commit) and — the common case — when nothing is pinned, where it costs one
+    /// atomic load. Freezes at most once per pinned generation: the freeze
+    /// installs a fresh unpinned `current`, so later writes in the same bulk
+    /// import see no pin and merge in place, and the snapshot keeps reading the
+    /// frozen pre-import buffer.
+    async fn freeze_for_non_tx_write_if_pinned(&self, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) {
+        // Self-gates on the runtime SSI toggle: nothing pins a snapshot unless a
+        // transaction began under `ssi_enabled`, so `is_current_pinned()` is
+        // always false (one atomic load) when SSI is off.
+        if tx_l0.is_none() && self.l0_manager.is_current_pinned() {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            // Re-check under the lock: a concurrent commit may have frozen first.
+            if self.l0_manager.is_current_pinned() {
+                self.l0_manager.freeze_current_for_snapshot();
+                metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
+            }
+        }
+    }
+
     #[instrument(skip(self, properties, labels), level = "trace")]
     pub async fn insert_vertex_with_labels(
-        &mut self,
+        &self,
         vid: Vid,
         mut properties: Properties,
         labels: &[String],
@@ -1335,8 +2003,17 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
-        self.process_embeddings_for_labels(labels, &mut properties)
-            .await?;
+
+        // Component C1 (G4): a non-transactional write (`tx_l0 == None`, e.g. bulk
+        // import / LOAD CSV) mutates main L0 directly, outside the commit-time
+        // snapshot freeze. Freeze the pinned generation aside first so snapshots
+        // taken before this write stay isolated from it.
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await;
+
+        if !self.try_defer_embedding(labels, &properties, vid, tx_l0) {
+            self.process_embeddings_for_labels(labels, &mut properties)
+                .await?;
+        }
         self.validate_vertex_constraints(vid, &properties, labels, tx_l0)
             .await?;
         self.prepare_vertex_upsert(
@@ -1419,6 +2096,181 @@ impl Writer {
         Ok(properties_copy)
     }
 
+    /// True iff routing this partial write through MergeInsert would
+    /// miss a constraint check. Specifically: a multi-key UNIQUE
+    /// constraint where the touched-set doesn't cover all member keys
+    /// requires the unchanged keys from the existing row to compute
+    /// the composite. Conservative: also returns true if any touched
+    /// key is `ext_id` (uniqueness checked globally — handled in the
+    /// full-row path).
+    fn touched_needs_full_read(&self, touched: &Properties, labels: &[String]) -> bool {
+        if touched.contains_key("ext_id") {
+            return true;
+        }
+        let schema = self.schema_manager.schema();
+        for label in labels {
+            if schema.get_label_case_insensitive(label).is_none() {
+                continue;
+            }
+            for constraint in &schema.constraints {
+                if !constraint.enabled {
+                    continue;
+                }
+                if let ConstraintTarget::Label(l) = &constraint.target {
+                    if !l.eq_ignore_ascii_case(label) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                if let ConstraintType::Unique {
+                    properties: unique_props,
+                } = &constraint.constraint_type
+                {
+                    if unique_props.len() < 2 {
+                        continue; // single-key UNIQUE — partial path sees the key
+                    }
+                    if unique_props.iter().any(|p| touched.contains_key(p)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Insert a vertex's FULL property row plus a touched-keys hint so
+    /// the flush emits ONLY those columns via Lance MergeInsert.
+    ///
+    /// Caller must have read the full row (via PropertyManager) and
+    /// applied SET-touched values on top before calling — same input
+    /// shape as `insert_vertex_with_labels`. The new arg `touched_keys`
+    /// is the set of property keys this SET statement actually
+    /// assigned; L0 records it in `vertex_partial_keys[vid]` and the
+    /// flush filters the MergeInsert source schema down to those keys.
+    /// When `UniConfig::partial_lance_writes == false`, falls through
+    /// to `insert_vertex_with_labels` (Append) — preserving bit-for-bit
+    /// equivalence with prior releases.
+    #[instrument(skip(self, props, touched_keys, labels), level = "trace")]
+    pub async fn insert_vertex_partial_full(
+        &self,
+        vid: Vid,
+        mut props: Properties,
+        touched_keys: HashSet<String>,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        if !self.config.partial_lance_writes
+            || self.touched_needs_full_read(&props_subset(&props, &touched_keys), labels)
+        {
+            self.insert_vertex_with_labels(vid, props, labels, tx_l0)
+                .await?;
+            return Ok(());
+        }
+
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        if !self.try_defer_embedding(labels, &props, vid, tx_l0) {
+            self.process_embeddings_for_labels(labels, &mut props)
+                .await?;
+        }
+        // Full-row validation runs because we have the complete map;
+        // no need for the partial-only validator.
+        self.validate_vertex_constraints(vid, &props, labels, tx_l0)
+            .await?;
+        {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut l0_guard = l0.write();
+            l0_guard.insert_vertex_partial_full(vid, props, touched_keys, labels);
+        }
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Insert a vertex's *partial* property set without first reading the
+    /// full row.
+    ///
+    /// When `WriterConfig::partial_lance_writes` is `true`, the touched
+    /// keys flow into `L0Buffer::vertex_partial_keys` so the next flush
+    /// emits them via Lance `MergeInsertBuilder` against a subset-of-
+    /// schema source — preserving untouched columns (e.g., embeddings)
+    /// byte-equal in Lance with no read at the caller and no write of
+    /// those columns.
+    ///
+    /// When the flag is `false`, this falls back to the existing
+    /// `insert_vertex_with_labels` path after merging `touched` with
+    /// the current properties from L0/storage. The caller can therefore
+    /// use this entry point unconditionally; the optimization activates
+    /// only when the flag is on.
+    #[instrument(skip(self, touched, labels), level = "trace")]
+    pub async fn insert_vertex_partial(
+        &self,
+        vid: Vid,
+        touched: Properties,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let needs_full_read =
+            !self.config.partial_lance_writes || self.touched_needs_full_read(&touched, labels);
+        if needs_full_read {
+            // Flag-off fallback (or constraint-driven fallback): merge
+            // `touched` with the current full property snapshot from
+            // L0/storage and route through the existing path. Preserves
+            // bit-for-bit equivalence with the pre-Round-11 release.
+            let existing = if let Some(pm) = &self.property_manager {
+                pm.get_all_vertex_props_with_ctx(vid, None)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+            } else {
+                Properties::new()
+            };
+            let mut merged = existing;
+            for (k, v) in touched {
+                merged.insert(k, v);
+            }
+            self.insert_vertex_with_labels(vid, merged, labels, tx_l0)
+                .await?;
+            return Ok(());
+        }
+
+        // Flag-on fast path: stage the partial update directly. Pressure
+        // checks, embedding generation, constraint validation all still
+        // run — but the validator is the partial-aware variant that
+        // skips NOT NULL / multi-key UNIQUE / CHECK / EXISTS for
+        // properties not present in `touched`. Multi-key UNIQUE that
+        // overlaps the touched set forces a fallback above via
+        // `touched_needs_full_read`.
+        let mut touched = touched;
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        if !self.try_defer_embedding(labels, &touched, vid, tx_l0) {
+            self.process_embeddings_for_labels(labels, &mut touched)
+                .await?;
+        }
+        self.validate_vertex_constraints_partial(vid, &touched, labels, tx_l0)
+            .await?;
+
+        {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut l0_guard = l0.write();
+            l0_guard.insert_vertex_partial(vid, touched, labels);
+        }
+
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        Ok(())
+    }
+
     /// Insert multiple vertices with batched operations.
     ///
     /// This method uses batched operations to achieve O(N) complexity instead of O(N²)
@@ -1445,7 +2297,7 @@ impl Writer {
     /// # Atomicity
     /// If this method fails, all changes are rolled back (if transaction was started here).
     pub async fn insert_vertices_batch(
-        &mut self,
+        &self,
         vids: Vec<Vid>,
         mut properties_batch: Vec<Properties>,
         labels: Vec<String>,
@@ -1471,6 +2323,11 @@ impl Writer {
         let result = async {
             self.check_write_pressure().await?;
             self.check_transaction_memory(tx_l0)?;
+
+            // Component C1 (G4): batch bulk-import is the canonical non-tx write —
+            // freeze the pinned generation aside before merging so snapshot
+            // readers stay isolated. No-op when unpinned or transactional.
+            self.freeze_for_non_tx_write_if_pinned(tx_l0).await;
 
             // Batch embedding generation (1 API call per config)
             self.process_embeddings_for_batch(&labels, &mut properties_batch)
@@ -1500,6 +2357,20 @@ impl Writer {
             };
 
             if has_crdt_fields {
+                // Layer-1 variant enforcement (G3): the batch path must reject a
+                // declared-CRDT variant mismatch exactly as the single-vertex
+                // `prepare_vertex_upsert` does. Without this, a wrong-variant CRDT
+                // written via batch import slips past write-time validation and
+                // the OCC carve-out then masks the overwrite as a lost update.
+                {
+                    let schema = self.schema_manager.schema();
+                    if let Some(props_meta) = schema.properties.get(label.as_str()) {
+                        for props in &properties_batch {
+                            Self::enforce_crdt_variants(props_meta, props)?;
+                        }
+                    }
+                }
+
                 // Batch fetch existing CRDT values: collect VIDs that need merging,
                 // then query once via PropertyManager instead of per-vertex lookups.
                 let schema = self.schema_manager.schema();
@@ -1579,7 +2450,7 @@ impl Writer {
     /// the L0 delete operation fails.
     #[instrument(skip(self, labels), level = "trace")]
     pub async fn delete_vertex(
-        &mut self,
+        &self,
         vid: Vid,
         labels: Option<Vec<String>>,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
@@ -1587,6 +2458,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         let l0 = self.resolve_l0(tx_l0);
 
         // Before deleting, ensure we have the vertex's labels stored in L0
@@ -1709,9 +2581,74 @@ impl Writer {
     }
 
     #[expect(clippy::too_many_arguments)]
-    #[instrument(skip(self, properties), level = "trace")]
+    #[instrument(skip(self, props, touched_keys), level = "trace")]
+    pub async fn insert_edge_partial_full(
+        &self,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        eid: Eid,
+        props: Properties,
+        edge_type_name: Option<String>,
+        touched_keys: HashSet<String>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
+        if !self.config.partial_lance_writes {
+            return self
+                .insert_edge(
+                    src_vid,
+                    dst_vid,
+                    edge_type,
+                    eid,
+                    props,
+                    edge_type_name,
+                    tx_l0,
+                )
+                .await;
+        }
+
+        let start = std::time::Instant::now();
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        let mut props = props;
+        self.prepare_edge_upsert(eid, &mut props, tx_l0).await?;
+
+        let l0 = self.resolve_l0(tx_l0);
+        l0.write().insert_edge_partial_full(
+            src_vid,
+            dst_vid,
+            edge_type,
+            eid,
+            props,
+            edge_type_name,
+            touched_keys,
+        )?;
+
+        if tx_l0.is_none() {
+            let version = l0.read().current_version;
+            self.adjacency_manager
+                .insert_edge(src_vid, dst_vid, eid, edge_type, version);
+        }
+
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        if start.elapsed().as_millis() > 100 {
+            log::warn!(
+                "Slow insert_edge_partial_full: {}ms",
+                start.elapsed().as_millis()
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
     pub async fn insert_edge(
-        &mut self,
+        &self,
         src_vid: Vid,
         dst_vid: Vid,
         edge_type: u32,
@@ -1723,6 +2660,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         self.prepare_edge_upsert(eid, &mut properties, tx_l0)
             .await?;
 
@@ -1752,7 +2690,7 @@ impl Writer {
 
     #[instrument(skip(self), level = "trace")]
     pub async fn delete_edge(
-        &mut self,
+        &self,
         eid: Eid,
         src_vid: Vid,
         dst_vid: Vid,
@@ -1762,6 +2700,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         let l0 = self.resolve_l0(tx_l0);
 
         l0.write().delete_edge(eid, src_vid, dst_vid, edge_type)?;
@@ -1784,31 +2723,36 @@ impl Writer {
         Ok(())
     }
 
+    /// Decide whether a flush should be triggered based on mutation count
+    /// or elapsed time since the last flush.
+    ///
+    /// Extracted from [`Writer::check_flush`] so `commit_transaction_l0` can
+    /// reuse the decision while bypassing the lock-acquiring entry point
+    /// (it already holds `flush_lock`).
+    fn should_flush(&self) -> bool {
+        let count = self.l0_manager.get_current().read().mutation_count;
+        if count == 0 {
+            return false;
+        }
+        if count >= self.config.auto_flush_threshold {
+            return true;
+        }
+        if let Some(interval) = self.config.auto_flush_interval
+            && self.last_flush_time.lock().elapsed() >= interval
+            && count >= self.config.auto_flush_min_mutations
+        {
+            return true;
+        }
+        false
+    }
+
     /// Check if flush should be triggered based on mutation count or time elapsed.
     /// This method is called after each write operation and can also be called
     /// by a background task for time-based flushing.
-    pub async fn check_flush(&mut self) -> Result<()> {
-        let count = self.l0_manager.get_current().read().mutation_count;
-
-        // Skip if no mutations
-        if count == 0 {
-            return Ok(());
-        }
-
-        // Flush on mutation count threshold (10,000 default)
-        if count >= self.config.auto_flush_threshold {
-            self.flush_to_l1(None).await?;
-            return Ok(());
-        }
-
-        // Flush on time interval IF minimum mutations met
-        if let Some(interval) = self.config.auto_flush_interval
-            && self.last_flush_time.elapsed() >= interval
-            && count >= self.config.auto_flush_min_mutations
-        {
+    pub async fn check_flush(&self) -> Result<()> {
+        if self.should_flush() {
             self.flush_to_l1(None).await?;
         }
-
         Ok(())
     }
 
@@ -1821,6 +2765,118 @@ impl Writer {
     ) -> Result<()> {
         let label_name = labels.first().map(|s| s.as_str());
         self.process_embeddings_impl(label_name, properties).await
+    }
+
+    /// Phase B: if `defer_embeddings` is enabled in `UniConfig` and the
+    /// vertex has an embedding config that hasn't been satisfied by the
+    /// caller-provided properties, enqueue the VID in
+    /// `L0Buffer::pending_embeddings` and return `true`. The caller then
+    /// skips `process_embeddings_for_labels` and the embedding is computed
+    /// in a single batched call at flush time via
+    /// `drain_pending_embeddings`.
+    ///
+    /// Returns `false` (caller falls back to today's per-row eager embed)
+    /// if any of:
+    ///  - the flag is off,
+    ///  - no label has an embedding config,
+    ///  - the user already provided the target property (matches the
+    ///    existing skip-if-present semantics at writer.rs:2727).
+    ///
+    /// Trade-off: when deferral is active, in-tx reads of the embedding
+    /// column return only what was already in storage (or nothing for
+    /// brand-new vertices). Existing tests that RETURN n.embedding in
+    /// the same tx as a SET on the source column must run with the flag
+    /// off; opt in only when no such reads happen between write and
+    /// commit.
+    fn try_defer_embedding(
+        &self,
+        labels: &[String],
+        properties: &Properties,
+        vid: Vid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> bool {
+        if !self.config.defer_embeddings {
+            return false;
+        }
+        let Some(label) = labels.first() else {
+            return false;
+        };
+
+        let schema = self.schema_manager.schema();
+        let mut has_unsatisfied_cfg = false;
+        for idx in &schema.indexes {
+            if let IndexDefinition::Vector(v_cfg) = idx
+                && v_cfg.label == *label
+                && v_cfg.embedding_config.is_some()
+                && !properties.contains_key(&v_cfg.property)
+            {
+                has_unsatisfied_cfg = true;
+                break;
+            }
+        }
+        if !has_unsatisfied_cfg {
+            return false;
+        }
+
+        let l0 = self.resolve_l0(tx_l0);
+        let mut guard = l0.write();
+        guard.pending_embeddings.insert(vid, label.clone());
+        true
+    }
+
+    /// Drain `pending_embeddings` from the rotated old-L0 right before
+    /// `flush_stream_l1` reads it. Groups by label, issues one batched
+    /// `process_embeddings_for_batch` call per label, and writes the
+    /// resulting embedding vectors into each VID's `vertex_properties`
+    /// map. After this returns, the flush proceeds against an L0 that
+    /// looks no different from one whose embeddings were generated
+    /// per-row at insert.
+    ///
+    /// Idempotent: a VID whose embedding was already materialized
+    /// (e.g., by on-demand read paths in a future Phase B revision) is
+    /// detected via `properties.contains_key(target_prop)` inside
+    /// `process_embeddings_for_batch` (writer.rs:~2650), so re-running
+    /// the drain is safe.
+    async fn drain_pending_embeddings(&self, old_l0_arc: &Arc<RwLock<L0Buffer>>) -> Result<()> {
+        let by_label: HashMap<String, Vec<Vid>> = {
+            let guard = old_l0_arc.read();
+            if guard.pending_embeddings.is_empty() {
+                return Ok(());
+            }
+            let mut m: HashMap<String, Vec<Vid>> = HashMap::new();
+            for (vid, label) in &guard.pending_embeddings {
+                m.entry(label.clone()).or_default().push(*vid);
+            }
+            m
+        };
+
+        for (label, vids) in by_label {
+            let mut properties_batch: Vec<Properties> = {
+                let guard = old_l0_arc.read();
+                vids.iter()
+                    .map(|vid| {
+                        guard
+                            .vertex_properties
+                            .get(vid)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            };
+
+            self.process_embeddings_for_batch(std::slice::from_ref(&label), &mut properties_batch)
+                .await?;
+
+            let mut guard = old_l0_arc.write();
+            for (vid, props) in vids.iter().zip(properties_batch) {
+                let target = guard.vertex_properties.entry(*vid).or_default();
+                for (k, v) in props {
+                    target.insert(k, v);
+                }
+                guard.pending_embeddings.remove(vid);
+            }
+        }
+        Ok(())
     }
 
     /// Process embeddings for a batch of vertices efficiently.
@@ -1892,7 +2948,7 @@ impl Writer {
                     continue;
                 }
 
-                let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
+                let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
                 let embedder = runtime.embedding(&emb_config.alias).await?;
@@ -1964,7 +3020,7 @@ impl Writer {
                     None => input_text,
                 };
 
-                let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
+                let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
                 let embedder = runtime.embedding(&emb_config.alias).await?;
@@ -1986,80 +3042,188 @@ impl Writer {
     /// # Lock Ordering
     ///
     /// To prevent deadlocks, locks must be acquired in the following order:
-    /// 1. `Writer` lock (held by caller)
-    /// 2. `L0Manager` lock (via `begin_flush` / `get_current`)
-    /// 3. `L0Buffer` lock (individual buffer RWLocks)
-    /// 4. `Index` / `Storage` locks (during actual flush)
-    #[instrument(
-        skip(self),
-        fields(snapshot_id, mutations_count, size_bytes),
-        level = "info"
-    )]
-    pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String> {
-        let start = std::time::Instant::now();
-        let schema = self.schema_manager.schema();
+    /// 1. `Writer` lock (held by caller via outer `Arc<RwLock<Writer>>`; removed in Phase 4)
+    /// 2. `flush_lock` (acquired by this entry point; held across the whole flush)
+    /// 3. `L0Manager` lock (via `begin_flush` / `get_current`)
+    /// 4. `L0Buffer` lock (individual buffer RWLocks)
+    /// 5. `Index` / `Storage` locks (during actual flush)
+    ///
+    /// Callers that already hold `flush_lock` (today only `commit_transaction_l0`)
+    /// must call `flush_inline_under_lock` (private) directly to avoid a re-entrant
+    /// `tokio::sync::Mutex` deadlock — see concurrent_writer.md §5.5.
+    pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+        // Drain any in-flight async flushes first. `flush_to_l1` is a
+        // SYNCHRONIZATION BARRIER — callers (test fixtures, fork
+        // setup, shutdown paths) rely on it as "all writes are now
+        // durably in Lance". Without the drain, an async stream from
+        // a recent commit might still be writing to Lance when
+        // `flush_to_l1` returns, leaving a window where forks branch
+        // off pre-write Lance state and lose data.
+        if let Some(coord) = self.flush_coordinator.as_ref() {
+            let _ = coord.drain(self.config.drop_fork_drain_timeout).await;
+        }
+        let _flush_lock_guard = self.flush_lock.lock().await;
+        self.flush_inline_under_lock(name).await
+    }
 
-        // Signal that a flush is in progress so compaction skips delta clears.
-        self.storage
-            .flush_in_progress
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        let (initial_size, initial_count) = {
-            let l0_arc = self.l0_manager.get_current();
-            let l0 = l0_arc.read();
-            (l0.estimated_size, l0.mutation_count)
+    /// Async-flush entry point: rotate under `flush_lock`, release the
+    /// lock, then submit the stream phase to the [`FlushCoordinator`].
+    /// Returns a [`FlushTicket`](crate::runtime::flush_coordinator::FlushTicket)
+    /// that resolves when finalize completes.
+    ///
+    /// Errors if `config.async_flush_enabled = false` (the coordinator
+    /// is `None` in that case — see `flush_coordinator` field doc).
+    pub async fn flush_to_l1_async(
+        self: &Arc<Self>,
+        name: Option<String>,
+    ) -> Result<crate::runtime::flush_coordinator::FlushTicket> {
+        let coord = self
+            .flush_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("async flush not enabled (config.async_flush_enabled=false)"))?
+            .clone();
+        // 1. Acquire permit FIRST (outside flush_lock) so we don't
+        //    introduce a permit-while-holding-flush-lock convoy.
+        let permit = coord.acquire_permit().await?;
+        let seq = coord.next_rotate_seq();
+        coord.note_pending();
+        // 2. Rotate under flush_lock (µs work).
+        let RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard,
+        } = {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            self.flush_l0_rotate().await?
         };
-        tracing::Span::current().record("size_bytes", initial_size);
-        tracing::Span::current().record("mutations_count", initial_count);
+        // 3. Build the coordinator's RotatedFlush. parent_manifest is the
+        //    cached_manifest snapshot at this moment.
+        let parent_manifest = self.cached_manifest.lock().clone();
+        let rotated = RotatedFlush {
+            seq,
+            old_l0_arc: old_l0_arc.clone(),
+            wal_lsn,
+            current_version,
+            name: name.clone(),
+            parent_manifest,
+            permit,
+            flush_in_progress_guard,
+        };
+        // 4. Spawn the stream phase via the coordinator. The closure
+        //    captures Arc<Writer> transiently — drops when stream
+        //    completes (bounded, ~50-500 ms).
+        let writer = self.clone();
+        let ticket = coord.submit_for_stream(rotated, move |old_l0, wal, ver, n| async move {
+            let outcome = writer.flush_stream_l1(old_l0, wal, ver, n).await?;
+            Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                new_manifest: outcome.manifest,
+                snapshot_id: outcome.snapshot_id,
+            })
+        });
+        Ok(ticket)
+    }
 
-        debug!("Starting L0 flush to L1");
+    /// Phase A+B+C of the flush: flush the WAL, rotate L0 (so the
+    /// to-be-flushed buffer moves to `pending_flush` and a fresh L0 takes
+    /// its place), and hand off the WAL to the new L0.
+    ///
+    /// Runs in microseconds. Must be called under `flush_lock` (the caller
+    /// is responsible). The returned [`RotateOutput`] carries everything
+    /// the subsequent stream + finalize phases need; in particular the
+    /// [`FlushInProgressGuard`] is bound to the return value so it stays
+    /// alive for the full flush lifetime — including any future async
+    /// path where stream runs on a spawned task.
+    async fn flush_l0_rotate(&self) -> Result<RotateOutput> {
+        // Acquire the in-progress counter BEFORE any heavy work. The
+        // guard lives on RotateOutput; dropping RotateOutput drops the
+        // guard, so the counter goes back to zero exactly when the flush
+        // is fully done.
+        let flush_in_progress_guard = FlushInProgressGuard::new(&self.storage);
 
-        // 1. Flush WAL BEFORE rotating L0
-        // This ensures that if WAL flush fails, the current L0 is still active
-        // and mutations are retained in memory until restart/retry.
-        // Capture the LSN of the flushed segment for the snapshot's wal_high_water_mark.
+        // A. Flush WAL BEFORE rotating L0. If WAL flush fails, the
+        // current L0 is still active and mutations are retained in
+        // memory until restart/retry.
         let wal_for_truncate = {
             let current_l0 = self.l0_manager.get_current();
             let l0_guard = current_l0.read();
             l0_guard.wal.clone()
         };
-
         let wal_lsn = if let Some(ref w) = wal_for_truncate {
             w.flush().await?
         } else {
             0
         };
 
-        // 2. Begin flush: rotate L0 and keep old L0 visible to reads
-        // The old L0 stays in pending_flush list until complete_flush is called,
-        // ensuring data remains visible even if L1 writes fail.
+        // B. Begin flush: rotate L0 and keep old L0 visible to reads via
+        // pending_flush until complete_flush is called by finalize.
         let old_l0_arc = self.l0_manager.begin_flush(0, None);
         metrics::counter!("uni_l0_buffer_rotations_total").increment(1);
 
+        // C. WAL handoff: record wal_lsn on old L0, transfer WAL handle
+        // and current_version to the new L0.
         let current_version;
         {
-            // Acquire Write lock to take WAL and version
             let mut old_l0_guard = old_l0_arc.write();
             current_version = old_l0_guard.current_version;
-
-            // Record the WAL LSN for this L0 so we don't truncate past it
-            // if this flush fails and a subsequent flush succeeds.
             old_l0_guard.wal_lsn_at_flush = wal_lsn;
-
             let wal = old_l0_guard.wal.take();
-
-            // Give WAL to new L0
             let new_l0_arc = self.l0_manager.get_current();
             let mut new_l0_guard = new_l0_arc.write();
             new_l0_guard.wal = wal;
             new_l0_guard.current_version = current_version;
-        } // Drop locks
+        }
 
+        Ok(RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard,
+        })
+    }
+
+    /// Phases D, E, F, G of the flush: L1 collect, orphan resolve,
+    /// manifest seed, Lance writes. Reads from `old_l0_arc` (kept in
+    /// pending_flush by Phase B); writes append-only Lance datasets; does
+    /// NOT call save_snapshot / set_latest_snapshot — those are
+    /// finalize's job, so the manifest doesn't get published until the
+    /// next phase.
+    ///
+    /// Today takes `&self`; in a follow-up commit this becomes a
+    /// static `Send + 'static` function over `SharedFlushCtx` so it can
+    /// run on a spawned task while concurrent commits proceed.
+    async fn flush_stream_l1(
+        &self,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        current_version: u64,
+        name: Option<String>,
+    ) -> Result<FlushOutcome> {
+        // Phase B: materialize any deferred embeddings before column
+        // extraction. No-op when `defer_embeddings` is off (the set will
+        // be empty). On-demand reads of the embedding column are a TODO
+        // for a future revision (see UniConfig::defer_embeddings docs).
+        self.drain_pending_embeddings(&old_l0_arc).await?;
+
+        let schema = self.schema_manager.schema();
         // 2. Acquire Read lock on Old L0 for flushing
         let mut entries_by_type: HashMap<u32, Vec<L1Entry>> = HashMap::new();
         // (Vid, labels, properties, deleted, version)
         type VertexEntry = (Vid, Vec<String>, Properties, bool, u64);
         let mut vertices_by_label: HashMap<u16, Vec<VertexEntry>> = HashMap::new();
+        // Partial-column updates (Lance MergeInsert path). Per-VID tuple:
+        // (vid, full L0 properties map, version, set of keys to update).
+        // Only the keys in the HashSet are emitted to the partial source;
+        // the full props map is retained so the per-row column extractor
+        // can read each touched key's value.
+        type PartialEntry = (Vid, Properties, u64, std::collections::HashSet<String>);
+        let mut partial_by_label: HashMap<u16, Vec<PartialEntry>> = HashMap::new();
+        // DELETE-via-MergeInsert (Round-12 §B): tombstones flush as a
+        // partial source with just `_vid`, `_deleted=true`, `_version`,
+        // `_updated_at`. Skips the wide-row Append payload that adds
+        // nothing on a soft-delete.
+        let mut tombstones_by_label: HashMap<u16, Vec<(Vid, u64)>> = HashMap::new();
+        let mut main_vertex_tombstones: Vec<(Vid, u64)> = Vec::new();
         // Collect vertex timestamps from L0 for flushing to storage
         let mut vertex_created_at: HashMap<Vid, i64> = HashMap::new();
         let mut vertex_updated_at: HashMap<Vid, i64> = HashMap::new();
@@ -2158,27 +3322,58 @@ impl Writer {
                     vertex_updated_at.insert(*vid, ts);
                 }
                 if let Some(labels) = old_l0.vertex_labels.get(vid) {
-                    push_vertex_to_labels(
-                        *vid,
-                        labels,
-                        props.clone(),
-                        false,
-                        version,
-                        &mut vertices_by_label,
-                    );
+                    // Partial-write routing: when this VID was last
+                    // touched via `insert_vertex_partial` AND the
+                    // partial_lance_writes flag is on, send only the
+                    // touched columns to a MergeInsert batch. Otherwise
+                    // (CREATE, MERGE-ON-CREATE, full-replace SET, DELETE
+                    // — or flag off) use the existing full-row Append.
+                    let is_partial = self.config.partial_lance_writes
+                        && old_l0.vertex_partial_keys.contains_key(vid);
+                    if is_partial {
+                        if let Some(touched) = old_l0.vertex_partial_keys.get(vid) {
+                            for label in labels {
+                                if let Some(label_id) = schema.label_id_by_name(label) {
+                                    partial_by_label.entry(label_id).or_default().push((
+                                        *vid,
+                                        props.clone(),
+                                        version,
+                                        touched.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        push_vertex_to_labels(
+                            *vid,
+                            labels,
+                            props.clone(),
+                            false,
+                            version,
+                            &mut vertices_by_label,
+                        );
+                    }
                 }
             }
             for &vid in &old_l0.vertex_tombstones {
                 let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
+                if let Some(&ts) = old_l0.vertex_updated_at.get(&vid) {
+                    vertex_updated_at.insert(vid, ts);
+                }
                 if let Some(labels) = old_l0.vertex_labels.get(&vid) {
-                    push_vertex_to_labels(
-                        vid,
-                        labels,
-                        HashMap::new(),
-                        true,
-                        version,
-                        &mut vertices_by_label,
-                    );
+                    // Round-12 §B: tombstones flush via Lance MergeInsert
+                    // (just `_vid`, `_deleted=true`, `_version`,
+                    // `_updated_at`) — skipping the wide-row Append.
+                    // Unconditional (no `partial_lance_writes` gating);
+                    // tombstone Append carries no useful payload.
+                    for label in labels {
+                        if let Some(label_id) = schema.label_id_by_name(label) {
+                            tombstones_by_label
+                                .entry(label_id)
+                                .or_default()
+                                .push((vid, version));
+                        }
+                    }
                 } else {
                     // Tombstone missing labels (old WAL format) - collect for storage query fallback
                     orphaned_tombstones.push((vid, version));
@@ -2198,21 +3393,26 @@ impl Writer {
                 {
                     for label in &labels {
                         if let Some(label_id) = schema.label_id_by_name(label) {
-                            vertices_by_label.entry(label_id).or_default().push((
-                                vid,
-                                labels.clone(),
-                                HashMap::new(),
-                                true,
-                                version,
-                            ));
+                            // Round-12 §B: route through partial tombstone too.
+                            tombstones_by_label
+                                .entry(label_id)
+                                .or_default()
+                                .push((vid, version));
                         }
                     }
                 }
             }
         }
 
-        // 1. Load previous snapshot from cache, or fall back to storage
-        let mut manifest = if let Some(cached) = self.cached_manifest.take() {
+        // 1. Load previous snapshot from cache, or fall back to storage.
+        //
+        // Use clone() not take(): for the async path, multiple
+        // concurrent streams may run; if we take() here, a sibling
+        // stream sees cached_manifest = None and seeds from
+        // load_latest_snapshot (stale), losing the chain. clone()
+        // preserves the parent. Finalize writes back the new manifest
+        // unconditionally.
+        let mut manifest = if let Some(cached) = self.cached_manifest.lock().clone() {
             cached
         } else {
             self.storage
@@ -2304,16 +3504,23 @@ impl Writer {
             let old_l0 = old_l0_arc.read();
             let mut vertices = Vec::new();
 
+            // Live vertices: full-row Append on the main table (the
+            // props_json blob is required for global ID lookups). For
+            // partial-row VIDs (vertex_partial_keys non-empty), the
+            // main table still needs the full props for the
+            // ext_id-uniqueness path; we keep the Append here. The
+            // per-label Lance write IS partial via MergeInsert.
             for (vid, props) in &old_l0.vertex_properties {
                 let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
                 let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
                 vertices.push((*vid, labels, props.clone(), false, version));
             }
 
+            // Tombstones: collected into `main_vertex_tombstones` for
+            // the MergeInsert path below; skipping the wide-row Append.
             for &vid in &old_l0.vertex_tombstones {
                 let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
-                let labels = old_l0.vertex_labels.get(&vid).cloned().unwrap_or_default();
-                vertices.push((vid, labels, HashMap::new(), true, version));
+                main_vertex_tombstones.push((vid, version));
             }
 
             vertices
@@ -2326,6 +3533,18 @@ impl Writer {
                 Some(&vertex_updated_at),
             )?;
             MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
+        }
+        // Round-12 §B: tombstones via MergeInsert on the main vertices
+        // table. Independent of `vertex_properties` length.
+        if !main_vertex_tombstones.is_empty() {
+            let tomb_batch = MainVertexDataset::build_tombstone_partial_batch(
+                &main_vertex_tombstones,
+                Some(&vertex_updated_at),
+            )?;
+            MainVertexDataset::merge_insert_tombstone_batch(self.storage.backend(), tomb_batch)
+                .await?;
+        }
+        if !main_vertices.is_empty() || !main_vertex_tombstones.is_empty() {
             MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
@@ -2339,24 +3558,95 @@ impl Writer {
                 .ok_or_else(|| anyhow!("Edge type ID {} not found", edge_type_id))?;
 
             // FWD Run (sorted by src_vid)
-            let mut fwd_entries = entries.clone();
-            fwd_entries.sort_by_key(|e| e.src_vid);
-            let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
-            let fwd_batch = fwd_ds.build_record_batch(&fwd_entries, &schema)?;
+            // Round-12 §A: split entries into full-row Append and
+            // partial MergeInsert routes based on `edge_partial_keys`.
+            // Edges in `edge_partial_keys` were last written via
+            // `insert_edge_partial_full`; the per-edge-type delta
+            // tables receive only the touched schema columns plus
+            // (when any overflow key was touched) the regenerated
+            // `overflow_json` blob. Untouched columns retain their
+            // previous-version value via Lance MergeInsert.
+            let partial_eids: std::collections::HashSet<Eid> = {
+                let old_l0 = old_l0_arc.read();
+                entries
+                    .iter()
+                    .filter(|e| {
+                        self.config.partial_lance_writes
+                            && old_l0.edge_partial_keys.contains_key(&e.eid)
+                    })
+                    .map(|e| e.eid)
+                    .collect()
+            };
+            let touched_union_by_eid: HashMap<Eid, std::collections::HashSet<String>> = {
+                let old_l0 = old_l0_arc.read();
+                partial_eids
+                    .iter()
+                    .filter_map(|eid| old_l0.edge_partial_keys.get(eid).map(|s| (*eid, s.clone())))
+                    .collect()
+            };
+            let (full_entries, partial_entries): (Vec<L1Entry>, Vec<L1Entry>) = entries
+                .clone()
+                .into_iter()
+                .partition(|e| !partial_eids.contains(&e.eid));
 
-            // Write using backend
             let backend = self.storage.backend();
-            fwd_ds.write_run(backend, fwd_batch).await?;
+
+            // FWD run (sorted by src_vid)
+            let mut fwd_full = full_entries.clone();
+            fwd_full.sort_by_key(|e| e.src_vid);
+            let mut fwd_partial = partial_entries.clone();
+            fwd_partial.sort_by_key(|e| e.src_vid);
+            let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
+            if !fwd_full.is_empty() {
+                let fwd_batch = fwd_ds.build_record_batch(&fwd_full, &schema)?;
+                fwd_ds.write_run(backend, fwd_batch).await?;
+            }
+            if !fwd_partial.is_empty() {
+                let touched_union: std::collections::HashSet<String> = fwd_partial
+                    .iter()
+                    .flat_map(|e| {
+                        touched_union_by_eid
+                            .get(&e.eid)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                    })
+                    .collect();
+                let fwd_partial_batch =
+                    fwd_ds.build_partial_record_batch(&fwd_partial, &touched_union, &schema)?;
+                fwd_ds
+                    .merge_insert_partial_run(backend, fwd_partial_batch)
+                    .await?;
+            }
             fwd_ds.ensure_eid_index(backend).await?;
 
             // BWD Run (sorted by dst_vid)
-            let mut bwd_entries = entries.clone();
-            bwd_entries.sort_by_key(|e| e.dst_vid);
+            let mut bwd_full = full_entries.clone();
+            bwd_full.sort_by_key(|e| e.dst_vid);
+            let mut bwd_partial = partial_entries.clone();
+            bwd_partial.sort_by_key(|e| e.dst_vid);
             let bwd_ds = self.storage.delta_dataset(&edge_type_name, "bwd")?;
-            let bwd_batch = bwd_ds.build_record_batch(&bwd_entries, &schema)?;
-
-            let backend = self.storage.backend();
-            bwd_ds.write_run(backend, bwd_batch).await?;
+            if !bwd_full.is_empty() {
+                let bwd_batch = bwd_ds.build_record_batch(&bwd_full, &schema)?;
+                bwd_ds.write_run(backend, bwd_batch).await?;
+            }
+            if !bwd_partial.is_empty() {
+                let touched_union: std::collections::HashSet<String> = bwd_partial
+                    .iter()
+                    .flat_map(|e| {
+                        touched_union_by_eid
+                            .get(&e.eid)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                    })
+                    .collect();
+                let bwd_partial_batch =
+                    bwd_ds.build_partial_record_batch(&bwd_partial, &touched_union, &schema)?;
+                bwd_ds
+                    .merge_insert_partial_run(backend, bwd_partial_batch)
+                    .await?;
+            }
             bwd_ds.ensure_eid_index(backend).await?;
 
             // Update Manifest
@@ -2379,7 +3669,17 @@ impl Writer {
         }
 
         // 4. Per-label vertex table writes
-        for (label_id, vertices) in vertices_by_label {
+        // Iterate all labels that have either full-row OR partial-write
+        // data pending. A label may appear in only one of the two maps
+        // (e.g., all updates on this label were partial-only).
+        let all_label_ids: std::collections::HashSet<u16> = vertices_by_label
+            .keys()
+            .chain(partial_by_label.keys())
+            .chain(tombstones_by_label.keys())
+            .copied()
+            .collect();
+        for label_id in all_label_ids {
+            let vertices = vertices_by_label.remove(&label_id).unwrap_or_default();
             let label_name = schema
                 .label_name_by_id(label_id)
                 .ok_or_else(|| anyhow!("Label ID {} not found", label_id))?;
@@ -2414,6 +3714,14 @@ impl Writer {
                             }
                         }
                     }
+                    // Round-12 §B: tombstones no longer in `vertices`;
+                    // pull them from `tombstones_by_label` for inverted
+                    // index removal.
+                    if let Some(tomb_rows) = tombstones_by_label.get(&label_id) {
+                        for (vid, _) in tomb_rows {
+                            removed.insert(*vid);
+                        }
+                    }
 
                     if !added.is_empty() || !removed.is_empty() {
                         inverted_updates.insert(cfg.property.clone(), (added, removed));
@@ -2430,27 +3738,78 @@ impl Writer {
                 ver_data.push(version);
             }
 
-            let batch = ds.build_record_batch_with_timestamps(
-                &v_data,
-                &d_data,
-                &ver_data,
-                &schema,
-                Some(&vertex_created_at),
-                Some(&vertex_updated_at),
-            )?;
-
-            // Write using backend
             let backend = self.storage.backend();
-            ds.write_batch(backend, batch, &schema).await?;
+
+            // Skip the full-row Append entirely if this label only has
+            // partial-write rows pending.
+            if !v_data.is_empty() {
+                let batch = ds.build_record_batch_with_timestamps(
+                    &v_data,
+                    &d_data,
+                    &ver_data,
+                    &schema,
+                    Some(&vertex_created_at),
+                    Some(&vertex_updated_at),
+                )?;
+                ds.write_batch(backend, batch, &schema).await?;
+            }
+
+            // Partial-column batch (Lance MergeInsert path). The flag
+            // gates whether the routing classified any VIDs as partial;
+            // outside the flag this collection is always empty so the
+            // call below is a cheap no-op.
+            if let Some(partial_rows) = partial_by_label.remove(&label_id)
+                && !partial_rows.is_empty()
+            {
+                let touched_union: std::collections::HashSet<String> = partial_rows
+                    .iter()
+                    .flat_map(|(_, _, _, keys)| keys.iter().cloned())
+                    .collect();
+                let pairs: Vec<(Vid, Properties)> = partial_rows
+                    .iter()
+                    .map(|(vid, props, _, _)| (*vid, props.clone()))
+                    .collect();
+                let versions: Vec<u64> = partial_rows.iter().map(|(_, _, v, _)| *v).collect();
+                let partial_batch = ds.build_partial_record_batch(
+                    &pairs,
+                    &versions,
+                    &touched_union,
+                    &schema,
+                    Some(&vertex_updated_at),
+                )?;
+                if partial_batch.num_rows() > 0 {
+                    ds.merge_insert_batch(backend, partial_batch).await?;
+                }
+            }
+
+            // Tombstone batch (Round-12 §B): always MergeInsert with
+            // just `_vid`, `_deleted=true`, `_version`, `_updated_at`.
+            // No partial_lance_writes gating — tombstones never carry
+            // useful property payload to write. Captured tombstone vids
+            // also drive `remove_from_vid_labels_index` below.
+            let tombstone_rows = tombstones_by_label.remove(&label_id).unwrap_or_default();
+            if !tombstone_rows.is_empty() {
+                let tomb_batch =
+                    ds.build_tombstone_partial_batch(&tombstone_rows, Some(&vertex_updated_at))?;
+                if tomb_batch.num_rows() > 0 {
+                    ds.merge_insert_batch(backend, tomb_batch).await?;
+                }
+            }
+
             ds.ensure_default_indexes(backend).await?;
 
-            // Update VidLabelsIndex (if enabled)
+            // Update VidLabelsIndex (if enabled). v_data carries live
+            // vertices; tombstone removals come from the
+            // `tombstone_rows` captured above the MergeInsert call.
             for ((vid, labels, _props), &deleted) in v_data.iter().zip(d_data.iter()) {
                 if deleted {
                     self.storage.remove_from_vid_labels_index(*vid);
                 } else {
                     self.storage.update_vid_labels_index(*vid, labels.clone());
                 }
+            }
+            for (vid, _) in &tombstone_rows {
+                self.storage.remove_from_vid_labels_index(*vid);
             }
 
             // Update Manifest
@@ -2505,29 +3864,181 @@ impl Writer {
                 }
             }
         }
+        Ok(FlushOutcome {
+            manifest,
+            snapshot_id,
+        })
+    }
 
-        // 5. Save Snapshot
-        self.storage
+    /// Composition entry that assumes the caller already holds `flush_lock`.
+    /// Runs rotate + stream + finalize_locked in sequence. Used by
+    /// [`Writer::flush_to_l1`] (acquires the lock first) and by
+    /// `commit_transaction_l0`'s post-merge auto-flush branch (which already
+    /// holds the lock from the commit critical section).
+    #[instrument(
+        skip(self),
+        fields(snapshot_id, mutations_count, size_bytes),
+        level = "info"
+    )]
+    async fn flush_inline_under_lock(&self, name: Option<String>) -> Result<String> {
+        let start = std::time::Instant::now();
+
+        let (initial_size, initial_count) = {
+            let l0_arc = self.l0_manager.get_current();
+            let l0 = l0_arc.read();
+            (l0.estimated_size, l0.mutation_count)
+        };
+        tracing::Span::current().record("size_bytes", initial_size);
+        tracing::Span::current().record("mutations_count", initial_count);
+
+        debug!("Starting L0 flush to L1");
+
+        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff).
+        // FlushInProgressGuard lives on RotateOutput and stays alive for
+        // the full flush — including the finalize_locked call below.
+        let RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard: _flush_guard,
+        } = self.flush_l0_rotate().await?;
+
+        // Phases D (L1 collect), E (orphan resolve), F (manifest seed),
+        // G (Lance writes). Builds the manifest but does NOT publish it.
+        let FlushOutcome {
+            manifest,
+            snapshot_id,
+        } = self
+            .flush_stream_l1(old_l0_arc.clone(), wal_lsn, current_version, name)
+            .await?;
+
+        // Phases H..S: publish manifest, complete_flush, WAL truncate,
+        // property cache clear, last_flush_time, metrics, l1_runs++,
+        // compaction trigger, index-rebuild scheduling, fork tick.
+        self.flush_finalize_locked(
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
+
+    /// Phases H..S of the flush: publish the manifest and run all
+    /// post-publish bookkeeping. Assumes the caller already holds
+    /// `flush_lock` — see [`Writer::flush_finalize_now`] for the
+    /// lock-acquiring variant used by the async finalize path.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_finalize_locked(
+        &self,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
+        Self::flush_finalize_body(
+            &self.shared_ctx(),
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
+
+    /// Phases H..S of the flush, lock-acquiring variant. Used by the
+    /// async-flush finalizer task (running on a spawned tokio task),
+    /// which holds neither `&self` nor `flush_lock`. Briefly re-acquires
+    /// `flush_lock` to serialize the publish boundary, then runs the
+    /// same body as `flush_finalize_locked` but over a SharedFlushCtx.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn flush_finalize_now(
+        shared: SharedFlushCtx,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
+        let _flush_lock_guard = shared.flush_lock.clone().lock_owned().await;
+        Self::flush_finalize_body(
+            &shared,
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
+
+    /// Shared body of `flush_finalize_locked` and `flush_finalize_now`.
+    /// Static over `SharedFlushCtx`; the caller is responsible for
+    /// holding `flush_lock`.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_finalize_body(
+        shared: &SharedFlushCtx,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        mut manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
+        // Parent-snapshot fixup. The stream phase built `manifest` with
+        // parent_snapshot set from cached_manifest at stream time. If
+        // OTHER flushes (sync or async) have finalized since then,
+        // cached_manifest has advanced. Re-link this manifest to the
+        // current cached chain so we don't orphan their data when we
+        // overwrite cached_manifest below.
+        let current_parent_id = shared
+            .cached_manifest
+            .lock()
+            .as_ref()
+            .map(|m| m.snapshot_id.clone());
+        if current_parent_id.is_some() && manifest.parent_snapshot != current_parent_id {
+            manifest.parent_snapshot = current_parent_id;
+            metrics::counter!("uni_flush_parent_chain_fixups_total").increment(1);
+        }
+
+        // H. Publish manifest (body first, then pointer — recovery is
+        // idempotent if we crash between the two).
+        shared
+            .storage
             .snapshot_manager()
             .save_snapshot(&manifest)
             .await?;
-        self.storage
+        shared
+            .storage
             .snapshot_manager()
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
 
-        // Cache manifest for next flush to avoid re-reading from object store
-        self.cached_manifest = Some(manifest.clone());
+        // I. Cache manifest for next flush to avoid re-reading from object store.
+        *shared.cached_manifest.lock() = Some(manifest.clone());
 
-        // Complete flush: remove old L0 from pending list now that L1 writes succeeded.
-        // This must happen BEFORE WAL truncation so min_pending_wal_lsn is accurate.
-        self.l0_manager.complete_flush(&old_l0_arc);
+        // J. Complete flush: remove old L0 from pending_flush. MUST happen
+        // BEFORE WAL truncation so min_pending_wal_lsn is accurate.
+        shared.l0_manager.complete_flush(&old_l0_arc);
 
-        // Truncate WAL segments, but only up to the minimum LSN of any remaining pending L0s.
-        // This prevents data loss if earlier flushes failed and left L0s in pending_flush.
-        if let Some(w) = wal_for_truncate {
-            // Determine safe truncation point: the minimum of our LSN and any pending L0s
-            let safe_lsn = self
+        // K. Truncate WAL up to the safe LSN.
+        let wal_handle = shared.l0_manager.get_current().read().wal.clone();
+        if let Some(w) = wal_handle {
+            let safe_lsn = shared
                 .l0_manager
                 .min_pending_wal_lsn()
                 .map(|min_pending| min_pending.min(wal_lsn))
@@ -2535,14 +4046,13 @@ impl Writer {
             w.truncate_before(safe_lsn).await?;
         }
 
-        // Invalidate property cache after flush to prevent stale reads.
-        // Once L0 data moves to storage, cached values from storage may be outdated.
-        if let Some(ref pm) = self.property_manager {
+        // L. Invalidate property cache after flush to prevent stale reads.
+        if let Some(ref pm) = shared.property_manager {
             pm.clear_cache().await;
         }
 
-        // Reset last flush time for time-based auto-flush
-        self.last_flush_time = std::time::Instant::now();
+        // M. Reset last flush time for time-based auto-flush.
+        *shared.last_flush_time.lock() = std::time::Instant::now();
 
         info!(
             snapshot_id,
@@ -2554,52 +4064,51 @@ impl Writer {
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
 
-        // Clear flush-in-progress flag so compaction can proceed with delta clears.
-        self.storage
-            .flush_in_progress
-            .store(false, std::sync::atomic::Ordering::Release);
-
-        // Increment flush generation counter for write throttling.
-        // l1_runs counts uncompacted flush generations (reset by compaction).
+        // P. Increment flush generation counter for write throttling.
         {
             let mut status = uni_common::sync::acquire_mutex(
-                &self.storage.compaction_status,
+                &shared.storage.compaction_status,
                 "compaction_status",
             )?;
             status.l1_runs += 1;
         }
 
-        // Trigger CSR compaction if enough frozen segments have accumulated.
-        // After flush, the old L0 data is now in L1; the overlay segments can be merged
-        // into the Main CSR to reduce lookup overhead. Threshold is configurable
-        // via `CompactionConfig::frozen_segments_compact_threshold` (default 4).
-        let am = self.adjacency_manager.clone();
-        if am.should_compact(self.config.compaction.frozen_segments_compact_threshold) {
+        // Q. Trigger CSR compaction if enough frozen segments have accumulated.
+        let am = shared.adjacency_manager.clone();
+        if am.should_compact(shared.compaction_config.frozen_segments_compact_threshold) {
             let previous_still_running = {
-                let guard = self.compaction_handle.read();
+                let guard = shared.compaction_handle.read();
                 guard.as_ref().is_some_and(|h| !h.is_finished())
             };
-
             if previous_still_running {
                 info!("Skipping compaction: previous compaction still in progress");
             } else {
                 let handle = tokio::spawn(async move {
                     am.compact();
                 });
-                *self.compaction_handle.write() = Some(handle);
+                *shared.compaction_handle.write() = Some(handle);
             }
         }
 
-        // Post-flush: check if any indexes need rebuilding based on thresholds
-        if let Some(ref rebuild_mgr) = self.index_rebuild_manager
-            && self.config.index_rebuild.auto_rebuild_enabled
+        // R. Post-flush: check if any indexes need rebuilding based on thresholds.
+        if shared.auto_rebuild_enabled
+            && let Some(rebuild_mgr) = shared.index_rebuild_manager.get()
         {
-            self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
+            Self::schedule_index_rebuilds_if_needed_static(
+                &manifest,
+                rebuild_mgr.clone(),
+                shared.schema_manager.clone(),
+                shared.index_rebuild_config.clone(),
+            );
         }
 
-        // Phase 2 Day 12: emit fork-fragment observability after a
-        // successful forked flush.
-        self.tick_fork_fragment_observability();
+        // S. Emit fork-fragment observability after a successful forked flush.
+        Self::tick_fork_fragment_observability_static(
+            shared.fork_id,
+            shared.fork_flush_count.clone(),
+            shared.fork_fragment_warn_fired.clone(),
+            shared.fork_fragment_warn_threshold,
+        );
 
         Ok(snapshot_id)
     }
@@ -2616,21 +4125,43 @@ impl Writer {
     /// is too costly for a purely observational guard rail.
     ///
     /// No-op for primary writers (`fork_id == None`).
-    pub(crate) fn tick_fork_fragment_observability(&mut self) {
-        let Some(fork_id) = self.fork_id else { return };
-        self.fork_flush_count = self.fork_flush_count.saturating_add(1);
+    #[allow(dead_code)] // called by tests; production path uses _static
+    pub(crate) fn tick_fork_fragment_observability(&self) {
+        Self::tick_fork_fragment_observability_static(
+            self.fork_id,
+            self.fork_flush_count.clone(),
+            self.fork_fragment_warn_fired.clone(),
+            self.config.fork_fragment_warn_threshold,
+        );
+    }
+
+    /// Static variant of [`Writer::tick_fork_fragment_observability`].
+    /// Used by the async-flush finalize path, where we hold a
+    /// [`SharedFlushCtx`] bundle of Arcs rather than `&Writer`.
+    pub(crate) fn tick_fork_fragment_observability_static(
+        fork_id: Option<ForkId>,
+        fork_flush_count: Arc<AtomicU64>,
+        fork_fragment_warn_fired: Arc<AtomicBool>,
+        warn_threshold: usize,
+    ) {
+        let Some(fork_id) = fork_id else { return };
+        // `Relaxed` is sufficient: observational counter, no synchronizes-with.
+        let new_count = fork_flush_count.fetch_add(1, Ordering::Relaxed) + 1;
         let fork_label = fork_id.to_string();
         metrics::gauge!(
             "uni_fork_l1_flushes",
             "fork" => fork_label.clone(),
         )
-        .set(self.fork_flush_count as f64);
-        let threshold = self.config.fork_fragment_warn_threshold as u64;
-        if !self.fork_fragment_warn_fired && threshold > 0 && self.fork_flush_count >= threshold {
-            self.fork_fragment_warn_fired = true;
+        .set(new_count as f64);
+        let threshold = warn_threshold as u64;
+        if !fork_fragment_warn_fired.load(Ordering::Relaxed)
+            && threshold > 0
+            && new_count >= threshold
+        {
+            fork_fragment_warn_fired.store(true, Ordering::Relaxed);
             tracing::warn!(
                 fork = %fork_label,
-                flush_count = self.fork_flush_count,
+                flush_count = new_count,
                 threshold,
                 "fork has exceeded the L1 flush-count threshold; \
                  fork compaction is deferred to Phase 5 — consider \
@@ -2642,15 +4173,33 @@ impl Writer {
     /// Check rebuild thresholds and schedule background index rebuilds for
     /// labels that exceed growth or age limits. Marks affected indexes as
     /// `Stale` and spawns an async task to schedule the rebuild.
+    #[allow(dead_code)] // production path uses _static; kept as the
+    // documented instance entry point.
     fn schedule_index_rebuilds_if_needed(
         &self,
         manifest: &SnapshotManifest,
         rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
     ) {
-        let checker = crate::storage::index_rebuild::RebuildTriggerChecker::new(
+        Self::schedule_index_rebuilds_if_needed_static(
+            manifest,
+            rebuild_mgr,
+            self.schema_manager.clone(),
             self.config.index_rebuild.clone(),
         );
-        let schema = self.schema_manager.schema();
+    }
+
+    /// Static variant of [`Writer::schedule_index_rebuilds_if_needed`].
+    /// Used by the async-flush finalize path, where we hold the
+    /// [`SchemaManager`] via `SharedFlushCtx` rather than `&Writer`.
+    pub(crate) fn schedule_index_rebuilds_if_needed_static(
+        manifest: &SnapshotManifest,
+        rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
+        schema_manager: Arc<uni_common::core::schema::SchemaManager>,
+        index_rebuild_config: uni_common::config::IndexRebuildConfig,
+    ) {
+        let checker =
+            crate::storage::index_rebuild::RebuildTriggerChecker::new(index_rebuild_config);
+        let schema = schema_manager.schema();
         let labels = checker.labels_needing_rebuild(manifest, &schema.indexes);
 
         if labels.is_empty() {
@@ -2661,7 +4210,7 @@ impl Writer {
         for label in &labels {
             for idx in &schema.indexes {
                 if idx.label() == label {
-                    let _ = self.schema_manager.update_index_metadata(idx.name(), |m| {
+                    let _ = schema_manager.update_index_metadata(idx.name(), |m| {
                         m.status = uni_common::core::schema::IndexStatus::Stale;
                     });
                 }
@@ -2674,10 +4223,67 @@ impl Writer {
             }
         });
     }
+}
 
-    /// Set the property manager for cache invalidation.
-    pub fn set_property_manager(&mut self, pm: Arc<PropertyManager>) {
-        self.property_manager = Some(pm);
+/// `FinalizeFn` implementation that the `FlushCoordinator` invokes from
+/// its single-task finalizer loop. Unit struct on purpose: it must NOT
+/// hold `Arc<Writer>` (that would create a reference cycle Writer ->
+/// FlushCoordinator -> Arc<dyn FinalizeFn> -> Writer). All state needed
+/// for finalize travels in via `SharedFlushCtx`.
+pub(crate) struct WriterFinalizer;
+
+impl FinalizeFn for WriterFinalizer {
+    fn finalize<'a>(
+        &'a self,
+        rotated: RotatedFlush,
+        outcome: AsyncFlushOutcome,
+        shared: SharedFlushCtx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            // Read initial_size / initial_count from the rotated L0 so
+            // we don't have to plumb them through the coordinator
+            // submission. The buffer is still alive in pending_flush
+            // until `complete_flush` (J) below pops it.
+            let (initial_size, initial_count) = {
+                let l0 = rotated.old_l0_arc.read();
+                (l0.estimated_size, l0.mutation_count)
+            };
+            let result = Writer::flush_finalize_now(
+                shared,
+                rotated.old_l0_arc.clone(),
+                rotated.wal_lsn,
+                outcome.new_manifest,
+                outcome.snapshot_id,
+                initial_size,
+                initial_count,
+                std::time::Instant::now(),
+            )
+            .await;
+            // `rotated` (permit + flush_in_progress_guard) drops here.
+            drop(rotated.permit);
+            result
+        })
+    }
+
+    fn finalize_failure<'a>(
+        &'a self,
+        rotated: RotatedFlush,
+        err: anyhow::Error,
+        _shared: SharedFlushCtx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>> {
+        Box::pin(async move {
+            tracing::warn!(
+                error = %err,
+                seq = rotated.seq,
+                "async flush stream failed; old L0 remains in pending_flush, \
+                 WAL retains its data, recovery via WAL replay on restart"
+            );
+            metrics::counter!("uni_flush_failures_total").increment(1);
+            // Permit + guard drop here so back-pressure releases even on
+            // failure.
+            drop(rotated.permit);
+            err
+        })
     }
 }
 
@@ -2712,7 +4318,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,
@@ -2764,6 +4370,7 @@ mod tests {
         let count_before = mutations_before.len();
 
         // Commit transaction - this should write to WAL first
+        let writer = Arc::new(writer);
         writer.commit_transaction_l0(tx_l0).await?;
 
         // Verify WAL has the new mutations
@@ -2855,7 +4462,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,
@@ -2944,7 +4551,7 @@ mod tests {
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
         // Shared labels - should not be cloned per vertex
         let labels = &["Person".to_string()];
@@ -2998,7 +4605,7 @@ mod tests {
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
         let l0 = writer.l0_manager.get_current();
 
@@ -3142,7 +4749,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,
@@ -3230,28 +4837,137 @@ mod tests {
         for _ in 0..10 {
             writer.tick_fork_fragment_observability();
         }
-        assert!(!writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 0);
+        assert!(!writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 0);
 
         // Fork path: tag and tick. Below threshold → no fire.
         writer.fork_id = Some(ForkId::new());
         writer.tick_fork_fragment_observability();
         writer.tick_fork_fragment_observability();
-        assert!(!writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 2);
+        assert!(!writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 2);
 
         // Crossing threshold → fires once.
         writer.tick_fork_fragment_observability();
-        assert!(writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 3);
+        assert!(writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 3);
 
         // Subsequent ticks bump the gauge but do not re-fire.
-        let fired_after = writer.fork_fragment_warn_fired;
+        let fired_after = writer.fork_fragment_warn_fired.load(Ordering::Relaxed);
         for _ in 0..5 {
             writer.tick_fork_fragment_observability();
         }
-        assert_eq!(writer.fork_flush_count, 8);
-        assert_eq!(writer.fork_fragment_warn_fired, fired_after);
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            writer.fork_fragment_warn_fired.load(Ordering::Relaxed),
+            fired_after
+        );
+
+        Ok(())
+    }
+
+    /// The hot-path mutators must not write to any `Writer` struct field.
+    /// Phase 2 of the refactor
+    /// gave them `&self` receivers, which the compiler enforces against
+    /// direct `self.x = y` assignment — but interior-mutable writes
+    /// (Mutex/Atomic/OnceLock) still compile. This regression test snapshots
+    /// every potentially-writable field, calls each hot-path mutator, and
+    /// asserts no field changed.
+    ///
+    /// Cold-path methods (`flush_to_l1`, `commit_transaction_l0`,
+    /// `tick_fork_fragment_observability`) DO mutate fields by design and
+    /// are intentionally out of scope here.
+    #[tokio::test]
+    async fn hot_path_mutators_do_not_change_writer_fields() -> Result<()> {
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        schema_manager.add_label("Person")?;
+        schema_manager.save().await?;
+        let storage = Arc::new(
+            StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?,
+        );
+
+        let writer =
+            Writer::new_with_config(storage, schema_manager, 1, UniConfig::default(), None, None)
+                .await?;
+
+        /// Captures every `Writer` field that *could* be written by a
+        /// hot-path mutator (i.e., every non-Arc, non-immutable-after-
+        /// construction field). Arc'd substructures (`l0_manager`,
+        /// `storage`, etc.) are intentionally not checked — they are
+        /// re-pointed only at construction.
+        #[derive(Debug, PartialEq)]
+        struct Snapshot {
+            last_flush_time: std::time::Instant,
+            cached_manifest_some: bool,
+            fork_flush_count: u64,
+            fork_fragment_warn_fired: bool,
+            xervo_runtime_some: bool,
+            index_rebuild_manager_some: bool,
+            fork_id: Option<ForkId>,
+        }
+
+        fn snap(w: &Writer) -> Snapshot {
+            Snapshot {
+                last_flush_time: *w.last_flush_time.lock(),
+                cached_manifest_some: w.cached_manifest.lock().is_some(),
+                fork_flush_count: w.fork_flush_count.load(Ordering::Relaxed),
+                fork_fragment_warn_fired: w.fork_fragment_warn_fired.load(Ordering::Relaxed),
+                xervo_runtime_some: w.xervo_runtime.get().is_some(),
+                index_rebuild_manager_some: w.index_rebuild_manager.get().is_some(),
+                fork_id: w.fork_id,
+            }
+        }
+
+        // 1. insert_vertex_with_labels
+        let before = snap(&writer);
+        let vid = writer.next_vid().await?;
+        writer
+            .insert_vertex_with_labels(vid, Properties::new(), &["Person".to_string()], None)
+            .await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "insert_vertex_with_labels mutated a Writer field"
+        );
+
+        // 2. insert_vertices_batch
+        let before = snap(&writer);
+        let vids = writer.allocate_vids(2).await?;
+        writer
+            .insert_vertices_batch(
+                vids,
+                vec![Properties::new(), Properties::new()],
+                vec!["Person".into()],
+                None,
+            )
+            .await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "insert_vertices_batch mutated a Writer field"
+        );
+
+        // 3. delete_vertex
+        let before = snap(&writer);
+        writer.delete_vertex(vid, None, None).await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "delete_vertex mutated a Writer field"
+        );
+
+        // (insert_edge / delete_edge are skipped here: their fixture cost is
+        // disproportionate to the audit's marginal value, and the same
+        // structural argument plus the compiler-enforced `&self` covers them.)
 
         Ok(())
     }

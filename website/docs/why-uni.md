@@ -32,31 +32,57 @@ Strip away the tooling and look at what agents actually lack. There are five gap
 
 Vector stores capture meaning but lose relationships. Graph databases capture relationships but don't embed. An agent that needs both — and they all do — ends up maintaining two systems with two data models and no unified query path. Knowledge gets fragmented across storage backends, and the agent loses the ability to ask questions that span both structure and semantics.
 
-[How Uni closes this gap →](index.md#structured-memory)
+[How Uni closes this gap →](#structured-memory)
 
 ### 2. No Associative Recall
 
 Retrieval today forces a choice: search by meaning (vectors) or search by structure (graph traversal) or search by keyword (full-text). But cognition doesn't work that way. An agent diagnosing a production incident needs to find components *semantically similar* to the failing one, then traverse dependency edges to find upstream causes, then filter by keyword for the specific error signature. That's one thought, not three queries to three systems.
 
-[How Uni closes this gap →](index.md#associative-recall)
+[How Uni closes this gap →](#associative-recall)
 
 ### 3. No Domain Physics
 
 Chain-of-thought prompting generates tokens that *look* like reasoning but aren't formal inference. The LLM doesn't know your business rules — it hallucinates plausible ones. Real domain reasoning requires declared rules evaluated by a logic engine: if a supplier is high-risk AND they're a sole source, then the component is critical. That's not a prompt. That's a rule, and it needs to be deterministic, reproducible, and version-controlled.
 
-[How Uni closes this gap →](index.md#domain-physics)
+[How Uni closes this gap →](#domain-physics)
 
 ### 4. No Mental Simulation
 
 Agents act and hope. There's no way to ask "what if supplier X goes offline?" without actually changing the data, running the query, and then reverting. Real planning requires hypothetical reasoning — temporarily assuming facts, propagating consequences through rules, and inspecting the results — all without mutating the real state. Without this, agents can't plan. They can only react.
 
-[How Uni closes this gap →](index.md#mental-simulation)
+[How Uni closes this gap →](#mental-simulation)
 
 ### 5. No Explainable Decisions
 
 "The model said so" isn't auditable. When an agent recommends rejecting a loan, flagging a transaction, or rerouting a supply chain, someone needs to know *why*. Not a confidence score. Not an attention heatmap. A formal derivation chain: this conclusion follows from these rules applied to these facts. Today, that chain doesn't exist because the reasoning never happened — the LLM generated an answer that looked right.
 
-[How Uni closes this gap →](index.md#explainable-decisions)
+[How Uni closes this gap →](#explainable-decisions)
+
+---
+
+## How Uni Closes the Gaps
+
+Each gap above maps to one of Uni's five pillars. Here is the mechanism behind each.
+
+### Structured Memory
+
+Uni stores entities and relationships as a typed property graph and indexes their embeddings in the *same* engine — one data model, one query path. A node carries both its structural edges and its vectors, so there are no two stores to sync and no two schemas to reconcile. Query the structure with OpenCypher, run the built-in graph algorithms over it, and reach the same nodes by semantic similarity — without leaving the database.
+
+### Associative Recall
+
+Retrieval in Uni is one operation, not three. `uni.search` fuses vector similarity with BM25 full-text ranking (via rank fusion such as RRF), and because every hit is a graph node, you keep traversing dependency edges from there in the same query. Find the components semantically closest to a failing one, walk their upstream dependencies, then filter for an error signature — a single thought, expressed once.
+
+### Domain Physics
+
+Domain rules in Uni are *declared*, not prompted. You write them as Locy rules — recursive, with stratified negation — and a logic engine evaluates them deterministically: if a supplier is high-risk *and* sole-source, then the component is critical. The same facts always derive the same conclusions, the rules live in version control, and nothing is left to a model's guess.
+
+### Mental Simulation
+
+Uni lets an agent reason about what *hasn't* happened. An `ASSUME … THEN` block temporarily adds hypothetical facts, re-evaluates the rules over them, and returns the consequences — then rolls the change back, leaving the real graph untouched. Ask "what if supplier X goes offline?" and read the propagated impact without ever mutating state. Agents can plan, not just react.
+
+### Explainable Decisions
+
+Every derived conclusion in Uni carries its reasoning. `EXPLAIN RULE` returns a derivation tree — *this* fact holds because *these* rules fired over *these* base facts — so a recommendation rests on a formal proof chain, not a confidence score or an attention heatmap. And `ABDUCE` runs it backwards: given a desired outcome, it derives which facts would have to change to make it true. The decision is auditable — and so is the path to a different one.
 
 ---
 

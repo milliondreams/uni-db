@@ -119,7 +119,7 @@ pub struct GraphScanExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Metrics for execution tracking.
     metrics: ExecutionPlanMetricsSet,
@@ -525,7 +525,7 @@ impl ExecutionPlan for GraphScanExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -678,6 +678,11 @@ pub(crate) fn resolve_property_type(
 ) -> DataType {
     if prop == "overflow_json" {
         DataType::LargeBinary
+    } else if prop == "_created_at" || prop == "_updated_at" {
+        // System-managed timestamps surfaced via `created_at(n)` /
+        // `updated_at(n)`. Stored on every vertex/edge by the L0 buffer
+        // and the on-disk Arrow tables as Timestamp(Nanosecond, UTC).
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
     } else {
         schema_props
             .and_then(|props| props.get(prop))
@@ -1260,18 +1265,27 @@ fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
 /// Merges L0 buffers in visibility order (pending_flush → current → transaction),
 /// with later buffers overwriting earlier ones for the same VID.
 ///
-/// When `target_vid` is `Some`, only that single VID is collected (direct HashMap
-/// lookup instead of iterating all VIDs for the label).
+/// When `target_vids` is `Some`, only those VIDs are collected (direct HashMap
+/// lookups instead of iterating all VIDs for the label). This must mirror the
+/// Lance-side VID pushdown — otherwise L0-only (unflushed) rows bypass the
+/// filter and the scan emits the full label table. See issue #72 item 1.
 fn build_l0_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     lance_schema: &SchemaRef,
     label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
-    target_vid: Option<u64>,
+    target_vids: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
     let mut tombstones: HashSet<u64> = HashSet::new();
+    // System-managed timestamps: created_at takes the earliest seen
+    // timestamp across L0 buffers (preserving the original creation
+    // moment when a row has been touched in multiple buffers); updated_at
+    // takes the latest (most recent write). Used by `created_at(n)` /
+    // `updated_at(n)` Cypher functions.
+    let mut vid_created_at: HashMap<u64, i64> = HashMap::new();
+    let mut vid_updated_at: HashMap<u64, i64> = HashMap::new();
 
     for l0 in l0_ctx.iter_l0_buffers() {
         let guard = l0.read();
@@ -1279,21 +1293,26 @@ fn build_l0_vertex_batch(
         for vid in guard.vertex_tombstones.iter() {
             tombstones.insert(vid.as_u64());
         }
-        // Collect vertices — either a single target or all for the label
-        let candidate_vids: Vec<Vid> = if let Some(tv) = target_vid {
-            let vid = Vid::from(tv);
-            // Only include if this VID exists in this L0 buffer and has the right label
-            if guard.vertex_properties.contains_key(&vid)
-                && (label.is_empty()
-                    || guard
-                        .label_to_vids
-                        .get(label)
-                        .is_some_and(|s| s.contains(&vid)))
-            {
-                vec![vid]
-            } else {
-                vec![]
+        // Collect vertices — restrict to target_vids (single- or multi-VID
+        // pushdown from id(x) = ? / id(x) IN [...]) when set, else all
+        // vertices for the label. See issue #72 item 1: without this filter,
+        // freshly-inserted L0 rows bypass the IN-list pushdown that Lance
+        // already honors, defeating the optimization.
+        let candidate_vids: Vec<Vid> = if let Some(tvs) = target_vids {
+            let mut out = Vec::with_capacity(tvs.len());
+            for &tv in tvs {
+                let vid = Vid::from(tv);
+                if guard.vertex_properties.contains_key(&vid)
+                    && (label.is_empty()
+                        || guard
+                            .label_to_vids
+                            .get(label)
+                            .is_some_and(|s| s.contains(&vid)))
+                {
+                    out.push(vid);
+                }
             }
+            out
         } else {
             guard.vids_for_label(label)
         };
@@ -1315,6 +1334,27 @@ fn build_l0_vertex_batch(
             // Take the highest version
             if version > entry.1 {
                 entry.1 = version;
+            }
+            // Merge system timestamps: earliest creation, latest update
+            if let Some(&ts) = guard.vertex_created_at.get(&vid) {
+                vid_created_at
+                    .entry(vid_u64)
+                    .and_modify(|cur| {
+                        if ts < *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+            }
+            if let Some(&ts) = guard.vertex_updated_at.get(&vid) {
+                vid_updated_at
+                    .entry(vid_u64)
+                    .and_modify(|cur| {
+                        if ts > *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
             }
         }
     }
@@ -1354,6 +1394,28 @@ fn build_l0_vertex_batch(
             "_version" => {
                 let vals: Vec<u64> = vids.iter().map(|v| vid_data[v].1).collect();
                 columns.push(Arc::new(UInt64Array::from(vals)));
+            }
+            "_created_at" => {
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
+                for v in &vids {
+                    match vid_created_at.get(v) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "_updated_at" => {
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
+                for v in &vids {
+                    match vid_updated_at.get(v) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
             }
             "overflow_json" => {
                 // Collect non-schema properties as CypherValue
@@ -1427,6 +1489,10 @@ fn build_l0_edge_batch(
     // eid -> (src_vid, dst_vid, properties, version)
     let mut eid_data: HashMap<u64, (u64, u64, Properties, u64)> = HashMap::new();
     let mut tombstones: HashSet<u64> = HashSet::new();
+    // System-managed timestamps: earliest creation, latest update.
+    // See `build_l0_vertex_batch` for the rationale.
+    let mut eid_created_at: HashMap<u64, i64> = HashMap::new();
+    let mut eid_updated_at: HashMap<u64, i64> = HashMap::new();
 
     for l0 in l0_ctx.iter_l0_buffers() {
         let guard = l0.read();
@@ -1460,6 +1526,27 @@ fn build_l0_edge_batch(
             // Take the highest version
             if version > entry.3 {
                 entry.3 = version;
+            }
+            // Merge system timestamps
+            if let Some(&ts) = guard.edge_created_at.get(&eid) {
+                eid_created_at
+                    .entry(eid_u64)
+                    .and_modify(|cur| {
+                        if ts < *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+            }
+            if let Some(&ts) = guard.edge_updated_at.get(&eid) {
+                eid_updated_at
+                    .entry(eid_u64)
+                    .and_modify(|cur| {
+                        if ts > *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
             }
         }
     }
@@ -1507,6 +1594,28 @@ fn build_l0_edge_batch(
             "_version" => {
                 let vals: Vec<u64> = eids.iter().map(|e| eid_data[e].3).collect();
                 columns.push(Arc::new(UInt64Array::from(vals)));
+            }
+            "_created_at" => {
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
+                for e in &eids {
+                    match eid_created_at.get(e) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "_updated_at" => {
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
+                for e in &eids {
+                    match eid_updated_at.get(e) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
             }
             "overflow_json" => {
                 // Collect non-schema properties as CypherValue
@@ -1884,6 +1993,10 @@ async fn columnar_scan_vertex_batch_static(
     for prop in projected_properties {
         if prop == "overflow_json" {
             push_column_if_absent(&mut lance_columns, "overflow_json");
+        } else if prop == "_created_at" || prop == "_updated_at" {
+            // System-managed timestamps live on every vertex table regardless
+            // of label schema. Request them directly from Lance.
+            push_column_if_absent(&mut lance_columns, prop);
         } else {
             let exists_in_schema = label_props.is_some_and(|lp| lp.contains_key(prop));
             if exists_in_schema {
@@ -1893,9 +2006,12 @@ async fn columnar_scan_vertex_batch_static(
     }
 
     // Ensure overflow_json is present when any projected property is not in the schema
-    let needs_overflow = projected_properties
-        .iter()
-        .any(|p| p == "overflow_json" || !label_props.is_some_and(|lp| lp.contains_key(p)));
+    // (excluding system-managed columns like `_created_at` / `_updated_at`).
+    let needs_overflow = projected_properties.iter().any(|p| {
+        p == "overflow_json"
+            || (!matches!(p.as_str(), "_created_at" | "_updated_at")
+                && !label_props.is_some_and(|lp| lp.contains_key(p)))
+    });
     if needs_overflow {
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
@@ -1911,10 +2027,57 @@ async fn columnar_scan_vertex_batch_static(
     };
     let combined_filter = combine_lance_filters(vid_part.as_deref(), extra_lance_filter);
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
-    let lance_batch = storage
-        .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // M5h.2: route through plugin Storage if one is registered for
+    // this label. v1 ships reads only — writes still go to native
+    // backend. v1 ignores `combined_filter` when delegating (the
+    // planner re-filters via the surrounding Filter node); per-plugin
+    // filter pushdown is a v1.1 follow-up (`TODO(M5h.2-filter)`).
+    let plugin_batch: Option<arrow::record_batch::RecordBatch> = match graph_ctx.plugin_registry() {
+        Some(reg) => match reg.lookup_label_storage(label) {
+            Some(plugin_storage) => {
+                let mut stream = plugin_storage.read_batch(label, None).await.map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "plugin Storage::read_batch({label}) failed: {} (code 0x{:x})",
+                        e.message, e.code
+                    ))
+                })?;
+                use futures::StreamExt;
+                let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+                let mut schema_ref: Option<SchemaRef> = None;
+                while let Some(b) = stream.next().await {
+                    let b = b.map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "plugin Storage stream({label}) errored: {e}"
+                        ))
+                    })?;
+                    if schema_ref.is_none() {
+                        schema_ref = Some(b.schema());
+                    }
+                    batches.push(b);
+                }
+                if let Some(s) = schema_ref {
+                    Some(arrow::compute::concat_batches(&s, &batches).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "plugin Storage concat({label}) failed: {e}"
+                        ))
+                    })?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        },
+        None => None,
+    };
+
+    let lance_batch = match plugin_batch {
+        Some(b) => Some(b),
+        None => storage
+            .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+    };
 
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;
@@ -1935,6 +2098,12 @@ async fn columnar_scan_vertex_batch_static(
                 }
                 if col == "overflow_json" {
                     fields.push(Field::new("overflow_json", DataType::LargeBinary, true));
+                } else if col == "_created_at" || col == "_updated_at" {
+                    fields.push(Field::new(
+                        col,
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ));
                 } else {
                     let arrow_type = label_props
                         .and_then(|lp| lp.get(col.as_str()))
@@ -1947,8 +2116,22 @@ async fn columnar_scan_vertex_batch_static(
         }
     };
 
-    // Build L0 batch
-    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, target_vid)?;
+    // Build L0 batch. Prefer the multi-VID list when present (IN-list pushdown
+    // from issue #55 PR #4 — must restrict L0 to the same VID set Lance was
+    // filtered against, see issue #72 item 1). Fall back to single-VID
+    // (`id(x) = $literal` short-circuit). One-element buffer keeps the
+    // borrowed slice alive for the single-VID case.
+    let single_vid_buf: [u64; 1];
+    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(vs),
+        (_, Some(v)) => {
+            single_vid_buf = [v];
+            Some(&single_vid_buf)
+        }
+        _ => None,
+    };
+    let l0_batch =
+        build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -2041,6 +2224,9 @@ async fn columnar_scan_edge_batch_static(
     for prop in projected_properties {
         if prop == "overflow_json" {
             push_column_if_absent(&mut lance_columns, "overflow_json");
+        } else if prop == "_created_at" || prop == "_updated_at" {
+            // System-managed timestamps live on every edge table.
+            push_column_if_absent(&mut lance_columns, prop);
         } else {
             let exists_in_schema = type_props.is_some_and(|tp| tp.contains_key(prop));
             if exists_in_schema {
@@ -2050,9 +2236,12 @@ async fn columnar_scan_edge_batch_static(
     }
 
     // Ensure overflow_json is present when any projected property is not in the schema
-    let needs_overflow = projected_properties
-        .iter()
-        .any(|p| p == "overflow_json" || !type_props.is_some_and(|tp| tp.contains_key(p)));
+    // (excluding system-managed columns like `_created_at` / `_updated_at`).
+    let needs_overflow = projected_properties.iter().any(|p| {
+        p == "overflow_json"
+            || (!matches!(p.as_str(), "_created_at" | "_updated_at")
+                && !type_props.is_some_and(|tp| tp.contains_key(p)))
+    });
     if needs_overflow {
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
@@ -2088,6 +2277,12 @@ async fn columnar_scan_edge_batch_static(
                 }
                 if col == "overflow_json" {
                     fields.push(Field::new("overflow_json", DataType::LargeBinary, true));
+                } else if col == "_created_at" || col == "_updated_at" {
+                    fields.push(Field::new(
+                        col,
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ));
                 } else {
                     let arrow_type = type_props
                         .and_then(|tp| tp.get(col.as_str()))
@@ -2213,8 +2408,20 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         ])),
     };
 
-    // Build L0 batch
-    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, target_vid)?;
+    // Build L0 batch. Prefer the multi-VID list when present (IN-list pushdown
+    // from issue #55 PR #4 — must restrict L0 to match Lance filtering, see
+    // issue #72 item 1). Fall back to single-VID.
+    let single_vid_buf: [u64; 1];
+    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(vs),
+        (_, Some(v)) => {
+            single_vid_buf = [v];
+            Some(&single_vid_buf)
+        }
+        _ => None,
+    };
+    let l0_batch =
+        build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -2257,7 +2464,7 @@ fn build_l0_schemaless_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     internal_schema: &SchemaRef,
-    target_vid: Option<u64>,
+    target_vids: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     // vid -> (merged_props, highest_version, labels)
@@ -2281,12 +2488,15 @@ fn build_l0_schemaless_vertex_batch(
             tombstones.insert(vid.as_u64());
         }
 
-        // Collect VIDs matching the label filter — short-circuit when target_vid is set
-        let vids: Vec<Vid> = if let Some(tv) = target_vid {
-            let vid = Vid::from(tv);
-            // Only include if this VID exists in this L0 buffer
-            if guard.vertex_properties.contains_key(&vid) {
-                // Check label filter if applicable
+        // Collect VIDs matching the label filter — short-circuit when target_vids is set
+        // (see issue #72 item 1; multi-VID IN-list must filter L0 too).
+        let vids: Vec<Vid> = if let Some(tvs) = target_vids {
+            let mut out = Vec::with_capacity(tvs.len());
+            for &tv in tvs {
+                let vid = Vid::from(tv);
+                if !guard.vertex_properties.contains_key(&vid) {
+                    continue;
+                }
                 let label_ok = if label_filter.is_empty() {
                     true
                 } else if let Some(labels) = guard.vertex_labels.get(&vid) {
@@ -2296,10 +2506,11 @@ fn build_l0_schemaless_vertex_batch(
                 } else {
                     false
                 };
-                if label_ok { vec![vid] } else { vec![] }
-            } else {
-                vec![]
+                if label_ok {
+                    out.push(vid);
+                }
             }
+            out
         } else if label_filter.is_empty() {
             guard.all_vertex_vids()
         } else if label_filter.len() == 1 {
@@ -3443,6 +3654,8 @@ impl Stream for GraphScanStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             // Use a temporary to avoid borrow issues
             let state = std::mem::replace(&mut self.state, GraphScanState::Done);

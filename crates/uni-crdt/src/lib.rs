@@ -9,6 +9,7 @@ pub mod gset;
 pub mod lww_map;
 pub mod lww_register;
 pub mod orset;
+pub mod registry_dispatch;
 pub mod rga;
 pub mod vc_register;
 pub mod vector_clock;
@@ -60,76 +61,69 @@ pub enum Crdt {
     VCRegister(VCRegister<serde_json::Value>),
 }
 
-impl Crdt {
-    /// Try to merge another CRDT into this one.
-    /// Returns an error if the types don't match.
-    /// This is the safe, non-panicking version of merge.
-    pub fn try_merge(&mut self, other: &Self) -> Result<(), CrdtError> {
-        match (self, other) {
-            (Crdt::GCounter(a), Crdt::GCounter(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::GSet(a), Crdt::GSet(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::ORSet(a), Crdt::ORSet(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::LWWRegister(a), Crdt::LWWRegister(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::LWWMap(a), Crdt::LWWMap(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::Rga(a), Crdt::Rga(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::VectorClock(a), Crdt::VectorClock(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (Crdt::VCRegister(a), Crdt::VCRegister(b)) => {
-                a.merge(b);
-                Ok(())
-            }
-            (a, b) => Err(CrdtError::TypeMismatch(
-                format!("{:?}", std::mem::discriminant(a)),
-                format!("{:?}", std::mem::discriminant(b)),
-            )),
+/// Single source of truth for the `Crdt` variant table.
+///
+/// Expands a passed-in `$mac` over the rows
+/// `<Variant> => <type_name_str> => <registry_kind_str>`. Every consumer
+/// of the variant set — `try_merge`, `type_name`, and
+/// `registry_dispatch::Crdt::kind` — drives off this list, so adding a
+/// new CRDT means editing exactly one place.
+#[macro_export]
+macro_rules! for_each_crdt_variant {
+    ($mac:ident) => {
+        $mac! {
+            GCounter    => "GCounter"    => "uni-crdt:g-counter",
+            GSet        => "GSet"        => "uni-crdt:g-set",
+            ORSet       => "ORSet"       => "uni-crdt:or-set",
+            LWWRegister => "LWWRegister" => "uni-crdt:lww-register",
+            LWWMap      => "LWWMap"      => "uni-crdt:lww-map",
+            Rga         => "Rga"         => "uni-crdt:rga",
+            VectorClock => "VectorClock" => "uni-crdt:vector-clock",
+            VCRegister  => "VCRegister"  => "uni-crdt:vc-register",
         }
-    }
-
-    /// Returns the type name of this CRDT variant for error messages.
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Crdt::GCounter(_) => "GCounter",
-            Crdt::GSet(_) => "GSet",
-            Crdt::ORSet(_) => "ORSet",
-            Crdt::LWWRegister(_) => "LWWRegister",
-            Crdt::LWWMap(_) => "LWWMap",
-            Crdt::Rga(_) => "Rga",
-            Crdt::VectorClock(_) => "VectorClock",
-            Crdt::VCRegister(_) => "VCRegister",
-        }
-    }
+    };
 }
+
+macro_rules! try_merge_body {
+    ($($variant:ident => $type_name:literal => $kind:literal,)*) => {
+        impl Crdt {
+            /// Try to merge another CRDT into this one.
+            /// Returns an error if the types don't match.
+            /// This is the safe, non-panicking version of merge.
+            pub fn try_merge(&mut self, other: &Self) -> Result<(), CrdtError> {
+                match (self, other) {
+                    $(
+                        (Crdt::$variant(a), Crdt::$variant(b)) => a.merge(b),
+                    )*
+                    (a, b) => {
+                        return Err(CrdtError::TypeMismatch(
+                            a.type_name().to_owned(),
+                            b.type_name().to_owned(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+
+            /// Returns the type name of this CRDT variant for error messages.
+            pub fn type_name(&self) -> &'static str {
+                match self {
+                    $(
+                        Crdt::$variant(_) => $type_name,
+                    )*
+                }
+            }
+        }
+    };
+}
+for_each_crdt_variant!(try_merge_body);
 
 impl CrdtMerge for Crdt {
     /// Merge another CRDT into this one.
     /// Panics if the types don't match. For a non-panicking version, use `try_merge`.
     fn merge(&mut self, other: &Self) {
         if let Err(e) = self.try_merge(other) {
-            panic!(
-                "Cannot merge different CRDT types: {} and {} ({e})",
-                self.type_name(),
-                other.type_name()
-            );
+            panic!("CRDT merge failed: {e}");
         }
     }
 }
@@ -160,5 +154,22 @@ mod tests {
         let decoded = Crdt::from_msgpack(&bytes).unwrap();
 
         assert_eq!(crdt, decoded);
+    }
+
+    #[test]
+    fn try_merge_type_mismatch_surfaces_readable_names() {
+        // Regression: previously formatted via `mem::discriminant`, producing
+        // opaque `Discriminant(...)` strings. Both names should now be the
+        // same human-readable identifiers `type_name()` returns.
+        let mut a = Crdt::GCounter(GCounter::new());
+        let b = Crdt::GSet(GSet::new());
+        let err = a.try_merge(&b).expect_err("type mismatch must error");
+        match err {
+            CrdtError::TypeMismatch(left, right) => {
+                assert_eq!(left, "GCounter");
+                assert_eq!(right, "GSet");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 }

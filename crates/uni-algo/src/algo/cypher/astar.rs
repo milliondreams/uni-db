@@ -5,11 +5,12 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{AStar, AStarConfig, Algorithm};
+use crate::algo::procedure_template::{arg_str, err_stream, parse_vid_arg};
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::Result;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uni_common::core::id::Vid;
@@ -37,7 +38,11 @@ impl AlgoProcedure for AStarProcedure {
         }
     }
 
-    fn execute(
+    fn wants_native_terminals(&self) -> bool {
+        true
+    }
+
+    fn execute_with_native_terminals(
         &self,
         ctx: AlgoContext,
         args: Vec<Value>,
@@ -45,26 +50,23 @@ impl AlgoProcedure for AStarProcedure {
         let signature = self.signature();
         let args = match signature.validate_args(args) {
             Ok(a) => a,
-            Err(e) => return stream::once(async { Err(e) }).boxed(),
+            Err(e) => return err_stream(e),
         };
 
-        let start_vid_u64 = match &args[0] {
-            Value::String(s) => s.parse::<u64>().unwrap_or_default(),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid start node")) }).boxed(),
+        // Parse every terminal up front; bad input now surfaces a clear
+        // error instead of the old `unwrap_or(0)` (silent vertex-0 routing)
+        // or `unwrap()` (panic).
+        let (start_vid, end_vid, edge_type, heuristic_prop) = match (|| {
+            Ok((
+                parse_vid_arg(&args[0], "startNode")?,
+                parse_vid_arg(&args[1], "endNode")?,
+                arg_str(&args, 2, "edgeType")?.to_string(),
+                arg_str(&args, 3, "heuristicProperty")?.to_string(),
+            ))
+        })() {
+            Ok(parsed) => parsed,
+            Err(e) => return err_stream(e),
         };
-
-        let end_vid_u64 = match &args[1] {
-            Value::String(s) => s.parse::<u64>().unwrap_or(0),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid end node")) }).boxed(),
-        };
-
-        let edge_type = args[2].as_str().unwrap().to_string();
-        let heuristic_prop = args[3].as_str().unwrap().to_string();
-
-        let start_vid = Vid::from(start_vid_u64);
-        let end_vid = Vid::from(end_vid_u64);
 
         let stream = async_stream::try_stream! {
             let schema = ctx.storage.schema_manager().schema();

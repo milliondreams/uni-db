@@ -1,0 +1,8 @@
+pub mod plugin_custom_declare;
+pub mod plugin_index_handle_dispatch;
+pub mod plugin_mid_pattern_virtual;
+pub mod plugin_native_label_storage;
+pub mod plugin_procedure_dispatch_test;
+pub mod plugin_replacement_scan_dispatch;
+pub mod plugin_storage_catalog;
+pub mod plugin_virtual_label_dispatch;

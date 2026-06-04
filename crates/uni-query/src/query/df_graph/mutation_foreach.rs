@@ -13,7 +13,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DFResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -56,7 +56,7 @@ pub struct ForeachExec {
     schema: SchemaRef,
 
     /// Plan properties for DataFusion optimizer.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -105,7 +105,7 @@ impl ExecutionPlan for ForeachExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -142,6 +142,7 @@ impl ExecutionPlan for ForeachExec {
         let list_expr = self.list_expr.clone();
         let body = self.body.clone();
         let mutation_ctx = self.mutation_ctx.clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
 
         let stream = futures::stream::once(execute_foreach_inner(
             input,
@@ -152,6 +153,7 @@ impl ExecutionPlan for ForeachExec {
             mutation_ctx,
             partition,
             context,
+            baseline,
         ))
         .try_flatten();
 
@@ -174,7 +176,10 @@ async fn execute_foreach_inner(
     mutation_ctx: Arc<MutationContext>,
     partition: usize,
     task_ctx: Arc<TaskContext>,
+    baseline: BaselineMetrics,
 ) -> DFResult<futures::stream::Iter<std::vec::IntoIter<DFResult<RecordBatch>>>> {
+    // Time the whole eager-barrier body. Timer records on Drop.
+    let _timer = baseline.elapsed_compute().timer();
     // 1. Collect all input batches (eager barrier)
     let input_stream = input.execute(partition, task_ctx)?;
     let input_batches: Vec<RecordBatch> = input_stream.try_collect().await?;
@@ -201,7 +206,7 @@ async fn execute_foreach_inner(
     let ctx = mutation_ctx.query_ctx.as_ref();
 
     let writer_lock = &mutation_ctx.writer;
-    let mut writer = writer_lock.write().await;
+    let writer: &uni_store::Writer = writer_lock.as_ref();
 
     for row in &rows {
         // Evaluate the list expression
@@ -229,7 +234,7 @@ async fn execute_foreach_inner(
                 exec.execute_foreach_body_plan(
                     plan.clone(),
                     &mut scope,
-                    &mut writer,
+                    writer,
                     pm,
                     params,
                     ctx,
@@ -241,8 +246,6 @@ async fn execute_foreach_inner(
         }
     }
 
-    drop(writer);
-
     tracing::debug!(
         variable = variable.as_str(),
         rows = input_row_count,
@@ -253,6 +256,8 @@ async fn execute_foreach_inner(
     // Reconstruct from rows in case the schema needs normalization
     let result_batches =
         rows_to_batches(&rows, &schema).map_err(|e| df_err("failed to reconstruct batches", &e))?;
+    let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    baseline.record_output(output_rows);
     let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();
     Ok(futures::stream::iter(results))
 }

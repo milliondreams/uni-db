@@ -53,7 +53,7 @@ pub struct BindFixedPathExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -118,7 +118,7 @@ impl ExecutionPlan for BindFixedPathExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -349,6 +349,9 @@ impl Stream for BindFixedPathStream {
             Poll::Ready(Some(Ok(batch))) => {
                 let _timer = self.metrics.elapsed_compute().timer();
                 let result = self.process_batch(batch);
+                if let Ok(ref b) = result {
+                    self.metrics.record_output(b.num_rows());
+                }
                 Poll::Ready(Some(result))
             }
             other => other,

@@ -36,7 +36,5 @@ pub fn build_test_graph(vids: Vec<Vid>, edges: Vec<(Vid, Vid)>) -> GraphProjecti
         in_neighbors: Vec::new(),
         out_weights: None,
         id_map,
-        _node_labels: Vec::new(),
-        _edge_types: Vec::new(),
     }
 }

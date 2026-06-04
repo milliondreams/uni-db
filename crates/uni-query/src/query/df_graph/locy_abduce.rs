@@ -444,6 +444,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                         optional: false,
                         pattern: Pattern { paths: vec![path] },
                         where_clause,
+                        for_update: false,
                     }),
                     Clause::Delete(DeleteClause {
                         detach: false,
@@ -476,6 +477,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                         optional: false,
                         pattern: Pattern { paths: vec![path] },
                         where_clause: None,
+                        for_update: false,
                     }),
                     Clause::Set(SetClause {
                         items: vec![SetItem::Property {
@@ -572,6 +574,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                             paths: vec![match_path],
                         },
                         where_clause: None,
+                        for_update: false,
                     }),
                     Clause::Create(uni_cypher::ast::CreateClause {
                         pattern: Pattern {

@@ -7,15 +7,47 @@
 //! columnar analytics, and vector search.
 
 pub mod api;
-mod shutdown;
+/// Change-data-capture runtime — moved to `uni-plugin-host`; re-exported to
+/// keep the `uni_db::cdc_runtime::*` path stable.
+pub mod cdc_runtime {
+    pub use uni_plugin_host::cdc_runtime::*;
+}
+/// OpenTelemetry layer — moved to `uni-plugin-host`; re-exported to keep the
+/// `uni_db::observability::*` path stable.
+pub mod observability {
+    pub use uni_plugin_host::observability::*;
+}
+/// Meta-plugin persistence — moved to `uni-plugin-host`; re-exported to keep
+/// the `uni_db::persistence::*` path stable.
+pub mod persistence {
+    pub use uni_plugin_host::persistence::*;
+}
+/// Background-job scheduler — moved to `uni-plugin-host`; re-exported to keep
+/// the `uni_db::scheduler::*` path stable.
+pub mod scheduler {
+    pub use uni_plugin_host::scheduler::*;
+}
+/// Durable scheduler persistence — moved to `uni-plugin-host`; re-exported.
+pub mod scheduler_persistence {
+    pub use uni_plugin_host::scheduler_persistence::*;
+}
+/// Graceful-shutdown coordinator — moved to `uni-plugin-host`; re-exported.
+pub(crate) mod shutdown {
+    pub use uni_plugin_host::shutdown::*;
+}
+/// Synthetic declared-procedure host — moved to `uni-plugin-host`; re-exported
+/// to keep the `uni_db::synthetic_procedure::*` path stable.
+pub mod synthetic_procedure {
+    pub use uni_plugin_host::synthetic_procedure::*;
+}
 
-pub use api::appender::{AppenderBuilder, StreamingAppender};
 pub use api::builder::PropertiesBuilder;
 pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
 pub use api::impl_locy::LocyRuleRegistry;
 pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
 pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
 pub use api::prepared::{PreparedLocy, PreparedLocyBinder, PreparedQuery, PreparedQueryBinder};
+pub use api::retry::RetryOptions;
 pub use api::rule_registry::{RuleInfo, RuleRegistry};
 pub use api::schema::{
     ConstraintInfo, EdgeTypeBuilder, EdgeTypeInfo, IndexInfo, IndexType, LabelBuilder, LabelInfo,
@@ -35,13 +67,32 @@ pub use api::transaction::{
 #[cfg(feature = "provider-onnx")]
 pub use api::xervo::{RawTensorModel, TensorBatch, TensorSpec, TensorValue};
 pub use api::xervo::{RerankerModel, ScoredDoc, UniXervo};
+pub use uni_bulk::{AppenderBuilder, StreamingAppender};
+pub use uni_bulk::{
+    BulkPhase, BulkProgress, BulkStats, BulkWriter, BulkWriterBuilder, EdgeData, IntoArrow,
+};
 
-// Re-exports from xervo for catalog parsing
-pub use api::fork_diff::{
+// Fork diff/promote value types, re-exported from `uni-fork`.
+pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
+pub use uni_fork::{
     DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromotePattern, PromoteReport,
     PropertyChange, VertexDiff, VertexPropertyChange,
 };
-pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
+
+/// `mimalloc` allocator, re-exported under the `mimalloc` feature.
+///
+/// Wire it as your global allocator in the consuming binary for ~3x
+/// throughput on allocation-heavy workloads (per-statement Cypher CREATE,
+/// many small mutations):
+///
+/// ```ignore
+/// #[global_allocator]
+/// static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+/// ```
+///
+/// See `crates/uni/benches/concurrent_mutations.rs` for the measurement.
+#[cfg(feature = "mimalloc")]
+pub use mimalloc::MiMalloc;
 pub use uni_xervo::api::{
     ModelAliasSpec, ModelTask, WarmupPolicy, catalog_from_file as xervo_catalog_from_file,
     catalog_from_str as xervo_catalog_from_str,
@@ -49,7 +100,8 @@ pub use uni_xervo::api::{
 
 // Re-exports from internal crates
 pub use uni_common::{
-    CrdtType, DataType, Eid, Result, Schema, UniConfig, UniError, UniId, Vid, unival,
+    CrdtType, DataType, Eid, LocyIncomplete, LocyIncompleteReason, Result, Schema, UniConfig,
+    UniError, UniId, Vid, unival,
 };
 pub use uni_query::{
     Edge, ExecuteResult, ExplainOutput, FromValue, Node, Path, ProfileOutput, QueryMetrics,

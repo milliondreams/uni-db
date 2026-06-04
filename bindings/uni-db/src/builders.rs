@@ -12,12 +12,158 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uni_common::core::schema::{DataType, IndexDefinition};
 
+/// M8 F2 helper: convert a list of grant strings into a
+/// [`uni_plugin::CapabilitySet`]. Empty / `None` → empty set.
+///
+/// Recognised grants mirror the rhai loader's surface (sync_api.rs
+/// `load_rhai_plugin` accepts the same set): `ScalarFn` /
+/// `AggregateFn` / `Procedure` / `Filesystem` / `Network` /
+/// `HostQuery` / `Kms` / `Secret`. Unknown grants are silently
+/// dropped (decorators don't fail on best-effort grant strings;
+/// stricter validation lives in the Python source-load path).
+pub(crate) fn build_capability_set(grants: Option<Vec<String>>) -> uni_plugin::CapabilitySet {
+    use uni_plugin::Capability;
+    let mut cap_set = uni_plugin::CapabilitySet::new();
+    if let Some(list) = grants {
+        for g in list {
+            match g.as_str() {
+                "ScalarFn" => cap_set.insert(Capability::ScalarFn),
+                "AggregateFn" => cap_set.insert(Capability::AggregateFn),
+                "Procedure" => cap_set.insert(Capability::Procedure),
+                "Filesystem" => cap_set.insert(Capability::Filesystem {
+                    read: vec!["**".into()],
+                    write: vec!["**".into()],
+                }),
+                "Network" => cap_set.insert(Capability::Network {
+                    allow: vec!["**".into()],
+                }),
+                "HostQuery" => cap_set.insert(Capability::HostQuery {
+                    read_only: true,
+                    scopes: vec!["**".into()],
+                }),
+                "Kms" => cap_set.insert(Capability::Kms {
+                    key_ids: vec!["*".into()],
+                }),
+                "Secret" => cap_set.insert(Capability::Secret {
+                    ids: vec!["*".into()],
+                }),
+                _ => true, // ignore unknown for now
+            };
+        }
+    } else {
+        // Default for decorator surface: enable scalar / aggregate /
+        // procedure registration. Users opt into network / fs /
+        // host-query grants explicitly.
+        cap_set.insert(Capability::ScalarFn);
+        cap_set.insert(Capability::AggregateFn);
+        cap_set.insert(Capability::Procedure);
+    }
+    cap_set
+}
+
+/// Like [`build_capability_set`] but rejects unknown grant names.
+///
+/// Used by the Rhai loader (sync and async), which validates grants strictly.
+/// Grants default to `ScalarFn` / `AggregateFn` / `Procedure` when `None`.
+///
+/// # Errors
+/// Returns a `ValueError` if `grants` contains an unrecognized capability name.
+pub(crate) fn build_capability_set_strict(
+    grants: Option<Vec<String>>,
+) -> PyResult<uni_plugin::CapabilitySet> {
+    use uni_plugin::Capability;
+    let mut cap_set = uni_plugin::CapabilitySet::new();
+    // Any grant adds the capability with the broadest attenuation
+    // (e.g. Filesystem {read: ["**"]}); tightening is host-side work.
+    let grants = grants.unwrap_or_else(|| {
+        vec![
+            "ScalarFn".to_owned(),
+            "AggregateFn".to_owned(),
+            "Procedure".to_owned(),
+        ]
+    });
+    for g in &grants {
+        match g.as_str() {
+            "ScalarFn" => {
+                cap_set.insert(Capability::ScalarFn);
+            }
+            "AggregateFn" => {
+                cap_set.insert(Capability::AggregateFn);
+            }
+            "Procedure" => {
+                cap_set.insert(Capability::Procedure);
+            }
+            "Filesystem" => {
+                cap_set.insert(Capability::Filesystem {
+                    read: vec!["**".into()],
+                    write: vec!["**".into()],
+                });
+            }
+            "Network" => {
+                cap_set.insert(Capability::Network {
+                    allow: vec!["**".into()],
+                });
+            }
+            "HostQuery" => {
+                cap_set.insert(Capability::HostQuery {
+                    read_only: true,
+                    scopes: vec!["**".into()],
+                });
+            }
+            "Kms" => {
+                cap_set.insert(Capability::Kms {
+                    key_ids: vec!["*".into()],
+                });
+            }
+            "Secret" => {
+                cap_set.insert(Capability::Secret {
+                    ids: vec!["*".into()],
+                });
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown grant `{other}`; supported: ScalarFn / AggregateFn / Procedure / Filesystem / Network / HostQuery / Kms / Secret"
+                )));
+            }
+        }
+    }
+    Ok(cap_set)
+}
+
+/// M8 F2 helper: serialize a [`uni_plugin_pyo3::LoadOutcome`] into a
+/// metadata dict matching `Database::load_rhai_plugin`'s return shape.
+pub(crate) fn load_outcome_to_pydict(
+    py: Python<'_>,
+    outcome: &uni_plugin_pyo3::LoadOutcome,
+) -> PyResult<Py<PyAny>> {
+    use pyo3::types::PyDict;
+    let dict = PyDict::new(py);
+    dict.set_item("plugin_id", outcome.plugin_id.as_str())?;
+    dict.set_item("version", outcome.version.clone())?;
+    dict.set_item("scalars_registered", outcome.scalars_registered.clone())?;
+    dict.set_item(
+        "aggregates_registered",
+        outcome.aggregates_registered.clone(),
+    )?;
+    dict.set_item(
+        "procedures_registered",
+        outcome.procedures_registered.clone(),
+    )?;
+    let denied: Vec<String> = outcome
+        .denied_capabilities
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect();
+    dict.set_item("denied_capabilities", denied)?;
+    Ok(dict.into())
+}
+
 // ============================================================================
 // DatabaseBuilder
 // ============================================================================
 
 /// Builder for creating and configuring a Uni instance.
-#[pyclass(name = "UniBuilder")]
+#[pyclass(name = "UniBuilder", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DatabaseBuilder {
     pub(crate) uri: String,
@@ -317,7 +463,7 @@ impl DatabaseBuilder {
 // ============================================================================
 
 /// Builder for defining and modifying the graph schema.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct SchemaBuilder {
     pub(crate) inner: Arc<Uni>,
@@ -442,7 +588,7 @@ pub(crate) fn parse_index_config(
 }
 
 /// Builder for defining a label with its properties and indexes.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct LabelBuilder {
     parent_inner: Arc<Uni>,
@@ -572,7 +718,7 @@ impl LabelBuilder {
 }
 
 /// Builder for defining an edge type with its properties.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct EdgeTypeBuilder {
     parent_inner: Arc<Uni>,
@@ -674,6 +820,12 @@ impl EdgeTypeBuilder {
 #[pyclass]
 pub struct Session {
     pub(crate) inner: ::uni_db::Session,
+    /// M8 F2: per-session decorator-accumulator. Each `@db.scalar_fn`
+    /// / `@db.aggregate_fn` / `@db.procedure` decoration pushes into
+    /// this builder; `Session.finalize_plugin(plugin_id)` drains it
+    /// and registers the accumulated entries into the session's
+    /// local plugin registry (proposal §5.4.2 default).
+    pub(crate) pending_plugin_builder: std::sync::Arc<uni_plugin_pyo3::ManifestBuilder>,
 }
 
 #[pymethods]
@@ -769,21 +921,25 @@ impl Session {
     }
 
     /// Add a named session hook.
+    #[allow(deprecated)] // Python binding still uses per-session hooks; migration to BuiltinHookPlugin tracked alongside the v2.0 ABI break.
     fn add_hook(&mut self, name: &str, hook: Py<PyAny>) {
         self.inner.add_hook(name, PySessionHook { py_obj: hook });
     }
 
     /// Remove a hook by name.
+    #[allow(deprecated)]
     fn remove_hook(&mut self, name: &str) -> bool {
         self.inner.remove_hook(name)
     }
 
     /// List names of all registered hooks.
+    #[allow(deprecated)]
     fn list_hooks(&self) -> Vec<String> {
         self.inner.list_hooks()
     }
 
     /// Remove all hooks.
+    #[allow(deprecated)]
     fn clear_hooks(&mut self) {
         self.inner.clear_hooks();
     }
@@ -809,19 +965,24 @@ impl Session {
         program: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<crate::types::PyLocyResult> {
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier from
+        // `LocyConfig::classifier_registry`). Holding the GIL while
+        // blocking on tokio would deadlock the callback's GIL acquisition
+        // on a worker thread.
         let result = if let Some(p) = params {
             let mut builder = self.inner.locy_with(program);
             for (k, v) in p {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(self.inner.locy(program))
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
+            py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.locy(program))
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)
     }
@@ -912,6 +1073,156 @@ impl Session {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.refresh())
             .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    // ── PyO3 plugin decorator surface (M8 follow-up F2) ──────────────
+    //
+    // Per proposal §5.4: Python notebook users register session-scoped
+    // UDFs via `@session.scalar_fn("name", ...)` (or aggregate_fn /
+    // procedure). Each decoration appends to the per-session
+    // `pending_plugin_builder`; `session.finalize_plugin(plugin_id)`
+    // commits the accumulated entries into the session's local
+    // plugin registry (proposal §5.4.2 default scope).
+
+    /// `@session.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism="pure")`
+    ///
+    /// Returns a Python decorator that, when applied to a function,
+    /// captures it as a session-scoped scalar UDF. Call
+    /// `session.finalize_plugin("plugin.id")` to commit accumulated
+    /// decorations.
+    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="pure"))]
+    fn scalar_fn(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        returns: String,
+        vectorized: bool,
+        determinism: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_scalar_trampoline(
+            py,
+            std::sync::Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            returns,
+            vectorized,
+            determinism,
+        )
+    }
+
+    /// `@session.aggregate_fn(name, args=[...], returns=..., determinism="pure")`
+    ///
+    /// The wrapped target must be a dict with `init` / `accumulate` /
+    /// `merge` / `finalize` callables (or a class exposing those as
+    /// methods).
+    #[pyo3(signature = (name, args, returns, determinism="pure"))]
+    fn aggregate_fn(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        returns: String,
+        determinism: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_aggregate_trampoline(
+            py,
+            std::sync::Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            returns,
+            determinism,
+        )
+    }
+
+    /// `@session.procedure(name, args=[...], yields=[...], mode="read")`
+    ///
+    /// The wrapped callable receives the procedure args and must
+    /// return an iterable of dicts mapping the yield column names to
+    /// values. (M8.7 contract.)
+    #[pyo3(signature = (name, args, yields, mode="read"))]
+    fn procedure(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        yields: Bound<'_, PyAny>,
+        mode: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_procedure_trampoline(
+            py,
+            std::sync::Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            yields,
+            mode,
+        )
+    }
+
+    /// `session.set_plugin_id(id)` — sets the plugin id used by the
+    /// next `finalize_plugin()` (the per-decorator path).
+    fn set_plugin_id(&self, plugin_id: String) {
+        self.pending_plugin_builder.set_id(plugin_id);
+    }
+
+    /// `session.set_plugin_version(version)` — sets the version used
+    /// by the next `finalize_plugin()`.
+    fn set_plugin_version(&self, version: String) {
+        self.pending_plugin_builder.set_version(version);
+    }
+
+    /// `session.finalize_plugin(plugin_id, version=None, grants=None)`
+    /// — drain accumulated decorator entries and register them into
+    /// this session's local plugin registry. Returns a metadata dict
+    /// (`plugin_id`, `version`, `scalars_registered`, etc.) mirroring
+    /// the shape of `load_rhai_plugin`'s return value.
+    #[pyo3(signature = (plugin_id, version=None, grants=None))]
+    fn finalize_plugin(
+        &self,
+        py: Python<'_>,
+        plugin_id: &str,
+        version: Option<&str>,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        if self.pending_plugin_builder.entry_count() == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "session.finalize_plugin: no pending decorators — call \
+                 @session.scalar_fn / aggregate_fn / procedure first",
+            ));
+        }
+        self.pending_plugin_builder.set_id(plugin_id);
+        if let Some(v) = version {
+            self.pending_plugin_builder.set_version(v);
+        }
+        let caps = build_capability_set(grants);
+        let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id(plugin_id);
+        let outcome = self
+            .inner
+            .finalize_python_plugin(&loader, &self.pending_plugin_builder, &caps)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        load_outcome_to_pydict(py, &outcome)
+    }
+
+    /// `session.load_python_plugin(module_src, module_name, grants=None)`
+    /// — load a Python plugin from a source string. The module body
+    /// uses `@db.scalar_fn(...)` etc. on the host-injected `db`
+    /// global, identical to the source-load form used by
+    /// `Uni::load_python_plugin`. Registers session-scoped.
+    #[pyo3(signature = (module_src, module_name, grants=None))]
+    fn load_python_plugin(
+        &self,
+        py: Python<'_>,
+        module_src: &str,
+        module_name: &str,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let caps = build_capability_set(grants);
+        let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id(module_name);
+        let outcome = self
+            .inner
+            .add_python_plugin(py, &loader, module_src, module_name, &caps)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        load_outcome_to_pydict(py, &outcome)
     }
 
     /// Create a query builder for parameterized queries.
@@ -1222,8 +1533,11 @@ impl SessionLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
@@ -1426,6 +1740,35 @@ impl PyTxExecuteBuilder {
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
+
+    /// Execute the mutation with profiling. Returns
+    /// `(ExecuteResult, ProfileOutput)`: the first carries mutation
+    /// counters from the transaction's private L0, the second carries
+    /// per-operator timings/memory. Mirrors `SessionQueryBuilder.profile`
+    /// for the write path.
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyExecuteResult, crate::types::PyProfileOutput)> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let mut builder = tx.execute_with(&self.cypher);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        let (result, profile) = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(builder.profile())
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        let exec_result = convert::execute_result_to_py(py, result)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((exec_result, profile_output))
+    }
 }
 
 /// Builder for Locy evaluation on a Transaction.
@@ -1507,8 +1850,11 @@ impl PyTxLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
@@ -1694,6 +2040,61 @@ impl ::uni_db::SessionHook for PySessionHook {
 // StreamingAppender
 // ============================================================================
 
+/// Convert a PyArrow `RecordBatch` into an Arrow [`RecordBatch`], zero-copy.
+///
+/// Uses the Arrow PyCapsule C Data Interface (`__arrow_c_array__`). Shared by
+/// the sync and async streaming appenders so the FFI extraction lives in one
+/// place.
+///
+/// # Errors
+/// Returns a `TypeError` if `batch` does not expose `__arrow_c_array__`, or a
+/// `ValueError` if the Arrow FFI import fails.
+pub(crate) fn record_batch_from_pyarrow(
+    batch: &Bound<'_, PyAny>,
+) -> PyResult<arrow_array::RecordBatch> {
+    let capsule_tuple = batch.call_method0("__arrow_c_array__").map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "Expected a PyArrow RecordBatch with __arrow_c_array__ support: {}",
+            e
+        ))
+    })?;
+    let schema_capsule = capsule_tuple.get_item(0)?;
+    let array_capsule = capsule_tuple.get_item(1)?;
+
+    // Safety: the capsules are produced by the Arrow C Data Interface, which
+    // guarantees valid `arrow_schema` / `arrow_array` pointers; per that
+    // interface the consumer takes ownership, so we `ptr::read` them out.
+    let (ffi_schema, ffi_array) = unsafe {
+        let schema_ptr =
+            pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
+                as *mut arrow_array::ffi::FFI_ArrowSchema;
+        let array_ptr =
+            pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
+                as *mut arrow_array::ffi::FFI_ArrowArray;
+        (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
+    };
+
+    // Safety: `ffi_array` / `ffi_schema` were just read from valid Arrow C Data
+    // Interface capsules and describe a consistent array/schema pair.
+    let array_data = unsafe {
+        arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).map_err(
+            |e: arrow_schema::ArrowError| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+            },
+        )?
+    };
+    let struct_array = arrow_array::StructArray::from(array_data);
+    let schema = arrow_schema::Schema::new(
+        struct_array
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+    );
+    arrow_array::RecordBatch::try_new(std::sync::Arc::new(schema), struct_array.columns().to_vec())
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+}
+
 /// A streaming appender for single-label data loading.
 ///
 /// Rows are buffered and flushed in batches. Use as a context manager:
@@ -1758,49 +2159,7 @@ impl StreamingAppender {
     /// Accepts a PyArrow RecordBatch. Uses the Arrow PyCapsule C Data Interface
     /// (`__arrow_c_array__`) for zero-copy transfer.
     fn write_batch(&self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        // Use Arrow PyCapsule interface (__arrow_c_array__) for zero-copy
-        let capsule_tuple = batch.call_method0("__arrow_c_array__").map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                "Expected a PyArrow RecordBatch with __arrow_c_array__ support: {}",
-                e
-            ))
-        })?;
-        let schema_capsule = capsule_tuple.get_item(0)?;
-        let array_capsule = capsule_tuple.get_item(1)?;
-
-        // Extract raw pointers from PyCapsules and convert via Arrow FFI
-        let (ffi_schema, ffi_array) = unsafe {
-            let schema_ptr =
-                pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
-                    as *mut arrow_array::ffi::FFI_ArrowSchema;
-            let array_ptr =
-                pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
-                    as *mut arrow_array::ffi::FFI_ArrowArray;
-            // Move out of the capsule pointers (Arrow C Data Interface: consumer owns the data)
-            (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
-        };
-
-        let array_data = unsafe {
-            arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).map_err(
-                |e: arrow_schema::ArrowError| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
-                },
-            )?
-        };
-        let struct_array = arrow_array::StructArray::from(array_data);
-        let schema = arrow_schema::Schema::new(
-            struct_array
-                .fields()
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<_>>(),
-        );
-        let record_batch = arrow_array::RecordBatch::try_new(
-            std::sync::Arc::new(schema),
-            struct_array.columns().to_vec(),
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
+        let record_batch = record_batch_from_pyarrow(batch)?;
         let mut guard = self.inner.lock().unwrap();
         let appender = guard.as_mut().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
@@ -1951,6 +2310,7 @@ impl SessionTemplate {
     fn create(&self) -> Session {
         Session {
             inner: self.inner.create(),
+            pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
         }
     }
 }
@@ -2179,7 +2539,10 @@ impl PyForkBuilder {
                 b.await
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(Session { inner: forked })
+        Ok(Session {
+            inner: forked,
+            pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
+        })
     }
 }
 

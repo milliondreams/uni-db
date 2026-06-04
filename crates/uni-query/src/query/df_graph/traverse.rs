@@ -157,6 +157,11 @@ fn resolve_edge_property_type(
 ) -> DataType {
     if prop == "overflow_json" {
         DataType::LargeBinary
+    } else if prop == "_created_at" || prop == "_updated_at" {
+        // System-managed timestamps surfaced via `created_at(r)` /
+        // `updated_at(r)`. Stored on every edge by the L0 buffer and
+        // the on-disk Arrow tables as Timestamp(Nanosecond, UTC).
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
     } else {
         schema_props
             .and_then(|props| props.get(prop))
@@ -247,7 +252,7 @@ pub struct GraphTraverseExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -449,7 +454,7 @@ impl ExecutionPlan for GraphTraverseExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -903,6 +908,40 @@ async fn build_edge_columns(
         let vid_keys: Vec<Vid> = eids.iter().map(|e| Vid::from(e.as_u64())).collect();
 
         for prop_name in edge_properties {
+            // System-managed edge timestamps live outside the property bag.
+            // Read them directly from L0 (earliest creation, latest update).
+            // Disk-only edges will surface as null — acceptable for the
+            // common case where the queried edges are L0-resident in the
+            // same session.
+            if prop_name == "_created_at" || prop_name == "_updated_at" {
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
+                let l0_ctx = graph_ctx.l0_context();
+                for eid in &eids {
+                    let mut value: Option<i64> = None;
+                    for l0 in l0_ctx.iter_l0_buffers() {
+                        let guard = l0.read();
+                        let opt = if prop_name == "_created_at" {
+                            guard.edge_created_at.get(eid).copied()
+                        } else {
+                            guard.edge_updated_at.get(eid).copied()
+                        };
+                        if let Some(ts) = opt {
+                            value = Some(match value {
+                                None => ts,
+                                Some(cur) if prop_name == "_created_at" => cur.min(ts),
+                                Some(cur) => cur.max(ts),
+                            });
+                        }
+                    }
+                    match value {
+                        Some(ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()) as ArrayRef);
+                continue;
+            }
             let data_type = resolve_edge_property_type(prop_name, edge_type_props);
             let column =
                 build_property_column_static(&vid_keys, &props_map, prop_name, &data_type)?;
@@ -1175,6 +1214,8 @@ impl Stream for GraphTraverseStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, TraverseStreamState::Done);
 
@@ -1506,7 +1547,7 @@ pub struct GraphTraverseMainExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -1675,7 +1716,7 @@ impl ExecutionPlan for GraphTraverseMainExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -2167,6 +2208,36 @@ impl GraphTraverseMainStream {
     }
 }
 
+impl GraphExecutionContext {
+    /// Records a schemaless traversal's full edge-type scan into the SSI read-set.
+    ///
+    /// `build_edge_adjacency_map` scans every edge of the traversed type(s) via
+    /// `find_edges_by_type_names` up front, so the transaction's true read
+    /// footprint is that whole adjacency — not just the neighbourhoods later
+    /// expanded. Recording it here gives schemaless single-hop and
+    /// variable-length traversal (which bypass the per-vertex `get_neighbors`
+    /// path) the same item-level antidependency coverage the schema-typed
+    /// `record_neighbor_reads` path provides. No-op for read-only transactions
+    /// (`occ_read_set` is `Some` only for read-write transactions).
+    fn record_edge_adjacency(&self, adjacency: &EdgeAdjacencyMap) {
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for (src, neighbors) in adjacency {
+            rs.vertices.insert(*src);
+            for (nbr, eid, _type, _props) in neighbors {
+                rs.vertices.insert(*nbr);
+                rs.edges.insert(*eid);
+            }
+        }
+    }
+}
+
 /// Build adjacency map from main edges table for given type names and direction.
 ///
 /// Supports OR relationship types like `[:KNOWS|HATES]` via multiple type_names.
@@ -2276,6 +2347,10 @@ async fn build_edge_adjacency_map(
         }
     }
 
+    // SSI: a schemaless traversal physically scans the whole edge type above, so
+    // record that read footprint for read-write transactions (no-op otherwise).
+    graph_ctx.record_edge_adjacency(&adjacency);
+
     Ok(adjacency)
 }
 
@@ -2283,6 +2358,8 @@ impl Stream for GraphTraverseMainStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, GraphTraverseMainState::Done);
 
@@ -2454,7 +2531,7 @@ pub struct GraphVariableLengthTraverseExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -2634,7 +2711,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -3037,6 +3114,8 @@ impl Stream for GraphVariableLengthTraverseStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, VarLengthStreamState::Done);
 
@@ -3732,7 +3811,7 @@ pub struct GraphVariableLengthTraverseMainExec {
     schema: SchemaRef,
 
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -3890,7 +3969,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -4403,6 +4482,8 @@ impl Stream for GraphVariableLengthTraverseMainStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, VarLengthMainStreamState::Done);
 

@@ -1,6 +1,6 @@
 # Python API Reference
 
-Complete reference for the `uni_db` Python bindings (v1.0.0). All operations go through the **Session** (reads, Locy) or **Transaction** (writes, bulk loading) obtained from a `Uni` instance.
+Complete reference for the `uni_db` Python bindings (v2.0.0). All operations go through the **Session** (reads, Locy) or **Transaction** (writes, bulk loading) obtained from a `Uni` instance.
 
 ## Installation
 
@@ -463,6 +463,21 @@ Returned by `tx.execute_with(cypher)`.
 | `.param(name, value)` | self | Bind a parameter |
 | `.timeout(seconds)` | self | Set execution timeout |
 | `.run()` | `ExecuteResult` | Execute the mutation |
+| `.profile()` | `(ExecuteResult, ProfileOutput)` | Execute the mutation with profiling |
+
+```python
+# Profile a transaction write end-to-end
+with db.session().tx() as tx:
+    res, prof = (
+        tx.execute_with("CREATE (p:Person {name: $name}) RETURN p")
+        .param("name", "Alice")
+        .profile()
+    )
+    tx.commit()
+    print(f"nodes_created={res.nodes_created}, total_time_ms={prof.total_time_ms}")
+```
+
+The async equivalent (`AsyncTxExecuteBuilder.profile()`) returns an awaitable that resolves to the same `(ExecuteResult, ProfileOutput)` tuple.
 
 #### TxLocyBuilder
 

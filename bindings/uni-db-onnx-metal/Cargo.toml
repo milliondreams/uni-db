@@ -14,8 +14,8 @@ crate-type = ["cdylib"]
 path = "../uni-db/src/lib.rs"
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
-pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 # Slim variant + Apple acceleration. Opts out of uni-db's
 # default-everything to exclude candle and mistralrs. xervo 0.9.0's
 # gpu-metal activates ort?/coreml so the ORT CoreML EP reaches Apple
@@ -24,6 +24,7 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 # requires another feature to flip ort on).
 uni-db = { workspace = true, default-features = false, features = [
     "lance-backend",
+    "mimalloc",
     "provider-onnx",
     "gpu-metal",
     "provider-openai",
@@ -38,9 +39,13 @@ uni-db = { workspace = true, default-features = false, features = [
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+uni-plugin = { workspace = true }
+uni-plugin-rhai = { workspace = true }
+uni-plugin-pyo3 = { workspace = true, features = ["pyo3"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }

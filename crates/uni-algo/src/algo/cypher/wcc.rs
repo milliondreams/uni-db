@@ -4,7 +4,7 @@
 //! uni.algo.wcc procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, Wcc, WccConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, arg_u64};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -23,10 +23,10 @@ impl GraphAlgoAdapter for WccAdapter {
         vec![("nodeId", ValueType::Int), ("componentId", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> WccConfig {
-        WccConfig {
-            min_component_size: Some(args[0].as_u64().unwrap() as usize),
-        }
+    fn to_config(args: Vec<Value>) -> Result<WccConfig> {
+        Ok(WccConfig {
+            min_component_size: Some(arg_u64(&args, 0, "minComponentSize")? as usize),
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

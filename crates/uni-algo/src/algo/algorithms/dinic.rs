@@ -29,6 +29,9 @@ impl Default for DinicConfig {
 
 pub struct DinicResult {
     pub max_flow: f64,
+    /// Number of forward edges carrying nonzero flow in the final
+    /// residual graph (back-edges with `cap == 0` are excluded).
+    pub flow_edges: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -50,16 +53,27 @@ impl Algorithm for Dinic {
     fn run(graph: &GraphProjection, config: Self::Config) -> Self::Result {
         let source = match graph.to_slot(config.source) {
             Some(s) => s as usize,
-            None => return DinicResult { max_flow: 0.0 },
+            None => {
+                return DinicResult {
+                    max_flow: 0.0,
+                    flow_edges: 0,
+                };
+            }
         };
         let sink = match graph.to_slot(config.sink) {
             Some(s) => s as usize,
-            None => return DinicResult { max_flow: 0.0 },
+            None => {
+                return DinicResult {
+                    max_flow: 0.0,
+                    flow_edges: 0,
+                };
+            }
         };
 
         if source == sink {
             return DinicResult {
                 max_flow: f64::INFINITY,
+                flow_edges: 0,
             };
         }
 
@@ -128,7 +142,15 @@ impl Algorithm for Dinic {
             }
         }
 
-        DinicResult { max_flow }
+        let flow_edges = adj
+            .iter()
+            .flatten()
+            .filter(|e| e.cap > 0.0 && e.flow > 1e-9)
+            .count();
+        DinicResult {
+            max_flow,
+            flow_edges,
+        }
     }
 }
 
@@ -188,5 +210,7 @@ mod tests {
 
         let result = Dinic::run(&graph, config);
         assert_eq!(result.max_flow, 5.0);
+        // Both forward edges (0->1 and 1->2) carry flow of 5.
+        assert_eq!(result.flow_edges, 2);
     }
 }

@@ -457,6 +457,13 @@ pub struct UniConfig {
     /// Default query execution timeout (default: 30s)
     pub query_timeout: Duration,
 
+    /// Maximum wall time a transaction commit may take before it is aborted with
+    /// `CommitTimeout` (default: 5s). This guards against a commit blocking on the
+    /// writer/flush lock, but it also bounds the commit's own compute time — so
+    /// workloads that commit very large transactions in a single shot (bulk-history
+    /// backfills, or unoptimized debug builds) may need to raise it.
+    pub commit_timeout: Duration,
+
     /// Default maximum memory per query (default: 1GB)
     pub max_query_memory: usize,
 
@@ -486,11 +493,68 @@ pub struct UniConfig {
     /// is accepted and dynamically registered).
     pub strict_schema: bool,
 
+    /// Enable Lance `MergeInsert` for SET-only flushes (default: false).
+    ///
+    /// When true, `Writer::insert_vertex_partial` records the touched
+    /// property keys into L0 and the flush emits a partial-column source
+    /// to Lance via `MergeInsertBuilder` — skipping the read of (and write
+    /// of) the unchanged columns. Wide-row schemas with vector indexes
+    /// benefit most (~17 ms/row → ~3 ms/row on the issue #72 ingest
+    /// workload). See the Round-11 plan section in
+    /// `plan-and-implement-a-valiant-flame.md`.
+    pub partial_lance_writes: bool,
+
+    /// When true, auto-embedding for vertex writes is deferred from the
+    /// per-row `insert_vertex_*` path to the next L1 flush, where the
+    /// existing `process_embeddings_for_batch` issues one model call for
+    /// the whole flush batch instead of N per-row calls.
+    ///
+    /// Trade-off: in-tx reads of the embedding column on a freshly
+    /// SET/inserted vertex see the OLD storage value (or no value, for
+    /// new vertices) until flush. Existing behavior is identical to
+    /// today's `process_embeddings_impl(target_prop present)` short-circuit
+    /// (writer.rs:2727) — updating only the source text never refreshes
+    /// the embedding mid-tx, deferred or not. Opt-in for workloads that
+    /// don't read embeddings between write and commit.
+    ///
+    /// Default: `false` (preserves bit-for-bit compatibility with
+    /// pre-Phase-B releases).
+    pub defer_embeddings: bool,
+
     /// Per-fork L1 fragment-count threshold above which a `tracing::warn!`
     /// fires once per crossing during fork flush. Long-lived heavy-write
     /// forks accumulate fragments because fork compaction is deferred to
     /// Phase 5; this surfaces the risk operationally. Default: 256.
     pub fork_fragment_warn_threshold: usize,
+
+    /// Per-transaction VID/EID reservoir refill size. Each `Transaction`
+    /// pre-reserves this many IDs at a time from the global `IdAllocator`,
+    /// amortizing its `tokio::Mutex` over `N` allocations. Tradeoff:
+    /// larger = fewer global-mutex acquisitions but more wasted IDs on
+    /// short transactions (capped at `batch_size - 1` per tx). u64 ID space
+    /// makes the waste negligible. Default: 16.
+    pub tx_id_reservoir_batch: usize,
+
+    /// When `true`, `check_flush` on the commit path dispatches via the
+    /// async path (`flush_to_l1_async`): rotate L0 under `flush_lock`,
+    /// then spawn the streaming + finalize work on a background task.
+    /// Concurrent committers no longer queue on the flush's long I/O.
+    ///
+    /// When `false` (default for now), `check_flush` calls the original
+    /// synchronous `flush_to_l1` and holds `flush_lock` across the full
+    /// L1-streaming write. This is the kill-switch.
+    pub async_flush_enabled: bool,
+
+    /// Maximum number of L0→L1 flushes that may be in-flight simultaneously
+    /// when `async_flush_enabled` is true. The (N+1)th rotate blocks until
+    /// one of the in-flight flushes finalizes. Bounds WAL retention and
+    /// memory growth. Default: 2.
+    pub max_pending_flushes: usize,
+
+    /// Maximum time `drop_fork` will wait for pending async flushes on
+    /// that fork before failing with `PendingFlushTimeout`. Only meaningful
+    /// when `async_flush_enabled` is true. Default: 10s.
+    pub drop_fork_drain_timeout: Duration,
 
     /// Phase 4a: cap on total fork count (Active + Pending + Tombstoned).
     /// `None` = unbounded. When set, `Session::fork(name).await` errors
@@ -532,6 +596,31 @@ pub struct UniConfig {
     /// trigger should set this to `true` so timing isn't dependent on
     /// the polling cadence.
     pub disable_fork_index_builder: bool,
+
+    /// Enable Serializable Snapshot Isolation and optimistic concurrency
+    /// control (default: `true`).
+    ///
+    /// When `true`, read-write transactions read from a pinned L0 snapshot,
+    /// track an item-level read/write-set, and validate at commit under
+    /// `flush_lock`: a write-write or read-write conflict against a commit
+    /// landed since the transaction's snapshot aborts with
+    /// `UniError::SerializationConflict`, a duplicate concurrent `MERGE` on a
+    /// unique key aborts with `UniError::ConstraintConflict`, and `FOR UPDATE`
+    /// acquires per-key row locks. Callers should wrap contended writes in
+    /// `Session::transact_with_retry`, which re-runs retriable conflicts.
+    ///
+    /// When `false`, the engine reverts to last-writer-wins: concurrent
+    /// read-modify-write transactions can silently lose updates, concurrent
+    /// `MERGE` can create duplicate unique keys, and `FOR UPDATE` is a no-op
+    /// (a `tracing::warn!` is emitted when a query requests it). Reads run
+    /// against the live L0 with no snapshot pinning. This reproduces the
+    /// pre-SSI behavior bit-for-bit and skips the (near-zero, but non-nil)
+    /// read-set/validation overhead — appropriate only for single-writer
+    /// workloads or callers that guard read-modify-write externally.
+    ///
+    /// Defaults to `true` because silent lost updates are a correctness hazard
+    /// for any concurrent-writer workload.
+    pub ssi_enabled: bool,
 }
 
 impl Default for UniConfig {
@@ -553,6 +642,7 @@ impl Default for UniConfig {
             throttle: WriteThrottleConfig::default(),
             file_sandbox: FileSandboxConfig::default(),
             query_timeout: Duration::from_secs(30),
+            commit_timeout: Duration::from_secs(5),
             max_query_memory: 1024 * 1024 * 1024,       // 1GB
             max_transaction_memory: 1024 * 1024 * 1024, // 1GB
             max_compaction_rows: 5_000_000,             // 5M rows
@@ -561,7 +651,29 @@ impl Default for UniConfig {
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
+            partial_lance_writes: false,
+            defer_embeddings: false,
             fork_fragment_warn_threshold: 256,
+            tx_id_reservoir_batch: 16,
+            // Default ON as of the Item-B-deep-fix landing (per-table
+            // write serialization + Lance Table cache removed + drain
+            // in flush_to_l1). Validated by full UNI_ASYNC_FLUSH=1
+            // cross-crate nextest: 1754/1754 pass.
+            //
+            // `UNI_ASYNC_FLUSH=0` / `=false` / `=no` (case-insensitive)
+            // explicitly DISABLES async flush — useful for bisecting
+            // suspected async-flush regressions and for the sync-only
+            // benchmarks in `flush_pressure.rs`. Unset = default
+            // behavior (true).
+            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH")
+                .ok()
+                .map(|v| {
+                    let v = v.to_ascii_lowercase();
+                    !(v == "0" || v == "false" || v == "no")
+                })
+                .unwrap_or(true),
+            max_pending_flushes: 2,
+            drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,
             fork_default_ttl: None,
             fork_sweeper_interval: Duration::from_secs(60),
@@ -569,6 +681,11 @@ impl Default for UniConfig {
             fork_index_build_threshold: 10_000,
             fork_index_builder_interval: Duration::from_secs(30),
             disable_fork_index_builder: false,
+            // Correctness-first default: SSI/OCC on. See the field docs for
+            // the behavioral contract and the migration note (concurrent
+            // writers now observe aborts instead of silent lost updates;
+            // wrap them in `Session::transact_with_retry`).
+            ssi_enabled: true,
         }
     }
 }

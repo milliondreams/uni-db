@@ -10,11 +10,25 @@ repository.workspace = true
 [features]
 default = ["lance-backend"]
 lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linalg"]
+# NOTE: SSI/OCC (snapshot-isolation reads, write/read-set conflict detection,
+# serializable MERGE, FOR UPDATE) is no longer a compile-time feature. It is
+# always compiled and toggled at runtime via `UniConfig::ssi_enabled`
+# (default `true`).
+# Test-only fault injection: activates the `fail::fail_point!` markers placed in
+# the commit path (`commit_transaction_l0`) so crash-recovery tests can simulate
+# a crash at a precise point. No-op and zero-cost unless enabled. The `fail`
+# crate is always linked but its macros expand to `{}` without this feature.
+failpoints = ["fail/failpoints"]
 
 [dependencies]
 uni-common = { workspace = true }
 uni-btic = { workspace = true }
 uni-crdt = { workspace = true }
+# M10 follow-up: PropertyManager's CRDT merge funnel consults
+# `Crdt::merge_via_registry`, which requires a `PluginRegistry`
+# handle. uni-plugin → uni-store is a one-way edge (uni-plugin does
+# not depend on uni-store), so no cycle.
+uni-plugin = { path = "../uni-plugin", version = "1.8" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -29,23 +43,29 @@ parking_lot = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
-lru = "0.16"
+lru = "0.18"
 metrics = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 futures = "0.3"
 lance = { workspace = true, optional = true }
-lance-index = { version = "3.0.1", optional = true }
-lance-linalg = { version = "3.0.1", optional = true }
+lance-index = { version = "7.0.0", optional = true }
+lance-linalg = { version = "7.0.0", optional = true }
 lancedb = { workspace = true, optional = true }
-dashmap = "6.0"
+dashmap = "6.2"
 arc-swap = { workspace = true }
 uni-xervo = { workspace = true }
 
 object_store = { workspace = true }
 url = { workspace = true }
-sha3 = "0.10.8"
+sha3 = "0.12"
 tokio-util = { workspace = true }
+# Commit-path fault injection for crash-recovery tests. Macros are no-ops (and
+# the crate links to nothing measurable) unless the `failpoints` feature is on.
+fail = "0.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Capture emitted `metrics` counters in-process so tests can assert on
+# freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
+metrics-util = "0.20"

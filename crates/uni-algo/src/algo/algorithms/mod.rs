@@ -4,6 +4,78 @@
 //! Core algorithm trait and common utilities.
 
 use crate::algo::GraphProjection;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+
+/// Unweighted single-source BFS over the outbound CSR.
+///
+/// Returns a `dist` vector of length `graph.vertex_count()` where
+/// `dist[v]` is the number of hops from `source` to slot `v`, or `-1`
+/// if `v` is unreachable. The source itself has distance `0`.
+///
+/// This is the shared building block for the unweighted centrality and
+/// all-pairs algorithms (closeness, harmonic, betweenness samples,
+/// all-pairs shortest path) which previously each hand-rolled the same
+/// queue/visited bookkeeping with subtly different conventions.
+pub(crate) fn bfs_levels(graph: &GraphProjection, source: u32) -> Vec<i32> {
+    let n = graph.vertex_count();
+    let mut dist = vec![-1; n];
+    let mut q = VecDeque::with_capacity(n);
+
+    dist[source as usize] = 0;
+    q.push_back(source);
+
+    while let Some(u) = q.pop_front() {
+        let dist_u = dist[u as usize];
+        for &v in graph.out_neighbors(u) {
+            if dist[v as usize] == -1 {
+                dist[v as usize] = dist_u + 1;
+                q.push_back(v);
+            }
+        }
+    }
+
+    dist
+}
+
+/// Weighted single-source shortest paths (Dijkstra) over the outbound CSR.
+///
+/// Returns a `dist` vector of length `graph.vertex_count()` where
+/// `dist[v]` is the shortest weighted distance from `source` to slot `v`,
+/// or `f64::INFINITY` if `v` is unreachable. Edge weights default to `1.0`
+/// when the projection carries no weights.
+///
+/// Shared by [`Dijkstra`] (single-source distances) and harmonic
+/// centrality, which previously duplicated the relaxation loop.
+pub(crate) fn dijkstra_distances(graph: &GraphProjection, source: u32) -> Vec<f64> {
+    let n = graph.vertex_count();
+    let mut dist = vec![f64::INFINITY; n];
+    let mut heap = BinaryHeap::new();
+
+    dist[source as usize] = 0.0;
+    heap.push(Reverse((0.0f64.to_bits(), source)));
+
+    while let Some(Reverse((d_bits, u))) = heap.pop() {
+        let d = f64::from_bits(d_bits);
+        if d > dist[u as usize] {
+            continue;
+        }
+        for (i, &v) in graph.out_neighbors(u).iter().enumerate() {
+            let weight = if graph.has_weights() {
+                graph.out_weight(u, i)
+            } else {
+                1.0
+            };
+            let new_dist = d + weight;
+            if new_dist < dist[v as usize] {
+                dist[v as usize] = new_dist;
+                heap.push(Reverse((new_dist.to_bits(), v)));
+            }
+        }
+    }
+
+    dist
+}
 
 /// Core trait for all graph algorithms.
 pub trait Algorithm: Send + Sync {

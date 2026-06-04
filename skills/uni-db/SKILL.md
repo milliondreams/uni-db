@@ -15,7 +15,7 @@ description: >-
 
 ## What is uni-db?
 
-uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
+uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, abductive inference, and inline neural predicates with calibration (`CREATE MODEL` / `CALIBRATE` / `VALIDATE` / `NeuralProvenance` in `EXPLAIN`). APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
 
 ---
 
@@ -63,7 +63,7 @@ Transaction / AsyncTransaction (write scope)
 |---|---|---|
 | `SessionQueryBuilder` | `session.query_with(cypher)` | `.fetch_all()`, `.fetch_one()`, `.cursor()` |
 | `SessionLocyBuilder` | `session.locy_with(program)` | `.run()` |
-| `TxExecuteBuilder` | `tx.execute_with(cypher)` | `.run()` |
+| `TxExecuteBuilder` | `tx.execute_with(cypher)` | `.run()`, `.profile()` |
 | `TxQueryBuilder` | `tx.query_with(cypher)` | `.fetch_all()`, `.fetch_one()`, `.execute()` |
 | `SchemaBuilder` | `db.schema()` | `.apply()` |
 | `BulkWriterBuilder` | `tx.bulk_writer()` | `.build()` |
@@ -395,6 +395,16 @@ ORDER BY p.age DESC
 SKIP 10 LIMIT 20
 ```
 
+**11. System-managed timestamps (`created_at` / `updated_at`):**
+Every vertex and edge automatically carries a creation and modification timestamp. Access via Cypher functions, returns `DateTime` (UTC, ns). Read-only, no schema declaration needed.
+```cypher
+MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01")
+RETURN n, updated_at(n) AS last_modified
+
+MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
+```
+`updated_at` bumps on any write that touches the row — including idempotent MERGE / same-value SET.
+
 ---
 
 ## Critical Gotchas
@@ -428,6 +438,8 @@ SKIP 10 LIMIT 20
 14. **Context managers for transactions** -- Always use `with session.tx() as tx:` (or `async with`) to guarantee auto-rollback on exceptions. Forgetting to commit or rollback leaks the write lock.
 
 15. **Locy DERIVE in a transaction** -- When `locy()` is called on a Transaction, DERIVE commands automatically apply mutations to the transaction. On a Session (read-only), DERIVE returns a `DerivedFactSet` that must be explicitly applied via `tx.apply(derived)`.
+
+16. **Index your MERGE keys for batched upserts** -- A single-node, single-label `MERGE (n:Label {key: ...})` with a literal `{...}` key map takes a batched fast path (one L0 snapshot per statement, no per-row query planning) -- this is what makes `UNWIND $rows AS e MERGE (n:Label {key: e.key}) ...` fast. For the per-row match to be an index point-lookup rather than a filtered label scan, put a **scalar index** on the key (`db.schema().label("Label").index("key", IndexType::Scalar(ScalarType::Hash))` or `CREATE INDEX`); without one the lookup is a full label scan (fine in-memory, O(N x label_size) for large on-disk labels). **Multi-node/edge MERGE** (e.g. `MERGE (a)-[:R]->(b)`) and **non-literal property maps** (`MERGE (n:Label $props)`) fall back to the slower per-row general path -- prefer a single-node MERGE for the node, then batched `CREATE`/`MATCH` for edges.
 
 ---
 
@@ -468,6 +480,38 @@ let config = UniConfig {
 
 Diagnostic: if `MATCH (a)-[r:LINK]->(b) WHERE id(a)=$nid` for a small constant out-degree gets noticeably slower over a long write-heavy run, this is the regime.
 
+### Allocator: use mimalloc for mutation-heavy workloads
+
+For workloads that run many small mutations (per-statement Cypher `CREATE`/`MERGE`, concurrent writers, mutation streams), the **default glibc allocator becomes the dominant bottleneck**. At 24-session concurrency, profile showed ~50% of CPU time in `__memset` (zeroing fresh heap pages), kernel `clear_page_erms`, and glibc arena locks.
+
+**Python users:** every PyO3 wheel (`uni-db`, `uni-db-cuda`, `uni-db-metal`, `uni-db-onnx`, etc.) **ships with mimalloc built in** as the Rust-side global allocator. No configuration needed.
+
+**Rust library consumers:** opt in via the `mimalloc` feature flag:
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+**CLI users:** the `uni` binary already uses mimalloc by default.
+
+Measured win on `concurrent_mutations` benchmark (24 sessions × 100 `CREATE` each):
+
+| N sessions | glibc | mimalloc | speedup |
+|---|---|---|---|
+| 1 | 139 ms | 45 ms | 3.08× |
+| 24 | 984 ms | 394 ms | 2.50× |
+
+The 3× win at sess=1 reveals glibc was bloated even single-threaded for the per-statement parse + plan + DataFusion churn. mimalloc's thread-local arenas avoid the page-fault traffic. CPython's `PyMem_*` allocator is untouched in Python wheels — only Rust allocations route through mimalloc.
+
+**When to recommend it:** any code that runs `tx.execute("CREATE ...")` in a loop, multi-session writers, ingest pipelines, or benchmarks. Skip if the consumer has a strong reason to pick a different allocator (custom allocators for embedded use, etc.).
+
 ---
 
 ## When to Load References
@@ -482,6 +526,7 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Pydantic models, OGM, QueryBuilder, relationships | `references/pydantic-ogm.md` |
 | Vector search, FTS, hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
+| Locy neural predicates: CREATE MODEL/FEATURES/CALIBRATE/VALIDATE/NeuralProvenance EXPLAIN | `references/neural-predicates.md` |
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
 | BTIC temporal intervals, Allen algebra, certainty/granularity | `references/btic.md` |
 | Xervo ML runtime, providers, model catalog, auto-embedding | `references/xervo.md` |

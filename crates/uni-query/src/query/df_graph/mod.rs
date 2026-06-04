@@ -39,6 +39,7 @@ pub mod apply;
 pub mod bind_fixed_path;
 pub mod bind_zero_length_path;
 pub mod bitmap;
+pub mod catalog_scan;
 pub mod common;
 pub mod comprehension;
 pub mod expr_compiler;
@@ -48,6 +49,7 @@ pub mod locy_assume;
 pub mod locy_ast_builder;
 pub(crate) mod locy_bdd;
 pub mod locy_best_by;
+pub mod locy_calibrate;
 pub mod locy_delta;
 pub mod locy_derive;
 pub mod locy_errors;
@@ -55,16 +57,16 @@ pub mod locy_eval;
 pub mod locy_explain;
 pub mod locy_fixpoint;
 pub mod locy_fold;
+pub mod locy_model_invoke;
 pub mod locy_priority;
 pub mod locy_program;
 pub mod locy_query;
 pub mod locy_slg;
 pub mod locy_traits;
+pub mod locy_validate;
 pub mod mutation_common;
-pub mod mutation_create;
 pub mod mutation_delete;
 pub mod mutation_foreach;
-pub mod mutation_merge;
 pub mod mutation_remove;
 pub mod mutation_set;
 pub mod nfa;
@@ -74,6 +76,7 @@ pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
 pub mod quantifier;
+mod read_set_exec;
 pub mod recursive_cte;
 pub mod reduce;
 pub mod scan;
@@ -96,21 +99,28 @@ use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::storage::adjacency_manager::AdjacencyManager;
 use uni_store::storage::direction::Direction;
 use uni_store::storage::manager::StorageManager;
+
+pub mod search_procedures;
 use uni_xervo::runtime::ModelRuntime;
 
 use crate::types::QueryWarning;
 
 pub use apply::GraphApplyExec;
 pub use ext_id_lookup::GraphExtIdLookupExec;
-pub use mutation_common::{MutationContext, MutationExec};
-pub use mutation_create::MutationCreateExec;
+// CREATE and MERGE both execute through `MutationExec`; these aliases and
+// the `new_*_exec` builders are re-exported here so the planner can refer to
+// them by their clause-specific names without a dedicated module each.
+pub use mutation_common::{
+    MutationContext, MutationExec, MutationExec as MutationCreateExec,
+    MutationExec as MutationMergeExec, new_create_exec, new_merge_exec,
+};
 pub use mutation_delete::MutationDeleteExec;
 pub use mutation_foreach::ForeachExec;
-pub use mutation_merge::MutationMergeExec;
 pub use mutation_remove::MutationRemoveExec;
 pub use mutation_set::MutationSetExec;
 pub use optional_filter::OptionalFilterExec;
 pub use procedure_call::GraphProcedureCallExec;
+pub use read_set_exec::ReadSetRecordingExec;
 pub use scan::GraphScanExec;
 pub use shortest_path::GraphShortestPathExec;
 pub use traverse::{GraphTraverseExec, GraphTraverseMainExec};
@@ -166,6 +176,10 @@ pub struct GraphExecutionContext {
 
     /// External procedure registry for test/user-defined procedures.
     procedure_registry: Option<Arc<ProcedureRegistry>>,
+    /// Plugin registry — used by the native-label scan dispatcher
+    /// (M5h.2) to route a label's reads through plugin `Storage` when
+    /// one is registered via `PluginRegistry::register_label_storage`.
+    plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
     /// Uni-Xervo runtime used by vector auto-embedding paths.
     xervo_runtime: Option<Arc<ModelRuntime>>,
 
@@ -174,6 +188,15 @@ pub struct GraphExecutionContext {
 
     /// Cooperative cancellation token, threaded from `QueryContext`.
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
+
+    /// Outer transaction's writer handle (FU-1 / M11 #6). Threaded
+    /// from the [`crate::Executor`] when the query is running inside a
+    /// write-mode transaction; consumed by
+    /// `QueryProcedureHost::with_writer` at procedure invocation time
+    /// so a declared `WRITE`-mode procedure's Cypher body can mutate
+    /// the outer transaction's L0. `Arc<Writer>` (interior-mutable,
+    /// no outer lock) matches the executor's writer handle type.
+    writer: Option<Arc<uni_store::Writer>>,
 }
 
 impl std::fmt::Debug for GraphExecutionContext {
@@ -250,6 +273,31 @@ impl L0Context {
 }
 
 impl GraphExecutionContext {
+    /// Shared constructor for the public entry points. The three public
+    /// constructors differ only in the L0 visibility context, deadline,
+    /// and cancellation token; every other field starts at its default.
+    fn with_parts(
+        storage: Arc<StorageManager>,
+        l0_context: L0Context,
+        property_manager: Arc<PropertyManager>,
+        deadline: Option<Instant>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            storage,
+            l0_context,
+            property_manager,
+            deadline,
+            algo_registry: None,
+            procedure_registry: None,
+            plugin_registry: None,
+            xervo_runtime: None,
+            warnings: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token,
+            writer: None,
+        }
+    }
+
     /// Create a new graph execution context.
     ///
     /// # Arguments
@@ -262,17 +310,13 @@ impl GraphExecutionContext {
         l0: Arc<RwLock<L0Buffer>>,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
+        Self::with_parts(
             storage,
-            l0_context: L0Context::with_current(l0),
+            L0Context::with_current(l0),
             property_manager,
-            deadline: None,
-            algo_registry: None,
-            procedure_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: None,
-        }
+            None,
+            None,
+        )
     }
 
     /// Create context with full L0 visibility.
@@ -287,17 +331,7 @@ impl GraphExecutionContext {
         l0_context: L0Context,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
-            storage,
-            l0_context,
-            property_manager,
-            deadline: None,
-            algo_registry: None,
-            procedure_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: None,
-        }
+        Self::with_parts(storage, l0_context, property_manager, None, None)
     }
 
     /// Create context from a query context.
@@ -306,23 +340,34 @@ impl GraphExecutionContext {
         query_ctx: &QueryContext,
         property_manager: Arc<PropertyManager>,
     ) -> Self {
-        Self {
+        Self::with_parts(
             storage,
-            l0_context: L0Context::from_query_context(query_ctx),
+            L0Context::from_query_context(query_ctx),
             property_manager,
-            deadline: query_ctx.deadline,
-            algo_registry: None,
-            procedure_registry: None,
-            xervo_runtime: None,
-            warnings: Arc::new(Mutex::new(Vec::new())),
-            cancellation_token: query_ctx.cancellation_token.clone(),
-        }
+            query_ctx.deadline,
+            query_ctx.cancellation_token.clone(),
+        )
     }
 
     /// Set query timeout deadline.
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Attach the outer transaction's writer handle so declared
+    /// `WRITE`-mode procedures invoked through this context can run
+    /// their Cypher bodies via the write-enabled inner-query host.
+    #[must_use]
+    pub fn with_writer(mut self, writer: Arc<uni_store::Writer>) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Borrow the outer transaction's writer handle, if any.
+    #[must_use]
+    pub fn writer(&self) -> Option<&Arc<uni_store::Writer>> {
+        self.writer.as_ref()
     }
 
     /// Set the algorithm registry for `uni.algo.*` procedure dispatch.
@@ -351,6 +396,18 @@ impl GraphExecutionContext {
     /// Get a reference to the procedure registry, if set.
     pub fn procedure_registry(&self) -> Option<&Arc<ProcedureRegistry>> {
         self.procedure_registry.as_ref()
+    }
+
+    /// Attach the plugin registry. Required by the M5h.2 native-label
+    /// plugin-storage routing in `columnar_scan_vertex_batch_static`.
+    pub fn with_plugin_registry(mut self, registry: Arc<uni_plugin::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
+        self
+    }
+
+    /// Reference to the plugin registry (if set).
+    pub fn plugin_registry(&self) -> Option<&Arc<uni_plugin::PluginRegistry>> {
+        self.plugin_registry.as_ref()
     }
 
     pub fn xervo_runtime(&self) -> Option<&Arc<ModelRuntime>> {
@@ -409,6 +466,25 @@ impl GraphExecutionContext {
     /// Get a reference to the L0 context.
     pub fn l0_context(&self) -> &L0Context {
         &self.l0_context
+    }
+
+    /// Wall-clock deadline for the surrounding query, if any.
+    ///
+    /// Internal accessor used by [`crate::query::executor::procedure_host::QueryProcedureHost`]
+    /// to snapshot the deadline so procedure plugins can implement
+    /// `check_timeout` without holding a borrow on this context.
+    #[must_use]
+    pub fn deadline_for_host(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Cancellation token clone for the surrounding query, if any.
+    ///
+    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`];
+    /// see [`Self::deadline_for_host`].
+    #[must_use]
+    pub fn cancellation_token_for_host(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancellation_token.clone()
     }
 
     /// Create a query context for property manager calls.
@@ -498,34 +574,11 @@ impl GraphExecutionContext {
     ///
     /// Vector of (neighbor VID, edge ID) pairs.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
-        let am = self.adjacency_manager();
         let version_hwm = self.storage.version_high_water_mark();
-
-        // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
-        // For snapshot queries, filter by version via StorageManager delegate.
-        let mut neighbors = if let Some(hwm) = version_hwm {
-            self.storage
-                .get_neighbors_at_version(vid, edge_type, direction, hwm)
-        } else {
-            am.get_neighbors(vid, edge_type, direction)
-        };
-
-        // Overlay transaction L0 if present (transaction edges bypass Writer/AM).
-        if version_hwm.is_none()
-            && let Some(tx_l0) = &self.l0_context.transaction_l0
-        {
-            let tx_guard = tx_l0.read();
-            overlay_l0_neighbors(
-                vid,
-                edge_type,
-                direction,
-                &tx_guard,
-                &mut neighbors,
-                version_hwm,
-            );
-        }
-
-        neighbors
+        // Single-vid case: acquire the transaction-L0 guard once for this
+        // vertex (the batch path amortizes it across many vertices).
+        let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
+        self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref())
     }
 
     /// Get neighbors for multiple vertices in batch.
@@ -548,43 +601,131 @@ impl GraphExecutionContext {
         edge_type: u32,
         direction: Direction,
     ) -> Vec<(Vid, Vid, Eid)> {
-        let am = self.adjacency_manager();
         let version_hwm = self.storage.version_high_water_mark();
-
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
 
         let mut results = Vec::new();
-
         for &vid in vids {
-            let mut neighbors = if let Some(hwm) = version_hwm {
-                self.storage
-                    .get_neighbors_at_version(vid, edge_type, direction, hwm)
-            } else {
-                am.get_neighbors(vid, edge_type, direction)
-            };
-
-            // Overlay transaction L0 if present
-            if version_hwm.is_none()
-                && let Some(ref tx_guard) = tx_guard
-            {
-                overlay_l0_neighbors(
-                    vid,
-                    edge_type,
-                    direction,
-                    tx_guard,
-                    &mut neighbors,
-                    version_hwm,
-                );
-            }
-
+            let neighbors =
+                self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref());
             results.extend(
                 neighbors
                     .into_iter()
                     .map(|(neighbor, eid)| (vid, neighbor, eid)),
             );
         }
-
         results
+    }
+
+    /// Resolve a single vertex's neighbours, overlaying the transaction L0
+    /// (if visible) and recording the traversal into the SSI read-set.
+    ///
+    /// `tx_guard` is the already-acquired read guard over the transaction
+    /// L0 buffer (if any), so batch callers acquire the lock once and pass
+    /// the borrow in for every vertex.
+    fn neighbors_for_vid(
+        &self,
+        vid: Vid,
+        edge_type: u32,
+        direction: Direction,
+        version_hwm: Option<u64>,
+        tx_guard: Option<&L0Buffer>,
+    ) -> Vec<(Vid, Eid)> {
+        // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
+        // For snapshot queries, filter by version via StorageManager delegate.
+        let mut neighbors = if let Some(hwm) = version_hwm {
+            self.storage
+                .get_neighbors_at_version(vid, edge_type, direction, hwm)
+        } else {
+            self.adjacency_manager()
+                .get_neighbors(vid, edge_type, direction)
+        };
+
+        // Overlay transaction L0 if present (transaction edges bypass Writer/AM).
+        if version_hwm.is_none()
+            && let Some(tx_guard) = tx_guard
+        {
+            overlay_l0_neighbors(
+                vid,
+                edge_type,
+                direction,
+                tx_guard,
+                &mut neighbors,
+                version_hwm,
+            );
+        }
+
+        self.record_neighbor_reads(vid, &neighbors);
+
+        neighbors
+    }
+
+    /// Records traversed edges and discovered neighbours into the SSI read-set.
+    ///
+    /// No-op unless this is a read-write transaction (`occ_read_set` is `Some`
+    /// only then), so read-only and analytical traversals pay nothing. Recording
+    /// the source plus each neighbour vid and edge id gives item-level
+    /// antidependency coverage for traversals, matching the keyed read paths.
+    fn record_neighbor_reads(&self, src: Vid, neighbors: &[(Vid, Eid)]) {
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        rs.vertices.insert(src);
+        for (nbr, eid) in neighbors {
+            rs.vertices.insert(*nbr);
+            rs.edges.insert(*eid);
+        }
+    }
+
+    /// Records the vertex/edge ids in the given batch columns into the read-set.
+    ///
+    /// Used by [`ReadSetRecordingExec`] to capture the identities of rows that
+    /// survived a scan's filters. No-op when there is no transaction read-set
+    /// (read-only / analytical contexts).
+    ///
+    /// [`ReadSetRecordingExec`]: crate::query::df_graph::ReadSetRecordingExec
+    pub(crate) fn record_batch_ids(
+        &self,
+        batch: &arrow_array::RecordBatch,
+        vertex_cols: &[usize],
+        edge_cols: &[usize],
+    ) {
+        use arrow_array::{Array, UInt64Array};
+
+        if vertex_cols.is_empty() && edge_cols.is_empty() {
+            return;
+        }
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for &col in vertex_cols {
+            if let Some(arr) = batch.column(col).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        rs.vertices.insert(Vid::from(arr.value(i)));
+                    }
+                }
+            }
+        }
+        for &col in edge_cols {
+            if let Some(arr) = batch.column(col).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        rs.edges.insert(Eid::from(arr.value(i)));
+                    }
+                }
+            }
+        }
     }
 }
 

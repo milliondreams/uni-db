@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::{TemporalValue, Value};
 use uni_cypher::ast::{BinaryOp, Expr};
+use uni_store::PropertyManager;
 use uni_store::QueryContext;
 use uni_store::runtime::l0_manager::L0Manager;
 use uni_store::runtime::writer::Writer;
@@ -44,6 +45,13 @@ fn numeric_to_value(val: f64) -> Value {
 }
 
 /// Cross-type ordering rank for Cypher min/max (lower rank = smaller).
+///
+/// NOTE: This is deliberately a *different* ordering from
+/// [`Executor::compare_values`] (used for `ORDER BY`). The two systems must
+/// not be merged: `min`/`max` follow the openCypher aggregation ordering
+/// (Null < List < String < Boolean < Number), whereas `ORDER BY` follows the
+/// openCypher comparability/ordering rules for sort, which rank the type
+/// families differently. Unifying them would silently break one or the other.
 fn cypher_type_rank(val: &Value) -> u8 {
     match val {
         Value::Null => 0,
@@ -218,11 +226,17 @@ pub(crate) type GenExprCacheKey = (String, String);
 ///
 /// `Executor` is cheaply cloneable — all expensive state is held behind `Arc`s.
 /// Clone it freely to share across tasks.
+///
+/// **Note on `Clone` semantics**: the derived `Clone` would alias the
+/// `warnings` `Arc<Mutex<…>>`, making warnings collected on the clone
+/// bleed into the original. A clone is intended to be a "fresh executor
+/// borrowing shared state," so the manual impl below installs a fresh
+/// `warnings` accumulator. All other Arc-shared state is intentionally
+/// shared (caches, registries, runtimes).
 // M-PUBLIC-DEBUG: Manual impl because Writer/ModelRuntime do not implement Debug.
-#[derive(Clone)]
 pub struct Executor {
     pub(crate) storage: Arc<StorageManager>,
-    pub(crate) writer: Option<Arc<RwLock<Writer>>>,
+    pub(crate) writer: Option<Arc<Writer>>,
     pub(crate) l0_manager: Option<Arc<L0Manager>>,
     pub(crate) algo_registry: Arc<AlgorithmRegistry>,
     pub(crate) use_transaction: bool,
@@ -242,12 +256,33 @@ pub struct Executor {
     /// without requiring the writer lock at transaction-creation time.
     pub(crate) transaction_l0_override:
         Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Per-transaction VID/EID reservoir. When set, CREATE/MERGE paths pull
+    /// IDs from this batched cache instead of `Writer::next_vid()` /
+    /// `Writer::next_eid()`, amortizing the `IdAllocator`'s global mutex.
+    pub(crate) id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     /// User-defined custom scalar function registry.
     pub(crate) custom_function_registry:
-        Option<Arc<super::custom_functions::CustomFunctionRegistry>>,
+        Option<Arc<uni_query_functions::custom_functions::CustomFunctionRegistry>>,
     /// Cooperative cancellation token. Passed to `QueryContext` and
     /// `GraphExecutionContext` so in-flight operators can detect cancellation.
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// Shared `PropertyManager` to reuse inside `create_datafusion_planner`
+    /// instead of allocating a fresh one (with empty LRU caches) per query.
+    /// When `None`, the planner falls back to constructing from the
+    /// `&PropertyManager` parameter — preserving existing behavior for any
+    /// caller that does not set this.
+    pub(crate) prop_manager_arc: Option<Arc<PropertyManager>>,
+    /// Pre-built DataFusion `SessionContext` template with all Cypher UDFs
+    /// already registered. When set AND no custom UDFs are installed,
+    /// `create_datafusion_planner` clones this Arc (O(1)) instead of building
+    /// a fresh `SessionContext` and re-registering UDFs every query
+    /// (~140 µs/query saved on the InMemory backend).
+    pub(crate) df_session_template: Option<Arc<datafusion::execution::context::SessionContext>>,
+    /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). When set,
+    /// `get_context` builds the read context from this frozen view instead of the
+    /// live L0, so a transaction's reads are isolated from concurrent commits.
+    /// `None` (the default, when no snapshot has been pinned) means live reads.
+    pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -261,9 +296,45 @@ impl std::fmt::Debug for Executor {
     }
 }
 
+impl Clone for Executor {
+    /// Clone an `Executor`, sharing all Arc-backed state but installing a
+    /// fresh `warnings` accumulator. Warnings are query-scoped; aliasing
+    /// the Mutex across clones would let one query's warnings spill into
+    /// another.
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            writer: self.writer.clone(),
+            l0_manager: self.l0_manager.clone(),
+            algo_registry: self.algo_registry.clone(),
+            use_transaction: self.use_transaction,
+            file_sandbox: self.file_sandbox.clone(),
+            config: self.config.clone(),
+            gen_expr_cache: self.gen_expr_cache.clone(),
+            procedure_registry: self.procedure_registry.clone(),
+            xervo_runtime: self.xervo_runtime.clone(),
+            // Fresh warnings per clone — see struct doc.
+            warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
+            transaction_l0_override: self.transaction_l0_override.clone(),
+            id_reservoir: self.id_reservoir.clone(),
+            custom_function_registry: self.custom_function_registry.clone(),
+            cancellation_token: self.cancellation_token.clone(),
+            prop_manager_arc: self.prop_manager_arc.clone(),
+            df_session_template: self.df_session_template.clone(),
+            read_snapshot: self.read_snapshot.clone(),
+        }
+    }
+}
+
 impl Executor {
     /// Create a read-only executor backed by the given storage manager.
     pub fn new(storage: Arc<StorageManager>) -> Self {
+        // M4: auto-wire the host plugin registry so low-level test
+        // setups that bypass `Uni::build` still see `uni.schema.*` and
+        // `uni.algo.*` procedures (which no longer have hardcoded
+        // dispatch arms in `procedure_call.rs`).
+        let proc_registry = Arc::new(ProcedureRegistry::new());
+        proc_registry.set_plugin_registry(crate::procedures_plugin::default_host_plugin_registry());
         Self {
             storage,
             writer: None,
@@ -273,17 +344,43 @@ impl Executor {
             file_sandbox: uni_common::config::FileSandboxConfig::default(),
             config: uni_common::config::UniConfig::default(),
             gen_expr_cache: Arc::new(RwLock::new(HashMap::new())),
-            procedure_registry: None,
+            procedure_registry: Some(proc_registry),
             xervo_runtime: None,
             warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
             transaction_l0_override: None,
+            id_reservoir: None,
             custom_function_registry: None,
             cancellation_token: None,
+            prop_manager_arc: None,
+            df_session_template: None,
+            read_snapshot: None,
         }
     }
 
+    /// Install a shared `PropertyManager` so the planner can reuse it
+    /// instead of constructing a fresh one per query.
+    ///
+    /// Reusing the caller's `Arc<PropertyManager>` skips the LRU cache
+    /// allocation cost (~80 µs/query in the InMemory backend).
+    pub fn set_prop_manager(&mut self, pm: Arc<PropertyManager>) {
+        self.prop_manager_arc = Some(pm);
+    }
+
+    /// Install a pre-built `SessionContext` template with Cypher UDFs already
+    /// registered, so the planner can clone it (O(1)) instead of rebuilding.
+    ///
+    /// When custom UDFs are also installed, the template is bypassed and a
+    /// fresh `SessionContext` is built for that query (preserves UDF
+    /// isolation across executors).
+    pub fn set_df_session_template(
+        &mut self,
+        tmpl: Arc<datafusion::execution::context::SessionContext>,
+    ) {
+        self.df_session_template = Some(tmpl);
+    }
+
     /// Create a write-enabled executor with an attached `Writer`.
-    pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<RwLock<Writer>>) -> Self {
+    pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<Writer>) -> Self {
         let mut executor = Self::new(storage);
         executor.writer = Some(writer);
         executor
@@ -318,7 +415,7 @@ impl Executor {
     }
 
     /// Attach a `Writer` after construction, enabling write operations.
-    pub fn set_writer(&mut self, writer: Arc<RwLock<Writer>>) {
+    pub fn set_writer(&mut self, writer: Arc<Writer>) {
         self.writer = Some(writer);
     }
 
@@ -344,10 +441,26 @@ impl Executor {
         self.transaction_l0_override = Some(l0);
     }
 
+    /// Attach a pinned L0 snapshot for snapshot-isolated reads (Component C1).
+    ///
+    /// When `Some`, `get_context` reads from the frozen view instead of
+    /// the live L0. A `None` is a no-op (live reads), so threading it is always
+    /// safe — callers that do not pin a snapshot leave it `None`.
+    pub fn set_read_snapshot(&mut self, snapshot: Option<uni_store::runtime::SnapshotView>) {
+        self.read_snapshot = snapshot;
+    }
+
+    /// Attach a per-transaction VID/EID reservoir. When set, CREATE/MERGE
+    /// paths in `execute_create_pattern` pull IDs from the reservoir's
+    /// pre-reserved cache, amortizing the global `IdAllocator` mutex.
+    pub fn set_id_reservoir(&mut self, r: Arc<uni_store::runtime::TxIdReservoir>) {
+        self.id_reservoir = Some(r);
+    }
+
     /// Attach a custom scalar function registry for user-defined functions.
     pub fn set_custom_functions(
         &mut self,
-        registry: Arc<super::custom_functions::CustomFunctionRegistry>,
+        registry: Arc<uni_query_functions::custom_functions::CustomFunctionRegistry>,
     ) {
         self.custom_function_registry = Some(registry);
     }
@@ -362,15 +475,23 @@ impl Executor {
     /// this is how private-per-transaction L0 buffers become visible to reads
     /// without requiring the writer lock at tx creation.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
-        if let Some(writer_lock) = &self.writer {
-            let writer = writer_lock.read().await;
+        if let Some(writer) = &self.writer {
             // Prefer the override (private tx L0) over the writer's slot
             let tx_l0 = self.transaction_l0_override.clone();
-            let mut ctx = QueryContext::new_with_pending(
-                writer.l0_manager.get_current(),
-                tx_l0,
-                writer.l0_manager.get_pending_flush(),
-            );
+            // Component C1: when a snapshot is pinned, read from the frozen
+            // generation (`main` + `extra`) so concurrent commits are invisible;
+            // `transaction_l0` stays live for read-your-writes. `None` (the
+            // default, when no snapshot is pinned) ⇒ live reads.
+            let mut ctx = match &self.read_snapshot {
+                Some(snap) => {
+                    QueryContext::new_with_pending(snap.main.clone(), tx_l0, snap.extra.clone())
+                }
+                None => QueryContext::new_with_pending(
+                    writer.l0_manager.get_current(),
+                    tx_l0,
+                    writer.l0_manager.get_pending_flush(),
+                ),
+            };
             ctx.set_deadline(Instant::now() + self.config.query_timeout);
             if let Some(ref token) = self.cancellation_token {
                 ctx.set_cancellation_token(token.clone());
@@ -389,6 +510,12 @@ impl Executor {
     }
 
     /// Total ordering for Cypher ORDER BY, including cross-type comparisons.
+    ///
+    /// NOTE: This uses a different cross-type rank from
+    /// [`cypher_cross_type_cmp`]/[`cypher_type_rank`] (the `min`/`max`
+    /// aggregation ordering). The divergence is intentional — sort ordering
+    /// and aggregation ordering follow distinct openCypher rules — so the two
+    /// must stay separate.
     pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 

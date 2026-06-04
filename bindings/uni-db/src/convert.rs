@@ -392,6 +392,90 @@ pub fn prepare_params(
     Ok(rust_params)
 }
 
+/// Convert an optional Python params dict to Rust params, preserving the
+/// `None`/`Some` distinction so callers can pick the parameterized vs.
+/// parameter-free query path.
+pub fn convert_params(
+    py: Python,
+    params: Option<HashMap<String, Py<PyAny>>>,
+) -> PyResult<Option<HashMap<String, Value>>> {
+    match params {
+        Some(p) => {
+            let mut map = HashMap::with_capacity(p.len());
+            for (k, v) in p {
+                map.insert(k, py_object_to_value(py, &v)?);
+            }
+            Ok(Some(map))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build a bulk-writer progress callback that forwards each `BulkProgress`
+/// update to the given Python callable.
+///
+/// The Python object is not `Send`, but the bulk-writer requires a `Send`
+/// closure; the returned closure always re-attaches the GIL before touching it,
+/// so the `unsafe impl Send` wrapper is sound (the object is only ever used
+/// while the GIL is held).
+pub fn make_progress_callback(
+    cb: Py<PyAny>,
+) -> impl Fn(::uni_db::api::bulk::BulkProgress) + Send + 'static {
+    struct PyProgressWrapper {
+        py_obj: Py<PyAny>,
+    }
+    // SAFETY: `py_obj` is only dereferenced inside `Python::attach`, i.e. with
+    // the GIL held, so it is never accessed concurrently from Rust threads.
+    unsafe impl Send for PyProgressWrapper {}
+
+    let wrapper = PyProgressWrapper { py_obj: cb };
+    move |progress: ::uni_db::api::bulk::BulkProgress| {
+        Python::attach(|py| {
+            let py_progress = crate::types::BulkProgress {
+                phase: format!("{:?}", progress.phase),
+                rows_processed: progress.rows_processed,
+                total_rows: progress.total_rows,
+                current_label: progress.current_label.clone(),
+                elapsed_secs: progress.elapsed.as_secs_f64(),
+            };
+            if let Ok(bound) = Py::new(py, py_progress) {
+                let _ = wrapper.py_obj.call1(py, (bound,));
+            }
+        });
+    }
+}
+
+/// Map a Rust `WriteLease` to its Python representation.
+///
+/// `WriteLease` is `#[non_exhaustive]`; the catch-all (covering `Custom` and any
+/// future variant) reports `Local`, matching the pre-existing behavior.
+pub fn write_lease_to_py(
+    wl: &::uni_db::api::multi_agent::WriteLease,
+) -> crate::types::PyWriteLease {
+    match wl {
+        ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => crate::types::PyWriteLease {
+            variant: crate::types::WriteLeaseVariant::DynamoDB {
+                table: table.clone(),
+            },
+        },
+        _ => crate::types::PyWriteLease {
+            variant: crate::types::WriteLeaseVariant::Local,
+        },
+    }
+}
+
+/// Convert a borrowed Python params dict to Rust params.
+pub fn convert_params_ref(
+    py: Python,
+    params: &HashMap<String, Py<PyAny>>,
+) -> PyResult<HashMap<String, Value>> {
+    let mut map = HashMap::with_capacity(params.len());
+    for (k, v) in params {
+        map.insert(k.clone(), py_object_to_value(py, v)?);
+    }
+    Ok(map)
+}
+
 /// Convert query result rows to Python Row objects.
 pub fn rows_to_py(py: Python, rows: Vec<::uni_db::Row>) -> PyResult<Vec<Py<PyAny>>> {
     let mut result = Vec::new();
@@ -447,6 +531,48 @@ fn derivation_node_to_py(py: Python, node: uni_locy::DerivationNode) -> PyResult
     dict.set_item("children", children)?;
     dict.set_item("graph_fact", node.graph_fact)?;
     dict.set_item("proof_probability", node.proof_probability)?;
+
+    let neural_calls = PyList::empty(py);
+    for call in node.neural_calls {
+        let call_dict = PyDict::new(py);
+        call_dict.set_item("model_name", &call.model_name)?;
+        call_dict.set_item("raw_probability", call.raw_probability)?;
+        call_dict.set_item("calibrated_probability", call.calibrated_probability)?;
+        if let Some(band) = call.confidence_band {
+            let band_dict = PyDict::new(py);
+            band_dict.set_item("lower", band.lower)?;
+            band_dict.set_item("upper", band.upper)?;
+            let (source_name, source_params) = match band.source {
+                uni_locy::ConfidenceSource::Conformal { alpha } => {
+                    let p = PyDict::new(py);
+                    p.set_item("alpha", alpha)?;
+                    ("conformal", p)
+                }
+                uni_locy::ConfidenceSource::EnsembleVariance { n_estimators } => {
+                    let p = PyDict::new(py);
+                    p.set_item("n_estimators", n_estimators)?;
+                    ("ensemble_variance", p)
+                }
+                uni_locy::ConfidenceSource::Credal {
+                    lower_prior,
+                    upper_prior,
+                } => {
+                    let p = PyDict::new(py);
+                    p.set_item("lower_prior", lower_prior)?;
+                    p.set_item("upper_prior", upper_prior)?;
+                    ("credal", p)
+                }
+            };
+            band_dict.set_item("source", source_name)?;
+            band_dict.set_item("source_params", source_params)?;
+            call_dict.set_item("confidence_band", band_dict)?;
+        } else {
+            call_dict.set_item("confidence_band", py.None())?;
+        }
+        neural_calls.append(call_dict)?;
+    }
+    dict.set_item("neural_calls", neural_calls)?;
+
     Ok(dict.into())
 }
 
@@ -547,6 +673,46 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
             let list = PyList::new(py, &rows_py)?;
             Ok(Py::new(py, PyCypherCommandResult { rows: list.into() })?.into_any())
         }
+        uni_locy::CommandResult::Calibrate(c) => {
+            let d = PyDict::new(py);
+            d.set_item("type", "calibrate")?;
+            d.set_item("model_name", &c.model_name)?;
+            d.set_item("method", format!("{:?}", c.method))?;
+            d.set_item("n_samples", c.n_samples)?;
+            d.set_item("holdout_size", c.holdout_size)?;
+            d.set_item("raw_brier", c.raw_brier)?;
+            d.set_item("raw_ece", c.raw_ece)?;
+            d.set_item("calibrated_brier", c.calibrated_brier)?;
+            d.set_item("calibrated_ece", c.calibrated_ece)?;
+            match c.confidence_band_quantile {
+                Some(q) => d.set_item("confidence_band_quantile", q)?,
+                None => d.set_item("confidence_band_quantile", py.None())?,
+            }
+            // Surface the fitted calibrator so Python callers can apply
+            // it to raw classifier outputs (e.g. to rescore a ranked
+            // queue with calibrated probabilities).
+            let py_cal = Py::new(
+                py,
+                crate::types::PyCalibrator {
+                    inner: c.calibrator.clone(),
+                },
+            )?;
+            d.set_item("calibrator", py_cal)?;
+            Ok(d.into_any().unbind())
+        }
+        uni_locy::CommandResult::Validate(v) => {
+            let d = PyDict::new(py);
+            d.set_item("type", "validate")?;
+            d.set_item("rule_name", &v.rule_name)?;
+            d.set_item("prob_column", &v.prob_column)?;
+            d.set_item("n_samples", v.n_samples)?;
+            let metrics = PyDict::new(py);
+            for (m, val) in &v.metrics {
+                metrics.set_item(format!("{:?}", m), *val)?;
+            }
+            d.set_item("metrics", metrics)?;
+            Ok(d.into_any().unbind())
+        }
     }
 }
 
@@ -561,6 +727,9 @@ pub fn extract_locy_config(
     }
     if let Some(v) = config.get("timeout") {
         locy_config.timeout = std::time::Duration::from_secs_f64(v.extract::<f64>(py)?);
+    }
+    if let Some(v) = config.get("allow_partial") {
+        locy_config.allow_partial = v.extract::<bool>(py)?;
     }
     if let Some(v) = config.get("max_explain_depth") {
         locy_config.max_explain_depth = v.extract::<usize>(py)?;
@@ -602,12 +771,54 @@ pub fn extract_locy_config(
         let params_map = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
         locy_config.params = prepare_params(py, Some(params_map))?;
     }
+    if let Some(v) = config.get("classifier_registry") {
+        let raw = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
+        let registry = crate::classifier::build_classifier_registry(py, raw)?;
+        locy_config.classifier_registry = registry;
+    }
+    // Always-on NeuralProvenance side-channel store. Without it, EXPLAIN's
+    // neural_calls list comes back empty for Python-registered classifiers
+    // (the fallback re-invocation path in collect_neural_calls_for_row only
+    // populates entries when the planner's pre-rewrite model_invocations
+    // survive into the executed clause; the store side-channel is what
+    // apply_model_invocations actually writes into).
+    locy_config.classifier_provenance_store =
+        Some(std::sync::Arc::new(::uni_locy::NeuralProvenanceStore::new()));
     Ok(locy_config)
+}
+
+/// Convert the optional incompleteness diagnostics to a Python dict (or `None`).
+///
+/// Present only on the `allow_partial` path; `None` for a complete evaluation.
+fn locy_incomplete_to_py(
+    py: Python,
+    incomplete: Option<&uni_db::LocyIncomplete>,
+) -> PyResult<Py<PyAny>> {
+    let Some(d) = incomplete else {
+        return Ok(py.None());
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("reason", d.reason.as_str())?;
+    dict.set_item("elapsed_ms", d.elapsed_ms)?;
+    dict.set_item("limit_ms", d.limit_ms)?;
+    dict.set_item("max_iterations", d.max_iterations)?;
+    dict.set_item("completed_strata", d.completed_strata)?;
+    dict.set_item("total_strata", d.total_strata)?;
+    dict.set_item("incomplete_rules", PyList::new(py, &d.incomplete_rules)?)?;
+    dict.set_item("skipped_rules", PyList::new(py, &d.skipped_rules)?)?;
+    dict.set_item(
+        "complement_rules_affected",
+        PyList::new(py, &d.complement_rules_affected)?,
+    )?;
+    Ok(dict.into())
 }
 
 /// Convert a LocyResult to a Python dict.
 pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResult<Py<PyAny>> {
     let result = result.into_inner();
+    // Capture before the by-value field moves below — `timed_out()`
+    // borrows `&result`, which would conflict afterwards.
+    let timed_out = result.timed_out();
     let dict = PyDict::new(py);
 
     // derived: HashMap<String, Vec<Row>> -> Python dict of lists of dicts
@@ -649,6 +860,10 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
             uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
                 "cross_group_correlation_not_exact"
             }
+            uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic => "fuzzy_not_probabilistic",
+            uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency => {
+                "top_k_pruning_crossed_dependency"
+            }
         };
         wd.set_item("code", code_str)?;
         wd.set_item("message", &w.message)?;
@@ -672,6 +887,12 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
         approx_dict.set_item(&rule_name, group_list)?;
     }
     dict.set_item("approximate_groups", approx_dict)?;
+
+    dict.set_item("timed_out", timed_out)?;
+    dict.set_item(
+        "incomplete",
+        locy_incomplete_to_py(py, result.incomplete.as_ref())?,
+    )?;
 
     Ok(dict.into())
 }
@@ -717,6 +938,9 @@ pub fn locy_result_to_py_class(
     result: uni_db::locy::LocyResult,
 ) -> PyResult<crate::types::PyLocyResult> {
     let result = result.into_inner();
+    // Capture before the by-value field moves below — `timed_out()`
+    // borrows `&result`, which would conflict afterwards.
+    let timed_out = result.timed_out();
     // Reuse the existing dict-based conversion for the inner fields
     let derived_dict = pyo3::types::PyDict::new(py);
     for (rule_name, rows) in result.derived {
@@ -750,6 +974,10 @@ pub fn locy_result_to_py_class(
             uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
                 "cross_group_correlation_not_exact"
             }
+            uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic => "fuzzy_not_probabilistic",
+            uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency => {
+                "top_k_pruning_crossed_dependency"
+            }
         };
         wd.set_item("code", code_str)?;
         wd.set_item("message", &w.message)?;
@@ -780,6 +1008,8 @@ pub fn locy_result_to_py_class(
         None => py.None(),
     };
 
+    let incomplete = locy_incomplete_to_py(py, result.incomplete.as_ref())?;
+
     Ok(crate::types::PyLocyResult {
         derived: derived_dict.into(),
         stats: stats.into_py_any(py)?,
@@ -787,6 +1017,8 @@ pub fn locy_result_to_py_class(
         warnings: warn_list.into(),
         approximate_groups: approx_dict.into(),
         derived_fact_set,
+        timed_out,
+        incomplete,
     })
 }
 

@@ -30,3 +30,19 @@ debug = 1  # Line tables only - saves ~50% debug info size
 [profile.dev.package."*"]
 opt-level = 2  # Optimize dependencies even in dev builds
 
+# Inner-loop profile: like dev, but no debug info and more codegen-units for
+# parallelism. Use with `cargo build --profile dev-fast` when you don't need
+# a debugger (e.g. iterating on a compile error or a quick smoke test).
+[profile.dev-fast]
+inherits = "dev"
+debug = 0
+codegen-units = 256
+incremental = true
+
+# Release tuning: ThinLTO + 16 codegen units gives near-fat-LTO performance
+# without the wall-clock cost of fat-LTO + codegen-units=1 (which should be
+# reserved for publishable wheels via a separate `--profile publish`).
+[profile.release]
+lto = "thin"
+codegen-units = 16
+

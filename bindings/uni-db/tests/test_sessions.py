@@ -3,8 +3,6 @@
 
 """Tests for Session API."""
 
-import tempfile
-
 import pytest
 
 import uni_db
@@ -16,18 +14,17 @@ class TestSession:
     @pytest.fixture
     def db(self):
         """Create a database with test data."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Person").property("name", "string").property(
-                "age", "int"
-            ).apply()
-            session = db.session()
-            tx = session.tx()
-            tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
-            tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
-            tx.commit()
-            db.flush()
-            yield db
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Person").property("name", "string").property(
+            "age", "int"
+        ).apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+        tx.commit()
+        db.flush()
+        return db
 
     def test_session_set_and_get_variable(self, db):
         """Test setting and getting a session variable."""

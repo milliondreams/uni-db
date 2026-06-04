@@ -25,6 +25,14 @@ use uni_crdt::Crdt;
 pub struct PropertyManager {
     storage: Arc<StorageManager>,
     schema_manager: Arc<SchemaManager>,
+    /// Plugin registry consulted by CRDT merges via
+    /// [`uni_crdt::Crdt::merge_via_registry`]. The legacy 3-arg
+    /// [`Self::new`] passes an empty registry so callers that don't
+    /// wire plugin dispatch keep getting bit-identical native
+    /// behavior (empty registry → `merge_via_registry`'s native
+    /// fallback). Production paths in `UniInner` use
+    /// [`Self::with_plugin_registry`] to share the host's registry.
+    plugin_registry: Arc<uni_plugin::PluginRegistry>,
     /// Cache is None when capacity=0 (caching disabled)
     vertex_cache: Option<Mutex<LruCache<(Vid, String), Value>>>,
     edge_cache: Option<Mutex<LruCache<(uni_common::core::id::Eid, String), Value>>>,
@@ -32,10 +40,36 @@ pub struct PropertyManager {
 }
 
 impl PropertyManager {
+    /// Construct a `PropertyManager` with an empty plugin registry.
+    ///
+    /// Back-compat shim for the ~17 algorithm and test call sites that
+    /// don't need registry-dispatched CRDT merges. Equivalent to
+    /// [`Self::with_plugin_registry`] with `Arc::new(PluginRegistry::new())`.
     pub fn new(
         storage: Arc<StorageManager>,
         schema_manager: Arc<SchemaManager>,
         capacity: usize,
+    ) -> Self {
+        Self::with_plugin_registry(
+            storage,
+            schema_manager,
+            capacity,
+            Arc::new(uni_plugin::PluginRegistry::new()),
+        )
+    }
+
+    /// Construct a `PropertyManager` wired to a shared `PluginRegistry`.
+    ///
+    /// CRDT merges in this `PropertyManager` consult `plugin_registry`
+    /// for `CrdtKindProvider`s matching each `Crdt::kind()`; matched
+    /// kinds dispatch through the provider (so hot-reloaded plugins
+    /// take effect immediately), unmatched kinds fall back to the
+    /// native `Crdt::try_merge`.
+    pub fn with_plugin_registry(
+        storage: Arc<StorageManager>,
+        schema_manager: Arc<SchemaManager>,
+        capacity: usize,
+        plugin_registry: Arc<uni_plugin::PluginRegistry>,
     ) -> Self {
         // Capacity of 0 disables caching
         let (vertex_cache, edge_cache) = if capacity == 0 {
@@ -51,6 +85,7 @@ impl PropertyManager {
         Self {
             storage,
             schema_manager,
+            plugin_registry,
             vertex_cache,
             edge_cache,
             cache_capacity: capacity,
@@ -749,76 +784,6 @@ impl PropertyManager {
         }
     }
 
-    pub async fn load_properties_columnar(
-        &self,
-        vids: &UInt64Array,
-        properties: &[&str],
-        ctx: Option<&QueryContext>,
-    ) -> Result<RecordBatch> {
-        // This is complex because vids can be mixed labels.
-        // Vectorized execution usually processes batches of same label (Phase 3).
-        // For Phase 2, let's assume `vids` contains mixed labels and we return a RecordBatch
-        // that aligns with `vids` (same length, same order).
-        // This likely requires gathering values and building new arrays.
-        // OR we return a batch where missing values are null.
-
-        // Strategy:
-        // 1. Convert UInt64Array to Vec<Vid>
-        // 2. Call `get_batch_vertex_props`
-        // 3. Reconstruct RecordBatch from HashMap results ensuring alignment.
-
-        // This is not "true" columnar zero-copy loading from disk to memory,
-        // but it satisfies the interface and prepares for better optimization later.
-        // True zero-copy requires filtered scans returning aligned batches, which is hard with random access.
-        // Lance `take` is better.
-
-        let mut vid_vec = Vec::with_capacity(vids.len());
-        for i in 0..vids.len() {
-            vid_vec.push(Vid::from(vids.value(i)));
-        }
-
-        let _props_map = self
-            .get_batch_vertex_props(&vid_vec, properties, ctx)
-            .await?;
-
-        // Build output columns
-        // We need to know the Arrow DataType for each property.
-        // Problem: Different labels might have same property name but different type?
-        // Uni schema enforces unique property name/type globally? No, per label/type.
-        // But usually properties with same name share semantic/type.
-        // If types differ, we can't put them in one column.
-        // For now, assume consistent types or pick one.
-
-        // Let's inspect schema for first label found for each property?
-        // Or expect caller to handle schema.
-        // The implementation here constructs arrays from JSON Values.
-
-        // Actually, we can use `value_to_json` logic reverse or specific builders.
-        // For simplicity in Phase 2, we can return Arrays of mixed types? No, Arrow is typed.
-        // We will infer type from Schema.
-
-        // Let's create builders for each property.
-        // For now, support basic types.
-
-        // TODO: This implementation is getting long.
-        // Let's stick to the interface contract.
-
-        // Simplified: just return empty batch for now if not fully implemented or stick to scalar loading if too complex.
-        // But I should implement it.
-
-        // ... Implementation via Builder ...
-        // Skipping detailed columnar builder for brevity in this specific file update
-        // unless explicitly requested, as `get_batch_vertex_props` is the main win for now.
-        // But the design doc requested it.
-
-        // Let's throw Unimplemented for columnar for now, and rely on batch scalar load.
-        // Or better, map to batch load and build batch.
-
-        Err(anyhow!(
-            "Columnar property load not fully implemented yet - use batch load"
-        ))
-    }
-
     /// Batch load labels for multiple vertices.
     pub async fn get_batch_labels(
         &self,
@@ -1114,6 +1079,182 @@ impl PropertyManager {
         if ctx.is_some() {
             for props in result.values_mut() {
                 self.normalize_crdt_properties(props, label)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Batch-fetch properties for multiple edges of a known type.
+    ///
+    /// Mirrors `get_batch_vertex_props_for_label` (above) for the edge path.
+    /// Issues one `eid IN (...)` scan against the delta table for the edge
+    /// type, replaying per-EID version history (op-replay + CRDT merge) the
+    /// same way `fetch_all_edge_props_from_storage_with_hint` does. Far
+    /// faster than per-edge `get_all_edge_props_with_ctx` when many edges
+    /// of the same type need loading (e.g., batched SET/REMOVE on edges
+    /// matched by a MATCH).
+    ///
+    /// EIDs of deleted edges or those with no rows in delta storage are
+    /// omitted from the returned map; callers can fall back to the per-EID
+    /// path for misses.
+    pub async fn get_batch_edge_props_for_type(
+        &self,
+        eids: &[Eid],
+        type_name: &str,
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Eid, Properties>> {
+        use crate::backend::table_names;
+        use crate::backend::types::ScanRequest;
+
+        let mut result: HashMap<Eid, Properties> = HashMap::new();
+        if eids.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 1: L0 check per EID. Skip deleted; serve from L0 if it has
+        // an accumulated property set; otherwise note for storage scan.
+        let mut need_storage: Vec<Eid> = Vec::new();
+        for &eid in eids {
+            if l0_visibility::is_edge_deleted(eid, ctx) {
+                continue;
+            }
+            let l0_props = l0_visibility::accumulate_edge_props(eid, ctx);
+            // Edge L0 semantics: even an empty accumulator means "edge exists
+            // in L0 with no user props yet" — we still go to storage to pick
+            // up the persisted full row (mirrors get_all_edge_props_with_ctx).
+            if let Some(props) = l0_props {
+                result.insert(eid, props);
+            }
+            need_storage.push(eid);
+        }
+
+        if need_storage.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 2: One scan with `eid IN (...)` on the delta table.
+        let schema = self.schema_manager.schema();
+        let type_props = schema.properties.get(type_name);
+
+        if self.storage.delta_dataset(type_name, "fwd").is_err() {
+            return Ok(result);
+        }
+
+        let table_name = table_names::delta_table_name(type_name, "fwd");
+        let backend = self.storage.backend();
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(result);
+        }
+
+        let eid_list: String = need_storage
+            .iter()
+            .map(|e| e.as_u64().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base_filter = format!("eid IN ({})", eid_list);
+        let filter_expr = self.storage.apply_version_filter(base_filter);
+
+        let batches = match backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => return Ok(result), // Storage error: per-row fallback handles correctness
+        };
+
+        // Collect (eid, version, op, props) tuples, then group + replay per EID.
+        let mut per_eid_rows: HashMap<Eid, Vec<(u64, u8, Properties)>> = HashMap::new();
+        for batch in batches {
+            let eid_col = match batch
+                .column_by_name("eid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let op_col = match batch
+                .column_by_name("op")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt8Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let ver_col = match batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+
+            for row in 0..batch.num_rows() {
+                let eid = Eid::from(eid_col.value(row));
+                let ver = ver_col.value(row);
+                let op = op_col.value(row);
+                let mut props = Properties::new();
+
+                if op != 1
+                    && let Some(tp) = type_props
+                {
+                    for (p_name, p_meta) in tp {
+                        if let Some(col) = batch.column_by_name(p_name)
+                            && !col.is_null(row)
+                        {
+                            let val = Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
+                            props.insert(p_name.clone(), val);
+                        }
+                    }
+                }
+                per_eid_rows.entry(eid).or_default().push((ver, op, props));
+            }
+        }
+
+        for (eid, mut rows) in per_eid_rows {
+            rows.sort_by_key(|(ver, _, _)| *ver);
+
+            let mut merged_props: Properties = Properties::new();
+            let mut is_deleted = false;
+
+            for (_, op, props) in rows {
+                if op == 1 {
+                    is_deleted = true;
+                    merged_props.clear();
+                } else {
+                    is_deleted = false;
+                    for (p_name, p_val) in props {
+                        let is_crdt = type_props
+                            .and_then(|tp| tp.get(&p_name))
+                            .map(|pm| matches!(pm.r#type, DataType::Crdt(_)))
+                            .unwrap_or(false);
+                        if is_crdt {
+                            if let Some(existing) = merged_props.get(&p_name) {
+                                if let Ok(merged) = self.merge_crdt_values(existing, &p_val) {
+                                    merged_props.insert(p_name, merged);
+                                }
+                            } else {
+                                merged_props.insert(p_name, p_val);
+                            }
+                        } else {
+                            merged_props.insert(p_name, p_val);
+                        }
+                    }
+                }
+            }
+
+            if is_deleted {
+                // Deleted in storage; remove any L0 accumulation that may
+                // have been recorded under this EID by Phase 1 (matches
+                // is_edge_deleted single-EID semantics).
+                result.remove(&eid);
+                continue;
+            }
+
+            // L0 takes precedence over storage for shared keys; insert
+            // storage values only where L0 did not already provide them.
+            let entry = result.entry(eid).or_default();
+            for (k, v) in merged_props {
+                entry.entry(k).or_insert(v);
             }
         }
 
@@ -1691,7 +1832,19 @@ impl PropertyManager {
         )
     }
 
-    pub(crate) fn merge_crdt_values(&self, a: &Value, b: &Value) -> Result<Value> {
+    /// Merge two `Value`-wrapped CRDT operands.
+    ///
+    /// Routes through [`uni_crdt::Crdt::merge_via_registry`] using the
+    /// `PropertyManager`'s `plugin_registry`. With an empty registry
+    /// (the legacy 3-arg [`Self::new`] default) `merge_via_registry`
+    /// falls back to `Crdt::try_merge`, preserving native semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `anyhow::Error` when either operand is malformed
+    /// CRDT JSON, the variants disagree, or the registry-dispatched
+    /// merge surfaces a `CrdtError`.
+    pub fn merge_crdt_values(&self, a: &Value, b: &Value) -> Result<Value> {
         // Handle the case where values are JSON strings containing CRDT JSON
         // (this happens when values come from Cypher CREATE statements)
         // Parse before checking for null to ensure proper format conversion
@@ -1707,8 +1860,13 @@ impl PropertyManager {
 
         let mut crdt_a: Crdt = serde_json::from_value(a_parsed)?;
         let crdt_b: Crdt = serde_json::from_value(b_parsed)?;
+        // M10 follow-up: route through `merge_via_registry` so a
+        // hot-reloaded `CrdtKindProvider` plugin can intercept the
+        // merge. With an empty registry (the 3-arg `new()` default)
+        // this falls back to `Crdt::try_merge`, preserving prior
+        // behavior bit-for-bit.
         crdt_a
-            .try_merge(&crdt_b)
+            .merge_via_registry(&crdt_b, &self.plugin_registry)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Value::from(serde_json::to_value(crdt_a)?))
     }

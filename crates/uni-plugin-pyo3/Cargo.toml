@@ -1,0 +1,55 @@
+[package]
+name = "uni-plugin-pyo3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "PyO3 live-callable plugin loader for uni-db"
+keywords = ["plugin", "python", "graph", "database"]
+categories = ["database"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+# `ffi` enables `arrow_array::ffi` / `arrow_schema::ffi` — the C Data
+# Interface types we use to bridge to PyArrow via the Arrow PyCapsule
+# protocol. pyo3-arrow is NOT a dep: its 0.15.x line needs buffer-protocol
+# fns that pyo3 0.27 only exposes under `Py_3_11` / `not(Py_LIMITED_API)`,
+# which is incompatible with our workspace `abi3-py310` pin. The PyCapsule
+# bridge in `arrow_bridge.rs` is feature-flag-free and small (~200 lines).
+arrow = { workspace = true, features = ["ffi"] }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema = { workspace = true, features = ["ffi"] }
+arrow-data = { version = "58.3.0", features = ["ffi"] }
+datafusion = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+smol_str = "0.3"
+semver = "1"
+
+# pyo3 is gated by the `pyo3` feature so embedders that don't use Python
+# bindings don't pull libpython.
+#
+# We do NOT inherit the workspace `pyo3` features list — the workspace
+# enables `extension-module` (correct for `bindings/uni-db`, which is
+# loaded by Python and must not link libpython itself). For
+# `uni-plugin-pyo3` we need libpython available because the crate is
+# also reachable via the host's `Uni::load_python_plugin` path where the
+# embedder is the host process. `auto-initialize` causes pyo3 to call
+# `Py_Initialize` on first `Python::attach`, which is required for
+# `cargo test -p uni-plugin-pyo3` to link.
+pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "auto-initialize"] }
+
+[features]
+default = []
+pyo3 = ["dep:pyo3"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+uni-plugin-conformance = { workspace = true }

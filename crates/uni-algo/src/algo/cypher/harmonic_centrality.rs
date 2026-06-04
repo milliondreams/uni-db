@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for HarmonicCentralityAdapter {
         vec![("nodeId", ValueType::Int), ("centrality", ValueType::Float)]
     }
 
-    fn to_config(_args: Vec<Value>) -> HarmonicCentralityConfig {
-        HarmonicCentralityConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<HarmonicCentralityConfig> {
+        Ok(HarmonicCentralityConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

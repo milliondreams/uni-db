@@ -4,7 +4,7 @@ This document provides a comprehensive reference for all Uni configuration optio
 
 ## Configuration Overview
 
-**Status (2026-01-30):** Configuration is currently applied **programmatically** via the Rust API (`UniConfig`) or the Python builder. Configuration files (`uni.toml`) and `UNI_*` environment overrides are **planned** but not wired into the CLI/server yet.
+**Status (2026-06-03):** Configuration is currently applied **programmatically** via the Rust API (`UniConfig`) or the Python builder. Configuration files (`uni.toml`) and `UNI_*` environment overrides are **planned** but not wired into the CLI/server yet.
 
 Uni can be configured through:
 1. **Rust API** — `UniConfig` (available)
@@ -75,6 +75,10 @@ pub struct UniConfig {
     /// Default query execution timeout (default: 30s)
     pub query_timeout: Duration,
 
+    /// Maximum wall time a transaction commit may take before it is aborted
+    /// with `CommitTimeout` (default: 5s).
+    pub commit_timeout: Duration,
+
     /// Default maximum memory per query (default: 1GB)
     pub max_query_memory: usize,
 
@@ -98,6 +102,63 @@ pub struct UniConfig {
 
     /// When true, reject writes with undeclared labels or edge types (default: false).
     pub strict_schema: bool,
+
+    /// Enable Lance `MergeInsert` for SET-only flushes (default: false).
+    pub partial_lance_writes: bool,
+
+    /// Defer per-row auto-embedding to the next L1 flush, where the whole
+    /// batch is embedded in one model call (default: false).
+    pub defer_embeddings: bool,
+
+    /// Per-fork L1 fragment-count threshold above which a warning fires once
+    /// per crossing during fork flush (default: 256).
+    pub fork_fragment_warn_threshold: usize,
+
+    /// Per-transaction VID/EID reservoir refill size (default: 16).
+    pub tx_id_reservoir_batch: usize,
+
+    /// Dispatch commit-path flushes via the async path (rotate L0, then
+    /// stream + finalize on a background task). Defaults to `true` unless
+    /// overridden by the `UNI_ASYNC_FLUSH` env var.
+    pub async_flush_enabled: bool,
+
+    /// Maximum number of L0→L1 flushes in flight simultaneously when
+    /// `async_flush_enabled` is true (default: 2).
+    pub max_pending_flushes: usize,
+
+    /// Maximum time `drop_fork` waits for pending async flushes on that fork
+    /// before failing with `PendingFlushTimeout` (default: 10s).
+    pub drop_fork_drain_timeout: Duration,
+
+    /// Cap on total fork count (Active + Pending + Tombstoned). `None` =
+    /// unbounded (default: None).
+    pub max_forks: Option<usize>,
+
+    /// Default TTL applied to forks when the user does not supply one.
+    /// `None` = no TTL (default: None).
+    pub fork_default_ttl: Option<Duration>,
+
+    /// How often the background TTL sweeper polls for expired forks
+    /// (default: 60s).
+    pub fork_sweeper_interval: Duration,
+
+    /// Skip spawning the TTL sweeper (default: false). Useful in tests.
+    pub disable_fork_sweeper: bool,
+
+    /// Minimum per-fork row count (per label) before the background index
+    /// builder schedules a fork-local index build (default: 10,000).
+    pub fork_index_build_threshold: u64,
+
+    /// How often the background fork index builder polls active forks
+    /// (default: 30s).
+    pub fork_index_builder_interval: Duration,
+
+    /// Skip spawning the background fork index builder (default: false).
+    pub disable_fork_index_builder: bool,
+
+    /// Enable Serializable Snapshot Isolation and optimistic concurrency
+    /// control (default: true). When false, reverts to last-writer-wins.
+    pub ssi_enabled: bool,
 }
 ```
 
@@ -114,12 +175,28 @@ pub struct UniConfig {
 | `auto_flush_min_mutations` | count | 1 | Minimum mutations for time-based flush |
 | `wal_enabled` | bool | true | Enable write-ahead logging |
 | `query_timeout` | duration | 30s | Default query execution timeout |
+| `commit_timeout` | duration | 5s | Max wall time a commit may take before `CommitTimeout` abort |
 | `max_query_memory` | bytes | 1 GB | Maximum memory per query |
 | `max_transaction_memory` | bytes | 1 GB | Maximum memory per transaction |
 | `max_compaction_rows` | rows | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | bool | true | Enable O(1) VID→labels lookups |
 | `max_recursive_cte_iterations` | count | 1,000 | Maximum iterations for recursive CTE evaluation |
 | `strict_schema` | bool | false | Reject writes with undeclared labels or edge types |
+| `ssi_enabled` | bool | true | Serializable Snapshot Isolation / OCC (false = last-writer-wins) |
+| `partial_lance_writes` | bool | false | Use Lance `MergeInsert` for SET-only flushes |
+| `defer_embeddings` | bool | false | Defer per-row auto-embedding to the next L1 flush |
+| `fork_fragment_warn_threshold` | count | 256 | Per-fork L1 fragment count that triggers a warning |
+| `tx_id_reservoir_batch` | count | 16 | Per-transaction VID/EID reservoir refill size |
+| `async_flush_enabled` | bool | true | Dispatch commit-path flushes via the async path |
+| `max_pending_flushes` | count | 2 | Max in-flight L0→L1 flushes when async flush is enabled |
+| `drop_fork_drain_timeout` | duration | 10s | Max wait for pending fork flushes in `drop_fork` |
+| `max_forks` | count | None | Cap on total fork count (None = unbounded) |
+| `fork_default_ttl` | duration | None | Default fork TTL (None = no TTL) |
+| `fork_sweeper_interval` | duration | 60s | TTL sweeper poll interval |
+| `disable_fork_sweeper` | bool | false | Skip spawning the TTL sweeper |
+| `fork_index_build_threshold` | rows | 10,000 | Min per-fork rows before a fork-local index build |
+| `fork_index_builder_interval` | duration | 30s | Fork index builder poll interval |
+| `disable_fork_index_builder` | bool | false | Skip spawning the fork index builder |
 
 ### strict_schema
 
@@ -140,6 +217,12 @@ When `strict_schema` is `true`, CREATE and MERGE operations reject any label or 
 
 Error messages include the undeclared name and suggest using `db.schema()` to declare it.
 
+### Concurrency & Isolation
+
+Serializable Snapshot Isolation (SSI) with optimistic concurrency control is **enabled by default** (`ssi_enabled = true`). Each read-write transaction reads from a pinned snapshot and validates its read/write set at commit. When a concurrent commit has landed since the transaction's snapshot, the commit aborts with `UniError::SerializationConflict` (and a duplicate concurrent `MERGE` on a unique key aborts with `UniError::ConstraintConflict`). Contended writers should be wrapped in the Rust retry helpers `Session::transact_with_retry` (or the single-statement convenience `Session::execute_with_retry`), which re-run retriable conflicts; callers driving the database from another binding should catch the conflict error and retry the transaction.
+
+Setting `ssi_enabled = false` reverts to last-writer-wins: concurrent read-modify-write transactions can silently lose updates, concurrent `MERGE` can create duplicate unique keys, and `FOR UPDATE` becomes a no-op (a warning is logged when a query requests it). This reproduces the pre-SSI behavior and is appropriate only for single-writer workloads or callers that guard read-modify-write externally.
+
 ### CompactionConfig
 
 ```rust
@@ -147,7 +230,7 @@ pub struct CompactionConfig {
     /// Enable background compaction (default: true)
     pub enabled: bool,
 
-    /// Max L1 runs before triggering compaction (default: 4)
+    /// Max uncompacted flush generations before triggering compaction (default: 8)
     pub max_l1_runs: usize,
 
     /// Max L1 size in bytes before compaction (default: 256MB)
@@ -156,11 +239,15 @@ pub struct CompactionConfig {
     /// Max age of oldest L1 run before compaction (default: 1 hour)
     pub max_l1_age: Duration,
 
-    /// Background check interval (default: 30s)
+    /// Background check interval (default: 10s)
     pub check_interval: Duration,
 
     /// Number of compaction worker threads (default: 1)
     pub worker_threads: usize,
+
+    /// Number of frozen L0-csr overlay segments that must accumulate before
+    /// post-flush compaction is spawned (default: 2)
+    pub frozen_segments_compact_threshold: usize,
 }
 ```
 
@@ -168,10 +255,10 @@ pub struct CompactionConfig {
 
 ```rust
 pub struct WriteThrottleConfig {
-    /// L1 run count to start throttling (default: 8)
+    /// Uncompacted flush generations to start throttling (default: 16)
     pub soft_limit: usize,
 
-    /// L1 run count to stop writes entirely (default: 16)
+    /// Uncompacted flush generations to stop writes entirely (default: 32)
     pub hard_limit: usize,
 
     /// Base delay when throttling (default: 10ms)

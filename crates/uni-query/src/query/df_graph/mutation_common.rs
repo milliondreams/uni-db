@@ -15,7 +15,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -25,10 +25,10 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use uni_common::core::id::Vid;
-use uni_common::{Path, Value};
+use uni_common::core::id::{Eid, Vid};
+use uni_common::{Path, Properties, Value};
 use uni_cypher::ast::{Expr, Pattern, PatternElement, RemoveItem, SetClause, SetItem};
+use uni_store::QueryContext;
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
 use uni_store::storage::arrow_convert;
@@ -47,7 +47,7 @@ pub struct MutationContext {
     pub executor: Executor,
 
     /// Writer for graph mutations (vertices, edges, properties).
-    pub writer: Arc<RwLock<Writer>>,
+    pub writer: Arc<Writer>,
 
     /// Property manager for lazy-loading vertex/edge properties.
     pub prop_manager: Arc<PropertyManager>,
@@ -98,6 +98,224 @@ pub enum MutationKind {
         on_match: Option<SetClause>,
         on_create: Option<SetClause>,
     },
+}
+
+/// Pre-fetched property maps for SET/REMOVE mutation rows.
+///
+/// Built once at the top of `apply_mutations` for `MutationKind::Set` and
+/// `MutationKind::Remove` (see `prefetch_set_targets`, `prefetch_remove_targets`).
+/// Replaces N per-row `get_all_vertex_props_with_ctx` calls (each ~716 µs of
+/// DataFusion+Lance setup) with a single `_vid IN (...)` scan amortized
+/// across all rows.
+///
+/// Per-row read sites in `execute_set_items_locked`,
+/// `apply_properties_to_entity`, `flush_pending_var`, and
+/// `execute_remove_items_locked` look up the VID/EID here first and fall
+/// back to the per-row call if absent — preserving correctness for newly
+/// created VIDs, schemaless rows, and non-Mutation callers.
+#[derive(Default, Debug)]
+pub(crate) struct Prefetch {
+    pub vertex: HashMap<Vid, Properties>,
+    pub edge: HashMap<Eid, Properties>,
+}
+
+/// Extract `(label, vid)` pairs and `(type_name, eid)` pairs that a SET
+/// clause will touch, batch-fetch them, return a [`Prefetch`] map.
+///
+/// Walks `rows` once to dedupe by VID/EID per label/type. Issues one
+/// `get_batch_vertex_props_for_label` per distinct vertex label. Edge
+/// prefetch is a no-op for now (Phase A.1 only covers vertices; the
+/// fallback path in execute_set_items_locked keeps edge SET correct).
+pub(crate) async fn prefetch_set_targets(
+    items: &[SetItem],
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    // 1. Collect vertex-targeted variable names from SET items.
+    let touched_vars: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            SetItem::Property { expr, .. } => extract_var_from_property_expr(expr),
+            SetItem::Variable { variable, .. } | SetItem::VariablePlus { variable, .. } => {
+                Some(variable.as_str())
+            }
+            SetItem::Labels { .. } => None,
+        })
+        .collect();
+    if touched_vars.is_empty() {
+        return Ok(Prefetch::default());
+    }
+
+    collect_and_fetch_vertex_prefetch(&touched_vars, rows, pm, ctx).await
+}
+
+/// Same shape as [`prefetch_set_targets`] for REMOVE clauses.
+pub(crate) async fn prefetch_remove_targets(
+    items: &[RemoveItem],
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    let touched_vars: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            RemoveItem::Property(expr) => extract_var_from_property_expr(expr),
+            RemoveItem::Labels { .. } => None,
+        })
+        .collect();
+    if touched_vars.is_empty() {
+        return Ok(Prefetch::default());
+    }
+
+    collect_and_fetch_vertex_prefetch(&touched_vars, rows, pm, ctx).await
+}
+
+/// Inspect a property-access expr (e.g. `n.prop` or `n[expr]`) and return
+/// the root variable name if it's a plain `Variable("n").Property("prop")`.
+fn extract_var_from_property_expr(expr: &Expr) -> Option<&str> {
+    if let Expr::Property(inner, _) = expr
+        && let Expr::Variable(name) = inner.as_ref()
+    {
+        return Some(name.as_str());
+    }
+    None
+}
+
+/// Group VIDs/EIDs by their primary label / edge type across `rows`,
+/// issue one batched fetch per group, merge results into a [`Prefetch`].
+///
+/// Schemaless rows / rows without a label or type fall through to the
+/// per-row fallback at the fetch site. Per-row bindings are inspected
+/// once; a variable bound to a vertex in some rows and an edge in
+/// others (rare; e.g., from union) is grouped under each kind it
+/// appears as.
+async fn collect_and_fetch_vertex_prefetch(
+    touched_vars: &HashSet<&str>,
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    let mut by_label: HashMap<String, HashSet<Vid>> = HashMap::new();
+    let mut by_type: HashMap<String, HashSet<Eid>> = HashMap::new();
+
+    for row in rows {
+        for &var in touched_vars {
+            let Some(bound) = row.get(var) else { continue };
+            if let Some((vid, labels)) = vertex_vid_and_labels(bound) {
+                if let Some(label) = labels.first() {
+                    by_label.entry(label.clone()).or_default().insert(vid);
+                }
+            } else if let Some((eid, type_name)) = edge_eid_and_type(bound)
+                && !type_name.is_empty()
+            {
+                by_type.entry(type_name).or_default().insert(eid);
+            }
+        }
+    }
+
+    let mut prefetch = Prefetch::default();
+    for (label, vid_set) in by_label {
+        let vids: Vec<Vid> = vid_set.into_iter().collect();
+        if vids.is_empty() {
+            continue;
+        }
+        if let Ok(label_results) = pm
+            .get_batch_vertex_props_for_label(&vids, &label, ctx)
+            .await
+        {
+            for (vid, props) in label_results {
+                prefetch.vertex.entry(vid).or_insert(props);
+            }
+        }
+        // Batch errors fall through to per-row fallback (correctness preserved).
+    }
+    for (type_name, eid_set) in by_type {
+        let eids: Vec<Eid> = eid_set.into_iter().collect();
+        if eids.is_empty() {
+            continue;
+        }
+        if let Ok(type_results) = pm
+            .get_batch_edge_props_for_type(&eids, &type_name, ctx)
+            .await
+        {
+            for (eid, props) in type_results {
+                prefetch.edge.entry(eid).or_insert(props);
+            }
+        }
+    }
+    Ok(prefetch)
+}
+
+/// Extract (vid, labels) from a bound vertex value (`Value::Node` or a
+/// `Value::Map` that has the `_vid`/`_labels` shape produced by the
+/// planner). Returns `None` for edges, paths, scalars, or untyped maps.
+fn vertex_vid_and_labels(val: &Value) -> Option<(Vid, Vec<String>)> {
+    match val {
+        Value::Node(node) => Some((node.vid, node.labels.clone())),
+        Value::Map(map) => {
+            if map.contains_key("_eid") {
+                return None;
+            }
+            let vid_val = map.get("_vid")?;
+            let vid = match vid_val {
+                Value::Int(i) if *i >= 0 => Vid::from(*i as u64),
+                _ => return None,
+            };
+            let labels = map
+                .get("_labels")
+                .and_then(|v| match v {
+                    Value::List(items) => Some(
+                        items
+                            .iter()
+                            .filter_map(|x| {
+                                if let Value::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some((vid, labels))
+        }
+        _ => None,
+    }
+}
+
+/// Extract (eid, type_name) from a bound edge value. Mirrors
+/// [`vertex_vid_and_labels`] for the edge case. The type name is
+/// resolved from `_type_name` (string) or `_type` (string) on map-encoded
+/// edges, and from `Value::Edge::edge_type` on typed edges.
+fn edge_eid_and_type(val: &Value) -> Option<(Eid, String)> {
+    match val {
+        Value::Edge(edge) => Some((edge.eid, edge.edge_type.clone())),
+        Value::Map(map) => {
+            // Must be edge-shaped: _eid, _src, _dst.
+            let eid_val = map.get("_eid")?;
+            if !map.contains_key("_src") || !map.contains_key("_dst") {
+                return None;
+            }
+            let eid = match eid_val {
+                Value::Int(i) if *i >= 0 => Eid::from(*i as u64),
+                Value::Null => return None,
+                _ => return None,
+            };
+            let type_name = map
+                .get("_type_name")
+                .or_else(|| map.get("_type"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some((eid, type_name))
+        }
+        _ => None,
+    }
 }
 
 /// Convert RecordBatches to row-based HashMaps for mutation processing.
@@ -427,6 +645,7 @@ pub fn execute_mutation_stream(
     mutation_kind: MutationKind,
     partition: usize,
     task_ctx: Arc<datafusion::execution::TaskContext>,
+    baseline: BaselineMetrics,
 ) -> DFResult<SendableRecordBatchStream> {
     if mutation_ctx.query_ctx.is_none() {
         tracing::warn!(
@@ -441,6 +660,7 @@ pub fn execute_mutation_stream(
         mutation_kind,
         partition,
         task_ctx,
+        baseline,
     ))
     .try_flatten();
 
@@ -466,7 +686,11 @@ async fn execute_mutation_inner(
     mutation_kind: MutationKind,
     partition: usize,
     task_ctx: Arc<datafusion::execution::TaskContext>,
+    baseline: BaselineMetrics,
 ) -> DFResult<futures::stream::Iter<std::vec::IntoIter<DFResult<RecordBatch>>>> {
+    // Time the whole eager-barrier body: input collection, mutation writes,
+    // and output batch reconstruction. Timer records on Drop.
+    let _timer = baseline.elapsed_compute().timer();
     let mutation_label = mutation_kind_label(&mutation_kind);
 
     // 1. Collect all input batches (eager barrier)
@@ -535,16 +759,21 @@ async fn execute_mutation_inner(
                 "Failed to reconstruct MERGE batches: {e}"
             ))
         })?;
+        let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        baseline.record_output(output_rows);
         let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();
         return Ok(futures::stream::iter(results));
     }
 
-    let mut writer = mutation_ctx.writer.write().await;
     let tx_l0 = mutation_ctx.tx_l0_override.as_ref();
-    let result =
-        apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer, tx_l0).await;
-    drop(writer);
-    result?;
+    apply_mutations(
+        &mutation_ctx,
+        &mutation_kind,
+        &mut rows,
+        &mutation_ctx.writer,
+        tx_l0,
+    )
+    .await?;
 
     tracing::debug!(
         mutation = mutation_label,
@@ -561,6 +790,8 @@ async fn execute_mutation_inner(
     let result_batches = rows_to_batches(&rows, &output_schema).map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Failed to reconstruct batches: {e}"))
     })?;
+    let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    baseline.record_output(output_rows);
     let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();
     Ok(futures::stream::iter(results))
 }
@@ -642,7 +873,7 @@ async fn apply_mutations(
     mutation_ctx: &MutationContext,
     mutation_kind: &MutationKind,
     rows: &mut [HashMap<String, Value>],
-    writer: &mut Writer,
+    writer: &Writer,
     tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 ) -> DFResult<()> {
     tracing::trace!(
@@ -678,15 +909,23 @@ async fn apply_mutations(
             }
         }
         MutationKind::Set { items } => {
+            let prefetch = prefetch_set_targets(items, rows, pm, ctx)
+                .await
+                .map_err(|e| df_err("SET prefetch failed", e))?;
             for row in rows.iter_mut() {
-                exec.execute_set_items_locked(items, row, writer, pm, params, ctx, tx_l0)
-                    .await
-                    .map_err(|e| df_err("SET failed", e))?;
+                exec.execute_set_items_locked(
+                    items, row, writer, pm, params, ctx, tx_l0, &prefetch,
+                )
+                .await
+                .map_err(|e| df_err("SET failed", e))?;
             }
         }
         MutationKind::Remove { items } => {
+            let prefetch = prefetch_remove_targets(items, rows, pm, ctx)
+                .await
+                .map_err(|e| df_err("REMOVE prefetch failed", e))?;
             for row in rows.iter_mut() {
-                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0)
+                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0, &prefetch)
                     .await
                     .map_err(|e| df_err("REMOVE failed", e))?;
             }
@@ -718,8 +957,17 @@ async fn apply_mutations(
                     .await
                     .map_err(|e| df_err("DETACH DELETE failed", e))?;
             } else {
+                // Non-detach: one batched edge-dependency check across all
+                // targets (Phase C — collapses N per-VID subgraph loads to
+                // one), then the per-VID writer.delete_vertex calls
+                // (cheap; no scan).
+                let vids: Vec<Vid> = collector.node_entries.iter().map(|(v, _)| *v).collect();
+                exec.batch_check_vertices_have_no_edges(&vids, writer, tx_l0)
+                    .await
+                    .map_err(|e| df_err("DELETE check failed", e))?;
                 for (vid, labels) in &collector.node_entries {
-                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer, tx_l0)
+                    writer
+                        .delete_vertex(*vid, labels.clone(), tx_l0)
                         .await
                         .map_err(|e| df_err("DELETE node failed", e))?;
                 }
@@ -780,12 +1028,28 @@ pub fn pattern_variable_names(pattern: &Pattern) -> Vec<String> {
 fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
     use arrow_schema::{Field, Schema};
 
-    let needs_normalization = schema
-        .fields()
-        .iter()
-        .any(|f| matches!(f.data_type(), DataType::Struct(_)));
+    // Detect any field whose type round-trips through `rows_to_batches` as
+    // CV-encoded LargeBinary, so the declared schema must match or
+    // `RecordBatch::try_new` rejects the batch with "column types must
+    // match schema types".
+    //   * `Struct(_)` — bare graph entities (Node/Edge).
+    //   * `List<Struct>` / `LargeList<Struct>` — the VLP-bound edge-list
+    //     `r` from `MATCH (a)-[r*1..2]->(b)`.
+    //   * `List<T>` for any T that `arrow_convert::values_to_array` doesn't
+    //     know how to construct from `Value::List` (today: everything
+    //     except `List<Utf8>`). RecursiveCTE-side WHERE-IN aggregations
+    //     emit `List<Int64>` here, for example.
+    fn needs_norm(dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(_) => true,
+            DataType::List(inner) | DataType::LargeList(inner) => {
+                !matches!(inner.data_type(), DataType::Utf8)
+            }
+            _ => false,
+        }
+    }
 
-    if !needs_normalization {
+    if !schema.fields().iter().any(|f| needs_norm(f.data_type())) {
         return schema.clone();
     }
 
@@ -793,7 +1057,7 @@ fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
         .fields()
         .iter()
         .map(|field| {
-            if matches!(field.data_type(), DataType::Struct(_)) {
+            if needs_norm(field.data_type()) {
                 let mut metadata = field.metadata().clone();
                 metadata.insert("cv_encoded".to_string(), "true".to_string());
                 Arc::new(
@@ -967,7 +1231,7 @@ pub struct MutationExec {
     schema: SchemaRef,
 
     /// Plan properties for DataFusion optimizer.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     /// Metrics.
     metrics: ExecutionPlanMetricsSet,
@@ -1045,7 +1309,7 @@ impl ExecutionPlan for MutationExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1077,6 +1341,7 @@ impl ExecutionPlan for MutationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
         execute_mutation_stream(
             self.input.clone(),
             self.schema.clone(),
@@ -1084,6 +1349,7 @@ impl ExecutionPlan for MutationExec {
             self.kind.clone(),
             partition,
             context,
+            baseline,
         )
     }
 

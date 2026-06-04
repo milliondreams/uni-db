@@ -4,7 +4,7 @@
 //! uni.algo.louvain procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, Louvain, LouvainConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, arg_f64, arg_u64};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -27,12 +27,12 @@ impl GraphAlgoAdapter for LouvainAdapter {
         vec![("nodeId", ValueType::Int), ("communityId", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> LouvainConfig {
-        LouvainConfig {
-            resolution: args[0].as_f64().unwrap(),
-            max_iterations: args[1].as_u64().unwrap() as usize,
-            min_modularity_gain: args[2].as_f64().unwrap(),
-        }
+    fn to_config(args: Vec<Value>) -> Result<LouvainConfig> {
+        Ok(LouvainConfig {
+            resolution: arg_f64(&args, 0, "resolution")?,
+            max_iterations: arg_u64(&args, 1, "maxIterations")? as usize,
+            min_modularity_gain: arg_f64(&args, 2, "minModularityGain")?,
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -43,10 +43,6 @@ impl GraphAlgoAdapter for LouvainAdapter {
                 values: vec![json!(vid.as_u64()), json!(cid)],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

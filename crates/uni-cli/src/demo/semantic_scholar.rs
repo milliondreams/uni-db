@@ -33,12 +33,8 @@ pub async fn import_semantic_scholar(
     let schema_manager = SchemaManager::load(&schema_file).await?;
 
     // Define Schema
-    // Paper
-    let _paper_lbl = if let Ok(id) = schema_manager.add_label("Paper") {
-        id
-    } else {
-        schema_manager.schema().labels["Paper"].id
-    };
+    // Paper — the label id is unused; we only need it registered.
+    let _ = schema_manager.add_label("Paper");
 
     // Ensure properties
     let _ = schema_manager.add_property("Paper", "title", DataType::String, false);
@@ -77,69 +73,36 @@ pub async fn import_semantic_scholar(
 
     // 2. Load Papers
     println!("Loading papers from {:?}", papers_path);
-    let file = File::open(papers_path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let mut count = 0;
-
-    {
-        let mut w = writer.write().await;
-
-        while let Some(line) = lines.next_line().await? {
-            let json: Value = serde_json::from_str(&line)?;
-
-            // Extract fields
+    for_each_jsonl(&writer, papers_path, "papers", |w, _count, json| {
+        Box::pin(async move {
             let vid_u64 = json
                 .get("vid")
                 .and_then(|v| v.as_u64())
                 .ok_or(anyhow!("Missing vid"))?;
             let vid = Vid::new(vid_u64);
 
+            // Copy the known scalar/vector properties straight through; any
+            // key not present in the JSON is simply omitted.
             let mut props = HashMap::new();
-            if let Some(t) = json.get("title") {
-                props.insert("title".to_string(), t.clone());
-            }
-            if let Some(y) = json.get("year") {
-                props.insert("year".to_string(), y.clone());
-            }
-            if let Some(c) = json.get("citation_count") {
-                props.insert("citation_count".to_string(), c.clone());
-            }
-            if let Some(e) = json.get("embedding") {
-                props.insert("embedding".to_string(), e.clone());
+            for key in ["title", "year", "citation_count", "embedding"] {
+                if let Some(v) = json.get(key) {
+                    props.insert(key.to_string(), v.clone());
+                }
             }
 
-            // Insert vertex — convert serde_json values to uni_common values
+            // Insert vertex — convert serde_json values to uni_common values.
             let uni_props: uni_common::Properties =
                 props.into_iter().map(|(k, v)| (k, v.into())).collect();
             w.insert_vertex(vid, uni_props, None).await?;
-
-            count += 1;
-            if count % 1000 == 0 {
-                print!("\rProcessed {} papers", count);
-            }
-        }
-    }
-    println!("\nFlushing papers...");
-    {
-        let mut w = writer.write().await;
-        w.flush_to_l1(None).await?;
-    }
+            Ok(())
+        })
+    })
+    .await?;
 
     // 3. Load Citations
     println!("Loading citations from {:?}", citations_path);
-    let file = File::open(citations_path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let mut count = 0;
-    {
-        let mut w = writer.write().await;
-
-        while let Some(line) = lines.next_line().await? {
-            let json: Value = serde_json::from_str(&line)?;
-
+    for_each_jsonl(&writer, citations_path, "citations", |w, count, json| {
+        Box::pin(async move {
             let src_u64 = json
                 .get("src_vid")
                 .and_then(|v| v.as_u64())
@@ -152,7 +115,7 @@ pub async fn import_semantic_scholar(
             let src_vid = Vid::new(src_u64);
             let dst_vid = Vid::new(dst_u64);
 
-            // Generate EID based on count (simple)
+            // Generate EID based on count (simple).
             let eid = Eid::new(count);
 
             w.insert_edge(
@@ -165,19 +128,59 @@ pub async fn import_semantic_scholar(
                 None,
             )
             .await?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    println!("Import complete!");
+    Ok(())
+}
+
+/// Stream a JSONL file line-by-line, invoking `f` for each parsed record.
+///
+/// Acquires the writer guard for the whole stream, prints progress every
+/// 1000 records under `label`, then flushes to L1. `f` receives the held
+/// writer guard, the zero-based record index, and the parsed JSON value.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, a line is not valid
+/// JSON, `f` fails, or the final flush fails.
+async fn for_each_jsonl<F>(
+    writer: &Arc<RwLock<Writer>>,
+    path: &Path,
+    label: &str,
+    mut f: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(
+        &'a Writer,
+        u64,
+        Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
+{
+    let file = File::open(path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut count: u64 = 0;
+    {
+        let w = writer.write().await;
+        while let Some(line) = lines.next_line().await? {
+            let json: Value = serde_json::from_str(&line)?;
+            f(&w, count, json).await?;
 
             count += 1;
-            if count % 1000 == 0 {
-                print!("\rProcessed {} citations", count);
+            if count.is_multiple_of(1000) {
+                print!("\rProcessed {} {}", count, label);
             }
         }
     }
-    println!("\nFlushing citations...");
+    println!("\nFlushing {}...", label);
     {
-        let mut w = writer.write().await;
+        let w = writer.write().await;
         w.flush_to_l1(None).await?;
     }
-
-    println!("Import complete!");
     Ok(())
 }

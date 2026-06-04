@@ -1,0 +1,37 @@
+[package]
+name = "uni-query-functions"
+description = "Leaf modules from uni-query: UDFs, datetime/spatial functions, expression eval, rewrite rules, type coercion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uni-common = { workspace = true }
+uni-btic = { workspace = true }
+uni-store = { workspace = true }
+uni-cypher = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-row = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+rand = { workspace = true }
+datafusion = { workspace = true }
+fxhash = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+
+[features]
+default = []

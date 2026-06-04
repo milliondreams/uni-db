@@ -219,8 +219,6 @@ mod tests {
             in_neighbors,
             out_weights: None,
             id_map,
-            _node_labels: Vec::new(),
-            _edge_types: Vec::new(),
         }
     }
 

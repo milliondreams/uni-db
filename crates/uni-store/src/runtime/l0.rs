@@ -12,12 +12,53 @@ use uni_common::graph::simple_graph::{Direction, SimpleGraph};
 use uni_common::{Properties, Value};
 use uni_crdt::Crdt;
 
+/// Items a read-write transaction observed during execution, used for SSI
+/// read-write antidependency detection at commit.
+///
+/// Shared (via `Arc<Mutex<_>>`) between the read path — which records reads
+/// through the transaction's `QueryContext` — and the commit path, which checks
+/// it against concurrently-committed write-sets. Item-level granularity;
+/// phantoms are out of scope (handled by the `FOR UPDATE` escape hatch).
+#[derive(Debug, Default)]
+pub struct OccReadSet {
+    /// Vertices the transaction read.
+    pub vertices: HashSet<Vid>,
+    /// Edges the transaction read.
+    pub edges: HashSet<Eid>,
+}
+
+impl OccReadSet {
+    /// `true` when nothing has been read yet. Used to decide whether a `FOR
+    /// UPDATE` acquisition may safely re-pin a still-fresh transaction.
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty()
+    }
+}
+
 /// Returns the current timestamp in nanoseconds since Unix epoch.
 fn now_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// Returns the [`Crdt`] a property value encodes, or `None` if it is not one.
+///
+/// `Crdt` is `#[serde(tag = "t", content = "d")]`, so it deserializes only from a
+/// JSON object, and only `Value::Map(_)` produces one — gating on `Map` avoids
+/// allocating a JSON tree for large non-map values (e.g. embedding columns).
+///
+/// This is the single source of truth for "is this value CRDT-mergeable": both
+/// the commit-time merge ([`L0Buffer::merge_crdt_properties`]) and the OCC
+/// write-set carve-out ([`crate::runtime::occ::WriteSet::from_l0`]) consult it,
+/// so the carve-out can never exclude an item the merge would actually overwrite
+/// (which would silently lose an update).
+pub(crate) fn try_as_crdt(v: &Value) -> Option<Crdt> {
+    if !matches!(v, Value::Map(_)) {
+        return None;
+    }
+    serde_json::from_value::<Crdt>(v.clone().into()).ok()
 }
 
 /// Serialize a constraint key for O(1) uniqueness checks.
@@ -107,6 +148,14 @@ pub struct L0Buffer {
     /// Reverse index: label name → set of VIDs with that label. Maintained
     /// alongside `vertex_labels` for O(1) label-based vertex lookups.
     pub label_to_vids: HashMap<String, HashSet<Vid>>,
+    /// Vids whose FULL label set was explicitly replaced by a label mutation
+    /// (`SET n:Label` / `REMOVE n:Label`) in this buffer, via
+    /// [`L0Buffer::set_vertex_labels`]. Distinguishes a deliberate label
+    /// replacement from the empty `vertex_labels` entry a property-only write
+    /// incidentally creates (`entry().or_default()`), so `merge` knows to REPLACE
+    /// (not append) these vids' labels and `WriteSet::from_l0` knows they are
+    /// conflictable writes. A transaction-buffer concept; empty on main L0.
+    pub vertex_label_overwrites: HashSet<Vid>,
     /// Edge types (EID -> type name)
     pub edge_types: HashMap<Eid, String>,
     /// Current version counter
@@ -135,6 +184,36 @@ pub struct L0Buffer {
     /// Key: constraint composite key (label + sorted property values serialized).
     /// Value: Vid that owns this key.
     pub constraint_index: HashMap<Vec<u8>, Vid>,
+    /// Per-VID set of property keys that should land via Lance MergeInsert
+    /// (partial-column update) at flush time. Populated by
+    /// `insert_vertex_partial`; cleared by full-row inserts and deletes.
+    /// A VID present here at flush time is emitted to the partial batch;
+    /// absent VIDs flush via the existing full-row Append.
+    pub vertex_partial_keys: HashMap<Vid, HashSet<String>>,
+    /// Edge analog of `vertex_partial_keys` (Round 12 §A). Populated by
+    /// `insert_edge_partial_full`; cleared by full-row inserts and edge
+    /// deletes. Per-edge-type delta-table flush honors these by emitting
+    /// a `MergeInsertBuilder` source with only the touched schema
+    /// columns plus `eid`, `op`, `_version`, `_updated_at`, and
+    /// `overflow_json` (when an overflow prop was touched).
+    pub edge_partial_keys: HashMap<Eid, HashSet<String>>,
+    /// Phase B (UniConfig::defer_embeddings): VIDs whose auto-embedding
+    /// was skipped at insert time and is owed at flush. Value = primary
+    /// label name (the rest of the embedding config is looked up from the
+    /// schema at flush time). Drained by `flush_stream_l1` before column
+    /// extraction; entries are removed when the embedding lands in the
+    /// vertex's L0 property map.
+    pub pending_embeddings: HashMap<Vid, String>,
+    /// Optimistic-concurrency read sequence (SSI). Stamped on a transaction's
+    /// private L0 at creation with the Writer's commit-sequence at that moment,
+    /// and consulted at commit to detect intervening conflicting commits. `0`
+    /// for the main L0 and when SSI is disabled.
+    pub occ_read_seq: u64,
+    /// Optimistic-concurrency read-set (SSI). `Some` on a read-write
+    /// transaction's private L0 when SSI tracking is active; the read path
+    /// records observed ids here and commit checks them for antidependencies.
+    /// `None` for the main L0 and read-only / SSI-disabled paths.
+    pub occ_read_set: Option<Arc<parking_lot::Mutex<OccReadSet>>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -167,6 +246,7 @@ impl Clone for L0Buffer {
             edge_endpoints: self.edge_endpoints.clone(),
             vertex_labels: self.vertex_labels.clone(),
             label_to_vids: self.label_to_vids.clone(),
+            vertex_label_overwrites: self.vertex_label_overwrites.clone(),
             edge_types: self.edge_types.clone(),
             current_version: self.current_version,
             mutation_count: self.mutation_count,
@@ -179,6 +259,12 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            vertex_partial_keys: self.vertex_partial_keys.clone(),
+            edge_partial_keys: self.edge_partial_keys.clone(),
+            pending_embeddings: self.pending_embeddings.clone(),
+            occ_read_seq: self.occ_read_seq,
+            // Forked L0s (ASSUME/ABDUCE) do not participate in OCC tracking.
+            occ_read_set: None,
         }
     }
 }
@@ -214,11 +300,33 @@ impl L0Buffer {
         }
     }
 
+    /// Replaces a vertex's FULL label set — the semantics of `SET n:Label` /
+    /// `REMOVE n:Label`, which resolve the new complete set before writing.
+    ///
+    /// Unlike [`add_vertex_labels`](Self::add_vertex_labels) (append), this clears
+    /// the vid's existing labels from the reverse index, sets the new set, and
+    /// re-indexes — so a removal actually removes. It marks the vid in
+    /// `vertex_label_overwrites` so `merge` REPLACES (not appends) these labels at
+    /// commit and `WriteSet::from_l0` treats the change as a conflictable write.
+    /// Increments `mutation_count` (a label change is a real mutation; its sibling
+    /// `remove_vertex_label` already does so).
+    pub fn set_vertex_labels(&mut self, vid: Vid, labels: &[String]) {
+        self.remove_vid_from_label_index(vid);
+        self.vertex_labels.insert(vid, labels.to_vec());
+        self.index_labels_for_vid(vid, labels);
+        self.vertex_label_overwrites.insert(vid);
+        self.current_version += 1;
+        self.mutation_count += 1;
+    }
+
     /// Merge CRDT properties into an existing property map.
     /// Attempts CRDT merge if both values are valid CRDTs, falls back to overwrite.
     ///
     /// When the entry is empty (new vertex insert), skips the expensive JSON
     /// round-trip and directly assigns the properties.
+    ///
+    /// Logs a warning when a CRDT value is overwritten by a non-CRDT scalar
+    /// (limitation R1).
     fn merge_crdt_properties(entry: &mut Properties, properties: Properties) {
         // Fast path: new vertex with no existing properties — skip JSON round-trip
         if entry.is_empty() {
@@ -227,22 +335,49 @@ impl L0Buffer {
         }
 
         for (k, v) in properties {
-            // Attempt merge if CRDT — convert to serde_json::Value for CRDT deserialization
-            let json_v: serde_json::Value = v.clone().into();
-            if let Ok(mut new_crdt) = serde_json::from_value::<Crdt>(json_v)
+            // `try_as_crdt` performs the Map-gated CRDT probe (see its docs for the
+            // wide-row perf rationale). Sharing it with `WriteSet::from_l0` keeps the
+            // OCC carve-out consistent with this merge-versus-overwrite decision.
+            if let Some(mut new_crdt) = try_as_crdt(&v)
                 && let Some(existing_v) = entry.get(&k)
                 && let Ok(existing_crdt) = serde_json::from_value::<Crdt>(existing_v.clone().into())
             {
-                // Use try_merge to avoid panic on type mismatch
+                // Use try_merge to avoid panic on type mismatch.
                 if new_crdt.try_merge(&existing_crdt).is_ok()
                     && let Ok(merged_json) = serde_json::to_value(new_crdt)
                 {
                     entry.insert(k, uni_common::Value::from(merged_json));
                     continue;
                 }
-                // try_merge failed (type mismatch) - fall through to overwrite
+                // CRDT variant mismatch (or a failed re-serialize): fall through to
+                // a last-writer-wins overwrite, discarding the existing CRDT's
+                // merged state. The OCC commit-time carve-out check
+                // (`occ::crdt_carveout_overwrite`) aborts a *concurrent* writer
+                // before reaching here, and write-time schema enforcement rejects a
+                // wrong declared variant; this warns on any residual (e.g. a
+                // single-writer variant change) so the discarded state is visible.
+                tracing::warn!(
+                    property = %k,
+                    existing_variant = existing_crdt.type_name(),
+                    "overwriting CRDT property with a different CRDT variant \
+                     (last-writer-wins); merged CRDT state is discarded"
+                );
+            } else if try_as_crdt(&v).is_none()
+                && entry.get(&k).is_some_and(|e| try_as_crdt(e).is_some())
+            {
+                // R1: an existing CRDT value is overwritten by a non-CRDT scalar
+                // (last-writer-wins), silently discarding the CRDT's merged state
+                // — a property written as BOTH a CRDT and last-writer-wins. The OCC
+                // write-set carve-out lets CRDT-only writers commit without
+                // conflicting, so a concurrent LWW write on the same property
+                // cannot be flagged as a conflict; surface it here instead.
+                tracing::warn!(
+                    property = %k,
+                    "overwriting CRDT property with non-CRDT value (last-writer-wins); \
+                     merged CRDT state is discarded"
+                );
             }
-            // Fallback: Overwrite
+            // Fallback: Overwrite (last-writer-wins).
             entry.insert(k, v);
         }
     }
@@ -312,6 +447,7 @@ impl L0Buffer {
             edge_endpoints: HashMap::new(),
             vertex_labels: HashMap::new(),
             label_to_vids: HashMap::new(),
+            vertex_label_overwrites: HashSet::new(),
             edge_types: HashMap::new(),
             current_version: start_version,
             mutation_count: 0,
@@ -324,6 +460,11 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            vertex_partial_keys: HashMap::new(),
+            edge_partial_keys: HashMap::new(),
+            pending_embeddings: HashMap::new(),
+            occ_read_seq: 0,
+            occ_read_set: None,
         }
     }
 
@@ -364,6 +505,10 @@ impl L0Buffer {
 
         self.vertex_tombstones.remove(&vid);
 
+        // Full-row insert supersedes any pending partial-update state for
+        // this VID.
+        self.vertex_partial_keys.remove(&vid);
+
         let entry = self.vertex_properties.entry(vid).or_default();
         Self::merge_crdt_properties(entry, properties.clone());
         self.vertex_versions.insert(vid, version);
@@ -382,6 +527,133 @@ impl L0Buffer {
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
         self.mutation_stats.nodes_created += 1;
+        self.mutation_stats.properties_set += properties.len();
+        self.mutation_stats.labels_added += labels.len();
+
+        let props_size = Self::estimate_properties_size(&properties);
+        self.estimated_size += 8 + props_size + 16 + labels_size + 32;
+    }
+
+    /// Insert a vertex's FULL property row, tagging `touched_keys` so the
+    /// flush emits exactly those columns via Lance `MergeInsertBuilder`
+    /// instead of a full-row Append.
+    ///
+    /// `props` MUST be the fully-merged property map (storage union
+    /// in-flight L0 union the new touched values, per
+    /// `PropertyManager::get_all_vertex_props_with_ctx`). The caller is
+    /// responsible for the union; L0 here just stores it so scans see
+    /// the complete row without per-key reconciliation.
+    ///
+    /// `touched_keys` lists the property keys this SET statement
+    /// actually assigned — the union of those across all coalesced
+    /// SetItems on this VID. Lance MergeInsert sends a source batch
+    /// with `_vid`, `_deleted`, `_version`, `_updated_at`, and those
+    /// touched columns; non-touched columns retain their pre-merge
+    /// values on the Lance side, skipping the wide-row write.
+    ///
+    /// A subsequent full-row `insert_vertex_with_labels` or
+    /// `delete_vertex` on the same VID clears the partial-keys entry
+    /// so partial state never outlives a stronger write.
+    pub fn insert_vertex_partial_full(
+        &mut self,
+        vid: Vid,
+        props: Properties,
+        touched_keys: HashSet<String>,
+        labels: &[String],
+    ) {
+        // Stage the full row through the existing partial-impl (same
+        // CRDT merge / version bump / timestamps), preserving the
+        // partial-keys entry so we can extend it below.
+        self.insert_vertex_with_labels_partial_impl(vid, props, labels, false);
+        self.vertex_partial_keys
+            .entry(vid)
+            .or_default()
+            .extend(touched_keys);
+    }
+
+    /// Legacy partial-only variant used by some uni-store paths. Kept
+    /// for source-compatibility but new uni-query callers should use
+    /// `insert_vertex_partial_full` to preserve scan-side L0 visibility.
+    pub fn insert_vertex_partial(&mut self, vid: Vid, touched: Properties, labels: &[String]) {
+        // Record dirty keys BEFORE the full-row impl runs (which would
+        // clear them). The keys come from the touched set; the values
+        // are merged into L0 by the shared CRDT path below.
+        let touched_keys: Vec<String> = touched.keys().cloned().collect();
+
+        // If the VID already has a full-row pending insert (e.g., CREATE
+        // earlier in the same tx), we must NOT downgrade it to partial.
+        // Detected by: VID is in vertex_properties WITH a version stamp
+        // AND not currently in vertex_partial_keys → it was written as
+        // a full row recently. The conservative rule: only enable the
+        // partial path when there's no full-row pending insert. We
+        // approximate "no full-row pending" by checking that the VID's
+        // current entry in vertex_partial_keys is non-empty OR the VID
+        // is not in vertex_properties (fresh row, but caller asked
+        // partial — let it through and the post-flush union covers it).
+        let already_full = self.vertex_properties.contains_key(&vid)
+            && !self.vertex_partial_keys.contains_key(&vid);
+
+        // Stage the CRDT merge through the existing path. We bypass the
+        // full-row `insert_vertex_with_labels_impl` clearing of
+        // partial_keys by inlining the work, then restoring/extending
+        // the partial-key set.
+        self.insert_vertex_with_labels_partial_impl(vid, touched, labels, false);
+
+        if !already_full {
+            self.vertex_partial_keys
+                .entry(vid)
+                .or_default()
+                .extend(touched_keys);
+        }
+    }
+
+    /// Core partial-insert: same as `insert_vertex_with_labels_impl` but
+    /// preserves any existing `vertex_partial_keys[vid]` entry so the
+    /// caller can extend it after the merge.
+    fn insert_vertex_with_labels_partial_impl(
+        &mut self,
+        vid: Vid,
+        properties: Properties,
+        labels: &[String],
+        skip_wal: bool,
+    ) {
+        self.current_version += 1;
+        let version = self.current_version;
+        let now = now_nanos();
+
+        if !skip_wal && let Some(wal) = &self.wal {
+            // WAL records the partial as a full-row InsertVertex; on replay
+            // the full-row path runs (which clears partial_keys). This is
+            // semantically correct — L0 in memory always holds the union of
+            // partial deltas via merge_crdt_properties; recovery doesn't
+            // need to preserve partial-vs-full distinction.
+            let _ = wal.append(&Mutation::InsertVertex {
+                vid,
+                properties: properties.clone(),
+                labels: labels.to_vec(),
+            });
+        }
+
+        self.vertex_tombstones.remove(&vid);
+        // NOTE: deliberately DOES NOT remove from vertex_partial_keys.
+        // The caller (`insert_vertex_partial`) extends that set after.
+
+        let entry = self.vertex_properties.entry(vid).or_default();
+        Self::merge_crdt_properties(entry, properties.clone());
+        self.vertex_versions.insert(vid, version);
+
+        self.vertex_created_at.entry(vid).or_insert(now);
+        self.vertex_updated_at.insert(vid, now);
+
+        let labels_size: usize = labels.iter().map(|l| l.len() + 24).sum();
+        let existing = self.vertex_labels.entry(vid).or_default();
+        Self::append_unique_labels(existing, labels);
+        self.index_labels_for_vid(vid, labels);
+
+        self.graph.add_vertex(vid);
+        self.mutation_count += 1;
+        // Partial writes don't create new nodes — they update existing ones.
+        // But counting under properties_set is correct.
         self.mutation_stats.properties_set += properties.len();
         self.mutation_stats.labels_added += labels.len();
 
@@ -479,6 +751,8 @@ impl L0Buffer {
         self.remove_vid_from_label_index(vid);
         self.vertex_tombstones.insert(vid);
         self.vertex_properties.remove(&vid);
+        // Deletion supersedes any pending partial-update state.
+        self.vertex_partial_keys.remove(&vid);
         self.vertex_versions.insert(vid, version);
         self.graph.remove_vertex(vid);
         self.mutation_count += 1;
@@ -527,6 +801,66 @@ impl L0Buffer {
         };
 
         // Set timestamps - created_at only set if this is a new edge
+        self.edge_created_at.entry(eid).or_insert(now);
+        self.edge_updated_at.insert(eid, now);
+
+        // A full-row insert supersedes any pending partial-update state
+        // for this EID (Round 12 §A).
+        self.edge_partial_keys.remove(&eid);
+
+        self.estimated_size += type_name_size;
+
+        Ok(())
+    }
+
+    /// Insert an edge's FULL property row plus a touched-keys hint so the
+    /// flush emits only those schema columns via Lance `MergeInsert` on
+    /// the per-edge-type delta tables. Edge analog of
+    /// `insert_vertex_partial_full` (Round 12 §A).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_edge_partial_full(
+        &mut self,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        eid: Eid,
+        properties: Properties,
+        edge_type_name: Option<String>,
+        touched_keys: HashSet<String>,
+    ) -> Result<()> {
+        self.current_version += 1;
+        let now = now_nanos();
+
+        if let Some(wal) = &mut self.wal {
+            wal.append(&Mutation::InsertEdge {
+                src_vid,
+                dst_vid,
+                edge_type,
+                eid,
+                version: self.current_version,
+                properties: properties.clone(),
+                edge_type_name: edge_type_name.clone(),
+            })?;
+        }
+
+        self.apply_edge_insertion(src_vid, dst_vid, edge_type, eid, properties)?;
+
+        // `apply_edge_insertion` cleared the partial-keys entry as a
+        // safety measure (full-row insert supersedes partial). Re-insert
+        // with the touched-keys hint so the flush emits a partial source.
+        self.edge_partial_keys
+            .entry(eid)
+            .or_default()
+            .extend(touched_keys);
+
+        let type_name_size = if let Some(ref name) = edge_type_name {
+            let size = name.len() + 24;
+            self.edge_types.insert(eid, name.clone());
+            size
+        } else {
+            0
+        };
+
         self.edge_created_at.entry(eid).or_insert(now);
         self.edge_updated_at.insert(eid, now);
 
@@ -647,6 +981,9 @@ impl L0Buffer {
             },
         );
         self.edge_versions.insert(eid, version);
+        // Deletion supersedes any pending partial-update state for this
+        // EID (Round 12 §A).
+        self.edge_partial_keys.remove(&eid);
         self.graph.remove_edge(eid);
         self.mutation_count += 1;
         self.mutation_stats.relationships_deleted += 1;
@@ -823,6 +1160,22 @@ impl L0Buffer {
             }
         }
 
+        // Label-overwrite pass: a `SET n:Label` / `REMOVE n:Label` resolved the
+        // FULL new label set into `other.vertex_labels[vid]` and flagged the vid.
+        // REPLACE (not append) so removals actually remove and an existing
+        // vertex's label change lands — overriding any append from the property
+        // loop above. Skip vids deleted in the same commit. (The append loops
+        // stay correct for property-path label unions, which are NOT flagged.)
+        for vid in &other.vertex_label_overwrites {
+            if other.vertex_tombstones.contains(vid) {
+                continue;
+            }
+            let labels = other.vertex_labels.get(vid).cloned().unwrap_or_default();
+            self.remove_vid_from_label_index(*vid);
+            self.vertex_labels.insert(*vid, labels.clone());
+            self.index_labels_for_vid(*vid, &labels);
+        }
+
         // Merge Edges - insert all edges from edge_endpoints, using empty props if none exist
         for (eid, (src, dst, etype)) in &other.edge_endpoints {
             if other.tombstones.contains_key(eid) {
@@ -926,6 +1279,17 @@ impl L0Buffer {
                         }
                     }
                     self.apply_vertex_deletion(vid);
+                }
+                Mutation::SetVertexLabels { vid, labels } => {
+                    // REPLACE the vid's full label set (a label-only mutation
+                    // resolved the complete set). Replace, not append, so a
+                    // replayed removal removes; clears the old reverse-index
+                    // entries first.
+                    self.current_version += 1;
+                    self.remove_vid_from_label_index(vid);
+                    self.vertex_labels.insert(vid, labels.clone());
+                    self.index_labels_for_vid(vid, &labels);
+                    self.mutation_count += 1;
                 }
                 Mutation::InsertEdge {
                     src_vid,

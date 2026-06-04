@@ -235,6 +235,47 @@ struct DerivedScanHandle {
 pub struct LocyPlanBuilder<'a> {
     planner: &'a QueryPlanner,
     derived_scan_handles: RefCell<Vec<DerivedScanHandle>>,
+    /// Plugin registry used to resolve Locy aggregates for the recursive-stratum
+    /// monotonicity check. Defaults to the process-wide built-in registry; hosts
+    /// with user-registered aggregates should override via
+    /// [`Self::with_plugin_registry`].
+    plugin_registry: std::sync::Arc<uni_plugin::PluginRegistry>,
+}
+
+/// Neural-classifier-related plumbing threaded through `build_stratum` →
+/// `build_rule` → `build_clause`. Bundled to avoid the
+/// too-many-arguments smell on those builders.
+#[derive(Clone)]
+struct ClassifierContext {
+    registry: Arc<uni_locy::ClassifierRegistry>,
+    cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+    provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+}
+
+/// Probabilistic-evaluation knobs threaded through the same builders.
+/// Fields are not yet read by the clause-level builders (the actual
+/// strict-domain / epsilon enforcement happens later in the fixpoint
+/// hot path); they ride along here so the planner surface stays
+/// consistent with the runtime config and is forward-compatible with
+/// plan-time enforcement.
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "reserved for plan-time probabilistic-config rollout"
+)]
+struct ProbabilityConfig {
+    strict_domain: bool,
+    epsilon: f64,
+}
+
+/// Lookup state shared by the clause builder: target rule catalog,
+/// the in-progress stratum's rule names, and the clause's bound node
+/// variables. Bundled to keep `build_clause` under the
+/// too-many-arguments threshold.
+struct ClauseCtx<'a> {
+    stratum_rule_names: &'a HashSet<String>,
+    rule_catalog: &'a HashMap<String, CompiledRule>,
+    node_vars: &'a HashSet<String>,
 }
 
 impl<'a> LocyPlanBuilder<'a> {
@@ -243,7 +284,18 @@ impl<'a> LocyPlanBuilder<'a> {
         Self {
             planner,
             derived_scan_handles: RefCell::new(Vec::new()),
+            plugin_registry: crate::query::df_graph::locy_fold::default_locy_plugin_registry(),
         }
+    }
+
+    /// Replace the plugin registry used for aggregate monotonicity resolution.
+    #[must_use]
+    pub fn with_plugin_registry(
+        mut self,
+        registry: std::sync::Arc<uni_plugin::PluginRegistry>,
+    ) -> Self {
+        self.plugin_registry = registry;
+        self
     }
 
     /// Build a full `LogicalPlan::LocyProgram` with embedded `DerivedScanRegistry`.
@@ -261,8 +313,125 @@ impl<'a> LocyPlanBuilder<'a> {
         max_bdd_variables: usize,
         top_k_proofs: usize,
     ) -> Result<LogicalPlan> {
+        // Legacy entry point — defaults to AddMultProb. New code paths
+        // should call `build_program_plan_with_semiring_and_classifiers`.
+        self.build_program_plan_with_semiring_and_classifiers(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            uni_locy::SemiringKind::AddMultProb,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+        )
+    }
+
+    /// Build a `LocyProgram` plan threading an explicit semiring through.
+    /// Compatibility wrapper; for full Slice 3 wiring use
+    /// `build_program_plan_with_semiring_and_classifiers`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_semiring(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+    ) -> Result<LogicalPlan> {
+        self.build_program_plan_with_semiring_and_classifiers(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+        )
+    }
+
+    /// Phase B Slice 3 entry: threads both the active semiring and the
+    /// runtime classifier registry through the plan.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_semiring_and_classifiers(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+    ) -> Result<LogicalPlan> {
+        self.build_program_plan_with_full_neural(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            None,
+            None,
+        )
+    }
+
+    /// Phase B follow-up: full entry threading both the classifier
+    /// registry and the optional memoization cache.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_full_neural(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
+        let prob_config = ProbabilityConfig {
+            strict_domain: strict_probability_domain,
+            epsilon: probability_epsilon,
+        };
+        let classifiers = ClassifierContext {
+            registry: Arc::clone(&classifier_registry),
+            cache: classifier_cache.as_ref().map(Arc::clone),
+            provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
+        };
         for stratum in &compiled.strata {
             let rule_names: HashSet<String> =
                 stratum.rules.iter().map(|r| r.name.clone()).collect();
@@ -270,8 +439,8 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum,
                 &compiled.rule_catalog,
                 &rule_names,
-                strict_probability_domain,
-                probability_epsilon,
+                prob_config,
+                &classifiers,
             )?;
             strata.push(locy_stratum);
         }
@@ -279,7 +448,7 @@ impl<'a> LocyPlanBuilder<'a> {
         let registry = self.build_registry();
         let plan = LogicalPlan::LocyProgram {
             strata,
-            commands: self.build_commands(&compiled.commands),
+            commands: self.build_commands_with_models(&compiled.commands, &compiled.model_catalog),
             derived_scan_registry: Arc::new(registry),
             max_iterations,
             timeout,
@@ -290,6 +459,10 @@ impl<'a> LocyPlanBuilder<'a> {
             exact_probability,
             max_bdd_variables,
             top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            classifier_cache,
+            classifier_provenance_store,
         };
 
         Ok(plan)
@@ -299,7 +472,11 @@ impl<'a> LocyPlanBuilder<'a> {
     ///
     /// Commands carry AST data for dispatch by the caller (e.g., `evaluate_native`)
     /// via the orchestrator after strata evaluation completes.
-    fn build_commands(&self, commands: &[CompiledCommand]) -> Vec<LocyCommand> {
+    fn build_commands_with_models(
+        &self,
+        commands: &[CompiledCommand],
+        model_catalog: &HashMap<String, uni_locy::CompiledModel>,
+    ) -> Vec<LocyCommand> {
         commands
             .iter()
             .map(|cmd| match cmd {
@@ -319,6 +496,19 @@ impl<'a> LocyPlanBuilder<'a> {
                     derive_command: dc.clone(),
                 },
                 CompiledCommand::Cypher(q) => LocyCommand::Cypher { query: q.clone() },
+                CompiledCommand::Calibrate(cc) => {
+                    let inputs = model_catalog
+                        .get(&cc.model_name)
+                        .map(|m| m.inputs.clone())
+                        .unwrap_or_default();
+                    LocyCommand::Calibrate {
+                        calibrate: cc.clone(),
+                        model_inputs: inputs,
+                    }
+                }
+                CompiledCommand::Validate(cv) => LocyCommand::Validate {
+                    validate: cv.clone(),
+                },
             })
             .collect()
     }
@@ -330,8 +520,8 @@ impl<'a> LocyPlanBuilder<'a> {
         stratum: &Stratum,
         rule_catalog: &HashMap<String, CompiledRule>,
         stratum_rule_names: &HashSet<String>,
-        strict_probability_domain: bool,
-        probability_epsilon: f64,
+        prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
@@ -340,8 +530,8 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum.is_recursive,
                 stratum_rule_names,
                 rule_catalog,
-                strict_probability_domain,
-                probability_epsilon,
+                prob_config,
+                classifiers,
             )?);
         }
 
@@ -361,8 +551,8 @@ impl<'a> LocyPlanBuilder<'a> {
         is_recursive: bool,
         stratum_rule_names: &HashSet<String>,
         rule_catalog: &HashMap<String, CompiledRule>,
-        strict_probability_domain: bool,
-        probability_epsilon: f64,
+        prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
         let node_vars = collect_node_vars(&rule.clauses);
@@ -373,11 +563,13 @@ impl<'a> LocyPlanBuilder<'a> {
                 clause,
                 &rule.yield_schema,
                 is_recursive,
-                stratum_rule_names,
-                rule_catalog,
-                &node_vars,
-                strict_probability_domain,
-                probability_epsilon,
+                ClauseCtx {
+                    stratum_rule_names,
+                    rule_catalog,
+                    node_vars: &node_vars,
+                },
+                prob_config,
+                classifiers,
             )?);
         }
 
@@ -493,21 +685,54 @@ impl<'a> LocyPlanBuilder<'a> {
 
     // -- Clause ---------------------------------------------------------
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "clause builder requires full planner context"
-    )]
     fn build_clause(
         &self,
         clause: &CompiledClause,
         yield_cols: &[YieldColumn],
-        _is_recursive: bool,
-        stratum_rule_names: &HashSet<String>,
-        rule_catalog: &HashMap<String, CompiledRule>,
-        node_vars: &HashSet<String>,
-        _strict_probability_domain: bool,
-        _probability_epsilon: f64,
+        is_recursive: bool,
+        ctx: ClauseCtx<'_>,
+        _prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyClausePlan> {
+        let stratum_rule_names = ctx.stratum_rule_names;
+        let rule_catalog = ctx.rule_catalog;
+        let node_vars = ctx.node_vars;
+        let classifier_registry = Arc::clone(&classifiers.registry);
+        let classifier_cache = classifiers.cache.as_ref().map(Arc::clone);
+        let classifier_provenance_store = classifiers.provenance_store.as_ref().map(Arc::clone);
+
+        // Reject non-monotone FOLD aggregates in recursive strata using the
+        // plugin registry's Semilattice metadata. Defense in depth: the
+        // uni-locy typecheck pass usually rejects this upstream, but
+        // direct LocyPlanBuilder consumers (in-process tests, future API
+        // surfaces) might bypass that pass.
+        if is_recursive {
+            for fold in &clause.fold {
+                let fname = match &fold.aggregate {
+                    uni_cypher::ast::Expr::FunctionCall { name, .. } => name.clone(),
+                    _ => {
+                        anyhow::bail!(
+                            "FOLD '{}' aggregate must be a function call (e.g., SUM(x))",
+                            fold.name
+                        );
+                    }
+                };
+                match crate::query::df_graph::locy_fold::is_monotonic_aggregate(
+                    &self.plugin_registry,
+                    &fname,
+                ) {
+                    Some(true) => {}
+                    Some(false) | None => {
+                        anyhow::bail!(
+                            "non-monotonic aggregate '{}' in recursive rule clause (FOLD '{}')",
+                            fname,
+                            fold.name
+                        );
+                    }
+                }
+            }
+        }
+
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
         // have expanded {var}._vid columns in the graph scan output.
@@ -816,7 +1041,11 @@ impl<'a> LocyPlanBuilder<'a> {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
                 rewrite_locy_expr(locy_expr)?
             } else if let Some(fold_input) = fold_input_map.get(yc.name.as_str()) {
-                (*fold_input).clone()
+                // Substitute ALONG names so a FOLD input like
+                // `MNOR(link)` where `link` is an ALONG binding
+                // unfolds to the underlying ALONG expression
+                // (e.g., `e.base * Variable("__model_scorer_0")`).
+                substitute_along_vars((*fold_input).clone(), &rewritten_along)
             } else if fold_output_names.contains(yc.name.as_str()) {
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
@@ -850,6 +1079,81 @@ impl<'a> LocyPlanBuilder<'a> {
                 Some("__priority".to_string()),
             ));
             target_types.push(DataType::Int64);
+        }
+
+        // Hidden YIELD items emitted by `extract_model_invocations` for
+        // property feature exprs (e.g. `scorer(s.tier)`). These columns
+        // (named `__feat_<var>_<prop>`) flow through the body batch so
+        // `apply_model_invocations` can read property values per row;
+        // `record_batches_to_locy_rows` strips them by prefix before
+        // returning the user-visible rows.
+        //
+        // We deliberately push to `projections` AFTER `target_types` is
+        // already populated for the user-visible columns + priority.
+        // `plan_locy_project` reads `target_types.get(i)` and skips
+        // coercion when the entry is absent (returns `None`); leaving
+        // these out preserves the property's native storage type
+        // (Utf8 / LargeBinary / Int64 / Float64 / etc.) end-to-end
+        // into `apply_model_invocations`.
+        for hidden in &clause.hidden_yield_cols {
+            if let Some(orig_expr) = yield_expr_map.get(hidden) {
+                let e = (*orig_expr).clone();
+                let e = substitute_along_vars(e, &rewritten_along);
+                projections.push((e, Some(hidden.clone())));
+            }
+        }
+
+        // Phase B A4 follow-up: when the clause has neural-model
+        // invocations (extracted from YIELD / ALONG / FOLD positions
+        // and replaced with `Variable("__model_<n>_<idx>")`
+        // references), wrap the pre-projection plan with
+        // `LocyModelInvoke` so the synthesized columns exist in the
+        // input schema of `LocyProject`. Downstream FOLD aggregates
+        // also see those columns (FoldExec reads projected columns).
+        if !clause.model_invocations.is_empty() {
+            // Phase D D3 runtime: for every distinct source rule
+            // referenced by a path-context invocation on this clause,
+            // mint a `DerivedScanHandle` (non-self-ref → full cross-stratum
+            // facts) and surface it as a `PathContextHandle` on the
+            // logical plan node. The `data` Arc is shared with
+            // `DerivedScanRegistry`, so the fixpoint loop's writes flow
+            // through here without further plumbing.
+            let mut path_context_handles: HashMap<
+                String,
+                super::df_graph::locy_model_invoke::PathContextHandle,
+            > = HashMap::new();
+            for inv in &clause.model_invocations {
+                if let Some(pc) = &inv.path_context {
+                    if path_context_handles.contains_key(&pc.source_rule) {
+                        continue;
+                    }
+                    let target_rule = rule_catalog.get(&pc.source_rule).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "model '{}' path_context references undefined rule '{}'",
+                            inv.model_name,
+                            pc.source_rule
+                        )
+                    })?;
+                    let handle =
+                        self.get_or_create_derived_scan_handle(&pc.source_rule, target_rule, false);
+                    path_context_handles.insert(
+                        pc.source_rule.clone(),
+                        super::df_graph::locy_model_invoke::PathContextHandle {
+                            source_rule: pc.source_rule.clone(),
+                            data: handle.data,
+                            schema: handle.schema,
+                        },
+                    );
+                }
+            }
+            plan = LogicalPlan::LocyModelInvoke {
+                input: Box::new(plan),
+                invocations: clause.model_invocations.clone(),
+                classifier_registry: Arc::clone(&classifier_registry),
+                classifier_cache: classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
+                path_context_handles,
+            };
         }
 
         plan = LogicalPlan::LocyProject {
@@ -890,6 +1194,7 @@ impl<'a> LocyPlanBuilder<'a> {
             is_refs,
             along_bindings,
             priority: clause.priority,
+            model_invocations: clause.model_invocations.clone(),
         })
     }
 
@@ -1289,6 +1594,14 @@ mod tests {
         QueryPlanner::new(test_schema())
     }
 
+    fn test_classifier_ctx() -> ClassifierContext {
+        ClassifierContext {
+            registry: Arc::new(uni_locy::ClassifierRegistry::new()),
+            cache: None,
+            provenance_store: None,
+        }
+    }
+
     fn yield_col(name: &str, is_key: bool) -> YieldColumn {
         YieldColumn {
             name: name.to_string(),
@@ -1376,6 +1689,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(yield_names),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         }
     }
 
@@ -1396,6 +1711,7 @@ mod tests {
         CompiledProgram {
             strata,
             rule_catalog,
+            model_catalog: HashMap::new(),
             warnings: vec![],
             commands: vec![],
         }
@@ -1628,7 +1944,16 @@ mod tests {
         };
         let names: HashSet<String> = ["base".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.id, 0);
@@ -1658,7 +1983,16 @@ mod tests {
         };
         let names: HashSet<String> = ["reach".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert!(result.is_recursive);
@@ -1686,7 +2020,16 @@ mod tests {
         };
         let names: HashSet<String> = ["derived".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.depends_on, vec![0, 1]);
@@ -1720,7 +2063,16 @@ mod tests {
         };
         let names: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.rules.len(), 3);
@@ -1748,7 +2100,17 @@ mod tests {
         let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.name, "reachable");
         assert_eq!(result.yield_schema.len(), 2);
@@ -1773,7 +2135,17 @@ mod tests {
         let names: HashSet<String> = ["prio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.priority, Some(5));
     }
@@ -1792,7 +2164,17 @@ mod tests {
         let names: HashSet<String> = ["noprio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.priority, None);
     }
@@ -1815,7 +2197,17 @@ mod tests {
         let names: HashSet<String> = ["multi".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
     }
@@ -1838,7 +2230,17 @@ mod tests {
         let names: HashSet<String> = ["keyed".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert!(result.yield_schema[0].is_key);
         assert!(!result.yield_schema[1].is_key);
@@ -1864,11 +2266,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -1895,6 +2302,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true)];
         let catalog = HashMap::new();
@@ -1905,11 +2314,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -1948,6 +2362,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -1957,11 +2373,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2010,6 +2431,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x", "y"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true), yield_col("y", false)];
         let names = HashSet::new();
@@ -2019,11 +2442,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2060,6 +2488,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -2069,11 +2499,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2132,6 +2567,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -2141,11 +2578,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2187,6 +2629,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["a", "b", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [
             yield_col("a", true),
@@ -2200,11 +2644,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2242,6 +2691,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
@@ -2252,11 +2703,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2267,6 +2723,11 @@ mod tests {
 
     #[test]
     fn test_clause_fold_skipped_recursive() {
+        // Probes that a monotone FOLD in a recursive clause is deferred
+        // from the body plan to the fixpoint engine (not whether the
+        // monotonicity check passes — that's covered by the dedicated
+        // validation tests above). Uses `MMAX` because non-monotone
+        // aggregates are now rejected outright in recursive strata.
         let planner = test_planner();
         let builder = LocyPlanBuilder::new(&planner);
 
@@ -2275,9 +2736,9 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![FoldBinding {
-                name: "total".to_string(),
+                name: "best".to_string(),
                 aggregate: Expr::FunctionCall {
-                    name: "SUM".to_string(),
+                    name: "MMAX".to_string(),
                     args: vec![Expr::Variable("cost".to_string())],
                     distinct: false,
                     window_spec: None,
@@ -2285,10 +2746,12 @@ mod tests {
             }],
             having: vec![],
             best_by: None,
-            output: simple_yield_output(&["n", "total"]),
+            output: simple_yield_output(&["n", "best"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
-        let yield_cols = [yield_col("n", true), yield_col("total", false)];
+        let yield_cols = [yield_col("n", true), yield_col("best", false)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
@@ -2297,11 +2760,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 true,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2329,6 +2797,8 @@ mod tests {
             }),
             output: simple_yield_output(&["n", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("cost", false)];
         let catalog = HashMap::new();
@@ -2339,11 +2809,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2376,11 +2851,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2438,6 +2918,8 @@ mod tests {
             }),
             output: simple_yield_output(&["x", "cost", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [
             yield_col("x", true),
@@ -2451,11 +2933,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2542,6 +3029,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["a", "b"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("a", true), yield_col("b", false)],
         );
@@ -2611,6 +3100,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -2687,6 +3178,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -2761,6 +3254,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("n", true)],
         );
@@ -2780,6 +3275,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("n", true)],
         );
@@ -2858,6 +3355,8 @@ mod tests {
                     best_by: None,
                     output: simple_yield_output(&["x"]),
                     priority: None,
+                    model_invocations: vec![],
+                    hidden_yield_cols: vec![],
                 },
                 CompiledClause {
                     match_pattern: node_pattern("y"),
@@ -2873,6 +3372,8 @@ mod tests {
                     best_by: None,
                     output: simple_yield_output(&["y"]),
                     priority: None,
+                    model_invocations: vec![],
+                    hidden_yield_cols: vec![],
                 },
             ],
             vec![yield_col("x", true)],
@@ -3026,6 +3527,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -3053,6 +3556,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["y"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("y", true)],
         );
@@ -3153,6 +3658,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let catalog = HashMap::new();
@@ -3162,11 +3669,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3199,6 +3711,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -3207,11 +3721,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3247,6 +3766,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true), yield_col("cost", false)];
         let names = HashSet::new();
@@ -3255,11 +3776,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3267,7 +3793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_fold_on_recursive_stratum_skipped() {
+    fn test_validation_fold_non_monotonic_rejected_in_recursive_stratum() {
         let planner = test_planner();
         let builder = LocyPlanBuilder::new(&planner);
 
@@ -3288,22 +3814,135 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
-        // No error — FOLD in recursive stratum is silently skipped
         let result = builder.build_clause(
             &clause,
             &yield_cols,
             true,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
-        assert!(result.is_ok());
+        assert!(result.is_err(), "SUM in a recursive stratum must reject");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-monotonic aggregate 'SUM'"),
+            "error must name the aggregate; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validation_fold_monotonic_accepted_in_recursive_stratum() {
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+
+        for name in ["MMAX", "MMIN", "MNOR", "MPROD", "MSUM"] {
+            let clause = CompiledClause {
+                match_pattern: node_pattern("n"),
+                where_conditions: vec![],
+                along: vec![],
+                fold: vec![FoldBinding {
+                    name: "score".to_string(),
+                    aggregate: Expr::FunctionCall {
+                        name: name.to_string(),
+                        args: vec![Expr::Variable("cost".to_string())],
+                        distinct: false,
+                        window_spec: None,
+                    },
+                }],
+                having: vec![],
+                best_by: None,
+                output: simple_yield_output(&["n", "score"]),
+                priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
+            };
+            let yield_cols = [yield_col("n", true), yield_col("score", false)];
+            let catalog = HashMap::new();
+            let names = HashSet::new();
+
+            let result = builder.build_clause(
+                &clause,
+                &yield_cols,
+                true,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            );
+            assert!(
+                result.is_ok(),
+                "{name} should be accepted in recursive stratum; got: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_validation_fold_non_monotonic_accepted_in_non_recursive_stratum() {
+        // SUM is fine in a non-recursive rule — the check only triggers for
+        // is_recursive=true.
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+
+        let clause = CompiledClause {
+            match_pattern: node_pattern("n"),
+            where_conditions: vec![],
+            along: vec![],
+            fold: vec![FoldBinding {
+                name: "total".to_string(),
+                aggregate: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Variable("cost".to_string())],
+                    distinct: false,
+                    window_spec: None,
+                },
+            }],
+            having: vec![],
+            best_by: None,
+            output: simple_yield_output(&["n", "total"]),
+            priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
+        };
+        let yield_cols = [yield_col("n", true), yield_col("total", false)];
+        let catalog = HashMap::new();
+        let names = HashSet::new();
+
+        let result = builder.build_clause(
+            &clause,
+            &yield_cols,
+            false,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
+        );
+        assert!(result.is_ok(), "SUM in non-recursive stratum is valid");
     }
 }

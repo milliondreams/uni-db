@@ -5,7 +5,11 @@ use super::{CrdtMerge, VectorClock};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-/// Result of a merge operation on a VCRegister.
+/// Outcome of merging another [`VCRegister`] into this one.
+///
+/// Public diagnostic returned by [`VCRegister::merge_register`] so callers
+/// (and the conflict-resolution test suites) can observe which branch the
+/// causal comparison took. The blanket [`CrdtMerge::merge`] impl discards it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeResult {
     KeptSelf,
@@ -46,7 +50,7 @@ impl<T: Clone> VCRegister<T> {
     }
 
     pub fn merge_register(&mut self, other: &VCRegister<T>) -> MergeResult {
-        match self.clock.partial_cmp(&other.clock) {
+        match self.clock.causal_cmp(&other.clock) {
             Some(Ordering::Less) => {
                 // Other is causally newer
                 self.value = other.value.clone();

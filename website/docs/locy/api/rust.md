@@ -11,17 +11,20 @@ let session = db.session();
 ## Core Methods
 
 ```rust
-// Simple evaluation
+// Simple evaluation (takes only the program string)
 let result = session.locy(program).await?;
 
-// With inline parameters
-let result = session.locy(program, Some(&params)).await?;
+// With inline parameters — use the builder, not a params argument
+let result = session.locy_with(program)
+    .param("threshold", 0.5)
+    .run()
+    .await?;
 
 // Compile-only check (no evaluation)
 let compiled = session.compile_locy(program)?;
 
-// Explain a Locy program
-let explain = session.explain_locy(program).await?;
+// Explain a Locy program — terminal on the builder, returns LocyExplainOutput
+let explain = session.locy_with(program).explain()?;
 ```
 
 ## Fluent Builder (`LocyBuilder`)
@@ -29,11 +32,13 @@ let explain = session.explain_locy(program).await?;
 For advanced configuration, use the builder API:
 
 ```rust
+use std::time::Duration;
+
 let result = session.locy_with(program)
     .param("threshold", 0.5)
-    .timeout(60.0)
+    .timeout(Duration::from_secs(60))
     .max_iterations(500)
-    .with_config(&cfg)
+    .with_config(cfg)
     .run()
     .await?;
 ```
@@ -44,11 +49,12 @@ Builder methods:
 |--------|-------------|
 | `.param(name, value)` | Add a named parameter |
 | `.params(map)` | Add multiple parameters |
-| `.timeout(seconds)` | Set evaluation timeout |
+| `.timeout(duration)` | Set evaluation timeout (`std::time::Duration`) |
 | `.max_iterations(n)` | Set recursion iteration cap |
-| `.with_config(&cfg)` | Set full `LocyConfig` options |
+| `.with_config(cfg)` | Set full `LocyConfig` options (taken by value) |
 | `.cancellation_token(token)` | Attach a cancellation token |
 | `.run()` | Execute and return `LocyResult` |
+| `.explain()` | Compile and return `LocyExplainOutput` without evaluating |
 
 ## Config (`LocyConfig`)
 
@@ -70,7 +76,7 @@ Common fields:
 
 ## Result Shape (`LocyResult`)
 
-- `derived: HashMap<String, Vec<Row>>`
+- `derived: HashMap<String, Vec<FactRow>>` (where `FactRow = HashMap<String, Value>`)
 - `stats: LocyStats`
 - `command_results: Vec<CommandResult>`
 - `warnings: Vec<RuntimeWarning>`
@@ -90,10 +96,10 @@ Helpers:
 ## Explain Output (`LocyExplainOutput`)
 
 ```rust
-let explain = session.explain_locy(program).await?;
+let explain = session.locy_with(program).explain()?;
 ```
 
-Returns the logical plan and compilation details for a Locy program without executing it.
+`explain()` is the terminal method on the builder — it compiles the program and returns the logical plan and compilation details without executing it.
 
 ## Compile-Only (`CompiledProgram`)
 

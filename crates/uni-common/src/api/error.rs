@@ -75,11 +75,35 @@ pub enum UniError {
     #[error("Operation timed out after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
 
+    /// A Locy program stopped before reaching its least fixed point because it
+    /// exceeded its wall-clock `timeout` or its `max_iterations` cap.
+    ///
+    /// This is the default outcome of an over-budget evaluation: partial results
+    /// are *not* returned silently. The boxed [`LocyIncomplete`] carries the
+    /// diagnostics (which rules were skipped, which complement rules are now
+    /// unsound, how far evaluation got). The partial facts themselves are not
+    /// embedded here — to recover them, re-run with `allow_partial` set, which
+    /// returns `Ok` with the partial result instead of this error.
+    #[error("Locy evaluation incomplete: {detail}")]
+    LocyIncomplete { detail: Box<LocyIncomplete> },
+
     #[error("Type error: expected {expected}, got {actual}")]
     Type { expected: String, actual: String },
 
     #[error("Constraint violation: {message}")]
     Constraint { message: String },
+
+    /// A transaction was aborted at commit because a concurrent transaction
+    /// committed a conflicting write since this transaction began (optimistic
+    /// concurrency control). The transaction may be safely retried.
+    #[error("Serialization conflict: {message}")]
+    SerializationConflict { message: String },
+
+    /// A transaction was aborted at commit because a concurrent transaction
+    /// committed a row with the same unique key (serializable MERGE). The
+    /// transaction may be safely retried, which will observe the existing row.
+    #[error("Constraint conflict: {message}")]
+    ConstraintConflict { message: String },
 
     #[error("Storage error: {message}")]
     Storage {
@@ -120,6 +144,15 @@ pub enum UniError {
     #[error("Transaction '{tx_id}' commit timed out")]
     CommitTimeout { tx_id: String, hint: &'static str },
 
+    /// A `FOR UPDATE` pessimistic row lock could not be acquired within the
+    /// deadline — the holder is another live transaction (contention or a
+    /// lock-ordering deadlock). Unlike a plain [`UniError::Timeout`] (a slow
+    /// operation that would just time out again), this is transient: a fresh
+    /// transaction can retry and win the lock once the holder releases it, so
+    /// it is classified retriable. See `is_retriable`.
+    #[error("FOR UPDATE lock acquisition timed out after {timeout_ms}ms")]
+    LockTimeout { timeout_ms: u64 },
+
     /// Transaction exceeded its deadline.
     #[error("Transaction '{tx_id}' expired")]
     TransactionExpired { tx_id: String, hint: &'static str },
@@ -139,6 +172,41 @@ pub enum UniError {
     /// A session hook rejected the operation.
     #[error("Hook rejected: {message}")]
     HookRejected { message: String },
+
+    /// A synchronous trigger returned `TriggerOutcome::Reject` (or `Err`)
+    /// during a `BeforeMutation` / `BeforeCommit` phase, aborting commit.
+    #[error("Trigger '{trigger}' rejected commit: {reason}")]
+    TriggerRejected { trigger: String, reason: String },
+
+    /// Authentication failed (M5i). Raised when
+    /// `Uni::session_with_credentials` cannot find a matching
+    /// `AuthProvider` or the matched provider rejects the credentials.
+    #[error("Authentication failed: {reason}")]
+    AuthenticationFailed {
+        /// Human-readable failure reason.
+        reason: String,
+    },
+
+    /// An `AuthzPolicy::check` returned `Decision::Deny` for the
+    /// current principal (M5i).
+    #[error("Authorization denied: {reason}")]
+    AuthorizationDenied {
+        /// Reason from the deciding policy.
+        reason: String,
+    },
+
+    /// A write was attempted against an ephemeral (transient, in-query)
+    /// node or edge — i.e. one whose `Vid` / `Eid` has the
+    /// `EPHEMERAL_BIT` set. Ephemeral entities are return-only
+    /// projections; SET / DELETE / MERGE against them must fail before
+    /// they reach storage (M5g / proposal §4.13.1).
+    #[error("Cannot mutate ephemeral {kind} {id}: ephemeral entities are return-only")]
+    EphemeralWriteAttempt {
+        /// `"node"` or `"edge"`.
+        kind: &'static str,
+        /// Transient id (bottom 63 bits) for diagnostic output.
+        id: u64,
+    },
 
     /// Fork with the given name does not exist in the registry.
     #[error("Fork '{name}' not found")]
@@ -163,6 +231,12 @@ pub enum UniError {
     /// fork. Commit or roll back the transaction first, then retry drop.
     #[error("Fork '{name}' has uncommitted transaction state; commit or rollback first")]
     ForkInflightTx { name: String },
+
+    /// Drop refused because the fork has pending async flushes that did
+    /// not drain within `UniConfig::drop_fork_drain_timeout`. Either retry
+    /// later (the streams will eventually complete) or raise the timeout.
+    #[error("Fork '{name}' has pending flushes that did not drain within timeout")]
+    PendingFlushTimeout { name: String },
 
     /// Registry on disk is malformed (corrupt JSON, missing required field, etc.).
     #[error("Fork registry is corrupt: {message}")]
@@ -205,4 +279,215 @@ pub enum UniError {
     },
 }
 
+impl UniError {
+    /// Returns `true` when retrying the failed operation from scratch may succeed.
+    ///
+    /// Distinguishes transient contention failures — optimistic-concurrency
+    /// aborts and lock/commit timeouts, which a fresh transaction can win — from
+    /// deterministic failures (bad query, schema or type violation) that would
+    /// fail identically on retry. This is the signal
+    /// [`Session::transact_with_retry`](../../../uni_db/api/session/struct.Session.html)
+    /// uses to decide whether to re-run a transaction closure.
+    ///
+    /// `TransactionExpired` is deliberately *not* retriable here: a fresh
+    /// transaction gets a new deadline, but the helper treats deadline expiry as
+    /// a caller-set budget, not a contention signal. A plain `Timeout` is
+    /// likewise *not* retriable — re-running the same slow operation would just
+    /// time out again; only `CommitTimeout` (lock contention at the commit point)
+    /// and `LockTimeout` (a contended `FOR UPDATE` row lock / deadlock) signal
+    /// retriable contention.
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::UniError;
+    ///
+    /// assert!(UniError::SerializationConflict { message: "lost update".into() }.is_retriable());
+    /// assert!(!UniError::Schema { message: "no such label".into() }.is_retriable());
+    /// ```
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            UniError::SerializationConflict { .. }
+                | UniError::ConstraintConflict { .. }
+                | UniError::TransactionConflict { .. }
+                | UniError::CommitTimeout { .. }
+                | UniError::LockTimeout { .. }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, UniError>;
+
+/// Why a Locy evaluation stopped before reaching its least fixed point.
+///
+/// A wall-clock timeout and a non-convergence failure are both *incomplete*
+/// outcomes, but they call for different remedies (raise the timeout / fix a
+/// slow rule vs. raise `max_iterations` / fix a non-monotone rule), so they are
+/// reported distinctly rather than collapsed into one flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocyIncompleteReason {
+    /// The wall-clock `timeout` budget was exhausted mid-evaluation.
+    Timeout,
+    /// A recursive stratum hit `max_iterations` without converging.
+    IterationLimit,
+}
+
+impl LocyIncompleteReason {
+    /// Returns a stable machine-readable tag (`"timeout"` / `"iteration_limit"`).
+    ///
+    /// Used as the discriminator surfaced to non-Rust callers (e.g. the Python
+    /// bindings), where matching on a Rust enum is not available.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocyIncompleteReason::Timeout => "timeout",
+            LocyIncompleteReason::IterationLimit => "iteration_limit",
+        }
+    }
+}
+
+impl std::fmt::Display for LocyIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Diagnostics describing a Locy evaluation that stopped before completing.
+///
+/// Returned (boxed) inside [`UniError::LocyIncomplete`] when a program exceeds
+/// its time or iteration budget, and also attached to a `LocyResult` when the
+/// caller opts into partial results. The rule lists exist so a caller can tell
+/// "not evaluated" apart from "genuinely empty": any rule named in
+/// `incomplete_rules` or `skipped_rules` may be missing facts purely because
+/// evaluation was cut short, so a zero-row count for it is not authoritative.
+///
+/// # Examples
+/// ```
+/// use uni_common::{LocyIncomplete, LocyIncompleteReason};
+///
+/// let detail = LocyIncomplete {
+///     reason: LocyIncompleteReason::Timeout,
+///     elapsed_ms: 305_000,
+///     limit_ms: 300_000,
+///     max_iterations: 1000,
+///     completed_strata: 2,
+///     total_strata: 4,
+///     incomplete_rules: vec!["upstream_reaches".into()],
+///     skipped_rules: vec!["healthy_assets".into()],
+///     complement_rules_affected: vec!["healthy_assets".into()],
+/// };
+/// assert!(detail.to_string().contains("timeout"));
+/// assert!(detail.to_string().contains("UNSOUND"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocyIncomplete {
+    /// Why evaluation stopped.
+    pub reason: LocyIncompleteReason,
+    /// Wall-clock time elapsed when evaluation was cut short, in milliseconds.
+    pub elapsed_ms: u64,
+    /// The configured wall-clock `timeout`, in milliseconds.
+    pub limit_ms: u64,
+    /// The configured `max_iterations` cap for recursive strata.
+    pub max_iterations: usize,
+    /// Number of strata fully evaluated before the cutoff.
+    pub completed_strata: usize,
+    /// Total number of strata in the program.
+    pub total_strata: usize,
+    /// Rules in the stratum that was interrupted mid-evaluation. Their facts may
+    /// be a partial fixpoint rather than the least fixed point.
+    pub incomplete_rules: Vec<String>,
+    /// Rules in strata that were never reached. They derived no facts solely
+    /// because evaluation stopped first, not because their result is empty.
+    pub skipped_rules: Vec<String>,
+    /// Subset of the incomplete/skipped rules that use an `IS NOT` complement.
+    /// Stratified negation over a partial relation is unsound, so these results
+    /// must not be trusted at all — surfaced separately for emphasis.
+    pub complement_rules_affected: Vec<String>,
+}
+
+impl std::fmt::Display for LocyIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{reason} after {elapsed_ms}ms (limit {limit_ms}ms, max_iterations {max_iters}); \
+             evaluated {done}/{total} strata, {n_incomplete} rule(s) incomplete, \
+             {n_skipped} rule(s) skipped",
+            reason = self.reason,
+            elapsed_ms = self.elapsed_ms,
+            limit_ms = self.limit_ms,
+            max_iters = self.max_iterations,
+            done = self.completed_strata,
+            total = self.total_strata,
+            n_incomplete = self.incomplete_rules.len(),
+            n_skipped = self.skipped_rules.len(),
+        )?;
+        if !self.complement_rules_affected.is_empty() {
+            write!(
+                f,
+                "; UNSOUND complement rule(s) affected: {:?}",
+                self.complement_rules_affected
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retriable_errors_are_contention_failures() {
+        let s = String::new;
+        let retriable = [
+            UniError::SerializationConflict { message: s() },
+            UniError::ConstraintConflict { message: s() },
+            UniError::TransactionConflict { message: s() },
+            UniError::CommitTimeout {
+                tx_id: s(),
+                hint: "",
+            },
+            // A contended FOR UPDATE row lock / deadlock clears when the holder
+            // releases; a fresh transaction can retry and win it.
+            UniError::LockTimeout { timeout_ms: 10_000 },
+        ];
+        for e in &retriable {
+            assert!(e.is_retriable(), "{e:?} should be retriable");
+        }
+    }
+
+    #[test]
+    fn deterministic_errors_are_not_retriable() {
+        let s = String::new;
+        let terminal = [
+            UniError::Parse {
+                message: s(),
+                position: None,
+                line: None,
+                column: None,
+                context: None,
+            },
+            UniError::Query {
+                message: s(),
+                query: None,
+            },
+            UniError::Schema { message: s() },
+            UniError::Constraint { message: s() },
+            UniError::InvalidArgument {
+                arg: s(),
+                message: s(),
+            },
+            // A caller-set deadline is not a contention signal.
+            UniError::TransactionExpired {
+                tx_id: s(),
+                hint: "",
+            },
+            // Re-running the same slow operation would just time out again.
+            UniError::Timeout { timeout_ms: 1 },
+        ];
+        for e in &terminal {
+            assert!(!e.is_retriable(), "{e:?} should not be retriable");
+        }
+    }
+}

@@ -5,6 +5,7 @@ members = [
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
+    "crates/uni-query-functions",
     "crates/uni-cli",
     "crates/uni",
     "crates/uni-crdt",
@@ -23,6 +24,20 @@ members = [
     "crates/uni-tck",
     "crates/uni-locy-tck",
     "crates/uni-locy",
+    "crates/uni-plugin",
+    "crates/uni-plugin-builtin",
+    "crates/uni-plugin-apoc-core",
+    "crates/uni-plugin-wasm",
+    "crates/uni-plugin-wasm-rt",
+    "crates/uni-plugin-extism",
+    "crates/uni-plugin-rhai",
+    "crates/uni-plugin-pyo3",
+    "crates/uni-plugin-custom",
+    "crates/uni-plugin-conformance",
+    "crates/uni-plugin-host",
+    "crates/uni-sidecar",
+    "crates/uni-bulk",
+    "crates/uni-fork",
 ]
 # Exclude uni-tck from default builds - run on-demand only
 default-members = [
@@ -31,17 +46,32 @@ default-members = [
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
+    "crates/uni-query-functions",
     "crates/uni-cli",
     "crates/uni",
     "crates/uni-crdt",
     "bindings/uni-db",
     "crates/uni-cypher",
     "crates/uni-locy",
+    "crates/uni-plugin",
+    "crates/uni-plugin-builtin",
+    "crates/uni-plugin-apoc-core",
+    "crates/uni-plugin-wasm",
+    "crates/uni-plugin-wasm-rt",
+    "crates/uni-plugin-extism",
+    "crates/uni-plugin-rhai",
+    "crates/uni-plugin-pyo3",
+    "crates/uni-plugin-custom",
+    "crates/uni-plugin-conformance",
+    "crates/uni-plugin-host",
+    "crates/uni-sidecar",
+    "crates/uni-bulk",
+    "crates/uni-fork",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "1.3.0"
+version = "2.0.0"
 edition = "2024"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
@@ -52,66 +82,89 @@ keywords = ["graph", "database", "cypher", "vector", "embedded"]
 categories = ["database", "data-structures"]
 
 [workspace.dependencies]
-uni-common = { path = "crates/uni-common", version = "1.3.0" }
-uni-store = { path = "crates/uni-store", version = "1.3.0" }
-uni-algo = { path = "crates/uni-algo", version = "1.3.0" }
-uni-query = { path = "crates/uni-query", version = "1.3.0" }
-uni-cli = { path = "crates/uni-cli", version = "1.3.0" }
-uni-db = { path = "crates/uni", version = "1.3.0", default-features = false }
-uni-crdt = { path = "crates/uni-crdt", version = "1.3.0" }
-uni-cypher = { path = "crates/uni-cypher", version = "1.3.0" }
-uni-locy = { path = "crates/uni-locy", version = "1.3.0" }
-uni-btic = { path = "crates/uni-btic", version = "1.3.0" }
+uni-common = { path = "crates/uni-common", version = "2.0.0" }
+uni-store = { path = "crates/uni-store", version = "2.0.0" }
+uni-algo = { path = "crates/uni-algo", version = "2.0.0" }
+uni-query = { path = "crates/uni-query", version = "2.0.0" }
+uni-query-functions = { path = "crates/uni-query-functions", version = "2.0.0" }
+uni-cli = { path = "crates/uni-cli", version = "2.0.0" }
+uni-db = { path = "crates/uni", version = "2.0.0", default-features = false }
+uni-crdt = { path = "crates/uni-crdt", version = "2.0.0" }
+uni-cypher = { path = "crates/uni-cypher", version = "2.0.0" }
+uni-locy = { path = "crates/uni-locy", version = "2.0.0" }
+uni-btic = { path = "crates/uni-btic", version = "2.0.0" }
+uni-plugin = { path = "crates/uni-plugin", version = "1.8.0" }
+uni-plugin-builtin = { path = "crates/uni-plugin-builtin", version = "2.0.0" }
+uni-plugin-apoc-core = { path = "crates/uni-plugin-apoc-core", version = "2.0.0" }
+uni-plugin-wasm = { path = "crates/uni-plugin-wasm", version = "2.0.0" }
+uni-plugin-wasm-rt = { path = "crates/uni-plugin-wasm-rt", version = "2.0.0" }
+uni-plugin-extism = { path = "crates/uni-plugin-extism", version = "2.0.0" }
+uni-plugin-rhai = { path = "crates/uni-plugin-rhai", version = "2.0.0" }
+uni-plugin-pyo3 = { path = "crates/uni-plugin-pyo3", version = "2.0.0" }
+uni-plugin-custom = { path = "crates/uni-plugin-custom", version = "2.0.0" }
+uni-plugin-conformance = { path = "crates/uni-plugin-conformance", version = "2.0.0" }
+uni-plugin-host = { path = "crates/uni-plugin-host", version = "2.0.0" }
+uni-sidecar = { path = "crates/uni-sidecar", version = "2.0.0" }
+uni-bulk = { path = "crates/uni-bulk", version = "2.0.0" }
+uni-fork = { path = "crates/uni-fork", version = "2.0.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-thiserror = "1.0"
-arrow = { version = "57.2.0", features = ["prettyprint"] }
-arrow-array = "57.2.0"
-arrow-schema = "57.2.0"
-arrow-row = "57.2.0"
-lance = { version = "3.0.1", default-features = false, features = ["aws", "azure", "gcp"] }
+thiserror = "2"
+arrow = { version = "58.3.0", features = ["prettyprint"] }
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
+arrow-row = "58.3.0"
+lance = { version = "7.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OTel API + tracing bridge. These two are a tightly-coupled compatible pair
+# (tracing-opentelemetry 0.33 ↔ opentelemetry 0.32); pin them together here so
+# every crate shares one version and a bump happens in exactly one place.
+opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 arc-swap = "1"
 log = "0.4"
 env_logger = "0.11"
-clap = { version = "4.4", features = ["derive"] }
-object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
-tempfile = "3.10"
-uuid = { version = "1.8", features = ["v4"] }
-ulid = { version = "1.1", features = ["serde"] }
-chrono = "0.4.43"
+clap = { version = "4.6", features = ["derive"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+tempfile = "3.27"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+semver = "1.0"
+blake3 = "1"
+cron = "0.16"
+ulid = { version = "1.2", features = ["serde"] }
+chrono = "0.4.44"
 chrono-tz = "0.10"
 fxhash = "0.2"
-bytes = "1.6"
+bytes = "1.11"
 parking_lot = "0.12"
-rand = "0.9"
-ordered-float = "4.2"
-rayon = "1.10"
-csv = "1.3"
-parquet = "57.2.0"
-regex = "1.10"
-metrics = "0.22"
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
-pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-rustyline = "13.0"
-colored = "2.1"
+rand = "0.10"
+ordered-float = "5"
+rayon = "1.12"
+csv = "1.4"
+parquet = "58.3.0"
+regex = "1.12"
+metrics = "0.24"
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+rustyline = "18"
+colored = "3"
 prettytable-rs = "0.10"
-criterion = "0.5"
+criterion = "0.8"
 url = "2.5"
-proptest = "1.4"
-datafusion = "52.3.0"
-lancedb = { version = "=0.27.1", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = "0.11.0", default-features = false }
-biodivine-lib-bdd = "0.5"
-candle-core = "0.9.2"
-candle-nn = "0.9.2"
-candle-transformers = "0.9.2"
+proptest = "1.11"
+datafusion = "53.1.0"
+lancedb = { version = "=0.30.0", default-features = false, features = ["aws", "gcs", "azure"] }
+uni-xervo = { version = "0.13.0", default-features = false }
+biodivine-lib-bdd = "0.6"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
-hf-hub = "0.4.3"
-tokenizers = "0.22.2"
+hf-hub = "0.5"
+tokenizers = "0.23"

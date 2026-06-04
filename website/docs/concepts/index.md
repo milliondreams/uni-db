@@ -35,7 +35,7 @@ Vector, scalar (BTree), full-text, JSON FTS, and inverted indexes for fast queri
 <div class="feature-card">
 
 ### [Concurrency](concurrency.md)
-Single-writer model, snapshot isolation, and concurrent readers.
+Snapshot isolation, serializable snapshot isolation (OCC) with abort/retry, and concurrent readers.
 
 </div>
 

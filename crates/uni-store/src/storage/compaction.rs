@@ -566,6 +566,7 @@ impl Compactor {
                 .storage
                 .flush_in_progress
                 .load(std::sync::atomic::Ordering::Acquire)
+                > 0
             {
                 log::info!(
                     "Skipping delta clear for {}/{}: flush in progress",

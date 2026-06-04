@@ -3,13 +3,11 @@
 
 //! uni.algo.bidirectionalDijkstra procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, BidirectionalDijkstra, BidirectionalDijkstraConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct BidirectionalDijkstraAdapter;
 
@@ -29,11 +27,11 @@ impl GraphAlgoAdapter for BidirectionalDijkstraAdapter {
         vec![("distance", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> BidirectionalDijkstraConfig {
-        BidirectionalDijkstraConfig {
-            source: Vid::from(args[0].as_u64().unwrap_or(0)),
-            target: Vid::from(args[1].as_u64().unwrap_or(0)),
-        }
+    fn to_config(args: Vec<Value>) -> Result<BidirectionalDijkstraConfig> {
+        Ok(BidirectionalDijkstraConfig {
+            source: parse_vid_arg(&args[0], "startNode")?,
+            target: parse_vid_arg(&args[1], "endNode")?,
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -46,11 +44,10 @@ impl GraphAlgoAdapter for BidirectionalDijkstraAdapter {
         Ok(rows)
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder.include_reverse(true)
+    // `include_reverse` defaults to true (this algorithm searches from both
+    // ends), so only the weight-property index needs overriding.
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

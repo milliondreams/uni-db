@@ -1,0 +1,41 @@
+pathway_id,name
+PC7_4044,GPCR ligand binding
+PC7_7439,Signaling Pathways
+PC7_7457,Signaling by GPCR
+PC7_4043,GPCR downstream signaling
+PC7_2620,Class A/1 (Rhodopsin-like receptors)
+WP455_r81793,"GPCRs, Class A Rhodopsin-like"
+PC7_5322,Metabolism
+PC7_1624,Amine ligand-binding receptors
+WP58_r80015,Monoamine GPCRs
+PC7_3992,G alpha (i) signalling events
+WP43_r84102,Oxidation by Cytochrome P450
+PC7_2098,Biological oxidations
+WP702_r73516,Metapathway biotransformation
+PC7_6432,Phase 1 - Functionalization of compounds
+PC7_2905,Cytochrome P450 - arranged by substrate type
+PC7_8790,Xenobiotics
+PC7_8339,Transmembrane transport of small molecules
+WP691_r79986,Tamoxifen metabolism
+PC7_5326,Metabolism of lipids and lipoproteins
+PC7_3993,G alpha (q) signalling events
+PC7_4107,Gastrin-CREB signalling pathway via PKC and MAPK
+WP299_r78587,Nuclear Receptors in Lipid Metabolism and Toxicity
+WP3594_r84573,Circadian rythm related genes
+WP2875_r79890,Constitutive Androstane Receptor Pathway
+PC7_1693,Arachidonic acid metabolism
+PC7_7432,Serotonin receptors
+WP536_r80211,Calcium Regulation in the Cardiac Cell
+PC7_2379,CYP2E1 reactions
+PC7_7761,Synthesis of epoxy (EET) and dihydroxyeicosatrienoic acids (DHET)
+PC7_7726,Synthesis of (16-20)-hydroxyeicosatetraenoic acids (HETE)
+PC7_7290,SLC-mediated transmembrane transport
+WP117_r82985,"GPCRs, Other"
+WP206_r68882,Fatty Acid Omega Oxidation
+WP229_r68389,Irinotecan Pathway
+WP465_r79226,Tryptophan metabolism
+WP3298_r84382,Melatonin metabolism and effects
+WP706_r80056,SIDS Susceptibility Pathways
+PC7_5887,Neuronal System
+PC7_3318,Dopamine receptors
+PC7_1578,Adrenoceptors

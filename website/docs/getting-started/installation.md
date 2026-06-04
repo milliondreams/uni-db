@@ -27,6 +27,22 @@ Or add it to your `Cargo.toml` directly:
 uni-db = "*"
 ```
 
+!!! tip "Enable mimalloc for ~3× throughput on mutation-heavy workloads"
+    Allocation-heavy workloads (many small Cypher `CREATE`/`MERGE` statements, concurrent writers) bottleneck on the default glibc allocator. Opt in to mimalloc:
+
+    ```toml
+    [dependencies]
+    uni-db = { version = "*", features = ["mimalloc"] }
+    ```
+
+    ```rust
+    // in your binary's main.rs:
+    #[global_allocator]
+    static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+    ```
+
+    Measured: `concurrent_mutations` bench wall time at sess=24 drops from **1012 ms → 394 ms** (2.5×). See the [Performance Tuning Guide](../guides/performance-tuning.md#use-mimalloc-as-global-allocator) for the full breakdown.
+
 ---
 
 ## Python Package
@@ -37,6 +53,9 @@ Install from [PyPI](https://pypi.org/project/uni-db/). The default wheel bundles
 pip install uni-db
 ```
 
+!!! info "mimalloc included by default"
+    Every wheel ships with mimalloc as the Rust-side global allocator — no configuration needed. Python's own `PyMem_*` allocator is untouched; only Rust allocations (the entire Cypher pipeline) route through mimalloc. Mutation-heavy workloads see ~3× throughput vs. glibc.
+
 For the Pydantic OGM layer:
 
 ```bash
@@ -45,7 +64,7 @@ pip install uni-pydantic
 
 ### Wheel variants
 
-`uni-db 1.2.0` ships **6 wheels** modeled on uni-xervo 0.9.0's three-axis capability matrix (provider × linking × acceleration). Pick by hardware first, then by whether you need local LLM inference:
+`uni-db 2.0.0` ships **6 wheels** modeled on uni-xervo 0.9.0's three-axis capability matrix (provider × linking × acceleration). Pick by hardware first, then by whether you need local LLM inference:
 
 | Wheel | Local providers | Accelerator |
 |---|---|---|
@@ -70,8 +89,6 @@ print(recommend())   # e.g. "uni-db-cuda" on a Linux NVIDIA host
 ```
 
 CUDA wheels require an NVIDIA driver supporting the bundled CUDA toolkit version, plus cuDNN ≥ 9 on the host loader path (not bundled — typically `/usr/local/cuda-X.X/...`). Metal wheels need a supported macOS arm64 host; CoreML/Metal frameworks ship with the OS.
-
-For the full migration mapping (if upgrading from 1.1.x), see [`docs/migrations/0.9.0-wheel-matrix-collapse.md`](https://github.com/rustic-ai/uni-db/blob/main/docs/migrations/0.9.0-wheel-matrix-collapse.md).
 
 ---
 
@@ -145,7 +162,7 @@ After installation, verify Uni is working correctly:
 
 ```bash
 uni --version
-# Output: uni 1.0.0
+# Output: uni 2.0.0
 ```
 
 ### Display Help
@@ -156,7 +173,7 @@ uni --help
 
 Expected output:
 ```
-Uni - Reasoning and Memory Infrastructure for Intelligent Systems
+Uni Graph Database
 
 Usage: uni <COMMAND>
 
@@ -165,6 +182,7 @@ Commands:
   query     Execute a Cypher query
   repl      Start the interactive REPL
   snapshot  Manage snapshots
+  plugin    Manage runtime-loaded plugins
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -280,13 +298,14 @@ cargo build --release
 | `gpu-cuda` | NVIDIA CUDA (Linux + Windows). Activates ORT CUDA EP and the `candle?/cuda` and `mistralrs?/cuda` kernels for any local provider also enabled. |
 | `gpu-metal` | Apple GPU/ANE (macOS). Activates the ORT CoreML EP and the `candle?/metal` and `mistralrs?/metal` kernels. |
 
-The previous nine `gpu-*` features (`gpu-tensorrt`, `gpu-rocm`, `gpu-coreml`, `gpu-directml`, `gpu-openvino`, `gpu-qnn`, `gpu-wgpu`, plus the two above) collapsed to two in `uni-db 1.2.0`. The retired EPs remain reachable via `provider-onnx-dynamic` plus a vendor-supplied ORT shared library at runtime (`ORT_DYLIB_PATH`).
+The previous nine `gpu-*` features (`gpu-tensorrt`, `gpu-rocm`, `gpu-coreml`, `gpu-directml`, `gpu-openvino`, `gpu-qnn`, `gpu-wgpu`, plus the two above) collapsed to two in `uni-db 2.0.0`. The retired EPs remain reachable via `provider-onnx-dynamic` plus a vendor-supplied ORT shared library at runtime (`ORT_DYLIB_PATH`).
 
 ### Backend features
 
 | Feature | Description | Default |
 |---|---|---|
 | `lance-backend` | Lance columnar storage backend | Enabled |
+| `mimalloc` | Re-export `mimalloc::MiMalloc` as `uni_db::MiMalloc` so consumers can install it as the global allocator (~3× throughput on mutation-heavy workloads). Setting `#[global_allocator]` is still the binary's job. | Disabled |
 | `snapshot-internals` | Expose snapshot internals (advanced) | Disabled |
 | `storage-internals` | Expose storage internals (advanced) | Disabled |
 

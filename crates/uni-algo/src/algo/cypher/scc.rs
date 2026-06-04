@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for SccAdapter {
         vec![("nodeId", ValueType::Int), ("componentId", ValueType::Int)]
     }
 
-    fn to_config(_args: Vec<Value>) -> SccConfig {
-        SccConfig::default()
+    fn to_config(_args: Vec<Value>) -> Result<SccConfig> {
+        Ok(SccConfig::default())
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

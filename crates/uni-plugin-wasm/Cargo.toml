@@ -1,0 +1,53 @@
+[package]
+name = "uni-plugin-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "WASM Component Model loader for the uni-db plugin framework"
+keywords = ["plugin", "wasm", "wasmtime", "graph", "database"]
+categories = ["database", "wasm"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+uni-plugin-wasm-rt = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = "58.3.0"
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+# Parse the component manifest's version string into the semver::Version that
+# uni_plugin::PluginManifest requires (for load_as_plugin / conformance).
+semver = "1.0"
+
+# wasmtime is the heaviest dep; gated by the `wasmtime-runtime` feature so
+# embedders that only want the trait surface (e.g., for compile-time
+# Rust-only plugins via uni-plugin-builtin) can opt out.
+wasmtime = { version = "45", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
+wasmtime-wasi = { version = "45", optional = true }
+datafusion = { workspace = true, optional = true }
+
+[features]
+default = ["wasmtime-runtime"]
+wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:datafusion"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+# `wat` assembles minimal valid component-model WASM from text for
+# instantiation tests without committing binary fixtures.
+wat = "1"
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+datafusion = { workspace = true }
+# Drives the shared conformance probe suite against a loaded component via the
+# `load_as_plugin` bridge (tests/conformance_wasm.rs). No cycle: the conformance
+# crate depends on uni-plugin, not on this loader.
+uni-plugin-conformance = { workspace = true }

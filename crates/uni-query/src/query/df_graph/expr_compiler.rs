@@ -2327,6 +2327,7 @@ impl PhysicalExpr for ExistsExecExpr {
                         &storage,
                         &uni_schema,
                         &combined_entity_vars,
+                        None, // EXISTS compile-time rejects mutations (expr_compiler:693)
                     ))?;
 
                     let has_rows = batches.iter().any(|b| b.num_rows() > 0);
@@ -2469,6 +2470,7 @@ fn rewrite_clause_correlated(clause: &Clause, outer_vars: &HashSet<String>) -> C
                 .where_clause
                 .as_ref()
                 .map(|e| rewrite_expr_correlated(e, outer_vars)),
+            for_update: m.for_update,
         }),
         Clause::With(w) => Clause::With(WithClause {
             distinct: w.distinct,

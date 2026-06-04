@@ -13,6 +13,7 @@ use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -525,11 +526,7 @@ impl IndexRebuildManager {
     /// Execute the actual index rebuild for a label.
     #[cfg(feature = "lance-backend")]
     async fn execute_rebuild(&self, label: &str) -> Result<()> {
-        let idx_mgr = IndexManager::new(
-            self.storage.base_path(),
-            self.schema_manager.clone(),
-            self.storage.backend_arc(),
-        );
+        let idx_mgr = IndexManager::new(self.storage.base_path(), self.schema_manager.clone());
         idx_mgr.rebuild_indexes_for_label(label).await
     }
 

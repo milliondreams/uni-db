@@ -66,9 +66,11 @@ pub struct StorageManager {
     adjacency_manager: Arc<AdjacencyManager>,
     pub config: UniConfig,
     pub compaction_status: Arc<Mutex<CompactionStatus>>,
-    /// Flag set during flush_to_l1 to prevent compaction from clearing delta
-    /// tables while new data is being appended.
-    pub flush_in_progress: std::sync::atomic::AtomicBool,
+    /// Counter of in-flight `flush_to_l1` operations. Compaction skips
+    /// delta-clear when this is non-zero to avoid wiping rows a flush is
+    /// about to append. Counter (not bool) so multiple async flushes can
+    /// be in flight concurrently.
+    pub flush_in_progress: std::sync::atomic::AtomicUsize,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
@@ -83,6 +85,129 @@ pub struct StorageManager {
     backend: Arc<dyn StorageBackend>,
     /// In-memory VID-to-labels index for O(1) lookups (optional, configurable)
     vid_labels_index: Option<Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>>,
+}
+
+/// RAII counter increment for `StorageManager.flush_in_progress`.
+///
+/// Acquired during the rotate phase of a flush (see
+/// `runtime::writer::flush_l0_rotate`) and dropped when the full
+/// rotate/stream/finalize pipeline completes. Compaction's delta-clear
+/// gate skips while this counter is non-zero, so the counter must
+/// reflect "flush has started, has not completed" — including any
+/// async stream phase running on a spawned task.
+pub struct FlushInProgressGuard {
+    storage: Arc<StorageManager>,
+}
+
+impl FlushInProgressGuard {
+    pub fn new(storage: &Arc<StorageManager>) -> Self {
+        storage
+            .flush_in_progress
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            storage: storage.clone(),
+        }
+    }
+}
+
+impl Drop for FlushInProgressGuard {
+    fn drop(&mut self) {
+        // M-PANIC-IS-STOP: must not panic in Drop. Atomic op cannot fail.
+        self.storage
+            .flush_in_progress
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Whether a Lance error represents a commit conflict that retrying may
+/// resolve. These fire under async-flush when ≥2 streams concurrently try
+/// to create the same table OR when an Append races with a still-in-progress
+/// Overwrite (create_table). See the Lance commit-conflict-resolver in
+/// `lance-3.0.1/src/io/commit/conflict_resolver.rs`.
+fn is_lance_conflict(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("Incompatible transaction") || msg.contains("conflict")
+}
+
+/// Runs `op` with exponential-backoff retry on Lance commit conflicts.
+/// Up to 10 attempts (~10s worst case); backoff is 1ms, 2ms, 4ms, ...,
+/// 512ms. Non-conflict errors return immediately. `op` is re-invoked each
+/// attempt so it can re-check table existence and adjust strategy.
+async fn retry_on_lance_conflict<F, Fut>(mut op: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    for attempt in 0u32..10 {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_lance_conflict(&e) || attempt == 9 {
+                    return Err(e);
+                }
+                let backoff_ms = 1u64 << attempt;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    unreachable!("retry loop exits via Ok or Err")
+}
+
+/// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
+///
+/// Source `batch` must contain the join columns in `on` plus any
+/// columns to update. Matched rows have `WhenMatched::UpdateAll`
+/// applied; unmatched source rows are dropped (partial writes never
+/// INSERT). Returns an error if the target table does not exist.
+/// Retries on Lance commit conflicts via `retry_on_lance_conflict`.
+/// RecordBatch clones are cheap (column data is Arc'd).
+pub async fn merge_insert_batch_with_lance_conflict_retry(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+    on: &[&str],
+) -> anyhow::Result<()> {
+    retry_on_lance_conflict(|| async {
+        let exists = backend.table_exists(table_name).await?;
+        if !exists {
+            anyhow::bail!(
+                "merge_insert target table '{}' does not exist (partial writes \
+                 require the row to already be present; CREATE goes through Append)",
+                table_name
+            );
+        }
+        backend
+            .merge_insert(table_name, on, vec![batch.clone()])
+            .await
+    })
+    .await
+}
+
+/// Race-safe write: creates the table if missing, otherwise appends.
+/// Each attempt re-checks `table_exists` and adjusts strategy: Append if
+/// now-exists, Create if still-missing. Retries on Lance commit conflicts
+/// via `retry_on_lance_conflict`.
+///
+/// Used by every dataset's `write_batch` helper to absorb the Lance
+/// commit-conflict-resolver behavior. RecordBatch clones are cheap
+/// (column data is Arc'd).
+pub async fn write_batch_with_lance_conflict_retry(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+) -> anyhow::Result<()> {
+    use crate::backend::types::WriteMode;
+    retry_on_lance_conflict(|| async {
+        let exists = backend.table_exists(table_name).await?;
+        if exists {
+            backend
+                .write(table_name, vec![batch.clone()], WriteMode::Append)
+                .await
+        } else {
+            backend.create_table(table_name, vec![batch.clone()]).await
+        }
+    })
+    .await
 }
 
 /// Helper to manage compaction_in_progress flag
@@ -153,7 +278,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
             config,
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             fork_scope: None,
             backend,
@@ -304,7 +429,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
@@ -357,7 +482,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             fork_scope: Some(scope),
             backend: branched_backend,
@@ -1013,11 +1138,7 @@ impl StorageManager {
     }
 
     pub fn index_manager(&self) -> IndexManager {
-        IndexManager::new(
-            &self.base_uri,
-            self.schema_manager.clone(),
-            self.backend.clone(),
-        )
+        IndexManager::new(&self.base_uri, self.schema_manager.clone())
     }
 
     // ========================================================================

@@ -50,6 +50,20 @@ pub trait DerivedFactSource: Send + Sync {
         pattern: &Pattern,
         where_conditions: &[Expr],
     ) -> Result<Vec<RecordBatch>, LocyError>;
+
+    /// Resolve a set of node vids to full `Value::Node` values.
+    ///
+    /// Used by Mode A EXPLAIN to enrich tracker fact_rows (which carry
+    /// node bindings as `Value::Int(vid)`) before WHERE-predicate
+    /// evaluation, so that `WHERE n.prop = X` style filters resolve
+    /// against materialised Node properties instead of returning Null.
+    ///
+    /// Default impl returns an empty map. Callers must handle missing
+    /// vids gracefully — typically by leaving the original
+    /// `Value::Int(vid)` in place. Native adapters override this.
+    async fn lookup_nodes_by_vids(&self, _vids: &[u64]) -> Result<HashMap<u64, Value>, LocyError> {
+        Ok(HashMap::new())
+    }
 }
 
 /// DB operations needed by ASSUME, DERIVE, and ABDUCE.

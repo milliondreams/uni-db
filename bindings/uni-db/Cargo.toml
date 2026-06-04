@@ -13,16 +13,37 @@ name = "_uni_db"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
-pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-uni-db = { workspace = true, default-features = true }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+uni-db = { workspace = true, default-features = true, features = ["mimalloc", "pyo3-plugins"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+uni-plugin = { workspace = true }
+uni-plugin-rhai = { workspace = true }
+# Optional WASM loaders — gated by the `wasm-plugins` / `extism-plugins`
+# binding features (on by default for the standard wheel). Wheel variants
+# that reuse this source without the features compile the wrappers out.
+uni-plugin-wasm = { workspace = true, optional = true }
+uni-plugin-extism = { workspace = true, optional = true }
+# M8 F2: enable the live PyO3 plugin loader (decorator surfaces on
+# Database / Session). Same workspace pin as uni-plugin-pyo3.
+uni-plugin-pyo3 = { workspace = true, features = ["pyo3"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# The standard wheel ships the WASM loaders. Variant wheel crates
+# (uni-db-onnx / -cuda / -metal) reuse this source with their own feature
+# sets; without these features the WASM wrapper methods compile out.
+default = ["wasm-plugins", "extism-plugins"]
+# Expose `Database.load_wasm_component` to Python (wasmtime Component Model).
+wasm-plugins = ["dep:uni-plugin-wasm", "uni-db/wasm-plugins"]
+# Expose `Database.load_wasm_extism` to Python (wasmtime + extism).
+extism-plugins = ["dep:uni-plugin-extism", "uni-db/extism-plugins"]

@@ -128,14 +128,82 @@ pub trait AlgoProcedure: Send + Sync {
     /// Procedure signature for validation and documentation.
     fn signature(&self) -> ProcedureSignature;
 
-    /// Execute the procedure with given arguments.
+    /// Execute against a pre-built [`crate::algo::GraphProjection`]
+    /// (V2 `(graphRef, config)` form, used by Cypher / Named projection
+    /// callers).
     ///
-    /// Returns a stream of result rows.
-    fn execute(
+    /// `args[0]` and `args[1]` are placeholder empty arrays — the
+    /// projection is supplied directly. Algorithm-specific args start
+    /// at position 2.
+    ///
+    /// Default implementation rejects with `0x823 — algorithm does
+    /// not support pre-built projections`. Override on algorithms
+    /// whose first args are `(nodeLabels, edgeTypes, …)`; see
+    /// [`crate::algo::procedure_template::GenericAlgoProcedure`] for
+    /// the generic projection-aware base.
+    fn execute_with_projection(
         &self,
-        ctx: AlgoContext,
-        args: Vec<Value>,
-    ) -> Pin<Box<dyn Stream<Item = Result<AlgoResultRow>> + Send + 'static>>;
+        _ctx: AlgoContext,
+        _args: Vec<Value>,
+        _projection: crate::algo::GraphProjection,
+    ) -> Pin<Box<dyn Stream<Item = Result<AlgoResultRow>> + Send + 'static>> {
+        use futures::stream::{self, StreamExt};
+        let name = self.name().to_owned();
+        stream::once(async move {
+            Err(anyhow!(
+                "Algorithm `{name}` does not support pre-built projections; \
+                 use Native graphRef instead"
+            ))
+        })
+        .boxed()
+    }
+
+    /// Execute with native-terminal arguments — `(startNode, endNode,
+    /// edgeType, …)` shape used by the cypher path family
+    /// (`shortest_path`, `astar`, `all_simple_paths`). The algorithm
+    /// is responsible for materialising its own
+    /// [`crate::algo::GraphProjection`] from the edge-type schema or
+    /// per-call inputs; no projection is supplied.
+    ///
+    /// Dispatched when [`Self::wants_native_terminals`] returns
+    /// `true`. Default implementation rejects with `0x824`.
+    fn execute_with_native_terminals(
+        &self,
+        _ctx: AlgoContext,
+        _args: Vec<Value>,
+    ) -> Pin<Box<dyn Stream<Item = Result<AlgoResultRow>> + Send + 'static>> {
+        use futures::stream::{self, StreamExt};
+        let name = self.name().to_owned();
+        stream::once(async move {
+            Err(anyhow!(
+                "Algorithm `{name}` does not support native-terminals entry; \
+                 override `execute_with_native_terminals` and set \
+                 `wants_native_terminals = true`"
+            ))
+        })
+        .boxed()
+    }
+
+    /// True if this algorithm consumes `(startNode, endNode, edgeType,
+    /// …)` arguments and wants
+    /// [`Self::execute_with_native_terminals`] dispatch instead of the
+    /// projection-aware [`Self::execute_with_projection`] path. Default
+    /// `false` — opt-in for the cypher path family.
+    fn wants_native_terminals(&self) -> bool {
+        false
+    }
+
+    /// Customise the [`crate::algo::ProjectionBuilder`] before
+    /// `.build()` is called on the projection-aware dispatch path.
+    /// Default enables `include_reverse(true)`. Override to set edge
+    /// weights or other algorithm-specific projection knobs.
+    fn customize_projection(
+        &self,
+        builder: crate::algo::ProjectionBuilder,
+        _args: &[Value],
+    ) -> crate::algo::ProjectionBuilder {
+        builder.include_reverse(true)
+    }
 }
 
 use std::sync::Arc;
@@ -158,5 +226,3 @@ impl AlgoContext {
         }
     }
 }
-
-// Placeholder procedure implementations will be added in Phase 3.3

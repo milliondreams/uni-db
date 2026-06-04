@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for BridgesAdapter {
         vec![("source", ValueType::Node), ("target", ValueType::Node)]
     }
 
-    fn to_config(_args: Vec<Value>) -> BridgesConfig {
-        BridgesConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<BridgesConfig> {
+        Ok(BridgesConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -35,10 +35,6 @@ impl GraphAlgoAdapter for BridgesAdapter {
                 values: vec![json!(u.as_u64()), json!(v.as_u64())],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for ArticulationPointsAdapter {
         vec![("node", ValueType::Node)]
     }
 
-    fn to_config(_args: Vec<Value>) -> ArticulationPointsConfig {
-        ArticulationPointsConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<ArticulationPointsConfig> {
+        Ok(ArticulationPointsConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -35,10 +35,6 @@ impl GraphAlgoAdapter for ArticulationPointsAdapter {
                 values: vec![json!(vid.as_u64())],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

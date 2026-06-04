@@ -3,7 +3,6 @@
 
 //! uni.algo.eigenvectorCentrality procedure implementation.
 
-use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, EigenvectorCentrality, EigenvectorCentralityConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
@@ -28,11 +27,11 @@ impl GraphAlgoAdapter for EigenvectorCentralityAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> EigenvectorCentralityConfig {
-        EigenvectorCentralityConfig {
+    fn to_config(args: Vec<Value>) -> Result<EigenvectorCentralityConfig> {
+        Ok(EigenvectorCentralityConfig {
             max_iterations: args[0].as_u64().unwrap_or(100) as usize,
             tolerance: args[1].as_f64().unwrap_or(1e-6),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -45,11 +44,12 @@ impl GraphAlgoAdapter for EigenvectorCentralityAdapter {
             .collect())
     }
 
-    fn customize_projection(mut builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        if let Some(prop) = args[2].as_str() {
-            builder = builder.weight_property(prop);
-        }
-        builder
+    fn include_reverse() -> bool {
+        false
+    }
+
+    fn weight_arg_index() -> Option<usize> {
+        Some(2)
     }
 }
 

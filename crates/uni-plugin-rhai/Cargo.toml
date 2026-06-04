@@ -1,0 +1,53 @@
+[package]
+name = "uni-plugin-rhai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Rhai-script loader for the uni-db plugin framework"
+keywords = ["plugin", "rhai", "scripting", "graph", "database"]
+categories = ["database"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+smol_str = "0.3"
+semver = "1"
+
+# rhai is the embedded scripting engine. `sync` makes Engine + AST Send + Sync
+# so adapters can be shared across DataFusion partitions without locking.
+# `serde` enables Dynamic <-> serde_json::Value for aggregate state envelopes.
+# `internals` exposes parse-position info used in error reporting.
+rhai = { version = "1", optional = true, features = ["sync", "serde", "internals"] }
+
+[features]
+default = ["rhai-runtime"]
+rhai-runtime = ["dep:rhai"]
+# Turns on real OTel trace-context extraction in `uni-plugin` so the host-fn
+# bodies inject a live W3C `traceparent`; gates the positive injection e2e test
+# (`host_services_e2e::http_get_injects_active_traceparent`). Default-off so the
+# normal build never pulls the OTel bridge.
+otel = ["uni-plugin/otel"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+# For the `otel`-gated positive injection test: a real (no-exporter) tracer
+# provider + the tracing-opentelemetry layer, mirroring uni-plugin's own otel
+# unit test. Dev-only; not in the production graph.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = "0.32"
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

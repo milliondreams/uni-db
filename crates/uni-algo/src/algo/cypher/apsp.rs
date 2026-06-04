@@ -27,8 +27,8 @@ impl GraphAlgoAdapter for AllPairsShortestPathAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> AllPairsShortestPathConfig {
-        AllPairsShortestPathConfig
+    fn to_config(_args: Vec<Value>) -> Result<AllPairsShortestPathConfig> {
+        Ok(AllPairsShortestPathConfig)
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

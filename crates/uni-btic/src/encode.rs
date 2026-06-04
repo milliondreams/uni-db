@@ -19,21 +19,18 @@ pub fn encode(btic: &Btic) -> [u8; 24] {
 ///
 /// Validates all invariants after decoding.
 pub fn decode(bytes: &[u8; 24]) -> Result<Btic, BticError> {
-    let lo_encoded = u64::from_be_bytes(
-        bytes[0..8]
+    // Reading a fixed [u8; 8] window out of a [u8; 24] is infallible — the
+    // compiler can prove the lengths line up — so `expect` here is unreachable.
+    fn word(slice: &[u8]) -> u64 {
+        let arr: [u8; 8] = slice
             .try_into()
-            .expect("infallible: 8-byte slice from 24-byte array"),
-    );
-    let hi_encoded = u64::from_be_bytes(
-        bytes[8..16]
-            .try_into()
-            .expect("infallible: 8-byte slice from 24-byte array"),
-    );
-    let meta = u64::from_be_bytes(
-        bytes[16..24]
-            .try_into()
-            .expect("infallible: 8-byte slice from 24-byte array"),
-    );
+            .expect("infallible: 8-byte slice from 24-byte array");
+        u64::from_be_bytes(arr)
+    }
+
+    let lo_encoded = word(&bytes[0..8]);
+    let hi_encoded = word(&bytes[8..16]);
+    let meta = word(&bytes[16..24]);
 
     let lo = (lo_encoded ^ SIGN_FLIP) as i64;
     let hi = (hi_encoded ^ SIGN_FLIP) as i64;

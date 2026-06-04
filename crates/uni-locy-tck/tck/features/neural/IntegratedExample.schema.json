@@ -1,0 +1,52 @@
+{
+  "edge_types": {
+    "REQUIRES": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    },
+    "SUPPLIED_BY": {
+      "dst_labels": [],
+      "id": 2,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Part": {
+      "id": 1
+    },
+    "Supplier": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Part": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "SUPPLIED_BY": {
+      "base_reliability": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    },
+    "Supplier": {
+      "country": {
+        "nullable": true,
+        "type": "Int64"
+      },
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "revenue": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    }
+  },
+  "schema_version": 1
+}

@@ -23,10 +23,10 @@ impl GraphAlgoAdapter for KCoreAdapter {
         vec![("nodeId", ValueType::Int), ("coreNumber", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> KCoreConfig {
-        KCoreConfig {
+    fn to_config(args: Vec<Value>) -> Result<KCoreConfig> {
+        Ok(KCoreConfig {
             k: args[0].as_u64().map(|v| v as usize),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -37,10 +37,6 @@ impl GraphAlgoAdapter for KCoreAdapter {
                 values: vec![json!(vid.as_u64()), json!(core)],
             })
             .collect())
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

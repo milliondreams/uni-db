@@ -155,7 +155,7 @@ async def test_async_multiple_queries():
 
 @pytest.mark.asyncio
 async def test_async_query_with_builder():
-    """Test AsyncQueryBuilder via query_with()."""
+    """Test AsyncSessionQueryBuilder via query_with()."""
     db = await uni_db.AsyncUni.temporary()
     session = db.session()
     await (
@@ -181,7 +181,7 @@ async def test_async_query_with_builder():
 
 @pytest.mark.asyncio
 async def test_async_query_with_timeout():
-    """Test AsyncQueryBuilder with timeout."""
+    """Test AsyncSessionQueryBuilder with timeout."""
     db = await uni_db.AsyncUni.temporary()
     session = db.session()
     await db.schema().label("Node").property("x", "int").apply()

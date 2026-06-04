@@ -106,6 +106,27 @@ let db = Uni::open("./local_meta")
     .await?;
 ```
 
+## Performance
+
+For allocation-heavy workloads (many small mutations, concurrent Cypher
+`CREATE`/`MERGE`, etc.), the default glibc allocator becomes the dominant
+bottleneck — its per-arena locks and the kernel's per-CPU page allocator
+serialize under concurrent churn. Opt in to mimalloc for ~3× throughput:
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+Measured at sess=24 on `concurrent_mutations` benchmark: 1012 ms → 394 ms.
+The `uni` CLI binary already does this by default.
+
 ## Documentation
 
 - [Full Documentation](https://rustic-ai.github.io/uni-db)

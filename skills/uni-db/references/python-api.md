@@ -237,7 +237,9 @@ class Transaction:
 
 ### TxExecuteBuilder (`tx.execute_with(cypher)`)
 
-`.param(name, value)`, `.timeout(seconds)` -> self. Terminal: `.run()` -> `ExecuteResult`.
+`.param(name, value)`, `.timeout(seconds)` -> self. Terminals:
+- `.run()` -> `ExecuteResult` (mutation counters from the tx's private L0).
+- `.profile()` -> `tuple[ExecuteResult, ProfileOutput]` (counters + per-operator timings/memory). The async variant on `AsyncTxExecuteBuilder.profile()` is awaitable.
 
 ### TransactionBuilder (`session.tx_with()`)
 

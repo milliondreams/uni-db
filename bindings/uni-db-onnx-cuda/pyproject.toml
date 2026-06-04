@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "uni-db-onnx-cuda"
-version = "1.3.0"
+version = "2.0.0"
 description = "Python bindings for Uni Graph Database (slim ONNX + remote APIs + NVIDIA CUDA)"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }

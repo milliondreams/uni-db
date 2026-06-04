@@ -16,6 +16,16 @@ uni-xervo = { workspace = true }
 uni-crdt = { workspace = true }
 uni-cypher = { workspace = true }
 uni-locy = { workspace = true }
+uni-query-functions = { workspace = true }
+uni-plugin = { workspace = true }
+# Layering note: uni-query depends on uni-plugin-builtin so the M3
+# `MonotonicAggState` retrofit can dispatch through `Arc<dyn LocyAggregate>`
+# trait objects sourced from the 9 built-in aggregates (MIN/MAX/SUM/MSUM/
+# COUNT/AVG/COLLECT/MNOR/MPROD). Pragmatic inversion of the expected
+# "builtin sits above query" direction; once `MonotonicAggState` receives
+# its trait objects from planning time (resolved via the framework
+# `PluginRegistry`) instead of constructing them lazily, this dep can move.
+uni-plugin-builtin = { workspace = true }
 tokio = { workspace = true }
 object_store = { workspace = true }
 bytes = { workspace = true }
@@ -31,6 +41,7 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-row = { workspace = true }
+smol_str = { version = "0.3", features = ["serde"] }
 regex = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -39,7 +50,7 @@ metrics = { workspace = true }
 csv = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
-base64 = "0.21"
+base64 = "0.22"
 datafusion = { workspace = true }
 bitvec = "1"
 fxhash = { workspace = true }
@@ -48,6 +59,10 @@ tokio-util = { workspace = true }
 
 [features]
 default = []
+# NOTE: SSI/OCC is always compiled and toggled at runtime via
+# `UniConfig::ssi_enabled` (default `true`). The executor's pinned-read path
+# and read-set capture self-gate on whether the transaction carries a pinned
+# snapshot / `occ_read_set`.
 
 [dev-dependencies]
 tempfile = { workspace = true }

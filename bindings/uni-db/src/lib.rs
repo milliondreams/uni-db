@@ -9,9 +9,24 @@
 //! asynchronous database management, query execution, schema management,
 //! and bulk loading.
 
+/// Apply an optional builder setter: when `$opt` is `Some(v)`, rebind
+/// `$builder` to `$builder.$method(v)`; otherwise leave it untouched.
+///
+/// Collapses the repeated `if let Some(x) = opt { builder = builder.x(x); }`
+/// chains in the bulk-writer / appender `build` methods (sync + async).
+#[macro_export]
+macro_rules! apply_opt {
+    ($builder:ident, $opt:expr, $method:ident) => {
+        if let Some(value) = $opt {
+            $builder = $builder.$method(value);
+        }
+    };
+}
+
 pub mod async_api;
 pub mod btic;
 pub mod builders;
+pub mod classifier;
 pub mod convert;
 pub mod core;
 pub mod exceptions;
@@ -20,8 +35,21 @@ pub mod types;
 
 use pyo3::prelude::*;
 
+// Use mimalloc as the Rust-side global allocator. CPython keeps its own
+// allocator for Python objects; this only affects Rust allocations (AST,
+// plan, DataFusion, executor state -- the hot path for `tx.execute()`).
+// Measured ~3x throughput at sess=24 on the concurrent_mutations bench;
+// see crates/uni/benches/concurrent_mutations.rs and crates/uni/README.md.
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+
 /// Python module for the Uni embedded graph database.
-#[pymodule]
+///
+/// `gil_used = true`: pyo3 0.28 defaults modules to advertising free-threaded
+/// (no-GIL) support, but this extension holds the GIL throughout (`Python::attach`
+/// everywhere) and is not audited for free-threaded safety, so it must keep
+/// requiring the GIL.
+#[pymodule(gil_used = true)]
 fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialise the tokio runtime used by pyo3-async-runtimes with an 8 MB
     // worker-thread stack.  The query executor builds deeply nested async state
@@ -74,8 +102,11 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncSession>()?;
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncTransactionBuilder>()?;
-    m.add_class::<async_api::AsyncQueryBuilder>()?;
     m.add_class::<async_api::AsyncQueryCursor>()?;
+    m.add_class::<async_api::AsyncStreamingAppender>()?;
+    m.add_class::<async_api::AsyncTxAppenderBuilder>()?;
+    m.add_class::<async_api::AsyncSessionTemplateBuilder>()?;
+    m.add_class::<async_api::AsyncSessionTemplate>()?;
     m.add_class::<async_api::AsyncSchemaBuilder>()?;
     m.add_class::<async_api::AsyncLabelBuilder>()?;
     m.add_class::<async_api::AsyncEdgeTypeBuilder>()?;
@@ -215,6 +246,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyAbduceCommandResult>()?;
     m.add_class::<types::PyDeriveCommandResult>()?;
     m.add_class::<types::PyCypherCommandResult>()?;
+    m.add_class::<types::PyCalibrator>()?;
 
     // Hook context types
     m.add_class::<types::PyHookContext>()?;

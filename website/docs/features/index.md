@@ -16,7 +16,8 @@ Uni is an embedded, multi-model graph database that unifies graph, vector, docum
 | [Hybrid Search](hybrid-search.md) | Combined vector + FTS with rank fusion | Best of both worlds |
 | [Schema & Indexing](schema-indexing.md) | Typed properties, constraints, and indexes | Performance, governance, stability |
 | [Graph Algorithms](graph-algorithms.md) | Built-in centrality, clustering, pathing | Insights, scoring, routing |
-| [Transactions & Consistency](transactions-consistency.md) | Snapshot isolation, single writer | Predictable reads, safe writes |
+| [Neural Predicates](neural-predicates.md) | Inline `CREATE MODEL` in Locy with calibration + audit-grade `EXPLAIN` | Learned scoring composed with graph rules |
+| [Transactions & Consistency](transactions-consistency.md) | Serializable snapshot isolation, optimistic concurrency | Predictable reads, safe writes |
 | [Snapshots & Time Travel](snapshots-time-travel.md) | Point-in-time snapshots + `AS OF` queries | Auditing, reproducible analytics |
 | [Bulk Ingest](bulk-ingest.md) | High-throughput loading with index rebuilds | Initial loads, large updates |
 | [Storage & Cloud Durability](storage-cloud.md) | Local + object-store storage with WAL | Low-ops durability on S3/GCS/Azure |

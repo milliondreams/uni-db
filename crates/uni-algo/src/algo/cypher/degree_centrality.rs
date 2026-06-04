@@ -26,7 +26,7 @@ impl GraphAlgoAdapter for DegreeCentralityAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> DegreeCentralityConfig {
+    fn to_config(args: Vec<Value>) -> Result<DegreeCentralityConfig> {
         let direction_str = args[0].as_str().unwrap_or("OUTGOING").to_uppercase();
         let direction = match direction_str.as_str() {
             "INCOMING" | "IN" => DegreeDirection::Incoming,
@@ -34,7 +34,7 @@ impl GraphAlgoAdapter for DegreeCentralityAdapter {
             _ => DegreeDirection::Outgoing,
         };
 
-        DegreeCentralityConfig { direction }
+        Ok(DegreeCentralityConfig { direction })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

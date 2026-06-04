@@ -84,6 +84,7 @@ DESCRIPTION_KW = @{ ^"description" ~ !ident_char }
 OPTIONS   = @{ ^"options" ~ !ident_char }
 ON        = @{ ^"on" ~ !ident_char }
 FOR       = @{ ^"for" ~ !ident_char }
+UPDATE    = @{ ^"update" ~ !ident_char }
 NODE      = @{ ^"node" ~ !ident_char }
 RELATIONSHIP = @{ ^"relationship" ~ !ident_char }
 
@@ -519,7 +520,13 @@ clause = {
 // CLAUSES
 // ═══════════════════════════════════════════════════════════════════════════
 
-match_clause = { OPTIONAL? ~ MATCH ~ pattern ~ where_clause? }
+match_clause = { OPTIONAL? ~ MATCH ~ pattern ~ where_clause? ~ for_update_clause? }
+
+// Pessimistic row-lock hint (SSI escape hatch). `UPDATE` is its own atomic
+// token (so `!ident_char` checks the char right after "update", not after
+// trailing whitespace), but is only referenced here — it is not added to the
+// reserved-keyword set, so identifiers named "update" elsewhere are unaffected.
+for_update_clause = { FOR ~ UPDATE }
 
 where_clause = { WHERE ~ expression }
 

@@ -26,8 +26,8 @@ impl GraphAlgoAdapter for BipartiteCheckAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> BipartiteCheckConfig {
-        BipartiteCheckConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<BipartiteCheckConfig> {
+        Ok(BipartiteCheckConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
@@ -41,10 +41,6 @@ impl GraphAlgoAdapter for BipartiteCheckAdapter {
         Ok(vec![AlgoResultRow {
             values: vec![json!(result.is_bipartite), Value::Object(partition_map)],
         }])
-    }
-
-    fn include_reverse() -> bool {
-        true
     }
 }
 

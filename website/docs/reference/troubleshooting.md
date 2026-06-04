@@ -28,7 +28,7 @@ RUST_LOG=uni_db=debug uni query "RETURN 1" --path ./storage 2>&1 | tail -50
 
 **Symptom:**
 ```
-error: package `uni-db v0.1.0` cannot be built because it requires rustc 1.75 or newer
+error: package `uni-db v0.1.0` cannot be built because it requires rustc 1.85 or newer
 ```
 
 **Solution:**
@@ -37,7 +37,7 @@ error: package `uni-db v0.1.0` cannot be built because it requires rustc 1.75 or
 rustup update stable
 
 # Verify version
-rustc --version  # Should be 1.75+
+rustc --version  # Should be 1.85+
 ```
 
 #### Missing System Dependencies
@@ -265,10 +265,9 @@ Error: Query execution failed: Out of memory
 
 2. **Stream results:**
    ```rust
-   let mut cursor = db.query_with(query).query_cursor().await?;
-   while let Some(batch) = cursor.next_batch().await {
-       let rows = batch?;
-       // Process a batch at a time
+   let mut cursor = session.query_with(query).cursor().await?;
+   while let Some(row) = cursor.next().await? {
+       // Process a row at a time
    }
    ```
 
@@ -380,7 +379,7 @@ Error: Failed to build vector index: out of memory
 
 2. **Build asynchronously after bulk load:**
    ```rust
-   let _task_id = db.rebuild_indexes("Paper", true).await?;
+   let _task_id = db.indexes().rebuild("Paper", true).await?;
    ```
    Or use `bulk_writer().async_indexes(true)`.
 
@@ -487,9 +486,8 @@ uni query "PROFILE MATCH (p:Paper)-[:CITES]->(c) RETURN COUNT(c)" --path ./stora
 
 3. **Use streaming queries:**
    ```rust
-   let mut cursor = db.query_with(query).query_cursor().await?;
-   while let Some(batch) = cursor.next_batch().await {
-       let _rows = batch?;
+   let mut cursor = session.query_with(query).cursor().await?;
+   while let Some(_row) = cursor.next().await? {
        // Process results without loading all into memory
    }
    ```

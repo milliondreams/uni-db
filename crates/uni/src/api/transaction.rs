@@ -19,11 +19,13 @@ use uuid::Uuid;
 use crate::api::UniInner;
 use crate::api::impl_locy::{self, LocyRuleRegistry};
 use crate::api::session::Session;
+use crate::api::triggers::{MutationEvents, TriggerRouter, tx_id_to_u64};
 use uni_common::{Result, UniError};
 use uni_locy::DerivedFactSet;
+use uni_plugin::traits::trigger::TriggerContext;
 
 use crate::api::locy_result::LocyResult;
-use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
+use uni_query::{ExecuteResult, ProfileOutput, QueryCursor, QueryResult, Row, Value};
 
 /// Snapshot of L0 mutation state, used for before/after comparison in execute operations.
 struct L0Snapshot {
@@ -52,39 +54,11 @@ impl std::fmt::Display for IsolationLevel {
     }
 }
 
-/// Result of committing a transaction.
-#[derive(Debug)]
-pub struct CommitResult {
-    /// Number of mutations committed.
-    pub mutations_committed: usize,
-    /// Number of rules promoted to the parent session.
-    pub rules_promoted: usize,
-    /// Database version after commit.
-    pub version: u64,
-    /// Database version when the transaction was created.
-    pub started_at_version: u64,
-    /// WAL log sequence number of the commit (0 when no WAL is configured).
-    pub wal_lsn: u64,
-    /// Duration of the commit operation (lock + WAL + merge).
-    pub duration: Duration,
-    /// Errors encountered during rule promotion (best-effort).
-    pub rule_promotion_errors: Vec<RulePromotionError>,
-}
-
-impl CommitResult {
-    /// Number of versions that committed between tx start and commit.
-    /// 0 means no concurrent commits occurred.
-    pub fn version_gap(&self) -> u64 {
-        self.version.saturating_sub(self.started_at_version + 1)
-    }
-}
-
-/// Error encountered during rule promotion at commit time.
-#[derive(Debug, Clone)]
-pub struct RulePromotionError {
-    pub rule_text: String,
-    pub error: String,
-}
+// `CommitResult` / `RulePromotionError` are pure value types; they live in
+// `uni-plugin-host` (shared with the hooks engine) and are re-exported here so
+// `uni_db::api::transaction::CommitResult` and `uni_db::CommitResult` stay
+// stable.
+pub use uni_plugin_host::commit_result::{CommitResult, RulePromotionError};
 
 /// A database transaction — the explicit write scope.
 ///
@@ -106,6 +80,10 @@ pub struct Transaction {
     pub(crate) db: Arc<UniInner>,
     /// Private L0 buffer — mutations within this transaction are routed here.
     pub(crate) tx_l0: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    /// Per-transaction VID/EID reservoir. Bulk-reserves from the global
+    /// `IdAllocator` and hands out IDs without re-locking — amortizes the
+    /// allocator's `tokio::Mutex` across the tx's mutations.
+    pub(crate) id_reservoir: Arc<uni_store::runtime::TxIdReservoir>,
     /// Session-level write guard (set false on complete)
     session_write_guard: Arc<std::sync::atomic::AtomicBool>,
     /// Session's rule registry (for rule promotion on commit)
@@ -126,6 +104,77 @@ pub struct Transaction {
     cancellation_token: CancellationToken,
     /// Hooks inherited from the session.
     hooks: Vec<Arc<dyn crate::api::hooks::SessionHook>>, // Flattened from session's HashMap
+    /// Principal inherited from the session (if any). Drives the
+    /// M6a.3 write/schema/dbms authz consultation in `Self::execute`.
+    principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+    /// `FOR UPDATE` pessimistic lock guards, held from MATCH until the
+    /// transaction ends (dropped on commit/rollback → locks released).
+    ///
+    /// Always present; only populated when `UniConfig::ssi_enabled` is `true`.
+    for_update_guards: parking_lot::Mutex<Vec<tokio::sync::OwnedMutexGuard<()>>>,
+    /// Row keys this transaction already holds a `FOR UPDATE` lock on, so a
+    /// repeated match on the same key does not self-deadlock.
+    ///
+    /// Always present; only populated when `UniConfig::ssi_enabled` is `true`.
+    for_update_held: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). Captured at
+    /// begin (after `occ_read_seq`), threaded into reads via the executor.
+    /// Released (`take`n) at the start of commit/rollback — **before** the
+    /// commit-time freeze check — so a transaction's own pin never makes its own
+    /// commit freeze; only a *concurrent* reader's pin does. `None` after release
+    /// (or on an abandoned tx, dropped via `Arc`).
+    ///
+    /// Behind a `Mutex` for interior mutability: a `FOR UPDATE` acquisition on a
+    /// still-fresh transaction RE-PINS this to lock-acquisition time so the
+    /// locked read sees the latest committed value (see `acquire_for_update_locks`).
+    ///
+    /// Always present; only set to `Some` when `UniConfig::ssi_enabled` is `true`.
+    snapshot: parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>,
+}
+
+/// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
+/// the purposes of `AuthzPolicy` consultation.
+///
+/// This is a deliberately shallow classifier: it scans the first
+/// keyword(s) of the trimmed, uppercased payload. Real parser-driven
+/// classification is a follow-up — for M6a.3 the only requirement is
+/// that the verb crossing the policy boundary is *meaningful* (so a
+/// policy that wants to reject `CREATE INDEX` while allowing `CREATE
+/// (n)` can do so).
+///
+/// Recognition:
+/// - `CREATE INDEX` / `DROP INDEX` / `CREATE LABEL` / `CREATE
+///   CONSTRAINT` / `DROP CONSTRAINT` → `"schema"`.
+/// - `CREATE USER` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW
+///   USERS` / `ALTER USER` → `"dbms"`.
+/// - Everything else routed through `Transaction::execute` → `"write"`.
+fn classify_verb(cypher: &str) -> &'static str {
+    let s = cypher.trim_start();
+    // Take up to 32 chars and uppercase for a cheap prefix match.
+    let prefix_len = s.len().min(32);
+    let prefix = s[..prefix_len].to_uppercase();
+    let p = prefix.as_str();
+
+    if p.starts_with("CREATE INDEX")
+        || p.starts_with("DROP INDEX")
+        || p.starts_with("CREATE LABEL")
+        || p.starts_with("DROP LABEL")
+        || p.starts_with("CREATE CONSTRAINT")
+        || p.starts_with("DROP CONSTRAINT")
+    {
+        return "schema";
+    }
+    if p.starts_with("CREATE USER")
+        || p.starts_with("DROP USER")
+        || p.starts_with("ALTER USER")
+        || p.starts_with("GRANT ")
+        || p.starts_with("REVOKE ")
+        || p.starts_with("SHOW USERS")
+        || p.starts_with("SHOW ROLES")
+    {
+        return "dbms";
+    }
+    "write"
 }
 
 impl Transaction {
@@ -170,11 +219,26 @@ impl Transaction {
         // READ lock only — create a private L0 buffer without blocking other writers.
         // This is the key commit-time serialization change: no writer WRITE lock
         // is taken at transaction begin; it's deferred to commit().
-        let (started_at_version, tx_l0) = {
-            let writer = writer_lock.read().await;
+        let (started_at_version, tx_l0, id_reservoir) = {
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             let l0 = writer.create_transaction_l0();
             let version = l0.read().current_version;
-            (version, l0)
+            let reservoir = Arc::new(uni_store::runtime::TxIdReservoir::new(
+                writer.allocator.clone(),
+                db.config.tx_id_reservoir_batch,
+            ));
+            (version, l0, reservoir)
+        };
+
+        // Component C1: pin the L0 snapshot AFTER `create_transaction_l0` stamped
+        // `occ_read_seq`, so the snapshot reflects state >= read_seq — any commit
+        // newer than read_seq is then caught by OCC rather than silently read.
+        // Only pinned when SSI is enabled; otherwise reads run against live L0.
+        let snapshot = if db.config.ssi_enabled {
+            let writer: &uni_store::Writer = writer_lock.as_ref();
+            parking_lot::Mutex::new(Some(writer.l0_manager.pin_snapshot()))
+        } else {
+            parking_lot::Mutex::new(None)
         };
 
         let id = Uuid::new_v4().to_string();
@@ -190,6 +254,7 @@ impl Transaction {
         let tx = Self {
             db,
             tx_l0,
+            id_reservoir,
             session_write_guard: session.active_write_guard().clone(),
             session_rule_registry: session.rule_registry().clone(),
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
@@ -202,6 +267,10 @@ impl Transaction {
             deadline,
             cancellation_token,
             hooks: session.hooks.values().cloned().collect(),
+            principal: session.principal.clone(),
+            for_update_guards: parking_lot::Mutex::new(Vec::new()),
+            for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            snapshot,
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -219,14 +288,133 @@ impl Transaction {
 
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
 
+    /// The transaction's pinned L0 snapshot for snapshot-isolated reads
+    /// (Component C1), threaded into the executor.
+    ///
+    /// Returns `Some` for a read-write transaction begun under
+    /// `UniConfig::ssi_enabled` (until commit/rollback `take`s it); `None` when
+    /// SSI is disabled (nothing was pinned ⇒ live reads) or after release. A
+    /// `None` is a safe no-op downstream.
+    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
+        self.snapshot.lock().clone()
+    }
+
     /// Execute a Cypher query within the transaction.
     /// Reads see the private L0 buffer (uncommitted writes).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
-        self.db
-            .execute_internal_with_tx_l0(cypher, HashMap::new(), self.tx_l0.clone())
-            .await
+        if self.db.config.ssi_enabled {
+            self.acquire_for_update_locks(cypher, &HashMap::new())
+                .await?;
+        } else if cypher.to_ascii_lowercase().contains("for update") {
+            // FOR UPDATE is a no-op when SSI is disabled — surface it loudly so a
+            // runtime misconfiguration does not silently drop pessimistic locking
+            // (a far easier mistake than a compile-time opt-out). Structured field
+            // for filtering; message template per M-LOG-STRUCTURED.
+            tracing::warn!(
+                ssi_enabled = false,
+                "FOR UPDATE ignored: ssi_enabled is false, so no row locks are acquired and \
+                 concurrent writers are not serialized — enable SSI or guard the RMW externally"
+            );
+        }
+        // FU-1: thread the transaction's principal into the executor
+        // scope so procedure capability gates (e.g. ProcedureWrites
+        // for `declareProcedure WRITE`) see the authenticated user.
+        let principal = self.principal.clone();
+        let fut = self.db.execute_internal_with_tx_l0(
+            cypher,
+            HashMap::new(),
+            self.tx_l0.clone(),
+            Some(self.id_reservoir.clone()),
+            self.read_snapshot(),
+        );
+        uni_query::maybe_scope_with_principal(principal, fut).await
+    }
+
+    /// Acquires `FOR UPDATE` pessimistic row locks for the matched keyed nodes,
+    /// holding them until the transaction ends. Only single keyed-node matches
+    /// are locked (the RMW use case); other `FOR UPDATE` patterns log a warning.
+    ///
+    /// # Errors
+    /// Returns [`UniError::LockTimeout`] (retriable) if a lock cannot be acquired
+    /// within the bound — a likely deadlock or long-held lock. `transact_with_retry`
+    /// will re-run the closure, which re-acquires from scratch and can win the lock
+    /// once the holder releases.
+    ///
+    /// Only ever called when `UniConfig::ssi_enabled` is `true` (see `query`).
+    async fn acquire_for_update_locks(
+        &self,
+        cypher: &str,
+        params: &HashMap<String, uni_common::Value>,
+    ) -> Result<()> {
+        // Cheap gate: only parse-for-locks when the hint is present. The full
+        // query parse/plan still happens downstream in execute_internal.
+        if !cypher.to_ascii_lowercase().contains("for update") {
+            return Ok(());
+        }
+        let Ok(ast) = uni_cypher::parse(cypher) else {
+            // Let execute_internal surface the parse error uniformly.
+            return Ok(());
+        };
+        let collected = crate::api::for_update::collect_for_update_keys(&ast, params);
+        if collected.unsupported {
+            tracing::warn!(
+                "FOR UPDATE applied to an unsupported pattern (only single keyed nodes are \
+                 locked); that lock hint is ignored"
+            );
+        }
+        let writer = self.db.writer.as_ref().ok_or(UniError::ReadOnly {
+            operation: "for_update".to_string(),
+        })?;
+        let mut keys = collected.keys;
+        keys.sort();
+        keys.dedup();
+        let mut acquired_any = false;
+        for key in keys {
+            if self.for_update_held.lock().contains(&key) {
+                continue;
+            }
+            let handle = writer.row_lock_handle(&key);
+            // Bounded wait so a deadlock surfaces as a retriable LockTimeout
+            // rather than hanging the transaction. (A plain Timeout would not be
+            // retriable; a contended row lock genuinely clears when the holder
+            // commits/rolls back, so the retry helper should re-attempt it.)
+            let guard =
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle.lock_owned())
+                    .await
+                    .map_err(|_| UniError::LockTimeout { timeout_ms: 10_000 })?;
+            self.for_update_held.lock().insert(key);
+            self.for_update_guards.lock().push(guard);
+            acquired_any = true;
+        }
+
+        // Read-latest under the lock. If this acquisition actually took a lock and
+        // the transaction is still FRESH (no reads, no writes yet), re-pin the
+        // snapshot and re-stamp the OCC read sequence to NOW. The locked read then
+        // sees the latest committed value, so a `FOR UPDATE` read-modify-write
+        // commits WITHOUT a retry: the lock keeps the row stable, while a
+        // non-FOR-UPDATE writer that commits the row after this new baseline is
+        // still caught by OCC (correct). Fresh-only because a single per-tx
+        // `occ_read_seq` cannot keep earlier reads at their begin basis — a tx that
+        // read before `FOR UPDATE` keeps today's mutex+retry behaviour.
+        if acquired_any && !self.is_dirty() {
+            let read_set_empty = self
+                .tx_l0
+                .read()
+                .occ_read_set
+                .as_ref()
+                .is_none_or(|rs| rs.lock().is_empty());
+            if read_set_empty {
+                // Order mirrors transaction begin: advance `occ_read_seq` first,
+                // then pin, so the snapshot always reflects state >= read_seq (a
+                // racing commit causes at most a spurious retry, never a missed
+                // conflict / lost update).
+                self.tx_l0.write().occ_read_seq = writer.current_commit_sequence();
+                *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
+            }
+        }
+        Ok(())
     }
 
     /// Execute a Cypher query with parameters.
@@ -247,10 +435,43 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
         self.check_completed()?;
+        self.authorize(cypher, classify_verb(cypher))?;
         let before = self.snapshot_l0();
         let result = self.query(cypher).await?;
         let after = self.snapshot_l0();
         Ok(Self::compute_execute_result(&before, &after, &result))
+    }
+
+    /// Consult the plugin registry's `AuthzPolicy` chain for an action
+    /// inside this transaction. Mirrors `Session::authorize` but reads
+    /// the principal off the transaction (cloned from the session at
+    /// `Transaction::new` time) so a long-lived transaction can't be
+    /// retroactively escalated by a session re-auth.
+    fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
+        use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
+
+        let policies = self.db.plugin_registry.authz_policies();
+        if policies.is_empty() {
+            return Ok(());
+        }
+        let anon = Principal::anonymous();
+        let principal = self.principal.as_deref().unwrap_or(&anon);
+        let action = Action {
+            verb: verb.to_owned(),
+        };
+        let resource = Resource {
+            path: cypher.to_owned(),
+        };
+        for policy in policies.iter() {
+            match policy.check(principal, &action, &resource) {
+                Ok(Decision::Allow) => {}
+                Ok(Decision::Deny { reason }) => {
+                    return Err(UniError::AuthorizationDenied { reason });
+                }
+                Err(e) => return Err(UniError::AuthorizationDenied { reason: e.0 }),
+            }
+        }
+        Ok(())
     }
 
     /// Execute a mutation with parameters using a builder.
@@ -357,7 +578,7 @@ impl Transaction {
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_vertices".to_string(),
         })?;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         if properties_list.is_empty() {
             return Ok(Vec::new());
         }
@@ -406,11 +627,15 @@ impl Transaction {
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_edges".to_string(),
         })?;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
+        // Pre-allocate all EIDs in one IdAllocator mutex acquisition.
+        let eids = writer
+            .allocate_eids(edges.len())
+            .await
+            .map_err(UniError::Internal)?;
         // Route mutations through the transaction's private L0.
         let result: Result<()> = async {
-            for (src_vid, dst_vid, props) in edges {
-                let eid = writer.next_eid(type_id).await.map_err(UniError::Internal)?;
+            for ((src_vid, dst_vid, props), eid) in edges.into_iter().zip(eids) {
                 writer
                     .insert_edge(
                         src_vid,
@@ -438,7 +663,7 @@ impl Transaction {
     /// The Transaction's write guard ensures mutual exclusion — the BulkWriter
     /// does not manage the guard itself.
     pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
-        crate::api::bulk::BulkWriterBuilder::new_unguarded(self.db.clone())
+        crate::api::bulk::BulkWriterBuilder::new_unguarded(self.db.bulk_backend())
     }
 
     /// Create a streaming appender for row-by-row data loading within this transaction.
@@ -446,7 +671,7 @@ impl Transaction {
     /// The appender writes directly to storage (bypassing the L0 buffer).
     /// The Transaction's write guard ensures mutual exclusion.
     pub fn appender(&self, label: &str) -> crate::api::appender::AppenderBuilder {
-        crate::api::appender::AppenderBuilder::new_from_tx(self.db.clone(), label)
+        crate::api::appender::AppenderBuilder::new_from_tx(self.db.bulk_backend(), label)
     }
 
     // ── Locy Evaluation ───────────────────────────────────────────────
@@ -533,8 +758,61 @@ impl Transaction {
             }
         }
 
-        // Snapshot labels and edge types from L0 BEFORE commit consumes the buffer
-        let (labels_affected, edge_types_affected) = {
+        // M5e — registry phased hooks also see `before_commit` so a
+        // `BuiltinHookPlugin`-installed legacy hook fires through the same
+        // path as a directly-registered phased hook. Reject short-circuits
+        // the same way the legacy chain above does.
+        {
+            let registry_hooks = self.db.plugin_registry.hooks();
+            if !registry_hooks.is_empty() {
+                let ctx = uni_plugin::traits::hook::CommitContext::new(&self.session_id);
+                for hook in registry_hooks.iter() {
+                    use uni_plugin::errors::HookOutcome;
+                    match hook.before_commit(&ctx) {
+                        HookOutcome::Continue => {}
+                        HookOutcome::Reject { reason } => {
+                            return Err(UniError::HookRejected { message: reason });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Build trigger router once per commit. `is_empty()` lets us
+        // short-circuit the per-row event extraction when no triggers
+        // are registered (zero overhead on the hot path).
+        let trigger_router = TriggerRouter::from_registry_with_queue(
+            &self.db.plugin_registry,
+            Some(Arc::clone(&self.db.defer_queue)),
+        )?;
+
+        // M11 FU-4: CDC subscribers also need per-row mutation events,
+        // so the extraction must run if *either* triggers or CDC
+        // outputs are registered. When neither is registered we skip
+        // the L0 probe + scan entirely (zero-cost hot path).
+        let cdc_active = !self.db.plugin_registry.cdc_outputs_is_empty();
+        let need_events = !trigger_router.is_empty() || cdc_active;
+
+        // For the trigger / CDC path, capture an `L0Manager` handle
+        // ahead of the L0 read scope so `PreExistingProbe` can scan
+        // committed L0 + pending-flush L0s for the VIDs/EIDs about to
+        // be committed. The handle is cheap (Arc clone).
+        let l0_manager_for_probe = if need_events {
+            if let Some(wl) = self.db.writer.as_ref() {
+                Some(Arc::clone(&wl.l0_manager))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Snapshot labels and edge types from L0 (sync read, short
+        // lock scope). Also build the L0-chain portion of the probe
+        // here while we already hold the lock — `from_l0_chain` is
+        // sync.
+        let (labels_affected, edge_types_affected, mut probe_opt) = {
             let l0 = self.tx_l0.read();
             let labels: Vec<String> = l0
                 .vertex_labels
@@ -551,20 +829,89 @@ impl Transaction {
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
-            (labels, edge_types)
+            let probe = l0_manager_for_probe
+                .as_ref()
+                .map(|l0m| crate::api::triggers::PreExistingProbe::from_l0_chain(l0m, &l0));
+            (labels, edge_types, probe)
         };
 
-        // Acquire writer WRITE lock for WAL + merge
-        let mut writer = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            writer_lock.write(),
+        // Extend the probe with an L1 storage existence scan for VIDs
+        // not found in the L0 chain. The candidate snapshot is taken
+        // under a short sync lock; the async probe runs outside the
+        // lock to keep the L0 buffer available to other readers and
+        // to satisfy the Send bound on the surrounding async fn.
+        if let Some(ref mut probe) = probe_opt {
+            let candidates = {
+                let l0 = self.tx_l0.read();
+                probe.pending_l1_candidates(&l0)
+            };
+            if !candidates.is_empty() {
+                probe.extend_with_l1(candidates, &self.db.storage).await;
+            }
+        }
+
+        // Build trigger events under a second short read of tx_l0
+        // — the tx is single-threaded, so its contents are stable
+        // between the snapshot above and now. Includes the CDC path:
+        // when triggers aren't registered but CDC subscribers are, we
+        // still extract events (with no property bag — the trigger
+        // predicate gate is the only consumer of `properties_referenced`).
+        let trigger_events = if need_events {
+            let l0 = self.tx_l0.read();
+            let props_referenced = trigger_router.properties_referenced();
+            Some(MutationEvents::from_l0_with_probe(
+                &l0,
+                probe_opt.as_ref(),
+                &props_referenced,
+            ))
+        } else {
+            None
+        };
+
+        // Trigger BeforeMutation / BeforeCommit dispatch — runs after
+        // hook before_commit so legacy hooks see the rejection state
+        // they already expect, and before the writer lock so a reject
+        // is cheap (no lock acquired yet).
+        if let Some(ref events) = trigger_events {
+            let tx_id_u64 = tx_id_to_u64(&self.id);
+            let ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            trigger_router.dispatch_before(ctx, events)?;
+        }
+
+        // Component C1: release this transaction's OWN snapshot pin before the
+        // commit runs, so the commit-time freeze (`is_current_pinned`) only fires
+        // when ANOTHER live transaction pins this generation. Without this, the
+        // tx's own pin would force a needless deep clone of the main L0 on every
+        // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
+        self.snapshot.lock().take();
+
+        // Wrap the commit (which acquires `flush_lock` internally) in the
+        // same timeout that used to wrap the outer writer-RwLock acquisition.
+        // `flush_lock` is now the actual serialization point.
+        //
+        // commit_transaction_l0 takes `self: &Arc<Self>` so the async branch
+        // can pass `Arc<Writer>` into the spawned stream task. We pass the
+        // Arc directly (no deref to &Writer).
+        let (wal_lsn, _flush_pending) = tokio::time::timeout(
+            self.db.config.commit_timeout,
+            writer_lock.commit_transaction_l0(self.tx_l0.clone()),
         )
         .await
         .map_err(|_| UniError::CommitTimeout {
             tx_id: self.id.clone(),
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
+        })?
+        // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
+        // `ConstraintConflict`) so callers can detect and retry them, instead
+        // of flattening every error into `Internal`.
+        .map_err(|e| match e.downcast::<UniError>() {
+            Ok(typed) => typed,
+            Err(other) => UniError::Internal(other),
         })?;
-        let wal_lsn = writer.commit_transaction_l0(self.tx_l0.clone()).await?;
+        // _flush_pending is true when async_flush_enabled and the coordinator
+        // accepted a flush submission. Nothing to do here — the spawned stream
+        // task drives the pipeline to completion independently.
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         // Update cached metrics atomics while we still hold the writer lock
         {
             let l0 = writer.l0_manager.get_current();
@@ -578,7 +925,6 @@ impl Transaction {
         }
         self.db.cached_wal_lsn.store(wal_lsn, Ordering::Relaxed);
         let version = writer.l0_manager.get_current().read().current_version;
-        drop(writer);
 
         self.completed = true;
 
@@ -640,7 +986,20 @@ impl Transaction {
             rule_promotion_errors,
         };
 
-        // Broadcast commit notification (ignore send error — no receivers is fine)
+        // Broadcast commit notification (ignore send error — no receivers is fine).
+        // M11 FU-4: when CDC providers are registered, materialize the
+        // canonical mutation-event batch onto the notification so
+        // `CdcRuntime` can hand subscribers actual rows (not an empty
+        // batch). Triggers consumed `trigger_events` synchronously
+        // above, so reusing it here is free.
+        let mutations_batch = if cdc_active {
+            trigger_events
+                .as_ref()
+                .and_then(|e| e.materialize_all())
+                .map(Arc::new)
+        } else {
+            None
+        };
         let notif = crate::api::notifications::CommitNotification {
             version,
             mutation_count: mutations,
@@ -651,6 +1010,7 @@ impl Transaction {
             tx_id: self.id.clone(),
             session_id: self.session_id.clone(),
             causal_version: self.started_at_version,
+            mutations: mutations_batch,
         };
         let _ = self.db.commit_tx.send(Arc::new(notif));
 
@@ -671,6 +1031,42 @@ impl Transaction {
             }
         }
 
+        // M5e — registry phased hooks also see `after_commit`. A
+        // `BuiltinHookPlugin`-installed legacy hook is dispatched through
+        // the `LegacyHookAdapter` (which mirrors the slim
+        // `PluginCommitResult` into the legacy `CommitResult` shape).
+        {
+            let registry_hooks = self.db.plugin_registry.hooks();
+            if !registry_hooks.is_empty() {
+                let plugin_commit_result = uni_plugin::traits::hook::PluginCommitResult {
+                    mutations: commit_result.mutations_committed as u64,
+                    version: commit_result.version,
+                    wal_lsn: commit_result.wal_lsn,
+                    duration: commit_result.duration,
+                };
+                let ctx = uni_plugin::traits::hook::CommitContext::new(&self.session_id)
+                    .with_commit_result(&plugin_commit_result);
+                for hook in registry_hooks.iter() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        hook.after_commit(&ctx);
+                    }));
+                    if let Err(e) = result {
+                        tracing::error!("registry after_commit hook panicked: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        // Trigger AfterMutation / AfterCommit dispatch. Synchronous
+        // triggers run inline (panics caught); Async / Eventual fire
+        // on the tokio runtime so the commit returns immediately.
+        if let Some(events) = trigger_events {
+            let tx_id_u64 = tx_id_to_u64(&self.id);
+            let ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            let runtime = tokio::runtime::Handle::current();
+            trigger_router.dispatch_after(ctx, &events, &runtime);
+        }
+
         info!("Transaction committed");
 
         Ok(commit_result)
@@ -686,6 +1082,9 @@ impl Transaction {
             return;
         }
         self.completed = true;
+
+        // Component C1: release the snapshot pin promptly (symmetric with commit).
+        self.snapshot.lock().take();
 
         // Release write guard
         self.session_write_guard.store(false, Ordering::SeqCst);
@@ -781,6 +1180,21 @@ impl Drop for Transaction {
             // Release write guard
             self.session_write_guard.store(false, Ordering::SeqCst);
         }
+        // Release any FOR UPDATE pessimistic locks and prune the now-unreferenced
+        // lock-map entries (otherwise the map grows once per distinct locked key
+        // for the life of the database). Order matters: drop the guards FIRST so
+        // the `Arc` strong count reflects only the map before we prune.
+        // (When SSI is disabled the guard vec and held set are always empty, so
+        // this is a cheap no-op.)
+        {
+            self.for_update_guards.lock().clear();
+            let keys: Vec<Vec<u8>> = self.for_update_held.lock().drain().collect();
+            if !keys.is_empty()
+                && let Some(writer) = self.db.writer.as_ref()
+            {
+                writer.release_for_update_locks(&keys);
+            }
+        }
         // Phase 2 Day 11: pair with the increment in `new_with_options`.
         // Always runs, regardless of commit/rollback/silent-drop.
         self.db.inflight_tx_count.fetch_sub(1, Ordering::SeqCst);
@@ -827,6 +1241,8 @@ impl<'a> ExecuteBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -840,6 +1256,42 @@ impl<'a> ExecuteBuilder<'a> {
         let after = self.tx.snapshot_l0();
         Ok(Transaction::compute_execute_result(
             &before, &after, &result,
+        ))
+    }
+
+    /// Execute the mutation with profiling, returning the [`ExecuteResult`]
+    /// (mutation counters from the tx's private L0) together with the
+    /// [`ProfileOutput`] (per-operator timings and memory).
+    ///
+    /// Mirrors `Session::query(cypher).profile()` for the write path:
+    /// the mutation is routed through the transaction's private L0
+    /// (commit-time serialization), so writes are only visible after
+    /// `tx.commit().await?`. The captured profile includes both the
+    /// DataFusion runtime stats and the DDL/admin aggregate stat where
+    /// applicable.
+    pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)> {
+        self.tx.check_completed()?;
+        let before = self.tx.snapshot_l0();
+        let fut = self.tx.db.profile_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
+        );
+        let (result, profile) = if let Some(t) = self.timeout {
+            tokio::time::timeout(t, fut)
+                .await
+                .map_err(|_| UniError::Timeout {
+                    timeout_ms: t.as_millis() as u64,
+                })??
+        } else {
+            fut.await?
+        };
+        let after = self.tx.snapshot_l0();
+        Ok((
+            Transaction::compute_execute_result(&before, &after, &result),
+            profile,
         ))
     }
 }
@@ -880,6 +1332,8 @@ impl<'a> TxQueryBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -903,6 +1357,8 @@ impl<'a> TxQueryBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -969,5 +1425,29 @@ impl<'a> ApplyBuilder<'a> {
         self.tx
             .apply_internal(self.derived, self.require_fresh, self.max_version_gap)
             .await
+    }
+}
+
+/// Write-side host for the `uni-fork` promote engine.
+#[async_trait::async_trait]
+impl uni_fork::ForkPromoteSink for Transaction {
+    async fn bulk_insert_vertices(
+        &self,
+        label: &str,
+        rows: Vec<uni_common::Properties>,
+    ) -> Result<Vec<uni_common::core::id::Vid>> {
+        Transaction::bulk_insert_vertices(self, label, rows).await
+    }
+
+    async fn bulk_insert_edges(
+        &self,
+        edge_type: &str,
+        edges: Vec<(
+            uni_common::core::id::Vid,
+            uni_common::core::id::Vid,
+            uni_common::Properties,
+        )>,
+    ) -> Result<()> {
+        Transaction::bulk_insert_edges(self, edge_type, edges).await
     }
 }

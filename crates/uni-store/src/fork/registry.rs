@@ -14,11 +14,6 @@
 //! single PUT for that mutation; it is *never* held across
 //! `lance_branch::create_branch` or `delete_branch`. This preserves
 //! the spec §10 guarantee that fork creation does not block primary.
-//!
-//! 2PC state machines and recovery semantics are detailed in
-//! `docs/proposals/graph_fork_plan.md` §Phase 1.
-
-// Rust guideline compliant
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -637,6 +632,7 @@ impl ForkRegistryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
     use uni_common::core::fork::ForkId;

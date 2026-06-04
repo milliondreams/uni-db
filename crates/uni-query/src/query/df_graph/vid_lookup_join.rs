@@ -123,7 +123,7 @@ pub struct VidLookupJoinExec {
     join_kind: VidJoinKind,
     /// Output schema = `left.schema() ++ right.schema()` in plan order.
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -225,7 +225,7 @@ impl ExecutionPlan for VidLookupJoinExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -323,6 +323,8 @@ impl Stream for VidLookupJoinStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         match &mut self.state {
             VidLookupJoinStreamState::Running(fut) => match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(batch)) => {

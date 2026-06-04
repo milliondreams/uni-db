@@ -6,6 +6,15 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use prettytable::{Cell, Row, Table};
 use std::path::PathBuf;
+use uni_plugin::{Capability, CapabilitySet};
+
+// Use mimalloc as the global allocator. Profile showed ~50% of CPU time in
+// glibc malloc + kernel page-fault zeroing under heavy concurrent allocation;
+// mimalloc's thread-local arenas reduce that to ~5%, yielding ~3x throughput
+// on allocation-heavy workloads (many small CREATE / mutation statements).
+// See crates/uni/benches/concurrent_mutations.rs.
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
 
 pub mod demo;
 pub mod repl;
@@ -55,6 +64,36 @@ enum Commands {
         #[arg(long, default_value = "./storage")]
         path: PathBuf,
     },
+    /// Manage runtime-loaded plugins
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCmd,
+        /// Path to DB storage
+        #[arg(long, default_value = "./storage")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install a plugin from a local file or URL.
+    ///
+    /// Dispatch by file extension / scheme:
+    ///   - `*.rhai`       → load via `Uni::load_rhai_plugin` (the only
+    ///     loader Phase 11 wires; the WASM / OCI / Extism Hub branches
+    ///     land in M12).
+    ///   - `*.wasm`       → not yet supported in this CLI (M12).
+    ///   - `oci://...`    → not yet supported (M12).
+    ///   - `extism://...` → not yet supported (M12).
+    Install {
+        /// Local path or URL to install from.
+        source: String,
+        /// Comma-separated capability grant names (e.g.
+        /// `ScalarFn,Filesystem,Network`). Defaults to
+        /// `ScalarFn,AggregateFn,Procedure`.
+        #[arg(long)]
+        grants: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -96,19 +135,23 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Query { statement, path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
-
+            let db = open_db(&path).await?;
             repl::execute_query(&db, &statement).await;
         }
         Commands::Repl { path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
+            let db = open_db(&path).await?;
             repl::run_repl(db).await?;
         }
+        Commands::Plugin { command, path } => {
+            let db = open_db(&path).await?;
+            match command {
+                PluginCmd::Install { source, grants } => {
+                    install_plugin(&db, &source, grants.as_deref()).await?;
+                }
+            }
+        }
         Commands::Snapshot { command, path } => {
-            let builder = uni_db::Uni::open(path.to_string_lossy().to_string());
-            let db = builder.build().await?;
+            let db = open_db(&path).await?;
 
             match command {
                 SnapshotCmd::List => {
@@ -151,4 +194,153 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Open the database at `path` with the CLI's standard settings.
+///
+/// # Errors
+///
+/// Returns an error if the storage at `path` cannot be opened or built.
+async fn open_db(path: &std::path::Path) -> Result<uni_db::Uni> {
+    Ok(uni_db::Uni::open(path.to_string_lossy()).build().await?)
+}
+
+/// Dispatch `uni plugin install <source>` by extension / scheme.
+async fn install_plugin(db: &uni_db::Uni, source: &str, grants: Option<&str>) -> Result<()> {
+    let caps = parse_grants(grants);
+
+    // Scheme dispatch — OCI / extism Hub / HTTP land in M12; CLI rejects
+    // them with a clear "not yet supported" message rather than silent
+    // failure. The order of the `http`/`https` prefixes is irrelevant
+    // because they share the same message.
+    const M12_SCHEMES: &[(&str, &str)] = &[
+        ("oci://", "OCI plugin installation lands in M12"),
+        ("extism://", "Extism Hub installation lands in M12"),
+        (
+            "https://",
+            "HTTP plugin fetch lands in M12 (download, signature pin)",
+        ),
+        (
+            "http://",
+            "HTTP plugin fetch lands in M12 (download, signature pin)",
+        ),
+    ];
+    for (prefix, message) in M12_SCHEMES {
+        if source.starts_with(prefix) {
+            anyhow::bail!("{} {message}", "not yet supported:".red());
+        }
+    }
+
+    // Local file by extension.
+    let path = std::path::Path::new(source);
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rhai" => {
+            #[cfg(feature = "rhai-plugins-cli")]
+            {
+                let script = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("reading {source}: {e}"))?;
+                let loader = uni_plugin_rhai::RhaiLoader::new();
+                let outcome = db
+                    .load_rhai_plugin(&loader, &script, &caps)
+                    .map_err(|e| anyhow::anyhow!("load_rhai_plugin: {e}"))?;
+                println!(
+                    "{} loaded plugin `{}` v{}",
+                    "ok:".green(),
+                    outcome.plugin_id.as_str(),
+                    outcome.version
+                );
+                if !outcome.scalars_registered.is_empty() {
+                    println!("  scalars:    {}", outcome.scalars_registered.join(", "));
+                }
+                if !outcome.aggregates_registered.is_empty() {
+                    println!("  aggregates: {}", outcome.aggregates_registered.join(", "));
+                }
+                if !outcome.procedures_registered.is_empty() {
+                    println!("  procedures: {}", outcome.procedures_registered.join(", "));
+                }
+                if !outcome.denied_capabilities.is_empty() {
+                    println!(
+                        "{} denied capabilities: {:?}",
+                        "warn:".yellow(),
+                        outcome.denied_capabilities
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(not(feature = "rhai-plugins-cli"))]
+            {
+                let _ = (db, caps);
+                anyhow::bail!(
+                    "{} Rhai plugin support requires the `rhai-plugins-cli` feature",
+                    "build:".red()
+                )
+            }
+        }
+        "wasm" => anyhow::bail!(
+            "{} WASM plugin installation via CLI lands in M12",
+            "not yet supported:".red()
+        ),
+        _ => anyhow::bail!("unknown plugin format for `{source}` (expected .rhai)"),
+    }
+}
+
+fn parse_grants(grants: Option<&str>) -> CapabilitySet {
+    let names: Vec<&str> = match grants {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => vec!["ScalarFn", "AggregateFn", "Procedure"],
+    };
+    let mut set = CapabilitySet::new();
+    for n in names {
+        match n {
+            "ScalarFn" => {
+                set.insert(Capability::ScalarFn);
+            }
+            "AggregateFn" => {
+                set.insert(Capability::AggregateFn);
+            }
+            "Procedure" => {
+                set.insert(Capability::Procedure);
+            }
+            "Filesystem" => {
+                set.insert(Capability::Filesystem {
+                    read: vec!["**".into()],
+                    write: vec!["**".into()],
+                });
+            }
+            "Network" => {
+                set.insert(Capability::Network {
+                    allow: vec!["**".into()],
+                });
+            }
+            "HostQuery" => {
+                set.insert(Capability::HostQuery {
+                    read_only: true,
+                    scopes: vec!["**".into()],
+                });
+            }
+            "Kms" => {
+                set.insert(Capability::Kms {
+                    key_ids: vec!["*".into()],
+                });
+            }
+            "Secret" => {
+                set.insert(Capability::Secret {
+                    ids: vec!["*".into()],
+                });
+            }
+            other => {
+                eprintln!("{} unknown grant `{other}` ignored", "warn:".yellow());
+            }
+        }
+    }
+    set
 }

@@ -3,8 +3,6 @@
 
 """Tests for Cypher features accessible through the Python API."""
 
-import tempfile
-
 import pytest
 
 import uni_db
@@ -16,29 +14,28 @@ class TestExplainProfile:
     @pytest.fixture
     def db_with_data(self):
         """Create a database with test data."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Person").property("name", "string").property(
-                "age", "int"
-            ).done().edge_type("KNOWS", ["Person"], ["Person"]).done().apply()
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Person").property("name", "string").property(
+            "age", "int"
+        ).done().edge_type("KNOWS", ["Person"], ["Person"]).done().apply()
 
-            # Insert test data via transaction
-            session = db.session()
-            tx = session.tx()
-            tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-            tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-            tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-            tx.execute("""
-                MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
-                CREATE (a)-[:KNOWS]->(b)
-            """)
-            tx.execute("""
-                MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
-                CREATE (b)-[:KNOWS]->(c)
-            """)
-            tx.commit()
-            db.flush()
-            yield db, session
+        # Insert test data via transaction
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx.execute("""
+            MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+            CREATE (a)-[:KNOWS]->(b)
+        """)
+        tx.execute("""
+            MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
+            CREATE (b)-[:KNOWS]->(c)
+        """)
+        tx.commit()
+        db.flush()
+        return db, session
 
     def test_explain_returns_plan(self, db_with_data):
         """Test that explain returns a query plan."""
@@ -105,18 +102,17 @@ class TestQueryWithParameters:
     @pytest.fixture
     def db(self):
         """Create a test database."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Person").property("name", "string").property(
-                "age", "int"
-            ).apply()
-            session = db.session()
-            tx = session.tx()
-            tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-            tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-            tx.commit()
-            db.flush()
-            yield db, session
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Person").property("name", "string").property(
+            "age", "int"
+        ).apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.commit()
+        db.flush()
+        return db, session
 
     def test_query_with_string_param(self, db):
         """Test query with string parameter."""
@@ -161,31 +157,26 @@ class TestAggregations:
     @pytest.fixture
     def db(self):
         """Create a database with test data for aggregations."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Product").property("category", "string").property(
-                "price", "float"
-            ).property("quantity", "int").apply()
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Product").property("category", "string").property(
+            "price", "float"
+        ).property("quantity", "int").apply()
 
-            session = db.session()
-            tx = session.tx()
-            tx.execute(
-                "CREATE (p:Product {category: 'Electronics', price: 100.0, quantity: 5})"
-            )
-            tx.execute(
-                "CREATE (p:Product {category: 'Electronics', price: 200.0, quantity: 3})"
-            )
-            tx.execute(
-                "CREATE (p:Product {category: 'Books', price: 20.0, quantity: 10})"
-            )
-            tx.commit()
-            tx = session.tx()
-            tx.execute(
-                "CREATE (p:Product {category: 'Books', price: 30.0, quantity: 8})"
-            )
-            tx.commit()
-            db.flush()
-            yield db, session
+        session = db.session()
+        tx = session.tx()
+        tx.execute(
+            "CREATE (p:Product {category: 'Electronics', price: 100.0, quantity: 5})"
+        )
+        tx.execute(
+            "CREATE (p:Product {category: 'Electronics', price: 200.0, quantity: 3})"
+        )
+        tx.execute("CREATE (p:Product {category: 'Books', price: 20.0, quantity: 10})")
+        tx.commit()
+        tx = session.tx()
+        tx.execute("CREATE (p:Product {category: 'Books', price: 30.0, quantity: 8})")
+        tx.commit()
+        db.flush()
+        return db, session
 
     def test_count_aggregation(self, db):
         """Test COUNT aggregation."""
@@ -240,19 +231,18 @@ class TestOrderingAndLimits:
     @pytest.fixture
     def db(self):
         """Create a database with numbered test data."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Item").property("num", "int").property(
-                "name", "string"
-            ).apply()
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Item").property("num", "int").property(
+            "name", "string"
+        ).apply()
 
-            session = db.session()
-            tx = session.tx()
-            for i in range(10):
-                tx.execute(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
-            tx.commit()
-            db.flush()
-            yield db, session
+        session = db.session()
+        tx = session.tx()
+        for i in range(10):
+            tx.execute(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
+        tx.commit()
+        db.flush()
+        return db, session
 
     def test_order_by_asc(self, db):
         """Test ORDER BY ascending."""
@@ -291,34 +281,33 @@ class TestPatternMatching:
     @pytest.fixture
     def db(self):
         """Create a database with a simple social graph."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.UniBuilder.open(tmpdir).build()
-            db.schema().label("Person").property("name", "string").done().edge_type(
-                "KNOWS", ["Person"], ["Person"]
-            ).done().edge_type("WORKS_WITH", ["Person"], ["Person"]).done().apply()
+        db = uni_db.UniBuilder.temporary().build()
+        db.schema().label("Person").property("name", "string").done().edge_type(
+            "KNOWS", ["Person"], ["Person"]
+        ).done().edge_type("WORKS_WITH", ["Person"], ["Person"]).done().apply()
 
-            # Create a small social network via transaction
-            session = db.session()
-            tx = session.tx()
-            tx.execute("CREATE (p:Person {name: 'Alice'})")
-            tx.execute("CREATE (p:Person {name: 'Bob'})")
-            tx.execute("CREATE (p:Person {name: 'Charlie'})")
-            tx.execute("CREATE (p:Person {name: 'David'})")
-            tx.execute("""
-                MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
-                CREATE (a)-[:KNOWS]->(b)
-            """)
-            tx.execute("""
-                MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
-                CREATE (b)-[:KNOWS]->(c)
-            """)
-            tx.execute("""
-                MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
-                CREATE (a)-[:WORKS_WITH]->(c)
-            """)
-            tx.commit()
-            db.flush()
-            yield db, session
+        # Create a small social network via transaction
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice'})")
+        tx.execute("CREATE (p:Person {name: 'Bob'})")
+        tx.execute("CREATE (p:Person {name: 'Charlie'})")
+        tx.execute("CREATE (p:Person {name: 'David'})")
+        tx.execute("""
+            MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+            CREATE (a)-[:KNOWS]->(b)
+        """)
+        tx.execute("""
+            MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
+            CREATE (b)-[:KNOWS]->(c)
+        """)
+        tx.execute("""
+            MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
+            CREATE (a)-[:WORKS_WITH]->(c)
+        """)
+        tx.commit()
+        db.flush()
+        return db, session
 
     def test_simple_relationship_match(self, db):
         """Test matching a simple relationship."""

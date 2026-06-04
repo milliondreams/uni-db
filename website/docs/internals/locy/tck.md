@@ -6,11 +6,18 @@ The Locy TCK validates language behavior across parse, compile, and evaluate lay
 
 ## Coverage Areas
 
-- Core rules and recursion.
-- Stratified negation.
-- ALONG/FOLD/BEST BY semantics.
-- QUERY, ASSUME, ABDUCE, EXPLAIN.
-- Module composition and priority behaviors.
+The feature suites under `crates/uni-locy-tck/tck/features/` cover:
+
+- Core rules and recursion (`rules/`, `combinations/`).
+- Stratified negation (`negation/`).
+- ALONG / FOLD / BEST BY semantics (`along/`, `fold/`, `bestby/`).
+- Monotonic aggregation operators (`monotonic/`).
+- QUERY, ASSUME, ABDUCE, DERIVE, EXPLAIN (`query/`, `assume/`, `abduce/`, `derive/`, `explain/`).
+- Module composition and priority behaviors (`modules/`, `priority/`).
+- Lexical / parse-level and compile-validation coverage (`lexical/`, `compile/`, `evaluate/`).
+- Neural predicates — CREATE MODEL, model invocation, CALIBRATE / VALIDATE, graph-structural and retrieval features (`neural/`).
+- Probabilistic semirings — AddMultProb, MaxMinProb (Viterbi), TopKProofs (`semiring/`).
+- Correlation / shared-evidence warnings — cross-group correlation, shared retrieval context, fold-in-recursive-path (`correlation/`).
 
 ## Test Layers
 
@@ -26,5 +33,5 @@ The Locy TCK validates language behavior across parse, compile, and evaluate lay
 
 ## Related Sources
 
-- `crates/uni-locy-tck/tck/features/*`
-- `docs/locy/locy-tck-spec.md`
+- `crates/uni-locy-tck/tck/features/*` — the feature files and their `.schema.json` expectation specs.
+- `crates/uni-locy-tck/` — the TCK harness crate.

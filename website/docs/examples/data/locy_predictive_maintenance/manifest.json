@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-05-16T09:20:06.531584+00:00",
+  "source": {
+    "name": "AI4I 2020 Predictive Maintenance Dataset",
+    "doi": "https://doi.org/10.24432/C5HS5C",
+    "url": "https://archive.ics.uci.edu/static/public/601/ai4i+2020+predictive+maintenance+dataset.zip",
+    "license": "CC BY 4.0",
+    "repository": "UCI Machine Learning Repository, dataset #601"
+  },
+  "shape": {
+    "raw_rows": 10000,
+    "curated_equipment": 60,
+    "topology_edges": 675,
+    "components": 180
+  },
+  "params": {
+    "n_failed": 30,
+    "n_healthy": 30,
+    "n_stages": 4,
+    "components_per_equipment": 3,
+    "seed": 42
+  },
+  "notes": [
+    "ai4i_equipment.csv carries real AI4I 2020 sensor rows.",
+    "ai4i_topology.csv is SYNTHETIC: a 4-stage process line",
+    "  partitioning the equipment, with all-to-all edges between",
+    "  consecutive stages. AI4I has no real topology data.",
+    "ai4i_components.csv is SYNTHETIC: 3 components per equipment",
+    "  with deterministic health values (lower for failed equipment)."
+  ]
+}

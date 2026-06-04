@@ -71,6 +71,26 @@ YIELD KEY v, reliability
 
 See [Probabilistic Logic](advanced/probabilistic-logic.md) for full documentation of MNOR and MPROD.
 
+### Neural Predicates
+
+Declare a learned scoring function and call it inside a rule:
+
+```cypher
+CREATE MODEL failure_likelihood AS
+  INPUT (a)
+  FEATURES a.score
+  OUTPUT PROB risk
+  USING xervo('classify/failure-likelihood-v1')
+
+CREATE RULE at_risk AS
+  MATCH (a:Asset)
+  YIELD KEY a, failure_likelihood(a.score) AS risk
+```
+
+Register a Python callable (or Rust `NeuralClassifier` impl) under the model name in `LocyConfig.classifier_registry` before running. Calibrate against held-out labels with `CALIBRATE failure_likelihood ON MATCH (a:Asset) TARGET a.actually_failed METHOD platt_scaling`; validate with `VALIDATE failure_likelihood ON MATCH (a:Asset) TARGET a.actually_failed METRICS brier_score, auc`. `EXPLAIN` traces every classifier invocation with raw and calibrated probabilities, a confidence band, and the feature dict that produced the score.
+
+See [Neural Predicates](advanced/neural-predicates.md) for the full reference (every FEATURES source, every calibration method, every warning).
+
 !!! note "Rule vs command expressions"
     In rule bodies (`WHERE`, `YIELD`, `ALONG`, `FOLD`), `similar_to()` runs inside DataFusion with full capability — metric-aware vector scoring, auto-embedding, FTS, and multi-source fusion. In command WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), only basic vector similarity (cosine) is available because commands execute on materialized rows after strata converge without schema context.
 

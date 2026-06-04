@@ -88,11 +88,13 @@ async fn when_evaluating_locy_program_without_apply(
     store_without_apply(world, result).await;
 }
 
-#[when(regex = r#"^evaluating the following Locy program with max_iterations (\d+):$"#)]
-async fn when_evaluating_with_max_iterations(
+/// Initialize the DB, build a `LocyConfig` via `mutate`, run the program in
+/// the docstring, and apply derived facts. Used by every `#[when]` handler
+/// that needs to set one or more config fields.
+async fn run_with_config(
     world: &mut LocyWorld,
-    max_iter: usize,
     step: &cucumber::gherkin::Step,
+    mutate: impl FnOnce(&mut LocyConfig),
 ) {
     let program = step
         .docstring()
@@ -103,10 +105,8 @@ async fn when_evaluating_with_max_iterations(
         .await
         .expect("Failed to initialize database");
 
-    let config = uni_locy::LocyConfig {
-        max_iterations: max_iter,
-        ..Default::default()
-    };
+    let mut config = LocyConfig::default();
+    mutate(&mut config);
     let result = world
         .db()
         .session()
@@ -115,6 +115,30 @@ async fn when_evaluating_with_max_iterations(
         .run()
         .await;
     apply_derived_and_store(world, result).await;
+}
+
+#[when(regex = r#"^evaluating the following Locy program with max_iterations (\d+):$"#)]
+async fn when_evaluating_with_max_iterations(
+    world: &mut LocyWorld,
+    max_iter: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    run_with_config(world, step, |c| c.max_iterations = max_iter).await;
+}
+
+#[when(
+    regex = r#"^evaluating the following Locy program with max_iterations (\d+) allowing partial:$"#
+)]
+async fn when_evaluating_with_max_iterations_allow_partial(
+    world: &mut LocyWorld,
+    max_iter: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    run_with_config(world, step, |c| {
+        c.max_iterations = max_iter;
+        c.allow_partial = true;
+    })
+    .await;
 }
 
 #[when("evaluating the following Locy program with strict_probability_domain:")]
@@ -122,27 +146,7 @@ async fn when_evaluating_with_strict_probability(
     world: &mut LocyWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
-    let config = uni_locy::LocyConfig {
-        strict_probability_domain: true,
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    run_with_config(world, step, |c| c.strict_probability_domain = true).await;
 }
 
 #[when("evaluating the following Locy program with exact_probability:")]
@@ -150,27 +154,7 @@ async fn when_evaluating_with_exact_probability(
     world: &mut LocyWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
-    let config = uni_locy::LocyConfig {
-        exact_probability: true,
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    run_with_config(world, step, |c| c.exact_probability = true).await;
 }
 
 #[when(
@@ -181,6 +165,36 @@ async fn when_evaluating_with_exact_probability_and_bdd_limit(
     max_bdd: usize,
     step: &cucumber::gherkin::Step,
 ) {
+    run_with_config(world, step, |c| {
+        c.exact_probability = true;
+        c.max_bdd_variables = max_bdd;
+    })
+    .await;
+}
+
+#[when(
+    regex = r#"^evaluating the following Locy program with exact_probability and top_k_proofs (\d+):$"#
+)]
+async fn when_evaluating_with_exact_probability_and_top_k(
+    world: &mut LocyWorld,
+    top_k: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    run_with_config(world, step, |c| {
+        c.exact_probability = true;
+        c.top_k_proofs = top_k;
+    })
+    .await;
+}
+
+#[when(
+    regex = r#"^evaluating the following Locy program with semiring "(AddMultProb|MaxMinProb|BddExact|TopKProofs\(\d+\))":$"#
+)]
+async fn when_evaluating_with_semiring(
+    world: &mut LocyWorld,
+    kind: String,
+    step: &cucumber::gherkin::Step,
+) {
     let program = step
         .docstring()
         .expect("Expected a docstring with the Locy program to evaluate");
@@ -190,9 +204,22 @@ async fn when_evaluating_with_exact_probability_and_bdd_limit(
         .await
         .expect("Failed to initialize database");
 
+    let semiring = match kind.as_str() {
+        "AddMultProb" => uni_locy::SemiringKind::AddMultProb,
+        "MaxMinProb" => uni_locy::SemiringKind::MaxMinProb,
+        "BddExact" => uni_locy::SemiringKind::BddExact,
+        s if s.starts_with("TopKProofs(") && s.ends_with(')') => {
+            let k_str = &s["TopKProofs(".len()..s.len() - 1];
+            let k: u32 = k_str
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid k in semiring '{s}'"));
+            uni_locy::SemiringKind::TopKProofs { k }
+        }
+        other => panic!("unknown semiring kind: {other}"),
+    };
+
     let config = uni_locy::LocyConfig {
-        exact_probability: true,
-        max_bdd_variables: max_bdd,
+        semiring,
         ..Default::default()
     };
     let result = world
@@ -205,12 +232,13 @@ async fn when_evaluating_with_exact_probability_and_bdd_limit(
     apply_derived_and_store(world, result).await;
 }
 
-#[when(
-    regex = r#"^evaluating the following Locy program with exact_probability and top_k_proofs (\d+):$"#
-)]
-async fn when_evaluating_with_exact_probability_and_top_k(
+/// Phase C gate-closure: the neural-predicates feature is GA;
+/// `neural_predicates_preview` defaults to `true`. This step
+/// explicitly sets it to `false` so scenarios can assert the
+/// opt-out behavior (CREATE MODEL rejection).
+#[when("evaluating the following Locy program with neural_predicates_preview disabled:")]
+async fn when_evaluating_with_neural_preview_disabled(
     world: &mut LocyWorld,
-    top_k: usize,
     step: &cucumber::gherkin::Step,
 ) {
     let program = step
@@ -223,8 +251,39 @@ async fn when_evaluating_with_exact_probability_and_top_k(
         .expect("Failed to initialize database");
 
     let config = uni_locy::LocyConfig {
-        exact_probability: true,
-        top_k_proofs: top_k,
+        neural_predicates_preview: false,
+        classifier_registry: world.classifier_registry.clone(),
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .session()
+        .locy_with(program)
+        .with_config(config)
+        .run()
+        .await;
+    apply_derived_and_store(world, result).await;
+}
+
+#[when("evaluating the following Locy program with neural_predicates_preview:")]
+async fn when_evaluating_with_neural_preview(
+    world: &mut LocyWorld,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = uni_locy::LocyConfig {
+        neural_predicates_preview: true,
+        // Pull any classifiers staged by `Given a registered mock
+        // classifier ...` so neural invocations dispatch correctly.
+        classifier_registry: world.classifier_registry.clone(),
         ..Default::default()
     };
     let result = world
@@ -239,25 +298,6 @@ async fn when_evaluating_with_exact_probability_and_top_k(
 
 #[when("evaluating the following Locy program with params:")]
 async fn when_evaluating_with_params(world: &mut LocyWorld, step: &cucumber::gherkin::Step) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
-    let config = LocyConfig {
-        params: world.params().clone(),
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    let params = world.params().clone();
+    run_with_config(world, step, |c| c.params = params).await;
 }

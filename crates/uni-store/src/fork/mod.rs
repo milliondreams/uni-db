@@ -7,11 +7,6 @@
 //!   and `catalog/fork_schemas/{fork_id}.json`; runs the create/drop 2PC.
 //! - [`recovery`] — driver invoked from `Uni::open` that resumes any
 //!   `Pending` create or `Tombstoned` drop left behind by a crash.
-//!
-//! The state machines and durability invariants are documented in
-//! `docs/proposals/graph_fork_plan.md` §Phase 1.
-
-// Rust guideline compliant
 
 pub mod id_alloc;
 pub mod index_builder;

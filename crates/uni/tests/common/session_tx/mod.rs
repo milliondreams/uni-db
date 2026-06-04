@@ -1,0 +1,11 @@
+pub mod constraint_enforcement_test;
+pub mod ddl_execution_test;
+pub mod ddl_test;
+pub mod reserved_property_names_test;
+pub mod schema_apply_idempotency;
+pub mod schema_dx;
+pub mod schema_path_migration_test;
+pub mod session_read_only;
+pub mod session_template_test;
+pub mod session_test;
+pub mod strict_schema_test;

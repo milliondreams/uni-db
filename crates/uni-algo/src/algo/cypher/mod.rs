@@ -66,6 +66,9 @@ pub use bellman_ford::BellmanFordProcedure;
 mod bidirectional_dijkstra;
 pub use bidirectional_dijkstra::BidirectionalDijkstraProcedure;
 
+mod dijkstra;
+pub use dijkstra::DijkstraProcedure;
+
 mod k_shortest_paths;
 pub use k_shortest_paths::KShortestPathsProcedure;
 

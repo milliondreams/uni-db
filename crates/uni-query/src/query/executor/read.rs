@@ -154,6 +154,98 @@ async fn hydrate_entity_if_needed(
     }
 }
 
+/// Promote a VID-string placeholder variable to a `Map`, draining its
+/// dotted system/property columns (`var.<prop>`) into the new map.
+///
+/// Used by `record_batches_to_rows` for search-procedure outputs, where the
+/// bare variable arrives as a VID string rather than a materialized Map.
+fn promote_vid_placeholder(row: &mut HashMap<String, Value>, var: &str) {
+    let prefix = format!("{}.", var);
+    let mut map = HashMap::new();
+
+    let dotted_keys: Vec<String> = row
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+
+    for key in &dotted_keys {
+        let prop_name = &key[prefix.len()..];
+        if let Some(val) = row.remove(key) {
+            map.insert(prop_name.to_string(), val);
+        }
+    }
+
+    // Replace the VID-string placeholder with the constructed Map
+    row.insert(var.to_string(), Value::Map(map));
+}
+
+/// Merge the helper system columns (`var._vid`, `var._labels`, `var._eid`,
+/// `var._type`) and remaining USER property columns (`var.<prop>`) into the
+/// bare `Map` variable, removing the dotted helper columns from `row`.
+///
+/// Merging user properties keeps `RETURN var.prop` consistent after a
+/// unit-subquery SET refreshes the dotted columns: without it the (now stale)
+/// bare entity Struct from the outer scan would override the post-SET values.
+/// Internal helpers (`_all_props`, `_src_vid`, …) and `overflow_json` are
+/// dropped silently.
+fn merge_dotted_columns(row: &mut HashMap<String, Value>, var: &str) {
+    // Merge node system fields (_vid, _labels)
+    let vid_key = format!("{}._vid", var);
+    let labels_key = format!("{}._labels", var);
+
+    let vid_val = row.remove(&vid_key);
+    let labels_val = row.remove(&labels_key);
+
+    if let Some(Value::Map(map)) = row.get_mut(var) {
+        if let Some(v) = vid_val {
+            map.insert("_vid".to_string(), v);
+        }
+        if let Some(v) = labels_val {
+            map.insert("_labels".to_string(), v);
+        }
+    }
+
+    // Merge edge system fields (_eid, _type, _src_vid, _dst_vid).
+    // These are emitted as helper columns by the traverse exec.
+    // The structural projection already includes them in the struct,
+    // but we still need to remove the dotted helper columns.
+    let eid_key = format!("{}._eid", var);
+    let type_key = format!("{}._type", var);
+
+    let eid_val = row.remove(&eid_key);
+    let type_val = row.remove(&type_key);
+
+    if (eid_val.is_some() || type_val.is_some())
+        && let Some(Value::Map(map)) = row.get_mut(var)
+    {
+        if let Some(v) = eid_val {
+            map.entry("_eid".to_string()).or_insert(v);
+        }
+        if let Some(v) = type_val {
+            map.entry("_type".to_string()).or_insert(v);
+        }
+    }
+
+    // Drain remaining dotted columns, merging surviving USER properties.
+    let prefix = format!("{}.", var);
+    let dotted_keys: Vec<String> = row
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in dotted_keys {
+        let prop_name = key[prefix.len()..].to_string();
+        let val = row.remove(&key);
+        if prop_name.starts_with('_') || prop_name == "overflow_json" {
+            continue;
+        }
+        if let (Some(val), Some(Value::Map(map))) = (val, row.get_mut(var)) {
+            map.insert(prop_name, val);
+        }
+    }
+}
+
 impl Executor {
     /// Helper to verify and filter candidates against an optional predicate.
     ///
@@ -308,17 +400,145 @@ impl Executor {
             None => L0Context::empty(),
         };
 
-        let prop_manager_arc = Arc::new(PropertyManager::new(
-            self.storage.clone(),
-            self.storage.schema_manager_arc(),
-            prop_manager.cache_size(),
-        ));
+        // Prefer the shared `Arc<PropertyManager>` installed via
+        // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
+        // (~80 µs/query) of constructing a fresh, immediately-abandoned
+        // PropertyManager. Falls back to the legacy fresh-construction path
+        // for callers that have not installed one.
+        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref() {
+            shared.clone()
+        } else {
+            Arc::new(PropertyManager::new(
+                self.storage.clone(),
+                self.storage.schema_manager_arc(),
+                prop_manager.cache_size(),
+            ))
+        };
 
-        let session = SessionContext::new();
-        crate::query::df_udfs::register_cypher_udfs(&session)?;
-        if let Some(ref registry) = self.custom_function_registry {
-            crate::query::df_udfs::register_custom_udfs(&session, registry)?;
-        }
+        // Two-mode session construction (hot/cold template path, main)
+        // fused with plugin-framework scalar/optimizer registration
+        // (plugin-fw).
+        //
+        // Hot path: clone the pre-built `df_session_template` — an O(1)
+        // Arc bump on the inner `SessionState`. Skips the ~140 µs cost of
+        // `SessionContext::new()` + `register_cypher_udfs()`. The template
+        // only has the built-in Cypher UDFs baked in (see
+        // `Uni::build` → `register_cypher_udfs`), so it is ONLY safe to
+        // reuse when this query needs no per-query dynamic registration:
+        //   - no legacy `CustomFunctionRegistry` scalars,
+        //   - no plugin-registered optimizer rules,
+        //   - no host-level plugin scalars (`Uni::load_*_plugin`),
+        //   - no session-scoped plugin scalars.
+        //
+        // Cold path: construct a fresh, isolated `SessionContext` (folding
+        // in any plugin optimizer rules) and register the dynamic scalar
+        // sets so they do not leak into the shared template.
+        let has_custom_udfs = self
+            .custom_function_registry
+            .as_ref()
+            .is_some_and(|r| !r.is_empty());
+        let host_plugin_registry = self
+            .procedure_registry
+            .as_ref()
+            .and_then(|pr| pr.plugin_registry());
+        // Optimizer rules come from the host plugin registry (the legacy
+        // `CustomFunctionRegistry` only ever carried scalar fns). When no
+        // host registry is attached, there are no plugin optimizer rules.
+        let optimizer_providers = host_plugin_registry
+            .as_ref()
+            .map(|pr| pr.optimizer_rules())
+            .unwrap_or_default();
+        let session_local_registry =
+            crate::query::df_udfs_plugin::current_session_plugin_registry();
+        let needs_dynamic_registration = has_custom_udfs
+            || !optimizer_providers.is_empty()
+            || host_plugin_registry.is_some()
+            || session_local_registry.is_some();
+
+        let session = if let (Some(tmpl), false) = (
+            self.df_session_template.as_ref(),
+            needs_dynamic_registration,
+        ) {
+            // Hot path: clone the template (Cypher UDFs already registered).
+            (**tmpl).clone()
+        } else {
+            // Cold path: build a fresh session, optionally with any
+            // plugin-registered optimizer rules folded in.
+            //
+            // M5h: build a `SessionContext` that includes any
+            // plugin-registered optimizer rules. The rule chain is
+            // snapshotted at session-construction time; reload discipline
+            // is M10's problem.
+            let session = if optimizer_providers.is_empty() {
+                SessionContext::new()
+            } else {
+                use datafusion::execution::session_state::SessionStateBuilder;
+                use uni_plugin::traits::operator::OptimizerPhase;
+                let mut builder = SessionStateBuilder::new().with_default_features();
+                for provider in optimizer_providers.iter() {
+                    match provider.phase() {
+                        OptimizerPhase::Logical => {
+                            builder = builder.with_optimizer_rule(provider.rule());
+                        }
+                        OptimizerPhase::Physical => {
+                            if let Some(rule) = provider.physical_rule() {
+                                builder = builder.with_physical_optimizer_rule(rule);
+                            } else {
+                                tracing::debug!(
+                                    target: "uni.plugin.registry",
+                                    "physical-phase provider returned no physical_rule(); skipping"
+                                );
+                            }
+                        }
+                        OptimizerPhase::Both => {
+                            builder = builder.with_optimizer_rule(provider.rule());
+                            if let Some(rule) = provider.physical_rule() {
+                                builder = builder.with_physical_optimizer_rule(rule);
+                            }
+                        }
+                        _ => {
+                            tracing::debug!(
+                                target: "uni.plugin.registry",
+                                "skipping optimizer rule for unknown phase"
+                            );
+                        }
+                    }
+                }
+                let state = builder.build();
+                SessionContext::new_with_state(state)
+            };
+            crate::query::df_udfs::register_cypher_udfs(&session)?;
+            // Instance-scope, legacy `CustomFunctionRegistry` shadow path
+            // (db.register_function() entries + apoc-core mirrors). Routed
+            // through the plugin-registry adapter (plugin-fw).
+            if let Some(ref registry) = self.custom_function_registry {
+                crate::query::df_udfs_plugin::register_custom_functions_as_plugin_scalars(
+                    &session, registry,
+                )?;
+            }
+            // Instance-scope, **host** plugin registry (M8.6 follow-up):
+            // `Uni::load_python_plugin` / `Uni::load_rhai_plugin` /
+            // `Uni::load_wasm_*` and other host-level plugin-load paths
+            // register into `UniInner.plugin_registry`. The executor
+            // reaches that registry via the procedure-registry's
+            // attached handle (set by `Uni::build` at construction time).
+            // Without this branch, scalars added through
+            // `Uni::load_*_plugin` were invisible to Cypher's UDF
+            // resolution despite being directly invokable via
+            // `db.plugin_registry().scalar_fn(...)`.
+            if let Some(ref host_pr) = host_plugin_registry {
+                crate::query::df_udfs_plugin::register_plugin_scalar_udfs(&session, host_pr)?;
+            }
+            // Session-scope (M8.6): when the call is inside a
+            // `scoped_with_session_plugin_registry` scope (set by a host
+            // crate's per-query execution path), register the session's
+            // local plugin scalars *last* so they shadow instance entries
+            // by name (DataFusion's `register_udf` is last-write-wins).
+            if let Some(ref session_local) = session_local_registry {
+                crate::query::df_udfs_plugin::register_plugin_scalar_udfs(&session, session_local)?;
+            }
+            session
+        };
         let session_ctx = Arc::new(SyncRwLock::new(session));
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
@@ -335,8 +555,30 @@ impl Executor {
         if let Some(ref registry) = self.procedure_registry {
             planner = planner.with_procedure_registry(registry.clone());
         }
+        // M5b follow-up #4: thread the host's plugin registry through to
+        // the physical planner so `plan_vector_knn` can consult
+        // `register_index_handle` for plugin-supplied vector index
+        // handles. The procedure registry's attached plugin registry is
+        // the host's actual instance (set by `Uni::build`, and what
+        // `db.plugin_registry()` returns to user code). The legacy
+        // `CustomFunctionRegistry` only ever carried scalar fns (no index
+        // handles / optimizer rules), so it is not a source here.
+        let host_plugin_registry = self
+            .procedure_registry
+            .as_ref()
+            .and_then(|r| r.plugin_registry());
+        if let Some(registry) = host_plugin_registry {
+            planner = planner.with_plugin_registry(registry);
+        }
         if let Some(ref xervo_runtime) = self.xervo_runtime {
             planner = planner.with_xervo_runtime(xervo_runtime.clone());
+        }
+        // FU-1 / M11 #6: thread the outer transaction's writer handle
+        // through so declared `WRITE`-mode procedures invoked from
+        // this query can run their Cypher bodies via the write-enabled
+        // inner-query host.
+        if let Some(writer) = &self.writer {
+            planner = planner.with_writer(Arc::clone(writer));
         }
 
         Ok((session_ctx, planner, prop_manager_arc))
@@ -580,75 +822,11 @@ impl Executor {
                     .collect();
 
                 for var in &vid_placeholder_vars {
-                    // Build a Map from system and property columns
-                    let prefix = format!("{}.", var);
-                    let mut map = HashMap::new();
-
-                    let dotted_keys: Vec<String> = row
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-
-                    for key in &dotted_keys {
-                        let prop_name = &key[prefix.len()..];
-                        if let Some(val) = row.remove(key) {
-                            map.insert(prop_name.to_string(), val);
-                        }
-                    }
-
-                    // Replace the VID-string placeholder with the constructed Map
-                    row.insert(var.clone(), Value::Map(map));
+                    promote_vid_placeholder(&mut row, var);
                 }
 
                 for var in &bare_vars {
-                    // Merge node system fields (_vid, _labels)
-                    let vid_key = format!("{}._vid", var);
-                    let labels_key = format!("{}._labels", var);
-
-                    let vid_val = row.remove(&vid_key);
-                    let labels_val = row.remove(&labels_key);
-
-                    if let Some(Value::Map(map)) = row.get_mut(var) {
-                        if let Some(v) = vid_val {
-                            map.insert("_vid".to_string(), v);
-                        }
-                        if let Some(v) = labels_val {
-                            map.insert("_labels".to_string(), v);
-                        }
-                    }
-
-                    // Merge edge system fields (_eid, _type, _src_vid, _dst_vid).
-                    // These are emitted as helper columns by the traverse exec.
-                    // The structural projection already includes them in the struct,
-                    // but we still need to remove the dotted helper columns.
-                    let eid_key = format!("{}._eid", var);
-                    let type_key = format!("{}._type", var);
-
-                    let eid_val = row.remove(&eid_key);
-                    let type_val = row.remove(&type_key);
-
-                    if (eid_val.is_some() || type_val.is_some())
-                        && let Some(Value::Map(map)) = row.get_mut(var)
-                    {
-                        if let Some(v) = eid_val {
-                            map.entry("_eid".to_string()).or_insert(v);
-                        }
-                        if let Some(v) = type_val {
-                            map.entry("_type".to_string()).or_insert(v);
-                        }
-                    }
-
-                    // Remove remaining dotted helper columns (e.g. _all_props, _src_vid, _dst_vid)
-                    let prefix = format!("{}.", var);
-                    let helper_keys: Vec<String> = row
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-                    for key in helper_keys {
-                        row.remove(&key);
-                    }
+                    merge_dotted_columns(&mut row, var);
                 }
 
                 rows.push(row);
@@ -788,9 +966,7 @@ impl Executor {
                 self.execute_subplan(plan, prop_manager, params, ctx.as_ref())
                     .await
             } else {
-                let batches = self
-                    .execute_datafusion(plan.clone(), prop_manager, params)
-                    .await?;
+                let batches = self.execute_datafusion(plan, prop_manager, params).await?;
                 self.record_batches_to_rows(batches)
             };
 
@@ -972,6 +1148,14 @@ impl Executor {
                 | "uni.vector.query"
                 | "uni.fts.query"
                 | "uni.search"
+                // M5g — `uni.create.vNode` produces a typed Node yield
+                // via the planner-level node-shape expansion in
+                // `GraphProcedureCallExec`; only the DataFusion path
+                // honours that, so route it there explicitly. (vEdge
+                // emits a self-contained Struct column and works on
+                // either path — list both for symmetry.)
+                | "uni.create.vNode"
+                | "uni.create.vEdge"
         ) || name.starts_with("uni.algo.")
     }
 
@@ -2811,7 +2995,8 @@ impl Executor {
                 | LogicalPlan::LocyBestBy { .. }
                 | LogicalPlan::LocyPriority { .. }
                 | LogicalPlan::LocyDerivedScan { .. }
-                | LogicalPlan::LocyProject { .. } => {
+                | LogicalPlan::LocyProject { .. }
+                | LogicalPlan::LocyModelInvoke { .. } => {
                     unreachable!("Locy operators are handled by DataFusion engine")
                 }
             }
@@ -2827,7 +3012,7 @@ impl Executor {
         &self,
         plan: LogicalPlan,
         scope: &mut HashMap<String, Value>,
-        writer: &mut uni_store::runtime::writer::Writer,
+        writer: &uni_store::runtime::writer::Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -2843,12 +3028,21 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    &crate::query::df_graph::mutation_common::Prefetch::default(),
                 )
                 .await?;
             }
             LogicalPlan::Remove { items, .. } => {
-                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx, tx_l0)
-                    .await?;
+                self.execute_remove_items_locked(
+                    &items,
+                    scope,
+                    writer,
+                    prop_manager,
+                    ctx,
+                    tx_l0,
+                    &crate::query::df_graph::mutation_common::Prefetch::default(),
+                )
+                .await?;
             }
             LogicalPlan::Delete { items, detach, .. } => {
                 for expr in &items {
@@ -2910,6 +3104,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        &crate::query::df_graph::mutation_common::Prefetch::default(),
                     )
                     .await?;
                 }
@@ -3812,7 +4007,7 @@ impl Executor {
     ) -> Result<Vec<HashMap<String, Value>>> {
         // 1. Flush L0
         if let Some(writer_arc) = &self.writer {
-            let mut writer = writer_arc.write().await;
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             writer.flush_to_l1(None).await?;
         }
 
@@ -3877,6 +4072,7 @@ impl Executor {
     /// Streams data from source to destination, supporting cross-cloud backups.
     async fn backup_to_cloud(&self, dest_url: &str, _snapshot_id: &str) -> Result<()> {
         use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as ObjPath;
 
@@ -4073,7 +4269,12 @@ impl Executor {
         let headers = rdr.headers()?.clone();
         let mut count = 0;
 
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
+
+        // Chunked VID/EID refill for streaming CSV: amortizes the IdAllocator
+        // mutex over `CSV_ID_CHUNK` rows. End-of-iteration may waste up to
+        // CSV_ID_CHUNK-1 IDs — harmless in the u64 space.
+        const CSV_ID_CHUNK: usize = 256;
 
         if label_meta.is_some() {
             let target_props = schema
@@ -4081,6 +4282,8 @@ impl Executor {
                 .get(target)
                 .ok_or_else(|| anyhow!("Properties for label '{}' not found", target))?;
 
+            let mut vid_chunk: std::collections::VecDeque<Vid> =
+                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
             for result in rdr.records() {
                 let record = result?;
                 let mut props = HashMap::new();
@@ -4094,7 +4297,10 @@ impl Executor {
                     }
                 }
 
-                let vid = writer.next_vid().await?;
+                if vid_chunk.is_empty() {
+                    vid_chunk.extend(writer.allocate_vids(CSV_ID_CHUNK).await?);
+                }
+                let vid = vid_chunk.pop_front().unwrap();
                 writer
                     .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                     .await?;
@@ -4118,6 +4324,8 @@ impl Executor {
                 .and_then(|v| v.as_str())
                 .unwrap_or("_dst");
 
+            let mut eid_chunk: std::collections::VecDeque<Eid> =
+                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
             for result in rdr.records() {
                 let record = result?;
                 let mut props = HashMap::new();
@@ -4144,7 +4352,10 @@ impl Executor {
                 let dst = dst_vid
                     .ok_or_else(|| anyhow!("Missing destination VID in column '{}'", dst_col))?;
 
-                let eid = writer.next_eid(type_id).await?;
+                if eid_chunk.is_empty() {
+                    eid_chunk.extend(writer.allocate_eids(CSV_ID_CHUNK).await?);
+                }
+                let eid = eid_chunk.pop_front().unwrap();
                 writer
                     .insert_edge(
                         src,
@@ -4204,7 +4415,7 @@ impl Executor {
         let mut reader = reader;
 
         let mut count = 0;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
 
         if label_meta.is_some() {
             let target_props = schema
@@ -4214,7 +4425,10 @@ impl Executor {
 
             for batch in reader.by_ref() {
                 let batch = batch?;
-                for row in 0..batch.num_rows() {
+                let num_rows = batch.num_rows();
+                // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
+                let vids = writer.allocate_vids(num_rows).await?;
+                for (row, &vid) in vids.iter().enumerate().take(num_rows) {
                     let mut props = HashMap::new();
                     for field in batch.schema().fields() {
                         let name = field.name();
@@ -4229,7 +4443,6 @@ impl Executor {
                             }
                         }
                     }
-                    let vid = writer.next_vid().await?;
                     writer
                         .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                         .await?;
@@ -4254,7 +4467,10 @@ impl Executor {
 
             for batch in reader {
                 let batch = batch?;
-                for row in 0..batch.num_rows() {
+                let num_rows = batch.num_rows();
+                // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
+                let eids = writer.allocate_eids(num_rows).await?;
+                for (row, &eid) in eids.iter().enumerate().take(num_rows) {
                     let mut props = HashMap::new();
                     let mut src_vid = None;
                     let mut dst_vid = None;
@@ -4286,7 +4502,6 @@ impl Executor {
                         anyhow!("Missing destination VID in column '{}'", dst_col)
                     })?;
 
-                    let eid = writer.next_eid(type_id).await?;
                     writer
                         .insert_edge(
                             src,
@@ -4315,7 +4530,7 @@ impl Executor {
         &self,
         source_url: &str,
     ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
 
         let (store, path) = build_store_from_url(source_url)?;
 
@@ -5083,7 +5298,7 @@ impl Executor {
         rows: &[HashMap<String, uni_common::Value>],
         arrow_schema: &arrow_schema::Schema,
     ) -> Result<()> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
 
         let (store, path) = build_store_from_url(dest_url)?;
 
@@ -5211,7 +5426,7 @@ impl Executor {
     pub(crate) async fn detach_delete_vertex(
         &self,
         vid: Vid,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
@@ -5256,18 +5471,28 @@ impl Executor {
         Ok(())
     }
 
-    /// Batch detach-delete: load subgraphs for all VIDs at once, then delete edges and vertices.
-    pub(crate) async fn batch_detach_delete_vertices(
+    /// Load outgoing + incoming subgraphs (1-hop) for a batch of vertices
+    /// in two scans — one per direction. Shared infrastructure for
+    /// `batch_detach_delete_vertices` (which deletes the loaded edges) and
+    /// `batch_check_vertices_have_no_edges` (which errors if any
+    /// non-tombstoned edges exist).
+    ///
+    /// Returns raw `WorkingGraph`s with **no tombstone filtering**;
+    /// callers that care about same-batch edge deletes (e.g., the
+    /// non-detach check that runs after edges have been individually
+    /// DELETEd) layer the filter on top.
+    async fn batch_load_incident_edges(
         &self,
         vids: &[Vid],
-        labels_per_vid: Vec<Option<Vec<String>>>,
-        writer: &mut Writer,
-        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
-    ) -> Result<()> {
+        writer: &Writer,
+    ) -> Result<(
+        uni_store::runtime::working_graph::WorkingGraph,
+        uni_store::runtime::working_graph::WorkingGraph,
+    )> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
+        let l0 = Some(writer.l0_manager.get_current());
 
-        // Load outgoing subgraph for all VIDs in one call.
         let out_graph = self
             .storage
             .load_subgraph_cached(
@@ -5275,17 +5500,9 @@ impl Executor {
                 &edge_type_ids,
                 1,
                 uni_store::runtime::Direction::Outgoing,
-                Some(writer.l0_manager.get_current()),
+                l0.clone(),
             )
             .await?;
-
-        for edge in out_graph.edges() {
-            writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
-                .await?;
-        }
-
-        // Load incoming subgraph for all VIDs in one call.
         let in_graph = self
             .storage
             .load_subgraph_cached(
@@ -5293,21 +5510,93 @@ impl Executor {
                 &edge_type_ids,
                 1,
                 uni_store::runtime::Direction::Incoming,
-                Some(writer.l0_manager.get_current()),
+                l0,
             )
             .await?;
+        Ok((out_graph, in_graph))
+    }
 
+    /// Batch detach-delete: load subgraphs for all VIDs at once, then delete edges and vertices.
+    pub(crate) async fn batch_detach_delete_vertices(
+        &self,
+        vids: &[Vid],
+        labels_per_vid: Vec<Option<Vec<String>>>,
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
+
+        for edge in out_graph.edges() {
+            writer
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
+                .await?;
+        }
         for edge in in_graph.edges() {
             writer
                 .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
-        // Delete all vertices.
         for (vid, labels) in vids.iter().zip(labels_per_vid) {
             writer.delete_vertex(*vid, labels, tx_l0).await?;
         }
 
+        Ok(())
+    }
+
+    /// Batch non-detach DELETE check: verify NO incident edges exist for
+    /// any VID in `vids`, modulo tombstones from the writer's L0 and the
+    /// tx-local L0 (same set the per-VID `check_vertex_has_no_edges`
+    /// consults at write.rs:2650-2673).
+    ///
+    /// Why this exists: the per-VID `check_vertex_has_no_edges` does two
+    /// `load_subgraph_cached(&[vid], ...)` calls per vertex (outgoing +
+    /// incoming). At N vertices that's 2N subgraph loads. The batched
+    /// path collapses to 2 loads regardless of N.
+    ///
+    /// Tombstone visibility: detach (which deletes everything) doesn't
+    /// need the tombstone filter; non-detach does, because the caller
+    /// may have already DELETEd some incident edges in the same
+    /// statement (e.g. `MATCH (a)-[r]->(b) DELETE r, a` — edges are
+    /// deleted before nodes per mutation_common.rs:720-724, so by the
+    /// time this check runs, `r`'s eid is in `tx_l0.tombstones` and
+    /// must be excluded from the "still has edges" set).
+    pub(crate) async fn batch_check_vertices_have_no_edges(
+        &self,
+        vids: &[Vid],
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        if vids.is_empty() {
+            return Ok(());
+        }
+
+        let mut tombstoned_eids: std::collections::HashSet<uni_common::core::id::Eid> =
+            std::collections::HashSet::new();
+        {
+            let writer_l0 = writer.l0_manager.get_current();
+            let guard = writer_l0.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
+        if let Some(tx) = tx_l0 {
+            let guard = tx.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
+
+        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
+
+        for edge in out_graph.edges().chain(in_graph.edges()) {
+            if !tombstoned_eids.contains(&edge.eid) {
+                return Err(anyhow!(
+                    "ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node {}, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.",
+                    edge.src_vid
+                ));
+            }
+        }
         Ok(())
     }
 }

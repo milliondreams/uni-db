@@ -23,10 +23,10 @@ impl GraphAlgoAdapter for ClosenessAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> ClosenessConfig {
-        ClosenessConfig {
+    fn to_config(args: Vec<Value>) -> Result<ClosenessConfig> {
+        Ok(ClosenessConfig {
             wasserman_faust: args[0].as_bool().unwrap_or(false),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

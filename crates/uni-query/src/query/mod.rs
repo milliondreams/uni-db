@@ -5,24 +5,28 @@
 //!
 //! Contains the logical planner, executor, DataFusion integration,
 //! predicate pushdown, rewrite rules, and supporting utilities.
+//!
+//! Leaf modules (df_udfs, datetime, spatial, df_expr, expr_eval,
+//! cypher_type_coerce, function_props, fusion, pushdown, rewrite,
+//! similar_to) live in the `uni-query-functions` crate and are
+//! re-exported below so downstream callers can keep using
+//! `uni_query::query::<name>::*`.
 
-pub mod cypher_type_coerce;
-pub mod datetime;
-pub mod df_expr;
 pub mod df_graph;
 pub mod df_planner;
-pub mod df_udfs;
+pub mod df_udaf_plugin;
+pub mod df_udfs_plugin;
 pub mod executor;
-pub mod expr_eval;
-pub mod function_props;
-pub mod fusion;
 pub mod locy_planner;
 pub mod planner;
 pub mod planner_locy_types;
-pub mod pushdown;
-pub mod rewrite;
-pub mod similar_to;
-pub mod spatial;
+
+// Re-export leaves from uni-query-functions so external code keeps
+// working without path changes.
+pub use uni_query_functions::{
+    cypher_type_coerce, datetime, df_expr, df_udfs, expr_eval, function_props, fusion, pushdown,
+    rewrite, similar_to, spatial,
+};
 
 /// Supported window function names (uppercase).
 /// Used by both planner and executor for consistency.

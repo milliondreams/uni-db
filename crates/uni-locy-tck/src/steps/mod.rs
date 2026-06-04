@@ -1,3 +1,4 @@
+mod assertions;
 mod given;
 mod then_compile;
 mod then_evaluate;

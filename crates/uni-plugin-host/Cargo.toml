@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Dragonscale Team
+[package]
+name = "uni-plugin-host"
+description = "Host-side runtime for the uni-db plugin framework (triggers, CDC, scheduler, persistence, synthetic procedures)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uni-common = { workspace = true }
+uni-query = { workspace = true }
+uni-store = { workspace = true }
+uni-cypher = { workspace = true }
+uni-plugin = { workspace = true, features = ["otel"] }
+uni-plugin-custom = { workspace = true }
+uni-sidecar = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = "58.3.0"
+serde_bytes = "0.11"
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+smol_str = "0.3"
+# observability — OpenTelemetry tracing-subscriber layer + traceparent helpers
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

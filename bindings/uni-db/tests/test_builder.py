@@ -3,6 +3,7 @@
 
 """Tests for UniBuilder API."""
 
+import gc
 import os
 import shutil
 import tempfile
@@ -26,6 +27,11 @@ class TestUniBuilderOpenModes:
             session = db.session()
             results = session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 0
+            # Stop background threads before TemporaryDirectory rmtree.
+            db.shutdown()
+            del session
+            del db
+            gc.collect()
 
     def test_create_fails_if_exists(self):
         """Test that create() fails if database exists."""
@@ -36,7 +42,9 @@ class TestUniBuilderOpenModes:
             db1 = uni_db.UniBuilder.create(path).build()
             db1.schema().label("Test").apply()
             db1.flush()
+            db1.shutdown()
             del db1
+            gc.collect()
 
             # Create again should fail
             with pytest.raises(uni_db.UniError):
@@ -56,8 +64,10 @@ class TestUniBuilderOpenModes:
             tx.execute("CREATE (n:Person {name: 'Alice'})")
             tx.commit()
             db1.flush()
+            db1.shutdown()
             del session1
             del db1
+            gc.collect()
 
             # Open existing
             db2 = uni_db.UniBuilder.open_existing(path).build()
@@ -65,6 +75,10 @@ class TestUniBuilderOpenModes:
             results = session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Alice"
+            db2.shutdown()
+            del session2
+            del db2
+            gc.collect()
 
     def test_open_existing_fails_if_not_exists(self):
         """Test that open_existing() fails if database doesn't exist."""
@@ -85,6 +99,10 @@ class TestUniBuilderOpenModes:
             tx.execute("CREATE (n:Test)")
             tx.commit()
             db.flush()
+            db.shutdown()
+            del session
+            del db
+            gc.collect()
 
     def test_open_reuses_existing(self):
         """Test that open() reuses existing database."""
@@ -98,8 +116,10 @@ class TestUniBuilderOpenModes:
             tx.execute("CREATE (n:Person {name: 'Bob'})")
             tx.commit()
             db1.flush()
+            db1.shutdown()
             del session1
             del db1
+            gc.collect()
 
             # Open should see existing data
             db2 = uni_db.UniBuilder.open(path).build()
@@ -107,6 +127,10 @@ class TestUniBuilderOpenModes:
             results = session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Bob"
+            db2.shutdown()
+            del session2
+            del db2
+            gc.collect()
 
     def test_temporary_database(self):
         """Test creating a temporary database."""
@@ -136,6 +160,9 @@ class TestUniBuilderConfiguration:
                 .build()
             )
             assert db is not None
+            db.shutdown()
+            del db
+            gc.collect()
 
     def test_parallelism(self):
         """Test setting parallelism level."""
@@ -143,6 +170,9 @@ class TestUniBuilderConfiguration:
             path = os.path.join(tmpdir, "testdb")
             db = uni_db.UniBuilder.create(path).parallelism(4).build()
             assert db is not None
+            db.shutdown()
+            del db
+            gc.collect()
 
     def test_chained_configuration(self):
         """Test chaining multiple configuration options."""
@@ -164,6 +194,10 @@ class TestUniBuilderConfiguration:
             db.flush()
             results = session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
+            db.shutdown()
+            del session
+            del db
+            gc.collect()
 
 
 class TestBackwardCompatibility:
@@ -182,3 +216,7 @@ class TestBackwardCompatibility:
             db.flush()
             results = session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1
+            db.shutdown()
+            del session
+            del db
+            gc.collect()

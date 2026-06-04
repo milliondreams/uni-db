@@ -3,6 +3,7 @@
 
 """Tests for AsyncUniBuilder API."""
 
+import gc
 import os
 import tempfile
 
@@ -25,6 +26,11 @@ class TestAsyncUniBuilderOpenModes:
             await db.schema().label("Test").apply()
             results = await session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 0
+            # Stop background threads before TemporaryDirectory rmtree.
+            await db.shutdown()
+            del session
+            del db
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_create_fails_if_exists(self):
@@ -34,7 +40,9 @@ class TestAsyncUniBuilderOpenModes:
             db1 = await uni_db.AsyncUniBuilder.create(path).build()
             await db1.schema().label("Test").apply()
             await db1.flush()
+            await db1.shutdown()
             del db1
+            gc.collect()
 
             with pytest.raises(uni_db.UniError):
                 await uni_db.AsyncUniBuilder.create(path).build()
@@ -51,13 +59,20 @@ class TestAsyncUniBuilderOpenModes:
             await tx1.execute("CREATE (n:Person {name: 'Alice'})")
             await tx1.commit()
             await db1.flush()
+            await db1.shutdown()
+            del session1
             del db1
+            gc.collect()
 
             db2 = await uni_db.AsyncUniBuilder.open_existing(path).build()
             session2 = db2.session()
             results = await session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Alice"
+            await db2.shutdown()
+            del session2
+            del db2
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_open_existing_fails_if_not_exists(self):
@@ -80,6 +95,10 @@ class TestAsyncUniBuilderOpenModes:
             await tx.execute("CREATE (n:Test)")
             await tx.commit()
             await db.flush()
+            await db.shutdown()
+            del session
+            del db
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_open_reuses_existing(self):
@@ -93,13 +112,20 @@ class TestAsyncUniBuilderOpenModes:
             await tx1.execute("CREATE (n:Person {name: 'Bob'})")
             await tx1.commit()
             await db1.flush()
+            await db1.shutdown()
+            del session1
             del db1
+            gc.collect()
 
             db2 = await uni_db.AsyncUniBuilder.open(path).build()
             session2 = db2.session()
             results = await session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Bob"
+            await db2.shutdown()
+            del session2
+            del db2
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_temporary_database(self):
@@ -131,6 +157,9 @@ class TestAsyncUniBuilderConfiguration:
                 .build()
             )
             assert db is not None
+            await db.shutdown()
+            del db
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_parallelism(self):
@@ -139,6 +168,9 @@ class TestAsyncUniBuilderConfiguration:
             path = os.path.join(tmpdir, "testdb")
             db = await uni_db.AsyncUniBuilder.create(path).parallelism(4).build()
             assert db is not None
+            await db.shutdown()
+            del db
+            gc.collect()
 
     @pytest.mark.asyncio
     async def test_chained_configuration(self):
@@ -160,6 +192,10 @@ class TestAsyncUniBuilderConfiguration:
             await db.flush()
             results = await session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
+            await db.shutdown()
+            del session
+            del db
+            gc.collect()
 
 
 class TestAsyncInMemory:
@@ -198,3 +234,7 @@ class TestAsyncBackwardCompatibility:
             await db.flush()
             results = await session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1
+            await db.shutdown()
+            del session
+            del db
+            gc.collect()

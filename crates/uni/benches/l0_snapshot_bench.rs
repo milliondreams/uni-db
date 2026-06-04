@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use mimalloc::MiMalloc;
-use std::hint::black_box;
 use parking_lot::RwLock;
+use std::hint::black_box;
 
 use uni_common::core::id::{Eid, Vid};
 use uni_common::{Properties, Value};

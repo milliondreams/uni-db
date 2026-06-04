@@ -20,7 +20,10 @@ pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 # CPU) plus NVIDIA acceleration. xervo 0.9.0's gpu-cuda activates ort/cuda
 # directly and the candle?/cuda + mistralrs?/cuda kernels for the local
 # providers already in the default.
-uni-db = { workspace = true, default-features = true, features = ["gpu-cuda", "mimalloc"] }
+# `pyo3-plugins` is opt-in (not in uni-db's default set) but the shared
+# binding source calls the PyO3 plugin loaders unconditionally, so it must
+# be enabled here. `rhai-plugins` already rides in via default-features.
+uni-db = { workspace = true, default-features = true, features = ["gpu-cuda", "mimalloc", "pyo3-plugins"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

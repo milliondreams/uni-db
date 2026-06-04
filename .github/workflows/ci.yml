@@ -349,3 +349,52 @@ jobs:
             --exclude uni-python-onnx-metal
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Release-path guards. The wheel matrix and crates.io publish list are only
+  # exercised by the release workflows, which `nextest` never touches — so
+  # feature drift (a wheel variant missing a plugin feature) and an incomplete
+  # crates.io publish list slip through green CI and only fail at release time.
+  # These checks reproduce both failure modes cheaply on every push.
+  release-guards:
+    name: Release Guards
+    needs: test
+    runs-on: linux-xlarge-32
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Static check (no compile): every wheel variant must enable the plugin
+      # loader features its shared binding source calls unconditionally.
+      - name: Check wheel-variant plugin features
+        run: python3 scripts/ci/check_wheel_variant_features.py
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      # The crates.io publish list must be uni-db's full publishable
+      # dependency closure in topological order (uses `cargo metadata`).
+      - name: Check crates.io publish list
+        run: python3 scripts/ci/check_publish_list.py
+
+      # Compile guard for the slim `default-features = false` wheel path, where
+      # plugin-feature drift surfaces. The CUDA/Metal variants can't build on a
+      # plain Linux runner (toolkit / Apple-only) — the static check above
+      # covers their feature wiring.
+      - name: Compile-check slim ONNX wheel variant
+        run: cargo check -p uni-python-onnx

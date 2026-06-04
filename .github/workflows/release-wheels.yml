@@ -163,7 +163,11 @@ jobs:
       fail-fast: false
       matrix:
         variant: [uni-db, uni-db-onnx]
-        target: [x86_64, aarch64]
+        # Apple Silicon only. ort (ONNX Runtime) ships no prebuilt binary for
+        # x86_64-apple-darwin, so Intel-macOS wheels can't link the onnx
+        # provider. Intel Macs are EOL and the metal variants are already
+        # aarch64-only — drop x86_64 rather than build ORT from source.
+        target: [aarch64]
     steps:
       - uses: actions/checkout@v4
 
@@ -395,6 +399,14 @@ jobs:
         uses: PyO3/maturin-action@v1
         env:
           RUSTFLAGS: ""
+          # candle/mistralrs CUDA kernels auto-detect the GPU compute
+          # capability via nvidia-smi, which doesn't exist on GPU-less build
+          # runners. Pin the target arch explicitly (SM 8.0 / Ampere). PTX is
+          # forward-compatible, so SM80 runs on Ampere through Hopper/Blackwell
+          # via driver JIT. No GPU is needed to build — only the toolkit (nvcc),
+          # which is installed below. Also exported in before-script-linux,
+          # which runs inside the manylinux container.
+          CUDA_COMPUTE_CAP: "80"
         with:
           target: x86_64
           args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
@@ -412,6 +424,9 @@ jobs:
             dnf install -y cuda-toolkit-13-0
             export PATH="/usr/local/cuda-13.0/bin:$PATH"
             export CUDA_HOME="/usr/local/cuda-13.0"
+            # No live GPU in the build container — pin the compute capability
+            # so candle/mistralrs don't try to probe nvidia-smi (see step env).
+            export CUDA_COMPUTE_CAP=80
             nvcc --version
 
       - name: Repair wheel with CUDA host-lib excludes

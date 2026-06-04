@@ -25,6 +25,12 @@ pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 uni-db = { workspace = true, default-features = false, features = [
     "lance-backend",
     "mimalloc",
+    # Plugin loaders the shared binding source calls unconditionally.
+    # `rhai-plugins` is in uni-db's default set, but this variant uses
+    # `default-features = false`, so both it and `pyo3-plugins` (always
+    # opt-in) must be re-listed explicitly or the wheel fails to compile.
+    "rhai-plugins",
+    "pyo3-plugins",
     "provider-onnx",
     "gpu-metal",
     "provider-openai",

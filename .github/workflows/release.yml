@@ -300,8 +300,6 @@ jobs:
     needs: [build-pydantic]
     runs-on: ubuntu-latest
     environment: testpypi
-    permissions:
-      id-token: write
     # Mirrors the testpypi gate from `release-wheels.yml`'s `publish-testpypi`.
     if: |
       needs.build-pydantic.result == 'success'
@@ -318,15 +316,15 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Publish to TestPyPI
-        run: uv publish --trusted-publishing always --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: uv publish --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
 
   publish-pydantic-pypi:
     name: Publish uni-pydantic to PyPI
     needs: [build-pydantic]
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      id-token: write
     # Mirrors the pypi gate from `release-wheels.yml`'s `publish-pypi`.
     if: |
       needs.build-pydantic.result == 'success'
@@ -342,4 +340,6 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Publish to PyPI
-        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --check-url https://pypi.org/simple/ dist/*

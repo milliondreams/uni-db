@@ -84,27 +84,36 @@ jobs:
             exit 1
           fi
 
-          # Every wheel-matrix sibling pyproject + uni-pydantic shares the same
-          # lock-step version. This workflow builds and publishes uni-pydantic
-          # too, so validate it here as well. Keep in sync with workspace
-          # members under `bindings/`.
+          # The six maturin wheel pyprojects single-source their version from
+          # the workspace Cargo version via `dynamic = ["version"]`. Assert none
+          # reintroduced a hardcoded literal that would drift from the source.
           for pyproject in \
             bindings/uni-db/pyproject.toml \
             bindings/uni-db-onnx/pyproject.toml \
             bindings/uni-db-cuda/pyproject.toml \
             bindings/uni-db-metal/pyproject.toml \
             bindings/uni-db-onnx-cuda/pyproject.toml \
-            bindings/uni-db-onnx-metal/pyproject.toml \
-            bindings/uni-pydantic/pyproject.toml; do
-            # Python versions are single-sourced from the workspace Cargo version
-            # (maturin wheels use `dynamic = ["version"]`). Assert none
-            # reintroduced a hardcoded literal that would drift from the source.
+            bindings/uni-db-onnx-metal/pyproject.toml; do
             if grep -qE '^version = ' "$pyproject"; then
               echo "Error: $pyproject hardcodes a version; use 'dynamic = [\"version\"]' so the single source ([workspace.package] version) is reused."
               exit 1
             fi
             echo "OK: $pyproject derives its version from the workspace"
           done
+
+          # uni-pydantic is the deliberate exception: it's pure-Python
+          # (hatchling), and its isolated build can't reliably read the
+          # workspace Cargo.toml (it resolves a bogus version), so it CANNOT use
+          # maturin's `dynamic = ["version"]`. It carries the one version literal
+          # outside Cargo.toml. This workflow builds/publishes it, so assert that
+          # literal stays in lock-step with the workspace version — do NOT demand
+          # `dynamic` here (that would be the bug this comment guards against).
+          PYDANTIC_VERSION=$(grep '^version = ' bindings/uni-pydantic/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$PYDANTIC_VERSION" ]; then
+            echo "Error: bindings/uni-pydantic/pyproject.toml version ($PYDANTIC_VERSION) does not match the workspace version ($VERSION)"
+            exit 1
+          fi
+          echo "OK: bindings/uni-pydantic/pyproject.toml literal matches the workspace at $VERSION"
 
   # CPU-only Linux wheels: the default-everything `uni-db` and the slim
   # ONNX-only `uni-db-onnx`. CUDA-equipped variants live in dedicated jobs

@@ -480,36 +480,61 @@ jobs:
             export RUSTFLAGS="-Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
             echo "RUSTFLAGS in build container: ${RUSTFLAGS}"
             nvcc --version
+            # CRITICAL: stage this container's glibc-2.34 OpenSSL 3 for the repair.
+            # The `auditwheel repair` step runs on the HOST runner (Ubuntu, glibc
+            # 2.39), NOT in this container. auditwheel BUNDLES the wheel's
+            # non-excluded deps — libssl.so.3 / libcrypto.so.3 — by resolving them
+            # on the host, where OpenSSL 3 carries GLIBC_2.38 symbols that bust the
+            # manylinux_2_34 policy ("too-recent versioned symbols"). The CUDA .so
+            # itself is fully compliant (GLIBC<=2.34); the violation is injected at
+            # bundle time by host OpenSSL. Copy the container's glibc-2.34 OpenSSL 3
+            # to a workspace dir; the repair step puts it first on LD_LIBRARY_PATH
+            # so auditwheel bundles THOSE. Same pattern the onnx-cuda job uses for
+            # OpenSSL 1.1. Verified locally: without this the repair fails with the
+            # exact CI error; with it the wheel relabels to manylinux_2_34.
+            mkdir -p "$GITHUB_WORKSPACE/_cudahostlibs"
+            cp -av /usr/lib64/libssl.so.3* /usr/lib64/libcrypto.so.3* "$GITHUB_WORKSPACE/_cudahostlibs/" 2>/dev/null || true
 
       - name: Repair wheel with CUDA host-lib excludes
         run: |
           set -euo pipefail
           pip install auditwheel patchelf
           mkdir -p dist
-          # uni-db-cuda links OpenSSL 3 (libcrypto.so.3), which the ubuntu
-          # runner provides host-native — so unlike the onnx-cuda job (ORT EP →
-          # libcrypto.so.1.1), no OpenSSL-1.1 staging is needed here. The real
-          # fix for this job is -static-libstdc++ in the build step above.
+          # Resolve libssl.so.3 / libcrypto.so.3 against the container's
+          # glibc-2.34 OpenSSL 3 (staged into _cudahostlibs by the build step),
+          # NOT this host runner's glibc-2.39 OpenSSL 3 (which references
+          # GLIBC_2.38 and would fail the manylinux_2_34 relabel). auditwheel
+          # bundles whatever LD_LIBRARY_PATH resolves first. See the staging
+          # rationale in the build step's before-script.
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/_cudahostlibs:${LD_LIBRARY_PATH:-}"
           # Same exclude list as `build-cuda-linux`. Note: candle's CUDA
           # path uses `cudarc` which dlopens libcudart at runtime; that's
           # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in
           # transitively for matrix ops.
-          # Diagnostic (cheap): print the highest libstdc++/libgcc versioned
-          # symbols the built .so references BEFORE repair. If -static-libstdc++
-          # took effect, the max GLIBCXX is <= 3.4.29 (or libstdc++ is absent
-          # from NEEDED entirely); if the flag was silently dropped, gcc-14's
-          # GLIBCXX_3.4.30+ shows up here and auditwheel rejects it below. This
-          # makes any future "too-recent symbol" failure self-explaining.
-          pip install pyelftools >/dev/null 2>&1 || true
+          # Authoritative pre-repair symbol audit. An earlier GLIBCXX-only audit
+          # proved libstdc++ is already compliant (GLIBCXX_3.4.29) yet repair
+          # still fails with "too-recent versioned symbols" — so the offender is
+          # a DIFFERENT class we weren't printing. `auditwheel show` names the
+          # exact library + the versioned symbols that constrain the platform
+          # tag; that is the ground truth. We also print the max referenced
+          # version per class against the manylinux_2_34 caps (GLIBC<=2.34,
+          # GCC[libgcc_s]<=7.0.0, GLIBCXX<=3.4.29, CXXABI<=1.3.13) so the
+          # offending class is obvious at a glance.
           for whl in dist-raw/*.whl; do
+            echo "########## auditwheel show: $(basename "$whl") ##########"
+            auditwheel show "$whl" || true
             tmp=$(mktemp -d)
             unzip -q "$whl" -d "$tmp"
             for so in $(find "$tmp" -name '*.so'); do
               echo "=== symbol audit: $(basename "$so") ==="
-              echo "NEEDED libstdc++/libgcc:"
-              readelf -d "$so" 2>/dev/null | grep -E 'libstdc\+\+|libgcc' || echo "  (none — fully static C++ runtime)"
-              echo "max GLIBCXX: $(readelf -sW "$so" 2>/dev/null | grep -oE 'GLIBCXX_[0-9.]+' | sort -V | tail -1 || echo none)"
-              echo "max CXXABI:  $(readelf -sW "$so" 2>/dev/null | grep -oE 'CXXABI_[0-9.]+' | sort -V | tail -1 || echo none)"
+              echo "  NEEDED: $(readelf -d "$so" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"
+              for cls in GLIBC GLIBCXX CXXABI GCC; do
+                printf '  max %-8s %s\n' "$cls" "$(readelf -sW "$so" 2>/dev/null | grep -oE "${cls}_[0-9.]+" | sort -V | tail -1 || echo none)"
+              done
+              # Full GLIBC ref list: any entry > 2.34 is the offender (the image
+              # itself can't emit GCC>7.0.0 or GLIBC>2.34, so a >2.34 here must
+              # come from a CUDA-toolkit-provided object, not the base toolchain).
+              echo "  all GLIBC refs: $(readelf -sW "$so" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tr '\n' ' ')"
             done
             rm -rf "$tmp"
           done

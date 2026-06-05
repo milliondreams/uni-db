@@ -36,10 +36,10 @@ on:
         type: boolean
         default: false
       target:
-        description: 'Publish target (ignored for dry_run)'
+        description: 'Publish target (ignored for dry_run). "none" builds wheels and attaches them to the GitHub Release without publishing to any index.'
         type: choice
-        options: [pypi, testpypi]
-        default: testpypi
+        options: [none, testpypi, pypi]
+        default: none
   push:
     tags: ['v*.*.*']
 
@@ -58,6 +58,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.set-version.outputs.version }}
+      publish_target: ${{ steps.resolve-target.outputs.publish_target }}
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +115,26 @@ jobs:
             exit 1
           fi
           echo "OK: bindings/uni-pydantic/pyproject.toml literal matches the workspace at $VERSION"
+
+      # Single source of truth for where wheels get published. Every PyPI /
+      # TestPyPI publish job below gates on this output; on a `none` target the
+      # build + GitHub-Release-attach jobs still run, but nothing is pushed to
+      # an index.
+      - name: Resolve publish target
+        id: resolve-target
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TARGET="${{ inputs.target }}"
+          else
+            # Default publish target for tag-push releases. Currently 'none'
+            # because PyPI per-project file-size-limit increases are pending
+            # (wheels exceed the 100 MB default). Tag-push builds the matrix and
+            # attaches it to the GitHub Release as the interim install channel.
+            # >>> Switch this to 'pypi' once the PyPI limit increases are granted. <<<
+            TARGET="none"
+          fi
+          echo "publish_target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Resolved publish target: $TARGET"
 
   # CPU-only Linux wheels: the default-everything `uni-db` and the slim
   # ONNX-only `uni-db-onnx`. CUDA-equipped variants live in dedicated jobs
@@ -590,10 +611,10 @@ jobs:
 
   publish-testpypi:
     name: Publish uni-db wheels to TestPyPI
-    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
+    needs: [validate, build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
-    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    if: needs.validate.outputs.publish_target == 'testpypi'
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -617,10 +638,10 @@ jobs:
 
   publish-pypi:
     name: Publish uni-db wheels to PyPI
-    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
+    needs: [validate, build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    if: needs.validate.outputs.publish_target == 'pypi'
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -642,6 +663,55 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: uv publish --check-url https://pypi.org/simple/ dist/*
 
+  # Attach the built wheels (+ sdists) to the GitHub Release as assets. This is
+  # an install channel that is NOT subject to PyPI's 100 MB per-file limit
+  # (release assets allow up to 2 GB/file), so it works even before/without the
+  # PyPI file-size-limit increases. Users install via:
+  #   pip install https://github.com/<owner>/uni-db/releases/download/<tag>/<wheel>
+  # `release.yml` owns release creation + notes; this job only uploads assets.
+  attach-to-release:
+    name: Attach wheels to GitHub Release
+    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Only on a real version-tag release (the same trigger under which
+    # release.yml creates the GitHub Release). Skipped for workflow_dispatch.
+    if: github.event_name == 'push'
+    steps:
+      - name: Download all wheels and sdists
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-uni-db-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # release.yml's create-release runs in parallel on this same tag, but
+          # only waits on validate+create-tag (~2 min) while this job waits on
+          # the ~45-min build matrix — so the release is normally present long
+          # before we get here. Wait as a safety net, then upload.
+          for i in $(seq 1 30); do
+            if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              break
+            fi
+            echo "Release $TAG not present yet (attempt $i/30); waiting 20s..."
+            sleep 20
+          done
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "ERROR: release $TAG never appeared; cannot attach wheels."
+            exit 1
+          fi
+          echo "Attaching $(find dist -type f | wc -l) files to release $TAG:"
+          ls -lh dist
+          gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+
   # uni-pydantic build + publish. Lives here (not in release.yml) because it
   # depends on the uni-db *wheel* being on the index. `needs:` the wheel publish
   # jobs so it can't start until the uni-db wheel is actually published — an
@@ -657,9 +727,10 @@ jobs:
       always() && inputs.dry_run != true && needs.validate.result == 'success'
       && (needs.publish-pypi.result == 'success' || needs.publish-testpypi.result == 'success')
     env:
-      # `push` events (tag) always go to pypi. `workflow_dispatch` honors the
-      # `target` input. Matches the wheel publish jobs above.
-      REGISTRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
+      # Mirrors the resolved publish target. build-pydantic only runs when a
+      # uni-db wheel publish job succeeded, so the target is 'pypi' or
+      # 'testpypi' here, never 'none'.
+      REGISTRY: ${{ needs.validate.outputs.publish_target == 'testpypi' && 'testpypi' || 'pypi' }}
       UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
@@ -722,13 +793,12 @@ jobs:
 
   publish-pydantic-testpypi:
     name: Publish uni-pydantic to TestPyPI
-    needs: [build-pydantic]
+    needs: [validate, build-pydantic]
     runs-on: ubuntu-latest
     environment: testpypi
     if: |
       needs.build-pydantic.result == 'success'
-      && github.event_name == 'workflow_dispatch'
-      && inputs.target == 'testpypi'
+      && needs.validate.outputs.publish_target == 'testpypi'
     steps:
       - name: Download pydantic dist
         uses: actions/download-artifact@v4
@@ -746,12 +816,12 @@ jobs:
 
   publish-pydantic-pypi:
     name: Publish uni-pydantic to PyPI
-    needs: [build-pydantic]
+    needs: [validate, build-pydantic]
     runs-on: ubuntu-latest
     environment: pypi
     if: |
       needs.build-pydantic.result == 'success'
-      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi'))
+      && needs.validate.outputs.publish_target == 'pypi'
     steps:
       - name: Download pydantic dist
         uses: actions/download-artifact@v4

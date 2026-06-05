@@ -31,8 +31,8 @@ semver = "1.0"
 # wasmtime is the heaviest dep; gated by the `wasmtime-runtime` feature so
 # embedders that only want the trait surface (e.g., for compile-time
 # Rust-only plugins via uni-plugin-builtin) can opt out.
-wasmtime = { version = "45", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
-wasmtime-wasi = { version = "45", optional = true }
+wasmtime = { version = "43", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
+wasmtime-wasi = { version = "43", optional = true }
 datafusion = { workspace = true, optional = true }
 
 [features]

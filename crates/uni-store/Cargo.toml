@@ -28,7 +28,7 @@ uni-crdt = { workspace = true }
 # `Crdt::merge_via_registry`, which requires a `PluginRegistry`
 # handle. uni-plugin → uni-store is a one-way edge (uni-plugin does
 # not depend on uni-store), so no cycle.
-uni-plugin = { path = "../uni-plugin", version = "1.8" }
+uni-plugin = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

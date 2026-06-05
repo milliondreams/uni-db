@@ -1977,7 +1977,6 @@ wheels = [
 
 [[package]]
 name = "uni-db"
-version = "2.0.2"
 source = { editable = "../uni-db" }
 
 [package.metadata]
@@ -1993,7 +1992,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'notebook-data-prep'", specifier = ">=1.4" },
     { name = "torch", marker = "extra == 'notebook-data-prep'", specifier = ">=2.2" },
 ]
-provides-extras = ["docs", "notebook-runtime", "notebook-data-prep"]
+provides-extras = ["docs", "notebook-data-prep", "notebook-runtime"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2009,7 +2008,7 @@ dev = [
 
 [[package]]
 name = "uni-pydantic"
-version = "2.0.2"
+version = "2.0.3"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },

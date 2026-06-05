@@ -96,12 +96,14 @@ jobs:
             bindings/uni-db-onnx-cuda/pyproject.toml \
             bindings/uni-db-onnx-metal/pyproject.toml \
             bindings/uni-pydantic/pyproject.toml; do
-            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            if [ "$VERSION" != "$PYPI_VERSION" ]; then
-              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+            # Python versions are single-sourced from the workspace Cargo version
+            # (maturin wheels use `dynamic = ["version"]`). Assert none
+            # reintroduced a hardcoded literal that would drift from the source.
+            if grep -qE '^version = ' "$pyproject"; then
+              echo "Error: $pyproject hardcodes a version; use 'dynamic = [\"version\"]' so the single source ([workspace.package] version) is reused."
               exit 1
             fi
-            echo "OK: $pyproject = $PYPI_VERSION"
+            echo "OK: $pyproject derives its version from the workspace"
           done
 
   # CPU-only Linux wheels: the default-everything `uni-db` and the slim
@@ -424,6 +426,13 @@ jobs:
           # stays manylinux_2_34-compliant (glibc itself is fine at 2.34). Setting
           # RUSTFLAGS here also overrides .cargo/config.toml's mold linker, which
           # isn't available inside the manylinux container.
+          #
+          # NOTE: this step-level env is belt-and-suspenders only. maturin-action
+          # did NOT reliably propagate it into the containerized cargo build (the
+          # flag was silently dropped → auditwheel still saw gcc-14 symbols and
+          # failed). The authoritative export is in before-script-linux below,
+          # which runs inside the container in the same session as the build —
+          # the same mechanism that makes CUDA_COMPUTE_CAP take effect.
           RUSTFLAGS: "-Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
           # candle/mistralrs CUDA kernels auto-detect the GPU compute
           # capability via nvidia-smi, which doesn't exist on GPU-less build
@@ -453,6 +462,14 @@ jobs:
             # No live GPU in the build container — pin the compute capability
             # so candle/mistralrs don't try to probe nvidia-smi (see step env).
             export CUDA_COMPUTE_CAP=80
+            # Export RUSTFLAGS HERE, not only in the step `env:`. maturin-action
+            # does not reliably forward step-level RUSTFLAGS into the
+            # containerized cargo build (the static-libstdc++ flag was silently
+            # dropped, so auditwheel still saw too-recent gcc-14 GLIBCXX
+            # symbols). before-script exports DO reach the build in the same
+            # container session — same mechanism that makes CUDA_COMPUTE_CAP work.
+            export RUSTFLAGS="-Clink-arg=-static-libstdc++ -Clink-arg=-static-libgcc"
+            echo "RUSTFLAGS in build container: ${RUSTFLAGS}"
             nvcc --version
 
       - name: Repair wheel with CUDA host-lib excludes
@@ -468,6 +485,25 @@ jobs:
           # path uses `cudarc` which dlopens libcudart at runtime; that's
           # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in
           # transitively for matrix ops.
+          # Diagnostic (cheap): print the highest libstdc++/libgcc versioned
+          # symbols the built .so references BEFORE repair. If -static-libstdc++
+          # took effect, the max GLIBCXX is <= 3.4.29 (or libstdc++ is absent
+          # from NEEDED entirely); if the flag was silently dropped, gcc-14's
+          # GLIBCXX_3.4.30+ shows up here and auditwheel rejects it below. This
+          # makes any future "too-recent symbol" failure self-explaining.
+          pip install pyelftools >/dev/null 2>&1 || true
+          for whl in dist-raw/*.whl; do
+            tmp=$(mktemp -d)
+            unzip -q "$whl" -d "$tmp"
+            for so in $(find "$tmp" -name '*.so'); do
+              echo "=== symbol audit: $(basename "$so") ==="
+              echo "NEEDED libstdc++/libgcc:"
+              readelf -d "$so" 2>/dev/null | grep -E 'libstdc\+\+|libgcc' || echo "  (none — fully static C++ runtime)"
+              echo "max GLIBCXX: $(readelf -sW "$so" 2>/dev/null | grep -oE 'GLIBCXX_[0-9.]+' | sort -V | tail -1 || echo none)"
+              echo "max CXXABI:  $(readelf -sW "$so" 2>/dev/null | grep -oE 'CXXABI_[0-9.]+' | sort -V | tail -1 || echo none)"
+            done
+            rm -rf "$tmp"
+          done
           for whl in dist-raw/*.whl; do
             auditwheel repair \
               --plat manylinux_2_34_x86_64 \

@@ -1728,7 +1728,6 @@ wheels = [
 
 [[package]]
 name = "uni-db"
-version = "2.0.2"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1778,7 +1777,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'notebook-data-prep'", specifier = ">=1.4" },
     { name = "torch", marker = "extra == 'notebook-data-prep'", specifier = ">=2.2" },
 ]
-provides-extras = ["docs", "notebook-runtime", "notebook-data-prep"]
+provides-extras = ["docs", "notebook-data-prep", "notebook-runtime"]
 
 [package.metadata.requires-dev]
 dev = [

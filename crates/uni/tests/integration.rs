@@ -11,6 +11,7 @@
 // which the default-feature-requiring groups here would fail to compile. It
 // remains a standalone binary (tests/reranker_integration.rs).
 #![recursion_limit = "256"]
+#![allow(dead_code, unused_imports, clippy::all)]
 
 #[path = "common/algo/mod.rs"]
 mod algo;
@@ -73,3 +74,25 @@ mod ssi_default_semantics;
 mod storage;
 #[path = "common/vector_search/mod.rs"]
 mod vector_search;
+
+// Folded-in former standalone test binaries (each was its own link step):
+#[path = "common/auth/mod.rs"]
+mod auth;
+#[path = "common/connectors/mod.rs"]
+mod connectors;
+#[path = "common/graph_algo/mod.rs"]
+mod graph_algo;
+#[path = "common/hooks/mod.rs"]
+mod hooks;
+#[path = "common/loaders/mod.rs"]
+mod loaders;
+#[path = "common/plugin/mod.rs"]
+mod plugin;
+#[path = "common/reload/mod.rs"]
+mod reload;
+#[path = "common/triggers/mod.rs"]
+mod triggers;
+// Real test module (was tests/plugin_trust.rs), moved under common/ so it
+// compiles into this binary instead of its own.
+#[path = "common/plugin_trust.rs"]
+mod plugin_trust;

@@ -1,21 +1,8 @@
 [package]
 name = "uni-plugin"
-# Overrides the workspace version (1.3.0). uni-plugin grew an additive
-# ABI surface in v1.4.0 (phased context shape v1.1) and a Storage::fork
-# signature change in v1.5.0 (Lance fork wiring, M5a follow-up #3) and
-# an additive `OptimizerRuleProvider::physical_rule()` method in v1.7.0
-# (M5 Batch 2 follow-up #2 — physical-phase optimizer rule installation).
-# v1.7.1 adds an additive host-side `register_index_handle` /
-# `index_handle` / `deregister_index_handle` API for the IndexProbeExec
-# bridge (M5 Batch 2 follow-up #4). v1.8.0 (M5 Batch 3): procedures
-# become arity-overloaded — same QName may register multiple times with
-# distinct positional-argument counts (`procedure_with_arity`,
-# `procedure_overloads`); `AlgoProcedure` grows
-# `execute_with_projection`. v1.9.0 removes the `ed25519` Cargo feature:
-# Ed25519 signature verification is now always compiled (security primitive,
-# must not be a build-time opt-out), and the manifest signing payload now
-# covers the whole manifest rather than just its hash pin. See CHANGELOG.md.
-version = "1.9.0"
+# Tracks the single workspace version (formerly versioned independently in the
+# 1.x line — its ABI-evolution history through v1.9.0 is in CHANGELOG.md).
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -12587,7 +12587,7 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "uni-algo"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12606,7 +12606,7 @@ dependencies = [
 
 [[package]]
 name = "uni-btic"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "chrono",
  "proptest",
@@ -12616,7 +12616,7 @@ dependencies = [
 
 [[package]]
 name = "uni-bulk"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12632,7 +12632,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cli"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -12652,7 +12652,7 @@ dependencies = [
 
 [[package]]
 name = "uni-common"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -12674,7 +12674,7 @@ dependencies = [
 
 [[package]]
 name = "uni-crdt"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "fxhash",
  "proptest",
@@ -12688,7 +12688,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cypher"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "pest",
  "pest_derive",
@@ -12699,7 +12699,7 @@ dependencies = [
 
 [[package]]
 name = "uni-db"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12769,7 +12769,7 @@ dependencies = [
 
 [[package]]
 name = "uni-fork"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12785,7 +12785,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -12801,7 +12801,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy-tck"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12828,7 +12828,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -12866,7 +12866,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-apoc-core"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12886,7 +12886,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-builtin"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12915,7 +12915,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-conformance"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "semver",
  "serde",
@@ -12927,7 +12927,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-custom"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12950,7 +12950,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-extism"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12975,7 +12975,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-host"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13010,7 +13010,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-pyo3"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13033,7 +13033,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-rhai"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13059,7 +13059,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13085,7 +13085,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm-rt"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13099,7 +13099,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13124,7 +13124,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-cuda"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13147,7 +13147,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-metal"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13170,7 +13170,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13193,7 +13193,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-cuda"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13216,7 +13216,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-metal"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13239,7 +13239,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13288,7 +13288,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query-functions"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13318,7 +13318,7 @@ dependencies = [
 
 [[package]]
 name = "uni-sidecar"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -13328,7 +13328,7 @@ dependencies = [
 
 [[package]]
 name = "uni-store"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -13370,7 +13370,7 @@ dependencies = [
 
 [[package]]
 name = "uni-tck"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "anyhow",
  "async-trait",

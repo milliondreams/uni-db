@@ -609,7 +609,26 @@ pub struct UniInner {
     pub(crate) cached_wal_lsn: AtomicU64,
     /// Temp directory guard — auto-deletes on drop. Only set for `Uni::temporary()`.
     pub(crate) _temp_dir: Option<TempDir>,
+    /// Transparent plan cache for the transaction write path.
+    ///
+    /// Caches the pre-rewrite logical plan keyed by query-text hash + schema
+    /// version, so repeated `Transaction::execute` of the same statement shape
+    /// (e.g. ingest `UNWIND … CREATE`) skips parse and planning. Shared db-wide
+    /// via `Arc`. Forks/snapshots get a fresh empty cache in `derived_clone`
+    /// because their storage layout (and thus the fork-fusion rewrite) differs.
+    /// The logical-plan rewrites (`rewrite_for_fork_fusion`, `fuse_create_set`)
+    /// and parameter binding still run per execution, so cached reuse is
+    /// parameter-value independent.
+    pub(crate) plan_cache: Arc<std::sync::Mutex<crate::api::session::PlanCache>>,
 }
+
+/// Capacity of the transaction-write-path plan cache (entries).
+///
+/// Matches the read-path [`crate::api::session`] cache (1000 entries, LFU
+/// eviction). Large enough to retain every distinct ingest statement shape a
+/// workload uses; raising it only helps when a session cycles through more than
+/// this many *distinct* query texts.
+pub(crate) const TX_PLAN_CACHE_CAPACITY: usize = 1000;
 
 /// Write throttle pressure as a value in 0.0–1.0.
 ///
@@ -799,6 +818,11 @@ impl UniInner {
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
             _temp_dir: None,
+            // Fork/snapshot inners read a different storage layout, so they
+            // must not reuse the primary's cached (fork-fusion-shaped) plans.
+            plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
+                TX_PLAN_CACHE_CAPACITY,
+            ))),
         }
     }
 
@@ -3604,6 +3628,9 @@ impl UniBuilder {
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),
                 _temp_dir: self.temp_dir,
+                plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
+                    TX_PLAN_CACHE_CAPACITY,
+                ))),
             }),
         };
 

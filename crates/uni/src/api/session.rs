@@ -1606,30 +1606,33 @@ impl uni_fork::ForkQueryHost for Session {
 // ── Plan Cache (internal) ─────────────────────────────────────────────
 
 /// Entry in the transparent plan cache.
-struct PlanCacheEntry {
-    plan: uni_query::LogicalPlan,
-    schema_version: u32,
-    hit_count: u64,
+pub(crate) struct PlanCacheEntry {
+    pub(crate) plan: uni_query::LogicalPlan,
+    pub(crate) schema_version: u32,
+    pub(crate) hit_count: u64,
 }
 
 /// Transparent plan cache keyed by query text hash.
 ///
 /// Caches parsed ASTs and logical plans to skip parsing and planning for
 /// repeated queries. Entries are evicted LFU-style when the cache is full.
-struct PlanCache {
+///
+/// Shared by the read path ([`Session::execute_cached`]) and the transaction
+/// write path ([`crate::api::UniInner::execute_internal_with_tx_l0`]).
+pub(crate) struct PlanCache {
     entries: HashMap<u64, PlanCacheEntry>,
     max_entries: usize,
 }
 
 impl PlanCache {
-    fn new(max_entries: usize) -> Self {
+    pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
             max_entries,
         }
     }
 
-    fn get(&mut self, key: u64, current_schema_version: u32) -> Option<&PlanCacheEntry> {
+    pub(crate) fn get(&mut self, key: u64, current_schema_version: u32) -> Option<&PlanCacheEntry> {
         if let Some(entry) = self.entries.get_mut(&key) {
             if entry.schema_version == current_schema_version {
                 entry.hit_count += 1;
@@ -1641,7 +1644,7 @@ impl PlanCache {
         None
     }
 
-    fn insert(&mut self, key: u64, entry: PlanCacheEntry) {
+    pub(crate) fn insert(&mut self, key: u64, entry: PlanCacheEntry) {
         if self.entries.len() >= self.max_entries {
             // Evict entry with lowest hit_count
             if let Some((&evict_key, _)) = self.entries.iter().min_by_key(|(_, e)| e.hit_count) {
@@ -1670,7 +1673,7 @@ fn query_type_to_plugin(t: QueryType) -> uni_plugin::traits::hook::QueryType {
 }
 
 /// Compute a hash key from a query string.
-fn plan_cache_key(cypher: &str) -> u64 {
+pub(crate) fn plan_cache_key(cypher: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cypher.hash(&mut hasher);

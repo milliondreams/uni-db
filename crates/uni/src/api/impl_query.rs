@@ -392,32 +392,73 @@ impl crate::api::UniInner {
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
-        let parse_start = Instant::now();
-        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
-        let parse_time = parse_start.elapsed();
+        // Write-path plan cache: a hit skips parse + planning for a repeated
+        // statement shape (the dominant ingest pattern, e.g. `UNWIND … CREATE`).
+        // The cached value is the *pre-rewrite* logical plan — the rewrites and
+        // parameter binding still run per execution below, so reuse is
+        // independent of both live fork-index state and parameter values.
+        let schema_version = self.schema.schema().schema_version;
+        let cache_key = crate::api::session::plan_cache_key(cypher);
+        let cached_plan = self
+            .plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(cache_key, schema_version).map(|e| e.plan.clone()));
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (logical_plan_raw, parse_time, plan_time, plan_cache_hit) =
+            if let Some(plan) = cached_plan {
+                (
+                    plan,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                    true,
+                )
+            } else {
+                let parse_start = Instant::now();
+                let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+                let parse_time = parse_start.elapsed();
 
-        if tt_spec.is_some() {
-            return Err(UniError::Query {
-                message: "Time-travel queries are not supported within transactions".to_string(),
-                query: Some(cypher.to_string()),
-            });
-        }
+                let (ast, tt_spec) = match ast {
+                    uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+                    other => (other, None),
+                };
+                if tt_spec.is_some() {
+                    return Err(UniError::Query {
+                        message: "Time-travel queries are not supported within transactions"
+                            .to_string(),
+                        query: Some(cypher.to_string()),
+                    });
+                }
 
-        let plan_start = Instant::now();
+                let plan_start = Instant::now();
+                let lp = {
+                    let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+                        .with_params(params.clone())
+                        .with_plugin_registry(Arc::clone(&self.plugin_registry));
+                    planner.plan(ast).map_err(|e| into_query_error(e, cypher))?
+                };
+                let plan_time = plan_start.elapsed();
+
+                // Cache the pre-rewrite logical plan for subsequent batches.
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.insert(
+                        cache_key,
+                        crate::api::session::PlanCacheEntry {
+                            plan: lp.clone(),
+                            schema_version,
+                            hit_count: 0,
+                        },
+                    );
+                }
+                (lp, parse_time, plan_time, false)
+            };
+
+        // Rewrites run on every execution: cheap tree-walks that must reflect
+        // live fork-index state, so they are intentionally not cached.
         let logical_plan = {
-            let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-                .with_params(params.clone())
-                .with_plugin_registry(Arc::clone(&self.plugin_registry));
-            let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-            let lp = uni_query::rewrite_for_fork_fusion(lp, &*self.storage);
+            let lp = uni_query::rewrite_for_fork_fusion(logical_plan_raw, &*self.storage);
             uni_query::fuse_create_set(lp)
         };
-        let plan_time = plan_start.elapsed();
 
         // Clone the cached executor template instead of running
         // `Executor::new` + six session-constant setters every query.
@@ -477,6 +518,7 @@ impl crate::api::UniInner {
             exec_time,
             total_time: total_start.elapsed(),
             rows_returned: rows.len(),
+            plan_cache_hit,
             ..Default::default()
         };
 

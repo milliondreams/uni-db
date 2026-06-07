@@ -1,5 +1,6 @@
 pub mod bidirectional_create_test;
 pub mod bulk_loading_test;
+pub mod create_set_fusion_test;
 pub mod cypher_create;
 pub mod cypher_delete;
 pub mod cypher_merge;

@@ -9288,6 +9288,229 @@ impl ForkIndexLookup for uni_store::storage::StorageManager {
     }
 }
 
+/// Fold a trailing `SET var.prop = value` into the freshly-created entity's
+/// inline property map, eliminating the separate `Set` write pass.
+///
+/// Rewrites `CREATE (a)-[r:T]->(b) SET r.x = e.v` into the equivalent of
+/// `CREATE (a)-[r:T {x: e.v}]->(b)`, so the plan collapses from `Set → Create`
+/// to a single `Create`. This removes an entire read-modify-write operator
+/// (`MutationSetExec`) — measured at ~38% of per-edge `UNWIND … CREATE … SET`
+/// execution — that the bulk write path never pays.
+///
+/// # Examples
+///
+/// ```ignore
+/// // CREATE (a)-[r:LINK]->(b) SET r.role = e.role   ==>
+/// // CREATE (a)-[r:LINK {role: e.role}]->(b)
+/// let fused = fuse_create_set(plan);
+/// ```
+///
+/// The fold is **all-or-nothing per `SET` clause** and only fires when every
+/// item is safe:
+/// - the item is the simple `Variable.property = value` form (not `+=`, label
+///   set `SET n:L`, or whole-entity map assignment `SET n = {...}`),
+/// - the target variable is introduced by the immediately-preceding
+///   `Create`/`CreateBatch` (a MATCHed variable is left untouched),
+/// - the target element's inline properties are absent or a map literal (a
+///   parameter-map form such as `CREATE (n $props)` cannot be merged),
+/// - the value references no variable created in the same statement, so
+///   evaluating it at create time is observably identical to SET time.
+///
+/// When any item fails these checks the whole `Set` node is preserved, keeping
+/// semantics unchanged. The pass is idempotent: a plan with no fusable
+/// `Set`/`Create` adjacency passes through untouched.
+#[must_use]
+pub fn fuse_create_set(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Set { input, items } => {
+            // Fuse any deeper adjacency first so chained
+            // `CREATE … SET … CREATE … SET` collapses bottom-up.
+            let input = fuse_create_set(*input);
+            match input {
+                LogicalPlan::Create {
+                    input: child,
+                    pattern,
+                } => match try_fuse_set_items(std::slice::from_ref(&pattern), &items) {
+                    Some(mut patterns) => LogicalPlan::Create {
+                        input: child,
+                        // try_fuse_set_items returns exactly as many patterns
+                        // as it was given (one here).
+                        pattern: patterns
+                            .pop()
+                            .expect("one pattern in yields one pattern out"),
+                    },
+                    None => LogicalPlan::Set {
+                        input: Box::new(LogicalPlan::Create {
+                            input: child,
+                            pattern,
+                        }),
+                        items,
+                    },
+                },
+                LogicalPlan::CreateBatch {
+                    input: child,
+                    patterns,
+                } => match try_fuse_set_items(&patterns, &items) {
+                    Some(fused) => LogicalPlan::CreateBatch {
+                        input: child,
+                        patterns: fused,
+                    },
+                    None => LogicalPlan::Set {
+                        input: Box::new(LogicalPlan::CreateBatch {
+                            input: child,
+                            patterns,
+                        }),
+                        items,
+                    },
+                },
+                other => LogicalPlan::Set {
+                    input: Box::new(other),
+                    items,
+                },
+            }
+        }
+        // Recurse through the operators that can sit above a write clause so a
+        // `Set` under RETURN/ORDER BY/LIMIT is still reached. This mirrors the
+        // pragmatic recursion of `rewrite_for_fork_fusion`: variants that never
+        // sit above a write clause fall through `other => other` unchanged.
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(fuse_create_set(*input)),
+            projections,
+        },
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
+            input: Box::new(fuse_create_set(*input)),
+            skip,
+            fetch,
+        },
+        LogicalPlan::Sort { input, order_by } => LogicalPlan::Sort {
+            input: Box::new(fuse_create_set(*input)),
+            order_by,
+        },
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } => LogicalPlan::Filter {
+            input: Box::new(fuse_create_set(*input)),
+            predicate,
+            optional_variables,
+        },
+        LogicalPlan::Create { input, pattern } => LogicalPlan::Create {
+            input: Box::new(fuse_create_set(*input)),
+            pattern,
+        },
+        LogicalPlan::CreateBatch { input, patterns } => LogicalPlan::CreateBatch {
+            input: Box::new(fuse_create_set(*input)),
+            patterns,
+        },
+        other => other,
+    }
+}
+
+/// Try to fold every `SET` item into the given CREATE patterns.
+///
+/// Returns the rewritten patterns when *all* items fuse safely (see
+/// [`fuse_create_set`] for the conditions); returns `None` the moment any item
+/// is unfusable, so the caller can keep the original `Set` node untouched.
+fn try_fuse_set_items(patterns: &[Pattern], items: &[SetItem]) -> Option<Vec<Pattern>> {
+    // Map each created variable to the index of the pattern that introduces it.
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    for (idx, pattern) in patterns.iter().enumerate() {
+        for var in crate::query::df_graph::mutation_common::pattern_variable_names(pattern) {
+            owner.entry(var).or_insert(idx);
+        }
+    }
+
+    let mut out = patterns.to_vec();
+    for item in items {
+        let SetItem::Property { expr, value } = item else {
+            return None; // `+=`, label set, or whole-entity map assignment
+        };
+        let Expr::Property(base, prop) = expr else {
+            return None; // not a property target
+        };
+        let Expr::Variable(var) = base.as_ref() else {
+            return None; // e.g. `n[expr].x` or a deeper path
+        };
+        let Some(&idx) = owner.get(var) else {
+            return None; // target is a MATCHed (not created) variable
+        };
+        // Evaluating the value at create time must equal evaluating it at SET
+        // time: reject any reference to a variable created in this statement
+        // (its value may not yet exist when the element is constructed).
+        if collect_expr_variables(value)
+            .iter()
+            .any(|referenced| owner.contains_key(referenced))
+        {
+            return None;
+        }
+        if !merge_pattern_property(&mut out[idx], var, prop, value) {
+            return None; // element absent or has a non-map property form
+        }
+    }
+    Some(out)
+}
+
+/// Merge `var.prop = value` into the matching element's inline property map.
+///
+/// Returns `false` (leaving the pattern unchanged) when the variable's element
+/// is not found or its existing properties are a non-map expression that cannot
+/// be merged. Any pre-existing entry for `prop` is replaced so the SET's
+/// last-write-wins precedence is preserved.
+fn merge_pattern_property(pattern: &mut Pattern, var: &str, prop: &str, value: &Expr) -> bool {
+    for path in &mut pattern.paths {
+        if merge_into_elements(&mut path.elements, var, prop, value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursive worker for [`merge_pattern_property`] over a list of elements.
+fn merge_into_elements(
+    elements: &mut [PatternElement],
+    var: &str,
+    prop: &str,
+    value: &Expr,
+) -> bool {
+    for element in elements {
+        match element {
+            PatternElement::Node(n) if n.variable.as_deref() == Some(var) => {
+                return set_map_property(&mut n.properties, prop, value.clone());
+            }
+            PatternElement::Relationship(r) if r.variable.as_deref() == Some(var) => {
+                return set_map_property(&mut r.properties, prop, value.clone());
+            }
+            PatternElement::Parenthesized { pattern, .. } => {
+                if merge_into_elements(&mut pattern.elements, var, prop, value) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Set `prop = value` on an optional inline property map, last-write-wins.
+///
+/// Returns `false` without mutating when the properties are present but are not
+/// a map literal (e.g. `CREATE (n $params)`), which cannot accept a single key.
+fn set_map_property(props: &mut Option<Expr>, prop: &str, value: Expr) -> bool {
+    match props {
+        None => {
+            *props = Some(Expr::Map(vec![(prop.to_string(), value)]));
+            true
+        }
+        Some(Expr::Map(entries)) => {
+            entries.retain(|(k, _)| k != prop);
+            entries.push((prop.to_string(), value));
+            true
+        }
+        Some(_) => false,
+    }
+}
+
 /// Walk a [`LogicalPlan`] tree and rewrite each `Scan` whose target
 /// `(label, column)` has a registered fork-local index into the
 /// matching `FusedIndexScan` variant.

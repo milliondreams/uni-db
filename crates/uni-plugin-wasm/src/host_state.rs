@@ -33,6 +33,11 @@ pub struct HostState {
     pub wasi: WasiCtx,
     /// WASI resource table.
     pub table: ResourceTable,
+    /// Store resource limits (linear-memory cap). Lives here because
+    /// `Store::limiter` borrows the limiter out of the store data.
+    /// Defaults to unlimited; the loader installs the effective cap via
+    /// `apply_resource_limits`.
+    pub limits: wasmtime::StoreLimits,
 }
 
 impl HostState {
@@ -48,6 +53,7 @@ impl HostState {
             http,
             wasi,
             table: ResourceTable::new(),
+            limits: wasmtime::StoreLimits::default(),
         }
     }
 }

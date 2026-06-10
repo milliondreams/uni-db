@@ -1376,6 +1376,10 @@ fn convert_to_fixpoint_plans(
     plugin_registry: &PluginRegistry,
     deterministic_best_by: bool,
 ) -> DFResult<Vec<FixpointRulePlan>> {
+    // `rules` is one stratum's rule set, so membership here means
+    // "same stratum" — the recursion-detection set for `non_linear`.
+    let stratum_rule_names: std::collections::HashSet<&str> =
+        rules.iter().map(|r| r.name.as_str()).collect();
     rules
         .iter()
         .map(|rule| {
@@ -1425,6 +1429,18 @@ fn convert_to_fixpoint_plans(
                 .find(|yc| yc.is_prob)
                 .map(|yc| yc.name.clone());
 
+            // Non-linear recursion: any clause joining ≥2 positive
+            // same-stratum IS-refs needs full facts on its self-ref scans
+            // (see `FixpointRulePlan::non_linear`).
+            let non_linear = rule.clauses.iter().any(|clause| {
+                clause
+                    .is_refs
+                    .iter()
+                    .filter(|ir| !ir.negated && stratum_rule_names.contains(ir.rule_name.as_str()))
+                    .count()
+                    >= 2
+            });
+
             Ok(FixpointRulePlan {
                 name: rule.name.clone(),
                 clauses,
@@ -1439,6 +1455,7 @@ fn convert_to_fixpoint_plans(
                 has_priority,
                 deterministic: deterministic_best_by,
                 prob_column_name,
+                non_linear,
             })
         })
         .collect()

@@ -1214,7 +1214,7 @@ impl Session {
         // Try cache lookup (brief lock, then release)
         let cached = self.plan_cache.lock().ok().and_then(|mut cache| {
             cache
-                .get(cache_key, schema_version)
+                .get(cache_key, cypher, schema_version)
                 .map(|entry| entry.plan.clone())
         });
 
@@ -1276,6 +1276,7 @@ impl Session {
                 cache_key,
                 PlanCacheEntry {
                     plan: plan.clone(),
+                    query: cypher.to_string(),
                     schema_version,
                     hit_count: 0,
                 },
@@ -1608,6 +1609,11 @@ impl uni_fork::ForkQueryHost for Session {
 /// Entry in the transparent plan cache.
 pub(crate) struct PlanCacheEntry {
     pub(crate) plan: uni_query::LogicalPlan,
+    /// The exact query text this plan was built from. Compared on every
+    /// lookup: the cache key is a 64-bit hash of the text, so two distinct
+    /// queries can collide — without this check a collision would silently
+    /// execute the other query's plan.
+    pub(crate) query: String,
     pub(crate) schema_version: u32,
     pub(crate) hit_count: u64,
 }
@@ -1632,8 +1638,18 @@ impl PlanCache {
         }
     }
 
-    pub(crate) fn get(&mut self, key: u64, current_schema_version: u32) -> Option<&PlanCacheEntry> {
+    pub(crate) fn get(
+        &mut self,
+        key: u64,
+        query: &str,
+        current_schema_version: u32,
+    ) -> Option<&PlanCacheEntry> {
         if let Some(entry) = self.entries.get_mut(&key) {
+            // Key collision: a different query text hashed to the same key.
+            // Treat as a miss but keep the entry — it belongs to a live query.
+            if entry.query != query {
+                return None;
+            }
             if entry.schema_version == current_schema_version {
                 entry.hit_count += 1;
                 return self.entries.get(&key);
@@ -1678,4 +1694,79 @@ pub(crate) fn plan_cache_key(cypher: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cypher.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod plan_cache_tests {
+    use super::*;
+
+    fn scan_plan(variable: &str) -> uni_query::LogicalPlan {
+        uni_query::LogicalPlan::Scan {
+            label_id: 0,
+            labels: vec!["N".to_string()],
+            variable: variable.to_string(),
+            filter: None,
+            optional: false,
+        }
+    }
+
+    /// Regression test for architecture review finding §2.1: the cache key
+    /// is a 64-bit hash of the query text, so two distinct queries can
+    /// collide. The entry stores the query text and `get` compares it on
+    /// every lookup — a colliding key with different text must MISS (and
+    /// must not evict the resident entry, which belongs to a live query).
+    ///
+    /// A real `DefaultHasher` collision pair is a ~2^32 offline birthday
+    /// search, so the collision is simulated at the cache API boundary by
+    /// looking up the first query's key with the second query's text.
+    #[test]
+    fn colliding_keys_with_different_query_text_miss() {
+        let schema_version = 7;
+        let query_a = "MATCH (n:Person) RETURN n";
+        let query_b = "CREATE (n:Hacker)";
+
+        let key_a = plan_cache_key(query_a);
+
+        let mut cache = PlanCache::new(10);
+        cache.insert(
+            key_a,
+            PlanCacheEntry {
+                plan: scan_plan("plan_for_query_a"),
+                query: query_a.to_string(),
+                schema_version,
+                hit_count: 0,
+            },
+        );
+
+        // Simulate `query_b` hashing to the same key as `query_a`: same u64,
+        // different text. The text comparison must turn this into a miss.
+        let colliding_key = key_a; // == plan_cache_key(query_b) under collision
+        assert!(
+            cache.get(colliding_key, query_b, schema_version).is_none(),
+            "a colliding key with different query text must miss"
+        );
+
+        // The resident entry survives the collision and still hits.
+        let entry = cache
+            .get(key_a, query_a, schema_version)
+            .expect("original query must still hit after a collision lookup");
+        match &entry.plan {
+            uni_query::LogicalPlan::Scan { variable, .. } => assert_eq!(
+                variable, "plan_for_query_a",
+                "query A must get its own plan back"
+            ),
+            _ => panic!("expected the Scan plan inserted for query A"),
+        }
+    }
+
+    /// `plan_cache_key` is built on `DefaultHasher::new()` (fixed SipHash
+    /// keys): the same text always yields the same key, with no per-process
+    /// seed material mixed in. This is what makes an offline-crafted
+    /// collision pair portable across processes and deployments.
+    #[test]
+    fn plan_cache_key_is_deterministic() {
+        let q = "MATCH (n) RETURN n";
+        assert_eq!(plan_cache_key(q), plan_cache_key(q));
+        assert_ne!(plan_cache_key(q), plan_cache_key("MATCH (m) RETURN m"));
+    }
 }

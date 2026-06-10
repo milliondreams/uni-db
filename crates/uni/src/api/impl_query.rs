@@ -403,7 +403,11 @@ impl crate::api::UniInner {
             .plan_cache
             .lock()
             .ok()
-            .and_then(|mut cache| cache.get(cache_key, schema_version).map(|e| e.plan.clone()));
+            .and_then(|mut cache| {
+                cache
+                    .get(cache_key, cypher, schema_version)
+                    .map(|e| e.plan.clone())
+            });
 
         let (logical_plan_raw, parse_time, plan_time, plan_cache_hit) =
             if let Some(plan) = cached_plan {
@@ -445,6 +449,7 @@ impl crate::api::UniInner {
                         cache_key,
                         crate::api::session::PlanCacheEntry {
                             plan: lp.clone(),
+                            query: cypher.to_string(),
                             schema_version,
                             hit_count: 0,
                         },

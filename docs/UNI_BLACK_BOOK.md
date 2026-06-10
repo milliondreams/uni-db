@@ -347,7 +347,7 @@ These principles, drawn from the original design documents, guide every architec
 3. **LSM-Style Writes**: Optimized for write-heavy workloads. Memory buffer → sorted runs → compacted base. Same proven pattern as LevelDB/RocksDB, adapted for graph data.
 4. **Columnar Everything**: Arrow arrays for properties, DataFusion for query execution. Get analytical performance without a separate OLAP system.
 5. **Content Addressing**: UniId (SHA3-256) provides stable references across systems and decouples identity from storage location. UID is a lookup index, not a uniqueness constraint — multiple vertices may share a UID.
-6. **Single-Writer Simplicity**: One writer at a time eliminates write-write conflicts. Multi-reader with snapshot isolation provides consistent reads without locking.
+6. **Optimistic Concurrency**: Transactions prepare in parallel against pinned snapshots and validate at commit (SSI/OCC, default-on since 2.0) — conflicts abort with a retriable error instead of silently losing writes. Readers never block writers and vice versa. See [Part XI](#part-xi-transactions-sessions--concurrency).
 
 ---
 
@@ -1233,6 +1233,19 @@ Triggered when `mutation_count >= auto_flush_threshold` (default: 10,000) or `au
 7. Write new snapshot manifest
 8. Complete flush: remove old L0 from `pending_flush`
 9. Truncate WAL segments with LSN ≤ flushed LSN
+
+Two refinements to this sequence:
+
+- **Async flush** (`UniConfig.async_flush`): the L1 streaming phase (steps
+  3–7) runs off the commit path through a `FlushCoordinator` that bounds
+  in-flight flushes with a semaphore and finalizes them in rotate order, so
+  the snapshot-manifest chain stays linear even when flushes complete out of
+  order. Rotated L0s stay readable on the `pending_flush` list until their
+  flush succeeds.
+- **Clone-on-freeze**: when a pinned snapshot (long-lived read view) holds
+  the L0 generation a committer wants to merge into, the committer clones
+  the buffer aside instead of mutating the pinned view — snapshots never
+  observe post-pin writes, and uncontended commits never pay for the clone.
 
 ### BulkWriter Path
 
@@ -3499,35 +3512,123 @@ CREATE RULE risk_assessment AS
 
 ## Concurrency Model
 
-Uni uses a **single-writer, multi-reader** concurrency model with **snapshot isolation**:
+Since 2.0, Uni provides **serializable transaction isolation** via Snapshot
+Isolation plus commit-time Optimistic Concurrency Control (SSI/OCC),
+**enabled by default** (`UniConfig.ssi_enabled = true`). Any number of
+read-write transactions prepare concurrently; conflicts are detected at
+commit and surface as retriable errors instead of silently losing writes.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
-    Idle --> Writing: begin() [single writer]
-    Writing --> Committing: commit()
-    Writing --> RollingBack: rollback()
-    Committing --> Idle: success
-    RollingBack --> Idle: success
-    Writing --> Idle: drop (auto-rollback)
+    [*] --> Preparing
+    Preparing --> Preparing: read (pinned snapshot, recorded in read-set) / write (private L0)
+    Preparing --> Validating: commit() [writer lock]
+    Validating --> Committed: no conflict → WAL append → merge
+    Validating --> Aborted: SerializationConflict / ConstraintConflict (retriable)
+    Preparing --> RolledBack: rollback() / drop (auto-rollback)
 
-    state "Concurrent Reads" as CR {
-        [*] --> Reading1
-        [*] --> Reading2
-        [*] --> ReadingN
-    }
-
-    note right of CR
-        Multiple readers run
-        concurrently against
-        snapshot-isolated views
+    note right of Preparing
+        Many transactions prepare
+        concurrently — no lock held
+        until commit-time validation
     end note
 ```
 
-- **One writer at a time**: Prevents write-write conflicts entirely
-- **Many concurrent readers**: Each reader sees a consistent snapshot
-- **No read locks**: Readers never block writers; writers never block readers
-- **Auto-rollback on drop**: If a transaction is dropped without commit/rollback, it auto-rolls back with a warning
+- **Snapshot reads**: each read-write transaction pins an L0 snapshot at
+  start; readers never block writers and writers never block readers.
+- **Private write buffers**: writes go to the transaction's own L0 buffer
+  (read-your-writes) and are invisible to others until commit.
+- **Read-set tracking**: point lookups, scans (post-filter), neighbor
+  traversals — and Locy clause-body reads inside `tx.locy()` — are recorded
+  so commit-time validation can detect read-write antidependencies.
+- **Auto-rollback on drop**: a transaction dropped without commit/rollback
+  rolls back with a warning.
+
+### Commit Protocol
+
+`tx.commit()` acquires the writer lock and runs, in order:
+
+1. **OCC validation** against every commit that landed since this
+   transaction's snapshot: write-write intersection, read-write
+   antidependencies (a committed write touching something this transaction
+   read), and serializable `MERGE` uniqueness via the constraint index. A
+   conflict aborts with `SerializationConflict` / `ConstraintConflict` —
+   nothing is written.
+2. **WAL append + flush** — the durable commit point (checksummed segment;
+   fsync'd on local filesystems).
+3. **Merge** of the private L0 into the main L0, then the write-set is
+   recorded for future validators.
+
+The whole step (lock acquisition included) is bounded by
+`UniConfig.commit_timeout` (default 5 s); exceeding it returns
+`UniError::CommitTimeout`. If a concurrent snapshot pins the current L0
+generation, the committer clones it aside ("clone-on-freeze") rather than
+mutating the pinned view.
+
+### Conflicts and Retry
+
+Conflicting commits fail fast. Wrap contended read-modify-write logic in a
+retry helper — `is_retriable()` classifies `SerializationConflict`,
+`ConstraintConflict`, and `CommitTimeout` as transient:
+
+```rust
+// Re-runs the whole transaction body on a retriable conflict
+// (jittered exponential backoff; default 5 attempts).
+session.transact_with_retry(RetryOptions::default(), |tx| async move {
+    let n: i64 = tx.query_scalar("MATCH (c:Counter {id:'x'}) RETURN c.n").await?;
+    tx.execute_with("MATCH (c:Counter {id:'x'}) SET c.n = $v")
+        .param("v", n + 1)
+        .run()
+        .await?;
+    Ok(())
+}).await?;
+
+// Single-statement convenience wrapper:
+session.execute_with_retry("MERGE (u:User {email:'a@b.com'})").await?;
+```
+
+### `FOR UPDATE` Row Locks
+
+For read-modify-write hotspots, `FOR UPDATE` provides pessimistic per-key
+row locks held from `MATCH` until commit, serializing contending writers on
+those keys instead of letting them race to validation. Acquiring the lock
+on a fresh transaction re-pins the snapshot to the latest committed state,
+so the locked RMW commits without retries:
+
+```cypher
+MATCH (c:Counter {id: 'x'}) FOR UPDATE
+SET c.n = c.n + 1
+```
+
+`FOR UPDATE` requires SSI; with `ssi_enabled = false` it is a no-op (a
+`tracing::warn!` is emitted when a query requests it).
+
+### CRDT Carve-Out
+
+Writes that touch only CRDT-mergeable properties are excluded from the
+write-set: their merges are commutative, so concurrent CRDT updates never
+cause spurious conflicts. Overwriting a CRDT property with a mismatched
+scalar/variant is still conflict-detected (that is a real lost-update
+risk, not a merge).
+
+### Legacy Mode
+
+`ssi_enabled = false` restores the 1.x behavior: single effective writer
+with last-writer-wins merging and no conflict detection. It exists as a
+migration valve, not a recommendation — concurrent writers can silently
+lose updates in this mode.
+
+### Known Limitations
+
+- **Predicate phantoms**: the read-set tracks items, not predicates. A
+  `MERGE` race on a key with no unique constraint can double-create;
+  mitigate with a unique constraint (validated at commit) or `FOR UPDATE`.
+- **Flush-boundary read skew**: snapshots pin L0 generations, not the Lance
+  (L1) dataset version, so a very long transaction spanning an L0→L1 flush
+  may observe post-snapshot L1 data on cold scans.
+- **`session.query()`** (outside a transaction) reads latest-visible data
+  and does not participate in OCC; use a transaction when the read feeds a
+  write.
 
 ## Three-Scope Model
 
@@ -3609,6 +3710,13 @@ let tx = session.tx().await?;
 tx.locy("DERIVE similar_to(x, y) :- ...").await?;
 tx.commit().await?;
 ```
+
+Session-level derivation reads are not OCC-validated (they happen outside
+any transaction), so `tx.apply()` **requires freshness by default**: if any
+commit landed between DERIVE evaluation and apply, it returns
+`StaleDerivedFacts`. Opt out with `tx.apply_with(derived).allow_stale()` or
+bound the gap with `.max_version_gap(n)`. DERIVE inside `tx.locy()` does
+not need this check — its reads are in the transaction's read-set.
 
 ## Session API
 
@@ -3734,7 +3842,9 @@ Triggers can be declared from Cypher via `CALL uni.plugin.declareTrigger(...)` (
 
 | Practice | Details |
 |---|---|
-| **Keep transactions short** | Long transactions accumulate large L0 buffers; the writer lock is only held at commit time |
+| **Keep transactions short** | Long transactions accumulate large L0 buffers, widen the conflict window, and risk flush-boundary read skew; the writer lock is only held at commit time |
+| **Retry contended writes** | Wrap read-modify-write logic in `transact_with_retry` / `execute_with_retry`; treat `SerializationConflict` as normal contention, not an error |
+| **Lock hotspots with `FOR UPDATE`** | For keys hammered by many writers, pessimistic row locks beat optimistic retry storms |
 | **Use context managers** | `with session.tx() as tx:` ensures auto-rollback on error |
 | **Monitor write throttle** | Alert on `l1_runs` approaching `soft_limit` |
 | **Break bulk operations** | Split large imports into batches of 10-50k |
@@ -3744,8 +3854,9 @@ Triggers can be declared from Cypher via `CALL uni.plugin.declareTrigger(...)` (
 
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
-| **Long-running write txns** | Large L0 buffers; commit serialization delays | Keep under a few seconds |
-| **Reading without snapshots** | May see inconsistent data during compaction | Use snapshot isolation |
+| **Long-running write txns** | Large L0 buffers; wide conflict window; commit serialization delays | Keep under a few seconds |
+| **Treating conflicts as fatal** | `SerializationConflict` is expected under contention; surfacing it to users loses writes for no reason | Retry via `transact_with_retry` / `is_retriable()` |
+| **Read in one tx, write in another** | The second transaction's validation never saw the first's reads | Do the read-modify-write in ONE transaction |
 | **Ignoring auto-rollback warning** | Resource leak indication | Always explicitly commit or rollback |
 | **Writing on Session** | Session is read-only; mutation queries return an error | Use `session.tx()` to create a Transaction |
 

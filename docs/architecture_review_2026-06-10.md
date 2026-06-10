@@ -184,7 +184,7 @@ Consequences:
 4. ~~WAL checksums + tail policy + local fsync~~ — **DONE 2026-06-10** (group commit stays P2), §2.5.
 
 **P1 — Before tagging 2.0.0 (docs honesty):**
-5. Fix RELEASE_NOTES dead references; restore proposals as archive; rewrite Black Book Part XI; fix AGENTS.md top half + README — §7.
+5. ~~Fix RELEASE_NOTES dead references (inlined the wheel-picker guidance; dropped the proposals bullet — per decision, no archive restore); rewrite Black Book Part XI (+ Design Principles #6, Part V async-flush/clone-on-freeze addendum); fix AGENTS.md top half + README~~ — **DONE 2026-06-10**, §7.
 
 **P2 — Near-term hardening:**
 6. ~~Locy/algo read-set recording + default-fresh `apply()` + projection pin~~ — **DONE 2026-06-10**, §2.4.

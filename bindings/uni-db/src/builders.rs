@@ -1861,19 +1861,32 @@ impl PyTxLocyBuilder {
 }
 
 /// Builder for applying a DerivedFactSet with options.
+///
+/// Defaults to fresh-required: a version gap > 0 fails with a
+/// stale-derived-facts error unless `allow_stale()` or
+/// `max_version_gap(n)` is chained.
 #[pyclass(name = "ApplyBuilder")]
 pub struct PyApplyBuilder {
     pub(crate) tx: Py<super::sync_api::Transaction>,
     pub(crate) derived: Option<uni_locy::DerivedFactSet>,
-    pub(crate) require_fresh: bool,
+    pub(crate) allow_stale: bool,
     pub(crate) max_version_gap: Option<u64>,
 }
 
 #[pymethods]
 impl PyApplyBuilder {
-    /// Require fresh version (fail if version gap is non-zero).
+    /// Require fresh version (fail if version gap is non-zero). This is the
+    /// default; `require_fresh(False)` is the explicit stale opt-out (the
+    /// pre-2.0.7 default behavior).
     fn require_fresh(mut slf: PyRefMut<'_, Self>, require: bool) -> PyRefMut<'_, Self> {
-        slf.require_fresh = require;
+        slf.allow_stale = !require;
+        slf
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated.
+    fn allow_stale(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.allow_stale = true;
         slf
     }
 
@@ -1893,8 +1906,8 @@ impl PyApplyBuilder {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("DerivedFactSet already consumed")
         })?;
         let mut builder = tx.apply_with(dfs);
-        if self.require_fresh {
-            builder = builder.require_fresh();
+        if self.allow_stale && self.max_version_gap.is_none() {
+            builder = builder.allow_stale();
         }
         if let Some(gap) = self.max_version_gap {
             builder = builder.max_version_gap(gap);

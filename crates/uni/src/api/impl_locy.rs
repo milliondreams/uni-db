@@ -353,6 +353,17 @@ impl<'a> LocyEngine<'a> {
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
         }
+        // Install the transaction's private L0 on the executor — exactly like
+        // the Cypher path (`execute_internal_with_tx_l0`). This gives Locy
+        // clause bodies read-your-writes over the transaction's uncommitted
+        // state AND puts the tx's `occ_read_set` into the planner's
+        // L0Context, so graph scans inside the fixpoint are wrapped with
+        // `ReadSetRecordingExec` and participate in SSI validation. Without
+        // this, a `tx.locy(...)` read-modify-write commits on reads the OCC
+        // validator never saw (architecture review §2.4).
+        if let Some(tx_l0) = self.tx_l0_override.clone() {
+            df_executor.set_transaction_l0(tx_l0);
+        }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
         if let Ok(reg) = self.db.custom_functions.read()

@@ -593,8 +593,16 @@ pub struct ApplyBuilderSync<'t, 'a> {
 
 impl<'t, 'a> ApplyBuilderSync<'t, 'a> {
     /// Require that no commits occurred between DERIVE evaluation and apply.
+    /// This is the default; kept so intent stays explicit.
     pub fn require_fresh(mut self) -> Self {
         self.inner = self.inner.require_fresh();
+        self
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated.
+    pub fn allow_stale(mut self) -> Self {
+        self.inner = self.inner.allow_stale();
         self
     }
 

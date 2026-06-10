@@ -1249,7 +1249,12 @@ impl AsyncTransaction {
     }
 
     /// Apply a DerivedFactSet to this transaction.
-    #[pyo3(signature = (derived, require_fresh=false, max_version_gap=None))]
+    ///
+    /// Freshness is required by default (`require_fresh=True`): a commit
+    /// between DERIVE evaluation and apply raises a stale-derived-facts
+    /// error. Pass `require_fresh=False` to apply regardless of staleness,
+    /// or `max_version_gap=n` to bound the allowed gap.
+    #[pyo3(signature = (derived, require_fresh=true, max_version_gap=None))]
     fn apply<'py>(
         &self,
         py: Python<'py>,
@@ -1264,17 +1269,17 @@ impl AsyncTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
-            let result = if require_fresh || max_version_gap.is_some() {
+            let result = {
                 let mut builder = tx.apply_with(dfs);
-                if require_fresh {
-                    builder = builder.require_fresh();
+                // `require_fresh=False` without a gap bound is the explicit
+                // stale opt-out (the pre-2.0.7 default behavior).
+                if !require_fresh && max_version_gap.is_none() {
+                    builder = builder.allow_stale();
                 }
                 if let Some(gap) = max_version_gap {
                     builder = builder.max_version_gap(gap);
                 }
                 builder.run().await
-            } else {
-                tx.apply(dfs).await
             }
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyApplyResult {
@@ -1459,7 +1464,7 @@ impl AsyncTransaction {
         Ok(AsyncApplyBuilder {
             inner: self.inner.clone(),
             derived: Some(dfs),
-            require_fresh: false,
+            allow_stale: false,
             max_version_gap: None,
         })
     }
@@ -3757,19 +3762,31 @@ impl AsyncTxLocyBuilder {
 }
 
 /// Async builder for applying a DerivedFactSet with staleness controls.
+///
+/// Defaults to fresh-required; chain `allow_stale()` or
+/// `max_version_gap(n)` to opt out.
 #[pyclass(name = "AsyncApplyBuilder")]
 pub struct AsyncApplyBuilder {
     inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
     derived: Option<uni_locy::DerivedFactSet>,
-    require_fresh: bool,
+    allow_stale: bool,
     max_version_gap: Option<u64>,
 }
 
 #[pymethods]
 impl AsyncApplyBuilder {
-    /// Require fresh version (fail if version gap is non-zero).
+    /// Require fresh version (fail if version gap is non-zero). This is the
+    /// default; `require_fresh(False)` is the explicit stale opt-out (the
+    /// pre-2.0.7 default behavior).
     fn require_fresh(mut slf: PyRefMut<'_, Self>, require: bool) -> PyRefMut<'_, Self> {
-        slf.require_fresh = require;
+        slf.allow_stale = !require;
+        slf
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated.
+    fn allow_stale(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.allow_stale = true;
         slf
     }
 
@@ -3785,14 +3802,14 @@ impl AsyncApplyBuilder {
         let dfs = self.derived.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("DerivedFactSet already consumed")
         })?;
-        let require_fresh = self.require_fresh;
+        let allow_stale = self.allow_stale;
         let max_version_gap = self.max_version_gap;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
             let mut builder = tx.apply_with(dfs);
-            if require_fresh {
-                builder = builder.require_fresh();
+            if allow_stale && max_version_gap.is_none() {
+                builder = builder.allow_stale();
             }
             if let Some(gap) = max_version_gap {
                 builder = builder.max_version_gap(gap);

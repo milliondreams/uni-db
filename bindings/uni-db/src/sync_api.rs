@@ -252,6 +252,10 @@ impl Transaction {
     }
 
     /// Apply a DerivedFactSet to this transaction.
+    ///
+    /// Freshness is required: a commit between DERIVE evaluation and apply
+    /// raises a stale-derived-facts error. Use `apply_with(...)` +
+    /// `allow_stale()` / `max_version_gap(n)` to opt out.
     fn apply(&self, _py: Python, derived: &mut PyDerivedFactSet) -> PyResult<PyApplyResult> {
         let tx = self.check_active()?;
         let dfs = derived.inner.take().ok_or_else(|| {
@@ -337,6 +341,9 @@ impl Transaction {
     }
 
     /// Create an apply builder for this transaction.
+    ///
+    /// Defaults to fresh-required; chain `allow_stale()` or
+    /// `max_version_gap(n)` to opt out.
     fn apply_with(
         slf: Py<Self>,
         derived: &mut PyDerivedFactSet,
@@ -347,7 +354,7 @@ impl Transaction {
         Ok(crate::builders::PyApplyBuilder {
             tx: slf,
             derived: Some(dfs),
-            require_fresh: false,
+            allow_stale: false,
             max_version_gap: None,
         })
     }

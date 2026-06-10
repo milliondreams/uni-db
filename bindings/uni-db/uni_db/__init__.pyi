@@ -1102,9 +1102,14 @@ class TxLocyBuilder:
     def run(self) -> LocyResult: ...
 
 class ApplyBuilder:
-    """Fluent builder for applying derived facts."""
+    """Fluent builder for applying derived facts.
+
+    Defaults to fresh-required (version gap must be 0); chain
+    ``allow_stale()`` or ``max_version_gap(n)`` to opt out.
+    """
 
     def require_fresh(self, require: bool) -> ApplyBuilder: ...
+    def allow_stale(self) -> ApplyBuilder: ...
     def max_version_gap(self, gap: int) -> ApplyBuilder: ...
     def run(self) -> ApplyResult: ...
 
@@ -1940,7 +1945,7 @@ class AsyncTransaction:
     async def apply(
         self,
         derived: DerivedFactSet,
-        require_fresh: bool = False,
+        require_fresh: bool = True,
         max_version_gap: int | None = None,
     ) -> ApplyResult: ...
     async def apply_with(self, derived: DerivedFactSet) -> AsyncApplyBuilder: ...
@@ -2073,9 +2078,14 @@ class AsyncTxLocyBuilder:
     async def run(self) -> LocyResult: ...
 
 class AsyncApplyBuilder:
-    """Async fluent builder for applying derived facts."""
+    """Async fluent builder for applying derived facts.
+
+    Defaults to fresh-required (version gap must be 0); chain
+    ``allow_stale()`` or ``max_version_gap(n)`` to opt out.
+    """
 
     def require_fresh(self, require: bool) -> AsyncApplyBuilder: ...
+    def allow_stale(self) -> AsyncApplyBuilder: ...
     def max_version_gap(self, gap: int) -> AsyncApplyBuilder: ...
     async def run(self) -> ApplyResult: ...
 

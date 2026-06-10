@@ -8,4 +8,5 @@ pub mod locy_native_integration;
 pub mod locy_non_send_repro;
 pub mod locy_nonlinear_recursion;
 pub mod locy_program_persistence;
+pub mod locy_ssi_read_set;
 pub mod locy_timeout_partial;

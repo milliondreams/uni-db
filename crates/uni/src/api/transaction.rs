@@ -492,8 +492,16 @@ impl Transaction {
     /// Apply a `DerivedFactSet` (from a session-level DERIVE) to this transaction.
     ///
     /// Replays the collected Cypher mutation ASTs against the transaction's
-    /// private L0 buffer. Logs an info-level warning if the database version
-    /// has advanced since the DERIVE was evaluated (version gap > 0).
+    /// private L0 buffer.
+    ///
+    /// **Freshness is required by default**: if any commit happened between
+    /// DERIVE evaluation and this apply (version gap > 0), this returns
+    /// [`UniError::StaleDerivedFacts`]. Session-level derivation reads are
+    /// not part of this transaction's OCC read-set, so this version check is
+    /// the only thing standing between a concurrent base-data change and a
+    /// silently stale derivation. Opt out with
+    /// [`Transaction::apply_with`] + [`ApplyBuilder::allow_stale`] or bound
+    /// the gap with [`ApplyBuilder::max_version_gap`].
     #[instrument(skip(self, derived), fields(transaction_id = %self.id))]
     pub async fn apply(&self, derived: DerivedFactSet) -> Result<ApplyResult> {
         self.apply_internal(derived, false, None).await
@@ -504,7 +512,7 @@ impl Transaction {
         ApplyBuilder {
             tx: self,
             derived,
-            require_fresh: false,
+            allow_stale: false,
             max_version_gap: None,
         }
     }
@@ -512,20 +520,22 @@ impl Transaction {
     async fn apply_internal(
         &self,
         derived: DerivedFactSet,
-        require_fresh: bool,
+        allow_stale: bool,
         max_gap: Option<u64>,
     ) -> Result<ApplyResult> {
         self.check_completed()?;
         let current_version = self.tx_l0.read().current_version;
         let version_gap = current_version.saturating_sub(derived.evaluated_at_version);
 
-        if require_fresh && version_gap > 0 {
-            return Err(UniError::StaleDerivedFacts { version_gap });
-        }
-        if let Some(max) = max_gap
-            && version_gap > max
-        {
-            return Err(UniError::StaleDerivedFacts { version_gap });
+        // Fresh-by-default: unless the caller explicitly opted into
+        // staleness, any commit between DERIVE evaluation and apply rejects
+        // the apply — the derivation may be based on data that no longer
+        // exists (architecture review §2.4).
+        if !allow_stale {
+            let max = max_gap.unwrap_or(0);
+            if version_gap > max {
+                return Err(UniError::StaleDerivedFacts { version_gap });
+            }
         }
         if version_gap > 0 {
             info!(
@@ -1398,18 +1408,33 @@ pub struct ApplyResult {
 }
 
 /// Builder for applying a `DerivedFactSet` with staleness controls.
+///
+/// The default is **fresh-required** (version gap must be 0); see
+/// [`Transaction::apply`] for the rationale.
 pub struct ApplyBuilder<'a> {
     tx: &'a Transaction,
     derived: DerivedFactSet,
-    require_fresh: bool,
+    allow_stale: bool,
     max_version_gap: Option<u64>,
 }
 
 impl<'a> ApplyBuilder<'a> {
     /// Require that no commits occurred between DERIVE evaluation and apply.
     /// Returns `StaleDerivedFacts` if the version gap is > 0.
+    ///
+    /// This is the default since 2.0.7; the method is kept so existing
+    /// callers stay valid and intent stays explicit.
     pub fn require_fresh(mut self) -> Self {
-        self.require_fresh = true;
+        self.allow_stale = false;
+        self.max_version_gap = None;
+        self
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated. The derivation may be based on data that has since
+    /// changed; a gap > 0 is logged at info level.
+    pub fn allow_stale(mut self) -> Self {
+        self.allow_stale = true;
         self
     }
 
@@ -1423,7 +1448,7 @@ impl<'a> ApplyBuilder<'a> {
     /// Execute the apply operation.
     pub async fn run(self) -> Result<ApplyResult> {
         self.tx
-            .apply_internal(self.derived, self.require_fresh, self.max_version_gap)
+            .apply_internal(self.derived, self.allow_stale, self.max_version_gap)
             .await
     }
 }

@@ -675,9 +675,14 @@ async fn test_wal_serde_backward_compat_missing_edge_type_name() -> Result<()> {
 }
 
 // ── WAL Corruption Recovery Tests ────────────────────────────────────
+//
+// Policy (architecture review §2.5): a corrupt segment at the TAIL of the
+// log is a torn write from a crash — recovery skips it with a warning and
+// keeps everything before it. A corrupt segment with valid segments AFTER
+// it is real data loss and fails recovery with an error naming the file.
 
 #[tokio::test]
-async fn test_wal_truncated_segment_recovery() {
+async fn test_wal_truncated_tail_segment_skipped() {
     let store = create_memory_store();
     let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
     wal.initialize().await.unwrap();
@@ -691,7 +696,7 @@ async fn test_wal_truncated_segment_recovery() {
     .unwrap();
     wal.flush().await.unwrap();
 
-    // Write a truncated (invalid JSON) segment directly
+    // Write a truncated (invalid JSON) segment directly, at the tail
     let truncated_path = Path::from("wal/00000000000000000099_bad.wal");
     store
         .put(
@@ -701,19 +706,19 @@ async fn test_wal_truncated_segment_recovery() {
         .await
         .unwrap();
 
-    // Replaying should fail on the corrupt segment or skip it.
-    // We verify it doesn't panic.
-    let result = wal.replay_since(0).await;
-    let _ = result;
+    // The corrupt tail is treated as end-of-WAL: the valid segment before
+    // it replays, the torn one is skipped.
+    let mutations = wal.replay_since(0).await.unwrap();
+    assert_eq!(mutations.len(), 1, "valid segment before torn tail replays");
 }
 
 #[tokio::test]
-async fn test_wal_corrupted_segment_data() {
+async fn test_wal_corrupt_only_segment_is_tolerated_tail() {
     let store = create_memory_store();
     let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
     wal.initialize().await.unwrap();
 
-    // Write random bytes as a WAL segment
+    // Write random bytes as the only WAL segment — it is the tail.
     let bad_path = Path::from("wal/00000000000000000001_corrupt.wal");
     store
         .put(
@@ -723,27 +728,160 @@ async fn test_wal_corrupted_segment_data() {
         .await
         .unwrap();
 
-    // Replay should handle corrupt data gracefully (error or skip)
-    let result = wal.replay_since(0).await;
-    let _ = result; // Should not panic
+    let mutations = wal.replay_since(0).await.unwrap();
+    assert!(mutations.is_empty(), "corrupt tail yields no mutations");
 }
 
 #[tokio::test]
-async fn test_wal_empty_segment_file() {
+async fn test_wal_empty_segment_file_is_corrupt_tail() {
     let store = create_memory_store();
     let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
     wal.initialize().await.unwrap();
 
-    // Write a zero-byte WAL segment
+    // A zero-byte segment is a torn write: tolerated only at the tail.
     let empty_path = Path::from("wal/00000000000000000001_empty.wal");
     store
         .put(&empty_path, bytes::Bytes::new().into())
         .await
         .unwrap();
 
-    // Empty segments should be handled gracefully
-    let result = wal.replay_since(0).await;
-    let _ = result; // Should not panic
+    let mutations = wal.replay_since(0).await.unwrap();
+    assert!(mutations.is_empty());
+}
+
+#[tokio::test]
+async fn test_wal_corrupt_middle_segment_fails_recovery() {
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Valid segment at LSN 1.
+    wal.append(&Mutation::InsertVertex {
+        vid: Vid::new(1),
+        labels: vec!["Person".to_string()],
+        properties: HashMap::new(),
+    })
+    .unwrap();
+    wal.flush().await.unwrap();
+
+    // Corrupt segment at LSN 2 (the middle).
+    let bad_path = Path::from("wal/00000000000000000002_corrupt.wal");
+    store
+        .put(&bad_path, bytes::Bytes::from(vec![0xDE, 0xAD]).into())
+        .await
+        .unwrap();
+
+    // Valid segment at LSN 3 — written directly so its LSN is above the
+    // corrupt one (the WAL instance's counter is at 2).
+    wal.append(&Mutation::InsertVertex {
+        vid: Vid::new(3),
+        labels: vec!["Person".to_string()],
+        properties: HashMap::new(),
+    })
+    .unwrap();
+    wal.flush().await.unwrap();
+    wal.append(&Mutation::InsertVertex {
+        vid: Vid::new(4),
+        labels: vec!["Person".to_string()],
+        properties: HashMap::new(),
+    })
+    .unwrap();
+    wal.flush().await.unwrap();
+
+    // A corrupt segment with valid segments after it must fail recovery,
+    // naming the file.
+    let err = wal
+        .replay_since(0)
+        .await
+        .expect_err("corrupt middle segment must fail recovery");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("00000000000000000002_corrupt.wal"),
+        "error must name the corrupt file, got: {msg}"
+    );
+    assert!(
+        msg.contains("refusing to skip"),
+        "error must state the policy, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_wal_checksum_mismatch_detected() {
+    use futures::TryStreamExt as _;
+
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Flush a valid (enveloped) segment, then flip a payload byte on disk.
+    wal.append(&Mutation::InsertVertex {
+        vid: Vid::new(1),
+        labels: vec!["Person".to_string()],
+        properties: HashMap::new(),
+    })
+    .unwrap();
+    wal.flush().await.unwrap();
+
+    let metas = store
+        .list(Some(&Path::from("wal")))
+        .map_ok(|m| m.location)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(metas.len(), 1);
+    let seg_path = metas[0].clone();
+    let mut bytes = store
+        .get(&seg_path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    // Flip the last payload byte (header stays intact → checksum mismatch).
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    store
+        .put(&seg_path, bytes::Bytes::from(bytes).into())
+        .await
+        .unwrap();
+
+    // Single (tail) segment with bad checksum: skipped, not replayed.
+    let mutations = wal.replay_since(0).await.unwrap();
+    assert!(
+        mutations.is_empty(),
+        "checksum-mismatched segment must not replay"
+    );
+}
+
+#[tokio::test]
+async fn test_wal_legacy_raw_json_segment_replays() {
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Hand-write a pre-2.0.7 segment: raw JSON, no checksum envelope.
+    let legacy = serde_json::json!({
+        "lsn": 5,
+        "mutations": [
+            { "InsertVertex": { "vid": 42, "properties": {} } }
+        ]
+    });
+    let legacy_path = Path::from("wal/00000000000000000005_legacy.wal");
+    store
+        .put(
+            &legacy_path,
+            bytes::Bytes::from(serde_json::to_vec(&legacy).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let mutations = wal.replay_since(0).await.unwrap();
+    assert_eq!(mutations.len(), 1, "legacy segment must stay readable");
+    match &mutations[0] {
+        Mutation::InsertVertex { vid, .. } => assert_eq!(u64::from(*vid), 42),
+        other => panic!("expected InsertVertex, got {other:?}"),
+    }
 }
 
 // ============================================================================

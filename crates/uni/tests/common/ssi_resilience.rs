@@ -322,3 +322,46 @@ async fn crash_after_merge_is_atomic() -> Result<()> {
     let db = h.open().await?;
     assert_atomic_and_usable(&db, 3).await
 }
+
+/// A corrupt (torn) WAL segment at the TAIL must not block reopen
+/// (architecture review §2.5): the torn segment belongs to a commit that was
+/// never acknowledged, so recovery skips it with a warning and replays
+/// everything before it. Before the tail-vs-middle policy existed, ANY
+/// corrupt segment hard-failed the whole recovery and left the database
+/// unopenable after a simple crash.
+#[tokio::test]
+async fn corrupt_wal_tail_does_not_block_reopen() -> Result<()> {
+    let h = DiskHarness::new()?;
+    {
+        let db = h.open().await?;
+        init_schema_and_seed(&db).await?; // commits n = 0
+        // Flush so a snapshot manifest exists (n = 0 reaches L1).
+        db.flush().await?;
+        // A post-flush commit that will become the WAL tail.
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute("MATCH (c:C {id: 'x'}) SET c.n = 5").await?;
+        tx.commit().await?;
+        drop(db);
+    }
+
+    // Simulate a torn write: overwrite the highest-LSN segment with garbage.
+    let wal_dir = std::path::PathBuf::from(h.uri()).join("wal");
+    let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(&wal_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "wal"))
+        .collect();
+    segments.sort();
+    let tail = segments.last().expect("at least one WAL segment");
+    std::fs::write(tail, b"torn-by-power-loss")?;
+
+    // Reopen succeeds; the corrupt tail's commit (n = 5) is gone, the
+    // commit before it (n = 0) survives.
+    let db = h.open().await?;
+    assert_eq!(
+        read_n(&db).await?,
+        0,
+        "intact segments before the torn tail must replay"
+    );
+    Ok(())
+}

@@ -410,6 +410,19 @@ impl StorageManager {
         }
     }
 
+    /// Filesystem root backing this manager's object store, when the store
+    /// is a local filesystem (the non-`://` branch of
+    /// `build_store_from_uri`). Used to fsync WAL segments after PUT —
+    /// `object_store::LocalFileSystem` does not fsync on its own. `None`
+    /// for remote/URL-based stores.
+    pub fn local_fs_root(&self) -> Option<std::path::PathBuf> {
+        if self.base_uri.contains("://") {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&self.base_uri))
+        }
+    }
+
     pub fn pinned(&self, snapshot: SnapshotManifest) -> Self {
         // Phase 4a: pinning a forked session is now supported. The
         // resulting StorageManager keeps `fork_scope` so reads continue

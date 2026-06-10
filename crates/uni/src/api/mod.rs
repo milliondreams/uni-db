@@ -3163,11 +3163,15 @@ impl UniBuilder {
         // storage layout (remote-only, hybrid, or local): the only
         // difference is which `wal_store` was resolved above, and
         // `local_store` maps to the FS even behind the ObjectStore trait.
+        // For local layouts the data directory is passed as the WAL's
+        // local root, enabling fsync-on-flush (LocalFileSystem `put` does
+        // not fsync; without it a power loss can drop acknowledged
+        // commits). Remote layouts rely on the PUT ack.
         let wal = if self.config.wal_enabled {
-            Some(Arc::new(WriteAheadLog::new(
-                wal_store,
-                object_store::path::Path::from("wal"),
-            )))
+            Some(Arc::new(
+                WriteAheadLog::new(wal_store, object_store::path::Path::from("wal"))
+                    .with_local_root(persistence_data_path.clone()),
+            ))
         } else {
             None
         };

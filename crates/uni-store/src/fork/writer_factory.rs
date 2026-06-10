@@ -51,7 +51,10 @@ pub async fn new_for_fork(
     let allocator =
         id_alloc::new_for_fork_arc(store.clone(), fork_id, id_alloc::DEFAULT_FORK_BATCH_SIZE)
             .await?;
-    let wal = fork_wal::new_for_fork_arc(store, fork_id);
+    // Local stores get fsync-on-flush for the fork WAL, same as the primary.
+    let wal = Arc::new(
+        fork_wal::new_for_fork(store, fork_id).with_local_root(storage.local_fs_root()),
+    );
     // Initialize the WAL so its LSN counter picks up any persisted
     // segments from prior sessions on the same fork.
     wal.initialize().await?;

@@ -13336,6 +13336,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "blake3",
  "bytes",
  "chrono",
  "dashmap",

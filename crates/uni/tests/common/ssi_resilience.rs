@@ -333,7 +333,18 @@ async fn crash_after_merge_is_atomic() -> Result<()> {
 async fn corrupt_wal_tail_does_not_block_reopen() -> Result<()> {
     let h = DiskHarness::new()?;
     {
-        let db = h.open().await?;
+        // Pin the post-flush `n = 5` commit to the WAL tail: disable the
+        // time-based auto-flush so a background flush cannot promote it into
+        // L1. Otherwise, under heavy load, ≥ `auto_flush_interval` can elapse
+        // between `flush()` and the commit, the commit trips the time-based
+        // auto-flush, and the spawned flush (which `Drop` does not drain)
+        // finalizes `n = 5` into L1 — so corrupting the WAL tail no longer
+        // reverts it and the reopen observes `n = 5` (a flaky failure).
+        let cfg = uni_db::UniConfig {
+            auto_flush_interval: None,
+            ..Default::default()
+        };
+        let db = h.open_with(cfg).await?;
         init_schema_and_seed(&db).await?; // commits n = 0
         // Flush so a snapshot manifest exists (n = 0 reaches L1).
         db.flush().await?;

@@ -23,7 +23,9 @@ fn parse_lsn_from_filename(path: &Path) -> Option<u64> {
     if filename.len() < 20 {
         return None;
     }
-    filename[..20].parse::<u64>().ok()
+    // `str::get(..20)` yields `None` (instead of panicking) when byte index 20
+    // falls mid-UTF-8-character, so a foreign multibyte filename is skipped.
+    filename.get(..20).and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Magic prefix of checksummed (v2) WAL segments.
@@ -643,6 +645,26 @@ mod tests {
         // Empty path
         let path = Path::from("");
         assert_eq!(parse_lsn_from_filename(&path), None);
+    }
+
+    /// Regression for Bug #30: `parse_lsn_from_filename` must not panic on a
+    /// filename whose byte 20 falls in the middle of a multi-byte UTF-8 char.
+    ///
+    /// The length guard uses [`str::len`] (byte length), but the subsequent
+    /// `filename[..20]` slice requires byte 20 to be a char boundary. A name of
+    /// 19 ASCII bytes plus one 2-byte char ('é', bytes 19..21) has a byte length
+    /// of at least 20, passes the guard, then slices mid-'é' and panics today.
+    /// The correct behavior is to return `None` for a non-numeric/unparsable name.
+    ///
+    /// We use [`Path::parse`] (not [`Path::from`]) because `from` percent-encodes
+    /// non-ASCII so that `filename()` would be pure ASCII and never reach the
+    /// mid-char slice; `parse` preserves the raw multi-byte segment verbatim,
+    /// which is exactly what a real on-disk listing can surface.
+    #[test]
+    fn test_parse_lsn_from_filename_multibyte_no_panic() {
+        let name = format!("{}{}.wal", "0".repeat(19), "é"); // byte 20 falls mid-'é'
+        let path = Path::parse(name).expect("multi-byte segment is a valid object_store path");
+        assert_eq!(parse_lsn_from_filename(&path), None); // RED: panics today; correct = None
     }
 
     /// Test for Issue #6: WAL initialization should parse LSN from filenames

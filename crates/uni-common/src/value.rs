@@ -510,9 +510,14 @@ use chrono::Timelike as _;
 /// Preserves the distinction between integers and floats, and includes
 /// graph-specific variants for nodes, edges, paths, and vectors.
 ///
-/// Note: `Eq` and `Hash` are implemented manually to support using `Value` as
-/// HashMap keys. Floats are compared/hashed by their bit representation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Note: `PartialEq`, `Eq`, and `Hash` are implemented manually to support
+/// using `Value` as a HashMap key. The [`Value::Float`] arm uses a *normalized*
+/// total ordering rather than raw IEEE-754: `0.0` equals `-0.0`, and `NaN`
+/// equals `NaN` (so `Eq`'s reflexivity holds). `Hash` is consistent with this:
+/// all zeros hash alike and all NaNs hash alike. All other floats compare and
+/// hash by their (canonical) bit representation. This affects only internal
+/// bucketing — Cypher `=`/`IN`/`DISTINCT` route through `cypher_eq`, not here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum Value {
@@ -728,10 +733,67 @@ impl fmt::Display for Value {
 }
 
 // ---------------------------------------------------------------------------
-// Eq and Hash implementations
+// PartialEq, Eq, and Hash implementations
 // ---------------------------------------------------------------------------
 
+/// Normalized float equality used by [`Value`]'s `PartialEq`/`Hash`.
+///
+/// Treats `0.0 == -0.0` and `NaN == NaN`, so that `Value` upholds the std
+/// `Hash`/`Eq` contract (`a == b` implies `hash(a) == hash(b)`) and `Eq`'s
+/// reflexivity (`NaN == NaN`). All other floats compare via `total_cmp`, which
+/// agrees with IEEE-754 `==` on finite, non-zero values.
+fn float_eq_normalized(a: f64, b: f64) -> bool {
+    a.total_cmp(&b) == std::cmp::Ordering::Equal
+        || (a == 0.0 && b == 0.0)
+        || (a.is_nan() && b.is_nan())
+}
+
+impl PartialEq for Value {
+    /// Structural equality, with the [`Value::Float`] arm normalized so that
+    /// `0.0 == -0.0` and `NaN == NaN` (see `float_eq_normalized`).
+    ///
+    /// All non-float arms match the behavior of the former `#[derive(PartialEq)]`
+    /// exactly. Container variants (`List`, `Map`, `Node`, `Edge`, `Path`)
+    /// recurse through this same impl, so nested floats normalize too.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Normalized float arm — the whole point of this hand-written impl.
+            (Value::Float(a), Value::Float(b)) => float_eq_normalized(*a, *b),
+            // All other arms reproduce the derived structural equality.
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Node(a), Value::Node(b)) => a == b,
+            (Value::Edge(a), Value::Edge(b)) => a == b,
+            (Value::Path(a), Value::Path(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Temporal(a), Value::Temporal(b)) => a == b,
+            // Distinct variants are never equal.
+            _ => false,
+        }
+    }
+}
+
 impl Eq for Value {}
+
+/// Hashes an `f64` with signed-zero and NaN normalization.
+///
+/// `0.0` and `-0.0` hash identically, and every NaN bit pattern hashes
+/// identically, keeping `Hash` consistent with [`float_eq_normalized`].
+fn hash_f64_normalized<H: Hasher>(f: f64, state: &mut H) {
+    let bits = if f == 0.0 {
+        0.0f64.to_bits()
+    } else if f.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        f.to_bits()
+    };
+    bits.hash(state);
+}
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -741,7 +803,10 @@ impl Hash for Value {
             Value::Null => {}
             Value::Bool(b) => b.hash(state),
             Value::Int(i) => i.hash(state),
-            Value::Float(f) => f.to_bits().hash(state),
+            // Normalize so that `0.0`/`-0.0` hash alike and all NaNs hash alike,
+            // matching `PartialEq` (see `float_eq_normalized`) and upholding the
+            // `Hash`/`Eq` contract.
+            Value::Float(f) => hash_f64_normalized(*f, state),
             Value::String(s) => s.hash(state),
             Value::Bytes(b) => b.hash(state),
             Value::List(l) => l.hash(state),
@@ -750,9 +815,18 @@ impl Hash for Value {
             Value::Edge(e) => e.hash(state),
             Value::Path(p) => p.hash(state),
             Value::Vector(v) => {
+                // `Vec<f32>` compares via IEEE-754 `==` (so `0.0 == -0.0`); hash
+                // with the same signed-zero/NaN normalization to stay consistent.
                 v.len().hash(state);
                 for f in v {
-                    f.to_bits().hash(state);
+                    let bits = if *f == 0.0f32 {
+                        0.0f32.to_bits()
+                    } else if f.is_nan() {
+                        f32::NAN.to_bits()
+                    } else {
+                        f.to_bits()
+                    };
+                    bits.hash(state);
                 }
             }
             Value::Temporal(t) => t.hash(state),
@@ -1820,5 +1894,32 @@ mod tests {
             timezone_name: Some("Europe/Stockholm".to_string()),
         };
         assert_eq!(dt.to_string(), "1984-10-11T12:31+01:00[Europe/Stockholm]");
+    }
+
+    /// Regression: `Value` `Hash`/`Eq` contract violation on signed-zero floats.
+    ///
+    /// `Value::Float` compares via IEEE-754 (`0.0 == -0.0`) but hashes via
+    /// `f64::to_bits`, where `0.0` and `-0.0` differ. The std contract requires
+    /// `k1 == k2` to imply `hash(k1) == hash(k2)`; violating it corrupts
+    /// `HashMap<Vec<Value>, _>` keys used for `PARTITION BY`.
+    #[test]
+    fn value_hash_eq_contract_float_signed_zero() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn h(v: &Value) -> u64 {
+            let mut s = DefaultHasher::new();
+            v.hash(&mut s);
+            s.finish()
+        }
+
+        let pos = Value::Float(0.0);
+        let neg = Value::Float(-0.0);
+        assert_eq!(pos, neg, "0.0 and -0.0 compare equal");
+        assert_eq!(
+            h(&pos),
+            h(&neg),
+            "equal Values must hash equally (Hash/Eq contract)"
+        );
     }
 }

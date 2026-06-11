@@ -433,11 +433,78 @@ impl Writer {
                 );
                 let mut l0_guard = l0.write();
                 l0_guard.replay_mutations(mutations)?;
+                // Rebuild the UNIQUE constraint index over the recovered rows
+                // (Bug #9 Mechanism B). `replay_mutations` restores
+                // vertices/properties/labels but never repopulates
+                // `constraint_index` (its only other caller is the live insert
+                // path). Without this, a unique key that lives only in the WAL
+                // (committed but not yet flushed to Lance) is invisible to
+                // `check_unique_constraint_multi` after recovery and a
+                // duplicate of it could be created.
+                self.rebuild_constraint_index(&mut l0_guard);
             }
 
             Ok(count)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Rebuild the UNIQUE constraint index on a recovered L0 buffer.
+    ///
+    /// Scans every recovered vertex's properties and, for each enabled UNIQUE
+    /// constraint whose target label the vertex carries and whose member
+    /// properties are all present, inserts the same constraint key the live
+    /// insert path builds (`serialize_constraint_key`). Tombstoned vertices are
+    /// skipped. Called after [`L0Buffer::replay_mutations`] under the buffer's
+    /// write lock; the schema is already loaded on the `Writer`.
+    fn rebuild_constraint_index(&self, l0_guard: &mut L0Buffer) {
+        let schema = self.schema_manager.schema();
+        // Collect entries first to avoid borrowing `vertex_properties`
+        // immutably while mutating `constraint_index` through the same guard.
+        let mut keys: Vec<(Vec<u8>, Vid)> = Vec::new();
+        for (&vid, props) in &l0_guard.vertex_properties {
+            if l0_guard.vertex_tombstones.contains(&vid) {
+                continue;
+            }
+            let Some(labels) = l0_guard.vertex_labels.get(&vid) else {
+                continue;
+            };
+            for label in labels {
+                for constraint in &schema.constraints {
+                    if !constraint.enabled {
+                        continue;
+                    }
+                    let ConstraintTarget::Label(l) = &constraint.target else {
+                        continue;
+                    };
+                    if l != label {
+                        continue;
+                    }
+                    let ConstraintType::Unique {
+                        properties: unique_props,
+                    } = &constraint.constraint_type
+                    else {
+                        continue;
+                    };
+                    let mut key_values = Vec::new();
+                    let mut all_present = true;
+                    for prop in unique_props {
+                        if let Some(val) = props.get(prop) {
+                            key_values.push((prop.clone(), val.clone()));
+                        } else {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    if all_present {
+                        keys.push((serialize_constraint_key(label, &key_values), vid));
+                    }
+                }
+            }
+        }
+        for (key, vid) in keys {
+            l0_guard.insert_constraint_key(key, vid);
         }
     }
 
@@ -856,10 +923,22 @@ impl Writer {
             {
                 match coord.try_acquire_permit() {
                     Some(permit) => {
-                        let seq = coord.next_rotate_seq();
-                        coord.note_pending();
                         match self.flush_l0_rotate().await {
                             Ok(rotate_out) => {
+                                // Allocate the rotate seq and bump pending ONLY
+                                // after the rotate succeeds (Bug #3). A failed
+                                // rotate must consume neither: the finalizer
+                                // advances strictly in consecutive seq order and
+                                // only decrements pending on finalize, so a
+                                // leaked seq/pending from a failed rotate would
+                                // wedge the finalizer forever and climb pending
+                                // toward `max_pending_flushes`. The seq is still
+                                // allocated under `flush_lock` (immediately after
+                                // the rotate, before the guard drops below), so
+                                // concurrent rotates keep seq order == rotation
+                                // order, and the seq is not used until submit.
+                                let seq = coord.next_rotate_seq();
+                                coord.note_pending();
                                 // Release flush_lock BEFORE the spawn so concurrent
                                 // commits can proceed while the stream runs.
                                 drop(_flush_lock_guard);
@@ -892,7 +971,10 @@ impl Writer {
                             }
                             Err(e) => {
                                 tracing::warn!("Async rotate failed (non-critical): {}", e);
-                                // permit drops here, freeing the slot
+                                // No seq was allocated and pending was not
+                                // bumped (both moved into the Ok arm for Bug
+                                // #3), so the finalizer is not wedged. The
+                                // permit drops here, freeing the slot.
                             }
                         }
                     }
@@ -1704,6 +1786,22 @@ impl Writer {
             }
         }
 
+        // 1b. Check pending-flush buffers (Bug #9A). A flush rotates a key's
+        // buffer onto `pending_flush` and installs a fresh empty current
+        // buffer; until the rotated rows reach Lance the key is invisible to
+        // both the current-buffer check above and the storage check below, so
+        // a duplicate could slip through that flush window. Mirror the read
+        // paths (e.g. `check_extid_globally_unique`, `get_vertex_labels`) that
+        // already consult `pending_flush`.
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            if pending_l0.read().has_constraint_key(&key, current_vid) {
+                return Err(anyhow!(
+                    "Constraint violation: Duplicate composite key for label '{}' (in pending flush)",
+                    label
+                ));
+            }
+        }
+
         // Check Transaction L0
         if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
@@ -2044,6 +2142,18 @@ impl Writer {
         let labels_copy = labels.to_vec();
 
         {
+            // For a non-tx write, re-resolve the live `current` buffer and hold
+            // `flush_lock` across the (synchronous) write so a concurrent flush
+            // rotate (which takes `flush_lock` via `begin_flush`) cannot install
+            // a fresh `current` between resolve and write, dropping our write
+            // (Bug #4). For a tx write `resolve_l0` returns the tx-private
+            // buffer, never the rotating `current`, so no `flush_lock` is needed
+            // (and taking it would risk re-entrancy with the commit path).
+            let _flush_lock_guard = if tx_l0.is_none() {
+                Some(self.flush_lock.lock().await)
+            } else {
+                None
+            };
             let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
             l0_guard.insert_vertex_with_labels(vid, properties, labels);
@@ -2474,42 +2584,73 @@ impl Writer {
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
         self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
-        let l0 = self.resolve_l0(tx_l0);
 
-        // Before deleting, ensure we have the vertex's labels stored in L0
-        // so the tombstone can be properly flushed to the correct label datasets.
+        // Before deleting, ensure we have the vertex's labels stored in L0 so
+        // the tombstone can be flushed to the correct label datasets. Discover
+        // them up front (this may await storage) WITHOUT pinning the buffer we
+        // will eventually mutate — for non-tx writes the live `current` buffer
+        // is re-resolved below under `flush_lock`, so a concurrent rotate can't
+        // drop our write (Bug #4). `resolve_l0` here is only used for cheap
+        // reads that tolerate a racing rotate.
         let has_labels = {
-            let l0_guard = l0.read();
-            l0_guard.vertex_labels.contains_key(&vid)
+            let l0_guard = self.resolve_l0(tx_l0);
+            let guard = l0_guard.read();
+            guard.vertex_labels.contains_key(&vid)
         };
 
-        if !has_labels {
-            let resolved_labels = if let Some(provided) = labels {
-                // Caller provided labels — skip the lookup entirely
-                Some(provided)
-            } else {
-                // Discover labels from pending flush L0s, then storage
-                let mut found = None;
-                for pending_l0 in self.l0_manager.get_pending_flush() {
-                    let pending_guard = pending_l0.read();
-                    if let Some(l) = pending_guard.get_vertex_labels(vid) {
-                        found = Some(l.to_vec());
-                        break;
-                    }
+        let backfill_labels = if has_labels {
+            None
+        } else if let Some(provided) = labels {
+            // Caller provided labels — skip the lookup entirely
+            Some(provided)
+        } else {
+            // Discover labels from pending flush L0s, then storage
+            let mut found = None;
+            for pending_l0 in self.l0_manager.get_pending_flush() {
+                let pending_guard = pending_l0.read();
+                if let Some(l) = pending_guard.get_vertex_labels(vid) {
+                    found = Some(l.to_vec());
+                    break;
                 }
-                if found.is_none() {
-                    found = self.find_vertex_labels_in_storage(vid).await?;
-                }
-                found
-            };
-
-            if let Some(found_labels) = resolved_labels {
-                let mut l0_guard = l0.write();
-                l0_guard.vertex_labels.insert(vid, found_labels);
             }
-        }
+            if found.is_none() {
+                found = self.find_vertex_labels_in_storage(vid).await?;
+            }
+            found
+        };
 
-        l0.write().delete_vertex(vid)?;
+        // Test-only seam (no-op without the `failpoints` feature): pause a
+        // non-transactional delete AFTER the awaited label discovery but BEFORE
+        // it re-resolves the live buffer and writes the tombstone. A concurrent
+        // flush can rotate+complete a buffer in this window; the fix re-resolves
+        // `get_current()` and mutates it under `flush_lock`, so the tombstone
+        // always lands in the live buffer (Bug #4 — silent lost delete across
+        // L0 rotation).
+        fail::fail_point!("nontx::after-capture");
+
+        // Apply the label backfill and the tombstone together. For a non-tx
+        // write, hold `flush_lock` across the (synchronous) re-resolve + write
+        // so a concurrent flush rotate (which takes `flush_lock` via
+        // `begin_flush`) cannot install a fresh `current` between our resolve
+        // and our write. For a tx write `resolve_l0` returns the tx-private
+        // buffer (never the rotating `current`), so no `flush_lock` is needed
+        // — and taking it there would risk re-entrancy with the commit path.
+        if tx_l0.is_none() {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            let l0 = self.l0_manager.get_current();
+            let mut guard = l0.write();
+            if let Some(found_labels) = backfill_labels {
+                guard.vertex_labels.insert(vid, found_labels);
+            }
+            guard.delete_vertex(vid)?;
+        } else {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut guard = l0.write();
+            if let Some(found_labels) = backfill_labels {
+                guard.vertex_labels.insert(vid, found_labels);
+            }
+            guard.delete_vertex(vid)?;
+        }
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
@@ -3100,17 +3241,29 @@ impl Writer {
         // 1. Acquire permit FIRST (outside flush_lock) so we don't
         //    introduce a permit-while-holding-flush-lock convoy.
         let permit = coord.acquire_permit().await?;
-        let seq = coord.next_rotate_seq();
-        coord.note_pending();
-        // 2. Rotate under flush_lock (µs work).
-        let RotateOutput {
-            old_l0_arc,
-            wal_lsn,
-            current_version,
-            flush_in_progress_guard,
-        } = {
+        // 2. Rotate under flush_lock (µs work), then allocate the rotate seq
+        //    and bump pending ONLY after the rotate succeeds (Bug #3). A failed
+        //    rotate (the `?` below) must consume neither: the finalizer
+        //    advances in strictly consecutive seq order and only decrements
+        //    pending on finalize, so a leaked seq/pending would wedge it
+        //    forever. The seq is allocated under `flush_lock`, immediately
+        //    after the rotate and before the guard drops, so concurrent rotates
+        //    keep seq order == rotation order, and the seq is unused until
+        //    submit. On the `?` error path the permit drops, freeing the slot.
+        let (
+            RotateOutput {
+                old_l0_arc,
+                wal_lsn,
+                current_version,
+                flush_in_progress_guard,
+            },
+            seq,
+        ) = {
             let _flush_lock_guard = self.flush_lock.lock().await;
-            self.flush_l0_rotate().await?
+            let rotate_out = self.flush_l0_rotate().await?;
+            let seq = coord.next_rotate_seq();
+            coord.note_pending();
+            (rotate_out, seq)
         };
         // 3. Build the coordinator's RotatedFlush. parent_manifest is the
         //    cached_manifest snapshot at this moment.
@@ -3164,6 +3317,13 @@ impl Writer {
             let l0_guard = current_l0.read();
             l0_guard.wal.clone()
         };
+        // Test-only seam (no-op without the `failpoints` feature): inject a
+        // WAL-flush failure here to drive the "failed async rotate wedges the
+        // finalizer" regression (Bug #3). When configured to "return" it makes
+        // `flush_l0_rotate` return Err exactly as a real WAL-flush failure would.
+        fail::fail_point!("flush::rotate-fail", |_| {
+            Err(anyhow!("flush::rotate-fail injected WAL-flush failure"))
+        });
         let wal_lsn = if let Some(ref w) = wal_for_truncate {
             w.flush().await?
         } else {
@@ -3214,6 +3374,14 @@ impl Writer {
         current_version: u64,
         name: Option<String>,
     ) -> Result<FlushOutcome> {
+        // Test-only seam (no-op without the `failpoints` feature): the rotate
+        // (begin_flush) already moved the to-be-flushed buffer onto
+        // pending_flush and installed a fresh empty current buffer, but the
+        // rotated rows are NOT yet durable in Lance. Pausing here holds that
+        // window open to drive the unique-constraint-hole regression
+        // (Bug #9 Mechanism A).
+        fail::fail_point!("flush::after-rotate-before-lance");
+
         // Phase B: materialize any deferred embeddings before column
         // extraction. No-op when `defer_embeddings` is off (the set will
         // be empty). On-demand reads of the embedding column are a TODO
@@ -4046,9 +4214,30 @@ impl Writer {
         // I. Cache manifest for next flush to avoid re-reading from object store.
         *shared.cached_manifest.lock() = Some(manifest.clone());
 
+        // L. Invalidate the property cache BEFORE removing the flushed buffer
+        // from the L0 chain (Bug #10). `clear_cache` has no dependency on the
+        // complete_flush (J) / WAL-truncate (K) steps below, so clearing it
+        // first closes the non-monotonic-read window: once the buffer leaves
+        // the L0 chain at J a freshly-written value would otherwise miss the
+        // chain and fall through to a stale cache entry. By the time finalize
+        // runs the streamed rows are already durable in L1, so a post-clear
+        // read falls through to fresh storage instead. The finalizer holds
+        // `flush_lock` throughout, so reordering L ahead of J is safe.
+        if let Some(ref pm) = shared.property_manager {
+            pm.clear_cache().await;
+        }
+
         // J. Complete flush: remove old L0 from pending_flush. MUST happen
         // BEFORE WAL truncation so min_pending_wal_lsn is accurate.
         shared.l0_manager.complete_flush(&old_l0_arc);
+
+        // Test-only seam (no-op without the `failpoints` feature): pause AFTER
+        // complete_flush removed the buffer from the L0 chain (J) but BEFORE
+        // WAL truncation (K). The property cache is already cleared (L moved
+        // ahead of J above), so a read in this window falls through to fresh
+        // L1 storage rather than a stale cache entry (Bug #10 — non-monotonic
+        // read after flush finalize).
+        fail::fail_point!("flush::after-complete-before-cache-clear");
 
         // K. Truncate WAL up to the safe LSN.
         let wal_handle = shared.l0_manager.get_current().read().wal.clone();
@@ -4059,11 +4248,6 @@ impl Writer {
                 .map(|min_pending| min_pending.min(wal_lsn))
                 .unwrap_or(wal_lsn);
             w.truncate_before(safe_lsn).await?;
-        }
-
-        // L. Invalidate property cache after flush to prevent stale reads.
-        if let Some(ref pm) = shared.property_manager {
-            pm.clear_cache().await;
         }
 
         // M. Reset last flush time for time-based auto-flush.

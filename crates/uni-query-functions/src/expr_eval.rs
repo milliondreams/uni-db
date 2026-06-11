@@ -16,6 +16,7 @@ use crate::datetime::{
     add_cypher_duration_to_time, classify_temporal, eval_datetime_function, is_duration_value,
     parse_datetime_utc, parse_duration_from_value, parse_duration_to_cypher,
 };
+use crate::df_udfs::checked_int_op;
 use crate::spatial::eval_spatial_function;
 use uni_cypher::ast::BinaryOp;
 
@@ -85,7 +86,17 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
         BinaryOp::Sub => eval_sub(left, right),
         BinaryOp::Mul => eval_mul(left, right),
         BinaryOp::Div => eval_div(left, right),
-        BinaryOp::Mod => eval_numeric_op(left, right, |a, b| a % b),
+        BinaryOp::Mod => {
+            // Integer % integer uses checked remainder (rejects modulo by zero,
+            // stays exact above 2^53). Float operands keep the f64 path.
+            if let (Value::Int(l), Value::Int(r)) = (left, right) {
+                checked_int_op(*l, *r, &BinaryOp::Mod)
+                    .map(Value::Int)
+                    .ok_or_else(|| anyhow!("division by zero"))
+            } else {
+                eval_numeric_op(left, right, |a, b| a % b)
+            }
+        }
         BinaryOp::Pow => eval_numeric_op(left, right, |a, b| a.powf(b)),
         BinaryOp::Regex => {
             let l = left
@@ -363,8 +374,13 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value> {
 
     // Numeric addition
     if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
-        if left.is_i64() && right.is_i64() {
-            return Ok(Value::Int(left.as_i64().unwrap() + right.as_i64().unwrap()));
+        if let (Some(li), Some(ri)) = (left.as_i64(), right.as_i64())
+            && left.is_i64()
+            && right.is_i64()
+        {
+            return checked_int_op(li, ri, &BinaryOp::Add)
+                .map(Value::Int)
+                .ok_or_else(|| anyhow!("integer overflow"));
         }
         return Ok(Value::Float(l + r));
     }
@@ -568,6 +584,13 @@ fn eval_sub(left: &Value, right: &Value) -> Result<Value> {
         return add_temporal_duration_to_value(left, &dur);
     }
 
+    // Integer - integer uses checked subtraction (rejects overflow, stays exact above 2^53).
+    if let (Value::Int(l), Value::Int(r)) = (left, right) {
+        return checked_int_op(*l, *r, &BinaryOp::Sub)
+            .map(Value::Int)
+            .ok_or_else(|| anyhow!("integer overflow"));
+    }
+
     eval_numeric_op(left, right, |a, b| a - b)
 }
 
@@ -618,6 +641,13 @@ fn eval_mul(left: &Value, right: &Value) -> Result<Value> {
     {
         let (dur, is_temporal) = dur_result?;
         return Ok(duration_to_value(dur.multiply(factor), is_temporal));
+    }
+
+    // Integer * integer uses checked multiplication (rejects overflow, stays exact above 2^53).
+    if let (Value::Int(l), Value::Int(r)) = (left, right) {
+        return checked_int_op(*l, *r, &BinaryOp::Mul)
+            .map(Value::Int)
+            .ok_or_else(|| anyhow!("integer overflow"));
     }
 
     eval_numeric_op(left, right, |a, b| a * b)
@@ -1521,10 +1551,15 @@ fn eval_substring(args: &[Value]) -> Result<Value> {
     }
     match &args[0] {
         Value::String(s) => {
-            let start = args[1]
+            let start_i = args[1]
                 .as_i64()
-                .ok_or_else(|| anyhow!("substring() start must be an integer"))?
-                as usize;
+                .ok_or_else(|| anyhow!("substring() start must be an integer"))?;
+            // Cypher requires a non-negative start; reject before the `as usize`
+            // cast (which would otherwise turn -1 into a huge index and panic).
+            if start_i < 0 {
+                return Err(anyhow!("substring: start must be non-negative"));
+            }
+            let start = start_i as usize;
             let len = if args.len() == 3 {
                 args[2]
                     .as_i64()
@@ -1534,7 +1569,8 @@ fn eval_substring(args: &[Value]) -> Result<Value> {
                 s.len().saturating_sub(start)
             };
             let chars: Vec<char> = s.chars().collect();
-            let end = (start + len).min(chars.len());
+            // `saturating_add` so `start + len` cannot overflow `usize`.
+            let end = start.saturating_add(len).min(chars.len());
             let result: String = chars[start.min(chars.len())..end].iter().collect();
             Ok(Value::String(result))
         }
@@ -1702,12 +1738,19 @@ fn eval_range_function(args: &[Value]) -> Result<Value> {
     if step > 0 {
         while i <= end {
             result.push(Value::Int(i));
-            i += step;
+            // Stop cleanly at the i64 boundary instead of panicking on overflow.
+            match i.checked_add(step) {
+                Some(n) => i = n,
+                None => break,
+            }
         }
     } else {
         while i >= end {
             result.push(Value::Int(i));
-            i += step;
+            match i.checked_add(step) {
+                Some(n) => i = n,
+                None => break,
+            }
         }
     }
     Ok(Value::List(result))
@@ -2993,5 +3036,96 @@ mod tests {
             eval_binary_op(&Value::Bool(true), &BinaryOp::Xor, &Value::Bool(true)).unwrap(),
             Value::Bool(false)
         );
+    }
+
+    // ========================================================================
+    // Regression tests for verified bug #19: interpreted-path integer
+    // arithmetic uses naive/f64-routed operations that overflow, lose
+    // precision, or yield NaN instead of returning typed/checked errors.
+    // These tests are RED on today's code and would pass once the arithmetic
+    // is made checked and integer-typed.
+    // ========================================================================
+
+    /// Bug #19(a): integer `+` overflow must be an error, not a panic/wrap.
+    ///
+    /// `eval_add` computes `left.as_i64() + right.as_i64()` directly, so
+    /// `i64::MAX + 1` panics in debug builds and wraps in release builds. A
+    /// checked addition should surface this as an `Err`.
+    #[test]
+    fn test_int_add_overflow_is_error() {
+        let result = eval_binary_op(&i(i64::MAX), &BinaryOp::Add, &i(1));
+        assert!(
+            result.is_err(),
+            "expected i64::MAX + 1 to be an arithmetic error, got {result:?}"
+        );
+    }
+
+    /// Bug #19(b): integer `*` must stay exact above 2^53.
+    ///
+    /// `eval_mul` routes integers through `eval_numeric_op`, which casts both
+    /// operands to f64, losing precision beyond 2^53. `(2^53 + 1) * 1` should
+    /// round-trip exactly as an integer.
+    #[test]
+    fn test_int_mul_precision_above_2pow53() {
+        let big = (1i64 << 53) + 1;
+        let result = eval_binary_op(&i(big), &BinaryOp::Mul, &i(1)).unwrap();
+        assert_eq!(
+            result,
+            Value::Int(big),
+            "expected exact integer multiplication, got {result:?}"
+        );
+    }
+
+    /// Bug #19(c): integer `%` by zero must be a division-by-zero error.
+    ///
+    /// `BinaryOp::Mod` routes through `eval_numeric_op`, computing `1.0 % 0.0`
+    /// which yields NaN and returns `Value::Float(NaN)` rather than erroring.
+    #[test]
+    fn test_int_mod_zero_is_error() {
+        let result = eval_binary_op(&i(1), &BinaryOp::Mod, &i(0));
+        assert!(
+            result.is_err(),
+            "expected 1 % 0 to be a division-by-zero error, got {result:?}"
+        );
+    }
+
+    /// Bug #19(c): integer `%` must stay exact above 2^53.
+    ///
+    /// `BinaryOp::Mod` routes through `eval_numeric_op` (f64 cast), losing
+    /// precision beyond 2^53. `((2^53 + 3) % 10)` should match the exact
+    /// integer remainder.
+    #[test]
+    fn test_int_mod_precision_above_2pow53() {
+        let big = (1i64 << 53) + 3;
+        let result = eval_binary_op(&i(big), &BinaryOp::Mod, &i(10)).unwrap();
+        assert_eq!(
+            result,
+            Value::Int(big % 10),
+            "expected exact integer remainder, got {result:?}"
+        );
+    }
+
+    /// Bug #19(d): `substring` with a negative start must not panic.
+    ///
+    /// `eval_substring` casts a negative start via `as usize` (→ `usize::MAX`),
+    /// then `start + len` overflows and panics in debug builds. It should
+    /// clamp or error, never panic.
+    #[test]
+    fn test_substring_negative_start_no_panic() {
+        let result = eval_scalar_function("substring", &[s("hello"), i(-1), i(5)], None);
+        // We only assert the absence of a panic; either Ok or Err is acceptable.
+        let _ = result.is_ok();
+    }
+
+    /// Bug #19(e): `range` near `i64::MAX` must terminate, not panic.
+    ///
+    /// `eval_range_function` advances with naive `i += step`, so a range whose
+    /// final increment crosses `i64::MAX` overflows and panics in debug
+    /// builds. It should terminate cleanly.
+    #[test]
+    fn test_range_near_i64_max_no_panic() {
+        let result = eval_scalar_function("range", &[i(i64::MAX - 1), i(i64::MAX)], None);
+        // We only assert the absence of a panic; either Ok or Err is acceptable.
+        let _ = result.is_ok();
     }
 }

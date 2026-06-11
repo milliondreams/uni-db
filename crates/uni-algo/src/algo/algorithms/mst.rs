@@ -63,8 +63,9 @@ impl Algorithm for MinimumSpanningTree {
             }
         }
 
-        // Sort by weight
-        edges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        // Sort by weight. Use total_cmp for a total order over f64 so NaN
+        // weights sort last (deprioritized) instead of panicking via partial_cmp.
+        edges.sort_by(|a, b| a.2.total_cmp(&b.2));
 
         // Union-Find
         let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -154,6 +155,36 @@ mod tests {
 
         let result = MinimumSpanningTree::run(&graph, MstConfig::default());
         assert_eq!(result.total_weight, 3.0);
+        assert_eq!(result.edges.len(), 2);
+    }
+
+    /// Regression: a `NaN` edge weight must not panic the sort comparator.
+    ///
+    /// `f64::partial_cmp` returns `None` for `NaN`, so the `sort_by`
+    /// comparator's `.unwrap()` in `run` panics when any edge weight is
+    /// `NaN`. A `NaN` weight can reach the sort directly from a graph float
+    /// property with no upstream filter. The MST should still be produced.
+    // Rust guideline compliant
+    #[test]
+    fn test_mst_nan_weight_does_not_panic() {
+        // 0-1 (1.0), 1-2 (NaN), 0-2 (10.0)
+        // Regardless of where the NaN edge is ordered, Kruskal must connect
+        // all three vertices, yielding a spanning tree of exactly 2 edges.
+        let vids = vec![Vid::from(0), Vid::from(1), Vid::from(2)];
+        let edges = vec![
+            (Vid::from(0), Vid::from(1)),
+            (Vid::from(1), Vid::from(2)),
+            (Vid::from(0), Vid::from(2)),
+        ];
+
+        let mut graph = build_test_graph(vids, edges);
+        // Flattened CSR weights, matching the layout used by `test_mst_simple`:
+        // Node 0: [0->1 = 1.0, 0->2 = 10.0]
+        // Node 1: [1->2 = NaN]
+        // Node 2: []
+        graph.out_weights = Some(vec![1.0, 10.0, f64::NAN]);
+
+        let result = MinimumSpanningTree::run(&graph, MstConfig::default());
         assert_eq!(result.edges.len(), 2);
     }
 }

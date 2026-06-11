@@ -8,4 +8,5 @@ pub mod schema_path_migration_test;
 pub mod session_read_only;
 pub mod session_template_test;
 pub mod session_test;
+pub mod statement_atomicity_test;
 pub mod strict_schema_test;

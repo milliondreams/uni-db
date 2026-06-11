@@ -885,6 +885,167 @@ async fn test_wal_legacy_raw_json_segment_replays() {
 }
 
 // ============================================================================
+// Bug #9 (Mechanism B): WAL recovery must rebuild the unique constraint_index
+// ============================================================================
+
+/// Regression for Bug #9 (Mechanism B): a unique constraint must still be
+/// enforced against rows that were recovered from the WAL but never flushed
+/// to Lance (L1).
+///
+/// The unique-constraint check (`Writer::check_unique_constraint_multi`)
+/// consults three sources: the in-memory `constraint_index` on main L0, the
+/// transaction's L0, and Lance. On crash recovery, `L0Buffer::replay_mutations`
+/// restores vertices/properties/labels/edges but never calls
+/// `insert_constraint_key` — its only caller is the live insert path. So after
+/// reopening a database from its WAL, the recovered (WAL-resident, not-yet-
+/// flushed) unique keys are invisible to all three sources, and a duplicate of
+/// a recovered key can be created.
+///
+/// This test commits a `Person { email: "a@x" }` vertex (durable in the WAL,
+/// not flushed to Lance), rebuilds the `Writer` over the same storage directory
+/// so `replay_wal` runs, then inserts a SECOND `Person { email: "a@x" }`. The
+/// second insert MUST fail with a constraint violation.
+///
+/// RED state today: step 5 SUCCEEDS (returns `Ok`) because the recovered
+/// `constraint_index` is empty and the row is not in Lance.
+#[tokio::test]
+async fn unique_constraint_survives_wal_recovery() {
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjectStorePath;
+    use uni_common::Value;
+    use uni_common::config::UniConfig;
+    use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType, SchemaManager};
+    use uni_store::runtime::writer::Writer;
+    use uni_store::storage::manager::StorageManager;
+
+    fn email_props(value: &str) -> HashMap<String, Value> {
+        let mut props = HashMap::new();
+        props.insert("email".to_string(), Value::String(value.to_string()));
+        props
+    }
+
+    // A config that disables auto-flush to L1 so the inserted row stays in the
+    // WAL + L0 and never reaches Lance — exactly the recovery window the bug
+    // lives in.
+    fn no_autoflush_config() -> UniConfig {
+        UniConfig {
+            auto_flush_threshold: usize::MAX,
+            auto_flush_interval: None,
+            ..Default::default()
+        }
+    }
+
+    // Build a schema with a UNIQUE constraint on Person.email and persist it.
+    async fn build_schema(store: Arc<dyn ObjectStore>) -> Arc<SchemaManager> {
+        let schema_path = ObjectStorePath::from("schema.json");
+        let schema = Arc::new(
+            SchemaManager::load_from_store(store, &schema_path)
+                .await
+                .unwrap(),
+        );
+        schema.add_label("Person").unwrap();
+        schema
+            .add_constraint(Constraint {
+                name: "Person_email_unique".to_string(),
+                constraint_type: ConstraintType::Unique {
+                    properties: vec!["email".to_string()],
+                },
+                target: ConstraintTarget::Label("Person".to_string()),
+                enabled: true,
+            })
+            .unwrap();
+        schema.save().await.unwrap();
+        schema
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_path = dir.path().join("storage");
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let storage_path_str = storage_path.to_str().unwrap().to_string();
+
+    // The schema store is rooted at the temp dir; the storage (and therefore the
+    // WAL) is rooted at `<temp>/storage`. Both are stable across the reopen.
+    let schema_store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+
+    // 1. Open a writer with the UNIQUE constraint and a WAL.
+    {
+        let schema = build_schema(schema_store.clone()).await;
+        let storage = Arc::new(
+            StorageManager::new_with_config(
+                &storage_path_str,
+                schema.clone(),
+                no_autoflush_config(),
+            )
+            .await
+            .unwrap(),
+        );
+        let wal = Arc::new(
+            WriteAheadLog::new(storage.store(), Path::from("wal"))
+                .with_local_root(storage.local_fs_root()),
+        );
+        wal.initialize().await.unwrap();
+        let writer = Arc::new(
+            Writer::new_with_config(storage, schema, 1, no_autoflush_config(), Some(wal), None)
+                .await
+                .unwrap(),
+        );
+
+        // 2. Insert Person { email: "a@x" } inside a transaction and commit so it
+        //    is durable in the WAL. Do NOT flush to L1.
+        let vid = writer.next_vid().await.unwrap();
+        let tx = writer.create_transaction_l0();
+        writer
+            .insert_vertex_with_labels(vid, email_props("a@x"), &["Person".to_string()], Some(&tx))
+            .await
+            .unwrap();
+        writer.commit_transaction_l0(tx).await.unwrap();
+
+        // 3. Drop the writer/storage without flushing — the row lives only in
+        //    the WAL + L0, never in Lance.
+    }
+
+    // 4. Reopen over the same storage directory: a fresh Writer whose main L0 is
+    //    rebuilt purely by replaying the WAL.
+    let schema = Arc::new(
+        SchemaManager::load_from_store(schema_store, &ObjectStorePath::from("schema.json"))
+            .await
+            .unwrap(),
+    );
+    let storage = Arc::new(
+        StorageManager::new_with_config(&storage_path_str, schema.clone(), no_autoflush_config())
+            .await
+            .unwrap(),
+    );
+    let wal = Arc::new(
+        WriteAheadLog::new(storage.store(), Path::from("wal"))
+            .with_local_root(storage.local_fs_root()),
+    );
+    let wal_max = wal.initialize().await.unwrap();
+    let writer = Arc::new(
+        Writer::new_with_config(storage, schema, 1, no_autoflush_config(), Some(wal), None)
+            .await
+            .unwrap(),
+    );
+    let replayed = writer.replay_wal(0).await.unwrap();
+    assert!(
+        replayed >= 1 && wal_max >= 1,
+        "WAL recovery must restore the committed vertex (replayed={replayed}, wal_max={wal_max})"
+    );
+
+    // 5. A SECOND Person with the same email must be rejected as a duplicate.
+    let vid2 = writer.next_vid().await.unwrap();
+    let result = writer
+        .insert_vertex_with_labels(vid2, email_props("a@x"), &["Person".to_string()], None)
+        .await;
+    assert!(
+        result.is_err(),
+        "duplicate of a WAL-recovered unique key must be rejected, but the insert succeeded \
+         (Bug #9 Mechanism B: replay_wal never rebuilds constraint_index)"
+    );
+}
+
+// ============================================================================
 // Transaction Commit Atomicity Tests (Issue #137)
 // ============================================================================
 // NOTE: These tests are currently disabled because they rely on an old Writer API

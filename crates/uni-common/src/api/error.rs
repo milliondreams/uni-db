@@ -37,6 +37,19 @@ pub enum UniError {
     #[error("Transaction already completed")]
     TransactionAlreadyCompleted,
 
+    /// A previous statement in this transaction failed, marking it rollback-only.
+    ///
+    /// Once any statement returns an error, the transaction is poisoned: it has
+    /// possibly half-applied rows in its private buffer, so it is no longer
+    /// committable (Neo4j-style rollback-only semantics). All further statements
+    /// and `commit()` are rejected with this error; only `rollback()` (or drop)
+    /// succeeds, discarding the partial writes. Start a fresh transaction to
+    /// retry.
+    #[error(
+        "Transaction is rollback-only: a previous statement failed; the transaction can no longer be committed and must be rolled back"
+    )]
+    TransactionRollbackOnly,
+
     /// Operation not supported on read-only database
     #[error("Operation '{operation}' not supported on read-only database")]
     ReadOnly { operation: String },

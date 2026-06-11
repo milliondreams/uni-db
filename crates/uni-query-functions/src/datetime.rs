@@ -3127,13 +3127,17 @@ pub fn add_cypher_duration_to_date(date_str: &str, dur: &CypherDuration) -> Resu
     // Step 1: Add months with clamping
     let after_months = add_months_to_date(date, dur.months);
 
-    // Step 2: Add days
-    let after_days = after_months + Duration::days(dur.days);
+    // Step 2: Add days (checked: out-of-range yields an error, not a panic)
+    let after_days = after_months
+        .checked_add_signed(Duration::days(dur.days))
+        .ok_or_else(|| anyhow!("date arithmetic out of range"))?;
 
     // Step 3: Add nanos (overflow into extra full days; sub-day remainder is discarded for dates)
     // Use truncating division (/) so negative sub-day nanos don't subtract an extra day.
     let extra_days = dur.nanos / NANOS_PER_DAY;
-    let result = after_days + Duration::days(extra_days);
+    let result = after_days
+        .checked_add_signed(Duration::days(extra_days))
+        .ok_or_else(|| anyhow!("date arithmetic out of range"))?;
 
     Ok(result.format("%Y-%m-%d").to_string())
 }
@@ -3143,7 +3147,9 @@ pub fn add_cypher_duration_to_date(date_str: &str, dur: &CypherDuration) -> Resu
 /// Time wraps modulo 24 hours. No date component is affected.
 pub fn add_cypher_duration_to_localtime(time_str: &str, dur: &CypherDuration) -> Result<String> {
     let time = parse_time_string(time_str)?;
-    let total_nanos = time_to_nanos(&time) + dur.nanos;
+    let total_nanos = time_to_nanos(&time)
+        .checked_add(dur.nanos)
+        .ok_or_else(|| anyhow!("time arithmetic out of range"))?;
     // Wrap modulo 24h
     let wrapped = total_nanos.rem_euclid(NANOS_PER_DAY);
     let result = nanos_to_time(wrapped);
@@ -3155,7 +3161,9 @@ pub fn add_cypher_duration_to_localtime(time_str: &str, dur: &CypherDuration) ->
 /// Time wraps modulo 24 hours, preserving the original timezone offset.
 pub fn add_cypher_duration_to_time(time_str: &str, dur: &CypherDuration) -> Result<String> {
     let (_, time, tz_info) = parse_datetime_with_tz(time_str)?;
-    let total_nanos = time_to_nanos(&time) + dur.nanos;
+    let total_nanos = time_to_nanos(&time)
+        .checked_add(dur.nanos)
+        .ok_or_else(|| anyhow!("time arithmetic out of range"))?;
     let wrapped = total_nanos.rem_euclid(NANOS_PER_DAY);
     let result_time = nanos_to_time(wrapped);
 
@@ -3180,10 +3188,14 @@ pub fn add_cypher_duration_to_localdatetime(dt_str: &str, dur: &CypherDuration) 
 
     // Step 1: Add months with clamping
     let after_months = add_months_to_date(ndt.date(), dur.months);
-    // Step 2: Add days
-    let after_days = after_months + Duration::days(dur.days);
-    // Step 3: Add nanos to time
-    let result_ndt = NaiveDateTime::new(after_days, ndt.time()) + Duration::nanoseconds(dur.nanos);
+    // Step 2: Add days (checked)
+    let after_days = after_months
+        .checked_add_signed(Duration::days(dur.days))
+        .ok_or_else(|| anyhow!("localdatetime arithmetic out of range"))?;
+    // Step 3: Add nanos to time (checked)
+    let result_ndt = NaiveDateTime::new(after_days, ndt.time())
+        .checked_add_signed(Duration::nanoseconds(dur.nanos))
+        .ok_or_else(|| anyhow!("localdatetime arithmetic out of range"))?;
 
     Ok(format_naive_datetime(&result_ndt))
 }
@@ -3194,10 +3206,14 @@ pub fn add_cypher_duration_to_datetime(dt_str: &str, dur: &CypherDuration) -> Re
 
     // Step 1: Add months with clamping
     let after_months = add_months_to_date(date, dur.months);
-    // Step 2: Add days
-    let after_days = after_months + Duration::days(dur.days);
-    // Step 3: Add nanos to the datetime
-    let ndt = NaiveDateTime::new(after_days, time) + Duration::nanoseconds(dur.nanos);
+    // Step 2: Add days (checked)
+    let after_days = after_months
+        .checked_add_signed(Duration::days(dur.days))
+        .ok_or_else(|| anyhow!("datetime arithmetic out of range"))?;
+    // Step 3: Add nanos to the datetime (checked)
+    let ndt = NaiveDateTime::new(after_days, time)
+        .checked_add_signed(Duration::nanoseconds(dur.nanos))
+        .ok_or_else(|| anyhow!("datetime arithmetic out of range"))?;
 
     if let Some(ref tz) = tz_info {
         let offset = tz.offset_for_local(&ndt)?;

@@ -13,6 +13,12 @@ mod cloud;
 mod cloud_integration_test;
 #[path = "common/crdt/mod.rs"]
 mod crdt;
+// Failing storage-race regression repros. Gated on `failpoints` (the file
+// itself carries `#![cfg(feature = "failpoints")]`) so the production seams it
+// drives are compiled in.
+#[cfg(feature = "failpoints")]
+#[path = "common/flush_resilience.rs"]
+mod flush_resilience;
 #[cfg(feature = "lance-backend")]
 #[path = "common/fork_recovery/mod.rs"]
 mod fork_recovery;

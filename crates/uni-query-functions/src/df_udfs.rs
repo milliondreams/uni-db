@@ -4467,31 +4467,45 @@ impl ScalarUDFImpl for CypherAbsUdf {
     }
 }
 
-/// Apply an integer arithmetic operator, returning CypherValue-encoded bytes.
-/// Returns `None` on overflow or division by zero.
-fn apply_int_arithmetic(lhs: i64, rhs: i64, op: &BinaryOp) -> Option<Vec<u8>> {
-    use uni_common::cypher_value_codec::encode_int;
+/// Apply a checked integer arithmetic operator, returning the `i64` result.
+///
+/// This is the i64-result core shared by both the DataFusion UDF path and the
+/// interpreted expression evaluator, so checked-overflow and div/rem-by-zero
+/// semantics stay identical across both paths. OpenCypher integer division and
+/// modulo truncate toward zero.
+///
+/// Returns `None` on overflow, on division by zero, on modulo by zero, or for a
+/// non-arithmetic operator.
+// Rust guideline compliant
+pub(crate) fn checked_int_op(lhs: i64, rhs: i64, op: &BinaryOp) -> Option<i64> {
     match op {
-        BinaryOp::Add => lhs.checked_add(rhs).map(encode_int),
-        BinaryOp::Sub => lhs.checked_sub(rhs).map(encode_int),
-        BinaryOp::Mul => lhs.checked_mul(rhs).map(encode_int),
+        BinaryOp::Add => lhs.checked_add(rhs),
+        BinaryOp::Sub => lhs.checked_sub(rhs),
+        BinaryOp::Mul => lhs.checked_mul(rhs),
+        // OpenCypher: integer / integer = integer (truncated toward zero)
         BinaryOp::Div => {
-            // OpenCypher: integer / integer = integer (truncated toward zero)
             if rhs == 0 {
                 None
             } else {
-                lhs.checked_div(rhs).map(encode_int)
+                lhs.checked_div(rhs)
             }
         }
         BinaryOp::Mod => {
             if rhs == 0 {
                 None
             } else {
-                lhs.checked_rem(rhs).map(encode_int)
+                lhs.checked_rem(rhs)
             }
         }
         _ => None,
     }
+}
+
+/// Apply an integer arithmetic operator, returning CypherValue-encoded bytes.
+/// Returns `None` on overflow or division by zero.
+fn apply_int_arithmetic(lhs: i64, rhs: i64, op: &BinaryOp) -> Option<Vec<u8>> {
+    use uni_common::cypher_value_codec::encode_int;
+    checked_int_op(lhs, rhs, op).map(encode_int)
 }
 
 /// Apply a float arithmetic operator, returning CypherValue-encoded bytes.

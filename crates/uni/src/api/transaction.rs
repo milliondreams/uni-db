@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,18 @@ pub struct Transaction {
     /// Session's metrics counters (for commit/rollback tracking)
     session_metrics: Arc<crate::api::session::SessionMetricsInner>,
     completed: bool,
+    /// Rollback-only poison flag (bug #15 / Neo4j-style atomicity).
+    ///
+    /// Set to `true` the first time any statement execution returns an `Err`.
+    /// Because statements run through `&self` entry points (`execute`, `query`,
+    /// `apply`, the builders) while `completed` is only flipped by the
+    /// `mut self` lifecycle methods, this needs interior mutability. An
+    /// `AtomicBool` (not a `Cell`) is required: a `&Transaction` is held across
+    /// `.await` points inside `Send` async fns, so the struct must stay `Sync` —
+    /// `Cell` is not `Sync`. Once set, every further statement and `commit()` is
+    /// rejected with [`UniError::TransactionRollbackOnly`]; only `rollback()`/drop
+    /// succeed, discarding the half-applied private L0.
+    rollback_only: AtomicBool,
     id: String,
     /// Session ID (for commit notifications and hooks).
     session_id: String,
@@ -272,6 +285,7 @@ impl Transaction {
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
             session_metrics: session.metrics_inner.clone(),
             completed: false,
+            rollback_only: AtomicBool::new(false),
             id,
             session_id: session.id().to_string(),
             start_time: Instant::now(),
@@ -316,6 +330,12 @@ impl Transaction {
     /// Reads see the private L0 buffer (uncommitted writes).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
+        self.mark_on_err(self.query_inner(cypher).await)
+    }
+
+    /// Inner body of [`Self::query`]; [`Self::query`] wraps its result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn query_inner(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
         if self.db.config.ssi_enabled {
             self.acquire_for_update_locks(cypher, &HashMap::new())
@@ -452,10 +472,17 @@ impl Transaction {
     /// Mutation count is read from the private L0 (not the global writer).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
+        self.mark_on_err(self.execute_inner(cypher).await)
+    }
+
+    /// Inner body of [`Self::execute`]; [`Self::execute`] wraps its result in
+    /// `mark_on_err` so any failure (authorization or statement execution)
+    /// poisons the transaction (bug #15).
+    async fn execute_inner(&self, cypher: &str) -> Result<ExecuteResult> {
         self.check_completed()?;
         self.authorize(cypher, classify_verb(cypher))?;
         let before = self.snapshot_l0();
-        let result = self.query(cypher).await?;
+        let result = self.query_inner(cypher).await?;
         let after = self.snapshot_l0();
         Ok(Self::compute_execute_result(&before, &after, &result))
     }
@@ -553,6 +580,13 @@ impl Transaction {
         // staleness, any commit between DERIVE evaluation and apply rejects
         // the apply — the derivation may be based on data that no longer
         // exists (architecture review §2.4).
+        //
+        // This is a pre-flight precondition check that runs BEFORE any
+        // mutation is replayed, so a `StaleDerivedFacts` rejection writes
+        // nothing to `tx_l0`. It must NOT poison the transaction (it is not a
+        // half-applied statement): the tx stays usable so a caller can re-apply
+        // with a wider gap. Only the replay loop below — which can leave
+        // half-applied rows — is wrapped in `mark_on_err` (bug #15).
         if !allow_stale {
             let max = max_gap.unwrap_or(0);
             if version_gap > max {
@@ -567,17 +601,33 @@ impl Transaction {
             );
         }
 
+        // From here on a failure can leave a partially-replayed `DerivedFactSet`
+        // in `tx_l0`, so poison the transaction on any error (bug #15).
+        self.mark_on_err(Self::replay_facts(&self.db, &self.tx_l0, derived, version_gap).await)
+    }
+
+    /// Replays a `DerivedFactSet`'s mutation queries into `tx_l0`.
+    ///
+    /// Factored out of [`Self::apply_internal`] so the caller can wrap exactly
+    /// this — the only part that can leave half-applied rows — in `mark_on_err`,
+    /// while the pre-flight staleness guard remains a clean (non-poisoning)
+    /// early return.
+    async fn replay_facts(
+        db: &Arc<UniInner>,
+        tx_l0: &Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        derived: DerivedFactSet,
+        version_gap: u64,
+    ) -> Result<ApplyResult> {
         let mut facts_applied = 0;
         for query in derived.mutation_queries {
-            self.db
-                .execute_ast_internal_with_tx_l0(
-                    query,
-                    "<locy-apply>",
-                    HashMap::new(),
-                    self.db.config.clone(),
-                    self.tx_l0.clone(),
-                )
-                .await?;
+            db.execute_ast_internal_with_tx_l0(
+                query,
+                "<locy-apply>",
+                HashMap::new(),
+                db.config.clone(),
+                tx_l0.clone(),
+            )
+            .await?;
             facts_applied += 1;
         }
 
@@ -628,7 +678,9 @@ impl Transaction {
             )
             .await
             .map_err(UniError::Internal);
-        result?;
+        // A partially-applied batch leaves rows in `tx_l0`; poison the tx so it
+        // cannot commit (bug #15).
+        self.mark_on_err(result)?;
         Ok(vids)
     }
 
@@ -684,7 +736,9 @@ impl Transaction {
             Ok(())
         }
         .await;
-        result
+        // A partially-applied batch leaves rows in `tx_l0`; poison the tx so it
+        // cannot commit (bug #15).
+        self.mark_on_err(result)
     }
 
     // ── Bulk Writer / Appender ────────────────────────────────────────
@@ -1200,9 +1254,38 @@ impl Transaction {
         ExecuteResult::with_details(affected_rows, &diff, result.metrics().clone())
     }
 
+    /// Marks the transaction rollback-only.
+    ///
+    /// Idempotent: once poisoned by a failed statement, the transaction stays
+    /// rollback-only for the rest of its life.
+    fn set_rollback_only(&self) {
+        self.rollback_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Poisons the transaction (rollback-only) whenever a statement returns
+    /// `Err`, then passes the result through unchanged.
+    ///
+    /// Applied at every `&self` statement-execution return seam (`execute`,
+    /// `query`, `apply`, and the parameterized builders) so that ANY statement
+    /// error — constraint violation, parse error, mid-`UNWIND` failure with rows
+    /// already in `tx_l0` — leaves the transaction non-committable (bug #15).
+    fn mark_on_err<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.set_rollback_only();
+        }
+        r
+    }
+
     fn check_completed(&self) -> Result<()> {
         if self.completed {
             return Err(UniError::TransactionAlreadyCompleted);
+        }
+        // A statement that previously failed poisoned the transaction: reject
+        // all further statements AND commit() so half-applied rows in `tx_l0`
+        // can never be persisted. `rollback()` does not route through here, so
+        // it still succeeds and discards the private L0 (Neo4j-style).
+        if self.rollback_only.load(Ordering::SeqCst) {
+            return Err(UniError::TransactionRollbackOnly);
         }
         if let Some(deadline) = self.deadline
             && Instant::now() > deadline
@@ -1284,6 +1367,13 @@ impl<'a> ExecuteBuilder<'a> {
 
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn run(self) -> Result<ExecuteResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.run_inner().await)
+    }
+
+    /// Inner body of [`Self::run`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn run_inner(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
@@ -1320,6 +1410,13 @@ impl<'a> ExecuteBuilder<'a> {
     /// DataFusion runtime stats and the DDL/admin aggregate stat where
     /// applicable.
     pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)> {
+        let tx = self.tx;
+        tx.mark_on_err(self.profile_inner().await)
+    }
+
+    /// Inner body of [`Self::profile`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn profile_inner(self) -> Result<(ExecuteResult, ProfileOutput)> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
@@ -1377,6 +1474,13 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn execute(self) -> Result<ExecuteResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.execute_inner().await)
+    }
+
+    /// Inner body of [`Self::execute`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn execute_inner(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
@@ -1404,6 +1508,13 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute as a query and return rows.
     pub async fn fetch_all(self) -> Result<QueryResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.fetch_all_inner().await)
+    }
+
+    /// Inner body of [`Self::fetch_all`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn fetch_all_inner(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let fut = self.tx.db.execute_internal_with_tx_l0(
@@ -1432,6 +1543,13 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute the query and return a cursor for streaming results.
     pub async fn cursor(self) -> Result<QueryCursor> {
+        let tx = self.tx;
+        tx.mark_on_err(self.cursor_inner().await)
+    }
+
+    /// Inner body of [`Self::cursor`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn cursor_inner(self) -> Result<QueryCursor> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         self.tx

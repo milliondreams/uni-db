@@ -400,27 +400,27 @@ impl Executor {
             None => L0Context::empty(),
         };
 
-        // C2: when the read snapshot carries a version-pinned storage
-        // manager, scans AND property reads must route through it so both
-        // tiers agree on the pinned view.
+        // C2: scans route through the version-pinned storage manager so
+        // post-snapshot L1 ROWS are invisible (the row-existence pin). The
+        // PropertyManager, by contrast, stays on LIVE storage: property
+        // point-reads must honor read-your-writes (a transaction's own
+        // uncommitted edge/vertex properties live in tx_l0, not L1, and a
+        // version filter would hide them — breaking e.g. MERGE's
+        // edge-property match). Cross-transaction property skew on an
+        // already-visible row is caught by OCC at commit, not the pin.
         let effective_storage = self.effective_storage();
-        let storage_is_pinned = !Arc::ptr_eq(&effective_storage, &self.storage);
 
         // Prefer the shared `Arc<PropertyManager>` installed via
         // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
         // (~80 µs/query) of constructing a fresh, immediately-abandoned
         // PropertyManager. Falls back to the legacy fresh-construction path
-        // for callers that have not installed one. Pinned transactions
-        // always construct fresh: the shared manager reads (and caches)
-        // through the LIVE storage, which would leak post-snapshot L1 rows.
-        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref()
-            && !storage_is_pinned
-        {
+        // for callers that have not installed one.
+        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref() {
             shared.clone()
         } else {
             Arc::new(PropertyManager::new(
-                effective_storage.clone(),
-                effective_storage.schema_manager_arc(),
+                self.storage.clone(),
+                self.storage.schema_manager_arc(),
                 prop_manager.cache_size(),
             ))
         };

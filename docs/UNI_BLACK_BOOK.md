@@ -3623,15 +3623,16 @@ lose updates in this mode.
 - **Predicate phantoms**: the read-set tracks items, not predicates. A
   `MERGE` race on a key with no unique constraint can double-create;
   mitigate with a unique constraint (validated at commit) or `FOR UPDATE`.
-- **Flush-boundary edge cases**: transactions also pin the L1 scan tier
-  (rows filter to `_version <=` the snapshot version, so post-snapshot
-  inserts flushed mid-transaction stay invisible). Two boundaries remain:
-  a row whose only pre-transaction state is in L1 and that is
-  updated-and-flushed mid-transaction is *excluded* from the pinned view
-  rather than shown at its old value (L1 rows are single-versioned), and
-  edge traversals read the live adjacency tier (its overlay is the only
-  source of unflushed edges) — both are caught by OCC validation when the
-  transaction's reads conflict with the concurrent write.
+- **Flush-boundary edge cases**: transactions pin the L1 vertex-scan tier
+  (vertex rows filter to `_version <=` the snapshot version, so
+  post-snapshot inserts flushed mid-transaction stay invisible). The pin is
+  on row *existence*, not property values or edges: property point-reads and
+  edge traversals stay on live storage so a transaction reads its own
+  uncommitted writes (tx_l0), and cross-transaction property/edge skew on an
+  already-visible row is caught by OCC validation at commit. A vertex whose
+  only pre-transaction state is in L1 and that is updated-and-flushed
+  mid-transaction is *excluded* from the pinned scan rather than shown old
+  (L1 rows are single-versioned).
 - **`session.query()`** (outside a transaction) reads latest-visible data
   and does not participate in OCC; use a transaction when the read feeds a
   write.

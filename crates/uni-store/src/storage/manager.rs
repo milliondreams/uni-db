@@ -1305,6 +1305,12 @@ impl StorageManager {
         columns: &[&str],
         additional_filter: Option<&str>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
+        // Edge path: manifest pin only. A transaction version pin must NOT
+        // version-filter edge reads — the edge tier is not version-pinned
+        // (the live AdjacencyManager + tx-L0 overlay carry unflushed and
+        // in-transaction edges), so filtering here would hide a relationship
+        // the same transaction just created (MERGE read-your-writes).
+        let edge_hwm = self.snapshot_version_hwm();
         let backend = self.backend();
         let table_name = table_names::delta_table_name(edge_type, direction);
 
@@ -1330,7 +1336,7 @@ impl StorageManager {
                 return Ok(None);
             };
 
-        let filter = match (self.version_high_water_mark(), additional_filter) {
+        let filter = match (edge_hwm, additional_filter) {
             (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
             (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
             (None, Some(f)) => Some(f.to_string()),
@@ -1871,7 +1877,7 @@ impl StorageManager {
                     // 2. L1: Delta
                     let delta_ds = self.delta_dataset(etype_name, dir_str)?;
                     let delta_entries = delta_ds
-                        .read_deltas(backend, vid, &schema, self.version_high_water_mark())
+                        .read_deltas(backend, vid, &schema, self.snapshot_version_hwm())
                         .await?;
                     Self::apply_delta_to_edges(&mut edges, delta_entries, neighbor_is_dst);
 

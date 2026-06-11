@@ -4,25 +4,28 @@
 //! Component C2 — transaction-level L1 (Lance) pinning.
 //!
 //! A read-write transaction pins the L0 tier via its `SnapshotView` (C1),
-//! and since C2 also pins the L1 tier: its scans route through a
-//! `StorageManager` clone whose reads filter to
-//! `_version <= started_at_version`. An L0→L1 flush completing
-//! mid-transaction therefore cannot leak post-snapshot rows into the
-//! transaction's view (previously: "flush-boundary read skew").
+//! and C2 pins the L1 VERTEX-SCAN tier: scans route through a
+//! `StorageManager` clone whose vertex reads filter to
+//! `_version <= started_at_version`, so an L0→L1 flush completing
+//! mid-transaction cannot leak post-snapshot ROWS into the transaction's
+//! view (previously: "flush-boundary read skew").
 //!
-//! Scope notes:
-//! - L1 vertex rows are single-versioned (`MergeInsert` replaces matched
-//!   rows in place), so the pin guarantees post-snapshot INSERTS stay
-//!   invisible. A row whose only pre-transaction state lives in L1 and that
-//!   is updated-and-flushed mid-transaction is *excluded* from the pinned
-//!   view rather than shown at its old value — the same boundary the
-//!   time-travel feature has. Rows resident in the pinned L0 generations
-//!   are immune (the L0 layer shadows L1).
-//! - The EDGE tier is not version-pinned: traversals share the live
+//! Scope — the pin is on row EXISTENCE (which vertices a scan returns),
+//! deliberately not on property values or edges:
+//! - **Vertex scans** filter by version. L1 vertex rows are single-versioned
+//!   (`MergeInsert` replaces in place), so post-snapshot INSERTS are hidden;
+//!   a row updated-and-flushed mid-transaction is *excluded* rather than
+//!   shown at its old value (the same boundary time-travel has). L0-resident
+//!   rows are immune (L0 shadows L1).
+//! - **Property reads** stay on LIVE storage: a property point-read must
+//!   honor read-your-writes (a transaction's own uncommitted edge/vertex
+//!   properties live in tx_l0, not L1; a version filter would hide them and
+//!   break e.g. MERGE's edge-property match). Cross-transaction property
+//!   skew on an already-visible row is caught by OCC at commit, not the pin.
+//! - **Edges** are not version-pinned: traversals share the live
 //!   `AdjacencyManager` (its commit-replay overlay is the only source of
-//!   unflushed edges), so post-snapshot edges remain visible to traversals
-//!   exactly as before C2. Edge reads are in the OCC read-set, so a
-//!   conflicting read-modify-write still aborts at commit.
+//!   unflushed edges), and edge-table reads use the manifest-only hwm. Edge
+//!   reads are in the OCC read-set, so a conflicting RMW still aborts.
 
 use anyhow::Result;
 use uni_db::{DataType, Uni, UniConfig};
@@ -192,5 +195,53 @@ async fn ssi_disabled_keeps_live_reads() -> Result<()> {
         "ssi_enabled=false must keep live (unpinned) reads"
     );
     tx.rollback();
+    Ok(())
+}
+
+/// Read-your-writes within a transaction must survive C2 pinning: a MERGE
+/// whose match phase reads an edge property created earlier in the SAME
+/// statement must see that edge (else it double-creates). Regression for a
+/// C2 pinning bug where the per-transaction PropertyManager version-filtered
+/// edge-property reads and hid the in-transaction edge — caught only by the
+/// sidecar-schema openCypher TCK (MERGE5[21]), so it lives here too to guard
+/// PR runs.
+#[tokio::test]
+async fn merge_sees_in_transaction_edge_under_pin() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("name", DataType::String)
+        .edge_type("R", &["N"], &["N"])
+        .property("tag", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (a:N {name: 'a'}), (b:N {name: 'b'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // One statement, two driving rows would re-create; but even two explicit
+    // MERGEs in one transaction must dedup: the second must see the first's
+    // edge through the live property read, not a version-filtered miss.
+    let tx = s.tx().await?;
+    tx.execute(
+        "MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)",
+    )
+    .await?;
+    tx.execute(
+        "MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let n = s.query("MATCH ()-[r:R]->() RETURN count(r) AS n").await?;
+    assert_eq!(
+        n.rows()[0].get::<i64>("n")?,
+        1,
+        "second MERGE must match the first's in-transaction edge, not duplicate"
+    );
     Ok(())
 }

@@ -425,7 +425,7 @@ impl DatabaseBuilder {
     }
 
     /// Build and return the Database instance.
-    fn build(&self) -> PyResult<crate::sync_api::Database> {
+    fn build(&self, py: Python<'_>) -> PyResult<crate::sync_api::Database> {
         let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
             crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
             crate::types::WriteLeaseVariant::DynamoDB { table } => {
@@ -434,22 +434,24 @@ impl DatabaseBuilder {
                 }
             }
         });
-        let uni = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::build_database_core(
-                &self.uri,
-                self.mode,
-                self.hybrid_local.as_deref(),
-                self.hybrid_remote.as_deref(),
-                self.cache_size,
-                self.parallelism,
-                self.schema_file.as_deref(),
-                self.xervo_catalog_json.as_deref(),
-                self.xervo_catalog_file.as_deref(),
-                self.cloud_config.clone(),
-                self.uni_config.clone(),
-                self.read_only,
-                rust_write_lease,
-            ))
+        let uni = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(core::build_database_core(
+                    &self.uri,
+                    self.mode,
+                    self.hybrid_local.as_deref(),
+                    self.hybrid_remote.as_deref(),
+                    self.cache_size,
+                    self.parallelism,
+                    self.schema_file.as_deref(),
+                    self.xervo_catalog_json.as_deref(),
+                    self.xervo_catalog_file.as_deref(),
+                    self.cloud_config.clone(),
+                    self.uni_config.clone(),
+                    self.read_only,
+                    rust_write_lease,
+                ))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
         Ok(crate::sync_api::Database {
@@ -546,16 +548,17 @@ impl SchemaBuilder {
     }
 
     /// Apply all pending schema changes.
-    fn apply(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::apply_schema_core(
+    fn apply(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(core::apply_schema_core(
                 &self.inner,
                 &self.pending_labels,
                 &self.pending_edge_types,
                 &self.pending_properties,
                 &self.pending_indexes,
             ))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 }
@@ -712,8 +715,8 @@ impl LabelBuilder {
     }
 
     /// Apply schema changes immediately.
-    fn apply(&self) -> PyResult<()> {
-        self.done()?.apply()
+    fn apply(&self, py: Python<'_>) -> PyResult<()> {
+        self.done()?.apply(py)
     }
 }
 
@@ -804,8 +807,8 @@ impl EdgeTypeBuilder {
     }
 
     /// Apply schema changes immediately.
-    fn apply(&self) -> PyResult<()> {
-        self.done()?.apply()
+    fn apply(&self, py: Python<'_>) -> PyResult<()> {
+        self.done()?.apply(py)
     }
 }
 
@@ -854,21 +857,21 @@ impl Session {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.fetch_all())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(self.inner.query(cypher))
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
+            py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.query(cypher))
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::query_result_to_py_class(py, result)
     }
 
     /// Create a new transaction for multi-statement writes.
-    fn tx(&self) -> PyResult<super::sync_api::Transaction> {
-        let tx = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.tx())
+    fn tx(&self, py: Python<'_>) -> PyResult<super::sync_api::Transaction> {
+        let tx = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.tx()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(super::sync_api::Transaction { inner: Some(tx) })
     }
@@ -904,9 +907,8 @@ impl Session {
     ///
     /// On a forked session this flushes the fork's L0 buffer to its
     /// Lance branches.
-    fn flush(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.flush())
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.flush()))
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
@@ -995,9 +997,11 @@ impl Session {
     }
 
     /// Prepare a Cypher query for repeated execution.
-    fn prepare(&self, cypher: &str) -> PyResult<crate::types::PyPreparedQuery> {
-        let prepared = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.prepare(cypher))
+    fn prepare(&self, py: Python<'_>, cypher: &str) -> PyResult<crate::types::PyPreparedQuery> {
+        let prepared = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.prepare(cypher))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedQuery {
             inner: std::sync::Mutex::new(prepared),
@@ -1050,28 +1054,30 @@ impl Session {
     }
 
     /// Pin this session to a specific snapshot version.
-    fn pin_to_version(&mut self, snapshot_id: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.pin_to_version(snapshot_id))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn pin_to_version(&mut self, py: Python<'_>, snapshot_id: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.pin_to_version(snapshot_id))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Pin this session to a specific timestamp (seconds since epoch).
-    fn pin_to_timestamp(&mut self, epoch_secs: f64) -> PyResult<()> {
+    fn pin_to_timestamp(&mut self, py: Python<'_>, epoch_secs: f64) -> PyResult<()> {
         let ts = chrono::DateTime::from_timestamp(
             epoch_secs as i64,
             ((epoch_secs.fract()) * 1_000_000_000.0) as u32,
         )
         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp"))?;
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.pin_to_timestamp(ts))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.pin_to_timestamp(ts))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Refresh session to latest database version (unpins if pinned).
-    fn refresh(&mut self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.refresh())
+    fn refresh(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.refresh()))
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
@@ -1256,9 +1262,15 @@ impl Session {
     }
 
     /// Prepare a Locy program for repeated execution.
-    fn prepare_locy(&self, program: &str) -> PyResult<crate::types::PyPreparedLocy> {
-        let prepared = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.prepare_locy(program))
+    fn prepare_locy(
+        &self,
+        py: Python<'_>,
+        program: &str,
+    ) -> PyResult<crate::types::PyPreparedLocy> {
+        let prepared = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.prepare_locy(program))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
@@ -1378,8 +1390,8 @@ impl SessionQueryBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.fetch_all())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::query_result_to_py_class(py, result)
     }
@@ -1407,8 +1419,8 @@ impl SessionQueryBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let cursor = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.cursor())
+        let cursor = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.cursor()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let columns = cursor.columns().to_vec();
         Ok(crate::sync_api::QueryCursor {
@@ -1422,8 +1434,8 @@ impl SessionQueryBuilder {
     fn explain(&self, py: Python) -> PyResult<crate::types::PyExplainOutput> {
         let session = self.session.borrow(py);
         let builder = session.inner.query_with(&self.cypher);
-        let output = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.explain())
+        let output = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.explain()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::explain_output_to_py_class(py, output)
     }
@@ -1439,8 +1451,8 @@ impl SessionQueryBuilder {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
         }
-        let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.profile())
+        let (results, profile) = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let query_result = convert::query_result_to_py_class(py, results)?;
         let profile_output = convert::profile_output_to_py_class(py, profile)?;
@@ -1595,8 +1607,8 @@ impl PyTransactionBuilder {
                 }
             }
         }
-        let tx = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.start())
+        let tx = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.start()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(super::sync_api::Transaction { inner: Some(tx) })
     }
@@ -1643,8 +1655,8 @@ impl PyTxQueryBuilder {
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.fetch_all())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::query_result_to_py_class(py, result)
     }
@@ -1666,8 +1678,8 @@ impl PyTxQueryBuilder {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
@@ -1686,8 +1698,8 @@ impl PyTxQueryBuilder {
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
         }
-        let cursor = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.cursor())
+        let cursor = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.cursor()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let columns = cursor.columns().to_vec();
         Ok(crate::sync_api::QueryCursor {
@@ -1735,8 +1747,8 @@ impl PyTxExecuteBuilder {
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
@@ -1762,8 +1774,8 @@ impl PyTxExecuteBuilder {
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
         }
-        let (result, profile) = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.profile())
+        let (result, profile) = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let exec_result = convert::execute_result_to_py(py, result)?;
         let profile_output = convert::profile_output_to_py_class(py, profile)?;
@@ -1912,8 +1924,8 @@ impl PyApplyBuilder {
         if let Some(gap) = self.max_version_gap {
             builder = builder.max_version_gap(gap);
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyApplyResult {
             facts_applied: result.facts_applied,
@@ -2133,19 +2145,20 @@ impl StreamingAppender {
         for (k, v) in properties {
             rust_props.insert(k, convert::py_object_to_value(py, &v)?);
         }
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(appender.append(rust_props))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(appender.append(rust_props))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Flush remaining rows and commit.
-    fn finish(&self) -> PyResult<BulkStats> {
+    fn finish(&self, py: Python<'_>) -> PyResult<BulkStats> {
         let mut guard = self.inner.lock().unwrap();
         let appender = guard.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
         })?;
-        let stats = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(appender.finish())
+        let stats = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(appender.finish()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(BulkStats {
             vertices_inserted: stats.vertices_inserted,
@@ -2171,15 +2184,16 @@ impl StreamingAppender {
     ///
     /// Accepts a PyArrow RecordBatch. Uses the Arrow PyCapsule C Data Interface
     /// (`__arrow_c_array__`) for zero-copy transfer.
-    fn write_batch(&self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn write_batch(&self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let record_batch = record_batch_from_pyarrow(batch)?;
         let mut guard = self.inner.lock().unwrap();
         let appender = guard.as_mut().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
         })?;
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(appender.write_batch(&record_batch))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(appender.write_batch(&record_batch))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Number of rows currently buffered.
@@ -2378,8 +2392,11 @@ impl BulkWriter {
             rust_props.push(map);
         }
         self.with_writer("insert_vertices", |writer| {
-            let vids = pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(writer.insert_vertices(label, rust_props))
+            let vids = py
+                .detach(|| {
+                    pyo3_async_runtimes::tokio::get_runtime()
+                        .block_on(writer.insert_vertices(label, rust_props))
+                })
                 .map_err(crate::exceptions::anyhow_to_pyerr)?;
             Ok(vids.into_iter().map(|v| v.as_u64()).collect())
         })
@@ -2405,9 +2422,11 @@ impl BulkWriter {
             ));
         }
         self.with_writer("insert_edges", |writer| {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(writer.insert_edges(edge_type, rust_edges))
-                .map_err(crate::exceptions::anyhow_to_pyerr)?;
+            py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(writer.insert_edges(edge_type, rust_edges))
+            })
+            .map_err(crate::exceptions::anyhow_to_pyerr)?;
             Ok(())
         })
     }
@@ -2441,7 +2460,7 @@ impl BulkWriter {
     }
 
     /// Commit all pending data and rebuild indexes.
-    fn commit(&self) -> PyResult<BulkStats> {
+    fn commit(&self, py: Python<'_>) -> PyResult<BulkStats> {
         let mut guard = self
             .inner
             .lock()
@@ -2449,8 +2468,8 @@ impl BulkWriter {
         let writer = guard.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
         })?;
-        let stats = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(writer.commit())
+        let stats = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(writer.commit()))
             .map_err(crate::exceptions::anyhow_to_pyerr)?;
         Ok(BulkStats {
             vertices_inserted: stats.vertices_inserted,
@@ -2464,14 +2483,13 @@ impl BulkWriter {
     }
 
     /// Abort bulk loading and discard uncommitted changes.
-    fn abort(&self) -> PyResult<()> {
+    fn abort(&self, py: Python<'_>) -> PyResult<()> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         if let Some(writer) = guard.take() {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(writer.abort())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(writer.abort()))
                 .map_err(crate::exceptions::anyhow_to_pyerr)?;
         }
         Ok(())
@@ -2485,6 +2503,7 @@ impl BulkWriter {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
@@ -2492,7 +2511,7 @@ impl BulkWriter {
         let guard = self.inner.lock().unwrap();
         if guard.is_some() {
             drop(guard);
-            self.abort()?;
+            self.abort(py)?;
         }
         Ok(false)
     }
@@ -2535,21 +2554,23 @@ impl PyForkBuilder {
     }
 
     /// Drive the open-or-create flow and return a forked `Session`.
-    fn build(&self) -> PyResult<Session> {
+    fn build(&self, py: Python<'_>) -> PyResult<Session> {
         let parent = self.parent.clone();
         let name = self.name.clone();
         let must_create = self.must_create;
         let ttl = self.ttl;
-        let forked = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async move {
-                let mut b = parent.fork(name);
-                if must_create {
-                    b = b.new_();
-                }
-                if let Some(d) = ttl {
-                    b = b.ttl(d);
-                }
-                b.await
+        let forked = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
+                    let mut b = parent.fork(name);
+                    if must_create {
+                        b = b.new_();
+                    }
+                    if let Some(d) = ttl {
+                        b = b.ttl(d);
+                    }
+                    b.await
+                })
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Session {
@@ -2617,15 +2638,17 @@ impl PyForkSchemaBuilder {
     /// Persist the pending entries to the fork's overlay file and the
     /// fork's in-memory `SchemaManager`. Errors with
     /// `UniInvalidArgumentError` on a non-forked session.
-    fn apply(&self) -> PyResult<()> {
+    fn apply(&self, py: Python<'_>) -> PyResult<()> {
         let parent = self.parent.clone();
         let pending = self.pending.clone();
         if pending.is_empty() {
             return Ok(());
         }
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(apply_fork_schema_pending(parent, pending))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(apply_fork_schema_pending(parent, pending))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 }

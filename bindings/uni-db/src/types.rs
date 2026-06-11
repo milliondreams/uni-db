@@ -1506,8 +1506,10 @@ impl PyPreparedQuery {
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute(&param_refs))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::query_result_to_py_class(py, result)
     }
@@ -1792,8 +1794,10 @@ impl PyPreparedLocy {
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute(&param_refs))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::locy_result_to_py_class(py, result)
     }
@@ -1905,8 +1909,10 @@ impl PyPreparedQueryBinder {
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute(&param_refs))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::query_result_to_py_class(py, result)
     }
@@ -1950,8 +1956,10 @@ impl PyPreparedLocyBinder {
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute(&param_refs))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::locy_result_to_py_class(py, result)
     }
@@ -2054,7 +2062,7 @@ impl PyCommitStream {
         slf
     }
 
-    fn __next__(&self) -> pyo3::PyResult<Option<PyCommitNotification>> {
+    fn __next__(&self, py: Python<'_>) -> pyo3::PyResult<Option<PyCommitNotification>> {
         let mut guard = self
             .inner
             .lock()
@@ -2063,7 +2071,8 @@ impl PyCommitStream {
             Some(s) => s,
             None => return Ok(None),
         };
-        let notification = pyo3_async_runtimes::tokio::get_runtime().block_on(stream.next());
+        let notification =
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(stream.next()));
         match notification {
             Some(n) => Ok(Some(PyCommitNotification::from(n))),
             None => Ok(None),

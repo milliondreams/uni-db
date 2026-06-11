@@ -122,6 +122,62 @@ class UniCommitTimeoutError(UniError):
 
     ...
 
+class UniConstraintConflictError(UniError):
+    """Commit-time uniqueness race (e.g. concurrent MERGE on the same key).
+
+    Retriable — unlike ``UniConstraintError``, which is a non-retriable
+    constraint violation.
+    """
+
+    ...
+
+class UniLockTimeoutError(UniError):
+    """Timed out waiting for a FOR UPDATE row lock. Retriable."""
+
+    ...
+
+# Conflict-retry helpers (mirror Rust's Session::transact_with_retry).
+RETRIABLE_EXCEPTIONS: tuple[type[BaseException], ...]
+
+def transact_with_retry(
+    session: Session,
+    fn: Callable[[Transaction], _T],
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> _T: ...
+def execute_with_retry(
+    session: Session,
+    cypher: str,
+    params: dict[str, Any] | None = None,
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> ExecuteResult: ...
+async def async_transact_with_retry(
+    session: AsyncSession,
+    fn: Callable[[AsyncTransaction], Awaitable[_T]],
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> _T: ...
+async def async_execute_with_retry(
+    session: AsyncSession,
+    cypher: str,
+    params: dict[str, Any] | None = None,
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> ApplyResult | Any: ...
+
 # Resource limits
 class UniMemoryLimitExceededError(UniError):
     """Query exceeded its memory limit."""

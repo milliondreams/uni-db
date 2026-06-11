@@ -32,7 +32,7 @@ pub struct QueryCursor {
 
 impl QueryCursor {
     /// Pull the next single row, refilling from the batch stream as needed.
-    fn next_row(&self) -> PyResult<Option<core::Row>> {
+    fn next_row(&self, py: Python<'_>) -> PyResult<Option<core::Row>> {
         let mut buf = self.buffer.lock().unwrap();
         if let Some(row) = buf.pop_front() {
             return Ok(Some(row));
@@ -43,7 +43,8 @@ impl QueryCursor {
             Some(c) => c,
             None => return Ok(None), // closed
         };
-        let batch = pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.next_batch());
+        let batch =
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.next_batch()));
         match batch {
             Some(Ok(rows)) => {
                 let mut iter = rows.into_iter();
@@ -61,7 +62,7 @@ impl QueryCursor {
 impl QueryCursor {
     /// Fetch a single row, or `None` if exhausted.
     fn fetch_one(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        match self.next_row()? {
+        match self.next_row(py)? {
             Some(row) => {
                 let dict = PyDict::new(py);
                 for (col, val) in row.as_map() {
@@ -78,7 +79,7 @@ impl QueryCursor {
     fn fetch_many(&self, py: Python, n: usize) -> PyResult<Vec<Py<PyAny>>> {
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            match self.next_row()? {
+            match self.next_row(py)? {
                 Some(row) => {
                     let dict = PyDict::new(py);
                     for (col, val) in row.as_map() {
@@ -105,8 +106,10 @@ impl QueryCursor {
             guard.take()
         };
         if let Some(cursor) = cursor_opt {
-            let remaining = pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(cursor.collect_remaining())
+            let remaining = py
+                .detach(|| {
+                    pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.collect_remaining())
+                })
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             rows.extend(remaining);
         }
@@ -187,12 +190,10 @@ impl Transaction {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.fetch_all())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(tx.query(cypher))
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.query(cypher)))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::query_result_to_py_class(py, result)
@@ -213,12 +214,10 @@ impl Transaction {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(tx.execute(cypher))
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.execute(cypher)))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::execute_result_to_py(py, result)
@@ -256,13 +255,13 @@ impl Transaction {
     /// Freshness is required: a commit between DERIVE evaluation and apply
     /// raises a stale-derived-facts error. Use `apply_with(...)` +
     /// `allow_stale()` / `max_version_gap(n)` to opt out.
-    fn apply(&self, _py: Python, derived: &mut PyDerivedFactSet) -> PyResult<PyApplyResult> {
+    fn apply(&self, py: Python, derived: &mut PyDerivedFactSet) -> PyResult<PyApplyResult> {
         let tx = self.check_active()?;
         let dfs = derived.inner.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("DerivedFactSet already consumed")
         })?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(tx.apply(dfs))
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.apply(dfs)))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyApplyResult {
             facts_applied: result.facts_applied,
@@ -286,10 +285,10 @@ impl Transaction {
     }
 
     /// Prepare a Cypher query for repeated execution within this transaction.
-    fn prepare(&self, cypher: &str) -> PyResult<PyPreparedQuery> {
+    fn prepare(&self, py: Python<'_>, cypher: &str) -> PyResult<PyPreparedQuery> {
         let tx = self.check_active()?;
-        let prepared = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(tx.prepare(cypher))
+        let prepared = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.prepare(cypher)))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedQuery {
             inner: std::sync::Mutex::new(prepared),
@@ -297,10 +296,10 @@ impl Transaction {
     }
 
     /// Prepare a Locy program for repeated execution within this transaction.
-    fn prepare_locy(&self, program: &str) -> PyResult<PyPreparedLocy> {
+    fn prepare_locy(&self, py: Python<'_>, program: &str) -> PyResult<PyPreparedLocy> {
         let tx = self.check_active()?;
-        let prepared = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(tx.prepare_locy(program))
+        let prepared = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.prepare_locy(program)))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
@@ -360,14 +359,14 @@ impl Transaction {
     }
 
     /// Commit the transaction, returning a CommitResult.
-    fn commit(&mut self) -> PyResult<PyCommitResult> {
+    fn commit(&mut self, py: Python<'_>) -> PyResult<PyCommitResult> {
         let tx = self.inner.take().ok_or_else(|| {
             crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
                 "Transaction already completed",
             )
         })?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(tx.commit())
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.commit()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyCommitResult::from(result))
     }
@@ -637,9 +636,12 @@ impl Database {
 
     /// Open or create a database at the given path.
     #[staticmethod]
-    fn open(path: &str) -> PyResult<Self> {
-        let uni = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async { Uni::open(path).build().await })
+    fn open(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let uni = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(async { Uni::open(path).build().await })
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
@@ -648,9 +650,12 @@ impl Database {
 
     /// Create a temporary in-memory database.
     #[staticmethod]
-    fn temporary() -> PyResult<Self> {
-        let uni = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async { Uni::temporary().build().await })
+    fn temporary(py: Python<'_>) -> PyResult<Self> {
+        let uni = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(async { Uni::temporary().build().await })
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
@@ -659,15 +664,18 @@ impl Database {
 
     /// Create an in-memory database (alias for temporary).
     #[staticmethod]
-    fn in_memory() -> PyResult<Self> {
-        Self::temporary()
+    fn in_memory(py: Python<'_>) -> PyResult<Self> {
+        Self::temporary(py)
     }
 
     /// Create a new database. Fails if it already exists.
     #[staticmethod]
-    fn create(path: &str) -> PyResult<Self> {
-        let uni = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async { Uni::create(path).build().await })
+    fn create(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let uni = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(async { Uni::create(path).build().await })
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
@@ -676,9 +684,12 @@ impl Database {
 
     /// Open an existing database. Fails if it does not exist.
     #[staticmethod]
-    fn open_existing(path: &str) -> PyResult<Self> {
-        let uni = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async { Uni::open_existing(path).build().await })
+    fn open_existing(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let uni = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(async { Uni::open_existing(path).build().await })
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
@@ -702,12 +713,13 @@ impl Database {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
         // Shutdown on exit.
-        let _ = self.shutdown();
+        let _ = self.shutdown(py);
         Ok(false)
     }
 
@@ -716,10 +728,11 @@ impl Database {
     }
 
     /// Flush all uncommitted changes to persistent storage.
-    fn flush(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::flush_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(core::flush_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 
@@ -739,63 +752,84 @@ impl Database {
     }
 
     /// Check if a label exists.
-    fn label_exists(&self, name: &str) -> PyResult<bool> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::label_exists_core(&self.inner, name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn label_exists(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::label_exists_core(&self.inner, name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Check if an edge type exists.
-    fn edge_type_exists(&self, name: &str) -> PyResult<bool> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::edge_type_exists_core(&self.inner, name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn edge_type_exists(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::edge_type_exists_core(&self.inner, name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get all label names.
-    fn list_labels(&self) -> PyResult<Vec<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::list_labels_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn list_labels(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(core::list_labels_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get all edge type names.
-    fn list_edge_types(&self) -> PyResult<Vec<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::list_edge_types_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn list_edge_types(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::list_edge_types_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get detailed information about a label.
-    fn get_label_info(&self, name: &str) -> PyResult<Option<LabelInfo>> {
-        let info = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::get_label_info_core(&self.inner, name))
+    fn get_label_info(&self, py: Python<'_>, name: &str) -> PyResult<Option<LabelInfo>> {
+        let info = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(core::get_label_info_core(&self.inner, name))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
         Ok(info.map(LabelInfo::from))
     }
 
     /// Get detailed information about an edge type.
-    fn get_edge_type_info(&self, name: &str) -> PyResult<Option<crate::types::EdgeTypeInfo>> {
-        let info = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::get_edge_type_info_core(&self.inner, name))
+    fn get_edge_type_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+    ) -> PyResult<Option<crate::types::EdgeTypeInfo>> {
+        let info = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(core::get_edge_type_info_core(&self.inner, name))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
         Ok(info.map(crate::types::EdgeTypeInfo::from))
     }
 
     /// Load schema from a JSON file.
-    fn load_schema(&self, path: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::load_schema_core(&self.inner, path))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn load_schema(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::load_schema_core(&self.inner, path))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Save schema to a JSON file.
-    fn save_schema(&self, path: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::save_schema_core(&self.inner, path))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn save_schema(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::save_schema_core(&self.inner, path))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // ========================================================================
@@ -966,16 +1000,21 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// Create a point-in-time snapshot. Returns the snapshot ID.
-    fn create_snapshot(&self, name: &str) -> PyResult<String> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::create_snapshot_core(&self.inner, name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn create_snapshot(&self, py: Python<'_>, name: &str) -> PyResult<String> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::create_snapshot_core(&self.inner, name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// List all available snapshots.
     fn list_snapshots(&self, py: Python) -> PyResult<Vec<crate::types::SnapshotInfo>> {
-        let manifests = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::list_snapshots_core(&self.inner))
+        let manifests = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(core::list_snapshots_core(&self.inner))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         manifests
             .into_iter()
@@ -984,10 +1023,12 @@ impl Database {
     }
 
     /// Restore the database to a specific snapshot.
-    fn restore_snapshot(&self, snapshot_id: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::restore_snapshot_core(&self.inner, snapshot_id))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn restore_snapshot(&self, py: Python<'_>, snapshot_id: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::restore_snapshot_core(&self.inner, snapshot_id))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // -----------------------------------------------------------------------
@@ -995,9 +1036,8 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// List all currently-Active forks across the database.
-    fn list_forks(&self) -> Vec<crate::types::PyForkInfo> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.list_forks())
+    fn list_forks(&self, py: Python<'_>) -> Vec<crate::types::PyForkInfo> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.list_forks()))
             .into_iter()
             .map(crate::types::PyForkInfo::from_rust)
             .collect()
@@ -1006,8 +1046,10 @@ impl Database {
     /// Look up a single fork by name. Returns `None` if the fork
     /// doesn't exist (rather than raising `UniForkNotFoundError` —
     /// matches the typical Python `dict.get`-style ergonomics).
-    fn fork_info(&self, name: &str) -> PyResult<Option<crate::types::PyForkInfo>> {
-        match pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.fork_info(name)) {
+    fn fork_info(&self, py: Python<'_>, name: &str) -> PyResult<Option<crate::types::PyForkInfo>> {
+        match py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.fork_info(name))
+        }) {
             Ok(info) => Ok(Some(crate::types::PyForkInfo::from_rust(info))),
             Err(uni_common::UniError::ForkNotFound { .. }) => Ok(None),
             Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
@@ -1018,9 +1060,8 @@ impl Database {
     ///
     /// Errors with `UniForkInUseError`, `UniForkInflightTxError`, or
     /// `UniForkHasChildrenError` (use `drop_fork_cascade` for the last).
-    fn drop_fork(&self, name: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.drop_fork(name))
+    fn drop_fork(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.drop_fork(name)))
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
@@ -1028,31 +1069,36 @@ impl Database {
     ///
     /// Pre-validates the whole subtree for live sessions / open
     /// transactions before tombstoning anything.
-    fn drop_fork_cascade(&self, name: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.drop_fork_cascade(name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn drop_fork_cascade(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.drop_fork_cascade(name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Tag a fork with a Lance tag (GC-exempt; survives drop).
-    fn tag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.tag_fork(fork_name, tag))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn tag_fork(&self, py: Python<'_>, fork_name: &str, tag: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.tag_fork(fork_name, tag))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Remove a previously-applied tag from a fork. Idempotent per dataset.
-    fn untag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.untag_fork(fork_name, tag))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn untag_fork(&self, py: Python<'_>, fork_name: &str, tag: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.untag_fork(fork_name, tag))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// List the unique user-visible tag names applied to this fork.
-    fn list_fork_tags(&self, fork_name: &str) -> PyResult<Vec<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.list_fork_tags(fork_name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn list_fork_tags(&self, py: Python<'_>, fork_name: &str) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.list_fork_tags(fork_name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // -----------------------------------------------------------------------
@@ -1065,20 +1111,27 @@ impl Database {
     /// primary doesn't (`added`), the rows primary has that the fork
     /// has dropped (`deleted`), and the rows with matching UID and
     /// differing properties (`changed`).
-    fn diff_fork_primary(&self, fork_name: &str) -> PyResult<crate::types::PyForkDiff> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.diff_fork_primary(fork_name))
-            .map(crate::types::PyForkDiff::from_rust)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn diff_fork_primary(
+        &self,
+        py: Python<'_>,
+        fork_name: &str,
+    ) -> PyResult<crate::types::PyForkDiff> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.diff_fork_primary(fork_name))
+        })
+        .map(crate::types::PyForkDiff::from_rust)
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Structural diff between two named forks. `diff(a, b)` is the
     /// delta that, if applied to `a`, produces `b`.
-    fn diff_forks(&self, a: &str, b: &str) -> PyResult<crate::types::PyForkDiff> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.diff_forks(a, b))
-            .map(crate::types::PyForkDiff::from_rust)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn diff_forks(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<crate::types::PyForkDiff> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.diff_forks(a, b))
+        })
+        .map(crate::types::PyForkDiff::from_rust)
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Promote matched fork rows onto primary.
@@ -1089,15 +1142,18 @@ impl Database {
     /// at the end.
     fn promote_from_fork(
         &self,
+        py: Python<'_>,
         fork_name: &str,
         patterns: Vec<crate::types::PyPromotePattern>,
     ) -> PyResult<crate::types::PyPromoteReport> {
         let rust_patterns: Vec<uni_db::PromotePattern> =
             patterns.into_iter().map(|p| p.inner).collect();
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.promote_from_fork(fork_name, &rust_patterns))
-            .map(crate::types::PyPromoteReport::from_rust)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.promote_from_fork(fork_name, &rust_patterns))
+        })
+        .map(crate::types::PyPromoteReport::from_rust)
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Access compaction operations.
@@ -1118,9 +1174,8 @@ impl Database {
     ///
     /// Calls `flush()` for data safety. The actual shutdown occurs when the
     /// last reference is dropped (Python GC triggers Rust `Drop`).
-    fn shutdown(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.flush())
+    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.flush()))
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
@@ -1159,10 +1214,15 @@ impl Xervo {
     }
 
     /// Embed texts using a configured model alias. Returns a list of float vectors.
-    fn embed(&self, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::xervo_embed_core(&self.inner, alias, texts))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn embed(&self, py: Python<'_>, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(core::xervo_embed_core(
+                &self.inner,
+                alias,
+                texts,
+            ))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Generate text using structured messages. Returns a GenerationResult.
@@ -1179,15 +1239,17 @@ impl Xervo {
         top_p: Option<f32>,
     ) -> PyResult<crate::types::PyGenerationResult> {
         let msg_pairs = convert::extract_messages(py, messages)?;
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::xervo_generate_core(
-                &self.inner,
-                alias,
-                msg_pairs,
-                max_tokens,
-                temperature,
-                top_p,
-            ))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(core::xervo_generate_core(
+                    &self.inner,
+                    alias,
+                    msg_pairs,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                ))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
     }
@@ -1204,31 +1266,37 @@ impl Xervo {
         top_p: Option<f32>,
     ) -> PyResult<crate::types::PyGenerationResult> {
         let msg_pairs = vec![("user".to_string(), prompt)];
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::xervo_generate_core(
-                &self.inner,
-                alias,
-                msg_pairs,
-                max_tokens,
-                temperature,
-                top_p,
-            ))
+        let result = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(core::xervo_generate_core(
+                    &self.inner,
+                    alias,
+                    msg_pairs,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                ))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
     }
 
     /// Pre-load and cache specific model aliases so first inference is instant.
-    fn prefetch(&self, aliases: Vec<String>) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::xervo_prefetch_core(&self.inner, aliases))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn prefetch(&self, py: Python<'_>, aliases: Vec<String>) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::xervo_prefetch_core(&self.inner, aliases))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Pre-load and cache every model in the Xervo catalog.
-    fn prefetch_all(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::xervo_prefetch_all_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn prefetch_all(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::xervo_prefetch_all_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 }
 
@@ -1306,17 +1374,21 @@ pub struct PyCompaction {
 #[pymethods]
 impl PyCompaction {
     /// Compact data for a label or edge type.
-    fn compact(&self, name: &str) -> PyResult<crate::types::PyCompactionStats> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::compact_core(&self.inner, name))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn compact(&self, py: Python<'_>, name: &str) -> PyResult<crate::types::PyCompactionStats> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::compact_core(&self.inner, name))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Wait for all background compaction to complete.
-    fn wait(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::wait_for_compaction_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn wait(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::wait_for_compaction_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 }
 
@@ -1353,16 +1425,24 @@ impl PyIndexes {
 
     /// Rebuild indexes for a label. If background=true, returns a task ID.
     #[pyo3(signature = (label, background=false))]
-    fn rebuild(&self, label: &str, background: bool) -> PyResult<Option<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::rebuild_indexes_core(&self.inner, label, background))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn rebuild(&self, py: Python<'_>, label: &str, background: bool) -> PyResult<Option<String>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(core::rebuild_indexes_core(
+                &self.inner,
+                label,
+                background,
+            ))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get status of all rebuild tasks.
     fn rebuild_status(&self, py: Python) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
-        let tasks = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::index_rebuild_status_core(&self.inner))
+        let tasks = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(core::index_rebuild_status_core(&self.inner))
+            })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         tasks
             .into_iter()
@@ -1371,10 +1451,12 @@ impl PyIndexes {
     }
 
     /// Retry failed rebuild tasks. Returns task IDs scheduled for retry.
-    fn retry_failed(&self) -> PyResult<Vec<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::retry_index_rebuilds_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn retry_failed(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::retry_index_rebuilds_core(&self.inner))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 }
 

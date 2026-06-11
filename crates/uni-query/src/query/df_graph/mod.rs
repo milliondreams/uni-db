@@ -520,7 +520,9 @@ impl GraphExecutionContext {
         direction: Direction,
     ) -> anyhow::Result<()> {
         let am = self.adjacency_manager();
-        let version = self.storage.version_high_water_mark();
+        // Manifest pin only: tx version pins must NOT filter adjacency
+        // warming/reads (see StorageManager::snapshot_version_hwm).
+        let version = self.storage.snapshot_version_hwm();
         for &etype_id in edge_type_ids {
             // Skip if AM already has data (CSR or overlay) for this edge type.
             // The overlay contains edges from dual-write (Writer), so warming
@@ -574,7 +576,8 @@ impl GraphExecutionContext {
     ///
     /// Vector of (neighbor VID, edge ID) pairs.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
-        let version_hwm = self.storage.version_high_water_mark();
+        // Manifest pin only (time-travel); tx pins read live edges + L0 overlays.
+        let version_hwm = self.storage.snapshot_version_hwm();
         // Single-vid case: acquire the transaction-L0 guard once for this
         // vertex (the batch path amortizes it across many vertices).
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
@@ -601,7 +604,8 @@ impl GraphExecutionContext {
         edge_type: u32,
         direction: Direction,
     ) -> Vec<(Vid, Vid, Eid)> {
-        let version_hwm = self.storage.version_high_water_mark();
+        // Manifest pin only (time-travel); tx pins read live edges + L0 overlays.
+        let version_hwm = self.storage.snapshot_version_hwm();
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
 
         let mut results = Vec::new();

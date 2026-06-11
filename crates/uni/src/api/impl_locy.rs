@@ -135,6 +135,7 @@ pub(crate) async fn evaluate_with_db_and_config(
         tx_l0_override: locy_l0.clone(),
         locy_l0,
         collect_derive: true,
+        read_snapshot: None,
     };
     engine.evaluate_compiled_with_config(compiled, config).await
 }
@@ -153,6 +154,12 @@ pub struct LocyEngine<'a> {
     /// When true, DERIVE commands collect ASTs + data instead of executing.
     /// Session-level evaluation sets this to true; transaction-level sets false.
     pub(crate) collect_derive: bool,
+    /// The transaction's pinned read snapshot (Components C1 + C2), when
+    /// evaluating inside a read-write transaction under SSI. Installed on
+    /// the executor so Locy clause bodies read the frozen L0 generations and
+    /// the version-pinned L1 view instead of live state. `None` at session
+    /// level or with SSI disabled (live reads — a safe no-op downstream).
+    pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
 }
 
 impl crate::api::Uni {
@@ -166,6 +173,7 @@ impl crate::api::Uni {
             tx_l0_override: None,
             locy_l0: None,
             collect_derive: true,
+            read_snapshot: None,
         }
     }
 }
@@ -363,6 +371,13 @@ impl<'a> LocyEngine<'a> {
         // validator never saw (architecture review §2.4).
         if let Some(tx_l0) = self.tx_l0_override.clone() {
             df_executor.set_transaction_l0(tx_l0);
+        }
+        // And the pinned read snapshot (C1 frozen L0 generations + C2
+        // version-pinned L1 storage), matching the Cypher path's
+        // `set_read_snapshot` — Locy reads see the same snapshot the rest of
+        // the transaction does.
+        if self.read_snapshot.is_some() {
+            df_executor.set_read_snapshot(self.read_snapshot.clone());
         }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
@@ -1149,6 +1164,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             tx_l0_override: locy_l0.clone(),
             locy_l0,
             collect_derive: false,
+            read_snapshot: None,
         };
         let native_store = engine
             .run_strata_native(&strata_only, config)

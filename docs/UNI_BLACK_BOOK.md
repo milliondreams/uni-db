@@ -3623,9 +3623,15 @@ lose updates in this mode.
 - **Predicate phantoms**: the read-set tracks items, not predicates. A
   `MERGE` race on a key with no unique constraint can double-create;
   mitigate with a unique constraint (validated at commit) or `FOR UPDATE`.
-- **Flush-boundary read skew**: snapshots pin L0 generations, not the Lance
-  (L1) dataset version, so a very long transaction spanning an L0→L1 flush
-  may observe post-snapshot L1 data on cold scans.
+- **Flush-boundary edge cases**: transactions also pin the L1 scan tier
+  (rows filter to `_version <=` the snapshot version, so post-snapshot
+  inserts flushed mid-transaction stay invisible). Two boundaries remain:
+  a row whose only pre-transaction state is in L1 and that is
+  updated-and-flushed mid-transaction is *excluded* from the pinned view
+  rather than shown at its old value (L1 rows are single-versioned), and
+  edge traversals read the live adjacency tier (its overlay is the only
+  source of unflushed edges) — both are caught by OCC validation when the
+  transaction's reads conflict with the concurrent write.
 - **`session.query()`** (outside a transaction) reads latest-visible data
   and does not participate in OCC; use a transaction when the read feeds a
   write.

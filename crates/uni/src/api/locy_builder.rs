@@ -91,6 +91,7 @@ impl<'a> InnerLocyBuilder<'a> {
             tx_l0_override: None,
             locy_l0: None,
             collect_derive: true,
+            read_snapshot: None,
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -289,6 +290,7 @@ impl<'a> TxLocyBuilder<'a> {
             tx_l0_override: Some(self.tx.tx_l0.clone()),
             locy_l0: Some(self.tx.tx_l0.clone()),
             collect_derive: false,
+            read_snapshot: self.tx.read_snapshot(),
         };
         engine
             .evaluate_with_config(&self.program, &self.config)

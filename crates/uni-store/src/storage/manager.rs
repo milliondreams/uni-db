@@ -73,6 +73,15 @@ pub struct StorageManager {
     pub flush_in_progress: std::sync::atomic::AtomicUsize,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
+    /// Optional row-version pin for transaction snapshot reads (C2).
+    ///
+    /// When set, L1 scans filter to `_version <= hwm` exactly like a pinned
+    /// snapshot, but WITHOUT a manifest: a read-write transaction pins the
+    /// version counter observed at begin (`SnapshotView.started_at_version`)
+    /// so an L0→L1 flush completing mid-transaction cannot leak
+    /// post-snapshot rows into its scans. Mutually exclusive with
+    /// `pinned_snapshot`.
+    pinned_version_hwm: Option<u64>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
     ///
     /// Mutually exclusive with `pinned_snapshot`: a single
@@ -280,6 +289,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
+            pinned_version_hwm: None,
             fork_scope: None,
             backend,
             vid_labels_index: None,
@@ -444,6 +454,43 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
+            pinned_version_hwm: None,
+            fork_scope: self.fork_scope.clone(),
+            backend: self.backend.clone(),
+            vid_labels_index: self.vid_labels_index.clone(),
+        }
+    }
+
+    /// Construct a clone of this `StorageManager` pinned to a row-version
+    /// high-water mark (C2: transaction-level L1 pinning).
+    ///
+    /// Unlike [`Self::pinned`], this needs no `SnapshotManifest`: scans
+    /// filter to `_version <= hwm` via [`Self::version_high_water_mark`].
+    /// A read-write transaction builds one of these at begin with
+    /// `SnapshotView.started_at_version`, so an L0→L1 flush completing
+    /// mid-transaction cannot leak post-snapshot rows into its L1 scans
+    /// (the L0 tier is pinned separately by the `SnapshotView`).
+    ///
+    /// Unlike [`Self::pinned`], the live `AdjacencyManager` is SHARED, not
+    /// fresh: commits replay their edges into the live manager's overlay,
+    /// which is the traversal path's only source for L0-resident edges — a
+    /// fresh manager would make every unflushed edge invisible to the
+    /// transaction. The cost is that the edge tier is not version-pinned
+    /// (post-snapshot edges remain visible to traversals, exactly as before
+    /// C2); edge reads are recorded in the OCC read-set, so a conflicting
+    /// read-modify-write still aborts at commit.
+    pub fn pinned_at_version(&self, hwm: u64) -> Self {
+        Self {
+            base_uri: self.base_uri.clone(),
+            store: self.store.clone(),
+            schema_manager: self.schema_manager.clone(),
+            snapshot_manager: self.snapshot_manager.clone(),
+            adjacency_manager: self.adjacency_manager.clone(),
+            config: self.config.clone(),
+            compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
+            pinned_snapshot: None,
+            pinned_version_hwm: Some(hwm),
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),
@@ -497,6 +544,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
+            pinned_version_hwm: None,
             fork_scope: Some(scope),
             backend: branched_backend,
             vid_labels_index: self.vid_labels_index.clone(),
@@ -541,14 +589,39 @@ impl StorageManager {
         self.pinned_snapshot
             .as_ref()
             .and_then(|s| s.edges.get(name).map(|es| es.lance_version))
+            // The flush path stamps `lance_version: 0` ("LanceDB tables don't
+            // expose Lance version directly") — 0 is a stub sentinel, not a
+            // real dataset version. Returning it would route adjacency reads
+            // through `checkout_version(0)` (the empty initial version).
+            .filter(|v| *v != 0)
     }
 
-    /// Returns the version_high_water_mark from the pinned snapshot if present.
+    /// Returns the version high-water mark from the pinned snapshot or the
+    /// transaction-level version pin, if present.
     ///
-    /// This is used for time-travel queries to filter data by version.
-    /// When a snapshot is pinned, only rows with `_version <= version_high_water_mark`
-    /// should be considered visible.
+    /// Used by the SCAN tier (vertex tables, property reads) to filter data
+    /// by version: when set, only rows with
+    /// `_version <= version_high_water_mark` are visible. The edge/adjacency
+    /// path must use [`Self::snapshot_version_hwm`] instead.
     pub fn version_high_water_mark(&self) -> Option<u64> {
+        self.pinned_snapshot
+            .as_ref()
+            .map(|s| s.version_high_water_mark)
+            .or(self.pinned_version_hwm)
+    }
+
+    /// Version high-water mark from a manifest-pinned (time-travel) snapshot
+    /// ONLY — never from a transaction-level version pin.
+    ///
+    /// The edge/adjacency read path switches to version-filtered CSR reads
+    /// and skips the L0 overlays when a hwm is present. That is correct for
+    /// time-travel (a snapshot is flushed state, with its own fresh
+    /// `AdjacencyManager`), but a transaction pin shares the LIVE adjacency
+    /// manager and needs live CSR + L0 overlays + its tx-L0 — filtering
+    /// there would hide unflushed edges and poison the shared warm cache.
+    /// The edge tier is deliberately not version-pinned for transactions
+    /// (see [`Self::pinned_at_version`]).
+    pub fn snapshot_version_hwm(&self) -> Option<u64> {
         self.pinned_snapshot
             .as_ref()
             .map(|s| s.version_high_water_mark)
@@ -1112,8 +1185,10 @@ impl StorageManager {
                 graph.add_vertex(vid);
 
                 for &etype_id in edge_types {
-                    // Warm adjacency with coalescing to prevent cache stampede (Issue #13)
-                    let edge_ver = self.version_high_water_mark();
+                    // Warm adjacency with coalescing to prevent cache stampede (Issue #13).
+                    // Manifest pin only: a tx version pin shares the LIVE adjacency
+                    // manager — warming it filtered would poison the shared cache.
+                    let edge_ver = self.snapshot_version_hwm();
                     self.adjacency_manager
                         .warm_coalesced(self, etype_id, dir, edge_ver)
                         .await?;

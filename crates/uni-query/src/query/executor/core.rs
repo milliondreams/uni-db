@@ -450,6 +450,18 @@ impl Executor {
         self.read_snapshot = snapshot;
     }
 
+    /// The storage manager queries should read through: the transaction's
+    /// version-pinned manager when the read snapshot carries one (C2 — L1
+    /// scans then filter to `_version <= started_at_version`, so a flush
+    /// completing mid-transaction cannot leak post-snapshot rows), else the
+    /// live manager.
+    pub(crate) fn effective_storage(&self) -> Arc<StorageManager> {
+        self.read_snapshot
+            .as_ref()
+            .and_then(|s| s.pinned_storage.clone())
+            .unwrap_or_else(|| self.storage.clone())
+    }
+
     /// Attach a per-transaction VID/EID reservoir. When set, CREATE/MERGE
     /// paths in `execute_create_pattern` pull IDs from the reservoir's
     /// pre-reserved cache, amortizing the global `IdAllocator` mutex.

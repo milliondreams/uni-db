@@ -286,6 +286,7 @@ impl PreparedLocy {
             tx_l0_override: None,
             locy_l0: None,
             collect_derive: true,
+            read_snapshot: None,
         };
         engine
             .evaluate_compiled_with_config(compiled, &config)

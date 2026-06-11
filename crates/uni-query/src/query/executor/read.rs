@@ -400,17 +400,27 @@ impl Executor {
             None => L0Context::empty(),
         };
 
+        // C2: when the read snapshot carries a version-pinned storage
+        // manager, scans AND property reads must route through it so both
+        // tiers agree on the pinned view.
+        let effective_storage = self.effective_storage();
+        let storage_is_pinned = !Arc::ptr_eq(&effective_storage, &self.storage);
+
         // Prefer the shared `Arc<PropertyManager>` installed via
         // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
         // (~80 µs/query) of constructing a fresh, immediately-abandoned
         // PropertyManager. Falls back to the legacy fresh-construction path
-        // for callers that have not installed one.
-        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref() {
+        // for callers that have not installed one. Pinned transactions
+        // always construct fresh: the shared manager reads (and caches)
+        // through the LIVE storage, which would leak post-snapshot L1 rows.
+        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref()
+            && !storage_is_pinned
+        {
             shared.clone()
         } else {
             Arc::new(PropertyManager::new(
-                self.storage.clone(),
-                self.storage.schema_manager_arc(),
+                effective_storage.clone(),
+                effective_storage.schema_manager_arc(),
                 prop_manager.cache_size(),
             ))
         };
@@ -543,10 +553,10 @@ impl Executor {
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
             session_ctx.clone(),
-            self.storage.clone(),
+            effective_storage.clone(),
             l0_context,
             prop_manager_arc.clone(),
-            self.storage.schema_manager().schema(),
+            effective_storage.schema_manager().schema(),
             params.clone(),
             HashMap::new(),
         );

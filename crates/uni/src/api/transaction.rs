@@ -234,9 +234,18 @@ impl Transaction {
         // `occ_read_seq`, so the snapshot reflects state >= read_seq — any commit
         // newer than read_seq is then caught by OCC rather than silently read.
         // Only pinned when SSI is enabled; otherwise reads run against live L0.
+        //
+        // Component C2: pin the L1 tier as well — a StorageManager clone whose
+        // scans filter to `_version <= started_at_version`, so a flush
+        // completing mid-transaction cannot leak post-snapshot rows. One per
+        // transaction (the pinned manager carries a fresh AdjacencyManager).
         let snapshot = if db.config.ssi_enabled {
             let writer: &uni_store::Writer = writer_lock.as_ref();
-            parking_lot::Mutex::new(Some(writer.l0_manager.pin_snapshot()))
+            let mut snap = writer.l0_manager.pin_snapshot();
+            snap.pinned_storage = Some(Arc::new(
+                db.storage.pinned_at_version(snap.started_at_version),
+            ));
+            parking_lot::Mutex::new(Some(snap))
         } else {
             parking_lot::Mutex::new(None)
         };
@@ -288,14 +297,15 @@ impl Transaction {
 
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
 
-    /// The transaction's pinned L0 snapshot for snapshot-isolated reads
-    /// (Component C1), threaded into the executor.
+    /// The transaction's pinned read snapshot — frozen L0 generations
+    /// (Component C1) plus the version-pinned L1 storage (Component C2) —
+    /// threaded into the executor.
     ///
     /// Returns `Some` for a read-write transaction begun under
     /// `UniConfig::ssi_enabled` (until commit/rollback `take`s it); `None` when
     /// SSI is disabled (nothing was pinned ⇒ live reads) or after release. A
     /// `None` is a safe no-op downstream.
-    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
+    pub(crate) fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
         self.snapshot.lock().clone()
     }
 
@@ -409,9 +419,14 @@ impl Transaction {
                 // Order mirrors transaction begin: advance `occ_read_seq` first,
                 // then pin, so the snapshot always reflects state >= read_seq (a
                 // racing commit causes at most a spurious retry, never a missed
-                // conflict / lost update).
+                // conflict / lost update). The C2 L1 pin is rebuilt at the new
+                // baseline alongside the L0 pin.
                 self.tx_l0.write().occ_read_seq = writer.current_commit_sequence();
-                *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
+                let mut snap = writer.l0_manager.pin_snapshot();
+                snap.pinned_storage = Some(Arc::new(
+                    self.db.storage.pinned_at_version(snap.started_at_version),
+                ));
+                *self.snapshot.lock() = Some(snap);
             }
         }
         Ok(())
@@ -699,6 +714,7 @@ impl Transaction {
             tx_l0_override: Some(self.tx_l0.clone()),
             locy_l0: Some(self.tx_l0.clone()),
             collect_derive: false,
+            read_snapshot: self.read_snapshot(),
         };
         engine.evaluate(program).await
     }

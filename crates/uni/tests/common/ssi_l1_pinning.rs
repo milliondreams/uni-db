@@ -219,7 +219,8 @@ async fn merge_sees_in_transaction_edge_under_pin() -> Result<()> {
 
     let s = db.session();
     let tx = s.tx().await?;
-    tx.execute("CREATE (a:N {name: 'a'}), (b:N {name: 'b'})").await?;
+    tx.execute("CREATE (a:N {name: 'a'}), (b:N {name: 'b'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -227,14 +228,10 @@ async fn merge_sees_in_transaction_edge_under_pin() -> Result<()> {
     // MERGEs in one transaction must dedup: the second must see the first's
     // edge through the live property read, not a version-filtered miss.
     let tx = s.tx().await?;
-    tx.execute(
-        "MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)",
-    )
-    .await?;
-    tx.execute(
-        "MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)",
-    )
-    .await?;
+    tx.execute("MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)")
+        .await?;
+    tx.execute("MATCH (a:N {name:'a'}), (b:N {name:'b'}) MERGE (a)-[:R {tag:'x'}]->(b)")
+        .await?;
     tx.commit().await?;
 
     let n = s.query("MATCH ()-[r:R]->() RETURN count(r) AS n").await?;

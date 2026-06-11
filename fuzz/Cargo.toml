@@ -1,0 +1,50 @@
+# Fuzz targets for the byte- and text-level attack surfaces:
+# the Cypher/Locy pest grammars, the WAL segment decoder, and the BTIC
+# binary codec. Build/run with `cargo +nightly fuzz run <target>`.
+#
+# Standalone workspace: the parent workspace stays nightly-free and
+# `cargo nextest run --workspace` never builds libfuzzer.
+[package]
+name = "uni-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+uni-cypher = { path = "../crates/uni-cypher" }
+uni-store = { path = "../crates/uni-store" }
+uni-btic = { path = "../crates/uni-btic" }
+
+[workspace]
+
+[[bin]]
+name = "cypher_parse"
+path = "fuzz_targets/cypher_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "locy_parse"
+path = "fuzz_targets/locy_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_decode"
+path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btic_decode"
+path = "fuzz_targets/btic_decode.rs"
+test = false
+doc = false
+bench = false

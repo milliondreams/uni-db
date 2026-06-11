@@ -54,7 +54,11 @@ fn encode_segment_envelope(payload_json: &[u8]) -> Vec<u8> {
 /// Returns a human-readable corruption description on failure — the caller
 /// decides whether that is fatal (corrupt middle segment) or a tolerated
 /// torn tail (see [`WriteAheadLog::replay_since`]).
-fn decode_segment(bytes: &[u8]) -> std::result::Result<WalSegment, String> {
+///
+/// `pub` + `doc(hidden)` solely so `fuzz/fuzz_targets/wal_decode.rs` can
+/// drive it with arbitrary bytes; it is not part of the public API.
+#[doc(hidden)]
+pub fn decode_segment(bytes: &[u8]) -> std::result::Result<WalSegment, String> {
     if let Some(rest) = bytes.strip_prefix(WAL_V2_MAGIC) {
         if rest.len() < WAL_V2_HASH_HEX_LEN + 1 || rest[WAL_V2_HASH_HEX_LEN] != b'\n' {
             return Err("truncated v2 segment header".to_string());

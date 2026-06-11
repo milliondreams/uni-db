@@ -18,6 +18,7 @@ pub mod cypher_subquery_parser;
 pub mod cypher_union;
 pub mod dynamic_access_test;
 pub mod explain_test;
+pub mod int_arithmetic_overflow_test;
 pub mod map_literal_test;
 pub mod map_projection_test;
 pub mod normalization_test;

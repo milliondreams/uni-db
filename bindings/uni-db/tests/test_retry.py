@@ -101,9 +101,7 @@ def test_transact_with_retry_no_lost_updates_under_contention(counter_db):
             for _ in range(increments_per_thread):
 
                 def body(tx):
-                    rows = tx.query(
-                        "MATCH (c:Counter {id: 'x'}) RETURN c.n AS n"
-                    )
+                    rows = tx.query("MATCH (c:Counter {id: 'x'}) RETURN c.n AS n")
                     n = rows[0]["n"]
                     tx.execute(
                         "MATCH (c:Counter {id: 'x'}) SET c.n = $v",
@@ -168,9 +166,13 @@ def test_execute_with_retry(counter_db):
 @pytest.mark.asyncio
 async def test_async_transact_with_retry():
     db = await uni_db.AsyncUniBuilder.temporary().build()
-    schema = db.schema().label("Counter").property("id", "string").property(
-        "n", "int"
-    ).done()
+    schema = (
+        db.schema()
+        .label("Counter")
+        .property("id", "string")
+        .property("n", "int")
+        .done()
+    )
     await schema.apply()
     session = db.session()
     tx = await session.tx()
@@ -180,9 +182,7 @@ async def test_async_transact_with_retry():
     async def body(tx):
         rows = await tx.query("MATCH (c:Counter {id: 'x'}) RETURN c.n AS n")
         n = rows[0]["n"]
-        await tx.execute(
-            "MATCH (c:Counter {id: 'x'}) SET c.n = $v", {"v": n + 1}
-        )
+        await tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = $v", {"v": n + 1})
         return n + 1
 
     result = await async_transact_with_retry(session, body)

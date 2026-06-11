@@ -15,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import Any, Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from ._uni_db import (  # type: ignore[attr-defined]
     UniCommitTimeoutError,
@@ -42,9 +43,7 @@ DEFAULT_MAX_BACKOFF = 0.05  # 50 ms
 DEFAULT_JITTER = 0.5  # ±50 %
 
 
-def _backoff_delay(
-    attempt: int, base: float, cap: float, jitter: float
-) -> float:
+def _backoff_delay(attempt: int, base: float, cap: float, jitter: float) -> float:
     """Exponential backoff with fractional jitter, clamped to ``cap``."""
     delay = min(base * (2 ** (attempt - 1)), cap)
     if jitter > 0.0:

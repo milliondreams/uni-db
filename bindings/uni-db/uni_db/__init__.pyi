@@ -9,10 +9,12 @@ Locy datalog evaluation, and columnar analytics.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
+
+_T = TypeVar("_T")
 
 # =============================================================================
 # Typed Exception Hierarchy

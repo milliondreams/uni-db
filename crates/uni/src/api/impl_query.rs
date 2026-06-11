@@ -398,10 +398,14 @@ impl crate::api::UniInner {
         // parameter binding still run per execution below, so reuse is
         // independent of both live fork-index state and parameter values.
         let schema_version = self.schema.schema().schema_version;
-        let cache_key = crate::api::session::plan_cache_key(cypher);
+        let text_key = crate::api::session::plan_cache_key(cypher);
+        // The effective key folds in the values of any LIMIT/SKIP parameters the
+        // planner baked into the cached plan, so a `LIMIT $n` read inside a tx is
+        // never served another value's plan.
         let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| {
+            let key = cache.effective_key(text_key, &params);
             cache
-                .get(cache_key, cypher, schema_version)
+                .get(key, cypher, schema_version)
                 .map(|e| e.plan.clone())
         });
 
@@ -431,18 +435,24 @@ impl crate::api::UniInner {
                 }
 
                 let plan_start = Instant::now();
-                let lp = {
+                let (lp, folded) = {
                     let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
                         .with_params(params.clone())
                         .with_plugin_registry(Arc::clone(&self.plugin_registry));
-                    planner.plan(ast).map_err(|e| into_query_error(e, cypher))?
+                    let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+                    let folded = planner.folded_limit_skip_params();
+                    (lp, folded)
                 };
                 let plan_time = plan_start.elapsed();
 
-                // Cache the pre-rewrite logical plan for subsequent batches.
+                // Cache the pre-rewrite logical plan for subsequent batches,
+                // under the effective key (folding in any LIMIT/SKIP parameter
+                // values baked into this plan).
                 if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.note_folded_params(text_key, folded);
+                    let key = cache.effective_key(text_key, &params);
                     cache.insert(
-                        cache_key,
+                        key,
                         crate::api::session::PlanCacheEntry {
                             plan: lp.clone(),
                             query: cypher.to_string(),

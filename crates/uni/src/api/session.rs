@@ -422,6 +422,25 @@ impl Session {
         &self.db.plugin_registry
     }
 
+    /// Whether a `CALL proc(...)` names a registered mutating procedure.
+    ///
+    /// Returns `true` only when `name` resolves (in the session-local registry
+    /// or the instance registry) to a procedure whose `ProcedureMode` is not
+    /// `Read`. Unknown procedure names return `false` — they are not
+    /// classifiable here and fail later at dispatch if truly absent. Used by the
+    /// read-only gate to reject write procedures alongside write clauses.
+    pub(crate) fn procedure_is_write(&self, name: &str) -> bool {
+        use uni_plugin::traits::procedure::ProcedureMode;
+        let Ok(qname) = uni_plugin::QName::parse(name) else {
+            return false;
+        };
+        let is_write = |reg: &uni_plugin::PluginRegistry| {
+            reg.procedure(&qname)
+                .is_some_and(|e| !matches!(e.signature.mode, ProcedureMode::Read))
+        };
+        is_write(&self.session_plugin_registry) || is_write(&self.db.plugin_registry)
+    }
+
     /// Load a PyO3 (Python source) plugin into this **session**'s
     /// local plugin registry.
     ///
@@ -565,6 +584,25 @@ impl Session {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Run the read-path guards `Session::query` applies, for the builder entry
+    /// points (`fetch_all`/`cursor`/`profile`) that otherwise bypass them:
+    /// authorization, before-query hooks, and read-only validation (including
+    /// writes nested in `CALL { … }` and registered write procedures).
+    ///
+    /// Centralizing them here means a new builder method inherits the guards by
+    /// calling this, rather than silently re-opening the bypass.
+    ///
+    /// # Errors
+    /// Returns an authorization, hook, parse, or read-only-violation error.
+    fn run_query_guards(&self, cypher: &str, params: &HashMap<String, Value>) -> Result<()> {
+        self.authorize(cypher, "read")?;
+        self.run_before_query_hooks(cypher, QueryType::Cypher, params)?;
+        let ast = uni_cypher::parse(cypher).map_err(crate::api::impl_query::into_parse_error)?;
+        uni_query::validate_read_only_with(&ast, &|name| self.procedure_is_write(name))
+            .map_err(|_| read_only_violation(cypher))?;
         Ok(())
     }
 
@@ -1209,12 +1247,15 @@ impl Session {
         params: HashMap<String, Value>,
     ) -> Result<QueryResult> {
         let schema_version = self.db.schema.schema().schema_version;
-        let cache_key = plan_cache_key(cypher);
+        let text_key = plan_cache_key(cypher);
 
-        // Try cache lookup (brief lock, then release)
+        // Try cache lookup (brief lock, then release). The effective key folds
+        // in the values of any LIMIT/SKIP parameters baked into the plan so a
+        // `LIMIT $n` query is never served another value's plan.
         let cached = self.plan_cache.lock().ok().and_then(|mut cache| {
+            let key = cache.effective_key(text_key, &params);
             cache
-                .get(cache_key, cypher, schema_version)
+                .get(key, cypher, schema_version)
                 .map(|entry| entry.plan.clone())
         });
 
@@ -1247,8 +1288,11 @@ impl Session {
         let ast = uni_cypher::parse(cypher).map_err(crate::api::impl_query::into_parse_error)?;
 
         // Enforce read-only semantics for session queries — mutations require
-        // a transaction for isolation, WAL protection, and commit hooks.
-        uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(cypher))?;
+        // a transaction for isolation, WAL protection, and commit hooks. This
+        // rejects write clauses, writes nested in `CALL { … }` subqueries, and
+        // registered write/schema/dbms procedures.
+        uni_query::validate_read_only_with(&ast, &|name| self.procedure_is_write(name))
+            .map_err(|_| read_only_violation(cypher))?;
 
         // Time-travel queries bypass the cache entirely
         if matches!(ast, uni_cypher::ast::Query::TimeTravel { .. }) {
@@ -1269,11 +1313,15 @@ impl Session {
         let plan = planner
             .plan(ast)
             .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?;
+        let folded = planner.folded_limit_skip_params();
 
-        // Cache the entry
+        // Cache the entry under the effective key (folding in any LIMIT/SKIP
+        // parameter values the planner baked into this plan).
         if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.note_folded_params(text_key, folded);
+            let key = cache.effective_key(text_key, &params);
             cache.insert(
-                cache_key,
+                key,
                 PlanCacheEntry {
                     plan: plan.clone(),
                     query: cypher.to_string(),
@@ -1423,16 +1471,17 @@ impl<'a> QueryBuilder<'a> {
     /// Uses the session's transparent plan cache when no custom timeout or
     /// memory limit is set.
     pub async fn fetch_all(self) -> Result<QueryResult> {
+        let params = self.session.merge_params(self.params);
+        // Authorize, run before-query hooks, and enforce read-only — guards the
+        // typed `Session::query` applies but the builder previously skipped,
+        // letting a parameterized query bypass an `AuthzPolicy` or write
+        // non-transactionally via `.profile()`/`.cursor()`.
+        self.session.run_query_guards(&self.cypher, &params)?;
+
         let has_overrides = self.timeout.is_some()
             || self.max_memory.is_some()
             || self.cancellation_token.is_some();
         if has_overrides {
-            // Validate read-only before bypassing the cache (which has its
-            // own validation). Parse is cheap relative to execution.
-            let ast = uni_cypher::parse(&self.cypher)
-                .map_err(crate::api::impl_query::into_parse_error)?;
-            uni_query::validate_read_only(&ast).map_err(|_| read_only_violation(&self.cypher))?;
-
             // Custom config — bypass cache and use the config-aware path
             let mut db_config = self.session.db.config.clone();
             if let Some(t) = self.timeout {
@@ -1441,7 +1490,6 @@ impl<'a> QueryBuilder<'a> {
             if let Some(m) = self.max_memory {
                 db_config.max_query_memory = m;
             }
-            let params = self.session.merge_params(self.params);
             let session_pr = Arc::clone(&self.session.session_plugin_registry);
             let session_principal = self.session.principal.clone();
             uni_query::scoped_with_session_context(
@@ -1461,7 +1509,6 @@ impl<'a> QueryBuilder<'a> {
             // `scoped_with_session_plugin_registry` so the session
             // registry is in scope through the cached / fresh-plan
             // branches inside.
-            let params = self.session.merge_params(self.params);
             self.session.execute_cached(&self.cypher, params).await
         }
     }
@@ -1482,6 +1529,7 @@ impl<'a> QueryBuilder<'a> {
             db_config.max_query_memory = m;
         }
         let params = self.session.merge_params(self.params);
+        self.session.run_query_guards(&self.cypher, &params)?;
         let session_pr = Arc::clone(&self.session.session_plugin_registry);
         let session_principal = self.session.principal.clone();
         uni_query::scoped_with_session_context(
@@ -1502,6 +1550,7 @@ impl<'a> QueryBuilder<'a> {
     /// Profile the query execution, returning results with profiling output.
     pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
         let params = self.session.merge_params(self.params);
+        self.session.run_query_guards(&self.cypher, &params)?;
         let session_pr = Arc::clone(&self.session.session_plugin_registry);
         let session_principal = self.session.principal.clone();
         uni_query::scoped_with_session_context(
@@ -1627,6 +1676,12 @@ pub(crate) struct PlanCacheEntry {
 /// write path ([`crate::api::UniInner::execute_internal_with_tx_l0`]).
 pub(crate) struct PlanCache {
     entries: HashMap<u64, PlanCacheEntry>,
+    /// Per-query-text record of parameter names the planner folded into a
+    /// `LIMIT`/`SKIP` position. Because such plans bake the concrete value in,
+    /// the effective cache key folds these parameters' values (see
+    /// [`PlanCache::effective_key`]); keyed by the query-text hash so it is
+    /// learned once per query shape and reused on every lookup.
+    folded_params: HashMap<u64, Vec<String>>,
     max_entries: usize,
 }
 
@@ -1634,8 +1689,63 @@ impl PlanCache {
     pub(crate) fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            folded_params: HashMap::new(),
             max_entries,
         }
+    }
+
+    /// Effective cache key for `cypher`, folding in the values of any parameters
+    /// baked into `LIMIT`/`SKIP` during a prior planning of this query text.
+    ///
+    /// The base key is the query-text hash (`text_key`). When this text was
+    /// previously found to fold parameters into its plan, those parameters'
+    /// current values are hashed into the key so each distinct value gets its
+    /// own entry — a `LIMIT $n` plan is never replayed with the wrong bound.
+    /// Queries with no folded parameter keep a single, value-independent entry,
+    /// so the hot parameterized-ingest path is unaffected. Collisions of the
+    /// derived key are still caught by the per-entry query-text compare in
+    /// [`PlanCache::get`].
+    pub(crate) fn effective_key(&self, text_key: u64, params: &HashMap<String, Value>) -> u64 {
+        let Some(names) = self.folded_params.get(&text_key) else {
+            return text_key;
+        };
+        if names.is_empty() {
+            return text_key;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text_key.hash(&mut hasher);
+        for name in names {
+            name.hash(&mut hasher);
+            match params.get(name) {
+                Some(v) => {
+                    1u8.hash(&mut hasher); // marker: parameter present
+                    v.hash(&mut hasher);
+                }
+                None => 0u8.hash(&mut hasher), // marker: parameter absent
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Record that planning `text_key` folded `names` into `LIMIT`/`SKIP`.
+    ///
+    /// Idempotent and stable per query text. To stay bounded under a workload
+    /// of ever-unique query texts (mirroring the LFU bound on `entries`), the
+    /// record is cleared and re-learned lazily once it grows past a small
+    /// multiple of `max_entries` — only a hint, so dropping it costs at most one
+    /// extra parse on the next miss, never correctness.
+    pub(crate) fn note_folded_params(&mut self, text_key: u64, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        // Headroom over `max_entries`: several param-value variants can share one
+        // query text (one `folded_params` row), so allow a few× before pruning.
+        const FOLDED_PARAMS_HEADROOM: usize = 8;
+        if self.folded_params.len() >= self.max_entries.saturating_mul(FOLDED_PARAMS_HEADROOM) {
+            self.folded_params.clear();
+        }
+        self.folded_params.entry(text_key).or_insert(names);
     }
 
     pub(crate) fn get(

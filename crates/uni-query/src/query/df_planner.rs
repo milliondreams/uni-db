@@ -6833,8 +6833,9 @@ struct JoinPredicateClassification {
 
 /// Walk a LogicalPlan subtree and collect all variable names produced by it
 /// (Scans, Unwind targets, Traverse targets, etc.). Used to classify which
-/// side of a CrossJoin a predicate's variables belong to.
-fn collect_plan_variables(plan: &LogicalPlan) -> HashSet<String> {
+/// side of a CrossJoin a predicate's variables belong to, and to tell
+/// upstream-bound variables apart from freshly-created ones in CREATE+SET fusion.
+pub(crate) fn collect_plan_variables(plan: &LogicalPlan) -> HashSet<String> {
     let mut out = HashSet::new();
     collect_plan_variables_into(plan, &mut out);
     out

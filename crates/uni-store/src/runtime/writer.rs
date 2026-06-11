@@ -638,6 +638,21 @@ impl Writer {
             None
         };
 
+        // Issue #77: an edge whose endpoint is tombstoned in main L0 makes the
+        // merge below bail. That bail MUST happen before the durable WAL flush —
+        // after it the transaction is committed-but-unmerged (a ghost commit),
+        // and WAL replay re-hits the same bail, making the database unopenable.
+        // SSI validation was deliberately placed before the flush for exactly
+        // this reason; the endpoint check belongs here too. Runs unconditionally
+        // (issue #77 is not SSI-gated) under `flush_lock`, so the main-L0
+        // tombstone set cannot change between here and the merge.
+        {
+            let tx_l0 = tx_l0_arc.read();
+            let main_l0_arc = self.l0_manager.get_current();
+            let main_l0 = main_l0_arc.read();
+            main_l0.validate_merge_edge_endpoints(&tx_l0)?;
+        }
+
         // Crash-recovery seam: SSI validation has passed; the transaction is
         // about to become durable. A crash here must leave NO trace (validation
         // happens before the WAL is touched). No-op unless `failpoints`.

@@ -175,6 +175,56 @@ async fn set_on_matched_var_does_not_fuse() -> Result<()> {
     Ok(())
 }
 
+/// SET on a MATCHed variable that is *reused* inside the CREATE pattern
+/// (`MATCH (a) CREATE (a)-[r]->(b) SET a.p = 1`) must NOT fuse onto `a`.
+///
+/// Regression for the 2026-06-10 review #4: the fusion built its `owner` set
+/// from *all* CREATE-pattern variables, so the upstream-bound `a` looked
+/// freshly created; the SET fused into the `(a)` element, which the executor
+/// skips because `a` is already bound — silently dropping the write.
+#[tokio::test]
+async fn set_on_matched_var_reused_in_create_does_not_fuse() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .property_nullable("p", DataType::Int64)
+        .done()
+        .edge_type("KNOWS", &["Person"], &["Person"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'a'})").await?;
+    tx.commit().await?;
+
+    // `a` is MATCH-bound, then reused as the source of a fresh edge; the SET
+    // targets the bound `a`, so it must not fuse into the CREATE element.
+    let cypher = "MATCH (a:Person {name: 'a'}) \
+         CREATE (a)-[r:KNOWS]->(b:Person {name: 'b'}) SET a.p = 1";
+    let ops = operator_names(&db, cypher, None).await?;
+    assert!(
+        ops.iter().any(|o| o == "MutationSetExec"),
+        "SET on a MATCHed var reused in CREATE must not fuse: {ops:?}"
+    );
+
+    let tx = db.session().tx().await?;
+    tx.execute(cypher).await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (a:Person {name: 'a'}) RETURN a.p AS p")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("p").unwrap(),
+        1,
+        "SET on the matched var must apply (was silently dropped by fusion)"
+    );
+    Ok(())
+}
+
 /// `SET n += {...}` (map merge) is not the simple property form and must not
 /// fuse, but must still apply.
 #[tokio::test]

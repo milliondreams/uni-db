@@ -129,7 +129,10 @@ pub struct Transaction {
     /// locked read sees the latest committed value (see `acquire_for_update_locks`).
     ///
     /// Always present; only set to `Some` when `UniConfig::ssi_enabled` is `true`.
-    snapshot: parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>,
+    /// Shared so a `tx.prepare(...)` [`PreparedQuery`] can read the *live*
+    /// snapshot at execute time (it is pinned lazily on first freeze, so a
+    /// value captured at prepare time could be stale).
+    snapshot: Arc<parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>>,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -245,9 +248,9 @@ impl Transaction {
             snap.pinned_storage = Some(Arc::new(
                 db.storage.pinned_at_version(snap.started_at_version),
             ));
-            parking_lot::Mutex::new(Some(snap))
+            Arc::new(parking_lot::Mutex::new(Some(snap)))
         } else {
-            parking_lot::Mutex::new(None)
+            Arc::new(parking_lot::Mutex::new(None))
         };
 
         let id = Uuid::new_v4().to_string();
@@ -485,6 +488,33 @@ impl Transaction {
                 }
                 Err(e) => return Err(UniError::AuthorizationDenied { reason: e.0 }),
             }
+        }
+        Ok(())
+    }
+
+    /// Per-statement guards shared by the typed `execute`/`query` entry points
+    /// and their parameterized builders: authorization and `FOR UPDATE` lock
+    /// acquisition **with the statement's actual parameters**.
+    ///
+    /// The builders previously called `execute_internal_with_tx_l0` directly,
+    /// skipping both — so a parameterized `tx.query(cypher, params)` carrying
+    /// `FOR UPDATE` silently took no row locks, and an `AuthzPolicy` was
+    /// bypassed by parameterizing the statement. Centralizing the guards keeps a
+    /// new builder method from re-opening either gap.
+    ///
+    /// # Errors
+    /// Returns an authorization error, or [`UniError::LockTimeout`] if a
+    /// `FOR UPDATE` lock cannot be acquired.
+    async fn run_exec_guards(&self, cypher: &str, params: &HashMap<String, Value>) -> Result<()> {
+        self.authorize(cypher, classify_verb(cypher))?;
+        if self.db.config.ssi_enabled {
+            self.acquire_for_update_locks(cypher, params).await?;
+        } else if cypher.to_ascii_lowercase().contains("for update") {
+            tracing::warn!(
+                ssi_enabled = false,
+                "FOR UPDATE ignored: ssi_enabled is false, so no row locks are acquired and \
+                 concurrent writers are not serialized — enable SSI or guard the RMW externally"
+            );
         }
         Ok(())
     }
@@ -733,7 +763,16 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn prepare(&self, cypher: &str) -> Result<crate::api::prepared::PreparedQuery> {
         self.check_completed()?;
-        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher).await
+        // Bind the prepared query to this transaction's private L0, id
+        // reservoir, and (live) read snapshot, so its reads see the tx's
+        // uncommitted writes and its writes land in `tx_l0` — undone by
+        // `rollback()` rather than leaking into main L0.
+        let binding = crate::api::prepared::PreparedTxBinding {
+            tx_l0: self.tx_l0.clone(),
+            id_reservoir: self.id_reservoir.clone(),
+            snapshot: self.snapshot.clone(),
+        };
+        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding).await
     }
 
     /// Prepare a Locy program for repeated evaluation within this transaction.
@@ -1262,6 +1301,7 @@ impl<'a> ExecuteBuilder<'a> {
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn run(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
@@ -1297,6 +1337,7 @@ impl<'a> ExecuteBuilder<'a> {
     /// applicable.
     pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.profile_internal_with_tx_l0(
             &self.cypher,
@@ -1353,6 +1394,7 @@ impl<'a> TxQueryBuilder<'a> {
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn execute(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
@@ -1379,6 +1421,7 @@ impl<'a> TxQueryBuilder<'a> {
     /// Execute as a query and return rows.
     pub async fn fetch_all(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
@@ -1406,6 +1449,7 @@ impl<'a> TxQueryBuilder<'a> {
     /// Execute the query and return a cursor for streaming results.
     pub async fn cursor(self) -> Result<QueryCursor> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         self.tx
             .db
             .execute_cursor_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())

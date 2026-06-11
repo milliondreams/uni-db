@@ -104,6 +104,62 @@ async fn deny_principal_blocks_query() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression for review (Tier 2): the parameterized builder path
+/// (`query_with(...).param(...).fetch_all()`) must consult the same
+/// `AuthzPolicy` as the typed `query`. Previously the builder bypassed
+/// authorization, so any policy could be evaded by parameterizing the query —
+/// the path the Python bindings take whenever params are supplied.
+#[tokio::test]
+async fn deny_principal_blocks_parameterized_builder() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    register_policy(&db, "admin")?;
+
+    let session = db.session().with_principal(Arc::new(Principal {
+        id: "mallory".to_owned(),
+        groups: vec!["guests".to_owned()],
+        capabilities: uni_plugin::CapabilitySet::default(),
+    }));
+
+    // fetch_all
+    let err = session
+        .query_with("RETURN $x AS one")
+        .param("x", 1i64)
+        .fetch_all()
+        .await
+        .expect_err("non-admin must be denied on the builder fetch_all path");
+    assert!(matches!(err, UniError::AuthorizationDenied { .. }));
+
+    // profile
+    let err = session
+        .query_with("RETURN $x AS one")
+        .param("x", 1i64)
+        .profile()
+        .await
+        .expect_err("non-admin must be denied on the builder profile path");
+    assert!(matches!(err, UniError::AuthorizationDenied { .. }));
+
+    Ok(())
+}
+
+/// A write smuggled through the read builder's `.profile()` / `.cursor()` must
+/// be rejected as read-only (it previously executed non-transactionally).
+#[tokio::test]
+async fn builder_profile_rejects_write() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let session = db.session();
+    let err = session
+        .query_with("CREATE (:Smuggled {v: $v})")
+        .param("v", 1i64)
+        .profile()
+        .await
+        .expect_err("a write via .profile() must be rejected as read-only");
+    assert!(
+        err.to_string().contains("read-only"),
+        "expected read-only violation, got: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn anonymous_principal_sees_policies() -> anyhow::Result<()> {
     // No principal set on session — policy sees "anonymous" with no

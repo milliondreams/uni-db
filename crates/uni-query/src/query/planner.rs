@@ -290,6 +290,33 @@ fn collect_expr_variables(expr: &Expr) -> Vec<String> {
     vars
 }
 
+/// Collect the names of `$param` references in a constant-foldable expression.
+///
+/// Walks the variants that `eval_const_numeric_expr` accepts (the only shapes a
+/// successfully-folded `LIMIT`/`SKIP` expression can take): parameters,
+/// literals, unary/binary arithmetic, and the whitelisted numeric functions.
+/// Used to tell the plan cache which parameter values were baked into the plan.
+fn collect_expr_parameters(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::Parameter(name) => {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        Expr::UnaryOp { expr: e, .. } => collect_expr_parameters(e, names),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_parameters(left, names);
+            collect_expr_parameters(right, names);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_expr_parameters(a, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
     let mut add_var = |name: &String| {
         if !vars.contains(name) {
@@ -2425,6 +2452,12 @@ pub struct QueryPlanner {
     plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
     /// Gate for replacement-scan dispatch on unknown identifiers (M5b).
     replacement_scans_enabled: bool,
+    /// Names of parameters folded into a `LIMIT`/`SKIP` position during the
+    /// plan. The resulting `LogicalPlan::Limit` bakes the concrete values in, so
+    /// a plan cache keyed on query text must additionally key on these
+    /// parameters' values (see `folded_limit_skip_params`). Interior-mutable
+    /// because `plan` takes `&self`.
+    folded_limit_skip_params: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 struct TraverseParams<'a> {
@@ -2461,7 +2494,35 @@ impl QueryPlanner {
             params: HashMap::new(),
             plugin_registry: None,
             replacement_scans_enabled: false,
+            folded_limit_skip_params: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Record the parameters referenced by a successfully-folded `LIMIT`/`SKIP`
+    /// expression so the caller's plan cache can key on their values.
+    fn note_folded_limit_skip(&self, expr: &Expr) {
+        let mut names = Vec::new();
+        collect_expr_parameters(expr, &mut names);
+        if !names.is_empty()
+            && let Ok(mut acc) = self.folded_limit_skip_params.lock()
+        {
+            acc.extend(names);
+        }
+    }
+
+    /// Parameter names folded into `LIMIT`/`SKIP` positions during the last
+    /// [`plan`](Self::plan).
+    ///
+    /// The cached plan bakes these values in, so a text-keyed plan cache must
+    /// fold their current values into its key — otherwise two calls differing
+    /// only in a LIMIT/SKIP parameter would wrongly share one cached plan.
+    /// Returns an empty vector when no parameter was folded.
+    #[must_use]
+    pub fn folded_limit_skip_params(&self) -> Vec<String> {
+        self.folded_limit_skip_params
+            .lock()
+            .map(|acc| acc.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Set query parameters for resolving `$param` references in SKIP/LIMIT.
@@ -3164,13 +3225,19 @@ impl QueryPlanner {
             let skip = return_clause
                 .skip
                 .as_ref()
-                .map(|e| parse_non_negative_integer(e, "SKIP", &self.params))
+                .map(|e| {
+                    self.note_folded_limit_skip(e);
+                    parse_non_negative_integer(e, "SKIP", &self.params)
+                })
                 .transpose()?
                 .flatten();
             let fetch = return_clause
                 .limit
                 .as_ref()
-                .map(|e| parse_non_negative_integer(e, "LIMIT", &self.params))
+                .map(|e| {
+                    self.note_folded_limit_skip(e);
+                    parse_non_negative_integer(e, "LIMIT", &self.params)
+                })
                 .transpose()?
                 .flatten();
 
@@ -7116,13 +7183,19 @@ impl QueryPlanner {
         let skip = with_clause
             .skip
             .as_ref()
-            .map(|e| parse_non_negative_integer(e, "SKIP", &self.params))
+            .map(|e| {
+                self.note_folded_limit_skip(e);
+                parse_non_negative_integer(e, "SKIP", &self.params)
+            })
             .transpose()?
             .flatten();
         let fetch = with_clause
             .limit
             .as_ref()
-            .map(|e| parse_non_negative_integer(e, "LIMIT", &self.params))
+            .map(|e| {
+                self.note_folded_limit_skip(e);
+                parse_non_negative_integer(e, "LIMIT", &self.params)
+            })
             .transpose()?
             .flatten();
 
@@ -9330,39 +9403,45 @@ pub fn fuse_create_set(plan: LogicalPlan) -> LogicalPlan {
                 LogicalPlan::Create {
                     input: child,
                     pattern,
-                } => match try_fuse_set_items(std::slice::from_ref(&pattern), &items) {
-                    Some(mut patterns) => LogicalPlan::Create {
-                        input: child,
-                        // try_fuse_set_items returns exactly as many patterns
-                        // as it was given (one here).
-                        pattern: patterns
-                            .pop()
-                            .expect("one pattern in yields one pattern out"),
-                    },
-                    None => LogicalPlan::Set {
-                        input: Box::new(LogicalPlan::Create {
+                } => {
+                    let bound_vars = crate::query::df_planner::collect_plan_variables(&child);
+                    match try_fuse_set_items(std::slice::from_ref(&pattern), &items, &bound_vars) {
+                        Some(mut patterns) => LogicalPlan::Create {
                             input: child,
-                            pattern,
-                        }),
-                        items,
-                    },
-                },
+                            // try_fuse_set_items returns exactly as many patterns
+                            // as it was given (one here).
+                            pattern: patterns
+                                .pop()
+                                .expect("one pattern in yields one pattern out"),
+                        },
+                        None => LogicalPlan::Set {
+                            input: Box::new(LogicalPlan::Create {
+                                input: child,
+                                pattern,
+                            }),
+                            items,
+                        },
+                    }
+                }
                 LogicalPlan::CreateBatch {
                     input: child,
                     patterns,
-                } => match try_fuse_set_items(&patterns, &items) {
-                    Some(fused) => LogicalPlan::CreateBatch {
-                        input: child,
-                        patterns: fused,
-                    },
-                    None => LogicalPlan::Set {
-                        input: Box::new(LogicalPlan::CreateBatch {
+                } => {
+                    let bound_vars = crate::query::df_planner::collect_plan_variables(&child);
+                    match try_fuse_set_items(&patterns, &items, &bound_vars) {
+                        Some(fused) => LogicalPlan::CreateBatch {
                             input: child,
-                            patterns,
-                        }),
-                        items,
-                    },
-                },
+                            patterns: fused,
+                        },
+                        None => LogicalPlan::Set {
+                            input: Box::new(LogicalPlan::CreateBatch {
+                                input: child,
+                                patterns,
+                            }),
+                            items,
+                        },
+                    }
+                }
                 other => LogicalPlan::Set {
                     input: Box::new(other),
                     items,
@@ -9412,11 +9491,27 @@ pub fn fuse_create_set(plan: LogicalPlan) -> LogicalPlan {
 /// Returns the rewritten patterns when *all* items fuse safely (see
 /// [`fuse_create_set`] for the conditions); returns `None` the moment any item
 /// is unfusable, so the caller can keep the original `Set` node untouched.
-fn try_fuse_set_items(patterns: &[Pattern], items: &[SetItem]) -> Option<Vec<Pattern>> {
-    // Map each created variable to the index of the pattern that introduces it.
+///
+/// `bound_vars` are the variables produced by the CREATE's input plan (e.g. an
+/// upstream MATCH). A CREATE pattern may *reuse* such a variable as an endpoint
+/// (`MATCH (a) CREATE (a)-[r:T]->(b)`), so `pattern_variable_names` alone cannot
+/// tell a freshly-created variable from a reused one. Reused variables are
+/// excluded from `owner`: a `SET` on them must not fuse, because the executor
+/// skips inline properties on already-bound elements (which would silently drop
+/// the write).
+fn try_fuse_set_items(
+    patterns: &[Pattern],
+    items: &[SetItem],
+    bound_vars: &HashSet<String>,
+) -> Option<Vec<Pattern>> {
+    // Map each freshly-created variable to the index of the pattern that
+    // introduces it, skipping any variable already bound upstream.
     let mut owner: HashMap<String, usize> = HashMap::new();
     for (idx, pattern) in patterns.iter().enumerate() {
         for var in crate::query::df_graph::mutation_common::pattern_variable_names(pattern) {
+            if bound_vars.contains(&var) {
+                continue;
+            }
             owner.entry(var).or_insert(idx);
         }
     }

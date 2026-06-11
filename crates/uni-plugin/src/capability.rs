@@ -224,19 +224,23 @@ impl CapabilitySet {
         self.set.iter().any(|c| variant_matches(c, target))
     }
 
-    /// Intersect this set with another, returning a new set.
+    /// Intersect this (guest-declared) set with the host-granted `other`,
+    /// returning the effective capability set.
     ///
-    /// The intersection is the effective capability set when manifest
-    /// declarations are intersected with host grants. Caps that match by
-    /// variant but differ in attenuation (e.g., two different `Network
-    /// { allow }` patterns) are *both retained* — the runtime check enforces
-    /// each individually.
+    /// Loaders call `declared.intersect(grants)`, so `self` is the guest
+    /// manifest and `other` is the host ceiling. A guest capability survives
+    /// only if the host grants the same variant, and its **payload is attenuated
+    /// against the host**: for the allow-list variants (`Network`,
+    /// `Filesystem`, `Kms`, `Secret`, `Config`) and `HostQuery`, the effective
+    /// grant permits a resource only if *both* the guest and the host permit it
+    /// — the host is a true ceiling a guest cannot widen. Non-payload variants
+    /// (registration gates, resource quotas) retain the guest value as before.
     #[must_use]
     pub fn intersect(&self, other: &Self) -> Self {
         let mut out = Self::new();
         for c in &self.set {
             if other.contains_variant(c) {
-                out.insert(c.clone());
+                out.insert(attenuate_to_host(c, other));
             }
         }
         out
@@ -262,6 +266,145 @@ impl CapabilitySet {
 
 fn variant_matches(a: &Capability, b: &Capability) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// Attenuate a guest capability against the host grant (the ceiling).
+///
+/// For the allow-list payload variants and `HostQuery`, returns a capability
+/// whose effective grant is the conjunction of guest and host; for every other
+/// variant, returns the guest capability unchanged (registration gates and
+/// quotas have no allow-list to narrow). See [`CapabilitySet::intersect`].
+fn attenuate_to_host(guest: &Capability, host: &CapabilitySet) -> Capability {
+    match guest {
+        Capability::Network { allow } => Capability::Network {
+            allow: intersect_globs(allow, &host_lists(host, |c| network_allow(c))),
+        },
+        Capability::Filesystem { read, write } => Capability::Filesystem {
+            read: intersect_globs(read, &host_lists(host, |c| fs_read(c))),
+            write: intersect_globs(write, &host_lists(host, |c| fs_write(c))),
+        },
+        Capability::Kms { key_ids } => Capability::Kms {
+            key_ids: intersect_globs(key_ids, &host_lists(host, |c| kms_ids(c))),
+        },
+        Capability::Secret { ids } => Capability::Secret {
+            ids: intersect_globs(ids, &host_lists(host, |c| secret_ids(c))),
+        },
+        Capability::Config { keys } => Capability::Config {
+            keys: intersect_globs(keys, &host_lists(host, |c| config_keys(c))),
+        },
+        Capability::HostQuery { read_only, scopes } => {
+            // `read_only` is restrictive-true: either side may force read-only.
+            // `scopes` empty means "unrestricted", so an empty list on a side
+            // imposes no narrowing (unlike the deny-on-empty allow-lists above).
+            let host_read_only = host.set.iter().any(|c| {
+                matches!(
+                    c,
+                    Capability::HostQuery {
+                        read_only: true,
+                        ..
+                    }
+                )
+            });
+            let host_scopes = host_lists(host, |c| host_query_scopes(c));
+            let scopes = if scopes.is_empty() {
+                host_scopes
+            } else if host_scopes.is_empty() {
+                scopes.clone()
+            } else {
+                intersect_globs(scopes, &host_scopes)
+            };
+            Capability::HostQuery {
+                read_only: *read_only || host_read_only,
+                scopes,
+            }
+        }
+        // Registration gates and resource quotas carry no allow-list to narrow.
+        other => other.clone(),
+    }
+}
+
+// Per-variant payload extractors used to gather the host ceiling. Each returns
+// the allow-list for capabilities of its variant, `None` otherwise.
+fn network_allow(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Network { allow } => Some(allow),
+        _ => None,
+    }
+}
+fn fs_read(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Filesystem { read, .. } => Some(read),
+        _ => None,
+    }
+}
+fn fs_write(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Filesystem { write, .. } => Some(write),
+        _ => None,
+    }
+}
+fn kms_ids(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Kms { key_ids } => Some(key_ids),
+        _ => None,
+    }
+}
+fn secret_ids(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Secret { ids } => Some(ids),
+        _ => None,
+    }
+}
+fn config_keys(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::Config { keys } => Some(keys),
+        _ => None,
+    }
+}
+fn host_query_scopes(c: &Capability) -> Option<&[SmolStr]> {
+    match c {
+        Capability::HostQuery { scopes, .. } => Some(scopes),
+        _ => None,
+    }
+}
+
+/// Union the allow-lists of every host capability matching `extract`'s variant.
+fn host_lists<'a>(
+    host: &'a CapabilitySet,
+    extract: impl Fn(&'a Capability) -> Option<&'a [SmolStr]>,
+) -> Vec<SmolStr> {
+    host.set
+        .iter()
+        .filter_map(extract)
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// Intersect two glob allow-lists with each side acting as a ceiling on the
+/// other.
+///
+/// A pattern is kept only when some pattern in the opposite list *subsumes* it
+/// (`wildcard_match(other_pattern, pattern)`), so the result permits a resource
+/// only if both inputs would. Incomparable patterns are dropped (deny — the
+/// safe direction). This is sound for the prefix-glob patterns capability
+/// allow-lists use; it can under-grant only for exotic overlapping-but-
+/// incomparable globs, never over-grant. An empty input yields an empty result
+/// (deny-all), matching the allow-list "empty = deny" convention.
+fn intersect_globs(a: &[SmolStr], b: &[SmolStr]) -> Vec<SmolStr> {
+    let mut out: Vec<SmolStr> = Vec::new();
+    let mut keep = |pat: &SmolStr, ceiling: &[SmolStr]| {
+        if ceiling.iter().any(|q| wildcard_match(q, pat)) && !out.contains(pat) {
+            out.push(pat.clone());
+        }
+    };
+    for pat in a {
+        keep(pat, b);
+    }
+    for pat in b {
+        keep(pat, a);
+    }
+    out
 }
 
 impl Capability {
@@ -470,6 +613,102 @@ mod tests {
         assert!(inter.contains(&Capability::ScalarFn));
         assert!(!inter.contains_variant(&Capability::Storage));
         assert!(inter.contains_variant(&Capability::Network { allow: vec![] }));
+    }
+
+    /// Regression for the 2026-06-10 review #6: `intersect` must bound the
+    /// guest's allow-list by the host grant (the host is the ceiling), not clone
+    /// the guest's broader list. A guest that declares `**` must not reach hosts
+    /// the grant excludes.
+    #[test]
+    fn intersect_attenuates_network_to_host_ceiling() {
+        let guest = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec![SmolStr::new("**")],
+        }]);
+        let host = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec![SmolStr::new("https://api.example/**")],
+        }]);
+
+        // Loaders call declared.intersect(grants) — guest is `self`.
+        let effective = guest.intersect(&host);
+
+        assert!(
+            effective
+                .iter()
+                .any(|c| c.network_allows("https://api.example/v1/x")),
+            "host-permitted URL must remain allowed"
+        );
+        assert!(
+            !effective
+                .iter()
+                .any(|c| c.network_allows("https://evil.example/x")),
+            "guest's `**` must not survive the host ceiling — sandbox escape"
+        );
+    }
+
+    /// A guest narrower than the host keeps its own (narrower) list.
+    #[test]
+    fn intersect_keeps_guest_when_narrower_than_host() {
+        let guest = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec![SmolStr::new("https://api.example/v1/**")],
+        }]);
+        let host = CapabilitySet::from_iter_of([Capability::Network {
+            allow: vec![SmolStr::new("https://api.example/**")],
+        }]);
+        let effective = guest.intersect(&host);
+        assert!(
+            effective
+                .iter()
+                .any(|c| c.network_allows("https://api.example/v1/x"))
+        );
+        assert!(
+            !effective
+                .iter()
+                .any(|c| c.network_allows("https://api.example/v2/x")),
+            "guest's own restriction must still bind"
+        );
+    }
+
+    /// KMS / Secret / Filesystem payloads attenuate the same way.
+    #[test]
+    fn intersect_attenuates_kms_secret_fs() {
+        let guest = CapabilitySet::from_iter_of([
+            Capability::Kms {
+                key_ids: vec![SmolStr::new("**")],
+            },
+            Capability::Secret {
+                ids: vec![SmolStr::new("**")],
+            },
+            Capability::Filesystem {
+                read: vec![SmolStr::new("**")],
+                write: vec![SmolStr::new("**")],
+            },
+        ]);
+        let host = CapabilitySet::from_iter_of([
+            Capability::Kms {
+                key_ids: vec![SmolStr::new("prod/signing/**")],
+            },
+            Capability::Secret {
+                ids: vec![SmolStr::new("db/**")],
+            },
+            Capability::Filesystem {
+                read: vec![SmolStr::new("/data/**")],
+                write: vec![], // host grants no write
+            },
+        ]);
+        let effective = guest.intersect(&host);
+
+        assert!(effective.iter().any(|c| c.kms_allows("prod/signing/key1")));
+        assert!(!effective.iter().any(|c| c.kms_allows("dev/key")));
+        assert!(effective.iter().any(|c| c.secret_allows("db/password")));
+        assert!(!effective.iter().any(|c| c.secret_allows("kms/root")));
+        // Host grants no write path → no writable path survives.
+        assert!(
+            !effective.iter().any(|c| matches!(
+                c,
+                Capability::Filesystem { write, .. } if !write.is_empty()
+            )),
+            "guest write `**` must not survive an empty host write grant"
+        );
     }
 
     #[test]

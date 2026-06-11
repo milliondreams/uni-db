@@ -74,6 +74,50 @@ async fn for_update_serializes_concurrent_transactions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression for review (Tier 2): a `FOR UPDATE` issued through the
+/// *parameterized builder* must take its row locks too. Previously the builder
+/// path never called `acquire_for_update_locks`, so `tx.query(cypher, params)`
+/// with `FOR UPDATE` silently lost its pessimistic-lock guarantee — exactly the
+/// path the Python bindings use when params are supplied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn for_update_via_parameterized_builder_acquires_lock() -> anyhow::Result<()> {
+    let db = Arc::new(seeded_db().await?);
+
+    // tx1 acquires the lock via the parameterized builder (key is `$id`).
+    let s1 = db.session();
+    let tx1 = s1.tx().await?;
+    tx1.query_with("MATCH (c:Counter {id: $id}) FOR UPDATE RETURN c.n")
+        .param("id", "x")
+        .fetch_all()
+        .await?;
+
+    // tx2 attempts the same lock through the builder — it must block.
+    let db2 = db.clone();
+    let handle = tokio::spawn(async move {
+        let s2 = db2.session();
+        let tx2 = s2.tx().await.unwrap();
+        tx2.query_with("MATCH (c:Counter {id: $id}) FOR UPDATE RETURN c.n")
+            .param("id", "x")
+            .fetch_all()
+            .await
+            .unwrap();
+        tx2.commit().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !handle.is_finished(),
+        "parameterized FOR UPDATE must acquire the lock and block tx2"
+    );
+
+    tx1.commit().await?;
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("tx2 should acquire the lock after tx1 commits")
+        .expect("tx2 task panicked");
+    Ok(())
+}
+
 /// Sequential `FOR UPDATE` acquisitions on the same key all succeed — the lock
 /// is released when each transaction commits.
 #[tokio::test]

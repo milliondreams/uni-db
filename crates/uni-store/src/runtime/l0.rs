@@ -1130,11 +1130,63 @@ impl L0Buffer {
     }
 
     #[instrument(skip(self, other), level = "trace")]
+    /// Validate that merging `other` into `self` will not bail on a tombstoned
+    /// edge endpoint (issue #77), **without mutating** either buffer.
+    ///
+    /// Mirrors the endpoint-liveness guard in `apply_edge_insertion`
+    /// against the tombstone state [`Self::merge`] produces: `other`'s vertex
+    /// deletions are applied and its vertex inserts clear their own tombstone,
+    /// so an inserted edge bails iff an endpoint is tombstoned in `self` or
+    /// `other` and is not (re-)inserted by `other`.
+    ///
+    /// Run this under `flush_lock` *before* the durable WAL flush so an
+    /// offending commit is rejected up front. After the flush the transaction
+    /// is durable, and a `merge` bail would leave a ghost/partial commit whose
+    /// WAL replay re-bails — rendering the database unopenable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the offending edge and endpoint when the merge
+    /// would bail.
+    pub fn validate_merge_edge_endpoints(&self, other: &L0Buffer) -> Result<()> {
+        // An endpoint is effectively deleted after the merge's vertex phase if
+        // it is tombstoned in either buffer and `other` does not re-insert it
+        // (an insert clears the tombstone).
+        let is_deleted = |vid: &Vid| {
+            (self.vertex_tombstones.contains(vid) || other.vertex_tombstones.contains(vid))
+                && !other.vertex_properties.contains_key(vid)
+        };
+        for (eid, (src_vid, dst_vid, _etype)) in &other.edge_endpoints {
+            if other.tombstones.contains_key(eid) {
+                continue; // a deletion, not an insertion — never resurrects a vertex
+            }
+            if is_deleted(src_vid) {
+                anyhow::bail!(
+                    "Cannot insert edge {}: source vertex {} has been deleted (issue #77)",
+                    eid,
+                    src_vid
+                );
+            }
+            if is_deleted(dst_vid) {
+                anyhow::bail!(
+                    "Cannot insert edge {}: destination vertex {} has been deleted (issue #77)",
+                    eid,
+                    dst_vid
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: &L0Buffer) -> Result<()> {
         trace!(
             other_mutation_count = other.mutation_count,
             "Merging L0 buffer"
         );
+        // Validate-then-apply: reject a merge that would bail on a tombstoned
+        // edge endpoint before mutating anything, so a failed merge can never
+        // leave a partially-applied (non-atomic) commit.
+        self.validate_merge_edge_endpoints(other)?;
         // Merge Vertices
         for &vid in &other.vertex_tombstones {
             self.delete_vertex(vid)?;
@@ -1301,10 +1353,26 @@ impl L0Buffer {
                     edge_type_name,
                 } => {
                     self.current_version += 1;
-                    self.apply_edge_insertion(src_vid, dst_vid, edge_type, eid, properties)?;
-                    // Restore edge type name metadata if present
-                    if let Some(name) = edge_type_name {
-                        self.edge_types.insert(eid, name);
+                    // Skip-and-warn on the issue-#77 endpoint bail: a pre-fix
+                    // durable WAL may hold a ghost edge whose endpoint was
+                    // tombstoned. Recovery must still open the database rather
+                    // than abort, so drop the offending edge and continue.
+                    match self.apply_edge_insertion(src_vid, dst_vid, edge_type, eid, properties) {
+                        Ok(()) => {
+                            // Restore edge type name metadata if present
+                            if let Some(name) = edge_type_name {
+                                self.edge_types.insert(eid, name);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ?eid,
+                                ?src_vid,
+                                ?dst_vid,
+                                error = %e,
+                                "WAL replay: skipping edge insertion to a deleted endpoint (issue #77)"
+                            );
+                        }
                     }
                 }
                 Mutation::DeleteEdge {
@@ -1349,6 +1417,82 @@ mod tests {
         assert_eq!(neighbors_after.len(), 0);
 
         Ok(())
+    }
+
+    /// Regression for review #5: merging an edge whose endpoint is tombstoned
+    /// in the target buffer must be rejected up front (`validate_merge_edge_endpoints`)
+    /// and `merge` must be atomic — never partially applied. Before the fix this
+    /// bailed only *inside* `merge`, after the durable WAL flush, leaving a ghost
+    /// commit that made the database unopenable on replay.
+    #[test]
+    fn validate_merge_rejects_edge_to_tombstoned_endpoint() {
+        let mut main = L0Buffer::new(0, None);
+        let vid_a = Vid::new(1);
+        let vid_b = Vid::new(2);
+        main.insert_vertex(vid_a, HashMap::new());
+        main.insert_vertex(vid_b, HashMap::new());
+        main.delete_vertex(vid_b).unwrap(); // B is now tombstoned in main
+
+        // A transaction that inserts an edge A -> B (B tombstoned in main).
+        let mut tx = L0Buffer::new(0, None);
+        let eid = Eid::new(101);
+        tx.insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None)
+            .unwrap();
+
+        assert!(
+            main.validate_merge_edge_endpoints(&tx).is_err(),
+            "edge to a tombstoned endpoint must be rejected before merge"
+        );
+        // merge validates first, so it errors and leaves main untouched (atomic).
+        assert!(
+            main.merge(&tx).is_err(),
+            "merge must reject, not bail mid-apply"
+        );
+        assert!(
+            !main.edge_endpoints.contains_key(&eid),
+            "a rejected merge must not have partially applied the edge"
+        );
+    }
+
+    /// When the transaction re-inserts the endpoint vertex, the edge is valid
+    /// (the insert clears the tombstone) and the merge succeeds.
+    #[test]
+    fn validate_merge_allows_edge_when_endpoint_reinserted() {
+        let mut main = L0Buffer::new(0, None);
+        let vid_a = Vid::new(1);
+        let vid_b = Vid::new(2);
+        main.insert_vertex(vid_a, HashMap::new());
+        main.insert_vertex(vid_b, HashMap::new());
+        main.delete_vertex(vid_b).unwrap();
+
+        let mut tx = L0Buffer::new(0, None);
+        tx.insert_vertex(vid_b, HashMap::new()); // re-insert B
+        let eid = Eid::new(101);
+        tx.insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None)
+            .unwrap();
+
+        assert!(main.validate_merge_edge_endpoints(&tx).is_ok());
+        assert!(main.merge(&tx).is_ok());
+        assert!(main.edge_endpoints.contains_key(&eid));
+    }
+
+    /// Edges between live endpoints merge as before — no false positives.
+    #[test]
+    fn validate_merge_allows_edge_to_live_endpoints() {
+        let mut main = L0Buffer::new(0, None);
+        let vid_a = Vid::new(1);
+        let vid_b = Vid::new(2);
+        main.insert_vertex(vid_a, HashMap::new());
+        main.insert_vertex(vid_b, HashMap::new());
+
+        let mut tx = L0Buffer::new(0, None);
+        let eid = Eid::new(101);
+        tx.insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None)
+            .unwrap();
+
+        assert!(main.validate_merge_edge_endpoints(&tx).is_ok());
+        assert!(main.merge(&tx).is_ok());
+        assert!(main.edge_endpoints.contains_key(&eid));
     }
 
     #[test]

@@ -951,9 +951,7 @@ impl<'a> LocyPlanBuilder<'a> {
                             let target_binding = Expr::BinaryOp {
                                 left: Box::new(Expr::Variable(format!("{}._vid", target_var))),
                                 op: BinaryOp::Eq,
-                                right: Box::new(Expr::Variable(format!(
-                                    "{col_prefix}{col_name}"
-                                ))),
+                                right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
                             };
                             plan = LogicalPlan::Filter {
                                 input: Box::new(plan),
@@ -1362,7 +1360,11 @@ fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| f.as_ref().clone().with_name(format!("{prefix}{}", f.name())))
+        .map(|f| {
+            f.as_ref()
+                .clone()
+                .with_name(format!("{prefix}{}", f.name()))
+        })
         .collect();
     Arc::new(ArrowSchema::new(fields))
 }

@@ -399,15 +399,11 @@ impl crate::api::UniInner {
         // independent of both live fork-index state and parameter values.
         let schema_version = self.schema.schema().schema_version;
         let cache_key = crate::api::session::plan_cache_key(cypher);
-        let cached_plan = self
-            .plan_cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| {
-                cache
-                    .get(cache_key, cypher, schema_version)
-                    .map(|e| e.plan.clone())
-            });
+        let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| {
+            cache
+                .get(cache_key, cypher, schema_version)
+                .map(|e| e.plan.clone())
+        });
 
         let (logical_plan_raw, parse_time, plan_time, plan_cache_hit) =
             if let Some(plan) = cached_plan {

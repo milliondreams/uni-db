@@ -166,6 +166,10 @@ name = "ssi_commit_overhead"
 harness = false
 
 [[bench]]
+name = "commit_throughput"
+harness = false
+
+[[bench]]
 name = "ssi_freeze"
 harness = false
 

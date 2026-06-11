@@ -188,10 +188,10 @@ Consequences:
 
 **P2 — Near-term hardening:**
 6. ~~Locy/algo read-set recording + default-fresh `apply()` + projection pin~~ — **DONE 2026-06-10**, §2.4.
-7. C2 Lance base-pinning (hook exists) — §3.
-8. Python `transact_with_retry` + `py.detach` audit — §5.2/§5.5.
-9. TCK on PRs, fuzz targets, `.config/nextest.toml`, nightly soak/bench lane — §6.
-10. Group commit on the existing WAL flush seam — §2.5.
+7. ~~C2 base-pinning~~ — **DONE 2026-06-10**: transactions pin the L1 scan tier via `StorageManager::pinned_at_version` (row-version filter at `SnapshotView.started_at_version`, carried on the snapshot and threaded through Cypher + Locy executors; per-tx fresh `PropertyManager` when pinned). Scope boundaries documented in `ssi_l1_pinning.rs`: single-versioned L1 rows mean post-snapshot updates-then-flushed are excluded rather than shown old (same boundary as time-travel), and the edge tier deliberately shares the live `AdjacencyManager` (its overlay is the only source of unflushed edges; OCC read-sets still guard RMWs). Also fixed the `lance_version: 0` stub footgun (`get_edge_version_by_id` now treats 0 as unset).
+8. ~~Python `transact_with_retry` + `py.detach` audit~~ — **DONE 2026-06-10**: 89/90 sync-API `block_on` sites now release the GIL (one justified no-op exception); `SerializationConflict`/`ConstraintConflict`/`LockTimeout` previously fell through to the generic `UniError` Python exception — now mapped (`UniTransactionConflictError`, new `UniConstraintConflictError`/`UniLockTimeoutError`); pure-Python `transact_with_retry`/`execute_with_retry` (+ async variants) in `uni_db._retry` mirroring Rust `RetryOptions`.
+9. ~~TCK on PRs, fuzz targets, `.config/nextest.toml`, nightly soak/bench lane~~ — **DONE 2026-06-10**: schemaless openCypher TCK job in pr.yml; `fuzz/` with 4 targets (cypher_parse, locy_parse, wal_decode, btic_decode); nextest slow-timeout backstop; `nightly.yml` (soak with cranked knobs, LocalStack cloud, 5-min/target fuzz, criterion artifact upload).
+10. Group commit — **bench + design done 2026-06-10** (`benches/commit_throughput.rs` quantifies the wal_on vs wal_off headroom; `docs/proposals/group_commit.md` specifies the leader-batch protocol, risks, and the go/no-go rule); implementation deliberately deferred pending the bench-justified go.
 
 **P3 — Structural (scheduled, not urgent):**
 11. Retire the legacy row interpreters (Cypher fallback + Locy row path) — §4.1.

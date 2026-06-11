@@ -765,7 +765,9 @@ impl EffectiveLimits {
     pub fn resolve(manifest: &ComponentManifest) -> Self {
         Self {
             timeout_ms: manifest.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-            memory_max_pages: manifest.memory_max_pages.unwrap_or(DEFAULT_MEMORY_MAX_PAGES),
+            memory_max_pages: manifest
+                .memory_max_pages
+                .unwrap_or(DEFAULT_MEMORY_MAX_PAGES),
             fuel_per_call: manifest.fuel_per_call,
         }
     }
@@ -855,7 +857,12 @@ fn build_pool<I, F>(
 ) -> Result<Arc<WasmInstancePool<I>>, WasmError>
 where
     I: Send + 'static,
-    F: Fn(Store<HostState>, &Component, &Linker<HostState>, EffectiveLimits) -> Result<I, WasmError>
+    F: Fn(
+            Store<HostState>,
+            &Component,
+            &Linker<HostState>,
+            EffectiveLimits,
+        ) -> Result<I, WasmError>
         + Send
         + Sync
         + 'static,
@@ -1160,9 +1167,7 @@ fn build_procedure_pool(
 ) -> Result<Arc<WasmInstancePool<ProcedurePluginInstance>>, WasmError> {
     build_pool(bytes, prepared, |mut store, component, linker, limits| {
         let bindings = ProcedurePluginBindings::instantiate(&mut store, component, linker)
-            .map_err(|e| {
-                WasmError::Instantiate(format!("procedure-plugin instantiate: {e}"))
-            })?;
+            .map_err(|e| WasmError::Instantiate(format!("procedure-plugin instantiate: {e}")))?;
         Ok(ProcedurePluginInstance {
             store,
             bindings,
@@ -1529,7 +1534,11 @@ mod tests {
             // 1 page initial + 3 = 4 pages: at the cap, allowed.
             assert_eq!(grow.call(&mut store, 3).unwrap(), 1, "grow to cap allowed");
             // Any further growth must be denied (memory.grow returns -1).
-            assert_eq!(grow.call(&mut store, 1).unwrap(), -1, "grow past cap denied");
+            assert_eq!(
+                grow.call(&mut store, 1).unwrap(),
+                -1,
+                "grow past cap denied"
+            );
         }
 
         /// Fuel exhaustion traps `OutOfFuel` and classifies as

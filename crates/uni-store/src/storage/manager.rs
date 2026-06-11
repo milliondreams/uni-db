@@ -1281,18 +1281,20 @@ impl StorageManager {
             request = request.with_filter(f);
         }
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 
@@ -1348,18 +1350,20 @@ impl StorageManager {
             request = request.with_filter(f);
         }
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 
@@ -1394,18 +1398,20 @@ impl StorageManager {
             None => request,
         };
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 

@@ -138,6 +138,40 @@ async fn deny_principal_blocks_parameterized_builder() -> anyhow::Result<()> {
         .expect_err("non-admin must be denied on the builder profile path");
     assert!(matches!(err, UniError::AuthorizationDenied { .. }));
 
+    // explain — leaks plan/cost info, so it must consult the policy too.
+    let err = session
+        .query_with("RETURN $x AS one")
+        .param("x", 1i64)
+        .explain()
+        .await
+        .expect_err("non-admin must be denied on the builder explain path");
+    assert!(matches!(err, UniError::AuthorizationDenied { .. }));
+
+    Ok(())
+}
+
+/// Regression for review (Tier 3, bonus #5b): a `PreparedQuery` must re-consult
+/// the `AuthzPolicy` on every execution, not only at prepare time. A cached
+/// handle previously executed without re-authorization.
+#[tokio::test]
+async fn deny_principal_blocks_prepared_execute() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    register_policy(&db, "admin")?;
+
+    let session = db.session().with_principal(Arc::new(Principal {
+        id: "mallory".to_owned(),
+        groups: vec!["guests".to_owned()],
+        capabilities: uni_plugin::CapabilitySet::default(),
+    }));
+
+    // `prepare` itself is allowed (no execution), but `execute` must authorize.
+    let prepared = session.prepare("RETURN 1 AS one").await?;
+    let err = prepared
+        .execute(&[])
+        .await
+        .expect_err("non-admin must be denied when executing a prepared query");
+    assert!(matches!(err, UniError::AuthorizationDenied { .. }));
+
     Ok(())
 }
 

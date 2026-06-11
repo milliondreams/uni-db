@@ -1495,7 +1495,19 @@ impl Executor {
         if entries.is_empty() {
             return None;
         }
-        Some((n, labels[0].clone()))
+        // Resolve the label to its schema-canonical case so the fast path agrees
+        // with the general MERGE path (which matches labels case-insensitively).
+        // Without this, `MERGE (:person …)` after a `:Person` row was flushed
+        // scans/keys a different label than the canonical one and creates a
+        // duplicate (review #3a). Falls back to the as-written label when the
+        // schema does not know it (schemaless).
+        let canonical = self
+            .storage
+            .schema_manager()
+            .schema()
+            .canonical_label_name(&labels[0])
+            .unwrap_or_else(|| labels[0].clone());
+        Some((n, canonical))
     }
 
     /// Build the persisted-scan filter for a MERGE key, or `None` if any value
@@ -1533,11 +1545,38 @@ impl Executor {
         Some(parts.join(" AND "))
     }
 
+    /// Canonicalize a numeric MERGE-key value for *matching only*.
+    ///
+    /// A finite `Float` with an integral value (e.g. `1.0`) is mapped to the
+    /// equivalent `Int`, so an `Int(1)` key matches a node stored with
+    /// `Float(1.0)` and vice versa — the coercion the general (DataFusion) MERGE
+    /// path already applies (review #3a). Non-numeric and non-integral values are
+    /// returned unchanged. Used only to build match keys / comparisons, never the
+    /// value written to a created node.
+    fn canonical_key_value(v: &Value) -> Value {
+        match v {
+            Value::Float(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f >= i64::MIN as f64
+                    && *f <= i64::MAX as f64 =>
+            {
+                Value::Int(*f as i64)
+            }
+            other => other.clone(),
+        }
+    }
+
     /// Canonical sorted `(name, value)` key tuple for a MERGE row's key map.
+    ///
+    /// Numeric values are canonicalized ([`Self::canonical_key_value`]) so the
+    /// tuple compares equal regardless of `Int`/`Float` spelling. This tuple is
+    /// used purely as a match key (intra-batch dedup, L0 overlay lookup); the
+    /// created node's properties come from the original, un-canonicalized map.
     fn merge_key_tuple(key_props: &HashMap<String, Value>) -> MergeKey {
         let mut tuple: MergeKey = key_props
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), Self::canonical_key_value(v)))
             .collect();
         tuple.sort_by(|a, b| a.0.cmp(&b.0));
         tuple
@@ -1577,7 +1616,7 @@ impl Executor {
                 .iter()
                 .map(|k| {
                     let v = l0_visibility::lookup_vertex_prop(vid, k, ctx).unwrap_or(Value::Null);
-                    (k.clone(), v)
+                    (k.clone(), Self::canonical_key_value(&v))
                 })
                 .collect();
             map.entry(tuple).or_default().push(vid);
@@ -1634,7 +1673,10 @@ impl Executor {
         ctx: Option<&QueryContext>,
     ) -> bool {
         key_props.iter().any(|(k, want)| {
-            matches!(l0_visibility::lookup_vertex_prop(vid, k, ctx), Some(got) if &got != want)
+            matches!(
+                l0_visibility::lookup_vertex_prop(vid, k, ctx),
+                Some(got) if Self::canonical_key_value(&got) != Self::canonical_key_value(want)
+            )
         })
     }
 
@@ -1667,7 +1709,7 @@ impl Executor {
     ) -> bool {
         key_props.iter().all(
             |(k, want)| match l0_visibility::lookup_vertex_prop(vid, k, ctx) {
-                Some(got) => &got == want,
+                Some(got) => Self::canonical_key_value(&got) == Self::canonical_key_value(want),
                 None => *want == Value::Null,
             },
         )

@@ -490,8 +490,11 @@ impl AdjacencyManager {
                             request = request.with_filter(format!("_version <= {}", hwm));
                         }
 
-                        let batches: Vec<arrow_array::RecordBatch> =
-                            backend.scan(request).await.unwrap_or_default();
+                        // Fail closed: a transient scan error must abort the warm,
+                        // not `unwrap_or_default()` into an empty L2 read that then
+                        // gets cached as the adjacency CSR — that silently drops
+                        // every base edge for this type until restart (review #3b).
+                        let batches: Vec<arrow_array::RecordBatch> = backend.scan(request).await?;
 
                         for batch in batches {
                             let src_col = batch
@@ -560,7 +563,11 @@ impl AdjacencyManager {
                     request = request.with_filter(format!("_version <= {}", hwm));
                 }
 
-                if let Ok(batches) = backend.scan(request).await {
+                // Fail closed: propagate a delta scan error rather than silently
+                // skipping it, which would drop unflushed edges from the cached
+                // adjacency CSR until restart (review #3b).
+                let batches = backend.scan(request).await?;
+                {
                     for batch in batches {
                         let src_col = batch
                             .column_by_name("src_vid")

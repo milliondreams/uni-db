@@ -11,11 +11,72 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::UniInner;
+use crate::api::hooks::{QueryType, SessionHook};
 use crate::api::impl_locy::LocyRuleRegistry;
 use crate::api::locy_result::LocyResult;
 use uni_common::{Result, UniError, Value};
 use uni_locy::LocyConfig;
 use uni_query::QueryResult;
+
+/// Authorization + before-query-hook context captured from the preparing
+/// `Session`/`Transaction`, so each prepared execution re-runs the same guards
+/// the live `Session::query` / `Transaction::execute` paths apply.
+///
+/// Without this, a `PreparedQuery` executed an `AuthzPolicy`-governed statement
+/// (and fired before-query hooks) only at prepare time — never on the repeated
+/// executions, letting a cached handle bypass authorization (review #5b).
+pub(crate) struct PreparedGuards {
+    principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+    hooks: Vec<Arc<dyn SessionHook>>,
+    session_id: String,
+    /// Authorization verb: `"read"` for session-prepared queries, the
+    /// statement's classified verb for transaction-bound ones.
+    verb: String,
+}
+
+impl PreparedGuards {
+    /// Build the guard context for a session-prepared (read-only) query.
+    pub(crate) fn for_session(
+        principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+        hooks: Vec<Arc<dyn SessionHook>>,
+        session_id: String,
+    ) -> Self {
+        Self {
+            principal,
+            hooks,
+            session_id,
+            verb: "read".to_string(),
+        }
+    }
+
+    /// Build the guard context for a transaction-bound query under `verb`.
+    pub(crate) fn for_transaction(
+        principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+        hooks: Vec<Arc<dyn SessionHook>>,
+        session_id: String,
+        verb: String,
+    ) -> Self {
+        Self {
+            principal,
+            hooks,
+            session_id,
+            verb,
+        }
+    }
+
+    /// Run authorization and before-query hooks against `db`.
+    fn run(&self, db: &UniInner, cypher: &str, params: &HashMap<String, Value>) -> Result<()> {
+        crate::api::session::authorize_query(db, self.principal.as_deref(), cypher, &self.verb)?;
+        crate::api::session::run_before_query_hooks_raw(
+            db,
+            &self.hooks,
+            &self.session_id,
+            cypher,
+            QueryType::Cypher,
+            params,
+        )
+    }
+}
 
 // ── PreparedQuery ─────────────────────────────────────────────────
 
@@ -53,6 +114,8 @@ pub struct PreparedQuery {
     /// `Some` for a transaction-bound query (writes allowed, routed to the
     /// tx's L0); `None` for a session-prepared query (validated read-only).
     tx: Option<PreparedTxBinding>,
+    /// Authorization + before-query-hook context, replayed on every execution.
+    guards: PreparedGuards,
     inner: std::sync::RwLock<PreparedQueryInner>,
 }
 
@@ -72,7 +135,11 @@ impl PreparedQuery {
     /// Returns an error if the Cypher fails to parse or plan, or if it contains
     /// a mutation — session-prepared queries are read-only (mutations require a
     /// transaction, which provides isolation, WAL protection, and commit hooks).
-    pub(crate) async fn new(db: Arc<UniInner>, cypher: &str) -> Result<Self> {
+    pub(crate) async fn new(
+        db: Arc<UniInner>,
+        cypher: &str,
+        guards: PreparedGuards,
+    ) -> Result<Self> {
         let ast = parse_cypher(cypher)?;
         // Session-prepared queries must be read-only, mirroring `Session::query`.
         uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
@@ -81,7 +148,7 @@ impl PreparedQuery {
                 .to_string(),
             query: Some(cypher.to_string()),
         })?;
-        Self::build(db, cypher, ast, None)
+        Self::build(db, cypher, ast, None, guards)
     }
 
     /// Create a transaction-bound prepared query (mutations allowed, routed to
@@ -90,9 +157,10 @@ impl PreparedQuery {
         db: Arc<UniInner>,
         cypher: &str,
         binding: PreparedTxBinding,
+        guards: PreparedGuards,
     ) -> Result<Self> {
         let ast = parse_cypher(cypher)?;
-        Self::build(db, cypher, ast, Some(binding))
+        Self::build(db, cypher, ast, Some(binding), guards)
     }
 
     /// Plan `ast` and assemble the prepared query.
@@ -101,6 +169,7 @@ impl PreparedQuery {
         cypher: &str,
         ast: uni_query::CypherQuery,
         tx: Option<PreparedTxBinding>,
+        guards: PreparedGuards,
     ) -> Result<Self> {
         let schema_version = db.schema.schema().schema_version;
         let planner = uni_query::QueryPlanner::new(db.schema.schema().clone());
@@ -113,6 +182,7 @@ impl PreparedQuery {
             db,
             query_text: cypher.to_string(),
             tx,
+            guards,
             inner: std::sync::RwLock::new(PreparedQueryInner {
                 ast,
                 plan,
@@ -139,6 +209,11 @@ impl PreparedQuery {
     /// see uncommitted writes and its writes land in the tx's L0; a session
     /// query runs the cached read-only plan against the committed store.
     async fn execute_with_params(&self, params: HashMap<String, Value>) -> Result<QueryResult> {
+        // Re-run authorization + before-query hooks on every execution, matching
+        // the live `Session::query` / `Transaction::execute` paths — a cached
+        // prepared handle must not bypass an `AuthzPolicy` or hook (review #5b).
+        self.guards.run(&self.db, &self.query_text, &params)?;
+
         if let Some(tx) = &self.tx {
             // Read the live snapshot, dropping the (non-Send) guard before the
             // await so the returned future stays `Send`.

@@ -571,6 +571,19 @@ impl Schema {
             .map(|(_, v)| v)
     }
 
+    /// Get the schema-canonical spelling of a label, matched case-insensitively.
+    ///
+    /// Returns the stored label name whose spelling differs only in case from
+    /// `name`, or `None` if no such label is registered. Callers use this to
+    /// normalize a user-supplied label to the canonical form the storage tier
+    /// keys on, so case variants resolve to the same vertex table.
+    pub fn canonical_label_name(&self, name: &str) -> Option<String> {
+        self.labels
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(k, _)| k.clone())
+    }
+
     /// Get label ID with case-insensitive lookup.
     pub fn label_id_by_name_case_insensitive(&self, label_name: &str) -> Option<u16> {
         self.get_label_case_insensitive(label_name)

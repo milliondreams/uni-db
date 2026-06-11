@@ -557,34 +557,7 @@ impl Session {
     ///
     /// [`AuthzPolicy`]: uni_plugin::traits::connector::AuthzPolicy
     fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
-        use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
-
-        let policies = self.db.plugin_registry.authz_policies();
-        if policies.is_empty() {
-            return Ok(());
-        }
-        // Anonymous principal default — policies are responsible for
-        // rejecting if they require an authenticated principal.
-        let anon = Principal::anonymous();
-        let principal = self.principal.as_deref().unwrap_or(&anon);
-        let action = Action {
-            verb: verb.to_owned(),
-        };
-        let resource = Resource {
-            path: cypher.to_owned(),
-        };
-        for policy in policies.iter() {
-            match policy.check(principal, &action, &resource) {
-                Ok(Decision::Allow) => {}
-                Ok(Decision::Deny { reason }) => {
-                    return Err(UniError::AuthorizationDenied { reason });
-                }
-                Err(e) => {
-                    return Err(UniError::AuthorizationDenied { reason: e.0 });
-                }
-            }
-        }
-        Ok(())
+        authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
     }
 
     /// Run the read-path guards `Session::query` applies, for the builder entry
@@ -1031,7 +1004,12 @@ impl Session {
     /// phases. If the schema changes, the prepared query auto-replans.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn prepare(&self, cypher: &str) -> Result<crate::api::prepared::PreparedQuery> {
-        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher).await
+        let guards = crate::api::prepared::PreparedGuards::for_session(
+            self.principal.clone(),
+            self.hooks.values().cloned().collect(),
+            self.id.clone(),
+        );
+        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher, guards).await
     }
 
     /// Prepare a Locy program for repeated evaluation.
@@ -1097,35 +1075,8 @@ impl Session {
         query_type: QueryType,
         params: &HashMap<String, Value>,
     ) -> Result<()> {
-        let legacy_ctx = HookContext {
-            session_id: self.id.clone(),
-            query_text: query_text.to_string(),
-            query_type,
-            params: params.clone(),
-        };
-        for hook in self.hooks.values() {
-            hook.before_query(&legacy_ctx)?;
-        }
-
-        // Phased registry hooks (M5b): translate to `ParseContext` and
-        // fire `on_parse`. Any non-`Continue` outcome rejects the query
-        // and short-circuits the rest of the chain.
-        let registry_hooks = self.db.plugin_registry.hooks();
-        if !registry_hooks.is_empty() {
-            let parse_ctx = uni_plugin::traits::hook::ParseContext::new(query_text, &self.id)
-                .with_query_type(query_type_to_plugin(query_type));
-            for hook in registry_hooks.iter() {
-                use uni_plugin::errors::HookOutcome;
-                match hook.on_parse(&parse_ctx) {
-                    HookOutcome::Continue => {}
-                    HookOutcome::Reject { reason } => {
-                        return Err(UniError::HookRejected { message: reason });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
+        let hooks: Vec<Arc<dyn SessionHook>> = self.hooks.values().cloned().collect();
+        run_before_query_hooks_raw(&self.db, &hooks, &self.id, query_text, query_type, params)
     }
 
     /// Run after-query hooks. Panics in hooks are caught and logged.
@@ -1544,6 +1495,16 @@ impl<'a> QueryBuilder<'a> {
 
     /// Explain the query plan without executing it.
     pub async fn explain(self) -> Result<ExplainOutput> {
+        // Authorize and fire before-query hooks — a parameterized `.explain()`
+        // must not leak plan/cost information past an `AuthzPolicy` (the bypass
+        // the other builder terminals had). Read-only validation is intentionally
+        // NOT applied: EXPLAIN only plans, it never executes, so explaining a
+        // write plan (e.g. to inspect a CREATE) is a legitimate read-like
+        // introspection, unlike `.fetch_all()`/`.profile()` which would execute.
+        let params = self.session.merge_params(self.params);
+        self.session.authorize(&self.cypher, "read")?;
+        self.session
+            .run_before_query_hooks(&self.cypher, QueryType::Cypher, &params)?;
         self.session.db.explain_internal(&self.cypher).await
     }
 
@@ -1796,6 +1757,90 @@ fn query_type_to_plugin(t: QueryType) -> uni_plugin::traits::hook::QueryType {
         QueryType::Locy => P::Locy,
         QueryType::Execute => P::Execute,
     }
+}
+
+/// Consult every registered [`AuthzPolicy`] for `cypher` under `verb`.
+///
+/// Shared by `Session::authorize`, `Transaction::authorize`, and the prepared-
+/// statement guards so all entry points enforce the same policy. An absent
+/// principal is treated as anonymous; policies are responsible for rejecting it.
+///
+/// # Errors
+/// Returns [`UniError::AuthorizationDenied`] if any policy denies or errors.
+///
+/// [`AuthzPolicy`]: uni_plugin::traits::connector::AuthzPolicy
+pub(crate) fn authorize_query(
+    db: &UniInner,
+    principal: Option<&uni_plugin::traits::connector::Principal>,
+    cypher: &str,
+    verb: &str,
+) -> Result<()> {
+    use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
+
+    let policies = db.plugin_registry.authz_policies();
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let anon = Principal::anonymous();
+    let principal = principal.unwrap_or(&anon);
+    let action = Action {
+        verb: verb.to_owned(),
+    };
+    let resource = Resource {
+        path: cypher.to_owned(),
+    };
+    for policy in policies.iter() {
+        match policy.check(principal, &action, &resource) {
+            Ok(Decision::Allow) => {}
+            Ok(Decision::Deny { reason }) => return Err(UniError::AuthorizationDenied { reason }),
+            Err(e) => return Err(UniError::AuthorizationDenied { reason: e.0 }),
+        }
+    }
+    Ok(())
+}
+
+/// Fire before-query hooks (legacy session hooks + registry `on_parse`) for a
+/// statement.
+///
+/// Shared by `Session::run_before_query_hooks` and the prepared-statement
+/// guards so a prepared execution runs the same hook chain as the live path.
+///
+/// # Errors
+/// Returns an error if a legacy hook fails or a registry hook rejects the query.
+pub(crate) fn run_before_query_hooks_raw(
+    db: &UniInner,
+    hooks: &[Arc<dyn SessionHook>],
+    session_id: &str,
+    query_text: &str,
+    query_type: QueryType,
+    params: &HashMap<String, Value>,
+) -> Result<()> {
+    let legacy_ctx = HookContext {
+        session_id: session_id.to_string(),
+        query_text: query_text.to_string(),
+        query_type,
+        params: params.clone(),
+    };
+    for hook in hooks {
+        hook.before_query(&legacy_ctx)?;
+    }
+
+    let registry_hooks = db.plugin_registry.hooks();
+    if !registry_hooks.is_empty() {
+        let parse_ctx = uni_plugin::traits::hook::ParseContext::new(query_text, session_id)
+            .with_query_type(query_type_to_plugin(query_type));
+        for hook in registry_hooks.iter() {
+            use uni_plugin::errors::HookOutcome;
+            match hook.on_parse(&parse_ctx) {
+                HookOutcome::Continue => {}
+                HookOutcome::Reject { reason } => {
+                    return Err(UniError::HookRejected { message: reason });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compute a hash key from a query string.

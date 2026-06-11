@@ -466,30 +466,7 @@ impl Transaction {
     /// `Transaction::new` time) so a long-lived transaction can't be
     /// retroactively escalated by a session re-auth.
     fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
-        use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
-
-        let policies = self.db.plugin_registry.authz_policies();
-        if policies.is_empty() {
-            return Ok(());
-        }
-        let anon = Principal::anonymous();
-        let principal = self.principal.as_deref().unwrap_or(&anon);
-        let action = Action {
-            verb: verb.to_owned(),
-        };
-        let resource = Resource {
-            path: cypher.to_owned(),
-        };
-        for policy in policies.iter() {
-            match policy.check(principal, &action, &resource) {
-                Ok(Decision::Allow) => {}
-                Ok(Decision::Deny { reason }) => {
-                    return Err(UniError::AuthorizationDenied { reason });
-                }
-                Err(e) => return Err(UniError::AuthorizationDenied { reason: e.0 }),
-            }
-        }
-        Ok(())
+        crate::api::session::authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
     }
 
     /// Per-statement guards shared by the typed `execute`/`query` entry points
@@ -772,7 +749,14 @@ impl Transaction {
             id_reservoir: self.id_reservoir.clone(),
             snapshot: self.snapshot.clone(),
         };
-        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding).await
+        let guards = crate::api::prepared::PreparedGuards::for_transaction(
+            self.principal.clone(),
+            self.hooks.clone(),
+            self.session_id.clone(),
+            classify_verb(cypher).to_string(),
+        );
+        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding, guards)
+            .await
     }
 
     /// Prepare a Locy program for repeated evaluation within this transaction.

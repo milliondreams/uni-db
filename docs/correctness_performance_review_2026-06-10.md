@@ -527,8 +527,47 @@ rewrite touching the Python-binding surface. Tracked separately.
 
 ## Performance — highest-payoff
 
-> ⬜ **Status: entirely OPEN.** No performance item below has been addressed; these remain a
-> separate track (the clone-on-freeze cliff is the known headline).
+> **Status update 2026-06-12: items #2–#7 + four P2s FIXED** (verify-first, bench-before/after;
+> criterion medians below from `target/perf-baselines/`). **#1 clone-on-freeze remains OPEN**
+> (generation-chaining design settled — O(1) freeze via the existing `snapshot_isolated` rotate
+> shape + fold-at-flush + overlay-aware commit validation — tracked as its own follow-up).
+>
+> | Fix | Bench | Before → After |
+> |---|---|---|
+> | #3a ext_id index | `mutation_extid_ingest/4000` | 193.1 ms → **38.6 ms** (5.0×; quadratic → linear) |
+> | #4 batched MERGE | `mutation_unwind_merge_batched` (1000 rows, 50% hit, flushed) | 1.702 s → **1.091 s** (1.56×; 1000 Lance scans → 1) |
+> | #5 traversal pushdown | `schemaless_traversal/one_source_100k_edges` | 32.9 ms → **7.7 ms** (4.3×); all-sources arm unregressed (47.2 → 50.7 ms, threshold 1024) |
+> | #2 WAL double-write | WAL entries per edge-commit | 2 → **1** (`commit_writes_each_mutation_to_wal_exactly_once`, red-green) |
+> | #2+#7 cluster | `mutation_*` / `commit_throughput` collateral | within noise |
+>
+> Detail per item:
+> - **#2** — `delete_vertex`/`insert_edge`/`delete_edge` gained `skip_wal` impls; `merge()` uses them.
+> - **#3a** — `L0Buffer.extid_index` (maintained in both insert impls, the WAL-replay arm, and
+>   cascade deletion; synced to the post-CRDT-merge value). Also closed a real **concurrent-commit
+>   ext_id race** (commit-time re-probe next to the unique-key check; new `ConstraintConflict`).
+>   #3b (per-row Lance `count_rows` on single inserts) deferred as documented.
+> - **#4** — per-statement prefetch `merge_lookup_persisted_batch` (canonical key tuples, 1000/chunk,
+>   type-grouped `IN`/OR-of-ANDs, fail-closed); per-row liveness re-checks kept at row time.
+>   Residual: per-row ON CREATE/ON MATCH SET + post-SET property re-read now dominate (~1.1 ms/row).
+>   **Found (pre-existing, parity-pinned):** MERGE on an *undeclared* label cannot match FLUSHED
+>   rows (persisted lookup sees nothing) and re-creates them — identical on the old per-row path;
+>   see `merge_batch_mixed_key_types`.
+> - **#5** — source-VID pushdown (`find_edges_by_type_names` endpoint filter, ≤1024 sources, both
+>   storage tiers — the L0 overlay too, so the SSI read-set footprint is consistent) + `Arc`-shared
+>   type/props in the adjacency map (the `Both` deep-clone is gone). New SSI tests cover the
+>   narrowed read-set in both directions.
+> - **#6** — `SchemaManager::get_or_assign_edge_type_id` read-lock fast path (double-checked; the
+>   write-lock + `Arc::make_mut` Schema deep-clone now only on first assignment).
+> - **#7** — CRDT-merge clones removed (props moved, size pre-computed); `WriteAheadLog::append`
+>   takes `Mutation` by value; `flush` serializes via borrowed `WalSegmentRef` (byte-identical,
+>   unit-tested); commit merges via `merge_take` (drains tx property maps; `merge` stays
+>   non-draining). Remaining clone: properties → WAL `Mutation` at commit (needs Arc/Cow `Mutation`,
+>   separate proposal).
+> - **P2s** — `=~` thread-local regex cache; plan caches hold `Arc<LogicalPlan>` (deep clone off the
+>   mutex, both read + tx paths); `COUNT(DISTINCT)` uses `HashSet<Value>` with numeric
+>   canonicalization (also fixes the latent `1` vs `'1'` collapse of the stringifying accumulator);
+>   `get_neighbors_batch` records the SSI read-set once per batch (zero-neighbor sources still
+>   recorded).
 
 1. **Clone-on-freeze deep-copies the entire main L0 per commit under SSI**
    (`crates/uni-store/src/runtime/l0_manager.rs:262`). With `ssi_enabled` default-ON every

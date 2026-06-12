@@ -528,9 +528,35 @@ rewrite touching the Python-binding surface. Tracked separately.
 ## Performance — highest-payoff
 
 > **Status update 2026-06-12: items #2–#7 + four P2s FIXED** (verify-first, bench-before/after;
-> criterion medians below from `target/perf-baselines/`). **#1 clone-on-freeze remains OPEN**
-> (generation-chaining design settled — O(1) freeze via the existing `snapshot_isolated` rotate
-> shape + fold-at-flush + overlay-aware commit validation — tracked as its own follow-up).
+> criterion medians below from `target/perf-baselines/`).
+>
+> **#1 clone-on-freeze: NO-GO after a full implementation + measurement** (same verdict shape as
+> the group-commit proposal). Generation chaining (O(1) freeze, frozen generations chained on
+> `pending_flush`, fold-at-flush, overlay-aware commit validation, CRDT merge-seeding, chain cap)
+> was built, fully green on the suites — and **slower than the lazy clone at every measured L0
+> size** (`ssi_freeze` commit-with-pin deltas, old → chained: 1k 2.8→4.0 ms; 10k 3.5→5.1 ms;
+> 50k 9.9→14.5 ms; a new 50k bench arm was added for the scaling check). Root cause: chaining
+> trades the O(L0) commit clone for an **O(chain-length) read tax** (~0.2 ms per chained buffer
+> per scan, paid by every query), and the clone cost it eliminates is already fenced by
+> `auto_flush_threshold` — L0 rotates at 10k mutations, so the "hundreds of MB" cliff cannot
+> accumulate under default config. Lowering the fold cap converges back to the clone's cost plus
+> overhead. The chaining implementation was reverted; the 50k bench arm is kept.
+>
+> **Salvage — three REAL pre-existing commit-time races found and FIXED** (the chaining work
+> exposed them; they exist in the shipped design whenever `async_flush_enabled` lets a commit
+> interleave with the post-rotate flush window — the commit-time layer of the Bug #9A window):
+> - the serializable-MERGE unique-key and ext_id commit-time re-probes consulted only the current
+>   buffer → two pre-inserted txs could both commit the same key around a mid-flush rotation;
+> - the CRDT carve-out merge ran against the (post-rotation, empty) current buffer → a concurrent
+>   counter increment committed mid-flush was silently shadowed (lost update);
+> - the issue-#77 edge-endpoint check missed tombstones sitting mid-flush → ghost edge.
+>
+> All three now walk `[current, pending_flush…]` (`Writer::validate_edge_endpoints_overlay`,
+> `Writer::seed_crdt_props`, and the overlay re-probes in `commit_transaction_l0`); red-green
+> failpoint repros in `flush_resilience.rs` (`extid_commit_probe_covers_flush_window`,
+> `crdt_increments_merge_across_flush_window`,
+> `edge_to_vertex_tombstoned_in_flush_window_rejected`). `ssi_freeze` is unchanged by the fixes
+> (4.5/7.1/20.7 ms with-pin at 1k/10k/50k ≈ pre-fix baseline).
 >
 > | Fix | Bench | Before → After |
 > |---|---|---|

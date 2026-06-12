@@ -425,3 +425,191 @@ async fn extid_check_covers_flush_window() -> Result<()> {
     );
     Ok(())
 }
+
+// ── Commit-time overlay checks during the flush window ───────────────────────
+//
+// An ASYNC flush rotation moves the current buffer onto `pending_flush`,
+// installs an empty current, releases `flush_lock`, and streams to Lance in
+// the background — so commits interleave with the window (inline flushes hold
+// `flush_lock` throughout and cannot race commits). The COMMIT-TIME layer had
+// the same exposure Bug #9A pinned for the per-insert unique check: the
+// serializable-MERGE/ext_id re-probes, the CRDT carve-out merge, and the
+// issue-#77 endpoint check all used to consult only the current buffer.
+// These tests hold an async flush paused mid-window and pin each seam.
+
+/// `UniConfig` with the async flush pipeline enabled (the only mode where a
+/// commit can interleave with the post-rotate flush window).
+fn async_flush_config() -> UniConfig {
+    UniConfig {
+        async_flush_enabled: true,
+        ..Default::default()
+    }
+}
+
+/// Two transactions insert the same ext_id before either commits; the first
+/// committer's row is mid-flush when the second commits. The commit-time
+/// re-probe must find the key in the pending buffer and abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extid_commit_probe_covers_flush_window() -> Result<()> {
+    fn ext_props(value: &str) -> HashMap<String, Value> {
+        let mut props = HashMap::new();
+        props.insert("ext_id".to_string(), Value::String(value.to_string()));
+        props
+    }
+
+    let (writer, _dir) = make_writer_with_config(async_flush_config()).await?;
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    let va = writer.next_vid().await?;
+    let vb = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(
+            va,
+            ext_props("shared"),
+            &["Counter".to_string()],
+            Some(&tx_a),
+        )
+        .await?;
+    writer
+        .insert_vertex_with_labels(
+            vb,
+            ext_props("shared"),
+            &["Counter".to_string()],
+            Some(&tx_b),
+        )
+        .await?;
+    writer.commit_transaction_l0(tx_a).await?;
+
+    // Rotate tx_a's row onto pending_flush (async: flush_lock released after
+    // the rotate), pausing the stream before it reaches Lance.
+    fail::cfg("flush::after-rotate-before-lance", "pause").unwrap();
+    let ticket = writer.flush_to_l1_async(None).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = writer.commit_transaction_l0(tx_b).await;
+
+    fail::cfg("flush::after-rotate-before-lance", "off").unwrap();
+    ticket.await_finalize().await?;
+
+    assert!(
+        second.is_err(),
+        "ext_id committed by tx_a must conflict even while its row is mid-flush \
+         (commit-time re-probe must walk pending_flush)"
+    );
+    Ok(())
+}
+
+/// Concurrent CRDT counter increments across a flush window must MERGE (sum):
+/// the committed counter state sits in a pending buffer while the second
+/// increment commits into the fresh (empty) current buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crdt_increments_merge_across_flush_window() -> Result<()> {
+    use uni_crdt::{Crdt, GCounter};
+    use uni_store::runtime::QueryContext;
+    use uni_store::runtime::l0_visibility::lookup_vertex_prop;
+
+    fn gcounter_val(node: &str, count: u64) -> Value {
+        let mut gc = GCounter::new();
+        gc.increment(node, count);
+        let json = serde_json::to_value(Crdt::GCounter(gc)).expect("serialize GCounter");
+        Value::from(json)
+    }
+
+    let (writer, _dir) = make_writer_with_config(async_flush_config()).await?;
+    let vid = writer.next_vid().await?;
+
+    // Node "a" increments and commits.
+    let tx1 = writer.create_transaction_l0();
+    let mut p1 = HashMap::new();
+    p1.insert("hits".to_string(), gcounter_val("a", 1));
+    writer
+        .insert_vertex_with_labels(vid, p1, &["Counter".to_string()], Some(&tx1))
+        .await?;
+    writer.commit_transaction_l0(tx1).await?;
+
+    // Rotate node-a's counter state onto pending_flush, pause mid-window.
+    fail::cfg("flush::after-rotate-before-lance", "pause").unwrap();
+    let ticket = writer.flush_to_l1_async(None).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Node "b" increments the same counter and commits during the window.
+    let tx2 = writer.create_transaction_l0();
+    let mut p2 = HashMap::new();
+    p2.insert("hits".to_string(), gcounter_val("b", 1));
+    writer
+        .insert_vertex_with_labels(vid, p2, &["Counter".to_string()], Some(&tx2))
+        .await?;
+    writer.commit_transaction_l0(tx2).await?;
+
+    fail::cfg("flush::after-rotate-before-lance", "off").unwrap();
+    ticket.await_finalize().await?;
+
+    // Both increments must survive: a:1 + b:1 = 2. Without the commit-time
+    // seed, node b's state shadows node a's mid-flush state at read time.
+    let ctx = QueryContext::new_with_pending(
+        writer.l0_manager.get_current(),
+        None,
+        writer.l0_manager.get_pending_flush(),
+    );
+    let merged = lookup_vertex_prop(vid, "hits", Some(&ctx)).expect("counter must be visible");
+    let crdt: Crdt = serde_json::from_value(merged.into()).expect("decode merged CRDT");
+    let Crdt::GCounter(gc) = crdt else {
+        panic!("expected GCounter");
+    };
+    assert_eq!(
+        gc.value(),
+        2,
+        "increments from both nodes must survive the flush window"
+    );
+    Ok(())
+}
+
+/// Issue #77 during the flush window: an edge to a vertex whose tombstone is
+/// mid-flush (on pending_flush, current buffer empty) must be rejected at
+/// commit, before the durable WAL flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_to_vertex_tombstoned_in_flush_window_rejected() -> Result<()> {
+    let (writer, _dir) = make_writer_with_config(async_flush_config()).await?;
+    let v1 = writer.next_vid().await?;
+    let v2 = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(v1, counter_props(1), &["Counter".to_string()], None)
+        .await?;
+    writer
+        .insert_vertex_with_labels(v2, counter_props(2), &["Counter".to_string()], None)
+        .await?;
+
+    // Delete v2 and pause its tombstone mid-flush.
+    let tx_del = writer.create_transaction_l0();
+    writer.delete_vertex(v2, None, Some(&tx_del)).await?;
+    writer.commit_transaction_l0(tx_del).await?;
+    fail::cfg("flush::after-rotate-before-lance", "pause").unwrap();
+    let ticket = writer.flush_to_l1_async(None).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let etype = writer.schema_manager.get_or_assign_edge_type_id("REL");
+    let eid = writer.next_eid(etype).await?;
+    let tx_edge = writer.create_transaction_l0();
+    writer
+        .insert_edge(
+            v1,
+            v2,
+            etype,
+            eid,
+            HashMap::new(),
+            Some("REL".into()),
+            Some(&tx_edge),
+        )
+        .await?;
+    let result = writer.commit_transaction_l0(tx_edge).await;
+
+    fail::cfg("flush::after-rotate-before-lance", "off").unwrap();
+    ticket.await_finalize().await?;
+
+    assert!(
+        result.is_err(),
+        "edge to a vertex whose tombstone is mid-flush must be rejected (issue #77)"
+    );
+    Ok(())
+}

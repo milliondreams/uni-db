@@ -581,7 +581,14 @@ impl GraphExecutionContext {
         // Single-vid case: acquire the transaction-L0 guard once for this
         // vertex (the batch path amortizes it across many vertices).
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
-        self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref())
+        self.neighbors_for_vid(
+            vid,
+            edge_type,
+            direction,
+            version_hwm,
+            tx_guard.as_deref(),
+            true,
+        )
     }
 
     /// Get neighbors for multiple vertices in batch.
@@ -610,14 +617,24 @@ impl GraphExecutionContext {
 
         let mut results = Vec::new();
         for &vid in vids {
-            let neighbors =
-                self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref());
+            // record_reads=false: the whole batch is recorded in one read-set
+            // lock below instead of two lock acquisitions per source vertex.
+            let neighbors = self.neighbors_for_vid(
+                vid,
+                edge_type,
+                direction,
+                version_hwm,
+                tx_guard.as_deref(),
+                false,
+            );
             results.extend(
                 neighbors
                     .into_iter()
                     .map(|(neighbor, eid)| (vid, neighbor, eid)),
             );
         }
+        drop(tx_guard);
+        self.record_neighbor_reads_batch(vids, &results);
         results
     }
 
@@ -707,6 +724,11 @@ impl GraphExecutionContext {
     /// `tx_guard` is the already-acquired read guard over the transaction
     /// L0 buffer (if any), so batch callers acquire the lock once and pass
     /// the borrow in for every vertex.
+    /// When `record_reads` is false the caller takes responsibility for
+    /// recording the traversal into the SSI read-set (the batch path records
+    /// once per batch via [`record_neighbor_reads_batch`]).
+    ///
+    /// [`record_neighbor_reads_batch`]: Self::record_neighbor_reads_batch
     fn neighbors_for_vid(
         &self,
         vid: Vid,
@@ -714,6 +736,7 @@ impl GraphExecutionContext {
         direction: Direction,
         version_hwm: Option<u64>,
         tx_guard: Option<&L0Buffer>,
+        record_reads: bool,
     ) -> Vec<(Vid, Eid)> {
         // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
         // For snapshot queries, filter by version via StorageManager delegate.
@@ -739,7 +762,9 @@ impl GraphExecutionContext {
             );
         }
 
-        self.record_neighbor_reads(vid, &neighbors);
+        if record_reads {
+            self.record_neighbor_reads(vid, &neighbors);
+        }
 
         neighbors
     }
@@ -761,6 +786,34 @@ impl GraphExecutionContext {
         let mut rs = read_set.lock();
         rs.vertices.insert(src);
         for (nbr, eid) in neighbors {
+            rs.vertices.insert(*nbr);
+            rs.edges.insert(*eid);
+        }
+    }
+
+    /// Batch variant of [`record_neighbor_reads`](Self::record_neighbor_reads):
+    /// records an entire expansion batch under ONE read-set lock instead of
+    /// two lock acquisitions per source vertex.
+    ///
+    /// `srcs` is recorded in full — a source with zero neighbours is still a
+    /// read ("no edges here") that a concurrent edge insert must conflict
+    /// with, exactly as the per-vertex recorder behaves.
+    fn record_neighbor_reads_batch(&self, srcs: &[Vid], triples: &[(Vid, Vid, Eid)]) {
+        if srcs.is_empty() && triples.is_empty() {
+            return;
+        }
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for src in srcs {
+            rs.vertices.insert(*src);
+        }
+        for (_, nbr, eid) in triples {
             rs.vertices.insert(*nbr);
             rs.edges.insert(*eid);
         }

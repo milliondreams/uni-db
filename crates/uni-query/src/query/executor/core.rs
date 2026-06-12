@@ -30,7 +30,7 @@ pub(crate) enum Accumulator {
     Max(Option<Value>),
     Avg { sum: f64, count: i64 },
     Collect(Vec<Value>),
-    CountDistinct(HashSet<String>),
+    CountDistinct(HashSet<Value>),
     PercentileDisc { values: Vec<f64>, percentile: f64 },
     PercentileCont { values: Vec<f64>, percentile: f64 },
 }
@@ -41,6 +41,24 @@ fn numeric_to_value(val: f64) -> Value {
         Value::Int(val as i64)
     } else {
         Value::Float(val)
+    }
+}
+
+/// Canonical key for `COUNT(DISTINCT …)`: integral finite floats collapse to
+/// `Int` so `1` and `1.0` count once (matching `cypher_eq`'s numeric
+/// coercion); every other value keeps its type. The accumulator previously
+/// stringified values, which also collapsed `1` with `'1'` — a wrong answer.
+fn distinct_key(val: &Value) -> Value {
+    match val {
+        Value::Float(f)
+            if f.is_finite()
+                && f.fract() == 0.0
+                && *f >= i64::MIN as f64
+                && *f <= i64::MAX as f64 =>
+        {
+            Value::Int(*f as i64)
+        }
+        other => other.clone(),
     }
 }
 
@@ -152,7 +170,7 @@ impl Accumulator {
             }
             Accumulator::CountDistinct(s) => {
                 if !val.is_null() {
-                    s.insert(val.to_string());
+                    s.insert(distinct_key(val));
                 }
             }
             Accumulator::PercentileDisc { values, .. }
@@ -1083,5 +1101,37 @@ mod tests {
         let l1 = Value::List(vec![Value::Int(1), Value::Int(2)]);
         let l2 = Value::List(vec![Value::Int(1), Value::Int(3)]);
         assert!(Executor::compare_values(&l1, &l2).is_lt());
+    }
+
+    /// COUNT(DISTINCT) must coerce numerically (1 vs 1.0 count once, matching
+    /// `cypher_eq`) while keeping cross-type identity (1 vs '1' vs true count
+    /// separately — the old stringifying accumulator collapsed 1 with '1').
+    #[test]
+    fn test_count_distinct_type_identity() {
+        let mut acc = Accumulator::new("COUNT", true);
+        acc.update(&Value::Int(1), false);
+        acc.update(&Value::Float(1.0), false);
+        assert_eq!(acc.finish(), Value::Int(1), "1 and 1.0 count once");
+
+        let mut acc = Accumulator::new("COUNT", true);
+        acc.update(&Value::Int(1), false);
+        acc.update(&Value::String("1".to_string()), false);
+        assert_eq!(acc.finish(), Value::Int(2), "1 and '1' are distinct");
+
+        let mut acc = Accumulator::new("COUNT", true);
+        acc.update(&Value::Int(1), false);
+        acc.update(&Value::Bool(true), false);
+        assert_eq!(acc.finish(), Value::Int(2), "1 and true are distinct");
+
+        // Non-integral and non-finite floats keep float identity; NaN and
+        // signed zero follow Value's normalized Hash/Eq (one bucket each).
+        let mut acc = Accumulator::new("COUNT", true);
+        acc.update(&Value::Float(1.5), false);
+        acc.update(&Value::Float(1.5), false);
+        acc.update(&Value::Float(f64::NAN), false);
+        acc.update(&Value::Float(f64::NAN), false);
+        acc.update(&Value::Float(0.0), false);
+        acc.update(&Value::Float(-0.0), false);
+        assert_eq!(acc.finish(), Value::Int(3), "1.5, NaN, 0 -> 3 buckets");
     }
 }

@@ -1262,8 +1262,10 @@ impl Session {
         let session_principal = self.principal.clone();
 
         if let Some(plan) = cached {
-            // Cache hit — skip parse and plan, execute the cached plan directly
+            // Cache hit — skip parse and plan, execute the cached plan directly.
+            // The deep clone for the owned plan happens here, off the cache mutex.
             self.plan_cache_metrics.hits.fetch_add(1, Ordering::Relaxed);
+            let plan = Arc::unwrap_or_clone(plan);
             return uni_query::scoped_with_session_context(
                 session_pr,
                 session_principal,
@@ -1304,9 +1306,11 @@ impl Session {
             .with_params(params.clone())
             .with_plugin_registry(Arc::clone(&self.db.plugin_registry))
             .with_replacement_scans(self.replacement_scans_enabled());
-        let plan = planner
-            .plan(ast)
-            .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?;
+        let plan = Arc::new(
+            planner
+                .plan(ast)
+                .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?,
+        );
         let folded = planner.folded_limit_skip_params();
 
         // Cache the entry under the effective key (folding in any LIMIT/SKIP
@@ -1317,7 +1321,7 @@ impl Session {
             cache.insert(
                 key,
                 PlanCacheEntry {
-                    plan: plan.clone(),
+                    plan: Arc::clone(&plan),
                     query: cypher.to_string(),
                     schema_version,
                     hit_count: 0,
@@ -1329,8 +1333,13 @@ impl Session {
         uni_query::scoped_with_session_context(
             session_pr,
             session_principal,
-            self.db
-                .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None),
+            self.db.execute_plan_internal(
+                Arc::unwrap_or_clone(plan),
+                cypher,
+                params,
+                self.db.config.clone(),
+                None,
+            ),
         )
         .await
     }
@@ -1661,7 +1670,11 @@ impl uni_fork::ForkQueryHost for Session {
 
 /// Entry in the transparent plan cache.
 pub(crate) struct PlanCacheEntry {
-    pub(crate) plan: uni_query::LogicalPlan,
+    /// `Arc` so a cache hit clones a pointer under the cache mutex; the
+    /// per-execution deep clone (consumers need an owned plan for the
+    /// fork-fusion rewrites) happens outside the lock via
+    /// `Arc::unwrap_or_clone`.
+    pub(crate) plan: std::sync::Arc<uni_query::LogicalPlan>,
     /// The exact query text this plan was built from. Compared on every
     /// lookup: the cache key is a 64-bit hash of the text, so two distinct
     /// queries can collide — without this check a collision would silently
@@ -1929,7 +1942,7 @@ mod plan_cache_tests {
         cache.insert(
             key_a,
             PlanCacheEntry {
-                plan: scan_plan("plan_for_query_a"),
+                plan: std::sync::Arc::new(scan_plan("plan_for_query_a")),
                 query: query_a.to_string(),
                 schema_version,
                 hit_count: 0,
@@ -1948,7 +1961,7 @@ mod plan_cache_tests {
         let entry = cache
             .get(key_a, query_a, schema_version)
             .expect("original query must still hit after a collision lookup");
-        match &entry.plan {
+        match entry.plan.as_ref() {
             uni_query::LogicalPlan::Scan { variable, .. } => assert_eq!(
                 variable, "plan_for_query_a",
                 "query A must get its own plan back"

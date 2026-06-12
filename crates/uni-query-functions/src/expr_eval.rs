@@ -105,12 +105,42 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
             let pattern = right
                 .as_str()
                 .ok_or_else(|| anyhow!("Right operand of =~ must be a regex pattern string"))?;
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
-            Ok(Value::Bool(re.is_match(l)))
+            let matched = with_cached_regex(pattern, |re| re.is_match(l))?;
+            Ok(Value::Bool(matched))
         }
         BinaryOp::ApproxEq => eval_vector_similarity(left, right),
     }
+}
+
+/// Maximum compiled patterns kept per thread before the cache is reset.
+const REGEX_CACHE_CAP: usize = 64;
+
+thread_local! {
+    /// Per-thread compiled-regex cache for the interpreted `=~` path, which
+    /// previously recompiled the pattern on every row. Thread-local avoids
+    /// any cross-query lock; per-query pattern counts are tiny, so a full
+    /// clear at capacity is simpler than LRU and effectively never fires.
+    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `f` against the compiled regex for `pattern`, compiling and caching on
+/// first use. Only successful compiles are cached — an invalid pattern errors
+/// identically on every row.
+fn with_cached_regex<T>(pattern: &str, f: impl FnOnce(&regex::Regex) -> T) -> Result<T> {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(pattern) {
+            return Ok(f(re));
+        }
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
+        if cache.len() >= REGEX_CACHE_CAP {
+            cache.clear();
+        }
+        let re = cache.entry(pattern.to_string()).or_insert(re);
+        Ok(f(re))
+    })
 }
 
 /// Deep equality comparison with Cypher-compliant numeric coercion and 3-valued logic.

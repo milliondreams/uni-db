@@ -448,13 +448,14 @@ impl crate::api::UniInner {
                 // Cache the pre-rewrite logical plan for subsequent batches,
                 // under the effective key (folding in any LIMIT/SKIP parameter
                 // values baked into this plan).
+                let lp = Arc::new(lp);
                 if let Ok(mut cache) = self.plan_cache.lock() {
                     cache.note_folded_params(text_key, folded);
                     let key = cache.effective_key(text_key, &params);
                     cache.insert(
                         key,
                         crate::api::session::PlanCacheEntry {
-                            plan: lp.clone(),
+                            plan: Arc::clone(&lp),
                             query: cypher.to_string(),
                             schema_version,
                             hit_count: 0,
@@ -465,9 +466,13 @@ impl crate::api::UniInner {
             };
 
         // Rewrites run on every execution: cheap tree-walks that must reflect
-        // live fork-index state, so they are intentionally not cached.
+        // live fork-index state, so they are intentionally not cached. The
+        // owned plan is produced here, outside the plan-cache mutex.
         let logical_plan = {
-            let lp = uni_query::rewrite_for_fork_fusion(logical_plan_raw, &*self.storage);
+            let lp = uni_query::rewrite_for_fork_fusion(
+                Arc::unwrap_or_clone(logical_plan_raw),
+                &*self.storage,
+            );
             uni_query::fuse_create_set(lp)
         };
 

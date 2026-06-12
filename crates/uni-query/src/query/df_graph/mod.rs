@@ -621,6 +621,86 @@ impl GraphExecutionContext {
         results
     }
 
+    /// Resolve an edge's STORED `(src, dst)` orientation given a traversed hop.
+    ///
+    /// A relationship in a path must report its stored (start -> end) direction
+    /// even when the path traversed it backward (undirected `-[r]-` or incoming
+    /// `<-[r]-`). This first consults the L0 visibility chain (exact for
+    /// in-memory edges); if the edge has been flushed to durable storage and is
+    /// no longer L0-resident, it recovers the orientation with a bounded
+    /// directed-outgoing adjacency probe: the edge is stored
+    /// `(traversal_src -> traversal_dst)` iff `eid` appears among
+    /// `traversal_src`'s outgoing neighbours for one of `edge_type_ids`,
+    /// otherwise it is the reverse. Falls back to the traversal order only when
+    /// the probe is inconclusive (e.g. the type carries no CSR adjacency).
+    ///
+    /// The probe costs at most the out-degree of one vertex per candidate edge
+    /// type — never a full edge scan — and reads the adjacency manager directly,
+    /// so it does not perturb the SSI read-set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let (src, dst) =
+    ///     ctx.resolve_stored_edge_endpoints(eid, node_path[i], node_path[i + 1], &edge_type_ids);
+    /// ```
+    #[must_use]
+    pub fn resolve_stored_edge_endpoints(
+        &self,
+        eid: Eid,
+        traversal_src: Vid,
+        traversal_dst: Vid,
+        edge_type_ids: &[u32],
+    ) -> (u64, u64) {
+        // 1. L0 visibility chain — exact stored endpoints for in-memory edges.
+        let query_ctx = self.query_context();
+        if let Some((src, dst)) =
+            uni_store::runtime::l0_visibility::get_edge_endpoints(eid, &query_ctx)
+        {
+            return (src.as_u64(), dst.as_u64());
+        }
+
+        // 2. Flushed (L1-resident) edge: recover orientation via a directed
+        //    outgoing adjacency probe. Read the adjacency manager / versioned
+        //    snapshot directly so the probe stays out of the SSI read-set.
+        //
+        //    When the caller could not supply the edge's type ids (e.g. an
+        //    anonymous `-[]-` relationship reaching BindFixedPath without a
+        //    `_type` column), fall back to the adjacency manager's warmed types
+        //    — exactly the set traversed by this query, so still a bounded probe.
+        let adjacency_manager = self.adjacency_manager();
+        let warmed_fallback: Vec<u32>;
+        let probe_types: &[u32] = if edge_type_ids.is_empty() {
+            warmed_fallback = adjacency_manager.known_edge_type_ids();
+            &warmed_fallback
+        } else {
+            edge_type_ids
+        };
+        let version_hwm = self.storage.snapshot_version_hwm();
+        let outgoing_contains = |vid: Vid| -> bool {
+            probe_types.iter().any(|&etype| {
+                let neighbors = match version_hwm {
+                    Some(hwm) => {
+                        self.storage
+                            .get_neighbors_at_version(vid, etype, Direction::Outgoing, hwm)
+                    }
+                    None => adjacency_manager.get_neighbors(vid, etype, Direction::Outgoing),
+                };
+                neighbors.iter().any(|&(_, e)| e == eid)
+            })
+        };
+
+        if outgoing_contains(traversal_src) {
+            (traversal_src.as_u64(), traversal_dst.as_u64())
+        } else if outgoing_contains(traversal_dst) {
+            (traversal_dst.as_u64(), traversal_src.as_u64())
+        } else {
+            // 3. Inconclusive (no CSR adjacency for this type): preserve the
+            //    long-standing traversal-order behaviour.
+            (traversal_src.as_u64(), traversal_dst.as_u64())
+        }
+    }
+
     /// Resolve a single vertex's neighbours, overlaying the transaction L0
     /// (if visible) and recording the traversal into the SSI read-set.
     ///

@@ -555,12 +555,19 @@ impl GraphShortestPathStream {
                         let src = window[0];
                         let dst = window[1];
                         let (eid, type_name) = self.find_edge(src, dst);
+                        // Report the relationship's STORED direction, not the
+                        // traversal order (`src` -> `dst` along the BFS path).
+                        // Resolves flushed (L1-resident) edges too, where the L0
+                        // chain no longer holds the stored endpoints.
+                        let (stored_src, stored_dst) = self
+                            .graph_ctx
+                            .resolve_stored_edge_endpoints(eid, src, dst, &self.edge_type_ids);
                         super::common::append_edge_to_struct(
                             rels_builder.values(),
                             eid,
                             &type_name,
-                            src.as_u64(),
-                            dst.as_u64(),
+                            stored_src,
+                            stored_dst,
                             &query_ctx,
                         );
                     }

@@ -3458,12 +3458,22 @@ impl GraphVariableLengthTraverseStream {
                     for (i, eid) in edge_path.iter().enumerate() {
                         let type_name = l0_visibility::get_edge_type(*eid, &query_ctx)
                             .unwrap_or_else(|| "UNKNOWN".to_string());
+                        // Report the relationship's STORED direction, not the
+                        // traversal order (`node_path[i]` -> `node_path[i + 1]`).
+                        // Resolves flushed (L1-resident) edges too, where the L0
+                        // chain no longer holds the stored endpoints.
+                        let (src, dst) = self.exec.graph_ctx.resolve_stored_edge_endpoints(
+                            *eid,
+                            node_path[i],
+                            node_path[i + 1],
+                            &self.exec.edge_type_ids,
+                        );
                         append_edge_to_struct(
                             edges_builder.values(),
                             *eid,
                             &type_name,
-                            node_path[i].as_u64(),
-                            node_path[i + 1].as_u64(),
+                            src,
+                            dst,
                             &query_ctx,
                         );
                     }
@@ -3530,12 +3540,22 @@ impl GraphVariableLengthTraverseStream {
                 for (i, eid) in edge_path.iter().enumerate() {
                     let type_name = l0_visibility::get_edge_type(*eid, &query_ctx)
                         .unwrap_or_else(|| "UNKNOWN".to_string());
+                    // Report the relationship's STORED direction, not the traversal
+                    // order (`node_path[i]` -> `node_path[i + 1]`). Resolves flushed
+                    // (L1-resident) edges too, where the L0 chain no longer holds
+                    // the stored endpoints.
+                    let (src, dst) = self.exec.graph_ctx.resolve_stored_edge_endpoints(
+                        *eid,
+                        node_path[i],
+                        node_path[i + 1],
+                        &self.exec.edge_type_ids,
+                    );
                     append_edge_to_struct(
                         rels_builder.values(),
                         *eid,
                         &type_name,
-                        node_path[i].as_u64(),
-                        node_path[i + 1].as_u64(),
+                        src,
+                        dst,
                         &query_ctx,
                     );
                 }
@@ -4273,6 +4293,17 @@ impl GraphVariableLengthTraverseMainStream {
         // Build output columns
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
 
+        // Resolve this operator's edge type names to numeric ids once, so path
+        // builders can recover the STORED orientation of flushed (L1-resident)
+        // relationships via a directed-outgoing adjacency probe.
+        let edge_type_ids: Vec<u32> = {
+            let uni_schema = self.graph_ctx.storage().schema_manager().schema();
+            self.type_names
+                .iter()
+                .filter_map(|name| uni_schema.edge_type_id_by_name(name))
+                .collect()
+        };
+
         // Expand input columns
         for col_idx in 0..batch.num_columns() {
             let array = batch.column(col_idx);
@@ -4353,12 +4384,22 @@ impl GraphVariableLengthTraverseMainStream {
                     edges_builder.append(true);
                 } else {
                     for (i, eid) in edge_path.iter().enumerate() {
+                        // Report the relationship's STORED direction, not the
+                        // traversal order (`node_path[i]` -> `node_path[i + 1]`).
+                        // Resolves flushed (L1-resident) edges too, where the L0
+                        // chain no longer holds the stored endpoints.
+                        let (src, dst) = self.graph_ctx.resolve_stored_edge_endpoints(
+                            *eid,
+                            node_path[i],
+                            node_path[i + 1],
+                            &edge_type_ids,
+                        );
                         append_edge_to_struct(
                             edges_builder.values(),
                             *eid,
                             &type_names_str,
-                            node_path[i].as_u64(),
-                            node_path[i + 1].as_u64(),
+                            src,
+                            dst,
                             &query_ctx,
                         );
                     }
@@ -4422,12 +4463,22 @@ impl GraphVariableLengthTraverseMainStream {
                 nodes_builder.append(true);
 
                 for (i, eid) in edge_path.iter().enumerate() {
+                    // Report the relationship's STORED direction, not the traversal
+                    // order (`node_path[i]` -> `node_path[i + 1]`). Resolves flushed
+                    // (L1-resident) edges too, where the L0 chain no longer holds
+                    // the stored endpoints.
+                    let (src, dst) = self.graph_ctx.resolve_stored_edge_endpoints(
+                        *eid,
+                        node_path[i],
+                        node_path[i + 1],
+                        &edge_type_ids,
+                    );
                     append_edge_to_struct(
                         rels_builder.values(),
                         *eid,
                         &type_names_str,
-                        node_path[i].as_u64(),
-                        node_path[i + 1].as_u64(),
+                        src,
+                        dst,
                         &query_ctx,
                     );
                 }

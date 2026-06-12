@@ -535,6 +535,49 @@ pub fn get_edge_type(eid: Eid, ctx: &QueryContext) -> Option<String> {
     None
 }
 
+/// Resolve an edge's STORED `(src_vid, dst_vid)` endpoints from the L0 chain.
+///
+/// Returns the endpoints in their stored (start -> end) orientation, regardless
+/// of the direction a query traversed the edge. Walks the L0 visibility chain
+/// (transaction L0 -> main L0 -> pending-flush L0s) and returns the first match.
+/// Returns `None` if the edge is not resident in any L0 buffer (e.g. it has been
+/// flushed to durable storage), in which case callers must fall back to storage.
+///
+/// # Examples
+///
+/// ```ignore
+/// if let Some((src, dst)) = get_edge_endpoints(eid, &ctx) {
+///     // src/dst reflect storage order, not traversal order.
+/// }
+/// ```
+pub fn get_edge_endpoints(eid: Eid, ctx: &QueryContext) -> Option<(Vid, Vid)> {
+    // Check transaction L0 first (newest)
+    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
+        let tx_l0 = tx_l0_arc.read();
+        if let Some(endpoints) = tx_l0.get_edge_endpoints(eid) {
+            return Some(endpoints);
+        }
+    }
+
+    // Check main L0
+    {
+        let l0 = ctx.l0.read();
+        if let Some(endpoints) = l0.get_edge_endpoints(eid) {
+            return Some(endpoints);
+        }
+    }
+
+    // Check pending flush L0s (newest first)
+    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
+        let pending_l0 = pending_l0_arc.read();
+        if let Some(endpoints) = pending_l0.get_edge_endpoints(eid) {
+            return Some(endpoints);
+        }
+    }
+
+    None
+}
+
 /// Get the properties for a vertex from the L0 chain.
 /// Returns properties from the most recent L0 buffer that has the vertex.
 /// Returns None if the vertex is not in any L0 buffer.

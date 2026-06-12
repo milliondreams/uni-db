@@ -287,33 +287,65 @@ impl BindFixedPathStream {
                     None
                 };
 
-                // Get src/dst VIDs from adjacent node variables
-                let src_vid = self
-                    .node_variables
-                    .get(edge_idx)
-                    .and_then(|nv| {
-                        let col = format!("{}._vid", nv);
-                        extract_column_value::<arrow_array::UInt64Array, u64>(
-                            &batch,
-                            &col,
-                            row_idx,
-                            |arr, i| arr.value(i),
+                // A relationship in a path must report its STORED (start -> end)
+                // direction, even when the path traversed it backward (undirected
+                // `-[r]-` or incoming `<-[r]-`). The L0 chain holds the stored
+                // endpoints for in-memory edges; for flushed (L1-resident) edges
+                // `resolve_stored_edge_endpoints` recovers the orientation via a
+                // directed-outgoing adjacency probe, keyed by the edge type id
+                // resolved from the batch `_type` column (falling back to the L0
+                // type). The adjacent path-node columns supply the traversal
+                // order, which is also the final fallback when the probe is
+                // inconclusive.
+                let adjacent = |idx: usize| {
+                    self.node_variables
+                        .get(idx)
+                        .and_then(|nv| {
+                            let col = format!("{}._vid", nv);
+                            extract_column_value::<arrow_array::UInt64Array, u64>(
+                                &batch,
+                                &col,
+                                row_idx,
+                                |arr, i| arr.value(i),
+                            )
+                        })
+                        .unwrap_or(0)
+                };
+                let traversal_src = adjacent(edge_idx);
+                let traversal_dst = adjacent(edge_idx + 1);
+
+                let (src_vid, dst_vid) = match eid {
+                    Some(e) => {
+                        let edge_type_ids: Vec<u32> = batch_type_name
+                            .as_deref()
+                            .and_then(|name| {
+                                self.graph_ctx
+                                    .storage()
+                                    .schema_manager()
+                                    .schema()
+                                    .edge_type_id_by_name(name)
+                            })
+                            .or_else(|| {
+                                uni_store::runtime::l0_visibility::get_edge_type(e, &query_ctx)
+                                    .and_then(|name| {
+                                        self.graph_ctx
+                                            .storage()
+                                            .schema_manager()
+                                            .schema()
+                                            .edge_type_id_by_name(&name)
+                                    })
+                            })
+                            .map(|id| vec![id])
+                            .unwrap_or_default();
+                        self.graph_ctx.resolve_stored_edge_endpoints(
+                            e,
+                            uni_common::core::id::Vid::from(traversal_src),
+                            uni_common::core::id::Vid::from(traversal_dst),
+                            &edge_type_ids,
                         )
-                    })
-                    .unwrap_or(0);
-                let dst_vid = self
-                    .node_variables
-                    .get(edge_idx + 1)
-                    .and_then(|nv| {
-                        let col = format!("{}._vid", nv);
-                        extract_column_value::<arrow_array::UInt64Array, u64>(
-                            &batch,
-                            &col,
-                            row_idx,
-                            |arr, i| arr.value(i),
-                        )
-                    })
-                    .unwrap_or(0);
+                    }
+                    None => (traversal_src, traversal_dst),
+                };
 
                 super::common::append_edge_to_struct_optional(
                     rels_builder.values(),

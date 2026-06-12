@@ -67,6 +67,19 @@ impl Algorithm for PageRank {
         for iter in 0..config.max_iterations {
             iterations = iter + 1;
 
+            // Total mass held by dangling nodes (out-degree 0) in the current
+            // score vector. Sinks absorb but never re-emit rank, so without an
+            // explicit correction their mass leaks out every iteration and the
+            // score vector decays below 1.0. Standard PageRank redistributes
+            // this mass uniformly across all `n` nodes, scaled by the damping
+            // factor, so total probability mass is conserved.
+            let dangling_mass: f64 = (0..n as u32)
+                .into_par_iter()
+                .filter(|&u| graph.out_degree(u) == 0)
+                .map(|u| scores[u as usize])
+                .sum();
+            let dangling_share = d * dangling_mass / n as f64;
+
             // Parallel iteration over vertices
             next.par_iter_mut().enumerate().for_each(|(v, score)| {
                 let sum: f64 = graph
@@ -77,14 +90,13 @@ impl Algorithm for PageRank {
                         if out_deg > 0 {
                             scores[u as usize] / out_deg as f64
                         } else {
-                            // Dangling node logic - standard PageRank distributes their score evenly
-                            // but simpler impl often just ignores or handles via sink correction.
-                            // For MVP, we ignore them in the sum (effectively base distributes them).
+                            // Dangling node: its rank is redistributed via
+                            // `dangling_share` below, not through this in-edge sum.
                             0.0
                         }
                     })
                     .sum();
-                *score = base + d * sum;
+                *score = base + dangling_share + d * sum;
             });
 
             // Convergence check
@@ -113,6 +125,59 @@ impl Algorithm for PageRank {
             scores: results,
             iterations,
             converged,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algo::test_utils::build_test_graph;
+
+    /// Regression: PageRank must conserve total mass with a dangling node.
+    ///
+    /// A dangling node (out-degree 0) contributes `0.0` to its neighbors'
+    /// sums (`run`, dangling branch) and its mass is *not* folded into
+    /// `base = (1 - d) / n`. So the rank of any walk that reaches a sink
+    /// leaks out every iteration and the score vector decays well below
+    /// `1.0`. A correct implementation redistributes dangling mass so the
+    /// scores sum to `1.0`.
+    // Rust guideline compliant
+    #[test]
+    fn test_pagerank_conserves_mass_with_dangling_node() {
+        // Path graph 0 -> 1 -> 2, with node 2 dangling (out-degree 0).
+        let vids = vec![Vid::from(0), Vid::from(1), Vid::from(2)];
+        let edges = vec![(Vid::from(0), Vid::from(1)), (Vid::from(1), Vid::from(2))];
+
+        let mut graph = build_test_graph(vids, edges);
+
+        // `build_test_graph` leaves the in-CSR empty, but PageRank iterates
+        // `in_neighbors`. Populate the reverse CSR by hand to match the
+        // out-edges: in(0) = {}, in(1) = {0}, in(2) = {1}.
+        // CSR offsets [V+1]: vertex slot -> start index in in_neighbors.
+        graph.in_offsets = vec![0, 0, 1, 2];
+        graph.in_neighbors = vec![0, 1];
+
+        let config = PageRankConfig {
+            damping_factor: 0.85,
+            max_iterations: 100,
+            tolerance: 1e-12,
+        };
+        let result = PageRank::run(&graph, config);
+
+        let total: f64 = result.scores.iter().map(|(_, s)| *s).sum();
+
+        // Correct PageRank conserves probability mass: the scores sum to 1.0.
+        // RED today: the dangling node's mass leaks out, leaving total ~= 0.27.
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "PageRank scores should sum to ~1.0, got {total}"
+        );
+        for (vid, score) in &result.scores {
+            assert!(
+                *score > 0.0,
+                "score for {vid:?} should be positive, got {score}"
+            );
         }
     }
 }

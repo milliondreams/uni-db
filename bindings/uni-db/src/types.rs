@@ -1510,7 +1510,7 @@ impl PyPreparedQuery {
             .detach(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::query_result_to_py_class(py, result)
     }
 
@@ -1798,7 +1798,7 @@ impl PyPreparedLocy {
             .detach(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::locy_result_to_py_class(py, result)
     }
 
@@ -1913,7 +1913,7 @@ impl PyPreparedQueryBinder {
             .detach(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::query_result_to_py_class(py, result)
     }
 }
@@ -1960,7 +1960,7 @@ impl PyPreparedLocyBinder {
             .detach(|| {
                 pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::locy_result_to_py_class(py, result)
     }
 }

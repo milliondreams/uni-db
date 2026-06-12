@@ -1547,6 +1547,118 @@ mod metric_tests {
     }
 }
 
+// ── Regression: Bug #9 — similar_to must null-propagate, not abort the query ──
+
+/// A NULL `similar_to` source must yield NULL for that row, not error the query.
+///
+/// Bug #9: `determine_scoring_mode()` in `similar_to_expr.rs` has no `Value::Null`
+/// arm, so a NULL source falls through to the catch-all
+/// "unsupported source/query type combination" error. Because the scoring modes
+/// are derived from the first batch row via `.collect::<Result<_>>()?`, a single
+/// NULL source aborts the ENTIRE query instead of producing a NULL score for the
+/// offending row (3VL-correct behavior).
+///
+/// The NULL embedding is injected via `OPTIONAL MATCH`: a Doc with no outgoing
+/// `:NEXT` edge leaves the optional node `n` unbound, so `n.embedding` evaluates
+/// to `Value::Null` and reaches the `similar_to` UDF. The NULL-source Doc sorts
+/// first (`Aardvark`) so the missing `Value::Null` arm in `determine_scoring_mode`
+/// is exercised on the first row (the mode-determination path itself).
+///
+/// RED today: the query returns
+/// `Err(... "unsupported source/query type combination" ...)`, so both the
+/// `is_ok()` assertion and the NULL-score assertion below fail.
+#[tokio::test]
+async fn similar_to_null_embedding_yields_null_not_error() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .vector("embedding", 3)
+        .index(
+            "embedding",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::Flat,
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .done()
+        .edge_type("NEXT", &["Doc"], &["Doc"])
+        .done()
+        .apply()
+        .await?;
+
+    // Aardvark has NO outgoing :NEXT edge (sorts first → NULL source is row 0,
+    // exercising the missing NULL arm in determine_scoring_mode directly).
+    // Beta -[:NEXT]-> Gamma gives a second row with a bound, real-vector source.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Doc {title: 'Aardvark', embedding: [1.0, 0.0, 0.0]}), \
+         (b:Doc {title: 'Beta', embedding: [0.6, 0.8, 0.0]}), \
+         (g:Doc {title: 'Gamma', embedding: [0.8, 0.6, 0.0]}), \
+         (b)-[:NEXT]->(g)",
+    )
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Row order (ORDER BY title): Aardvark, Beta, Gamma.
+    //   Aardvark: no outgoing :NEXT → n unbound → n.embedding is NULL (row 0).
+    //   Beta:     n = Gamma → n.embedding = [0.8, 0.6, 0.0] (real vector).
+    //   Gamma:    no outgoing :NEXT → n unbound → n.embedding is NULL.
+    let result = db
+        .session()
+        .query(
+            "MATCH (d:Doc) \
+             OPTIONAL MATCH (d)-[:NEXT]->(n:Doc) \
+             RETURN d.title AS title, similar_to(n.embedding, [1.0, 0.0, 0.0]) AS score \
+             ORDER BY title",
+        )
+        .await;
+
+    // The query must SUCCEED — a NULL source is a 3VL NULL, not a hard error.
+    assert!(
+        result.is_ok(),
+        "NULL similar_to source must null-propagate, not abort the query; got: {:?}",
+        result.as_ref().err()
+    );
+    let result = result.unwrap();
+
+    assert_eq!(result.len(), 3, "expected one row per Doc");
+
+    // Aardvark (row 0): NULL source → score must be NULL, not an error.
+    let aardvark = &result.rows()[0];
+    assert_eq!(aardvark.get::<String>("title")?, "Aardvark");
+    let aardvark_score: Option<f64> = aardvark.get("score")?;
+    assert!(
+        aardvark_score.is_none(),
+        "Aardvark's NULL embedding source must yield a NULL score, got {:?}",
+        aardvark_score
+    );
+
+    // Beta: source n.embedding = Gamma's [0.8, 0.6, 0.0] → numeric cosine score.
+    let beta = &result.rows()[1];
+    assert_eq!(beta.get::<String>("title")?, "Beta");
+    let beta_score: Option<f64> = beta.get("score")?;
+    assert!(
+        beta_score.is_some(),
+        "Beta has a bound neighbour embedding and must get a numeric score, got NULL"
+    );
+
+    // Gamma: NULL source → score must be NULL, not an error.
+    let gamma = &result.rows()[2];
+    assert_eq!(gamma.get::<String>("title")?, "Gamma");
+    let gamma_score: Option<f64> = gamma.get("score")?;
+    assert!(
+        gamma_score.is_none(),
+        "Gamma's NULL embedding source must yield a NULL score, got {:?}",
+        gamma_score
+    );
+
+    Ok(())
+}
+
 // ── Regression: Issue #39 — similar_to FTS must work without flush ───────────
 
 /// Verifies that `similar_to()` in FTS mode returns correct scores for data

@@ -1139,6 +1139,10 @@ impl AsyncDatabaseBuilder {
 pub struct AsyncTransaction {
     pub(crate) inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
     pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
+    /// Cloned cancellation token, captured before the `Transaction` is moved
+    /// into the `Arc<Mutex<..>>`, so `cancel()` can fire without taking the
+    /// async lock (which may be held by the in-flight operation being cancelled).
+    pub(crate) cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 #[pymethods]
@@ -1329,12 +1333,13 @@ impl AsyncTransaction {
     }
 
     /// Cancel in-progress operations on this transaction.
+    ///
+    /// Fires the cancellation token directly without taking the async lock,
+    /// which the in-flight operation being cancelled may still be holding.
     fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let token = self.cancellation_token.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = active_tx(&guard)?;
-            tx.cancel();
+            token.cancel();
             Ok(())
         })
     }
@@ -1470,14 +1475,12 @@ impl AsyncTransaction {
     }
 
     /// Get the transaction's cancellation token.
+    ///
+    /// Returns the cloned token directly without taking the async lock.
     fn cancellation_token<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let token = self.cancellation_token.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = active_tx(&guard)?;
-            Ok(crate::types::PyCancellationToken {
-                inner: tx.cancellation_token(),
-            })
+            Ok(crate::types::PyCancellationToken { inner: token })
         })
     }
 
@@ -1750,13 +1753,20 @@ impl AsyncStreamingAppender {
     fn abort<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // `abort` is a cheap synchronous drop on the core appender, so no
-            // `spawn_blocking` is needed.
-            let mut guard = inner
-                .lock()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            if let Some(appender) = guard.take() {
-                appender.abort();
+            // Take the appender out under the lock, then drop the guard before
+            // awaiting the async rollback so the non-Send guard never crosses an
+            // await point.
+            let appender = {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                guard.take()
+            };
+            if let Some(appender) = appender {
+                appender
+                    .abort()
+                    .await
+                    .map_err(crate::exceptions::uni_error_to_pyerr)?;
             }
             Ok(())
         })
@@ -1789,9 +1799,18 @@ impl AsyncStreamingAppender {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().unwrap();
-            if let Some(appender) = guard.take() {
-                appender.abort();
+            // Take the appender out under the lock, then drop the guard before
+            // awaiting the async rollback so the non-Send guard never crosses an
+            // await point.
+            let appender = {
+                let mut guard = inner.lock().unwrap();
+                guard.take()
+            };
+            if let Some(appender) = appender {
+                appender
+                    .abort()
+                    .await
+                    .map_err(crate::exceptions::uni_error_to_pyerr)?;
             }
             Ok(false)
         })
@@ -2205,9 +2224,11 @@ impl AsyncSession {
             }
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
             let rule_reg = tx.rules().clone_registry_arc();
+            let token = tx.cancellation_token();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
                 rule_registry_arc: rule_reg,
+                cancellation_token: token,
             })
         })
     }
@@ -2716,9 +2737,11 @@ impl AsyncTransactionBuilder {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             let rule_reg = tx.rules().clone_registry_arc();
+            let token = tx.cancellation_token();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
                 rule_registry_arc: rule_reg,
+                cancellation_token: token,
             })
         })
     }

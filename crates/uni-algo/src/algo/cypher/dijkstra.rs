@@ -11,7 +11,7 @@
 use crate::algo::algorithms::{Algorithm, Dijkstra, DijkstraConfig};
 use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 pub struct DijkstraAdapter;
@@ -55,6 +55,9 @@ impl GraphAlgoAdapter for DijkstraAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
+        // `Dijkstra::run` now returns a `Result`: propagate weight-validation
+        // errors (e.g. a negative edge) into the adapter's `anyhow::Result`.
+        let result = result.map_err(|e| anyhow!(e))?;
         if let Some(path) = result.path {
             let target = match path.last() {
                 Some(v) => *v,
@@ -111,7 +114,7 @@ mod tests {
             ],
             path: Some(vec![Vid::from(0), Vid::from(1), Vid::from(2)]),
         };
-        let rows = DijkstraAdapter::map_result(result).expect("map_result must succeed");
+        let rows = DijkstraAdapter::map_result(Ok(result)).expect("map_result must succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], json!(2_u64));
         assert_eq!(rows[0].values[1], json!(5.0));
@@ -131,7 +134,7 @@ mod tests {
             ],
             path: None,
         };
-        let rows = DijkstraAdapter::map_result(result).expect("map_result must succeed");
+        let rows = DijkstraAdapter::map_result(Ok(result)).expect("map_result must succeed");
         assert_eq!(rows.len(), 3);
         for row in &rows {
             assert!(matches!(&row.values[2], Value::Array(a) if a.is_empty()));

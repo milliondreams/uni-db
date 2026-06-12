@@ -3,6 +3,7 @@ pub mod bug_coalesce_utf8;
 pub mod bug_rebuild_indexes_path;
 pub mod bug_traversal_filtering;
 pub mod bug_vector_query_l0_scores;
+pub mod graph_projection_tx_visibility;
 pub mod issue43_insert_latency_diagnostic;
 pub mod issue43_repro;
 pub mod issue46_compaction_race;

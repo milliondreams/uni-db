@@ -108,7 +108,7 @@ mod wcc;
 pub use wcc::{Wcc, WccConfig, WccResult};
 
 mod dijkstra;
-pub use dijkstra::{Dijkstra, DijkstraConfig, DijkstraResult};
+pub use dijkstra::{Dijkstra, DijkstraConfig, DijkstraError, DijkstraResult};
 
 mod louvain;
 pub use louvain::{Louvain, LouvainConfig, LouvainResult};

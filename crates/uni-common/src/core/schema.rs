@@ -486,6 +486,18 @@ impl Default for Schema {
 }
 
 impl Schema {
+    /// Bumps `schema_version` to invalidate cached query plans.
+    ///
+    /// Called at the end of every DDL mutation that changes the schema's
+    /// shape (labels, edge types, properties, indexes, constraints). The
+    /// plan-cache eviction guard keys on `schema_version`, so a stale plan
+    /// built against an older shape is discarded once this advances. Uses
+    /// wrapping arithmetic: the value is a coarse change token, not a count,
+    /// so wraparound only risks a missed eviction after 2^32 DDL operations.
+    fn bump_version(&mut self) {
+        self.schema_version = self.schema_version.wrapping_add(1);
+    }
+
     /// Returns the label name for a given label ID.
     ///
     /// Performs a linear scan over all labels. This is efficient because
@@ -1193,6 +1205,7 @@ impl SchemaManager {
                 description,
             },
         );
+        schema.bump_version();
         Ok(id)
     }
 
@@ -1242,6 +1255,7 @@ impl SchemaManager {
                 description,
             },
         );
+        schema.bump_version();
         Ok(id)
     }
 
@@ -1306,6 +1320,8 @@ impl SchemaManager {
                 description,
             },
         );
+        // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
         Ok(())
     }
 
@@ -1342,6 +1358,8 @@ impl SchemaManager {
                 description: None,
             },
         );
+        // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
         Ok(())
     }
 
@@ -1406,6 +1424,7 @@ impl SchemaManager {
         } else {
             schema.indexes.push(index_def);
         }
+        schema.bump_version();
         Ok(())
     }
 
@@ -1439,6 +1458,7 @@ impl SchemaManager {
         let schema = Arc::make_mut(&mut *guard);
         if let Some(pos) = schema.indexes.iter().position(|i| i.name() == name) {
             schema.indexes.remove(pos);
+            schema.bump_version();
             Ok(())
         } else {
             Err(anyhow!("Index '{}' not found", name))
@@ -1452,6 +1472,7 @@ impl SchemaManager {
             return Err(anyhow!("Constraint '{}' already exists", constraint.name));
         }
         schema.constraints.push(constraint);
+        schema.bump_version();
         Ok(())
     }
 
@@ -1460,6 +1481,7 @@ impl SchemaManager {
         let schema = Arc::make_mut(&mut *guard);
         if let Some(pos) = schema.constraints.iter().position(|c| c.name == name) {
             schema.constraints.remove(pos);
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())
@@ -1471,19 +1493,18 @@ impl SchemaManager {
     pub fn drop_property(&self, label_or_type: &str, prop_name: &str) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
-        if let Some(props) = schema.properties.get_mut(label_or_type) {
-            if props.remove(prop_name).is_some() {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "Property '{}' not found for '{}'",
-                    prop_name,
-                    label_or_type
-                ))
-            }
-        } else {
-            Err(anyhow!("Label or Edge Type '{}' not found", label_or_type))
+        let Some(props) = schema.properties.get_mut(label_or_type) else {
+            return Err(anyhow!("Label or Edge Type '{}' not found", label_or_type));
+        };
+        if props.remove(prop_name).is_none() {
+            return Err(anyhow!(
+                "Property '{}' not found for '{}'",
+                prop_name,
+                label_or_type
+            ));
         }
+        schema.bump_version();
+        Ok(())
     }
 
     pub fn rename_property(
@@ -1494,25 +1515,24 @@ impl SchemaManager {
     ) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
-        if let Some(props) = schema.properties.get_mut(label_or_type) {
-            if let Some(meta) = props.remove(old_name) {
-                if props.contains_key(new_name) {
-                    // Rollback removal? Or just error.
-                    props.insert(old_name.to_string(), meta); // Restore
-                    return Err(anyhow!("Property '{}' already exists", new_name));
-                }
-                props.insert(new_name.to_string(), meta);
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "Property '{}' not found for '{}'",
-                    old_name,
-                    label_or_type
-                ))
-            }
-        } else {
-            Err(anyhow!("Label or Edge Type '{}' not found", label_or_type))
+        let Some(props) = schema.properties.get_mut(label_or_type) else {
+            return Err(anyhow!("Label or Edge Type '{}' not found", label_or_type));
+        };
+        let Some(meta) = props.remove(old_name) else {
+            return Err(anyhow!(
+                "Property '{}' not found for '{}'",
+                old_name,
+                label_or_type
+            ));
+        };
+        if props.contains_key(new_name) {
+            // Rollback removal? Or just error.
+            props.insert(old_name.to_string(), meta); // Restore
+            return Err(anyhow!("Property '{}' already exists", new_name));
         }
+        props.insert(new_name.to_string(), meta);
+        schema.bump_version();
+        Ok(())
     }
 
     pub fn drop_label(&self, name: &str, if_exists: bool) -> Result<()> {
@@ -1521,6 +1541,7 @@ impl SchemaManager {
         if let Some(label_meta) = schema.labels.get_mut(name) {
             label_meta.state = SchemaElementState::Tombstone { since: Utc::now() };
             // Do not remove properties; they are implicitly tombstoned by the label
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())
@@ -1535,6 +1556,7 @@ impl SchemaManager {
         if let Some(edge_meta) = schema.edge_types.get_mut(name) {
             edge_meta.state = SchemaElementState::Tombstone { since: Utc::now() };
             // Do not remove properties; they are implicitly tombstoned by the edge type
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())

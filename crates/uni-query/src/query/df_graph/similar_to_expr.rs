@@ -240,6 +240,8 @@ enum ScoringMode {
     AutoEmbed(DistanceMetric),
     /// Both are strings → FTS search once, VID lookup per-row.
     Fts,
+    /// Source or query is NULL → the row's result is NULL (no scoring/fusion).
+    Null,
 }
 
 impl PhysicalExpr for SimilarToExecExpr {
@@ -290,24 +292,43 @@ impl PhysicalExpr for SimilarToExecExpr {
             datafusion::error::DataFusionError::Execution(format!("similar_to: {}", e))
         })?;
 
-        // 3. Determine scoring mode per source by inspecting first row's types
+        // 3. Determine scoring mode per source.
         if num_rows == 0 {
             let mut builder = Float64Builder::with_capacity(0);
             return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
         }
 
-        let first_row_source_vals: Vec<Value> = source_cvs
-            .iter()
-            .map(|cv| columnar_value_to_value(cv, batch, 0))
-            .collect();
-        let first_row_query_vals: Vec<Value> = query_cvs
-            .iter()
-            .map(|cv| columnar_value_to_value(cv, batch, 0))
+        // Pick, per source column, the first row whose source AND query are both
+        // non-NULL — that representative row decides the mode and supplies any
+        // FTS/auto-embed query string. NULL rows never decide the mode (they are
+        // scored as NULL per-row below), so a leading NULL no longer aborts the
+        // batch nor forces a real-valued column to NULL.
+        let representative_rows: Vec<Option<usize>> = (0..num_sources)
+            .map(|i| {
+                (0..num_rows).find(|&r| {
+                    let s = columnar_value_to_value(&source_cvs[i], batch, r);
+                    let q = columnar_value_to_value(&query_cvs[i], batch, r);
+                    !matches!(s, Value::Null) && !matches!(q, Value::Null)
+                })
+            })
             .collect();
 
-        let scoring_modes: Vec<ScoringMode> = first_row_source_vals
+        let repr_source_vals: Vec<Value> = (0..num_sources)
+            .map(|i| match representative_rows[i] {
+                Some(r) => columnar_value_to_value(&source_cvs[i], batch, r),
+                None => Value::Null,
+            })
+            .collect();
+        let repr_query_vals: Vec<Value> = (0..num_sources)
+            .map(|i| match representative_rows[i] {
+                Some(r) => columnar_value_to_value(&query_cvs[i], batch, r),
+                None => Value::Null,
+            })
+            .collect();
+
+        let scoring_modes: Vec<ScoringMode> = repr_source_vals
             .iter()
-            .zip(first_row_query_vals.iter())
+            .zip(repr_query_vals.iter())
             .enumerate()
             .map(|(i, (s, q))| {
                 determine_scoring_mode(s, q, self.source_metrics.get(i).and_then(|m| m.as_ref()))
@@ -345,8 +366,9 @@ impl PhysicalExpr for SimilarToExecExpr {
         let graph_ctx = self.graph_ctx.clone();
         let source_property_names = self.source_property_names.clone();
 
-        // Collect query strings for FTS/auto-embed (from first row — typically constant)
-        let query_strings: Vec<Option<String>> = first_row_query_vals
+        // Collect query strings for FTS/auto-embed (from the representative row
+        // chosen above — typically constant across rows).
+        let query_strings: Vec<Option<String>> = repr_query_vals
             .iter()
             .map(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -396,7 +418,9 @@ impl PhysicalExpr for SimilarToExecExpr {
                             ))?;
                             fts_results[i] = Some(results);
                         }
-                        ScoringMode::Vector(_) => {} // No pre-computation needed
+                        // No pre-computation needed for direct vector scoring
+                        // or NULL-propagating sources.
+                        ScoringMode::Vector(_) | ScoringMode::Null => {}
                     }
                 }
 
@@ -418,12 +442,34 @@ impl PhysicalExpr for SimilarToExecExpr {
 
         for row_idx in 0..num_rows {
             let mut scores = Vec::with_capacity(num_sources);
+            // NULL propagates: if any source/query for this row is NULL, the
+            // whole row's similarity is NULL — no scoring or fusion.
+            let mut row_is_null = false;
 
             for (src_idx, mode) in scoring_modes.iter().enumerate() {
+                // NULL propagates per-row: the column-level mode is decided from a
+                // representative non-NULL row, but any individual row whose source
+                // or query is NULL scores as NULL regardless of that mode.
+                let row_source = columnar_value_to_value(&source_cvs[src_idx], batch, row_idx);
+                let row_query = columnar_value_to_value(&query_cvs[src_idx], batch, row_idx);
+                if matches!(mode, ScoringMode::Null)
+                    || matches!(row_source, Value::Null)
+                    || matches!(row_query, Value::Null)
+                {
+                    row_is_null = true;
+                    break;
+                }
+
                 let score = match mode {
+                    // Unreachable: a NULL column mode is handled by the per-row
+                    // NULL check above, which breaks before this match.
+                    ScoringMode::Null => {
+                        row_is_null = true;
+                        break;
+                    }
                     ScoringMode::Vector(metric) => {
-                        let sv = columnar_value_to_value(&source_cvs[src_idx], batch, row_idx);
-                        let qv = columnar_value_to_value(&query_cvs[src_idx], batch, row_idx);
+                        let sv = row_source;
+                        let qv = row_query;
                         score_vectors_from_values(&sv, &qv, metric).map_err(|e| {
                             datafusion::error::DataFusionError::Execution(format!(
                                 "similar_to vector: {}",
@@ -432,7 +478,7 @@ impl PhysicalExpr for SimilarToExecExpr {
                         })?
                     }
                     ScoringMode::AutoEmbed(metric) => {
-                        let sv = columnar_value_to_value(&source_cvs[src_idx], batch, row_idx);
+                        let sv = row_source;
                         let embed_vec = precomputed.embed_vectors[src_idx]
                             .as_ref()
                             .expect("auto-embed should have been precomputed");
@@ -461,6 +507,11 @@ impl PhysicalExpr for SimilarToExecExpr {
                     }
                 };
                 scores.push(score);
+            }
+
+            if row_is_null {
+                builder.append_null();
+                continue;
             }
 
             let fused = fuse_scores(&scores, &opts).map_err(|e| {
@@ -532,6 +583,12 @@ fn determine_scoring_mode(
     query: &Value,
     metric: Option<&DistanceMetric>,
 ) -> Result<ScoringMode, String> {
+    // NULL propagates: a NULL source or query yields a NULL score, never an
+    // error. Checked first so a NULL in the (mode-determining) first row does
+    // not fall through to the `_ => Err(...)` arm and abort the whole batch.
+    if matches!(source, Value::Null) || matches!(query, Value::Null) {
+        return Ok(ScoringMode::Null);
+    }
     let m = metric.cloned().unwrap_or(DistanceMetric::Cosine);
     match (source, query) {
         (Value::Vector(_) | Value::List(_), Value::Vector(_) | Value::List(_)) => {

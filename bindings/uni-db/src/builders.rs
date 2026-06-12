@@ -2172,10 +2172,11 @@ impl StreamingAppender {
     }
 
     /// Abort without committing.
-    fn abort(&self) -> PyResult<()> {
+    fn abort(&self, py: Python<'_>) -> PyResult<()> {
         let mut guard = self.inner.lock().unwrap();
         if let Some(appender) = guard.take() {
-            appender.abort();
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(appender.abort()))
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
         }
         Ok(())
     }
@@ -2211,6 +2212,7 @@ impl StreamingAppender {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
@@ -2218,7 +2220,7 @@ impl StreamingAppender {
         let guard = self.inner.lock().unwrap();
         if guard.is_some() {
             drop(guard);
-            self.abort()?;
+            self.abort(py)?;
         }
         Ok(false)
     }

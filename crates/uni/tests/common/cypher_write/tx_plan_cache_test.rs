@@ -13,6 +13,85 @@
 use anyhow::Result;
 use uni_db::{DataType, Uni, Value};
 
+/// Regression repro for the stale read-plan cache after a schema DDL change
+/// (Bug #2): `schema_version` is initialized to 1 and never incremented by any
+/// `SchemaManager` mutator, so the session read-plan cache's version-guard
+/// eviction is a dead branch. An untyped traversal `MATCH (a)-[]->(b)` freezes
+/// `edge_type_ids = all_edge_type_ids()` at plan time, so a session that cached
+/// the plan before a new edge type was added keeps undercounting after.
+///
+/// RED today: step 6 returns `1` (stale plan excludes the new `LIKES` edge),
+/// while a fresh session correctly returns `2` — proving the staleness is in the
+/// cache, not the data.
+#[tokio::test]
+async fn untyped_traversal_plan_is_stale_after_new_edge_type_ddl() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    // Schema: label `Person`, edge type `KNOWS` (Person -> Person).
+    db.schema()
+        .label("Person")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("KNOWS", &["Person"], &["Person"])
+        .done()
+        .apply()
+        .await?;
+
+    // Seed: two `:Person` joined by one `KNOWS` edge.
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {id: 'a'})-[:KNOWS]->(b:Person {id: 'b'})")
+        .await?;
+    tx.commit().await?;
+
+    // Reused session: cache the untyped-traversal plan (edge_type_ids = [KNOWS]).
+    let session = db.session();
+    let r1 = session
+        .query("MATCH (a)-[]->(b) RETURN count(*) AS c")
+        .await?;
+    assert_eq!(
+        r1.rows()[0].get::<i64>("c").unwrap(),
+        1,
+        "one KNOWS edge before the DDL change"
+    );
+
+    // DDL on the SAME db: add edge type `LIKES` (Person -> Person)...
+    db.schema()
+        .edge_type("LIKES", &["Person"], &["Person"])
+        .done()
+        .apply()
+        .await?;
+
+    // ...then create one `LIKES` edge in a fresh transaction.
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Person {id: 'a'}), (b:Person {id: 'b'}) CREATE (a)-[:LIKES]->(b)")
+        .await?;
+    tx.commit().await?;
+
+    // Sanity: a FRESH session re-plans and counts both edges — the data is fine.
+    let fresh = db
+        .session()
+        .query("MATCH (a)-[]->(b) RETURN count(*) AS c")
+        .await?;
+    assert_eq!(
+        fresh.rows()[0].get::<i64>("c").unwrap(),
+        2,
+        "a fresh session must count both KNOWS and LIKES — proving the data is correct"
+    );
+
+    // Re-run the SAME query text on the SAME `session`. Because `schema_version`
+    // never incremented, the stale cached plan (edge_type_ids = [KNOWS]) is
+    // reused and undercounts the `LIKES` edge.
+    let r2 = session
+        .query("MATCH (a)-[]->(b) RETURN count(*) AS c")
+        .await?;
+    assert_eq!(
+        r2.rows()[0].get::<i64>("c").unwrap(),
+        2,
+        "reused session must see the new LIKES edge after the DDL change"
+    );
+    Ok(())
+}
+
 fn row(name: &str, age: i64) -> Value {
     let mut m = std::collections::HashMap::new();
     m.insert("name".to_string(), Value::String(name.to_string()));
@@ -129,12 +208,13 @@ async fn distinct_query_texts_do_not_collide() -> Result<()> {
 /// A cached write plan survives a later schema change (a new column on the
 /// same label) and still produces correct results.
 ///
-/// Note: `add_property`/`add_label` do not bump `schema_version` (verified in
-/// `uni-common` schema.rs), so the version guard does not invalidate here — and
-/// it need not: a cached *write* plan encodes only the CREATE/SET structure
+/// Note: `add_property`/`add_label` now bump `schema_version` (in `uni-common`
+/// schema.rs), so the version guard evicts the cached plan after the DDL and the
+/// re-run re-plans against the live schema. Even absent that guard the result
+/// would be correct: a cached *write* plan encodes only the CREATE/SET structure
 /// from the query text, while constraint validation, type coercion, and index
 /// maintenance all re-read the live schema at execution. This test guards that
-/// reusing a pre-change plan does not corrupt post-change writes.
+/// a schema change between executions does not corrupt post-change writes.
 #[tokio::test]
 async fn cached_write_survives_schema_change() -> Result<()> {
     let db = Uni::in_memory().build().await?;

@@ -162,16 +162,22 @@ impl ProjectionStore {
 }
 
 /// Look up (or create) the [`ProjectionStore`] for the given
-/// `StorageManager`. Uses the `Arc<StorageManager>` pointer identity
-/// as the registry key — two callers holding the same `Arc` see the
-/// same store; two distinct `StorageManager`s get isolated stores.
+/// `StorageManager`. Uses the backing `Arc<SchemaManager>` pointer
+/// identity as the registry key — callers sharing the same
+/// `schema_manager` Arc (e.g. a pinned transaction and the live
+/// session) see the same store, while a fork (which holds a distinct
+/// `schema_manager`) gets an isolated store.
 ///
-/// The registry leaks one entry per distinct `StorageManager` over
+/// The registry leaks one entry per distinct `schema_manager` over
 /// the process lifetime, which is bounded (a typical embedded use
 /// constructs one or two `Uni` instances per process).
 pub fn for_storage(storage: &Arc<StorageManager>) -> Arc<ProjectionStore> {
     static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<ProjectionStore>>>> = OnceLock::new();
-    let key = Arc::as_ptr(storage) as usize;
+    // Key on the `schema_manager` Arc identity, not the `StorageManager` Arc:
+    // a pinned transaction and the live session clone the *same*
+    // `schema_manager` Arc (so they must share the projection store), while a
+    // fork holds a distinct one (so it stays isolated).
+    let key = Arc::as_ptr(storage.schema_manager_arc_ref()) as usize;
     let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = match reg.lock() {
         Ok(g) => g,

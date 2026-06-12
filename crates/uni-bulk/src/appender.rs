@@ -142,10 +142,22 @@ impl StreamingAppender {
 
     /// Abort the appender without committing.
     ///
-    /// Consumes the appender. Discards all buffered and previously flushed rows.
-    pub fn abort(mut self) {
+    /// Consumes the appender. Discards all buffered rows and rolls back any
+    /// batches that were already flushed to storage, so no partially loaded
+    /// rows survive the abort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying bulk writer fails to roll back its
+    /// flushed tables.
+    pub async fn abort(mut self) -> Result<()> {
         self.buffer.clear();
-        self.writer.take(); // Drop the writer
+        if let Some(writer) = self.writer.take() {
+            // BulkWriter::abort rolls back / drops any flushed tables so that
+            // previously flushed batches do not survive the abort.
+            writer.abort().await.map_err(UniError::Internal)?;
+        }
+        Ok(())
     }
 
     /// Get the number of rows currently buffered (not yet flushed).

@@ -187,3 +187,76 @@ async def test_async_transact_with_retry():
 
     result = await async_transact_with_retry(session, body)
     assert result == 1
+
+
+@pytest.fixture
+def unique_email_db():
+    """DB with a UNIQUE constraint on User.email and one row 'a@b.com'.
+
+    A duplicate insert against this constraint fires *at execute time*
+    (inline), not at commit — which is exactly the code path that
+    distinguishes the prepared from the non-prepared error mapping.
+    """
+    db = uni_db.UniBuilder.temporary().build()
+    db.schema().label("User").property("email", "string").done().apply()
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE CONSTRAINT ON (u:User) ASSERT u.email IS UNIQUE")
+    tx.commit()
+
+    seed = db.session().tx()
+    seed.execute("CREATE (:User {email: 'a@b.com'})")
+    seed.commit()
+    return db
+
+
+def test_nonprepared_execute_maps_to_typed_uni_error(unique_email_db):
+    """Baseline / control: the NON-prepared execute path maps the inline
+    constraint-violation UniError through `uni_error_to_pyerr`, so it
+    surfaces as a typed `UniError` subclass — NOT a bare RuntimeError.
+
+    (`sync_api.rs:194` maps correctly; this test documents the *correct*
+    behavior the prepared path is supposed to mirror.)
+    """
+    tx = unique_email_db.session().tx()
+    with pytest.raises(uni_db.UniError) as excinfo:
+        tx.execute("CREATE (:User {email: 'a@b.com'})")
+    # The raised class is a typed UniError, not a plain RuntimeError.
+    assert not isinstance(excinfo.value, RuntimeError)
+    assert "Constraint violation" in str(excinfo.value)
+
+
+def test_prepared_execute_preserves_typed_uni_error(unique_email_db):
+    """REGRESSION (Bug #7): a PREPARED statement's execute() must surface
+    the underlying UniError through the typed exception hierarchy, exactly
+    like the non-prepared path.
+
+    `bindings/uni-db/src/types.rs:1513` wraps the Rust error in a bare
+    `pyo3::exceptions::PyRuntimeError` instead of
+    `crate::exceptions::uni_error_to_pyerr`. So an inline UniError returned
+    by a prepared `execute()` (here: a UNIQUE-constraint duplicate insert,
+    which fires at execute time) surfaces as a plain `RuntimeError`, NOT a
+    typed `UniError` subclass. That makes retriable conflicts
+    (Serialization/Constraint/LockTimeout) invisible to
+    `transact_with_retry`, whose RETRIABLE_EXCEPTIONS are the typed classes.
+
+    Today this is RED: the prepared execute raises bare `RuntimeError`,
+    which is NOT a `uni_db.UniError`, so `pytest.raises(uni_db.UniError)`
+    fails. After the one-line fix (use `uni_error_to_pyerr`) it raises a
+    typed `UniError` subclass (the same `UniQueryError` the non-prepared
+    path raises) and this test passes.
+    """
+    tx = unique_email_db.session().tx()
+    pq = tx.prepare("CREATE (:User {email: 'a@b.com'})")
+
+    # The prepared execute() must raise a typed UniError, just like the
+    # non-prepared path. Today it raises a bare RuntimeError -> RED.
+    with pytest.raises(uni_db.UniError) as excinfo:
+        pq.execute()
+
+    # And it must NOT be a bare RuntimeError — that is the precise bug:
+    # the typed exception hierarchy is lost on the prepared path.
+    assert not isinstance(excinfo.value, RuntimeError), (
+        "prepared execute() lost the typed UniError hierarchy and surfaced "
+        "a bare RuntimeError (Bug #7, types.rs:1513)"
+    )

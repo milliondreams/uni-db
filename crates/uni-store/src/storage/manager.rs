@@ -996,6 +996,18 @@ impl StorageManager {
         self.schema_manager.clone()
     }
 
+    /// Returns the backing `Arc<SchemaManager>` by reference.
+    ///
+    /// Unlike [`Self::schema_manager`] (which derefs to `&SchemaManager`),
+    /// this preserves the `Arc`'s pointer identity. A pinned transaction and
+    /// the live session clone the *same* `schema_manager` `Arc`, while forks
+    /// hold a distinct one — so this is the correct registry key for the
+    /// projection store (see `uni-query`'s `projection_store::for_storage`).
+    #[must_use]
+    pub fn schema_manager_arc_ref(&self) -> &Arc<SchemaManager> {
+        &self.schema_manager
+    }
+
     /// Get the adjacency manager for the dual-CSR architecture.
     pub fn adjacency_manager(&self) -> Arc<AdjacencyManager> {
         Arc::clone(&self.adjacency_manager)

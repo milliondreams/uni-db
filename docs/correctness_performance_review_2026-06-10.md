@@ -561,7 +561,7 @@ rewrite touching the Python-binding surface. Tracked separately.
 > | Fix | Bench | Before → After |
 > |---|---|---|
 > | #3a ext_id index | `mutation_extid_ingest/4000` | 193.1 ms → **38.6 ms** (5.0×; quadratic → linear) |
-> | #4 batched MERGE | `mutation_unwind_merge_batched` (1000 rows, 50% hit, flushed) | 1.702 s → **1.091 s** (1.56×; 1000 Lance scans → 1) |
+> | #4 batched MERGE | `mutation_unwind_merge_batched` (1000 rows, 50% hit, flushed) | 1.702 s → **1.091 s** (1.56×; 1000 Lance scans → 1); then → **17.5 ms** with the statement-level property prefetch (2026-06-12, `f614f317c`; 97× total) |
 > | #5 traversal pushdown | `schemaless_traversal/one_source_100k_edges` | 32.9 ms → **7.7 ms** (4.3×); all-sources arm unregressed (47.2 → 50.7 ms, threshold 1024) |
 > | #2 WAL double-write | WAL entries per edge-commit | 2 → **1** (`commit_writes_each_mutation_to_wal_exactly_once`, red-green) |
 > | #2+#7 cluster | `mutation_*` / `commit_throughput` collateral | within noise |
@@ -574,10 +574,24 @@ rewrite touching the Python-binding surface. Tracked separately.
 >   #3b (per-row Lance `count_rows` on single inserts) deferred as documented.
 > - **#4** — per-statement prefetch `merge_lookup_persisted_batch` (canonical key tuples, 1000/chunk,
 >   type-grouped `IN`/OR-of-ANDs, fail-closed); per-row liveness re-checks kept at row time.
->   Residual: per-row ON CREATE/ON MATCH SET + post-SET property re-read now dominate (~1.1 ms/row).
->   **Found (pre-existing, parity-pinned):** MERGE on an *undeclared* label cannot match FLUSHED
+>   ~~Residual: per-row ON CREATE/ON MATCH SET + post-SET property re-read now dominate
+>   (~1.1 ms/row).~~ **FIXED 2026-06-12** (`f614f317c`): statement-level property `Prefetch` —
+>   matched vids batch-read once (`get_batch_vertex_props_for_label`, one `_vid IN (…)` scan),
+>   created vids seeded with an empty base, per-row reads resolve as base + L0 layering; CRDT-bearing
+>   labels keep the per-row path; fail-open on batch errors.
+>   `mutation_unwind_merge_batched`: 1.103 s → **17.5 ms** (−98.4%, ~63×); null-SET guard
+>   `merge_on_match_set_null_after_flush`.
+>   ~~**Found (pre-existing, parity-pinned):** MERGE on an *undeclared* label cannot match FLUSHED
 >   rows (persisted lookup sees nothing) and re-creates them — identical on the old per-row path;
->   see `merge_batch_mixed_key_types`.
+>   see `merge_batch_mixed_key_types`.~~ **FIXED 2026-06-12** (`d5b77ea71`): undeclared labels route
+>   to a main-vertex-table lookup (`array_contains(labels,…)` + MVCC dedup with tombstones visible +
+>   in-memory `props_json` key match — the schemaless MATCH read path). Fixing it exposed two more
+>   per-label blind spots, both fixed at the root: `fetch_prop_from_storage` (single-prop reads,
+>   e.g. SET RHS `n.freq + e.c`) had no main-table fallback (its all-props sibling did) — added,
+>   gated on "no per-label verdict"; and `find_props_by_vid` filtered `_deleted = false` *before*
+>   the max-version pick, letting a deleted-and-flushed schemaless vertex resurrect its older live
+>   row — now dedups with tombstones visible. Red-green: `merge_batch_mixed_key_types` tightened
+>   6 → 4, plus `merge_schemaless_{flushed_no_duplicates,on_match_set_after_flush,deleted_after_flush_recreates}`.
 > - **#5** — source-VID pushdown (`find_edges_by_type_names` endpoint filter, ≤1024 sources, both
 >   storage tiers — the L0 overlay too, so the SSI read-set footprint is consistent) + `Arc`-shared
 >   type/props in the adjacency map (the `Both` deep-clone is gone). New SSI tests cover the

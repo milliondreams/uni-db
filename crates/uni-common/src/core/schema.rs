@@ -416,6 +416,11 @@ impl SchemalessEdgeTypeRegistry {
         self.name_to_id.contains_key(type_name)
     }
 
+    /// Looks up the schemaless ID for `type_name` (exact match, read-only).
+    pub fn id_by_name(&self, type_name: &str) -> Option<u32> {
+        self.name_to_id.get(type_name).copied()
+    }
+
     /// Looks up the edge type ID for `type_name` with case-insensitive matching.
     pub fn id_by_name_case_insensitive(&self, type_name: &str) -> Option<u32> {
         self.name_to_id
@@ -635,10 +640,22 @@ impl Schema {
     /// Requires `&mut self` because it may assign a new schemaless ID.
     /// Use [`edge_type_id_by_name`](Self::edge_type_id_by_name) for read-only schema lookups.
     pub fn get_or_assign_edge_type_id(&mut self, type_name: &str) -> u32 {
-        if let Some(id) = self.edge_type_id_by_name(type_name) {
+        if let Some(id) = self.edge_type_id_unified(type_name) {
             return id;
         }
         self.schemaless_registry.get_or_assign_id(type_name)
+    }
+
+    /// Read-only unified exact lookup: schema-defined edge type id, falling
+    /// back to an already-assigned schemaless id.
+    ///
+    /// Mirrors exactly the checks [`get_or_assign_edge_type_id`]
+    /// (Self::get_or_assign_edge_type_id) performs before assigning, so a
+    /// `Some` here means the assigning path would be a no-op — the basis for
+    /// `SchemaManager`'s read-lock fast path.
+    pub fn edge_type_id_unified(&self, type_name: &str) -> Option<u32> {
+        self.edge_type_id_by_name(type_name)
+            .or_else(|| self.schemaless_registry.id_by_name(type_name))
     }
 
     /// Returns the edge type name for `type_id`, checking both the schema
@@ -1260,7 +1277,21 @@ impl SchemaManager {
     }
 
     /// Delegates to [`Schema::get_or_assign_edge_type_id`].
+    ///
+    /// Read-lock fast path: the type name is almost always already known
+    /// (it is constant per statement but resolved per row by the CREATE
+    /// executor), and the slow path's write lock + `Arc::make_mut` deep-clones
+    /// the whole `Schema` whenever the Arc is shared — which under SSI it
+    /// always is. Double-checked: on a miss, `Schema::get_or_assign_edge_type_id`
+    /// re-checks under the write lock, so two racing assigners converge on one id.
     pub fn get_or_assign_edge_type_id(&self, type_name: &str) -> u32 {
+        {
+            let guard = acquire_read(&self.schema, "schema")
+                .expect("Schema lock poisoned - a thread panicked while holding it");
+            if let Some(id) = guard.edge_type_id_unified(type_name) {
+                return id;
+            }
+        }
         let mut guard = acquire_write(&self.schema, "schema")
             .expect("Schema lock poisoned - a thread panicked while holding it");
         let schema = Arc::make_mut(&mut *guard);
@@ -2167,6 +2198,39 @@ mod tests {
 
         // Primary unchanged.
         assert!(!primary.schema().labels.contains_key("NewLabel"));
+        Ok(())
+    }
+
+    /// N threads racing `get_or_assign_edge_type_id` for the same new name
+    /// must converge on a single id (the read-lock fast path double-checks
+    /// under the write lock); a schema-defined type must win over the
+    /// schemaless registry.
+    #[tokio::test]
+    async fn test_get_or_assign_edge_type_id_concurrent() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = Arc::new(SchemaManager::load_from_store(store, &path).await?);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let m = manager.clone();
+            handles.push(std::thread::spawn(move || {
+                m.get_or_assign_edge_type_id("RACED")
+            }));
+        }
+        let ids: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            ids.iter().all(|&id| id == ids[0]),
+            "all racers must observe one id, got {ids:?}"
+        );
+        // Fast path returns the same id afterwards.
+        assert_eq!(manager.get_or_assign_edge_type_id("RACED"), ids[0]);
+
+        // Schema-defined type wins over the schemaless registry.
+        manager.add_label("A")?;
+        let declared = manager.add_edge_type("DECLARED", vec!["A".into()], vec!["A".into()])?;
+        assert_eq!(manager.get_or_assign_edge_type_id("DECLARED"), declared);
         Ok(())
     }
 }

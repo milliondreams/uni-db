@@ -685,6 +685,25 @@ impl Writer {
                     }
                 }
 
+                // Same race window for global ext_id uniqueness: the per-insert
+                // check ran against an older main L0; re-probe the committed
+                // index here, where commits serialize.
+                for (ext_id, vid) in &tx_l0.extid_index {
+                    if let Some(&owner) = main_l0.extid_index.get(ext_id)
+                        && owner != *vid
+                    {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: format!(
+                                    "ext_id '{ext_id}' already committed by a concurrent \
+                                     transaction"
+                                ),
+                            },
+                        ));
+                    }
+                }
+
                 // CRDT carve-out soundness: a pure-CRDT write was dropped from the
                 // write-set assuming its merge commutes. If main L0 holds a
                 // *different* CRDT variant for the same property, the merge would
@@ -740,7 +759,7 @@ impl Writer {
                 for (vid, properties) in &tx_l0.vertex_properties {
                     if !tx_l0.vertex_tombstones.contains(vid) {
                         let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                        wal.append(&crate::runtime::wal::Mutation::InsertVertex {
+                        wal.append(crate::runtime::wal::Mutation::InsertVertex {
                             vid: *vid,
                             properties: properties.clone(),
                             labels,
@@ -751,7 +770,7 @@ impl Writer {
                 // Vertex deletions
                 for vid in &tx_l0.vertex_tombstones {
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                    wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
+                    wal.append(crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
 
                 // Label-only mutations (SET n:Label / REMOVE n:Label). After
@@ -762,7 +781,7 @@ impl Writer {
                         continue;
                     }
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                    wal.append(&crate::runtime::wal::Mutation::SetVertexLabels {
+                    wal.append(crate::runtime::wal::Mutation::SetVertexLabels {
                         vid: *vid,
                         labels,
                     })?;
@@ -777,7 +796,7 @@ impl Writer {
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
                     if tx_l0.tombstones.contains_key(eid) {
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
-                        wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
+                        wal.append(crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
                             src_vid: *src_vid,
                             dst_vid: *dst_vid,
@@ -789,7 +808,7 @@ impl Writer {
                             tx_l0.edge_properties.get(eid).cloned().unwrap_or_default();
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
                         let edge_type_name = tx_l0.edge_types.get(eid).cloned();
-                        wal.append(&crate::runtime::wal::Mutation::InsertEdge {
+                        wal.append(crate::runtime::wal::Mutation::InsertEdge {
                             src_vid: *src_vid,
                             dst_vid: *dst_vid,
                             edge_type: *edge_type,
@@ -807,7 +826,7 @@ impl Writer {
                 for (eid, tombstone) in &tx_l0.tombstones {
                     if !tx_l0.edge_endpoints.contains_key(eid) {
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
-                        wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
+                        wal.append(crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
                             src_vid: tombstone.src_vid,
                             dst_vid: tombstone.dst_vid,
@@ -843,10 +862,15 @@ impl Writer {
 
         // 3. Merge into main L0 and make visible
         {
-            let tx_l0 = tx_l0_arc.read();
+            // Write-lock the tx buffer: `merge_take` moves its property maps
+            // into main L0 instead of cloning them. The commit consumes the
+            // transaction, so the drained maps are never observed afterwards;
+            // everything read below (endpoints, versions, tombstones) is left
+            // intact.
+            let mut tx_l0 = tx_l0_arc.write();
             let main_l0_arc = self.l0_manager.get_current();
             let mut main_l0 = main_l0_arc.write();
-            main_l0.merge(&tx_l0)?;
+            main_l0.merge_take(&mut tx_l0)?;
 
             // Replay transaction edges into the AdjacencyManager overlay
             for (eid, (src, dst, etype)) in &tx_l0.edge_endpoints {
@@ -1532,8 +1556,10 @@ impl Writer {
         };
 
         for l0 in &l0_buffers_to_check {
-            if let Some(vid) =
-                Self::find_extid_in_properties(&l0.read().vertex_properties, ext_id, current_vid)
+            // O(1) per buffer via the maintained `extid_index` (the previous
+            // full `vertex_properties` scan made constrained ingest O(n²)).
+            if let Some(&vid) = l0.read().extid_index.get(ext_id)
+                && vid != current_vid
             {
                 return Err(anyhow!(
                     "Constraint violation: ext_id '{}' already exists (vertex {:?})",
@@ -1557,21 +1583,6 @@ impl Writer {
         }
 
         Ok(())
-    }
-
-    /// Search vertex properties for a duplicate ext_id, excluding `current_vid`.
-    fn find_extid_in_properties(
-        vertex_properties: &HashMap<Vid, Properties>,
-        ext_id: &str,
-        current_vid: Vid,
-    ) -> Option<Vid> {
-        vertex_properties.iter().find_map(|(&vid, props)| {
-            if vid != current_vid && props.get("ext_id").and_then(|v| v.as_str()) == Some(ext_id) {
-                Some(vid)
-            } else {
-                None
-            }
-        })
     }
 
     /// Helper to get vertex labels from L0 buffer.

@@ -145,7 +145,7 @@ async fn test_wal_has_segments() -> Result<()> {
     use uni_common::core::id::Vid;
     use uni_store::runtime::wal::Mutation;
 
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(1),
         properties: HashMap::new(),
         labels: vec!["Test".to_string()],

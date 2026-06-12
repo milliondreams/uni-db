@@ -109,7 +109,7 @@ async fn test_wal_with_object_store() -> Result<()> {
         .collect(),
         labels: vec![],
     };
-    wal.append(&entry1)?;
+    wal.append(entry1)?;
 
     let entry2 = Mutation::InsertVertex {
         vid: Vid::new(101),
@@ -121,7 +121,7 @@ async fn test_wal_with_object_store() -> Result<()> {
         .collect(),
         labels: vec![],
     };
-    wal.append(&entry2)?;
+    wal.append(entry2)?;
 
     // Flush to ensure data is persisted
     wal.flush().await?;
@@ -326,7 +326,7 @@ async fn test_wal_large_entries() -> Result<()> {
         labels: vec![],
     };
 
-    wal.append(&entry)?;
+    wal.append(entry)?;
     wal.flush().await?;
 
     // Replay and verify
@@ -360,7 +360,7 @@ async fn test_wal_truncate() -> Result<()> {
             properties: HashMap::new(),
             labels: vec![],
         };
-        wal.append(&entry)?;
+        wal.append(entry)?;
     }
     wal.flush().await?;
 

@@ -29,21 +29,21 @@ async fn test_wal_lsn_ordering() -> Result<()> {
     let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
 
     // Flush multiple segments
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
     })?;
     let lsn1 = wal.flush().await?;
 
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
     })?;
     let lsn2 = wal.flush().await?;
 
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(102),
         properties: HashMap::new(),
         labels: vec![],
@@ -63,21 +63,21 @@ async fn test_wal_replay_since_high_water_mark() -> Result<()> {
     let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
 
     // Create segments with known LSNs
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
     })?;
     let lsn1 = wal.flush().await?;
 
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
     })?;
     let lsn2 = wal.flush().await?;
 
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(102),
         properties: HashMap::new(),
         labels: vec![],
@@ -109,7 +109,7 @@ async fn test_wal_empty_flush() -> Result<()> {
     assert_eq!(lsn, 0, "Empty flush should return current flushed_lsn");
 
     // Add a mutation and flush
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
@@ -131,7 +131,7 @@ async fn test_wal_truncate_before_high_water_mark() -> Result<()> {
 
     // Create multiple segments
     for i in 0..5 {
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
@@ -169,7 +169,7 @@ async fn test_wal_initialize_from_existing() -> Result<()> {
     {
         let wal = WriteAheadLog::new(store.clone(), path.clone());
         for i in 0..5 {
-            wal.append(&Mutation::InsertVertex {
+            wal.append(Mutation::InsertVertex {
                 vid: Vid::new(100 + i),
                 properties: HashMap::new(),
                 labels: vec![],
@@ -189,7 +189,7 @@ async fn test_wal_initialize_from_existing() -> Result<()> {
     );
 
     // Next flush should get LSN 6
-    wal2.append(&Mutation::InsertVertex {
+    wal2.append(Mutation::InsertVertex {
         vid: Vid::new(105),
         properties: HashMap::new(),
         labels: vec![],
@@ -210,7 +210,7 @@ async fn test_wal_edge_mutations() -> Result<()> {
     let dst_vid = Vid::new(200);
 
     // Insert edge
-    wal.append(&Mutation::InsertEdge {
+    wal.append(Mutation::InsertEdge {
         src_vid,
         dst_vid,
         edge_type: 1,
@@ -223,7 +223,7 @@ async fn test_wal_edge_mutations() -> Result<()> {
     })?;
 
     // Delete edge
-    wal.append(&Mutation::DeleteEdge {
+    wal.append(Mutation::DeleteEdge {
         eid: test_eid,
         src_vid,
         dst_vid,
@@ -270,7 +270,7 @@ async fn test_wal_delete_vertex_mutation() -> Result<()> {
     let test_vid = Vid::new(100);
 
     // Insert then delete vertex
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: test_vid,
         properties: [(
             "name".to_string(),
@@ -281,7 +281,7 @@ async fn test_wal_delete_vertex_mutation() -> Result<()> {
         labels: vec![],
     })?;
 
-    wal.append(&Mutation::DeleteVertex {
+    wal.append(Mutation::DeleteVertex {
         vid: test_vid,
         labels: vec![],
     })?;
@@ -308,7 +308,7 @@ async fn test_wal_concurrent_flushes() -> Result<()> {
 
     // Pre-populate with some mutations
     for i in 0..100 {
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
@@ -350,7 +350,7 @@ async fn test_wal_flushed_lsn_tracking() -> Result<()> {
     assert_eq!(wal.flushed_lsn().unwrap(), 0);
 
     // Flush with data
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
@@ -360,7 +360,7 @@ async fn test_wal_flushed_lsn_tracking() -> Result<()> {
     assert_eq!(wal.flushed_lsn().unwrap(), 1);
 
     // Another flush
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
@@ -379,7 +379,7 @@ async fn test_wal_full_truncate() -> Result<()> {
 
     // Create segments
     for i in 0..5 {
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
@@ -425,7 +425,7 @@ async fn test_replay_restores_vertex_labels() -> Result<()> {
 
     // Serialize to WAL
     for m in &mutations {
-        wal.append(m)?;
+        wal.append(m.clone())?;
     }
     wal.flush().await?;
 
@@ -469,7 +469,7 @@ async fn test_replay_delete_preserves_labels_for_flush() -> Result<()> {
     ];
 
     for m in &mutations {
-        wal.append(m)?;
+        wal.append(m.clone())?;
     }
     wal.flush().await?;
 
@@ -530,7 +530,7 @@ async fn test_wal_delete_vertex_labels_round_trip() -> Result<()> {
         labels: vec!["Person".to_string(), "Admin".to_string()],
     };
 
-    wal.append(&delete_mutation)?;
+    wal.append(delete_mutation)?;
     wal.flush().await?;
 
     // Replay in new L0
@@ -562,12 +562,12 @@ async fn test_wal_set_vertex_labels_round_trip_replace() -> Result<()> {
 
     // A vertex created with two labels, then a label-only change that drops one:
     // the WAL carries the FULL resolved set [Person].
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid,
         properties: HashMap::new(),
         labels: vec!["Person".to_string(), "Admin".to_string()],
     })?;
-    wal.append(&Mutation::SetVertexLabels {
+    wal.append(Mutation::SetVertexLabels {
         vid,
         labels: vec!["Person".to_string()],
     })?;
@@ -619,7 +619,7 @@ async fn test_edge_type_name_wal_roundtrip() -> Result<()> {
     let dst_vid = Vid::new(200);
 
     // Append InsertEdge with edge_type_name
-    wal.append(&Mutation::InsertEdge {
+    wal.append(Mutation::InsertEdge {
         src_vid,
         dst_vid,
         edge_type: 1,
@@ -688,7 +688,7 @@ async fn test_wal_truncated_tail_segment_skipped() {
     wal.initialize().await.unwrap();
 
     // Write a valid segment first
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
@@ -756,7 +756,7 @@ async fn test_wal_corrupt_middle_segment_fails_recovery() {
     wal.initialize().await.unwrap();
 
     // Valid segment at LSN 1.
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
@@ -773,14 +773,14 @@ async fn test_wal_corrupt_middle_segment_fails_recovery() {
 
     // Valid segment at LSN 3 — written directly so its LSN is above the
     // corrupt one (the WAL instance's counter is at 2).
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(3),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
     })
     .unwrap();
     wal.flush().await.unwrap();
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(4),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
@@ -814,7 +814,7 @@ async fn test_wal_checksum_mismatch_detected() {
     wal.initialize().await.unwrap();
 
     // Flush a valid (enveloped) segment, then flip a payload byte on disk.
-    wal.append(&Mutation::InsertVertex {
+    wal.append(Mutation::InsertVertex {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
@@ -1052,3 +1052,135 @@ async fn unique_constraint_survives_wal_recovery() {
 // that used UniConfig::new() instead of Writer::new(storage, schema, writer_id).
 // The transaction API tests should be re-implemented using the current API patterns
 // once the transaction feature is fully integrated with the new storage architecture.
+
+/// A committed transaction's mutations must appear in the WAL exactly once.
+///
+/// Regression test for the commit double-write: `L0Buffer::merge` used to
+/// re-call the public `delete_vertex` / `insert_edge` / `delete_edge` during
+/// `commit_transaction_l0`, re-appending every edge insert, edge delete, and
+/// vertex delete to the WAL — the commit path had already appended all of
+/// them before the durable flush (writer.rs "THIS IS THE COMMIT POINT"),
+/// so edge-heavy commits paid 2x WAL volume. Only vertex inserts were
+/// exempt via `insert_vertex_with_labels_impl(skip_wal=true)`.
+///
+/// The duplicates landed in the WAL buffer *after* the commit's flush, so
+/// they were flushed inside the NEXT commit's segment — tx3 below exists to
+/// surface tx2's would-be duplicates.
+#[tokio::test]
+async fn commit_writes_each_mutation_to_wal_exactly_once() -> Result<()> {
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjectStorePath;
+    use uni_common::Value;
+    use uni_common::config::UniConfig;
+    use uni_common::core::schema::SchemaManager;
+    use uni_store::runtime::l0::L0Buffer;
+    use uni_store::runtime::writer::Writer;
+    use uni_store::storage::manager::StorageManager;
+
+    fn props() -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("p".to_string(), Value::Int(1));
+        m
+    }
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_str().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+    let schema_path = ObjectStorePath::from("schema.json");
+    let schema_manager =
+        Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+    schema_manager.add_label("Node")?;
+    schema_manager.save().await?;
+    let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+    let wal = Arc::new(WriteAheadLog::new(
+        store.clone(),
+        ObjectStorePath::from("wal"),
+    ));
+    let no_autoflush = UniConfig {
+        auto_flush_threshold: usize::MAX,
+        auto_flush_interval: None,
+        ..Default::default()
+    };
+    let writer = Arc::new(
+        Writer::new_with_config(
+            storage,
+            schema_manager.clone(),
+            1,
+            no_autoflush,
+            Some(wal),
+            None,
+        )
+        .await?,
+    );
+
+    let etype = schema_manager.get_or_assign_edge_type_id("REL");
+    let v1 = writer.next_vid().await?;
+    let v2 = writer.next_vid().await?;
+    let e1 = writer.next_eid(etype).await?;
+    let label = ["Node".to_string()];
+
+    // Tx 1: two vertices + an edge between them.
+    let tx1 = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(v1, props(), &label, Some(&tx1))
+        .await?;
+    writer
+        .insert_vertex_with_labels(v2, props(), &label, Some(&tx1))
+        .await?;
+    writer
+        .insert_edge(
+            v1,
+            v2,
+            etype,
+            e1,
+            props(),
+            Some("REL".to_string()),
+            Some(&tx1),
+        )
+        .await?;
+    writer.commit_transaction_l0(tx1).await?;
+
+    // Tx 2: delete the edge and one endpoint.
+    let tx2 = writer.create_transaction_l0();
+    writer.delete_edge(e1, v1, v2, etype, Some(&tx2)).await?;
+    writer.delete_vertex(v2, None, Some(&tx2)).await?;
+    writer.commit_transaction_l0(tx2).await?;
+
+    // Tx 3: unrelated commit whose flush would carry tx2's duplicates.
+    let v3 = writer.next_vid().await?;
+    let tx3 = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(v3, props(), &label, Some(&tx3))
+        .await?;
+    writer.commit_transaction_l0(tx3).await?;
+
+    // Replay the durable WAL and count entries per mutation.
+    let replay_wal = WriteAheadLog::new(store, ObjectStorePath::from("wal"));
+    let mutations = replay_wal.replay().await?;
+
+    let insert_edge_e1 = mutations
+        .iter()
+        .filter(|m| matches!(m, Mutation::InsertEdge { eid, .. } if *eid == e1))
+        .count();
+    let delete_edge_e1 = mutations
+        .iter()
+        .filter(|m| matches!(m, Mutation::DeleteEdge { eid, .. } if *eid == e1))
+        .count();
+    let delete_vertex_v2 = mutations
+        .iter()
+        .filter(|m| matches!(m, Mutation::DeleteVertex { vid, .. } if *vid == v2))
+        .count();
+    assert_eq!(insert_edge_e1, 1, "edge insert WAL-logged exactly once");
+    assert_eq!(delete_edge_e1, 1, "edge delete WAL-logged exactly once");
+    assert_eq!(delete_vertex_v2, 1, "vertex delete WAL-logged exactly once");
+
+    // Recovery sanity: replaying the deduplicated WAL yields the right state.
+    let mut recovered = L0Buffer::new(1, None);
+    recovered.replay_mutations(mutations)?;
+    assert!(recovered.vertex_properties.contains_key(&v1));
+    assert!(recovered.vertex_properties.contains_key(&v3));
+    assert!(recovered.vertex_tombstones.contains(&v2));
+    assert!(recovered.tombstones.contains_key(&e1));
+
+    Ok(())
+}

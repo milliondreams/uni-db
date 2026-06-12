@@ -184,6 +184,13 @@ pub struct L0Buffer {
     /// Key: constraint composite key (label + sorted property values serialized).
     /// Value: Vid that owns this key.
     pub constraint_index: HashMap<Vec<u8>, Vid>,
+    /// Reverse index `ext_id` → owning vid for O(1) global ext_id uniqueness
+    /// checks (`Writer::check_extid_globally_unique` previously scanned every
+    /// `vertex_properties` map per insert — O(n²) ingest). Maintained by the
+    /// vertex insert impls (synced to the post-CRDT-merge value) and by
+    /// `apply_vertex_deletion`, so merge and WAL replay keep it consistent
+    /// for free.
+    pub extid_index: HashMap<String, Vid>,
     /// Per-VID set of property keys that should land via Lance MergeInsert
     /// (partial-column update) at flush time. Populated by
     /// `insert_vertex_partial`; cleared by full-row inserts and deletes.
@@ -259,6 +266,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            extid_index: self.extid_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
             edge_partial_keys: self.edge_partial_keys.clone(),
             pending_embeddings: self.pending_embeddings.clone(),
@@ -286,6 +294,35 @@ impl L0Buffer {
                 .entry(label.clone())
                 .or_default()
                 .insert(vid);
+        }
+    }
+
+    /// Read a vertex's current string `ext_id` from a property map.
+    fn extid_of(props: &Properties) -> Option<String> {
+        props
+            .get("ext_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    /// Sync `extid_index` for `vid` around a property write.
+    ///
+    /// `old` / `new` are the vertex's ext_id before / after the CRDT merge —
+    /// the index always reflects the post-merge value, matching what the old
+    /// full scan in `Writer::check_extid_globally_unique` observed. Only
+    /// called when the incoming properties contain an `ext_id` key (the merge
+    /// cannot change the value otherwise).
+    fn sync_extid_index(&mut self, vid: Vid, old: Option<String>, new: Option<String>) {
+        if old == new {
+            return;
+        }
+        if let Some(old) = old
+            && self.extid_index.get(&old) == Some(&vid)
+        {
+            self.extid_index.remove(&old);
+        }
+        if let Some(new) = new {
+            self.extid_index.insert(new, vid);
         }
     }
 
@@ -460,6 +497,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            extid_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
             edge_partial_keys: HashMap::new(),
             pending_embeddings: HashMap::new(),
@@ -496,7 +534,7 @@ impl L0Buffer {
         let now = now_nanos();
 
         if !skip_wal && let Some(wal) = &self.wal {
-            let _ = wal.append(&Mutation::InsertVertex {
+            let _ = wal.append(Mutation::InsertVertex {
                 vid,
                 properties: properties.clone(),
                 labels: labels.to_vec(),
@@ -509,8 +547,24 @@ impl L0Buffer {
         // this VID.
         self.vertex_partial_keys.remove(&vid);
 
+        // Size/count computed up front so `properties` can be moved into the
+        // CRDT merge below instead of deep-cloned.
+        let props_size = Self::estimate_properties_size(&properties);
+        let props_count = properties.len();
+        let tracks_extid = properties.contains_key("ext_id");
+
         let entry = self.vertex_properties.entry(vid).or_default();
-        Self::merge_crdt_properties(entry, properties.clone());
+        let old_extid = if tracks_extid {
+            Self::extid_of(entry)
+        } else {
+            None
+        };
+        Self::merge_crdt_properties(entry, properties);
+        if tracks_extid {
+            let new_extid =
+                Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
+            self.sync_extid_index(vid, old_extid, new_extid);
+        }
         self.vertex_versions.insert(vid, version);
 
         // Set timestamps - created_at only set if this is a new vertex
@@ -527,10 +581,9 @@ impl L0Buffer {
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
         self.mutation_stats.nodes_created += 1;
-        self.mutation_stats.properties_set += properties.len();
+        self.mutation_stats.properties_set += props_count;
         self.mutation_stats.labels_added += labels.len();
 
-        let props_size = Self::estimate_properties_size(&properties);
         self.estimated_size += 8 + props_size + 16 + labels_size + 32;
     }
 
@@ -627,7 +680,7 @@ impl L0Buffer {
             // semantically correct — L0 in memory always holds the union of
             // partial deltas via merge_crdt_properties; recovery doesn't
             // need to preserve partial-vs-full distinction.
-            let _ = wal.append(&Mutation::InsertVertex {
+            let _ = wal.append(Mutation::InsertVertex {
                 vid,
                 properties: properties.clone(),
                 labels: labels.to_vec(),
@@ -638,8 +691,24 @@ impl L0Buffer {
         // NOTE: deliberately DOES NOT remove from vertex_partial_keys.
         // The caller (`insert_vertex_partial`) extends that set after.
 
+        // Size/count computed up front so `properties` can be moved into the
+        // CRDT merge below instead of deep-cloned.
+        let props_size = Self::estimate_properties_size(&properties);
+        let props_count = properties.len();
+        let tracks_extid = properties.contains_key("ext_id");
+
         let entry = self.vertex_properties.entry(vid).or_default();
-        Self::merge_crdt_properties(entry, properties.clone());
+        let old_extid = if tracks_extid {
+            Self::extid_of(entry)
+        } else {
+            None
+        };
+        Self::merge_crdt_properties(entry, properties);
+        if tracks_extid {
+            let new_extid =
+                Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
+            self.sync_extid_index(vid, old_extid, new_extid);
+        }
         self.vertex_versions.insert(vid, version);
 
         self.vertex_created_at.entry(vid).or_insert(now);
@@ -654,10 +723,9 @@ impl L0Buffer {
         self.mutation_count += 1;
         // Partial writes don't create new nodes — they update existing ones.
         // But counting under properties_set is correct.
-        self.mutation_stats.properties_set += properties.len();
+        self.mutation_stats.properties_set += props_count;
         self.mutation_stats.labels_added += labels.len();
 
-        let props_size = Self::estimate_properties_size(&properties);
         self.estimated_size += 8 + props_size + 16 + labels_size + 32;
     }
 
@@ -694,11 +762,17 @@ impl L0Buffer {
     }
 
     pub fn delete_vertex(&mut self, vid: Vid) -> Result<()> {
+        self.delete_vertex_impl(vid, false)
+    }
+
+    /// Core vertex deletion. When `skip_wal` is true, skips WAL append
+    /// (used during merge where the caller already wrote to WAL).
+    fn delete_vertex_impl(&mut self, vid: Vid, skip_wal: bool) -> Result<()> {
         self.current_version += 1;
 
-        if let Some(wal) = &mut self.wal {
+        if !skip_wal && let Some(wal) = &mut self.wal {
             let labels = self.vertex_labels.get(&vid).cloned().unwrap_or_default();
-            wal.append(&Mutation::DeleteVertex { vid, labels })?;
+            wal.append(Mutation::DeleteVertex { vid, labels })?;
         }
 
         self.apply_vertex_deletion(vid);
@@ -750,6 +824,14 @@ impl L0Buffer {
 
         self.remove_vid_from_label_index(vid);
         self.vertex_tombstones.insert(vid);
+        // Drop the vid's ext_id index entry (O(1) via its current property
+        // value, read before the property map entry is removed below).
+        if let Some(props) = self.vertex_properties.get(&vid)
+            && let Some(ext) = Self::extid_of(props)
+            && self.extid_index.get(&ext) == Some(&vid)
+        {
+            self.extid_index.remove(&ext);
+        }
         self.vertex_properties.remove(&vid);
         // Deletion supersedes any pending partial-update state.
         self.vertex_partial_keys.remove(&vid);
@@ -774,11 +856,35 @@ impl L0Buffer {
         properties: Properties,
         edge_type_name: Option<String>,
     ) -> Result<()> {
+        self.insert_edge_impl(
+            src_vid,
+            dst_vid,
+            edge_type,
+            eid,
+            properties,
+            edge_type_name,
+            false,
+        )
+    }
+
+    /// Core edge insertion. When `skip_wal` is true, skips WAL append
+    /// (used during merge where the caller already wrote to WAL).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_edge_impl(
+        &mut self,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        eid: Eid,
+        properties: Properties,
+        edge_type_name: Option<String>,
+        skip_wal: bool,
+    ) -> Result<()> {
         self.current_version += 1;
         let now = now_nanos();
 
-        if let Some(wal) = &mut self.wal {
-            wal.append(&Mutation::InsertEdge {
+        if !skip_wal && let Some(wal) = &mut self.wal {
+            wal.append(Mutation::InsertEdge {
                 src_vid,
                 dst_vid,
                 edge_type,
@@ -832,7 +938,7 @@ impl L0Buffer {
         let now = now_nanos();
 
         if let Some(wal) = &mut self.wal {
-            wal.append(&Mutation::InsertEdge {
+            wal.append(Mutation::InsertEdge {
                 src_vid,
                 dst_vid,
                 edge_type,
@@ -944,11 +1050,24 @@ impl L0Buffer {
         dst_vid: Vid,
         edge_type: u32,
     ) -> Result<()> {
+        self.delete_edge_impl(eid, src_vid, dst_vid, edge_type, false)
+    }
+
+    /// Core edge deletion. When `skip_wal` is true, skips WAL append
+    /// (used during merge where the caller already wrote to WAL).
+    fn delete_edge_impl(
+        &mut self,
+        eid: Eid,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        skip_wal: bool,
+    ) -> Result<()> {
         self.current_version += 1;
         let now = now_nanos();
 
-        if let Some(wal) = &mut self.wal {
-            wal.append(&Mutation::DeleteEdge {
+        if !skip_wal && let Some(wal) = &mut self.wal {
+            wal.append(Mutation::DeleteEdge {
                 eid,
                 src_vid,
                 dst_vid,
@@ -1179,24 +1298,58 @@ impl L0Buffer {
     }
 
     pub fn merge(&mut self, other: &L0Buffer) -> Result<()> {
-        trace!(
-            other_mutation_count = other.mutation_count,
-            "Merging L0 buffer"
-        );
         // Validate-then-apply: reject a merge that would bail on a tombstoned
         // edge endpoint before mutating anything, so a failed merge can never
         // leave a partially-applied (non-atomic) commit.
         self.validate_merge_edge_endpoints(other)?;
+        self.merge_validated(
+            other,
+            other.vertex_properties.clone(),
+            other.edge_properties.clone(),
+        )
+    }
+
+    /// Commit-path variant of [`merge`](Self::merge) that consumes `other`'s
+    /// vertex/edge property maps instead of deep-cloning every row.
+    ///
+    /// Everything else in `other` (endpoints, tombstones, versions, labels)
+    /// is left intact — `commit_transaction_l0` still reads those after the
+    /// merge. The caller must not rely on `other.vertex_properties` /
+    /// `other.edge_properties` afterwards, which is safe on the commit path
+    /// because committing consumes the transaction.
+    pub fn merge_take(&mut self, other: &mut L0Buffer) -> Result<()> {
+        // Validate BEFORE draining: the endpoint check consults
+        // `other.vertex_properties` (the "re-inserted by other" exemption).
+        self.validate_merge_edge_endpoints(other)?;
+        let vertex_props = std::mem::take(&mut other.vertex_properties);
+        let edge_props = std::mem::take(&mut other.edge_properties);
+        self.merge_validated(other, vertex_props, edge_props)
+    }
+
+    /// Shared merge body. `vertex_props` / `edge_props` are `other`'s property
+    /// maps, passed by value so rows move instead of clone; the caller has
+    /// already run `validate_merge_edge_endpoints`.
+    fn merge_validated(
+        &mut self,
+        other: &L0Buffer,
+        vertex_props: HashMap<Vid, Properties>,
+        mut edge_props: HashMap<Eid, Properties>,
+    ) -> Result<()> {
+        trace!(
+            other_mutation_count = other.mutation_count,
+            "Merging L0 buffer"
+        );
+        // skip_wal=true throughout: the caller (commit_transaction_l0) already
+        // wrote every one of these mutations to WAL before invoking merge —
+        // re-appending here would double the WAL volume per commit.
         // Merge Vertices
         for &vid in &other.vertex_tombstones {
-            self.delete_vertex(vid)?;
+            self.delete_vertex_impl(vid, true)?;
         }
 
-        for (vid, props) in &other.vertex_properties {
-            let labels = other.vertex_labels.get(vid).cloned().unwrap_or_default();
-            // skip_wal=true: the caller (commit_transaction_l0) already wrote
-            // these mutations to WAL before invoking merge.
-            self.insert_vertex_with_labels_impl(*vid, props.clone(), &labels, true);
+        for (vid, props) in vertex_props {
+            let labels = other.vertex_labels.get(&vid).cloned().unwrap_or_default();
+            self.insert_vertex_with_labels_impl(vid, props, &labels, true);
         }
 
         // Merge vertex labels that might not have properties
@@ -1231,11 +1384,11 @@ impl L0Buffer {
         // Merge Edges - insert all edges from edge_endpoints, using empty props if none exist
         for (eid, (src, dst, etype)) in &other.edge_endpoints {
             if other.tombstones.contains_key(eid) {
-                self.delete_edge(*eid, *src, *dst, *etype)?;
+                self.delete_edge_impl(*eid, *src, *dst, *etype, true)?;
             } else {
-                let props = other.edge_properties.get(eid).cloned().unwrap_or_default();
+                let props = edge_props.remove(eid).unwrap_or_default();
                 let etype_name = other.edge_types.get(eid).cloned();
-                self.insert_edge(*src, *dst, *etype, *eid, props, etype_name)?;
+                self.insert_edge_impl(*src, *dst, *etype, *eid, props, etype_name, true)?;
             }
         }
 
@@ -1244,11 +1397,12 @@ impl L0Buffer {
         // DELETEs of pre-existing edges are silently lost on commit.
         for (eid, tombstone) in &other.tombstones {
             if !other.edge_endpoints.contains_key(eid) {
-                self.delete_edge(
+                self.delete_edge_impl(
                     *eid,
                     tombstone.src_vid,
                     tombstone.dst_vid,
                     tombstone.edge_type,
+                    true,
                 )?;
             }
         }
@@ -1301,8 +1455,20 @@ impl L0Buffer {
                     let version = self.current_version;
 
                     self.vertex_tombstones.remove(&vid);
+                    let tracks_extid = properties.contains_key("ext_id");
                     let entry = self.vertex_properties.entry(vid).or_default();
+                    let old_extid = if tracks_extid {
+                        Self::extid_of(entry)
+                    } else {
+                        None
+                    };
                     Self::merge_crdt_properties(entry, properties);
+                    if tracks_extid {
+                        let new_extid = Self::extid_of(
+                            self.vertex_properties.get(&vid).expect("just inserted"),
+                        );
+                        self.sync_extid_index(vid, old_extid, new_extid);
+                    }
                     self.vertex_versions.insert(vid, version);
                     self.graph.add_vertex(vid);
                     self.mutation_count += 1;

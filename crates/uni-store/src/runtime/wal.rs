@@ -144,6 +144,17 @@ pub struct WalSegment {
     pub mutations: Vec<Mutation>,
 }
 
+/// Borrowed serialization view of [`WalSegment`].
+///
+/// Field names and order match `WalSegment` exactly, so the serde output is
+/// byte-identical; `flush` serializes through this to avoid deep-cloning the
+/// whole mutation batch per flush.
+#[derive(Serialize, Debug)]
+struct WalSegmentRef<'a> {
+    lsn: u64,
+    mutations: &'a [Mutation],
+}
+
 pub struct WriteAheadLog {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
@@ -237,9 +248,9 @@ impl WriteAheadLog {
     }
 
     #[instrument(skip(self, mutation), level = "trace")]
-    pub fn append(&self, mutation: &Mutation) -> Result<()> {
+    pub fn append(&self, mutation: Mutation) -> Result<()> {
         let mut state = acquire_mutex(&self.state, "wal_state")?;
-        state.buffer.push(mutation.clone());
+        state.buffer.push(mutation);
         metrics::counter!("uni_wal_entries_total").increment(1);
         Ok(())
     }
@@ -261,10 +272,13 @@ impl WriteAheadLog {
         tracing::Span::current().record("lsn", lsn);
         tracing::Span::current().record("mutations_count", batch.len());
 
-        // Create segment with LSN
-        let segment = WalSegment {
+        // Serialize a borrowed view of the segment (serde output is identical
+        // to `WalSegment` — see `wal_segment_ref_serializes_identically`), so
+        // the batch is not deep-cloned per flush. `batch` itself stays owned
+        // for the restore-on-failure paths below.
+        let segment = WalSegmentRef {
             lsn,
-            mutations: batch.clone(),
+            mutations: &batch,
         };
 
         // Serialize segment; restore buffer on failure
@@ -545,7 +559,7 @@ mod tests {
             labels: vec![],
         };
 
-        wal.append(&mutation.clone())?;
+        wal.append(mutation)?;
         wal.flush().await?;
 
         let mutations = wal.replay().await?;
@@ -589,15 +603,15 @@ mod tests {
         };
 
         // First flush
-        wal.append(&mutation1)?;
+        wal.append(mutation1)?;
         let lsn1 = wal.flush().await?;
 
         // Second flush
-        wal.append(&mutation2)?;
+        wal.append(mutation2)?;
         let lsn2 = wal.flush().await?;
 
         // Third flush
-        wal.append(&mutation3)?;
+        wal.append(mutation3)?;
         let lsn3 = wal.flush().await?;
 
         // Verify strict monotonicity
@@ -684,7 +698,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -716,7 +730,7 @@ mod tests {
         let wal = WriteAheadLog::new(store.clone(), prefix.clone());
 
         // Flush mutation 1 successfully
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
@@ -725,7 +739,7 @@ mod tests {
         assert_eq!(lsn1, 1);
 
         // Flush mutation 2 successfully
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(2),
             properties: HashMap::new(),
             labels: vec![],
@@ -739,14 +753,14 @@ mod tests {
         // by checking that next_lsn increments even if we don't flush
 
         // Append mutation 3 but DON'T flush
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(3),
             properties: HashMap::new(),
             labels: vec![],
         })?;
 
         // Now flush mutation 4
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(4),
             properties: HashMap::new(),
             labels: vec![],
@@ -777,7 +791,7 @@ mod tests {
 
         // Perform 50 flushes
         for i in 1..=50 {
-            wal.append(&Mutation::InsertVertex {
+            wal.append(Mutation::InsertVertex {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
@@ -816,7 +830,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -859,7 +873,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -891,7 +905,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append InsertVertex with labels
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(42),
             properties: {
                 let mut props = HashMap::new();
@@ -934,7 +948,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append DeleteVertex with labels (needed for tombstone flushing - Issue #76)
-        wal.append(&Mutation::DeleteVertex {
+        wal.append(Mutation::DeleteVertex {
             vid: Vid::new(99),
             labels: vec!["Person".to_string(), "Admin".to_string()],
         })?;
@@ -969,7 +983,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append InsertEdge with edge_type_name
-        wal.append(&Mutation::InsertEdge {
+        wal.append(Mutation::InsertEdge {
             src_vid: Vid::new(1),
             dst_vid: Vid::new(2),
             edge_type: 100,
@@ -1047,5 +1061,40 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// `flush` serializes through the borrowed `WalSegmentRef`; its bytes must
+    /// be identical to the owned `WalSegment` so replay (which deserializes
+    /// `WalSegment`) is unaffected.
+    #[test]
+    fn wal_segment_ref_serializes_identically() {
+        let mut props = HashMap::new();
+        props.insert("p".to_string(), uni_common::Value::Int(7));
+        let mutations = vec![
+            Mutation::InsertVertex {
+                vid: Vid::new(1),
+                properties: props,
+                labels: vec!["L".to_string()],
+            },
+            Mutation::DeleteEdge {
+                eid: Eid::new(2),
+                src_vid: Vid::new(1),
+                dst_vid: Vid::new(3),
+                edge_type: 4,
+                version: 5,
+            },
+        ];
+        let owned = WalSegment {
+            lsn: 42,
+            mutations: mutations.clone(),
+        };
+        let borrowed = WalSegmentRef {
+            lsn: 42,
+            mutations: &mutations,
+        };
+        assert_eq!(
+            serde_json::to_vec(&owned).unwrap(),
+            serde_json::to_vec(&borrowed).unwrap()
+        );
     }
 }

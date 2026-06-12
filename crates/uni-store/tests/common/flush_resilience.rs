@@ -381,3 +381,47 @@ async fn stale_property_cache_window_after_flush() -> Result<()> {
     );
     Ok(())
 }
+
+// ── ext_id uniqueness during the flush window ────────────────────────────────
+
+/// The global ext_id uniqueness check must consult rotated-but-unflushed
+/// buffers (`pending_flush`) — the same window Bug #9A pinned for declared
+/// UNIQUE constraints. `check_extid_globally_unique` walks
+/// `[current, tx?, pending_flush…]` via each buffer's `extid_index`; this
+/// test holds a flush paused mid-window and asserts a duplicate is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extid_check_covers_flush_window() -> Result<()> {
+    fn ext_props(value: &str) -> HashMap<String, Value> {
+        let mut props = HashMap::new();
+        props.insert("ext_id".to_string(), Value::String(value.to_string()));
+        props
+    }
+
+    let (writer, _dir) = make_writer_with_config(UniConfig::default()).await?;
+
+    let k1 = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(k1, ext_props("shared"), &["Counter".to_string()], None)
+        .await?;
+
+    // Rotate K onto pending_flush, pausing before it reaches Lance.
+    fail::cfg("flush::after-rotate-before-lance", "pause").unwrap();
+    let writer_f = writer.clone();
+    let flush_handle = tokio::spawn(async move { writer_f.flush_to_l1(None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let k2 = writer.next_vid().await?;
+    let second = writer
+        .insert_vertex_with_labels(k2, ext_props("shared"), &["Counter".to_string()], None)
+        .await;
+
+    fail::cfg("flush::after-rotate-before-lance", "off").unwrap();
+    flush_handle.await.expect("flush task join")?;
+
+    assert!(
+        second.is_err(),
+        "duplicate ext_id insert must be rejected while the owner is mid-flush \
+         (on pending_flush, not yet in Lance)"
+    );
+    Ok(())
+}

@@ -1550,8 +1550,12 @@ impl PropertyManager {
             }
         }
 
-        // Fallback to main table props_json for unknown/schemaless labels
+        // Fallback to main table props_json for unknown/schemaless labels.
+        // Gated on "no per-label verdict" (neither a live row nor a tombstone
+        // was seen), so a per-label deletion tombstone is never overridden by
+        // an older main-table row.
         if merged_props.is_none()
+            && global_best_version.is_none()
             && let Some(main_props) = MainVertexDataset::find_props_by_vid(
                 self.storage.backend(),
                 vid,
@@ -1821,6 +1825,24 @@ impl PropertyManager {
                 }
             }
         }
+
+        // Fallback to main-table props_json for unknown/schemaless labels —
+        // their rows have no per-label table at all (mirrors
+        // `fetch_all_props_from_storage`). Gated on "no per-label verdict"
+        // (neither a live value nor a tombstone was seen), so a per-label
+        // tombstone is never overridden by an older main-table row.
+        if best_value.is_none()
+            && best_version.is_none()
+            && let Some(main_props) = MainVertexDataset::find_props_by_vid(
+                self.storage.backend(),
+                vid,
+                self.storage.version_high_water_mark(),
+            )
+            .await?
+        {
+            return Ok(main_props.get(prop).cloned().unwrap_or(Value::Null));
+        }
+
         Ok(best_value.unwrap_or(Value::Null))
     }
 

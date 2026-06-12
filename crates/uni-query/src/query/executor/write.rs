@@ -1718,6 +1718,21 @@ impl Executor {
         if keys.is_empty() {
             return Ok(out);
         }
+        // An undeclared (schemaless) label has no per-label table — its flushed
+        // rows live only in the unified main vertex table. Route to the
+        // main-table lookup, mirroring the planner's scan routing (a schemaless
+        // MATCH plans `ScanMainByLabels` on the same schema predicate).
+        if self
+            .storage
+            .schema_manager()
+            .schema()
+            .get_label_case_insensitive(label)
+            .is_none()
+        {
+            return self
+                .merge_lookup_persisted_batch_schemaless(label, key_names, keys)
+                .await;
+        }
         let mut columns: Vec<&str> = vec!["_vid"];
         columns.extend(key_names.iter().map(String::as_str));
 
@@ -1757,6 +1772,104 @@ impl Executor {
                         (k.clone(), Self::canonical_key_value(&v))
                     })
                     .collect();
+                out.entry(tuple).or_default().push(vid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persisted-match lookup for an UNDECLARED (schemaless) label.
+    ///
+    /// Schemaless rows live only in the unified main vertex table (per-label
+    /// tables exist only for declared labels), with all properties encoded in
+    /// the `props_json` CypherValue blob — so key values cannot be pushed into
+    /// the Lance filter; the key match happens in memory after decoding,
+    /// exactly like the schemaless MATCH scan. One main-table scan regardless
+    /// of key count.
+    ///
+    /// Mirrors `columnar_scan_schemaless_vertex_batch_static`: tombstones are
+    /// NOT filtered Lance-side (MVCC dedup must see them to pick the winning
+    /// version per vid); the per-vid max-`_version` dedup runs here, then
+    /// deleted winners are dropped.
+    ///
+    /// # Errors
+    /// Propagates scan and blob-decode failures — fail-closed: a MERGE must
+    /// never treat a failed lookup as "no match" and create duplicates.
+    async fn merge_lookup_persisted_batch_schemaless(
+        &self,
+        label: &str,
+        key_names: &[String],
+        keys: &HashSet<MergeKey>,
+    ) -> Result<HashMap<MergeKey, Vec<Vid>>> {
+        let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        let filter = format!("array_contains(labels, '{}')", label.replace('\'', "''"));
+        let Some(batch) = self
+            .storage
+            .scan_main_vertex_table(
+                &["_vid", "_deleted", "props_json", "_version"],
+                Some(&filter),
+            )
+            .await?
+        else {
+            return Ok(out);
+        };
+        let (Some(vid_col), Some(del_col), Some(ver_col)) = (
+            batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+            batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>()),
+            batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+        ) else {
+            return Err(anyhow!(
+                "schemaless MERGE lookup: main vertex table scan missing a required column"
+            ));
+        };
+        let props_col = batch
+            .column_by_name("props_json")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>());
+
+        // Per-vid MVCC dedup: keep the highest-version row for each vid.
+        let mut winners: HashMap<Vid, (u64, usize)> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            let vid = Vid::from(vid_col.value(i));
+            let ver = ver_col.value(i);
+            let entry = winners.entry(vid).or_insert((ver, i));
+            if ver > entry.0 {
+                *entry = (ver, i);
+            }
+        }
+        for (vid, (_ver, row)) in winners {
+            // Drop deletion tombstones AFTER picking the winner — a deleted
+            // winner must not let an older live version resurrect the match.
+            if del_col.value(row) {
+                continue;
+            }
+            // A row without properties matches only an all-Null key tuple.
+            let props = match props_col {
+                Some(arr) if !arrow_array::Array::is_null(arr, row) => {
+                    match uni_common::cypher_value_codec::decode(arr.value(row))
+                        .map_err(|e| anyhow!("schemaless MERGE lookup: props decode: {e}"))?
+                    {
+                        Value::Map(m) => m,
+                        _ => HashMap::new(),
+                    }
+                }
+                _ => HashMap::new(),
+            };
+            let tuple: MergeKey = key_names
+                .iter()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        Self::canonical_key_value(props.get(k).unwrap_or(&Value::Null)),
+                    )
+                })
+                .collect();
+            if keys.contains(&tuple) {
                 out.entry(tuple).or_default().push(vid);
             }
         }
@@ -1814,7 +1927,7 @@ impl Executor {
     }
 
     /// Index fast-path execution for one MERGE row of the shape detected by
-    /// [`Self::merge_indexed_fastpath`].
+    /// [`Self::merge_single_node_fastpath`].
     ///
     /// Resolves matches from the per-batch L0 snapshot `existing` (O(1) lookup,
     /// no per-row L0 enumeration) plus the per-statement persisted prefetch

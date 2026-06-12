@@ -623,6 +623,12 @@ impl MainVertexDataset {
     /// Returns the props_json parsed into a Properties HashMap if found.
     /// This is used as a fallback for unknown/schemaless labels.
     ///
+    /// MVCC: the scan must see deletion tombstones — the highest-version row
+    /// wins, and a deleted winner yields `None`. Filtering `_deleted = false`
+    /// in the scan would let an OLDER live version resurrect a vertex whose
+    /// tombstone lives only in the main table (schemaless deletes have no
+    /// per-label table to record them).
+    ///
     /// # Arguments
     /// * `version` - Optional version high water mark for snapshot isolation.
     ///
@@ -640,26 +646,31 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let filter = with_version_bound(
-            format!("_vid = {} AND _deleted = false", vid.as_u64()),
-            version,
-        );
+        let filter = with_version_bound(format!("_vid = {}", vid.as_u64()), version);
 
         let results = backend
             .scan(
                 ScanRequest::all(table_name)
                     .with_filter(filter)
-                    .with_columns(vec!["props_json".to_string(), "_version".to_string()]),
+                    .with_columns(vec![
+                        "props_json".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
-        // Find the row with highest version (latest)
+        // Find the row with highest version (latest), tombstones included.
         let mut best_props: Option<Properties> = None;
         let mut best_version: u64 = 0;
+        let mut best_deleted = false;
 
         for batch in results {
             let props_col = batch.column_by_name("props_json");
             let version_col = batch.column_by_name("_version");
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
 
             if let (Some(props_arr), Some(ver_arr)) = (
                 props_col.and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()),
@@ -674,7 +685,8 @@ impl MainVertexDataset {
 
                     if version >= best_version {
                         best_version = version;
-                        if props_arr.is_null(i) || props_arr.value(i).is_empty() {
+                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
+                        if best_deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
                             best_props = Some(Properties::new());
                         } else {
                             let bytes = props_arr.value(i);
@@ -690,6 +702,9 @@ impl MainVertexDataset {
             }
         }
 
+        if best_deleted {
+            return Ok(None);
+        }
         Ok(best_props)
     }
 

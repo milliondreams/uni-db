@@ -37,6 +37,20 @@ if [[ ! -f "$EXTISM_WASM" ]]; then
 fi
 echo "    extism plugin size: $(du -h "$EXTISM_WASM" | cut -f1)"
 
+echo "==> Building example-extism-stateful (wasm32-unknown-unknown)"
+(
+    cd examples/example-extism-stateful
+    cargo build --target wasm32-unknown-unknown --release
+)
+
+EXTISM_STATEFUL_WASM="examples/example-extism-stateful/target/wasm32-unknown-unknown/release/example_extism_stateful.wasm"
+if [[ ! -f "$EXTISM_STATEFUL_WASM" ]]; then
+    echo "ERROR: expected $EXTISM_STATEFUL_WASM after build" >&2
+    exit 1
+fi
+echo "    extism-stateful plugin size: $(du -h "$EXTISM_STATEFUL_WASM" | cut -f1)"
+echo "    (mutable global; proves a fresh extism::Plugin per invoke)"
+
 echo "==> Building example-extism-net (wasm32-unknown-unknown)"
 (
     cd examples/example-extism-net
@@ -65,6 +79,20 @@ if [[ ! -f "$WASM_COMPONENT" ]]; then
 fi
 echo "    wasm-geo component size: $(du -h "$WASM_COMPONENT" | cut -f1)"
 echo "    (wasm32-wasip2 produces a Component Model binary directly; no wasm-tools wrap needed)"
+
+echo "==> Building example-wasm-stateful (wasm32-wasip2)"
+(
+    cd examples/example-wasm-stateful
+    cargo build --target wasm32-wasip2 --release
+)
+
+WASM_STATEFUL_COMPONENT="examples/example-wasm-stateful/target/wasm32-wasip2/release/example_wasm_stateful.wasm"
+if [[ ! -f "$WASM_STATEFUL_COMPONENT" ]]; then
+    echo "ERROR: expected $WASM_STATEFUL_COMPONENT after build" >&2
+    exit 1
+fi
+echo "    wasm-stateful component size: $(du -h "$WASM_STATEFUL_COMPONENT" | cut -f1)"
+echo "    (mutable global; drives the per-invoke isolation repros)"
 
 echo "==> Building example-wasm-net (wasm32-wasip2)"
 (

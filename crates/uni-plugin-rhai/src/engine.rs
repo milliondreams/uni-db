@@ -29,6 +29,16 @@ use crate::host_fns::RhaiHostFnRegistry;
 /// expose a `Capability::MaxCallLevels(N)` so plugins can request more.
 pub const DEFAULT_MAX_CALL_LEVELS: usize = 64;
 
+/// Default Rhai operation-limit floor applied to every engine.
+///
+/// Rhai's built-in default of `max_operations = 0` means *unlimited*, so
+/// without an explicit cap a malicious or buggy plugin running `while true
+/// {}` would wedge the synchronous DataFusion worker thread forever. This
+/// floor bounds every engine's per-call work even when no
+/// `Capability::FuelPerCall` grant is present. A `FuelPerCall` grant may
+/// only *raise* this floor, never lower or disable it.
+pub const DEFAULT_MAX_OPERATIONS: u64 = 10_000_000;
+
 /// Build a Rhai engine pre-configured for a single plugin's effective
 /// capability set.
 ///
@@ -53,6 +63,12 @@ pub fn build_engine(effective_caps: &CapabilitySet, host_fns: &RhaiHostFnRegistr
 
     // Always cap call depth (stack-overflow protection).
     engine.set_max_call_levels(DEFAULT_MAX_CALL_LEVELS);
+
+    // Always apply an operation-limit floor. Rhai defaults to
+    // `max_operations = 0` (unlimited); without this every engine lacking a
+    // `FuelPerCall` grant could be wedged forever by an unbounded loop. A
+    // grant raises this floor in `apply_resource_limits`; it never lowers it.
+    engine.set_max_operations(DEFAULT_MAX_OPERATIONS);
 
     // Apply resource limits from capabilities.
     apply_resource_limits(&mut engine, effective_caps);
@@ -86,7 +102,9 @@ fn apply_resource_limits(engine: &mut Engine, caps: &CapabilitySet) {
     for cap in caps.iter() {
         match cap {
             Capability::FuelPerCall(n) => {
-                engine.set_max_operations(*n);
+                // A grant may only raise the always-applied floor, never
+                // lower it (and never re-enable Rhai's unlimited default of 0).
+                engine.set_max_operations((*n).max(DEFAULT_MAX_OPERATIONS));
             }
             Capability::MemoryBytes(n) => {
                 // Rhai doesn't have a direct total-memory cap. Apply
@@ -186,12 +204,15 @@ mod tests {
 
     #[test]
     fn fuel_limit_trips() {
-        let caps = CapabilitySet::from_iter_of([Capability::FuelPerCall(1_000)]);
+        // Grant a budget above the always-applied DEFAULT_MAX_OPERATIONS
+        // floor so this exercises the granted limit, not the floor.
+        let grant = DEFAULT_MAX_OPERATIONS + 2_000_000;
+        let caps = CapabilitySet::from_iter_of([Capability::FuelPerCall(grant)]);
         let engine = build_engine(&caps, &RhaiHostFnRegistry::new());
-        // 100k iterations of an empty loop will blow past 1000 ops.
+        // 100M loop iterations cost far more than `grant` operations.
         let script = r#"
             let i = 0;
-            while i < 100000 {
+            while i < 100000000 {
                 i += 1;
             }
             i
@@ -199,8 +220,46 @@ mod tests {
         let result = engine.eval::<i64>(script);
         assert!(
             result.is_err(),
-            "FuelPerCall(1000) should trip on a long loop"
+            "a FuelPerCall grant should trip on a long-enough loop"
         );
+    }
+
+    #[test]
+    fn default_op_limit_floor_applies_without_fuel_grant() {
+        // No FuelPerCall grant: the DEFAULT_MAX_OPERATIONS floor must still
+        // trip an unbounded loop instead of Rhai's unlimited default.
+        let engine = build_engine(&empty_caps(), &RhaiHostFnRegistry::new());
+        let script = r#"
+            let i = 0;
+            while true {
+                i += 1;
+            }
+            i
+        "#;
+        let result = engine.eval::<i64>(script);
+        assert!(
+            result.is_err(),
+            "the default op-limit floor must trip an unbounded loop without any fuel grant"
+        );
+    }
+
+    #[test]
+    fn fuel_grant_below_floor_is_raised_to_floor() {
+        // A grant below the floor must not lower it: a loop that exceeds the
+        // tiny grant but stays under the floor must succeed.
+        let caps = CapabilitySet::from_iter_of([Capability::FuelPerCall(1_000)]);
+        let engine = build_engine(&caps, &RhaiHostFnRegistry::new());
+        let script = r#"
+            let i = 0;
+            while i < 50000 {
+                i += 1;
+            }
+            i
+        "#;
+        let result: i64 = engine
+            .eval(script)
+            .expect("a sub-floor grant must be raised to the floor, not lowered");
+        assert_eq!(result, 50000);
     }
 
     #[test]

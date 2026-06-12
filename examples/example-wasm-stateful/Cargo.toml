@@ -1,0 +1,45 @@
+# Standalone example Component Model plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-wasm-stateful
+#   cargo build --target wasm32-wasip2 --release
+#
+# Produces target/wasm32-wasip2/release/example_wasm_stateful.wasm — a
+# Component Model binary directly. Under the current Rust toolchain
+# `wasm32-wasip2` emits a component, so no `wit-component` /
+# `wasm-tools component new` post-processing step is required; the
+# host loads the bytes as-is (see
+# `crates/uni-plugin-wasm/tests/it/pooled_instance_isolation.rs`).
+#
+# This fixture carries a module-level mutable global (`COUNTER`) used to
+# prove per-invoke `Store`/instance isolation: a fresh instance per call
+# must start the counter at its initial value every time, and a trapping
+# call must not poison the next call.
+
+[workspace]
+
+[package]
+name = "example-wasm-stateful"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Component Model plugin with a mutable global, for per-invoke isolation tests"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+# Arrow IPC on wasm32-wasip2. Same feature trim as the geo example
+# (no chrono / csv / json).
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

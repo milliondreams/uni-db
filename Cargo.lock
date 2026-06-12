@@ -13091,7 +13091,6 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
- "crossbeam-queue",
  "parking_lot",
  "thiserror 2.0.18",
  "tracing",

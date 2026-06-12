@@ -28,9 +28,9 @@ use wasmtime::{Config, Engine, Store};
 use crate::adapter::ComponentScalarFn;
 use crate::adapter_aggregate::ComponentAggregateFn;
 use crate::adapter_procedure::ComponentProcedure;
-use crate::bindings::aggregate::AggregatePlugin;
-use crate::bindings::procedure::ProcedurePlugin as ProcedurePluginBindings;
-use crate::bindings::scalar::ScalarPlugin;
+use crate::bindings::aggregate::{AggregatePlugin, AggregatePluginPre};
+use crate::bindings::procedure::{ProcedurePlugin as ProcedurePluginBindings, ProcedurePluginPre};
+use crate::bindings::scalar::{ScalarPlugin, ScalarPluginPre};
 use crate::error::WasmError;
 use crate::host_state::HostState;
 use crate::pool::WasmInstancePool;
@@ -188,13 +188,22 @@ impl std::fmt::Debug for PreparedComponent {
     }
 }
 
-/// Concrete instance type pooled by [`WasmInstancePool`].
+/// A fresh, single-use CM scalar instance.
 ///
-/// Wraps a wasmtime `Store<HostState>` and the typed `ScalarPlugin`
-/// binding. One `ScalarPluginInstance` per warm pool slot.
+/// Wraps a freshly-built wasmtime `Store<HostState>` and the typed
+/// `ScalarPlugin` binding. Built per acquire from the cached
+/// `ScalarPluginPre` (see `build_pool`) and dropped after one
+/// invocation, so guest state never leaks across calls and a trapped
+/// store is discarded rather than reused. The store arrives already
+/// armed (full fuel, fresh epoch deadline) from `fresh_store`, so the
+/// invoke methods don't re-arm it.
 pub struct ScalarPluginInstance {
     store: Store<HostState>,
     bindings: ScalarPlugin,
+    #[expect(
+        dead_code,
+        reason = "carried for parity with the other surfaces; the fresh store is armed at build time"
+    )]
     limits: EffectiveLimits,
 }
 
@@ -285,7 +294,6 @@ impl ScalarPluginInstance {
     /// - [`WasmError::Invoke`] if the underlying wasmtime call traps or
     ///   the plugin returns a fn-error.
     pub fn invoke_scalar(&mut self, qname: &str, ipc: &[u8]) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         let result = self
             .bindings
             .call_invoke_scalar(&mut self.store, qname, ipc);
@@ -294,7 +302,6 @@ impl ScalarPluginInstance {
 
     /// Call the plugin's `manifest` export.
     fn read_manifest(&mut self) -> Result<ComponentManifest, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         let s = self
             .bindings
             .call_manifest(&mut self.store)
@@ -305,7 +312,6 @@ impl ScalarPluginInstance {
 
     /// Call the plugin's `register` export.
     fn read_register(&mut self) -> Result<RegistrationManifest, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         let s = self
             .bindings
             .call_register(&mut self.store)
@@ -315,10 +321,20 @@ impl ScalarPluginInstance {
     }
 }
 
-/// Pooled instance for the `aggregate-plugin` world.
+/// A fresh, single-use instance for the `aggregate-plugin` world.
+///
+/// Built per acquire from the cached `AggregatePluginPre`; the store is
+/// armed at build time. Aggregate exports are stateless across host
+/// calls — running accumulator state is threaded by the host as
+/// `state: list<u8>` in→out (see [`crate::adapter_aggregate`]) — so a
+/// fresh instance per `agg-*` call is correct, not just safe.
 pub struct AggregatePluginInstance {
     store: Store<HostState>,
     bindings: AggregatePlugin,
+    #[expect(
+        dead_code,
+        reason = "carried for parity with the other surfaces; the fresh store is armed at build time"
+    )]
     limits: EffectiveLimits,
 }
 
@@ -332,7 +348,6 @@ impl std::fmt::Debug for AggregatePluginInstance {
 impl AggregatePluginInstance {
     /// Call `agg-new`.
     pub fn agg_new(&mut self, qname: &str) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         map_call(
             "agg-new",
             self.bindings.call_agg_new(&mut self.store, qname),
@@ -346,7 +361,6 @@ impl AggregatePluginInstance {
         state: &[u8],
         values_ipc: &[u8],
     ) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         map_call(
             "agg-update",
             self.bindings
@@ -361,7 +375,6 @@ impl AggregatePluginInstance {
         state: &[u8],
         other_states_ipc: &[u8],
     ) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         map_call(
             "agg-merge",
             self.bindings
@@ -371,7 +384,6 @@ impl AggregatePluginInstance {
 
     /// Call `agg-evaluate`.
     pub fn agg_evaluate(&mut self, qname: &str, state: &[u8]) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         map_call(
             "agg-evaluate",
             self.bindings
@@ -380,10 +392,17 @@ impl AggregatePluginInstance {
     }
 }
 
-/// Pooled instance for the `procedure-plugin` world.
+/// A fresh, single-use instance for the `procedure-plugin` world.
+///
+/// Built per acquire from the cached `ProcedurePluginPre`; the store is
+/// armed at build time and the instance is dropped after one call.
 pub struct ProcedurePluginInstance {
     store: Store<HostState>,
     bindings: ProcedurePluginBindings,
+    #[expect(
+        dead_code,
+        reason = "carried for parity with the other surfaces; the fresh store is armed at build time"
+    )]
     limits: EffectiveLimits,
 }
 
@@ -397,7 +416,6 @@ impl std::fmt::Debug for ProcedurePluginInstance {
 impl ProcedurePluginInstance {
     /// Call `invoke-procedure`.
     pub fn invoke_procedure(&mut self, qname: &str, args_ipc: &[u8]) -> Result<Vec<u8>, WasmError> {
-        reset_call_limits(&mut self.store, &self.limits);
         map_call(
             "invoke-procedure",
             self.bindings
@@ -839,55 +857,78 @@ fn reset_call_limits(store: &mut Store<HostState>, limits: &EffectiveLimits) {
     }
 }
 
-/// Generic CM-plugin pool factory.
+/// A fresh, cap-limited `Store<HostState>` for one invoke.
 ///
-/// The per-surface (`scalar` / `aggregate` / `procedure`) builders only
-/// differ in (a) which `wit-bindgen`-generated `instantiate` fn they
-/// call (b) how they pack the resulting `Store` + bindings into the
-/// surface-specific instance struct, and (c) the surface-name string
-/// for error messages. The caller-supplied closure receives a freshly
-/// built `Store` (already cap-limited) plus the linker and component
-/// and returns the surface-specific instance. Engine config, component
-/// compile, linker selection, and resource-limit application are
-/// shared.
-fn build_pool<I, F>(
+/// The per-invoke security boundary: every call gets its own `Store` so
+/// guest linear memory / globals / WASI context start clean and a trapped
+/// store is dropped, never reused (proposal §5.6 + architecture review
+/// findings #2 / #3). Engine + epoch deadline + fuel are all (re)armed
+/// here because a brand-new store starts with full fuel and a fresh epoch
+/// deadline anyway.
+fn fresh_store(
+    engine: &Engine,
+    prepared: &PreparedComponent,
+    limits: &EffectiveLimits,
+) -> Store<HostState> {
+    let mut store = Store::new(
+        engine,
+        HostState::new(prepared.effective.clone(), prepared.http.clone()),
+    );
+    apply_resource_limits(&mut store, limits);
+    store
+}
+
+/// Generic CM-plugin instance-cache factory.
+///
+/// Caches the heavy artifacts **once** at load time — the wasmtime
+/// `Engine`, the compiled `Component`, and the surface-specific
+/// `bindgen!`-generated `*Pre` (an `InstancePre<HostState>` wrapper) —
+/// then hands the instance cache a cheap factory that, per acquire,
+/// builds a fresh `Store<HostState>` and calls `pre.instantiate(&mut
+/// store)`. Re-instantiation per invoke is what gives each call clean
+/// guest state (a persistent store would leak it).
+///
+/// The per-surface builders supply two closures:
+///
+/// - `build_pre` — runs once: `linker.instantiate_pre(component)` →
+///   `SurfacePre::new(pre)`, returning a `Clone` `*Pre` value.
+/// - `instantiate` — runs per acquire: takes the fresh `Store` by value
+///   plus the cached `*Pre`, calls `pre.instantiate(&mut store)`, and
+///   packs both into the surface-specific instance struct (which owns
+///   its store for the duration of the call).
+fn build_pool<I, P, BP, MK>(
     bytes: &[u8],
     prepared: &PreparedComponent,
-    build_instance: F,
+    build_pre: BP,
+    instantiate: MK,
 ) -> Result<Arc<WasmInstancePool<I>>, WasmError>
 where
     I: Send + 'static,
-    F: Fn(
-            Store<HostState>,
-            &Component,
-            &Linker<HostState>,
-            EffectiveLimits,
-        ) -> Result<I, WasmError>
-        + Send
-        + Sync
-        + 'static,
+    P: Clone + Send + Sync + 'static,
+    BP: FnOnce(&Component, &Linker<HostState>) -> Result<P, WasmError>,
+    MK: Fn(&P, Store<HostState>, EffectiveLimits) -> Result<I, WasmError> + Send + Sync + 'static,
 {
-    let bytes_owned: Arc<Vec<u8>> = Arc::new(bytes.to_vec());
+    // Compile + link once; cache the artifact for cheap per-invoke
+    // instantiation.
+    let limits = EffectiveLimits::resolve(&prepared.manifest);
+    let engine = build_engine(&limits)?;
+    let component = Component::from_binary(&engine, bytes)
+        .map_err(|e| WasmError::InvalidWasm(format!("component compile: {e}")))?;
+    let linker: Linker<HostState> =
+        select_linker_for_manifest(&engine, &prepared.manifest, &prepared.effective)?;
+    let pre = build_pre(&component, &linker)?;
+
     let prepared_owned: Arc<PreparedComponent> = Arc::new(prepared.clone());
-    let build_instance = Arc::new(build_instance);
+    let engine_owned = Arc::new(engine);
+    let instantiate = Arc::new(instantiate);
 
     let factory = {
-        let bytes = Arc::clone(&bytes_owned);
         let prepared = Arc::clone(&prepared_owned);
-        let build_instance = Arc::clone(&build_instance);
+        let engine = Arc::clone(&engine_owned);
+        let instantiate = Arc::clone(&instantiate);
         move || -> Result<I, WasmError> {
-            let limits = EffectiveLimits::resolve(&prepared.manifest);
-            let engine = build_engine(&limits)?;
-            let component = Component::from_binary(&engine, &bytes)
-                .map_err(|e| WasmError::InvalidWasm(format!("component compile: {e}")))?;
-            let linker: Linker<HostState> =
-                select_linker_for_manifest(&engine, &prepared.manifest, &prepared.effective)?;
-            let mut store = Store::new(
-                &engine,
-                HostState::new(prepared.effective.clone(), prepared.http.clone()),
-            );
-            apply_resource_limits(&mut store, &limits);
-            build_instance(store, &component, &linker, limits)
+            let store = fresh_store(&engine, &prepared, &limits);
+            instantiate(&pre, store, limits)
         }
     };
 
@@ -1135,45 +1176,81 @@ fn build_scalar_pool(
     bytes: &[u8],
     prepared: &PreparedComponent,
 ) -> Result<Arc<WasmInstancePool<ScalarPluginInstance>>, WasmError> {
-    build_pool(bytes, prepared, |mut store, component, linker, limits| {
-        let bindings = ScalarPlugin::instantiate(&mut store, component, linker)
-            .map_err(|e| WasmError::Instantiate(format!("scalar-plugin instantiate: {e}")))?;
-        Ok(ScalarPluginInstance {
-            store,
-            bindings,
-            limits,
-        })
-    })
+    build_pool(
+        bytes,
+        prepared,
+        |component, linker| {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(|e| WasmError::Instantiate(format!("scalar-plugin pre: {e}")))?;
+            ScalarPluginPre::new(pre)
+                .map_err(|e| WasmError::Instantiate(format!("scalar-plugin pre-new: {e}")))
+        },
+        |pre, mut store, limits| {
+            let bindings = pre
+                .instantiate(&mut store)
+                .map_err(|e| WasmError::Instantiate(format!("scalar-plugin instantiate: {e}")))?;
+            Ok(ScalarPluginInstance {
+                store,
+                bindings,
+                limits,
+            })
+        },
+    )
 }
 
 fn build_aggregate_pool(
     bytes: &[u8],
     prepared: &PreparedComponent,
 ) -> Result<Arc<WasmInstancePool<AggregatePluginInstance>>, WasmError> {
-    build_pool(bytes, prepared, |mut store, component, linker, limits| {
-        let bindings = AggregatePlugin::instantiate(&mut store, component, linker)
-            .map_err(|e| WasmError::Instantiate(format!("aggregate-plugin instantiate: {e}")))?;
-        Ok(AggregatePluginInstance {
-            store,
-            bindings,
-            limits,
-        })
-    })
+    build_pool(
+        bytes,
+        prepared,
+        |component, linker| {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(|e| WasmError::Instantiate(format!("aggregate-plugin pre: {e}")))?;
+            AggregatePluginPre::new(pre)
+                .map_err(|e| WasmError::Instantiate(format!("aggregate-plugin pre-new: {e}")))
+        },
+        |pre, mut store, limits| {
+            let bindings = pre.instantiate(&mut store).map_err(|e| {
+                WasmError::Instantiate(format!("aggregate-plugin instantiate: {e}"))
+            })?;
+            Ok(AggregatePluginInstance {
+                store,
+                bindings,
+                limits,
+            })
+        },
+    )
 }
 
 fn build_procedure_pool(
     bytes: &[u8],
     prepared: &PreparedComponent,
 ) -> Result<Arc<WasmInstancePool<ProcedurePluginInstance>>, WasmError> {
-    build_pool(bytes, prepared, |mut store, component, linker, limits| {
-        let bindings = ProcedurePluginBindings::instantiate(&mut store, component, linker)
-            .map_err(|e| WasmError::Instantiate(format!("procedure-plugin instantiate: {e}")))?;
-        Ok(ProcedurePluginInstance {
-            store,
-            bindings,
-            limits,
-        })
-    })
+    build_pool(
+        bytes,
+        prepared,
+        |component, linker| {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(|e| WasmError::Instantiate(format!("procedure-plugin pre: {e}")))?;
+            ProcedurePluginPre::new(pre)
+                .map_err(|e| WasmError::Instantiate(format!("procedure-plugin pre-new: {e}")))
+        },
+        |pre, mut store, limits| {
+            let bindings = pre.instantiate(&mut store).map_err(|e| {
+                WasmError::Instantiate(format!("procedure-plugin instantiate: {e}"))
+            })?;
+            Ok(ProcedurePluginInstance {
+                store,
+                bindings,
+                limits,
+            })
+        },
+    )
 }
 
 /// Translate one wire arg type into the internal [`ArgType`].

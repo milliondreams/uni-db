@@ -1,0 +1,43 @@
+# Standalone example Extism plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-extism-stateful
+#   cargo build --target wasm32-unknown-unknown --release
+#
+# Produces target/wasm32-unknown-unknown/release/example_extism_stateful.wasm.
+#
+# This fixture carries a module-level mutable global (`COUNTER`) used to
+# prove the extism loader builds a FRESH `extism::Plugin` per invoke: a
+# fresh plugin instance starts the counter at zero every call, and a
+# trapping call must not poison the next call.
+
+# Declaring its own [workspace] opts this crate out of the outer `uni`
+# workspace so `cargo build --workspace` from the repo root won't try to
+# build it for the host target.
+[workspace]
+
+[package]
+name = "example-extism-stateful"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Extism plugin with a mutable global, for per-invoke isolation tests"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde_json = "1"
+# Arrow IPC on wasm32-unknown-unknown (no chrono / csv / json).
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

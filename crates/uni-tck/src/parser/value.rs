@@ -253,8 +253,15 @@ fn path(input: &str) -> IResult<&str, Path> {
     let (input, _) = char('<').parse(input)?;
     let (input, _) = multispace0(input)?;
 
-    // Parse first node
-    let (input, first_node) = node(input)?;
+    // Parse first node. Standalone `node()` stamps every node `vid = 0`, which
+    // would collapse all path nodes to the same identity and make edge
+    // orientation (src vs dst) unrecoverable. Assign a distinct positional vid to
+    // each node so the comparator can tell source from destination. The values
+    // are positional sequence numbers, not real graph IDs (which aren't available
+    // in TCK result tables); only their relative identity within the path matters.
+    let (input, mut first_node) = node(input)?;
+    first_node.vid = Vid::from(0);
+    let mut next_vid: u64 = 1;
     let mut nodes = vec![first_node];
     let mut edges = vec![];
 
@@ -277,8 +284,10 @@ fn path(input: &str) -> IResult<&str, Path> {
                 // Determine direction: -> is outgoing, <- is incoming
                 let outgoing = left_arrow.is_none() && right_arrow.is_some();
 
-                // Parse next node
-                let (input, next_node) = node(input)?;
+                // Parse next node and give it a distinct positional vid.
+                let (input, mut next_node) = node(input)?;
+                next_node.vid = Vid::from(next_vid);
+                next_vid += 1;
 
                 // Set edge source/destination based on direction
                 if outgoing {
@@ -343,6 +352,47 @@ mod tests {
         assert_eq!(
             parse_value("-Infinity").unwrap(),
             Value::Float(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn test_parse_path_preserves_direction() {
+        // An outgoing path edge must have distinct src/dst so orientation is
+        // recoverable; the standalone `node()` parser stamps every node vid = 0,
+        // which would otherwise collapse src == dst and lose direction.
+        let outgoing = parse_value("<(:A)-[:T]->(:B)>").unwrap();
+        let Value::Path(p) = outgoing else {
+            panic!("expected a path value");
+        };
+        assert_eq!(p.nodes.len(), 2);
+        assert_eq!(p.edges.len(), 1);
+        let edge = &p.edges[0];
+        assert_ne!(
+            edge.src, edge.dst,
+            "path edge src/dst must differ so direction is recoverable"
+        );
+        assert_eq!(
+            edge.src, p.nodes[0].vid,
+            "outgoing edge starts at first node"
+        );
+        assert_eq!(
+            edge.dst, p.nodes[1].vid,
+            "outgoing edge ends at second node"
+        );
+
+        // The reversed (incoming) form must flip src/dst.
+        let incoming = parse_value("<(:A)<-[:T]-(:B)>").unwrap();
+        let Value::Path(p2) = incoming else {
+            panic!("expected a path value");
+        };
+        let edge2 = &p2.edges[0];
+        assert_eq!(
+            edge2.src, p2.nodes[1].vid,
+            "incoming edge starts at second node"
+        );
+        assert_eq!(
+            edge2.dst, p2.nodes[0].vid,
+            "incoming edge ends at first node"
         );
     }
 

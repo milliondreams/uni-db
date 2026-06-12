@@ -17,6 +17,7 @@ use cucumber::{World, WriterExt};
 use gherkin::GherkinEnv;
 use libtest_mimic::{Arguments, Failed, Trial};
 use regex::Regex;
+use uni_tck::run_summary::scenario_count_is_empty;
 use uni_tck::{
     clear_tck_run_context_for_current_thread, set_tck_run_context_for_current_thread,
     TckSchemaMode, UniWorld,
@@ -333,13 +334,29 @@ fn run_single_scenario(
             })
             .await;
 
-        w.execution_has_failed()
+        // A run that executed zero scenarios is a failure, not a success:
+        // `execution_has_failed()` only reports *failed* scenarios, so a filter
+        // that matched nothing (or a feature that failed to load) would otherwise
+        // be silently reported as a pass. openCypher TCK semantics require every
+        // declared scenario to actually run and be asserted, so treat "0 scenarios
+        // ran" (no passed/failed/skipped) as a hard failure.
+        let scenarios = w.scenarios_stats();
+        let nothing_ran = scenario_count_is_empty(scenarios.total());
+        (w.execution_has_failed() || nothing_ran, nothing_ran)
     });
+    let (failed, nothing_ran) = failed;
 
     let output = buffer.contents();
 
     let (status, error_message) = if failed {
-        let error_detail = extract_error_from_output(&output);
+        let error_detail = if nothing_ran {
+            format!(
+                "No scenarios were executed for '{}' at line {} (filter matched nothing or the feature failed to load)",
+                scenario_name, scenario_line
+            )
+        } else {
+            extract_error_from_output(&output)
+        };
         ("failed", Some(error_detail))
     } else {
         ("passed", None)

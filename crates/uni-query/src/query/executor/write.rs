@@ -1704,6 +1704,11 @@ impl Executor {
     /// checked here — the per-row consumer re-checks at row time, exactly as
     /// the old per-row scan did.
     ///
+    /// The second returned map carries the FULL property maps the schemaless
+    /// branch already decoded for each matched vid (empty on the declared-label
+    /// branch, which projects only key columns) — the caller seeds the
+    /// statement-level [`Prefetch`] from it at zero extra scans.
+    ///
     /// # Errors
     /// Propagates persisted-scan and filter-build failures — fail-closed: a
     /// MERGE must never treat a failed lookup as "no match" and create
@@ -1713,10 +1718,13 @@ impl Executor {
         label: &str,
         key_names: &[String],
         keys: &HashSet<MergeKey>,
-    ) -> Result<HashMap<MergeKey, Vec<Vid>>> {
+    ) -> Result<(
+        HashMap<MergeKey, Vec<Vid>>,
+        HashMap<Vid, uni_common::Properties>,
+    )> {
         let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
         if keys.is_empty() {
-            return Ok(out);
+            return Ok((out, HashMap::new()));
         }
         // An undeclared (schemaless) label has no per-label table — its flushed
         // rows live only in the unified main vertex table. Route to the
@@ -1775,7 +1783,7 @@ impl Executor {
                 out.entry(tuple).or_default().push(vid);
             }
         }
-        Ok(out)
+        Ok((out, HashMap::new()))
     }
 
     /// Persisted-match lookup for an UNDECLARED (schemaless) label.
@@ -1792,6 +1800,10 @@ impl Executor {
     /// version per vid); the per-vid max-`_version` dedup runs here, then
     /// deleted winners are dropped.
     ///
+    /// Also returns the full decoded property map per matched vid — the blob
+    /// is decoded here anyway, and the caller seeds the statement-level
+    /// [`Prefetch`] from it instead of re-reading per row.
+    ///
     /// # Errors
     /// Propagates scan and blob-decode failures — fail-closed: a MERGE must
     /// never treat a failed lookup as "no match" and create duplicates.
@@ -1800,8 +1812,12 @@ impl Executor {
         label: &str,
         key_names: &[String],
         keys: &HashSet<MergeKey>,
-    ) -> Result<HashMap<MergeKey, Vec<Vid>>> {
+    ) -> Result<(
+        HashMap<MergeKey, Vec<Vid>>,
+        HashMap<Vid, uni_common::Properties>,
+    )> {
         let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        let mut props_by_vid: HashMap<Vid, uni_common::Properties> = HashMap::new();
         let filter = format!("array_contains(labels, '{}')", label.replace('\'', "''"));
         let Some(batch) = self
             .storage
@@ -1811,7 +1827,7 @@ impl Executor {
             )
             .await?
         else {
-            return Ok(out);
+            return Ok((out, props_by_vid));
         };
         let (Some(vid_col), Some(del_col), Some(ver_col)) = (
             batch
@@ -1871,9 +1887,26 @@ impl Executor {
                 .collect();
             if keys.contains(&tuple) {
                 out.entry(tuple).or_default().push(vid);
+                props_by_vid.insert(vid, props);
             }
         }
-        Ok(out)
+        Ok((out, props_by_vid))
+    }
+
+    /// True if the statement-level MERGE property prefetch is safe for `label`.
+    ///
+    /// False when the label declares any CRDT-typed property: a prefetch HIT in
+    /// [`read_vertex_props_with_prefetch`] skips the `normalize_crdt_properties`
+    /// pass that `get_all_vertex_props_with_ctx` applies, so CRDT-bearing
+    /// labels keep the per-row read path. Undeclared labels are trivially safe
+    /// (normalization is a no-op without schema CRDT entries).
+    fn merge_label_prefetch_safe(&self, label: &str) -> bool {
+        let schema = self.storage.schema_manager().schema();
+        schema.properties.get(label).is_none_or(|props| {
+            !props
+                .values()
+                .any(|pm| matches!(pm.r#type, DataType::Crdt(_)))
+        })
     }
 
     /// True if an L0 override rewrote any key column of a persisted match away
@@ -1938,6 +1971,13 @@ impl Executor {
     /// (intra-batch dedup). Returns the RETURN rows for this input row (one per
     /// match, or one for a create).
     ///
+    /// `prefetched` is the statement-level property prefetch (`None` when the
+    /// label is CRDT-bearing, see [`Self::merge_label_prefetch_safe`]): matched
+    /// vids carry their persisted base row, freshly created vids are seeded
+    /// with an empty base — per-row reads then resolve as base + L0 layering
+    /// (every SET flush writes the full row to L0 before the next read, so a
+    /// prefetch hit equals a fresh read) instead of one storage scan each.
+    ///
     /// # Errors
     /// Propagates evaluation, create, and SET failures.
     #[expect(
@@ -1962,7 +2002,9 @@ impl Executor {
         ctx: Option<&QueryContext>,
         tx_l0_override: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
         writer: &Writer,
+        mut prefetched: Option<&mut Prefetch>,
     ) -> Result<Vec<HashMap<String, Value>>> {
+        let empty_prefetch = Prefetch::default();
         let mut seen: HashSet<Vid> = HashSet::new();
         let mut matches: Vec<Vid> = Vec::new();
         // Persisted (flushed) matches from the per-statement prefetch. The
@@ -2009,6 +2051,20 @@ impl Executor {
                 tx_l0_override,
             )
             .await?;
+            // Fold the new vertex into the batch snapshot for intra-batch
+            // dedup, and seed the statement prefetch with an empty base: a
+            // fresh vid has nothing in storage, so ON CREATE SET's lazy read
+            // resolves from the L0 row the create just wrote instead of
+            // issuing a per-row storage scan that finds nothing.
+            if let Some(var) = &node.variable
+                && let Some(val) = row.get(var)
+                && let Ok(vid) = Self::vid_from_value(val)
+            {
+                existing.entry(key_tuple.clone()).or_default().push(vid);
+                if let Some(p) = prefetched.as_deref_mut() {
+                    p.vertex.entry(vid).or_default();
+                }
+            }
             if let Some(set) = on_create {
                 self.execute_set_items_locked(
                     &set.items,
@@ -2018,16 +2074,9 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0_override,
-                    &Prefetch::default(),
+                    prefetched.as_deref().unwrap_or(&empty_prefetch),
                 )
                 .await?;
-            }
-            // Fold the new vertex into the batch snapshot for intra-batch dedup.
-            if let Some(var) = &node.variable
-                && let Some(val) = row.get(var)
-                && let Ok(vid) = Self::vid_from_value(val)
-            {
-                existing.entry(key_tuple.clone()).or_default().push(vid);
             }
             Self::bind_path_variables(path_pattern, &mut row, temp_vars);
             out.push(row);
@@ -2054,15 +2103,18 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0_override,
-                        &Prefetch::default(),
+                        prefetched.as_deref().unwrap_or(&empty_prefetch),
                     )
                     .await?;
                 }
                 if let Some(var) = &node.variable {
-                    // Rebind with full, post-SET properties for RETURN fidelity.
+                    // Rebind with full, post-SET properties for RETURN
+                    // fidelity. The SET above flushed the full row to L0, so a
+                    // prefetch hit (base + L0 layering) reproduces exactly
+                    // what a fresh storage read would return.
                     let props = read_vertex_props_with_prefetch(
                         vid,
-                        &Prefetch::default(),
+                        prefetched.as_deref().unwrap_or(&empty_prefetch),
                         prop_manager,
                         ctx,
                     )
@@ -2116,6 +2168,13 @@ impl Executor {
         // evaluating them ahead of any creates cannot observe earlier rows.
         let mut row_fast: Vec<Option<(HashMap<String, Value>, MergeKey)>> = Vec::new();
         let mut fast_persisted: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        // Statement-level property prefetch for the fast path (review perf
+        // residual): every persisted match's full row is batch-read ONCE, so
+        // the per-row ON MATCH SET read and the post-SET rebind resolve as
+        // prefetch-base + L0 layering instead of one storage scan each.
+        // `None` disables it for CRDT-bearing labels (the prefetch-hit read
+        // skips CRDT normalization).
+        let mut merge_prefetch: Option<Prefetch> = None;
         if let Some((node, label)) = &fastpath {
             let mut key_names: Vec<String> = match &node.properties {
                 Some(Expr::Map(entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
@@ -2149,9 +2208,38 @@ impl Executor {
                 .flatten()
                 .map(|(_, tuple)| tuple.clone())
                 .collect();
-            fast_persisted = self
+            let (persisted, schemaless_props) = self
                 .merge_lookup_persisted_batch(label, &key_names, &unique_keys)
                 .await?;
+            fast_persisted = persisted;
+            if self.merge_label_prefetch_safe(label) {
+                let mut pf = Prefetch::default();
+                if !schemaless_props.is_empty() {
+                    // The schemaless lookup already decoded each matched vid's
+                    // full property map — zero extra scans.
+                    pf.vertex.extend(schemaless_props);
+                } else {
+                    let vids: Vec<Vid> = fast_persisted
+                        .values()
+                        .flatten()
+                        .copied()
+                        .collect::<HashSet<Vid>>()
+                        .into_iter()
+                        .collect();
+                    if !vids.is_empty()
+                        && let Ok(batch_props) = prop_manager
+                            .get_batch_vertex_props_for_label(&vids, label, ctx)
+                            .await
+                    {
+                        // One `_vid IN (…)` scan for every matched row's base.
+                        // On Err the map stays empty — every read falls back to
+                        // the per-row path (fail-open, same posture as
+                        // prefetch_set_targets).
+                        pf.vertex.extend(batch_props);
+                    }
+                }
+                merge_prefetch = Some(pf);
+            }
         }
 
         let mut results = Vec::new();
@@ -2180,6 +2268,7 @@ impl Executor {
                         ctx,
                         tx_l0_override,
                         writer,
+                        merge_prefetch.as_mut(),
                     )
                     .await?;
                 results.extend(row_out);

@@ -200,6 +200,58 @@ async fn merge_on_match_after_flush() -> Result<()> {
     Ok(())
 }
 
+/// `ON MATCH SET n.x = null` on a FLUSHED row must remove the property in the
+/// per-row RETURN and in a fresh MATCH — pins the null-tombstone L0 layering
+/// through the statement-level property prefetch (the prefetch base still
+/// carries the flushed value; the L0 overlay must win).
+#[tokio::test]
+async fn merge_on_match_set_null_after_flush() -> Result<()> {
+    let db = setup().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "nn")
+        .param("n", "ToClear")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query_with(
+            "UNWIND $batch AS e \
+             MERGE (n:Entity {entity_id: e.entity_id}) \
+             ON MATCH SET n.name = null \
+             RETURN n.entity_id AS id, n.name AS name",
+        )
+        .param("batch", Value::List(vec![entity("nn", "ignored", 0)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(res.rows().len(), 1);
+    assert!(
+        res.rows()[0].get::<String>("name").is_err(),
+        "RETURN must see the null-SET (property removed)"
+    );
+
+    let dump = db
+        .session()
+        .query_with("MATCH (n:Entity) WHERE n.entity_id = $id RETURN n.name AS name, n.freq AS f")
+        .param("id", "nn")
+        .fetch_all()
+        .await?;
+    assert_eq!(dump.rows().len(), 1, "matched, not re-created");
+    assert!(
+        dump.rows()[0].get::<String>("name").is_err(),
+        "fresh MATCH must see the property removed"
+    );
+    assert_eq!(dump.rows()[0].get::<i64>("f")?, 10, "other props untouched");
+    Ok(())
+}
+
 // ============================================================================
 // C-c: a non-unique key matching >1 node applies ON MATCH SET to ALL matches
 // and creates nothing.

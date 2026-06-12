@@ -429,6 +429,55 @@ async fn schemaless_traversal_antidependency_aborts() -> Result<()> {
     }
 }
 
+/// With source-vid pushdown, a schemaless traversal's read-set covers exactly
+/// the traversed sources' incident edges — a concurrent write to an UNRELATED
+/// vertex of the same edge type must NOT abort the reader. (Before pushdown
+/// the whole-type scan recorded every edge of the type, which was incidentally
+/// — not contractually — more conservative; phantoms are out of scope for the
+/// item-level read-set and handled by FOR UPDATE.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schemaless_traversal_pushdown_ignores_unrelated_vertices() -> Result<()> {
+    let db = {
+        let db = Uni::in_memory().build().await?;
+        db.schema()
+            .label("N")
+            .property("id", DataType::String)
+            .property("v", DataType::Int)
+            .done()
+            .apply()
+            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (a:N {id: 'a', v: 0})-[:R]->(b:N {id: 'b', v: 0})")
+            .await?;
+        tx.execute("CREATE (x:N {id: 'x', v: 0})-[:R]->(y:N {id: 'y', v: 0})")
+            .await?;
+        tx.commit().await?;
+        db
+    };
+
+    let s_a = db.session();
+    let tx_a = s_a.tx().await?;
+    // 1-source schemaless traversal a -> b (pushdown path: only a's edges).
+    tx_a.query("MATCH (a:N {id: 'a'})-[:R]->(nbr) RETURN a.id")
+        .await?;
+
+    // Concurrently modify the UNRELATED vertex y (same edge type, different
+    // component) and commit.
+    {
+        let s_b = db.session();
+        let tx_b = s_b.tx().await?;
+        tx_b.execute("MATCH (y:N {id: 'y'}) SET y.v = 1").await?;
+        tx_b.commit().await?;
+    }
+
+    tx_a.execute("CREATE (:N {id: 'c', v: 0})").await?;
+    tx_a.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("unrelated write must not abort the reader: {e}"))?;
+    Ok(())
+}
+
 /// A read-only transaction is never a serialization pivot: a concurrent writer to
 /// a row the reader observed still commits, and the read-only transaction itself
 /// commits cleanly afterwards (empty write-set → snapshot isolation, §7).

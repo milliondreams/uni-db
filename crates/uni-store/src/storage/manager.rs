@@ -1484,12 +1484,14 @@ impl StorageManager {
             .await
     }
 
-    /// Find edges from the main edge table by type names.
+    /// Find edges from the main edge table by type names, optionally pushing
+    /// a bounded endpoint vid set into the scan (review perf #5).
     pub async fn find_edges_by_type_names(
         &self,
         type_names: &[&str],
+        endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
-        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names).await
+        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names, endpoint_filter).await
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.

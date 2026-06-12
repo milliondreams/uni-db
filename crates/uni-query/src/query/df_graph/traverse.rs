@@ -1472,7 +1472,11 @@ impl RecordBatchStream for GraphTraverseStream {
 }
 
 /// Adjacency map type: maps source VID to list of (target_vid, eid, edge_type_name, properties).
-type EdgeAdjacencyMap = HashMap<Vid, Vec<(Vid, Eid, String, uni_common::Properties)>>;
+///
+/// Type name and properties are `Arc`-shared: an undirected (`Both`) traversal
+/// stores every edge under both endpoints, which used to deep-clone the whole
+/// property map per edge (review perf #5).
+type EdgeAdjacencyMap = HashMap<Vid, Vec<(Vid, Eid, Arc<str>, Arc<uni_common::Properties>)>>;
 
 /// Graph traversal execution plan for schemaless edge types (TraverseMainByType).
 ///
@@ -1782,17 +1786,35 @@ impl ExecutionPlan for GraphTraverseMainExec {
     }
 }
 
+/// Maximum number of distinct source vids pushed into the edge scan; above
+/// this a whole-type scan is cheaper than a giant `IN` filter (measured: a
+/// 10k-vid IN over a 100k-edge table is ~2.6x slower than the full scan,
+/// while small source sets are ~4.5x faster — see `schemaless_traversal`
+/// bench).
+const TRAVERSE_PUSHDOWN_MAX_SOURCES: usize = 1_024;
+
 /// State machine for GraphTraverseMainStream.
+///
+/// The input is drained FIRST so the distinct source vids can be pushed into
+/// the edge scan (review perf #5) — without this, a 1-source traversal
+/// materialized every edge of the type. Memory note: buffering the input does
+/// not change the operator's memory class; it already materialized the entire
+/// edge type (and with pushdown materializes strictly less).
 enum GraphTraverseMainState {
+    /// Draining the input stream to learn the source-vid set.
+    CollectingInput {
+        input_stream: SendableRecordBatchStream,
+        buffered: Vec<RecordBatch>,
+    },
     /// Loading adjacency map from main edges table.
     LoadingEdges {
         future: Pin<Box<dyn std::future::Future<Output = DFResult<EdgeAdjacencyMap>> + Send>>,
-        input_stream: SendableRecordBatchStream,
+        buffered: Vec<RecordBatch>,
     },
-    /// Processing input stream with loaded adjacency.
+    /// Replaying the buffered input batches against the loaded adjacency.
     Processing {
         adjacency: EdgeAdjacencyMap,
-        input_stream: SendableRecordBatchStream,
+        buffered: std::vec::IntoIter<RecordBatch>,
     },
     /// Stream is done.
     Done,
@@ -1833,6 +1855,12 @@ struct GraphTraverseMainStream {
     /// Output schema.
     schema: SchemaRef,
 
+    /// Edge type names to traverse (retained for the deferred edge load).
+    type_names: Vec<String>,
+
+    /// Traversal direction (retained for the deferred edge load).
+    direction: Direction,
+
     /// Stream state.
     state: GraphTraverseMainState,
 
@@ -1860,12 +1888,8 @@ impl GraphTraverseMainStream {
         schema: SchemaRef,
         metrics: BaselineMetrics,
     ) -> Self {
-        // Start by loading the adjacency map from the main edges table
-        let loading_ctx = graph_ctx.clone();
-        let loading_types = type_names.clone();
-        let fut =
-            async move { build_edge_adjacency_map(&loading_ctx, &loading_types, direction).await };
-
+        // The input is drained first (CollectingInput) so the edge load can
+        // push the bounded source-vid set into the scan.
         Self {
             source_column,
             target_variable,
@@ -1878,12 +1902,35 @@ impl GraphTraverseMainStream {
             bound_target_column,
             used_edge_columns,
             schema,
-            state: GraphTraverseMainState::LoadingEdges {
-                future: Box::pin(fut),
+            type_names,
+            direction,
+            state: GraphTraverseMainState::CollectingInput {
                 input_stream,
+                buffered: Vec::new(),
             },
             metrics,
         }
+    }
+
+    /// Distinct source vids across the buffered input, or `None` when the set
+    /// exceeds [`TRAVERSE_PUSHDOWN_MAX_SOURCES`] (whole-type scan is cheaper)
+    /// or the source column cannot be read (the edge load then behaves exactly
+    /// as before pushdown existed).
+    fn collect_source_vids(&self, buffered: &[RecordBatch]) -> Option<HashSet<Vid>> {
+        let mut vids: HashSet<Vid> = HashSet::new();
+        for batch in buffered {
+            let col = batch.column_by_name(&self.source_column)?;
+            let arr = column_as_vid_array(col.as_ref()).ok()?;
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    vids.insert(Vid::from(arr.value(i)));
+                    if vids.len() > TRAVERSE_PUSHDOWN_MAX_SOURCES {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(vids)
     }
 
     /// Expand input batch using adjacency map (synchronous version).
@@ -1923,8 +1970,9 @@ impl GraphTraverseMainStream {
             })
             .collect();
 
-        // Build expansions: (input_row_idx, target_vid, eid, edge_type, edge_props)
-        type Expansion = (usize, Vid, Eid, String, uni_common::Properties);
+        // Build expansions: (input_row_idx, target_vid, eid, edge_type, edge_props).
+        // Type/props are Arc-shared with the adjacency map (pointer clones).
+        type Expansion = (usize, Vid, Eid, Arc<str>, Arc<uni_common::Properties>);
         let mut expansions: Vec<Expansion> = Vec::new();
 
         for (row_idx, src_u64) in source_vids.iter().enumerate() {
@@ -1966,8 +2014,8 @@ impl GraphTraverseMainStream {
                             row_idx,
                             *target_vid,
                             *eid,
-                            edge_type.clone(),
-                            props.clone(),
+                            Arc::clone(edge_type),
+                            Arc::clone(props),
                         ));
                     }
                 }
@@ -2224,20 +2272,50 @@ impl GraphExecutionContext {
 /// Supports OR relationship types like `[:KNOWS|HATES]` via multiple type_names.
 /// Returns a HashMap mapping source VID -> Vec<(target_vid, eid, properties)>
 /// Direction determines the key: Outgoing uses src_vid, Incoming uses dst_vid, Both adds entries for both.
+///
+/// `source_vids`, when supplied, is pushed into the persisted scan so only the
+/// sources' incident edges are materialized instead of the whole edge type
+/// (review perf #5). The L0 overlay below deliberately stays whole-type: L0 is
+/// small, and unused adjacency entries are never expanded.
 async fn build_edge_adjacency_map(
     graph_ctx: &GraphExecutionContext,
     type_names: &[String],
     direction: Direction,
+    source_vids: Option<HashSet<Vid>>,
 ) -> DFResult<EdgeAdjacencyMap> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
 
-    // Step 1: Query main edges table for all type names
+    // Step 1: Query main edges table for all type names, pushing the bounded
+    // source set into the scan when present.
     let type_refs: Vec<&str> = type_names.iter().map(|s| s.as_str()).collect();
+    let endpoint_vids: Option<Vec<Vid>> = source_vids.as_ref().map(|s| s.iter().copied().collect());
+    let endpoint_filter = endpoint_vids.as_deref().map(|vids| {
+        let side = match direction {
+            Direction::Outgoing => uni_store::storage::EndpointSide::Src,
+            Direction::Incoming => uni_store::storage::EndpointSide::Dst,
+            Direction::Both => uni_store::storage::EndpointSide::Either,
+        };
+        (side, vids)
+    });
     let edges_with_type = storage
-        .find_edges_by_type_names(&type_refs)
+        .find_edges_by_type_names(&type_refs, endpoint_filter)
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // Edge filter matching the pushed-down scan, applied to the L0 overlay
+    // below so the map (and therefore the SSI read-set recorded from it) has
+    // ONE consistent footprint across both storage tiers.
+    let edge_in_scope = |src: Vid, dst: Vid| -> bool {
+        match &source_vids {
+            None => true,
+            Some(set) => match direction {
+                Direction::Outgoing => set.contains(&src),
+                Direction::Incoming => set.contains(&dst),
+                Direction::Both => set.contains(&src) || set.contains(&dst),
+            },
+        }
+    };
 
     // Preserve edge type name in the adjacency map for type(r) support
     let mut edges: Vec<(
@@ -2260,6 +2338,9 @@ async fn build_edge_adjacency_map(
                 if let Some(edge_ref) = l0_guard.graph.edge(eid) {
                     let src_vid = edge_ref.src_vid;
                     let dst_vid = edge_ref.dst_vid;
+                    if !edge_in_scope(src_vid, dst_vid) {
+                        continue;
+                    }
 
                     // Get properties for this edge from L0
                     let props = l0_guard
@@ -2296,10 +2377,13 @@ async fn build_edge_adjacency_map(
         unique_edges.retain(|edge| !tombstoned_eids.contains(&edge.0));
     }
 
-    // Step 5: Build adjacency map based on direction
+    // Step 5: Build adjacency map based on direction. Type name and props are
+    // Arc-shared so the `Both` arm clones two pointers, not the property map.
     let mut adjacency: EdgeAdjacencyMap = HashMap::new();
 
     for (eid, src_vid, dst_vid, edge_type, props) in unique_edges {
+        let edge_type: Arc<str> = edge_type.into();
+        let props = Arc::new(props);
         match direction {
             Direction::Outgoing => {
                 adjacency
@@ -2317,8 +2401,8 @@ async fn build_edge_adjacency_map(
                 adjacency.entry(src_vid).or_default().push((
                     dst_vid,
                     eid,
-                    edge_type.clone(),
-                    props.clone(),
+                    Arc::clone(&edge_type),
+                    Arc::clone(&props),
                 ));
                 adjacency
                     .entry(dst_vid)
@@ -2328,8 +2412,13 @@ async fn build_edge_adjacency_map(
         }
     }
 
-    // SSI: a schemaless traversal physically scans the whole edge type above, so
-    // record that read footprint for read-write transactions (no-op otherwise).
+    // SSI: a schemaless traversal physically scans the edge type above —
+    // whole-type, or with source pushdown every edge incident to every actual
+    // source — so record that read footprint for read-write transactions
+    // (no-op otherwise). With pushdown this records exactly what the
+    // transaction logically read; the whole-type scan was incidentally
+    // (not load-bearing) more conservative under the item-level,
+    // phantoms-out-of-scope read-set contract.
     graph_ctx.record_edge_adjacency(&adjacency);
 
     Ok(adjacency)
@@ -2345,15 +2434,61 @@ impl Stream for GraphTraverseMainStream {
             let state = std::mem::replace(&mut self.state, GraphTraverseMainState::Done);
 
             match state {
+                GraphTraverseMainState::CollectingInput {
+                    mut input_stream,
+                    mut buffered,
+                } => match input_stream.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(batch))) => {
+                        buffered.push(batch);
+                        self.state = GraphTraverseMainState::CollectingInput {
+                            input_stream,
+                            buffered,
+                        };
+                        // Continue loop to keep draining.
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        self.state = GraphTraverseMainState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(None) => {
+                        // Input fully drained: kick off the edge load with the
+                        // bounded source set pushed into the scan (when small).
+                        let source_vids = self.collect_source_vids(&buffered);
+                        let loading_ctx = self.graph_ctx.clone();
+                        let loading_types = self.type_names.clone();
+                        let direction = self.direction;
+                        let fut = async move {
+                            build_edge_adjacency_map(
+                                &loading_ctx,
+                                &loading_types,
+                                direction,
+                                source_vids,
+                            )
+                            .await
+                        };
+                        self.state = GraphTraverseMainState::LoadingEdges {
+                            future: Box::pin(fut),
+                            buffered,
+                        };
+                        // Continue loop to poll the load future.
+                    }
+                    Poll::Pending => {
+                        self.state = GraphTraverseMainState::CollectingInput {
+                            input_stream,
+                            buffered,
+                        };
+                        return Poll::Pending;
+                    }
+                },
                 GraphTraverseMainState::LoadingEdges {
                     mut future,
-                    input_stream,
+                    buffered,
                 } => match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(adjacency)) => {
                         // Move to processing state with loaded adjacency
                         self.state = GraphTraverseMainState::Processing {
                             adjacency,
-                            input_stream,
+                            buffered: buffered.into_iter(),
                         };
                         // Continue loop to start processing
                     }
@@ -2362,16 +2497,13 @@ impl Stream for GraphTraverseMainStream {
                         return Poll::Ready(Some(Err(e)));
                     }
                     Poll::Pending => {
-                        self.state = GraphTraverseMainState::LoadingEdges {
-                            future,
-                            input_stream,
-                        };
+                        self.state = GraphTraverseMainState::LoadingEdges { future, buffered };
                         return Poll::Pending;
                     }
                 },
                 GraphTraverseMainState::Processing {
                     adjacency,
-                    mut input_stream,
+                    mut buffered,
                 } => {
                     // Check timeout
                     if let Err(e) = self.graph_ctx.check_timeout() {
@@ -2380,14 +2512,14 @@ impl Stream for GraphTraverseMainStream {
                         )));
                     }
 
-                    match input_stream.poll_next_unpin(cx) {
-                        Poll::Ready(Some(Ok(batch))) => {
+                    match buffered.next() {
+                        Some(batch) => {
                             // Expand batch using adjacency map
                             let result = self.expand_batch(&batch, &adjacency);
 
                             self.state = GraphTraverseMainState::Processing {
                                 adjacency,
-                                input_stream,
+                                buffered,
                             };
 
                             if let Ok(ref r) = result {
@@ -2395,20 +2527,9 @@ impl Stream for GraphTraverseMainStream {
                             }
                             return Poll::Ready(Some(result));
                         }
-                        Poll::Ready(Some(Err(e))) => {
-                            self.state = GraphTraverseMainState::Done;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Ready(None) => {
+                        None => {
                             self.state = GraphTraverseMainState::Done;
                             return Poll::Ready(None);
-                        }
-                        Poll::Pending => {
-                            self.state = GraphTraverseMainState::Processing {
-                                adjacency,
-                                input_stream,
-                            };
-                            return Poll::Pending;
                         }
                     }
                 }
@@ -4018,8 +4139,10 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
         let graph_ctx = self.graph_ctx.clone();
         let type_names = self.type_names.clone();
         let direction = self.direction;
-        let load_fut =
-            async move { build_edge_adjacency_map(&graph_ctx, &type_names, direction).await };
+        let load_fut = async move {
+            // VLP frontier is unknown ahead of time: no source pushdown (whole-type).
+            build_edge_adjacency_map(&graph_ctx, &type_names, direction, None).await
+        };
 
         Ok(Box::pin(GraphVariableLengthTraverseMainStream {
             input: input_stream,

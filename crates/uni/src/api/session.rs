@@ -635,6 +635,49 @@ impl Session {
         result
     }
 
+    /// Run any Cypher statement, auto-committing writes; the "run anything" entry.
+    ///
+    /// Classifies `cypher` as read or write using the same read-only oracle
+    /// [`Session::query`] enforces ([`uni_query::validate_read_only_with`], with
+    /// this session's write-procedure predicate). Read statements are forwarded
+    /// to [`Session::query`]. Write statements (CREATE / MERGE / DELETE / SET /
+    /// REMOVE, write `CALL { … }` subqueries, write/schema/dbms procedures) are
+    /// executed inside a fresh auto-commit transaction: begin, run, commit.
+    ///
+    /// Unlike [`Session::query`], this never rejects a write; unlike a bare
+    /// [`Session::tx`] write, the transaction is committed for you. It is the
+    /// convenient single-statement entry point for REPLs and one-shot CLI use
+    /// where the caller does not know ahead of time whether the input mutates.
+    ///
+    /// Writes run through [`Transaction::query`] (not `execute`) so a write with
+    /// a trailing `RETURN` still yields its rows in the returned [`QueryResult`].
+    /// For multi-statement atomic units, drive a [`Session::tx`] directly.
+    ///
+    /// # Errors
+    /// Returns a parse error for malformed Cypher, any error surfaced by the
+    /// underlying read or transactional write, or a commit error.
+    #[instrument(skip(self, cypher), fields(session_id = %self.id))]
+    pub async fn run(&self, cypher: impl Into<String>) -> Result<QueryResult> {
+        let cypher = cypher.into();
+        // Reuse the read-only oracle: `Ok` ⇒ pure read, `Err` ⇒ contains a
+        // write/schema/dbms clause and must go through a transaction.
+        let ast = uni_cypher::parse(&cypher).map_err(crate::api::impl_query::into_parse_error)?;
+        let is_read =
+            uni_query::validate_read_only_with(&ast, &|name| self.procedure_is_write(name)).is_ok();
+
+        if is_read {
+            return self.query(&cypher).await;
+        }
+
+        // Write path: auto-commit transaction. `tx.query` (not `tx.execute`)
+        // executes the write and preserves any `RETURN` rows. The tx read-only
+        // gate only fires for time-travel, so a plain write passes.
+        let tx = self.tx().await?;
+        let result = tx.query(&cypher).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
     /// Execute a read-only Cypher query with a builder for parameters.
     pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_> {
         QueryBuilder {

@@ -1329,16 +1329,18 @@ impl PropertyManager {
 
         let jsonb_bytes = binary_array.value(row);
 
-        // Decode CypherValue binary
-        let uni_val = uni_common::cypher_value_codec::decode(jsonb_bytes)
-            .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-        let json_val: serde_json::Value = uni_val.into();
-
-        // Parse to Properties
-        let overflow_props: Properties = serde_json::from_value(json_val)
-            .map_err(|e| anyhow!("Failed to parse overflow properties: {}", e))?;
-
-        Ok(Some(overflow_props))
+        // Decode the CypherValue blob directly to `Value`. Routing through
+        // `serde_json` would stringify temporal values (and is unnecessary —
+        // the blob already decodes to a `Value::Map`).
+        match uni_common::cypher_value_codec::decode(jsonb_bytes)
+            .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?
+        {
+            Value::Map(map) => Ok(Some(map)),
+            Value::Null => Ok(None),
+            other => Err(anyhow!(
+                "overflow_json decoded to a non-map value: {other:?}"
+            )),
+        }
     }
 
     /// Merge overflow properties from the overflow_json column into an existing props map.

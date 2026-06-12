@@ -822,36 +822,32 @@ fn build_all_props_column(
     props_map: &HashMap<Vid, HashMap<String, uni_common::Value>>,
     graph_ctx: &Arc<GraphExecutionContext>,
 ) -> ArrayRef {
-    use crate::query::df_graph::scan::encode_cypher_value;
     use arrow_array::builder::LargeBinaryBuilder;
 
     let mut builder = LargeBinaryBuilder::new();
     let l0_ctx = graph_ctx.l0_context();
     for vid in target_vids {
-        let mut merged_props = serde_json::Map::new();
+        // Merge in `Value` space so typed values (temporals) are preserved.
+        let mut merged_props: HashMap<String, uni_common::Value> = HashMap::new();
         if let Some(vid_props) = props_map.get(vid) {
             for (k, v) in vid_props.iter() {
-                let json_val: serde_json::Value = v.clone().into();
-                merged_props.insert(k.to_string(), json_val);
+                merged_props.insert(k.clone(), v.clone());
             }
         }
         for l0 in l0_ctx.iter_l0_buffers() {
             let guard = l0.read();
             if let Some(l0_props) = guard.vertex_properties.get(vid) {
                 for (k, v) in l0_props.iter() {
-                    let json_val: serde_json::Value = v.clone().into();
-                    merged_props.insert(k.to_string(), json_val);
+                    merged_props.insert(k.clone(), v.clone());
                 }
             }
         }
         if merged_props.is_empty() {
             builder.append_null();
         } else {
-            let json = serde_json::Value::Object(merged_props);
-            match encode_cypher_value(&json) {
-                Ok(bytes) => builder.append_value(bytes),
-                Err(_) => builder.append_null(),
-            }
+            builder.append_value(uni_common::cypher_value_codec::encode(
+                &uni_common::Value::Map(merged_props),
+            ));
         }
     }
     Arc::new(builder.finish())
@@ -2072,24 +2068,19 @@ impl GraphTraverseMainStream {
 
             // Add edge property columns as cv_encoded LargeBinary to preserve types
             for prop_name in &self.edge_properties {
-                use crate::query::df_graph::scan::encode_cypher_value;
                 let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                 if prop_name == "_all_props" {
-                    // Serialize all edge properties to CypherValue blob
+                    // Serialize all edge properties to a CypherValue blob directly
+                    // from `Value` so typed values (temporals) are preserved.
                     for (_, _, _, _, props) in &expansions {
                         if props.is_empty() {
                             builder.append_null();
                         } else {
-                            let mut json_map = serde_json::Map::new();
-                            for (k, v) in props.iter() {
-                                let json_val: serde_json::Value = v.clone().into();
-                                json_map.insert(k.clone(), json_val);
-                            }
-                            let json = serde_json::Value::Object(json_map);
-                            match encode_cypher_value(&json) {
-                                Ok(bytes) => builder.append_value(bytes),
-                                Err(_) => builder.append_null(),
-                            }
+                            let map: HashMap<String, uni_common::Value> =
+                                props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            builder.append_value(uni_common::cypher_value_codec::encode(
+                                &uni_common::Value::Map(map),
+                            ));
                         }
                     }
                 } else {
@@ -2098,11 +2089,7 @@ impl GraphTraverseMainStream {
                         match props.get(prop_name) {
                             Some(uni_common::Value::Null) | None => builder.append_null(),
                             Some(val) => {
-                                let json_val: serde_json::Value = val.clone().into();
-                                match encode_cypher_value(&json_val) {
-                                    Ok(bytes) => builder.append_value(bytes),
-                                    Err(_) => builder.append_null(),
-                                }
+                                builder.append_value(uni_common::cypher_value_codec::encode(val));
                             }
                         }
                     }
@@ -2119,7 +2106,6 @@ impl GraphTraverseMainStream {
 
         // Add target property columns (hydrate from L0 buffers)
         {
-            use crate::query::df_graph::scan::encode_cypher_value;
             let l0_ctx = self.graph_ctx.l0_context();
 
             for prop_name in &self.target_properties {
@@ -2127,24 +2113,22 @@ impl GraphTraverseMainStream {
                     // Build full CypherValue blob from all L0 vertex properties
                     let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                     for (_, target_vid, _, _, _) in &expansions {
-                        let mut merged_props = serde_json::Map::new();
+                        // Merge in `Value` space so typed values (temporals) survive.
+                        let mut merged_props: HashMap<String, uni_common::Value> = HashMap::new();
                         for l0 in l0_ctx.iter_l0_buffers() {
                             let guard = l0.read();
                             if let Some(props) = guard.vertex_properties.get(target_vid) {
                                 for (k, v) in props.iter() {
-                                    let json_val: serde_json::Value = v.clone().into();
-                                    merged_props.insert(k.to_string(), json_val);
+                                    merged_props.insert(k.clone(), v.clone());
                                 }
                             }
                         }
                         if merged_props.is_empty() {
                             builder.append_null();
                         } else {
-                            let json = serde_json::Value::Object(merged_props);
-                            match encode_cypher_value(&json) {
-                                Ok(bytes) => builder.append_value(bytes),
-                                Err(_) => builder.append_null(),
-                            }
+                            builder.append_value(uni_common::cypher_value_codec::encode(
+                                &uni_common::Value::Map(merged_props),
+                            ));
                         }
                     }
                     columns.push(Arc::new(builder.finish()));
@@ -2159,12 +2143,9 @@ impl GraphTraverseMainStream {
                                 && let Some(val) = props.get(prop_name.as_str())
                                 && !val.is_null()
                             {
-                                let json_val: serde_json::Value = val.clone().into();
-                                if let Ok(bytes) = encode_cypher_value(&json_val) {
-                                    builder.append_value(bytes);
-                                    found = true;
-                                    break;
-                                }
+                                builder.append_value(uni_common::cypher_value_codec::encode(val));
+                                found = true;
+                                break;
                             }
                         }
                         if !found {
@@ -3691,19 +3672,18 @@ async fn hydrate_vlp_target_properties(
 
         for prop_name in &target_properties {
             if prop_name == "_all_props" {
-                // Build CypherValue blob from all vertex properties (L0 + storage)
-                use crate::query::df_graph::scan::encode_cypher_value;
+                // Build CypherValue blob from all vertex properties (L0 + storage),
+                // staying in `Value` space so typed values (temporals) are preserved.
                 use arrow_array::builder::LargeBinaryBuilder;
 
                 let mut builder = LargeBinaryBuilder::new();
                 let l0_ctx = graph_ctx.l0_context();
                 for vid in &target_vids {
-                    let mut merged_props = serde_json::Map::new();
+                    let mut merged_props: HashMap<String, uni_common::Value> = HashMap::new();
                     // Collect from storage-hydrated props
                     if let Some(vid_props) = props_map.get(vid) {
                         for (k, v) in vid_props.iter() {
-                            let json_val: serde_json::Value = v.clone().into();
-                            merged_props.insert(k.to_string(), json_val);
+                            merged_props.insert(k.clone(), v.clone());
                         }
                     }
                     // Overlay L0 properties
@@ -3711,19 +3691,16 @@ async fn hydrate_vlp_target_properties(
                         let guard = l0.read();
                         if let Some(l0_props) = guard.vertex_properties.get(vid) {
                             for (k, v) in l0_props.iter() {
-                                let json_val: serde_json::Value = v.clone().into();
-                                merged_props.insert(k.to_string(), json_val);
+                                merged_props.insert(k.clone(), v.clone());
                             }
                         }
                     }
                     if merged_props.is_empty() {
                         builder.append_null();
                     } else {
-                        let json = serde_json::Value::Object(merged_props);
-                        match encode_cypher_value(&json) {
-                            Ok(bytes) => builder.append_value(bytes),
-                            Err(_) => builder.append_null(),
-                        }
+                        builder.append_value(uni_common::cypher_value_codec::encode(
+                            &uni_common::Value::Map(merged_props),
+                        ));
                     }
                 }
                 property_columns.push(Arc::new(builder.finish()));

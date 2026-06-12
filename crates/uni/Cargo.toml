@@ -177,6 +177,10 @@ harness = false
 name = "ssi_contention"
 harness = false
 
+[[bench]]
+name = "schemaless_traversal"
+harness = false
+
 [features]
 default = [
     "lance-backend",

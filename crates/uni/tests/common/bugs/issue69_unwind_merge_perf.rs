@@ -531,3 +531,173 @@ async fn merge_batched_perf_profile() -> Result<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// Batched persisted lookup (review perf #4): the per-statement prefetch must
+// chunk past MERGE_SCAN_CHUNK keys and group mixed-type literals correctly.
+// ============================================================================
+
+/// A batch with >1000 distinct keys (exercising scan chunking) against a
+/// flushed table: every previously flushed key must MATCH (freq accumulates),
+/// every new key must CREATE — and no duplicates may appear.
+#[tokio::test]
+async fn merge_batch_over_chunk_limit() -> Result<()> {
+    let db = setup().await?;
+    let s = db.session();
+
+    // Seed 600 entities and flush so they are persisted (Lance), not L0.
+    let seed: Vec<Value> = (0..600).map(|i| entity(&format!("k{i}"), "n", 1)).collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_UPSERT)
+        .param("batch", Value::List(seed))
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // 1200 distinct keys: 600 existing (k0..k599) + 600 new (k600..k1199).
+    let batch: Vec<Value> = (0..1200)
+        .map(|i| entity(&format!("k{i}"), "n", 1))
+        .collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_UPSERT)
+        .param("batch", Value::List(batch))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(freq_by_id(&db, "k0").await?, 2, "existing key matched");
+    assert_eq!(freq_by_id(&db, "k599").await?, 2, "existing key matched");
+    assert_eq!(freq_by_id(&db, "k600").await?, 1, "new key created once");
+    assert_eq!(freq_by_id(&db, "k1199").await?, 1, "new key created once");
+    assert_eq!(count_by_id(&db, "k42").await?, 1, "no duplicates");
+    Ok(())
+}
+
+/// Mixed Int and String key values for the SAME key column in one batch:
+/// the batched filter must group literals by type (a mixed-type IN list is
+/// rejected by the scan parser, which would turn a batch the per-row path
+/// handled fine into a statement error).
+///
+/// KNOWN PRE-EXISTING LIMITATION (verified identical on the per-row path,
+/// 2026-06-12): for a SCHEMALESS label, the MERGE persisted lookup cannot see
+/// flushed rows at all — both seeded keys are re-created here even though
+/// MATCH finds the originals. This test therefore pins PARITY (6 nodes, no
+/// error), not the ideal 4. If schemaless persisted matching is ever fixed,
+/// tighten this to 4.
+#[tokio::test]
+async fn merge_batch_mixed_key_types() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    // Schemaless label: the key column takes whatever type each row supplies.
+    let s = db.session();
+
+    fn keyed(v: Value) -> Value {
+        let mut m = HashMap::new();
+        m.insert("k".to_string(), v);
+        Value::Map(m)
+    }
+    const MERGE_K: &str = "UNWIND $batch AS e \
+        MERGE (n:Mixed {k: e.k}) \
+        ON CREATE SET n.created = coalesce(n.created, 0) + 1 \
+        RETURN n.k AS k";
+
+    // Seed two nodes (one Int-keyed, one String-keyed) and flush.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_K)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Int(1)), keyed(Value::String("a".into()))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Mixed batch: the two seeded keys plus one new key of each type. The
+    // statement must succeed (type-grouped batched filter), with per-row-path
+    // parity: schemaless flushed rows are NOT matched (see doc above), so the
+    // seeded keys are re-created.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_K)
+        .param(
+            "batch",
+            Value::List(vec![
+                keyed(Value::Float(1.0)),
+                keyed(Value::String("a".into())),
+                keyed(Value::Int(2)),
+                keyed(Value::String("b".into())),
+            ]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let dump = s
+        .query("MATCH (n:Mixed) RETURN n.k AS k, n.created AS created")
+        .await?;
+    let rows: Vec<String> = dump.rows().iter().map(|r| format!("{r:?}")).collect();
+    assert_eq!(
+        rows.len(),
+        6,
+        "parity with the per-row path (schemaless flushed rows unmatched); got {rows:?}"
+    );
+    Ok(())
+}
+
+/// Int and non-integral Float key literals against one DECLARED Float64 key
+/// column in a single batch: the type-grouped batched filter must keep the
+/// two literal forms in separate IN lists, and Int/Float coercion must match
+/// the stored values exactly once each.
+#[tokio::test]
+async fn merge_batch_int_float_key_grouping() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("FK")
+        .property_nullable("k", DataType::Float64)
+        .property_nullable("seen", DataType::Int64)
+        .index("k", IndexType::Scalar(ScalarType::BTree))
+        .done()
+        .apply()
+        .await?;
+    let s = db.session();
+
+    fn keyed(v: Value) -> Value {
+        let mut m = HashMap::new();
+        m.insert("k".to_string(), v);
+        Value::Map(m)
+    }
+    const MERGE_FK: &str = "UNWIND $batch AS e \
+        MERGE (n:FK {k: e.k}) \
+        ON CREATE SET n.seen = 1 \
+        ON MATCH SET n.seen = n.seen + 1 \
+        RETURN n.k AS k";
+
+    // Seed k=1.0 and k=1.5, flush to Lance.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_FK)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Float(1.0)), keyed(Value::Float(1.5))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // One batch mixing an Int spelling of the integral key (must coerce and
+    // MATCH the stored 1.0) with the non-integral float key — two literal
+    // type groups in one batched filter.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_FK)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Int(1)), keyed(Value::Float(1.5))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let count = s.query("MATCH (n:FK) RETURN count(n) AS c").await?.rows()[0].get::<i64>("c")?;
+    assert_eq!(count, 2, "both keys matched, nothing re-created");
+    Ok(())
+}

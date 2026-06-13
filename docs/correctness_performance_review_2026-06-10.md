@@ -561,7 +561,7 @@ rewrite touching the Python-binding surface. Tracked separately.
 > | Fix | Bench | Before → After |
 > |---|---|---|
 > | #3a ext_id index | `mutation_extid_ingest/4000` | 193.1 ms → **38.6 ms** (5.0×; quadratic → linear) |
-> | #4 batched MERGE | `mutation_unwind_merge_batched` (1000 rows, 50% hit, flushed) | 1.702 s → **1.091 s** (1.56×; 1000 Lance scans → 1); then → **17.5 ms** with the statement-level property prefetch (2026-06-12, `f614f317c`; 97× total) |
+> | #4 batched MERGE | `mutation_unwind_merge_batched` (1000 rows, 50% hit, flushed) | 1.702 s → **1.091 s** (1.56×; 1000 Lance scans → 1); then → **17.5 ms** with the statement-level property prefetch (2026-06-12, `f614f317c`; 97× total); → **21.0 ms** after the mandatory MVCC verification pass (2026-06-12, correctness — see #4 narrative; 81× total) |
 > | #5 traversal pushdown | `schemaless_traversal/one_source_100k_edges` | 32.9 ms → **7.7 ms** (4.3×); all-sources arm unregressed (47.2 → 50.7 ms, threshold 1024) |
 > | #2 WAL double-write | WAL entries per edge-commit | 2 → **1** (`commit_writes_each_mutation_to_wal_exactly_once`, red-green) |
 > | #2+#7 cluster | `mutation_*` / `commit_throughput` collateral | within noise |
@@ -592,6 +592,38 @@ rewrite touching the Python-binding surface. Tracked separately.
 >   the max-version pick, letting a deleted-and-flushed schemaless vertex resurrect its older live
 >   row — now dedups with tombstones visible. Red-green: `merge_batch_mixed_key_types` tightened
 >   6 → 4, plus `merge_schemaless_{flushed_no_duplicates,on_match_set_after_flush,deleted_after_flush_recreates}`.
+>   **Follow-up session (2026-06-12, later):** the flagged declared-label MVCC gap is REAL and
+>   FIXED — per-label tables are MVCC-append, and the batched lookup pushed the key predicate into
+>   the Lance filter, so a superseded flushed version whose key was later rewritten still matched
+>   while the vid's CURRENT row (failing the filter) was invisible; version dedup among returned
+>   rows cannot detect this, so the lookup now runs candidate-then-verify (key-filtered scan
+>   nominates vids; an unfiltered `_vid IN (…)` pass requires each candidate's max-`_version` row
+>   to be live and still keyed as requested). Red-green:
+>   `merge_declared_key_rewritten_after_flush_creates_new` (+ pinning guard
+>   `merge_declared_deleted_after_flush_recreates`). The repro then exposed the SAME class in the
+>   **MATCH read path**: the issue-#57 indexed-property pushdown applies the property predicate
+>   Lance-side *before* the per-vid max-`_version` dedup, so
+>   `MATCH (n:L) WHERE n.indexed = <old value>` stale-matched rewritten-and-reflushed rows (the
+>   runtime re-filter can't help — Lance never returns the current row). Fixed in both scan paths
+>   (`columnar_scan_vertex_batch_static` + schemaless) via `drop_superseded_pushdown_rows`: the
+>   pushed scan keeps its selectivity, then a `_vid`/`_version`-only rescan of the candidate vids
+>   drops rows not carrying their vid's true max version (deletes and label removals fall out for
+>   free). Red-green: `pushed_filter_ignores_superseded_versions` (+ pinning guard
+>   `pushed_filter_ignores_deleted_versions`); single pushdown producer (`df_planner.rs`
+>   `build_indexed_property_pushdown`) feeds only these two paths, so the class is closed.
+>   Cost of correctness: `mutation_unwind_merge_batched` 17.5 → **21.0 ms** (+18.6%, the extra
+>   verification scan). *Flagged optimization (not done):* the lookup's verification scan and the
+>   prefetch batch-read scan cover the same vids and could collapse into one read, reclaiming most
+>   of the delta — declined for now to keep correctness independent of the prefetch path
+>   (CRDT-gated, fail-open). *General (non-fastpath) MERGE prefetch — measured and DECLINED:* new
+>   bench `mutation_unwind_merge_edge_general` (UNWIND 1000 rows, bound-endpoint
+>   `MERGE (a)-[r:REL]->(b)`, 50% hit) runs **6.43 s** vs 5.54 s for a no-SET variant — ~86% of
+>   the per-row cost is the per-row `execute_merge_match` plan/execute, not property reads, and a
+>   statement-level prefetch cannot be built up-front there anyway (matched vids are unknown until
+>   each row's match; a two-pass split would break intra-batch visibility). The right lever is an
+>   edge-MERGE fastpath (batched adjacency lookup keyed on `(src, dst, type)`, the
+>   `merge_single_node_fastpath` analogue) — left as a proposal-sized follow-up. Remaining open:
+>   whether declaring a label later backfills its per-label table from main-table rows.
 > - **#5** — source-VID pushdown (`find_edges_by_type_names` endpoint filter, ≤1024 sources, both
 >   storage tiers — the L0 overlay too, so the SSI read-set footprint is consistent) + `Arc`-shared
 >   type/props in the adjacency map (the `Both` deep-clone is gone). New SSI tests cover the

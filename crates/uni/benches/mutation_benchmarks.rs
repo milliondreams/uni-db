@@ -293,6 +293,121 @@ fn bench_unwind_merge_batched(c: &mut Criterion) {
     group.finish();
 }
 
+/// `{src, dst, w}` rows linking `k{i}` → `k{i+1}` for the edge-MERGE bench.
+fn edge_batch(n: usize) -> Value {
+    Value::List(
+        (0..n)
+            .map(|i| {
+                let mut m = HashMap::new();
+                m.insert("src".to_string(), Value::String(format!("k{i}")));
+                m.insert("dst".to_string(), Value::String(format!("k{}", i + 1)));
+                m.insert("w".to_string(), Value::Int(1));
+                Value::Map(m)
+            })
+            .collect(),
+    )
+}
+
+/// Batched `UNWIND … MATCH … MERGE (a)-[r]->(b)` — the GENERAL (non-fastpath)
+/// MERGE path: a relationship pattern never qualifies for
+/// `merge_single_node_fastpath`, so every row plans and runs a full
+/// `execute_merge_match`, and ON CREATE/ON MATCH SET property reads execute
+/// with an empty prefetch. Canonical edge-ingest shape.
+///
+/// Seeds 1001 keyed nodes and 500 `REL` edges, flushed to Lance; the batch is
+/// a 50/50 mix of existing and new edges. The transaction is rolled back each
+/// iteration so every sample sees identical state.
+fn bench_unwind_merge_edge_general(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("mutation_unwind_merge_edge_general");
+    group.sample_size(10);
+
+    let db = rt.block_on(async {
+        let db = make_db().await;
+        db.schema()
+            .label("MergeNode")
+            .property("entity_id", DataType::String)
+            .index("entity_id", IndexType::Scalar(ScalarType::BTree))
+            .done()
+            .edge_type("REL", &["MergeNode"], &["MergeNode"])
+            .property_nullable("weight", DataType::Int64)
+            .done()
+            .apply()
+            .await
+            .unwrap();
+        let s = db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute_with("UNWIND $rows AS r CREATE (:MergeNode {entity_id: r.id})")
+            .param("rows", merge_batch(0, 1_001))
+            .run()
+            .await
+            .unwrap();
+        tx.execute_with(
+            "UNWIND $rows AS e \
+             MATCH (a:MergeNode {entity_id: e.src}), (b:MergeNode {entity_id: e.dst}) \
+             CREATE (a)-[:REL {weight: 1}]->(b)",
+        )
+        .param("rows", edge_batch(500))
+        .run()
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.flush().await.unwrap();
+        db
+    });
+
+    // No-SET variant — isolates the per-row `execute_merge_match`
+    // plan/execute cost from the ON CREATE/ON MATCH SET property reads.
+    group.bench_function("merge_edge_1000_rows_no_set", |b| {
+        b.iter_batched(
+            || edge_batch(1_000),
+            |batch| {
+                rt.block_on(async {
+                    let s = db.session();
+                    let tx = s.tx().await.unwrap();
+                    tx.execute_with(
+                        "UNWIND $batch AS e \
+                         MATCH (a:MergeNode {entity_id: e.src}), (b:MergeNode {entity_id: e.dst}) \
+                         MERGE (a)-[r:REL]->(b)",
+                    )
+                    .param("batch", batch)
+                    .run()
+                    .await
+                    .unwrap();
+                    tx.rollback();
+                })
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("merge_edge_1000_rows_50pct_hit", |b| {
+        b.iter_batched(
+            || edge_batch(1_000),
+            |batch| {
+                rt.block_on(async {
+                    let s = db.session();
+                    let tx = s.tx().await.unwrap();
+                    tx.execute_with(
+                        "UNWIND $batch AS e \
+                         MATCH (a:MergeNode {entity_id: e.src}), (b:MergeNode {entity_id: e.dst}) \
+                         MERGE (a)-[r:REL]->(b) \
+                         ON CREATE SET r.weight = e.w \
+                         ON MATCH SET r.weight = r.weight + e.w",
+                    )
+                    .param("batch", batch)
+                    .run()
+                    .await
+                    .unwrap();
+                    tx.rollback();
+                })
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_100_nodes,
@@ -302,5 +417,6 @@ criterion_group!(
     bench_merge_50_nodes,
     bench_extid_ingest,
     bench_unwind_merge_batched,
+    bench_unwind_merge_edge_general,
 );
 criterion_main!(benches);

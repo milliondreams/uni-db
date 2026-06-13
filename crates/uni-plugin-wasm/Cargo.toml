@@ -31,6 +31,10 @@ semver = "1.0"
 # wasmtime is the heaviest dep; gated by the `wasmtime-runtime` feature so
 # embedders that only want the trait surface (e.g., for compile-time
 # Rust-only plugins via uni-plugin-builtin) can opt out.
+#
+# VERSION SYNC: keep wasmtime/wasmtime-wasi on the same major as the wasmtime
+# pulled in by `extism` (crates/uni-plugin-extism) — a mismatch links two
+# wasmtime copies into every uni-db binary. Bump all three together.
 wasmtime = { version = "43", default-features = false, features = ["runtime", "cranelift", "component-model"], optional = true }
 wasmtime-wasi = { version = "43", optional = true }
 datafusion = { workspace = true, optional = true }

@@ -58,7 +58,7 @@ uni-plugin-pyo3 = { workspace = true, optional = true, features = ["pyo3"] }
 # `pyo3-plugins` enabled, Cargo unifies features — bindings still
 # applies `extension-module` from its own pyo3 dep, and
 # `auto-initialize` becomes a no-op there.
-pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "auto-initialize"] }
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py310", "auto-initialize"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

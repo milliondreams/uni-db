@@ -200,6 +200,58 @@ async fn merge_on_match_after_flush() -> Result<()> {
     Ok(())
 }
 
+/// `ON MATCH SET n.x = null` on a FLUSHED row must remove the property in the
+/// per-row RETURN and in a fresh MATCH — pins the null-tombstone L0 layering
+/// through the statement-level property prefetch (the prefetch base still
+/// carries the flushed value; the L0 overlay must win).
+#[tokio::test]
+async fn merge_on_match_set_null_after_flush() -> Result<()> {
+    let db = setup().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "nn")
+        .param("n", "ToClear")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query_with(
+            "UNWIND $batch AS e \
+             MERGE (n:Entity {entity_id: e.entity_id}) \
+             ON MATCH SET n.name = null \
+             RETURN n.entity_id AS id, n.name AS name",
+        )
+        .param("batch", Value::List(vec![entity("nn", "ignored", 0)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(res.rows().len(), 1);
+    assert!(
+        res.rows()[0].get::<String>("name").is_err(),
+        "RETURN must see the null-SET (property removed)"
+    );
+
+    let dump = db
+        .session()
+        .query_with("MATCH (n:Entity) WHERE n.entity_id = $id RETURN n.name AS name, n.freq AS f")
+        .param("id", "nn")
+        .fetch_all()
+        .await?;
+    assert_eq!(dump.rows().len(), 1, "matched, not re-created");
+    assert!(
+        dump.rows()[0].get::<String>("name").is_err(),
+        "fresh MATCH must see the property removed"
+    );
+    assert_eq!(dump.rows()[0].get::<i64>("f")?, 10, "other props untouched");
+    Ok(())
+}
+
 // ============================================================================
 // C-c: a non-unique key matching >1 node applies ON MATCH SET to ALL matches
 // and creates nothing.
@@ -529,5 +581,428 @@ async fn merge_batched_perf_profile() -> Result<()> {
         merge_total.as_secs() < 8,
         "batched MERGE of {N} entities took {merge_total:?}, expected < 8s — perf regression"
     );
+    Ok(())
+}
+
+// ============================================================================
+// Batched persisted lookup (review perf #4): the per-statement prefetch must
+// chunk past MERGE_SCAN_CHUNK keys and group mixed-type literals correctly.
+// ============================================================================
+
+/// A batch with >1000 distinct keys (exercising scan chunking) against a
+/// flushed table: every previously flushed key must MATCH (freq accumulates),
+/// every new key must CREATE — and no duplicates may appear.
+#[tokio::test]
+async fn merge_batch_over_chunk_limit() -> Result<()> {
+    let db = setup().await?;
+    let s = db.session();
+
+    // Seed 600 entities and flush so they are persisted (Lance), not L0.
+    let seed: Vec<Value> = (0..600).map(|i| entity(&format!("k{i}"), "n", 1)).collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_UPSERT)
+        .param("batch", Value::List(seed))
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // 1200 distinct keys: 600 existing (k0..k599) + 600 new (k600..k1199).
+    let batch: Vec<Value> = (0..1200)
+        .map(|i| entity(&format!("k{i}"), "n", 1))
+        .collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_UPSERT)
+        .param("batch", Value::List(batch))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(freq_by_id(&db, "k0").await?, 2, "existing key matched");
+    assert_eq!(freq_by_id(&db, "k599").await?, 2, "existing key matched");
+    assert_eq!(freq_by_id(&db, "k600").await?, 1, "new key created once");
+    assert_eq!(freq_by_id(&db, "k1199").await?, 1, "new key created once");
+    assert_eq!(count_by_id(&db, "k42").await?, 1, "no duplicates");
+    Ok(())
+}
+
+/// Mixed Int and String key values for the SAME key column in one batch:
+/// the batched filter must group literals by type (a mixed-type IN list is
+/// rejected by the scan parser, which would turn a batch the per-row path
+/// handled fine into a statement error). The label is SCHEMALESS, so the
+/// persisted lookup must find the flushed seeds via the main vertex table
+/// (per-label tables only exist for declared labels): both seeded keys MATCH
+/// (Float(1.0) canonicalizes to the stored Int(1)), the two new keys CREATE.
+#[tokio::test]
+async fn merge_batch_mixed_key_types() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    // Schemaless label: the key column takes whatever type each row supplies.
+    let s = db.session();
+
+    fn keyed(v: Value) -> Value {
+        let mut m = HashMap::new();
+        m.insert("k".to_string(), v);
+        Value::Map(m)
+    }
+    const MERGE_K: &str = "UNWIND $batch AS e \
+        MERGE (n:Mixed {k: e.k}) \
+        ON CREATE SET n.created = coalesce(n.created, 0) + 1 \
+        RETURN n.k AS k";
+
+    // Seed two nodes (one Int-keyed, one String-keyed) and flush.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_K)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Int(1)), keyed(Value::String("a".into()))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Mixed batch: the two seeded keys plus one new key of each type. The
+    // statement must succeed (type-grouped batched filter) and match the two
+    // flushed schemaless seeds instead of re-creating them.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_K)
+        .param(
+            "batch",
+            Value::List(vec![
+                keyed(Value::Float(1.0)),
+                keyed(Value::String("a".into())),
+                keyed(Value::Int(2)),
+                keyed(Value::String("b".into())),
+            ]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let dump = s
+        .query("MATCH (n:Mixed) RETURN n.k AS k, n.created AS created")
+        .await?;
+    let rows: Vec<String> = dump.rows().iter().map(|r| format!("{r:?}")).collect();
+    assert_eq!(
+        rows.len(),
+        4,
+        "flushed schemaless seeds must MATCH, new keys CREATE once; got {rows:?}"
+    );
+    for row in dump.rows() {
+        assert_eq!(
+            row.get::<i64>("created")?,
+            1,
+            "ON CREATE SET must fire exactly once per key; got {rows:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Schemaless persisted matching: MERGE on an UNDECLARED label must match rows
+// that were flushed to the main vertex table (no per-label table exists), not
+// only L0-resident rows.
+// ============================================================================
+
+/// Build a `{sk, c}` map for one schemaless UNWIND row.
+fn schemaless_row(key: &str, c: i64) -> Value {
+    let mut m = HashMap::new();
+    m.insert("sk".to_string(), Value::String(key.to_string()));
+    m.insert("c".to_string(), Value::Int(c));
+    Value::Map(m)
+}
+
+const MERGE_SCHEMALESS: &str = "UNWIND $batch AS e \
+    MERGE (n:UndeclaredSL {sk: e.sk}) \
+    ON CREATE SET n.freq = e.c \
+    ON MATCH SET n.freq = n.freq + e.c \
+    RETURN n.sk AS sk, n.freq AS freq";
+
+/// Flushed schemaless rows must MATCH on re-MERGE — no duplicates; new keys
+/// in the same batch still CREATE.
+#[tokio::test]
+async fn merge_schemaless_flushed_no_duplicates() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let s = db.session();
+
+    // Seed 5 schemaless nodes and flush them out of L0.
+    let seed: Vec<Value> = (0..5)
+        .map(|i| schemaless_row(&format!("s{i}"), 1))
+        .collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(seed))
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Re-MERGE the 5 flushed keys plus 3 new ones.
+    let batch: Vec<Value> = (0..8)
+        .map(|i| schemaless_row(&format!("s{i}"), 1))
+        .collect();
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(batch))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let total = s
+        .query("MATCH (n:UndeclaredSL) RETURN count(n) AS c")
+        .await?
+        .rows()[0]
+        .get::<i64>("c")?;
+    assert_eq!(total, 8, "5 flushed keys matched + 3 new keys created");
+    for (key, want_freq) in [("s0", 2_i64), ("s4", 2), ("s5", 1), ("s7", 1)] {
+        let res = s
+            .query_with("MATCH (n:UndeclaredSL) WHERE n.sk = $k RETURN n.freq AS f")
+            .param("k", key)
+            .fetch_all()
+            .await?;
+        assert_eq!(res.rows().len(), 1, "exactly one node for {key}");
+        assert_eq!(res.rows()[0].get::<i64>("f")?, want_freq, "freq for {key}");
+    }
+    Ok(())
+}
+
+/// ON MATCH SET must apply to a flushed schemaless row (and create nothing).
+#[tokio::test]
+async fn merge_schemaless_on_match_set_after_flush() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let s = db.session();
+
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(vec![schemaless_row("m0", 10)]))
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = s.tx().await?;
+    let res = tx
+        .query_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(vec![schemaless_row("m0", 5)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    // RETURN reflects the post-SET state of the matched (not re-created) node.
+    assert_eq!(res.rows().len(), 1);
+    assert_eq!(res.rows()[0].get::<i64>("freq")?, 15);
+
+    let dump = s
+        .query("MATCH (n:UndeclaredSL) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(dump.rows()[0].get::<i64>("c")?, 1, "must not re-create");
+    Ok(())
+}
+
+/// A DELETED-and-flushed schemaless row must not MATCH (its main-table
+/// tombstone outranks the older live version — no resurrection through the
+/// MVCC dedup), so MERGE creates a fresh node.
+#[tokio::test]
+async fn merge_schemaless_deleted_after_flush_recreates() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let s = db.session();
+
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(vec![schemaless_row("d0", 10)]))
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = s.tx().await?;
+    tx.execute_with("MATCH (n:UndeclaredSL) WHERE n.sk = $k DELETE n")
+        .param("k", "d0")
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = s.tx().await?;
+    let res = tx
+        .query_with(MERGE_SCHEMALESS)
+        .param("batch", Value::List(vec![schemaless_row("d0", 5)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    // ON CREATE fired: freq is the fresh 5, not 10 + 5.
+    assert_eq!(res.rows().len(), 1);
+    assert_eq!(res.rows()[0].get::<i64>("freq")?, 5);
+    let dump = s
+        .query("MATCH (n:UndeclaredSL) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(dump.rows()[0].get::<i64>("c")?, 1, "exactly the new node");
+    Ok(())
+}
+
+// ============================================================================
+// Declared-label MVCC: per-label tables are append-only across flushes, so a
+// vid can have multiple persisted versions. The batched key-filter scan sees
+// every version whose row matches the key — the lookup must only trust a
+// candidate whose CURRENT (max-version, live) row still carries the key.
+// ============================================================================
+
+/// A flushed row whose MERGE key was later REWRITTEN and re-flushed must not
+/// match its stale superseded version: the old version's row still carries the
+/// old key value and passes the `_deleted = false` key filter, but the vid's
+/// current row holds the new key. MERGE on the old key must CREATE.
+#[tokio::test]
+async fn merge_declared_key_rewritten_after_flush_creates_new() -> Result<()> {
+    let db = setup().await?;
+
+    // v1: entity_id = "kr-old", flushed out of L0.
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "kr-old")
+        .param("n", "Rewritten")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // v2: key rewritten to "kr-new", flushed again (higher persisted version).
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $old}) SET n.entity_id = $new")
+        .param("old", "kr-old")
+        .param("new", "kr-new")
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // MERGE on the OLD key: no live row carries it, so this must CREATE.
+    let tx = db.session().tx().await?;
+    tx.query_with(MERGE_UPSERT)
+        .param("batch", Value::List(vec![entity("kr-old", "Fresh", 1)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        count_by_id(&db, "kr-old").await?,
+        1,
+        "stale superseded version must not match"
+    );
+    assert_eq!(
+        freq_by_id(&db, "kr-old").await?,
+        1,
+        "ON CREATE value, not an ON MATCH accumulation onto the old node"
+    );
+    assert_eq!(
+        count_by_id(&db, "kr-new").await?,
+        1,
+        "the rewritten node still exists under its new key"
+    );
+    assert_eq!(
+        freq_by_id(&db, "kr-new").await?,
+        10,
+        "the rewritten node must be untouched"
+    );
+    Ok(())
+}
+
+/// A DELETED-and-flushed DECLARED-label row must not MATCH: its per-label
+/// tombstone outranks the older live version, so MERGE creates a fresh node
+/// (declared-table sibling of `merge_schemaless_deleted_after_flush_recreates`).
+#[tokio::test]
+async fn merge_declared_deleted_after_flush_recreates() -> Result<()> {
+    let db = setup().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "dd")
+        .param("n", "Doomed")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $id}) DELETE n")
+        .param("id", "dd")
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query_with(MERGE_UPSERT)
+        .param("batch", Value::List(vec![entity("dd", "Fresh", 5)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    // ON CREATE fired: freq is the fresh 5, not 10 + 5.
+    assert_eq!(res.rows().len(), 1);
+    assert_eq!(res.rows()[0].get::<i64>("freq")?, 5);
+    assert_eq!(count_by_id(&db, "dd").await?, 1, "exactly the new node");
+    assert_eq!(freq_by_id(&db, "dd").await?, 5);
+    Ok(())
+}
+
+/// Int and non-integral Float key literals against one DECLARED Float64 key
+/// column in a single batch: the type-grouped batched filter must keep the
+/// two literal forms in separate IN lists, and Int/Float coercion must match
+/// the stored values exactly once each.
+#[tokio::test]
+async fn merge_batch_int_float_key_grouping() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("FK")
+        .property_nullable("k", DataType::Float64)
+        .property_nullable("seen", DataType::Int64)
+        .index("k", IndexType::Scalar(ScalarType::BTree))
+        .done()
+        .apply()
+        .await?;
+    let s = db.session();
+
+    fn keyed(v: Value) -> Value {
+        let mut m = HashMap::new();
+        m.insert("k".to_string(), v);
+        Value::Map(m)
+    }
+    const MERGE_FK: &str = "UNWIND $batch AS e \
+        MERGE (n:FK {k: e.k}) \
+        ON CREATE SET n.seen = 1 \
+        ON MATCH SET n.seen = n.seen + 1 \
+        RETURN n.k AS k";
+
+    // Seed k=1.0 and k=1.5, flush to Lance.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_FK)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Float(1.0)), keyed(Value::Float(1.5))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // One batch mixing an Int spelling of the integral key (must coerce and
+    // MATCH the stored 1.0) with the non-integral float key — two literal
+    // type groups in one batched filter.
+    let tx = s.tx().await?;
+    tx.execute_with(MERGE_FK)
+        .param(
+            "batch",
+            Value::List(vec![keyed(Value::Int(1)), keyed(Value::Float(1.5))]),
+        )
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let count = s.query("MATCH (n:FK) RETURN count(n) AS c").await?.rows()[0].get::<i64>("c")?;
+    assert_eq!(count, 2, "both keys matched, nothing re-created");
     Ok(())
 }

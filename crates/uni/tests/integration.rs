@@ -52,6 +52,8 @@ mod ssi_for_update;
 mod ssi_hermitage;
 #[path = "common/ssi_invariants.rs"]
 mod ssi_invariants;
+#[path = "common/ssi_l1_pinning.rs"]
+mod ssi_l1_pinning;
 #[path = "common/ssi_occ_e2e.rs"]
 mod ssi_occ_e2e;
 #[path = "common/ssi_read_path_matrix.rs"]

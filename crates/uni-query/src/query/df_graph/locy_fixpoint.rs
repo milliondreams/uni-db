@@ -1161,6 +1161,13 @@ pub struct FixpointRulePlan {
     pub deterministic: bool,
     /// Name of the PROB column in this rule's yield schema, if any.
     pub prob_column_name: Option<String>,
+    /// True when any clause of this rule has ≥2 positive same-stratum
+    /// IS-refs (non-linear recursion, e.g. `tc(a,b) :- tc(a,m), tc(m,b)`).
+    /// Such rules get FULL facts (naive evaluation) instead of the latest
+    /// delta on their self-ref scans: a delta-only join computes Δ×Δ and
+    /// misses the Δ×F_old combinations, silently under-deriving. Covers
+    /// both `p :- p, p` and `p :- p, q` (q in the same SCC) shapes.
+    pub non_linear: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -4636,11 +4643,12 @@ fn update_derived_scan_handles(
         };
 
         let is_self = entry.rule_name == *current_rule_name;
-        let data = if is_self {
-            // Self-ref: inject delta for semi-naive
+        let data = if is_self && !rules[current_rule_idx].non_linear {
+            // Self-ref in a linear rule: inject delta for semi-naive
             states[source_idx].all_delta().to_vec()
         } else {
-            // Cross-ref: inject full facts
+            // Cross-ref, or self-ref of a non-linear rule (≥2 same-stratum
+            // refs in one clause — Δ×Δ would miss Δ×F_old): inject full facts
             states[source_idx].all_facts().to_vec()
         };
 
@@ -4728,7 +4736,20 @@ impl ExecutionPlan for DerivedScanExec {
             if guard.is_empty() {
                 vec![RecordBatch::new_empty(Arc::clone(&self.schema))]
             } else {
-                guard.clone()
+                // Re-stamp every batch with this exec's schema. The shared
+                // data Arc always holds batches with the rule's original
+                // yield-schema names, but this scan may carry per-occurrence
+                // aliased column names (multi-IS-ref clauses). Zero-copy:
+                // only the schema pointer changes, never the columns.
+                guard
+                    .iter()
+                    .map(|b| {
+                        RecordBatch::try_new(Arc::clone(&self.schema), b.columns().to_vec())
+                            .map_err(|e| {
+                                datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                            })
+                    })
+                    .collect::<DFResult<Vec<_>>>()?
             }
         };
         Ok(Box::pin(MemoryStream::try_new(
@@ -5486,6 +5507,7 @@ impl ExecutionPlan for FixpointExec {
                     has_priority: r.has_priority,
                     deterministic: r.deterministic,
                     prob_column_name: r.prob_column_name.clone(),
+                    non_linear: r.non_linear,
                 }
             })
             .collect();

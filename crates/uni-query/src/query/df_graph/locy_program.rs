@@ -1376,6 +1376,10 @@ fn convert_to_fixpoint_plans(
     plugin_registry: &PluginRegistry,
     deterministic_best_by: bool,
 ) -> DFResult<Vec<FixpointRulePlan>> {
+    // `rules` is one stratum's rule set, so membership here means
+    // "same stratum" — the recursion-detection set for `non_linear`.
+    let stratum_rule_names: std::collections::HashSet<&str> =
+        rules.iter().map(|r| r.name.as_str()).collect();
     rules
         .iter()
         .map(|rule| {
@@ -1392,7 +1396,8 @@ fn convert_to_fixpoint_plans(
                 .clauses
                 .iter()
                 .map(|clause| {
-                    let is_ref_bindings = convert_is_refs(&clause.is_refs, registry)?;
+                    let is_ref_bindings =
+                        convert_is_refs(&clause.is_refs, registry, &stratum_rule_names)?;
                     Ok(FixpointClausePlan {
                         body_logical: clause.body.clone(),
                         is_ref_bindings,
@@ -1425,6 +1430,18 @@ fn convert_to_fixpoint_plans(
                 .find(|yc| yc.is_prob)
                 .map(|yc| yc.name.clone());
 
+            // Non-linear recursion: any clause joining ≥2 positive
+            // same-stratum IS-refs needs full facts on its self-ref scans
+            // (see `FixpointRulePlan::non_linear`).
+            let non_linear = rule.clauses.iter().any(|clause| {
+                clause
+                    .is_refs
+                    .iter()
+                    .filter(|ir| !ir.negated && stratum_rule_names.contains(ir.rule_name.as_str()))
+                    .count()
+                    >= 2
+            });
+
             Ok(FixpointRulePlan {
                 name: rule.name.clone(),
                 clauses,
@@ -1439,24 +1456,40 @@ fn convert_to_fixpoint_plans(
                 has_priority,
                 deterministic: deterministic_best_by,
                 prob_column_name,
+                non_linear,
             })
         })
         .collect()
 }
 
 /// Convert `LocyIsRef` to `IsRefBinding` by looking up scan indices in the registry.
+///
+/// `stratum_rule_names` is the set of rule names in the stratum being converted.
+/// A reference is self-referential exactly when its target is in that set — the
+/// same rule the planner used to mint the handle (see `get_or_create_derived_scan_handle`).
+/// Selecting the entry whose `is_self_ref` matches that decision is essential for
+/// negation: a recursive rule has BOTH a self-ref handle (carrying the final,
+/// usually-empty semi-naive delta) and a non-self-ref handle (carrying the
+/// converged facts). An `IS NOT <recursive rule>` reference is cross-stratum
+/// (`is_self_ref == false`), so it must anti-join against the converged facts —
+/// not the delta, which would silently under-filter.
 fn convert_is_refs(
     is_refs: &[LocyIsRef],
     registry: &DerivedScanRegistry,
+    stratum_rule_names: &std::collections::HashSet<&str>,
 ) -> DFResult<Vec<IsRefBinding>> {
     is_refs
         .iter()
         .map(|is_ref| {
             let entries = registry.entries_for_rule(&is_ref.rule_name);
-            // Find the matching entry (prefer self-ref for same-stratum rules)
+            // Select the handle matching the planner's self-ref decision for this
+            // reference: same-stratum targets use the delta (self-ref) handle for
+            // semi-naive evaluation; cross-stratum targets (including every IS NOT
+            // against a lower-stratum recursive rule) use the converged-facts handle.
+            let want_self_ref = stratum_rule_names.contains(is_ref.rule_name.as_str());
             let entry = entries
                 .iter()
-                .find(|e| e.is_self_ref)
+                .find(|e| e.is_self_ref == want_self_ref)
                 .or_else(|| entries.first())
                 .ok_or_else(|| {
                     datafusion::error::DataFusionError::Plan(format!(

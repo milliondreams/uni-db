@@ -4467,35 +4467,88 @@ impl ScalarUDFImpl for CypherAbsUdf {
     }
 }
 
-/// Apply an integer arithmetic operator, returning CypherValue-encoded bytes.
-/// Returns `None` on overflow or division by zero.
-fn apply_int_arithmetic(lhs: i64, rhs: i64, op: &BinaryOp) -> Option<Vec<u8>> {
-    use uni_common::cypher_value_codec::encode_int;
+/// Apply a checked integer arithmetic operator, returning the `i64` result.
+///
+/// This is the i64-result core shared by both the DataFusion UDF path and the
+/// interpreted expression evaluator, so checked-overflow and div/rem-by-zero
+/// semantics stay identical across both paths. OpenCypher integer division and
+/// modulo truncate toward zero.
+///
+/// Returns `None` on overflow, on division by zero, on modulo by zero, or for a
+/// non-arithmetic operator.
+// Rust guideline compliant
+pub(crate) fn checked_int_op(lhs: i64, rhs: i64, op: &BinaryOp) -> Option<i64> {
     match op {
-        BinaryOp::Add => lhs.checked_add(rhs).map(encode_int),
-        BinaryOp::Sub => lhs.checked_sub(rhs).map(encode_int),
-        BinaryOp::Mul => lhs.checked_mul(rhs).map(encode_int),
+        BinaryOp::Add => lhs.checked_add(rhs),
+        BinaryOp::Sub => lhs.checked_sub(rhs),
+        BinaryOp::Mul => lhs.checked_mul(rhs),
+        // OpenCypher: integer / integer = integer (truncated toward zero)
         BinaryOp::Div => {
-            // OpenCypher: integer / integer = integer (truncated toward zero)
             if rhs == 0 {
                 None
             } else {
-                lhs.checked_div(rhs).map(encode_int)
+                lhs.checked_div(rhs)
             }
         }
         BinaryOp::Mod => {
             if rhs == 0 {
                 None
             } else {
-                lhs.checked_rem(rhs).map(encode_int)
+                lhs.checked_rem(rhs)
             }
         }
         _ => None,
     }
 }
 
-/// Apply a float arithmetic operator, returning CypherValue-encoded bytes.
-fn apply_float_arithmetic(lhs: f64, rhs: f64, op: &BinaryOp) -> Option<Vec<u8>> {
+/// Outcome of a per-row CypherValue arithmetic operation.
+///
+/// Distinguishes a genuine null operand (preserve Cypher 3-valued logic, append
+/// null) from a hard error (integer overflow or division/modulo by zero, which
+/// must abort the query) and from a successful CypherValue-encoded result.
+// Rust guideline compliant
+enum CvArithOutcome {
+    /// A successful result, as CypherValue-encoded bytes.
+    Value(Vec<u8>),
+    /// A genuine null operand or non-numeric input: append a null (3VL).
+    Null,
+    /// A hard error such as integer overflow or division by zero.
+    Error(datafusion::error::DataFusionError),
+}
+
+/// Apply a checked integer arithmetic operator, encoding the CypherValue result.
+///
+/// Overflow and division/modulo by zero become a hard [`CvArithOutcome::Error`]
+/// (matching the native integer path and the interpreted evaluator); a
+/// non-arithmetic operator yields [`CvArithOutcome::Null`].
+// Rust guideline compliant
+fn apply_int_arithmetic(lhs: i64, rhs: i64, op: &BinaryOp) -> CvArithOutcome {
+    use uni_common::cypher_value_codec::encode_int;
+    if !matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+    ) {
+        return CvArithOutcome::Null;
+    }
+    match checked_int_op(lhs, rhs, op) {
+        Some(v) => CvArithOutcome::Value(encode_int(v)),
+        None => {
+            let msg = if matches!(op, BinaryOp::Div | BinaryOp::Mod) && rhs == 0 {
+                "division by zero"
+            } else {
+                "integer overflow"
+            };
+            CvArithOutcome::Error(datafusion::error::DataFusionError::Execution(msg.into()))
+        }
+    }
+}
+
+/// Apply a float arithmetic operator, encoding the CypherValue result.
+///
+/// Float arithmetic never errors (inf/NaN are valid Cypher); a non-arithmetic
+/// operator yields [`CvArithOutcome::Null`].
+// Rust guideline compliant
+fn apply_float_arithmetic(lhs: f64, rhs: f64, op: &BinaryOp) -> CvArithOutcome {
     use uni_common::cypher_value_codec::encode_float;
     let result = match op {
         BinaryOp::Add => lhs + rhs,
@@ -4503,37 +4556,95 @@ fn apply_float_arithmetic(lhs: f64, rhs: f64, op: &BinaryOp) -> Option<Vec<u8>> 
         BinaryOp::Mul => lhs * rhs,
         BinaryOp::Div => lhs / rhs, // Allows inf, -inf, NaN
         BinaryOp::Mod => lhs % rhs,
-        _ => return None,
+        _ => return CvArithOutcome::Null,
     };
-    Some(encode_float(result))
+    CvArithOutcome::Value(encode_float(result))
 }
 
 /// Perform arithmetic on a CypherValue-encoded LHS against an i64 RHS.
-/// Returns `None` for null/incompatible types.
-fn cv_arithmetic_int(bytes: &[u8], rhs: i64, op: &BinaryOp) -> Option<Vec<u8>> {
+///
+/// Returns [`CvArithOutcome::Null`] for null/incompatible operands and an error
+/// for integer overflow or division by zero.
+// Rust guideline compliant
+fn cv_arithmetic_int(bytes: &[u8], rhs: i64, op: &BinaryOp) -> CvArithOutcome {
     use uni_common::cypher_value_codec::{TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag};
-    match peek_tag(bytes)? {
-        TAG_INT => apply_int_arithmetic(decode_int(bytes)?, rhs, op),
-        TAG_FLOAT => apply_float_arithmetic(decode_float(bytes)?, rhs as f64, op),
-        _ => None,
+    match peek_tag(bytes) {
+        Some(TAG_INT) => match decode_int(bytes) {
+            Some(lhs) => apply_int_arithmetic(lhs, rhs, op),
+            None => CvArithOutcome::Null,
+        },
+        Some(TAG_FLOAT) => match decode_float(bytes) {
+            Some(lhs) => apply_float_arithmetic(lhs, rhs as f64, op),
+            None => CvArithOutcome::Null,
+        },
+        _ => CvArithOutcome::Null,
     }
 }
 
 /// Perform arithmetic on a CypherValue-encoded LHS against an f64 RHS.
-/// Returns `None` for null/incompatible types.
-fn cv_arithmetic_float(bytes: &[u8], rhs: f64, op: &BinaryOp) -> Option<Vec<u8>> {
-    let lhs = cv_bytes_as_f64(bytes)?;
-    apply_float_arithmetic(lhs, rhs, op)
+///
+/// Returns [`CvArithOutcome::Null`] for null/incompatible operands. Float
+/// arithmetic itself never errors.
+// Rust guideline compliant
+fn cv_arithmetic_float(bytes: &[u8], rhs: f64, op: &BinaryOp) -> CvArithOutcome {
+    match cv_bytes_as_f64(bytes) {
+        Some(lhs) => apply_float_arithmetic(lhs, rhs, op),
+        None => CvArithOutcome::Null,
+    }
 }
 
-/// Fast-path arithmetic for LargeBinary (CypherValue) vs native Arrow types.
+/// Resolve the dynamic return type of a Cypher arithmetic UDF from its arg types.
 ///
-/// Returns `Some(ColumnarValue)` if fast path succeeded, `None` to fallback to slow path.
+/// Keeps the result type type-preserving so the native overflow-checking Arrow
+/// kernels can stay in their natural type: two `Int64` operands yield `Int64`,
+/// any `Float64` operand (with no `LargeBinary`) yields `Float64`, and any
+/// `LargeBinary` (CypherValue-encoded) operand falls back to `LargeBinary`. A
+/// `Null` arg type is non-constraining: it matches the other operand, or
+/// `LargeBinary` when nothing else constrains it. Every other combination keeps
+/// the historical `LargeBinary` fallback so the CypherValue slow path applies.
+///
+/// This must agree with the array type each branch of [`try_fast_arithmetic`]
+/// produces, otherwise DataFusion rejects the plan on a schema mismatch between
+/// the declared `return_type` and the actual output column.
+// Rust guideline compliant
+pub(crate) fn cypher_arith_return_type(arg_types: &[DataType]) -> DataType {
+    let any_large_binary = arg_types.iter().any(|t| matches!(t, DataType::LargeBinary));
+    if any_large_binary {
+        return DataType::LargeBinary;
+    }
+    let any_float = arg_types.iter().any(|t| matches!(t, DataType::Float64));
+    if any_float {
+        return DataType::Float64;
+    }
+    // No LargeBinary and no Float64: if every non-null arg is Int64, the result
+    // is Int64. A lone Int64 alongside Null still resolves to Int64; all-Null or
+    // anything else keeps the conservative LargeBinary fallback.
+    let all_int_or_null = !arg_types.is_empty()
+        && arg_types
+            .iter()
+            .all(|t| matches!(t, DataType::Int64 | DataType::Null));
+    let any_int = arg_types.iter().any(|t| matches!(t, DataType::Int64));
+    if all_int_or_null && any_int {
+        DataType::Int64
+    } else {
+        DataType::LargeBinary
+    }
+}
+
+/// Fast-path arithmetic for native and LargeBinary (CypherValue) operand types.
+///
+/// Returns `None` to fall through to the slow path, `Some(Ok(_))` when the fast
+/// path produced a result, and `Some(Err(_))` when the fast path detected an
+/// error condition (integer overflow or division/modulo by zero). The result
+/// array type matches [`cypher_arith_return_type`] for the operand types:
+/// `Int64` for `Int64 × Int64`, `Float64` for float/mixed numeric, and
+/// `LargeBinary` for the CypherValue branches.
+// Rust guideline compliant
 fn try_fast_arithmetic(
     lhs: &ColumnarValue,
     rhs: &ColumnarValue,
     op: &BinaryOp,
-) -> Option<ColumnarValue> {
+) -> Option<DFResult<ColumnarValue>> {
     use arrow_array::builder::LargeBinaryBuilder;
 
     let (lhs_arr, rhs_arr) = match (lhs, rhs) {
@@ -4542,6 +4653,19 @@ fn try_fast_arithmetic(
     };
 
     match (lhs_arr.data_type(), rhs_arr.data_type()) {
+        // Int64 vs Int64: use the native overflow-checking Arrow kernels and
+        // keep a native Int64 result. The kernels error on overflow and on
+        // division/modulo by zero (and handle `i64::MIN / -1`).
+        (DataType::Int64, DataType::Int64) => Some(int_kernel_arithmetic(lhs_arr, rhs_arr, op)),
+
+        // Mixed Int×Float or Float×Float: compute in Float64. Float kernels
+        // never error (inf/NaN are valid Cypher per IEEE 754).
+        (DataType::Int64, DataType::Float64)
+        | (DataType::Float64, DataType::Int64)
+        | (DataType::Float64, DataType::Float64) => {
+            Some(float_kernel_arithmetic(lhs_arr, rhs_arr, op))
+        }
+
         // LargeBinary vs Int64
         (DataType::LargeBinary, DataType::Int64) => {
             let lb_arr = lhs_arr.as_any().downcast_ref::<LargeBinaryArray>()?;
@@ -4550,14 +4674,15 @@ fn try_fast_arithmetic(
             for i in 0..lb_arr.len() {
                 if lb_arr.is_null(i) || int_arr.is_null(i) {
                     builder.append_null();
-                } else if let Some(bytes) = cv_arithmetic_int(lb_arr.value(i), int_arr.value(i), op)
-                {
-                    builder.append_value(&bytes);
                 } else {
-                    builder.append_null();
+                    match cv_arithmetic_int(lb_arr.value(i), int_arr.value(i), op) {
+                        CvArithOutcome::Value(bytes) => builder.append_value(&bytes),
+                        CvArithOutcome::Null => builder.append_null(),
+                        CvArithOutcome::Error(e) => return Some(Err(e)),
+                    }
                 }
             }
-            Some(ColumnarValue::Array(Arc::new(builder.finish())))
+            Some(Ok(ColumnarValue::Array(Arc::new(builder.finish()))))
         }
 
         // LargeBinary vs Float64
@@ -4568,38 +4693,85 @@ fn try_fast_arithmetic(
             for i in 0..lb_arr.len() {
                 if lb_arr.is_null(i) || float_arr.is_null(i) {
                     builder.append_null();
-                } else if let Some(bytes) =
-                    cv_arithmetic_float(lb_arr.value(i), float_arr.value(i), op)
-                {
-                    builder.append_value(&bytes);
                 } else {
-                    builder.append_null();
+                    match cv_arithmetic_float(lb_arr.value(i), float_arr.value(i), op) {
+                        CvArithOutcome::Value(bytes) => builder.append_value(&bytes),
+                        CvArithOutcome::Null => builder.append_null(),
+                        CvArithOutcome::Error(e) => return Some(Err(e)),
+                    }
                 }
             }
-            Some(ColumnarValue::Array(Arc::new(builder.finish())))
-        }
-
-        // Int64 vs Int64 (both native, routed here because other context forced UDF path)
-        (DataType::Int64, DataType::Int64) => {
-            let lhs_int = lhs_arr.as_any().downcast_ref::<Int64Array>()?;
-            let rhs_int = rhs_arr.as_any().downcast_ref::<Int64Array>()?;
-            let mut builder = LargeBinaryBuilder::new();
-            for i in 0..lhs_int.len() {
-                if lhs_int.is_null(i) || rhs_int.is_null(i) {
-                    builder.append_null();
-                } else if let Some(bytes) =
-                    apply_int_arithmetic(lhs_int.value(i), rhs_int.value(i), op)
-                {
-                    builder.append_value(&bytes);
-                } else {
-                    builder.append_null();
-                }
-            }
-            Some(ColumnarValue::Array(Arc::new(builder.finish())))
+            Some(Ok(ColumnarValue::Array(Arc::new(builder.finish()))))
         }
 
         _ => None, // Fallback to slow path
     }
+}
+
+/// Run an overflow-checking integer arithmetic kernel over two `Int64` arrays.
+///
+/// Produces a native `Int64Array` wrapped in a `ColumnarValue::Array` and maps
+/// any Arrow error (overflow, division/modulo by zero) to a
+/// `DataFusionError::Execution`. A non-arithmetic operator surfaces as an
+/// execution error.
+// Rust guideline compliant
+fn int_kernel_arithmetic(
+    lhs_arr: &ArrayRef,
+    rhs_arr: &ArrayRef,
+    op: &BinaryOp,
+) -> DFResult<ColumnarValue> {
+    use arrow::compute::kernels::numeric::{add, div, mul, rem, sub};
+
+    let result = match op {
+        BinaryOp::Add => add(lhs_arr, rhs_arr),
+        BinaryOp::Sub => sub(lhs_arr, rhs_arr),
+        BinaryOp::Mul => mul(lhs_arr, rhs_arr),
+        BinaryOp::Div => div(lhs_arr, rhs_arr),
+        BinaryOp::Mod => rem(lhs_arr, rhs_arr),
+        other => {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "unsupported integer arithmetic operator: {other:?}"
+            )));
+        }
+    };
+    result
+        .map(ColumnarValue::Array)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+}
+
+/// Run a float arithmetic kernel after casting both operands to `Float64`.
+///
+/// Float arithmetic never errors: overflow yields `inf` and division by zero
+/// yields `inf`/`NaN` per IEEE 754, all of which are valid Cypher floats.
+// Rust guideline compliant
+fn float_kernel_arithmetic(
+    lhs_arr: &ArrayRef,
+    rhs_arr: &ArrayRef,
+    op: &BinaryOp,
+) -> DFResult<ColumnarValue> {
+    use arrow::compute::cast;
+    use arrow::compute::kernels::numeric::{add, div, mul, rem, sub};
+
+    let lhs_f = cast(lhs_arr, &DataType::Float64)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    let rhs_f = cast(rhs_arr, &DataType::Float64)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    let result = match op {
+        BinaryOp::Add => add(&lhs_f, &rhs_f),
+        BinaryOp::Sub => sub(&lhs_f, &rhs_f),
+        BinaryOp::Mul => mul(&lhs_f, &rhs_f),
+        BinaryOp::Div => div(&lhs_f, &rhs_f),
+        BinaryOp::Mod => rem(&lhs_f, &rhs_f),
+        other => {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "unsupported float arithmetic operator: {other:?}"
+            )));
+        }
+    };
+    result
+        .map(ColumnarValue::Array)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
 }
 
 #[derive(Debug)]
@@ -4643,8 +4815,11 @@ impl ScalarUDFImpl for CypherArithmeticUdf {
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary) // result is CypherValue-encoded
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        // Type-preserving: Int64×Int64 → Int64, float/mixed → Float64, else
+        // CypherValue-encoded LargeBinary. Must agree with the array type the
+        // fast path produces for the same operand types.
+        Ok(cypher_arith_return_type(arg_types))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -4655,13 +4830,19 @@ impl ScalarUDFImpl for CypherArithmeticUdf {
             )));
         }
 
-        // Try fast path first
+        // Try fast path first. `Some(Ok)` = handled, `Some(Err)` = handled and
+        // errored (overflow / div-by-zero), `None` = fall through to slow path.
         if let Some(result) = try_fast_arithmetic(&args.args[0], &args.args[1], &self.op) {
-            return Ok(result);
+            return result;
         }
 
-        // Fallback to slow path
-        let output_type = DataType::LargeBinary;
+        // Fallback to slow path. The output type MUST match the type promised by
+        // `return_type` (carried on `return_field`) — for native Int64/Float64
+        // arg types DataFusion promised Int64/Float64, not LargeBinary, so the
+        // materialized array must match or DataFusion rejects on a schema
+        // mismatch. `eval_binary_op` itself still errors on integer overflow /
+        // division by zero.
+        let output_type = args.return_field.data_type().clone();
         invoke_cypher_udf(args, &output_type, |val_args| {
             crate::expr_eval::eval_binary_op(&val_args[0], &self.op, &val_args[1])
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))

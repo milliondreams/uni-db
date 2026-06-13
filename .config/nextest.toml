@@ -1,0 +1,16 @@
+# Workspace nextest configuration.
+#
+# `slow-timeout`: a test running past `period` is flagged slow; after
+# `terminate-after` consecutive periods it is killed and reported as a
+# timeout instead of hanging the whole run (CI previously had no backstop).
+# Genuinely long tests (soak/stress) are `#[ignore]`d and opt in via
+# `--run-ignored`, so a 3-minute ceiling is generous for the default tier.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# CI profile: keep running after failures so one broken test surfaces the
+# full failure set in a single pipeline run. Select with `--profile ci`.
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 3 }

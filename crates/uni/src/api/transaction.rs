@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,18 @@ pub struct Transaction {
     /// Session's metrics counters (for commit/rollback tracking)
     session_metrics: Arc<crate::api::session::SessionMetricsInner>,
     completed: bool,
+    /// Rollback-only poison flag (bug #15 / Neo4j-style atomicity).
+    ///
+    /// Set to `true` the first time any statement execution returns an `Err`.
+    /// Because statements run through `&self` entry points (`execute`, `query`,
+    /// `apply`, the builders) while `completed` is only flipped by the
+    /// `mut self` lifecycle methods, this needs interior mutability. An
+    /// `AtomicBool` (not a `Cell`) is required: a `&Transaction` is held across
+    /// `.await` points inside `Send` async fns, so the struct must stay `Sync` —
+    /// `Cell` is not `Sync`. Once set, every further statement and `commit()` is
+    /// rejected with [`UniError::TransactionRollbackOnly`]; only `rollback()`/drop
+    /// succeed, discarding the half-applied private L0.
+    rollback_only: AtomicBool,
     id: String,
     /// Session ID (for commit notifications and hooks).
     session_id: String,
@@ -129,7 +142,10 @@ pub struct Transaction {
     /// locked read sees the latest committed value (see `acquire_for_update_locks`).
     ///
     /// Always present; only set to `Some` when `UniConfig::ssi_enabled` is `true`.
-    snapshot: parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>,
+    /// Shared so a `tx.prepare(...)` [`PreparedQuery`] can read the *live*
+    /// snapshot at execute time (it is pinned lazily on first freeze, so a
+    /// value captured at prepare time could be stale).
+    snapshot: Arc<parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>>,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -234,11 +250,20 @@ impl Transaction {
         // `occ_read_seq`, so the snapshot reflects state >= read_seq — any commit
         // newer than read_seq is then caught by OCC rather than silently read.
         // Only pinned when SSI is enabled; otherwise reads run against live L0.
+        //
+        // Component C2: pin the L1 tier as well — a StorageManager clone whose
+        // scans filter to `_version <= started_at_version`, so a flush
+        // completing mid-transaction cannot leak post-snapshot rows. One per
+        // transaction (the pinned manager carries a fresh AdjacencyManager).
         let snapshot = if db.config.ssi_enabled {
             let writer: &uni_store::Writer = writer_lock.as_ref();
-            parking_lot::Mutex::new(Some(writer.l0_manager.pin_snapshot()))
+            let mut snap = writer.l0_manager.pin_snapshot();
+            snap.pinned_storage = Some(Arc::new(
+                db.storage.pinned_at_version(snap.started_at_version),
+            ));
+            Arc::new(parking_lot::Mutex::new(Some(snap)))
         } else {
-            parking_lot::Mutex::new(None)
+            Arc::new(parking_lot::Mutex::new(None))
         };
 
         let id = Uuid::new_v4().to_string();
@@ -260,6 +285,7 @@ impl Transaction {
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
             session_metrics: session.metrics_inner.clone(),
             completed: false,
+            rollback_only: AtomicBool::new(false),
             id,
             session_id: session.id().to_string(),
             start_time: Instant::now(),
@@ -288,14 +314,15 @@ impl Transaction {
 
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
 
-    /// The transaction's pinned L0 snapshot for snapshot-isolated reads
-    /// (Component C1), threaded into the executor.
+    /// The transaction's pinned read snapshot — frozen L0 generations
+    /// (Component C1) plus the version-pinned L1 storage (Component C2) —
+    /// threaded into the executor.
     ///
     /// Returns `Some` for a read-write transaction begun under
     /// `UniConfig::ssi_enabled` (until commit/rollback `take`s it); `None` when
     /// SSI is disabled (nothing was pinned ⇒ live reads) or after release. A
     /// `None` is a safe no-op downstream.
-    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
+    pub(crate) fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
         self.snapshot.lock().clone()
     }
 
@@ -303,6 +330,12 @@ impl Transaction {
     /// Reads see the private L0 buffer (uncommitted writes).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
+        self.mark_on_err(self.query_inner(cypher).await)
+    }
+
+    /// Inner body of [`Self::query`]; [`Self::query`] wraps its result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn query_inner(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
         if self.db.config.ssi_enabled {
             self.acquire_for_update_locks(cypher, &HashMap::new())
@@ -409,9 +442,14 @@ impl Transaction {
                 // Order mirrors transaction begin: advance `occ_read_seq` first,
                 // then pin, so the snapshot always reflects state >= read_seq (a
                 // racing commit causes at most a spurious retry, never a missed
-                // conflict / lost update).
+                // conflict / lost update). The C2 L1 pin is rebuilt at the new
+                // baseline alongside the L0 pin.
                 self.tx_l0.write().occ_read_seq = writer.current_commit_sequence();
-                *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
+                let mut snap = writer.l0_manager.pin_snapshot();
+                snap.pinned_storage = Some(Arc::new(
+                    self.db.storage.pinned_at_version(snap.started_at_version),
+                ));
+                *self.snapshot.lock() = Some(snap);
             }
         }
         Ok(())
@@ -434,10 +472,17 @@ impl Transaction {
     /// Mutation count is read from the private L0 (not the global writer).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
+        self.mark_on_err(self.execute_inner(cypher).await)
+    }
+
+    /// Inner body of [`Self::execute`]; [`Self::execute`] wraps its result in
+    /// `mark_on_err` so any failure (authorization or statement execution)
+    /// poisons the transaction (bug #15).
+    async fn execute_inner(&self, cypher: &str) -> Result<ExecuteResult> {
         self.check_completed()?;
         self.authorize(cypher, classify_verb(cypher))?;
         let before = self.snapshot_l0();
-        let result = self.query(cypher).await?;
+        let result = self.query_inner(cypher).await?;
         let after = self.snapshot_l0();
         Ok(Self::compute_execute_result(&before, &after, &result))
     }
@@ -448,28 +493,32 @@ impl Transaction {
     /// `Transaction::new` time) so a long-lived transaction can't be
     /// retroactively escalated by a session re-auth.
     fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
-        use uni_plugin::traits::connector::{Action, Decision, Principal, Resource};
+        crate::api::session::authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
+    }
 
-        let policies = self.db.plugin_registry.authz_policies();
-        if policies.is_empty() {
-            return Ok(());
-        }
-        let anon = Principal::anonymous();
-        let principal = self.principal.as_deref().unwrap_or(&anon);
-        let action = Action {
-            verb: verb.to_owned(),
-        };
-        let resource = Resource {
-            path: cypher.to_owned(),
-        };
-        for policy in policies.iter() {
-            match policy.check(principal, &action, &resource) {
-                Ok(Decision::Allow) => {}
-                Ok(Decision::Deny { reason }) => {
-                    return Err(UniError::AuthorizationDenied { reason });
-                }
-                Err(e) => return Err(UniError::AuthorizationDenied { reason: e.0 }),
-            }
+    /// Per-statement guards shared by the typed `execute`/`query` entry points
+    /// and their parameterized builders: authorization and `FOR UPDATE` lock
+    /// acquisition **with the statement's actual parameters**.
+    ///
+    /// The builders previously called `execute_internal_with_tx_l0` directly,
+    /// skipping both — so a parameterized `tx.query(cypher, params)` carrying
+    /// `FOR UPDATE` silently took no row locks, and an `AuthzPolicy` was
+    /// bypassed by parameterizing the statement. Centralizing the guards keeps a
+    /// new builder method from re-opening either gap.
+    ///
+    /// # Errors
+    /// Returns an authorization error, or [`UniError::LockTimeout`] if a
+    /// `FOR UPDATE` lock cannot be acquired.
+    async fn run_exec_guards(&self, cypher: &str, params: &HashMap<String, Value>) -> Result<()> {
+        self.authorize(cypher, classify_verb(cypher))?;
+        if self.db.config.ssi_enabled {
+            self.acquire_for_update_locks(cypher, params).await?;
+        } else if cypher.to_ascii_lowercase().contains("for update") {
+            tracing::warn!(
+                ssi_enabled = false,
+                "FOR UPDATE ignored: ssi_enabled is false, so no row locks are acquired and \
+                 concurrent writers are not serialized — enable SSI or guard the RMW externally"
+            );
         }
         Ok(())
     }
@@ -492,8 +541,16 @@ impl Transaction {
     /// Apply a `DerivedFactSet` (from a session-level DERIVE) to this transaction.
     ///
     /// Replays the collected Cypher mutation ASTs against the transaction's
-    /// private L0 buffer. Logs an info-level warning if the database version
-    /// has advanced since the DERIVE was evaluated (version gap > 0).
+    /// private L0 buffer.
+    ///
+    /// **Freshness is required by default**: if any commit happened between
+    /// DERIVE evaluation and this apply (version gap > 0), this returns
+    /// [`UniError::StaleDerivedFacts`]. Session-level derivation reads are
+    /// not part of this transaction's OCC read-set, so this version check is
+    /// the only thing standing between a concurrent base-data change and a
+    /// silently stale derivation. Opt out with
+    /// [`Transaction::apply_with`] + [`ApplyBuilder::allow_stale`] or bound
+    /// the gap with [`ApplyBuilder::max_version_gap`].
     #[instrument(skip(self, derived), fields(transaction_id = %self.id))]
     pub async fn apply(&self, derived: DerivedFactSet) -> Result<ApplyResult> {
         self.apply_internal(derived, false, None).await
@@ -504,7 +561,7 @@ impl Transaction {
         ApplyBuilder {
             tx: self,
             derived,
-            require_fresh: false,
+            allow_stale: false,
             max_version_gap: None,
         }
     }
@@ -512,20 +569,29 @@ impl Transaction {
     async fn apply_internal(
         &self,
         derived: DerivedFactSet,
-        require_fresh: bool,
+        allow_stale: bool,
         max_gap: Option<u64>,
     ) -> Result<ApplyResult> {
         self.check_completed()?;
         let current_version = self.tx_l0.read().current_version;
         let version_gap = current_version.saturating_sub(derived.evaluated_at_version);
 
-        if require_fresh && version_gap > 0 {
-            return Err(UniError::StaleDerivedFacts { version_gap });
-        }
-        if let Some(max) = max_gap
-            && version_gap > max
-        {
-            return Err(UniError::StaleDerivedFacts { version_gap });
+        // Fresh-by-default: unless the caller explicitly opted into
+        // staleness, any commit between DERIVE evaluation and apply rejects
+        // the apply — the derivation may be based on data that no longer
+        // exists (architecture review §2.4).
+        //
+        // This is a pre-flight precondition check that runs BEFORE any
+        // mutation is replayed, so a `StaleDerivedFacts` rejection writes
+        // nothing to `tx_l0`. It must NOT poison the transaction (it is not a
+        // half-applied statement): the tx stays usable so a caller can re-apply
+        // with a wider gap. Only the replay loop below — which can leave
+        // half-applied rows — is wrapped in `mark_on_err` (bug #15).
+        if !allow_stale {
+            let max = max_gap.unwrap_or(0);
+            if version_gap > max {
+                return Err(UniError::StaleDerivedFacts { version_gap });
+            }
         }
         if version_gap > 0 {
             info!(
@@ -535,17 +601,33 @@ impl Transaction {
             );
         }
 
+        // From here on a failure can leave a partially-replayed `DerivedFactSet`
+        // in `tx_l0`, so poison the transaction on any error (bug #15).
+        self.mark_on_err(Self::replay_facts(&self.db, &self.tx_l0, derived, version_gap).await)
+    }
+
+    /// Replays a `DerivedFactSet`'s mutation queries into `tx_l0`.
+    ///
+    /// Factored out of [`Self::apply_internal`] so the caller can wrap exactly
+    /// this — the only part that can leave half-applied rows — in `mark_on_err`,
+    /// while the pre-flight staleness guard remains a clean (non-poisoning)
+    /// early return.
+    async fn replay_facts(
+        db: &Arc<UniInner>,
+        tx_l0: &Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        derived: DerivedFactSet,
+        version_gap: u64,
+    ) -> Result<ApplyResult> {
         let mut facts_applied = 0;
         for query in derived.mutation_queries {
-            self.db
-                .execute_ast_internal_with_tx_l0(
-                    query,
-                    "<locy-apply>",
-                    HashMap::new(),
-                    self.db.config.clone(),
-                    self.tx_l0.clone(),
-                )
-                .await?;
+            db.execute_ast_internal_with_tx_l0(
+                query,
+                "<locy-apply>",
+                HashMap::new(),
+                db.config.clone(),
+                tx_l0.clone(),
+            )
+            .await?;
             facts_applied += 1;
         }
 
@@ -596,7 +678,9 @@ impl Transaction {
             )
             .await
             .map_err(UniError::Internal);
-        result?;
+        // A partially-applied batch leaves rows in `tx_l0`; poison the tx so it
+        // cannot commit (bug #15).
+        self.mark_on_err(result)?;
         Ok(vids)
     }
 
@@ -652,7 +736,9 @@ impl Transaction {
             Ok(())
         }
         .await;
-        result
+        // A partially-applied batch leaves rows in `tx_l0`; poison the tx so it
+        // cannot commit (bug #15).
+        self.mark_on_err(result)
     }
 
     // ── Bulk Writer / Appender ────────────────────────────────────────
@@ -689,6 +775,7 @@ impl Transaction {
             tx_l0_override: Some(self.tx_l0.clone()),
             locy_l0: Some(self.tx_l0.clone()),
             collect_derive: false,
+            read_snapshot: self.read_snapshot(),
         };
         engine.evaluate(program).await
     }
@@ -707,7 +794,23 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn prepare(&self, cypher: &str) -> Result<crate::api::prepared::PreparedQuery> {
         self.check_completed()?;
-        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher).await
+        // Bind the prepared query to this transaction's private L0, id
+        // reservoir, and (live) read snapshot, so its reads see the tx's
+        // uncommitted writes and its writes land in `tx_l0` — undone by
+        // `rollback()` rather than leaking into main L0.
+        let binding = crate::api::prepared::PreparedTxBinding {
+            tx_l0: self.tx_l0.clone(),
+            id_reservoir: self.id_reservoir.clone(),
+            snapshot: self.snapshot.clone(),
+        };
+        let guards = crate::api::prepared::PreparedGuards::for_transaction(
+            self.principal.clone(),
+            self.hooks.clone(),
+            self.session_id.clone(),
+            classify_verb(cypher).to_string(),
+        );
+        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding, guards)
+            .await
     }
 
     /// Prepare a Locy program for repeated evaluation within this transaction.
@@ -1151,9 +1254,38 @@ impl Transaction {
         ExecuteResult::with_details(affected_rows, &diff, result.metrics().clone())
     }
 
+    /// Marks the transaction rollback-only.
+    ///
+    /// Idempotent: once poisoned by a failed statement, the transaction stays
+    /// rollback-only for the rest of its life.
+    fn set_rollback_only(&self) {
+        self.rollback_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Poisons the transaction (rollback-only) whenever a statement returns
+    /// `Err`, then passes the result through unchanged.
+    ///
+    /// Applied at every `&self` statement-execution return seam (`execute`,
+    /// `query`, `apply`, and the parameterized builders) so that ANY statement
+    /// error — constraint violation, parse error, mid-`UNWIND` failure with rows
+    /// already in `tx_l0` — leaves the transaction non-committable (bug #15).
+    fn mark_on_err<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.set_rollback_only();
+        }
+        r
+    }
+
     fn check_completed(&self) -> Result<()> {
         if self.completed {
             return Err(UniError::TransactionAlreadyCompleted);
+        }
+        // A statement that previously failed poisoned the transaction: reject
+        // all further statements AND commit() so half-applied rows in `tx_l0`
+        // can never be persisted. `rollback()` does not route through here, so
+        // it still succeeds and discards the private L0 (Neo4j-style).
+        if self.rollback_only.load(Ordering::SeqCst) {
+            return Err(UniError::TransactionRollbackOnly);
         }
         if let Some(deadline) = self.deadline
             && Instant::now() > deadline
@@ -1235,7 +1367,15 @@ impl<'a> ExecuteBuilder<'a> {
 
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn run(self) -> Result<ExecuteResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.run_inner().await)
+    }
+
+    /// Inner body of [`Self::run`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn run_inner(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
@@ -1270,7 +1410,15 @@ impl<'a> ExecuteBuilder<'a> {
     /// DataFusion runtime stats and the DDL/admin aggregate stat where
     /// applicable.
     pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)> {
+        let tx = self.tx;
+        tx.mark_on_err(self.profile_inner().await)
+    }
+
+    /// Inner body of [`Self::profile`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn profile_inner(self) -> Result<(ExecuteResult, ProfileOutput)> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.profile_internal_with_tx_l0(
             &self.cypher,
@@ -1326,7 +1474,15 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn execute(self) -> Result<ExecuteResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.execute_inner().await)
+    }
+
+    /// Inner body of [`Self::execute`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn execute_inner(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
@@ -1352,7 +1508,15 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute as a query and return rows.
     pub async fn fetch_all(self) -> Result<QueryResult> {
+        let tx = self.tx;
+        tx.mark_on_err(self.fetch_all_inner().await)
+    }
+
+    /// Inner body of [`Self::fetch_all`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn fetch_all_inner(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
@@ -1379,7 +1543,15 @@ impl<'a> TxQueryBuilder<'a> {
 
     /// Execute the query and return a cursor for streaming results.
     pub async fn cursor(self) -> Result<QueryCursor> {
+        let tx = self.tx;
+        tx.mark_on_err(self.cursor_inner().await)
+    }
+
+    /// Inner body of [`Self::cursor`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn cursor_inner(self) -> Result<QueryCursor> {
         self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         self.tx
             .db
             .execute_cursor_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
@@ -1398,18 +1570,33 @@ pub struct ApplyResult {
 }
 
 /// Builder for applying a `DerivedFactSet` with staleness controls.
+///
+/// The default is **fresh-required** (version gap must be 0); see
+/// [`Transaction::apply`] for the rationale.
 pub struct ApplyBuilder<'a> {
     tx: &'a Transaction,
     derived: DerivedFactSet,
-    require_fresh: bool,
+    allow_stale: bool,
     max_version_gap: Option<u64>,
 }
 
 impl<'a> ApplyBuilder<'a> {
     /// Require that no commits occurred between DERIVE evaluation and apply.
     /// Returns `StaleDerivedFacts` if the version gap is > 0.
+    ///
+    /// This is the default since 2.0.7; the method is kept so existing
+    /// callers stay valid and intent stays explicit.
     pub fn require_fresh(mut self) -> Self {
-        self.require_fresh = true;
+        self.allow_stale = false;
+        self.max_version_gap = None;
+        self
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated. The derivation may be based on data that has since
+    /// changed; a gap > 0 is logged at info level.
+    pub fn allow_stale(mut self) -> Self {
+        self.allow_stale = true;
         self
     }
 
@@ -1423,7 +1610,7 @@ impl<'a> ApplyBuilder<'a> {
     /// Execute the apply operation.
     pub async fn run(self) -> Result<ApplyResult> {
         self.tx
-            .apply_internal(self.derived, self.require_fresh, self.max_version_gap)
+            .apply_internal(self.derived, self.allow_stale, self.max_version_gap)
             .await
     }
 }

@@ -63,6 +63,16 @@ impl UniSync {
         }
     }
 
+    /// Access the database-level rule registry (blocking).
+    ///
+    /// Mutations persist to `catalog/locy_rules.json` and survive restarts.
+    pub fn rules(&self) -> RuleRegistrySync<'_> {
+        RuleRegistrySync {
+            inner: self.inner().rules(),
+            rt: &self.rt,
+        }
+    }
+
     /// Shutdown the database gracefully (blocking).
     ///
     /// Note: This consumes self, which prevents the Drop impl from also
@@ -136,9 +146,15 @@ impl<'a> SessionSync<'a> {
 
     // ── Rule Management ───────────────────────────────────────────────
 
-    /// Access the session-scoped rule registry.
-    pub fn rules(&self) -> crate::api::rule_registry::RuleRegistry<'_> {
-        self.session.rules()
+    /// Access the session-scoped rule registry (blocking).
+    ///
+    /// Session-scoped rules are ephemeral — they are not persisted. Use
+    /// [`UniSync::rules`] for durable database-level rules.
+    pub fn rules(&self) -> RuleRegistrySync<'_> {
+        RuleRegistrySync {
+            inner: self.session.rules(),
+            rt: self.rt,
+        }
     }
 
     /// Compile a Locy program without executing it.
@@ -278,6 +294,64 @@ impl<'a> SessionSync<'a> {
     /// Cancel all in-flight queries in this session.
     pub fn cancel(&self) {
         self.session.cancel()
+    }
+}
+
+// ── RuleRegistrySync ──────────────────────────────────────────────
+
+/// Blocking wrapper around [`RuleRegistry`](crate::RuleRegistry).
+///
+/// Mutating methods (`register`, `remove`, `clear`) are async on the
+/// underlying registry — to persist rule changes — and are wrapped here with
+/// `block_on`. Read-only methods forward directly.
+pub struct RuleRegistrySync<'a> {
+    inner: crate::api::rule_registry::RuleRegistry<'a>,
+    rt: &'a tokio::runtime::Runtime,
+}
+
+impl RuleRegistrySync<'_> {
+    /// Registers Locy rules from a program string (blocking).
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse/compile error for an invalid program, or an I/O error
+    /// if persistence fails.
+    pub fn register(&self, program: &str) -> Result<()> {
+        self.rt.block_on(self.inner.register(program))
+    }
+
+    /// Removes a rule by name (blocking).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rule shares its source program with others, or
+    /// if persistence fails.
+    pub fn remove(&self, name: &str) -> Result<bool> {
+        self.rt.block_on(self.inner.remove(name))
+    }
+
+    /// Clears all registered rules (blocking).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if persistence fails.
+    pub fn clear(&self) -> Result<()> {
+        self.rt.block_on(self.inner.clear())
+    }
+
+    /// Lists names of all registered rules, sorted.
+    pub fn list(&self) -> Vec<String> {
+        self.inner.list()
+    }
+
+    /// Gets metadata about a registered rule.
+    pub fn get(&self, name: &str) -> Option<crate::api::rule_registry::RuleInfo> {
+        self.inner.get(name)
+    }
+
+    /// Gets the number of registered rules.
+    pub fn count(&self) -> usize {
+        self.inner.count()
     }
 }
 
@@ -593,8 +667,16 @@ pub struct ApplyBuilderSync<'t, 'a> {
 
 impl<'t, 'a> ApplyBuilderSync<'t, 'a> {
     /// Require that no commits occurred between DERIVE evaluation and apply.
+    /// This is the default; kept so intent stays explicit.
     pub fn require_fresh(mut self) -> Self {
         self.inner = self.inner.require_fresh();
+        self
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated.
+    pub fn allow_stale(mut self) -> Self {
+        self.inner = self.inner.allow_stale();
         self
     }
 

@@ -12,7 +12,9 @@ Part of [The Rustic Initiative](https://www.rustic.ai) by [Dragonscale Industrie
 
 - **Embedded & Serverless:** Runs as a library within your application — no server process.
 - **Property Graph:** OpenCypher queries with MATCH, CREATE, WHERE, ORDER BY, LIMIT, and aggregations.
-- **Vector Search:** K-NN similarity search (L2, cosine) with pre-filter and threshold support.
+- **Serializable Transactions:** Snapshot isolation + optimistic concurrency control, on by default — conflicting concurrent commits abort with a retriable error instead of silently losing writes.
+- **Locy Reasoning:** Datalog-style recursive rules over the graph, with probabilistic semantics and neural predicates.
+- **Vector Search:** K-NN similarity search (L2, cosine) with pre-filter and threshold support, plus hybrid vector + BM25 fusion.
 - **Columnar Storage:** Lance-backed persistence on local disk or object storage (S3/GCS).
 - **Graph Algorithms:** PageRank, Louvain, shortest path, and more via the built-in algorithm library.
 - **Forks:** Named, durable, writable graph branches with nesting, TTL, structural diff, and content-UID-keyed write-audit-publish promotion to primary. See [`website/docs/features/forks.md`](website/docs/features/forks.md).
@@ -26,7 +28,36 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-uni-db = "0.1.3"
+uni-db = "2"
+```
+
+```rust
+use uni_db::{DataType, Uni};
+
+let db = Uni::open("./my_graph").build().await?;
+
+// Define schema
+db.schema()
+    .label("Person")
+    .property("name", DataType::String)
+    .property("age", DataType::Int)
+    .done()
+    .apply()
+    .await?;
+
+// Write data in a transaction
+let session = db.session();
+let tx = session.tx().await?;
+tx.execute("CREATE (:Person {name: 'Alice', age: 30})").await?;
+tx.execute("CREATE (:Person {name: 'Bob', age: 25})").await?;
+tx.commit().await?;
+
+// Query through the session
+let results = session
+    .query_with("MATCH (p:Person) WHERE p.age > $min RETURN p.name AS name")
+    .param("min", 28)
+    .fetch_all()
+    .await?;
 ```
 
 ### Python
@@ -39,65 +70,78 @@ pip install uni-db
 import uni_db
 
 # Open or create a database
-db = uni_db.Database("./my_graph")
+db = uni_db.Uni.open("./my_graph")
 
 # Define schema
-db.create_label("Person")
-db.add_property("Person", "name", "string", False)
-db.add_property("Person", "age", "int64", True)
-db.create_scalar_index("Person", "name", "btree")
-
-# Write data
-db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-db.flush()
-
-# Query
-results = db.query(
-    "MATCH (p:Person) WHERE p.age > $min RETURN p.name",
-    {"min": 28},
+(
+    db.schema()
+    .label("Person")
+    .property("name", "string")
+    .property("age", "int")
+    .index("name", "btree")
+    .done()
+    .apply()
 )
-print(results)  # [{'p.name': 'Alice'}]
+
+# Write data in a transaction
+session = db.session()
+tx = session.tx()
+tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
+tx.commit()
+
+# Query through the session
+results = session.query_with(
+    "MATCH (p:Person) WHERE p.age > $min RETURN p.name AS name"
+).param("min", 28).fetch_all()
+
+for row in results:
+    print(row["name"])  # Alice
 ```
 
 ## Vector Search
 
 ```python
-# Create schema with a vector property
-db.create_label("Document")
-db.add_property("Document", "text", "string", False)
-db.add_property("Document", "embedding", "vector[128]", True)
-db.create_vector_index("Document", "embedding", "cosine")
+# Create schema with an indexed vector property
+(
+    db.schema()
+    .label("Document")
+    .property("text", "string")
+    .vector("embedding", 128)
+    .index("embedding", {"type": "vector", "metric": "cosine"})
+    .done()
+    .apply()
+)
 
 # Insert data
-db.execute("CREATE (d:Document {text: 'hello world', embedding: [0.1, 0.2, 0.3]})")
-db.flush()
+tx = session.tx()
+tx.execute_with(
+    "CREATE (:Document {text: $text, embedding: $vec})"
+).param("text", "hello world").param("vec", my_embedding).run()
+tx.commit()
 
-# K-NN search
-results = db.query("""
+# K-NN search via Cypher procedure
+results = session.query_with("""
     CALL uni.vector.query('Document', 'embedding', $vec, 10)
-    YIELD vid, distance
-    RETURN vid, distance
+    YIELD node, distance
+    RETURN node.text AS text, distance
     ORDER BY distance
-""", {"vec": my_embedding})
-
-# K-NN with pre-filter
-results = db.query("""
-    CALL uni.vector.query('Document', 'embedding', $vec, 10, 'category = "tech"')
-    YIELD vid, distance
-    RETURN vid, distance
-""", {"vec": my_embedding})
+""").param("vec", query_embedding).fetch_all()
 ```
 
 ## Async API
 
+The async API mirrors the sync one (`AsyncUni`, sessions, transactions):
+
 ```python
 import uni_db
 
-db = await uni_db.AsyncDatabase.open("./my_graph")
-
-await db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-results = await db.query("MATCH (p:Person) RETURN p.name")
+async with uni_db.AsyncUni.open("./my_graph") as db:
+    session = db.session()
+    tx = await session.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    await tx.commit()
+    results = await session.query("MATCH (p:Person) RETURN p.name AS name")
 ```
 
 ## Python OGM (uni-pydantic)

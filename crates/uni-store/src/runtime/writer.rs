@@ -433,11 +433,78 @@ impl Writer {
                 );
                 let mut l0_guard = l0.write();
                 l0_guard.replay_mutations(mutations)?;
+                // Rebuild the UNIQUE constraint index over the recovered rows
+                // (Bug #9 Mechanism B). `replay_mutations` restores
+                // vertices/properties/labels but never repopulates
+                // `constraint_index` (its only other caller is the live insert
+                // path). Without this, a unique key that lives only in the WAL
+                // (committed but not yet flushed to Lance) is invisible to
+                // `check_unique_constraint_multi` after recovery and a
+                // duplicate of it could be created.
+                self.rebuild_constraint_index(&mut l0_guard);
             }
 
             Ok(count)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Rebuild the UNIQUE constraint index on a recovered L0 buffer.
+    ///
+    /// Scans every recovered vertex's properties and, for each enabled UNIQUE
+    /// constraint whose target label the vertex carries and whose member
+    /// properties are all present, inserts the same constraint key the live
+    /// insert path builds (`serialize_constraint_key`). Tombstoned vertices are
+    /// skipped. Called after [`L0Buffer::replay_mutations`] under the buffer's
+    /// write lock; the schema is already loaded on the `Writer`.
+    fn rebuild_constraint_index(&self, l0_guard: &mut L0Buffer) {
+        let schema = self.schema_manager.schema();
+        // Collect entries first to avoid borrowing `vertex_properties`
+        // immutably while mutating `constraint_index` through the same guard.
+        let mut keys: Vec<(Vec<u8>, Vid)> = Vec::new();
+        for (&vid, props) in &l0_guard.vertex_properties {
+            if l0_guard.vertex_tombstones.contains(&vid) {
+                continue;
+            }
+            let Some(labels) = l0_guard.vertex_labels.get(&vid) else {
+                continue;
+            };
+            for label in labels {
+                for constraint in &schema.constraints {
+                    if !constraint.enabled {
+                        continue;
+                    }
+                    let ConstraintTarget::Label(l) = &constraint.target else {
+                        continue;
+                    };
+                    if l != label {
+                        continue;
+                    }
+                    let ConstraintType::Unique {
+                        properties: unique_props,
+                    } = &constraint.constraint_type
+                    else {
+                        continue;
+                    };
+                    let mut key_values = Vec::new();
+                    let mut all_present = true;
+                    for prop in unique_props {
+                        if let Some(val) = props.get(prop) {
+                            key_values.push((prop.clone(), val.clone()));
+                        } else {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    if all_present {
+                        keys.push((serialize_constraint_key(label, &key_values), vid));
+                    }
+                }
+            }
+        }
+        for (key, vid) in keys {
+            l0_guard.insert_constraint_key(key, vid);
         }
     }
 
@@ -519,6 +586,126 @@ impl Writer {
         metrics::gauge!("l0_buffer_size_bytes").set(size as f64);
     }
 
+    /// Overlay-aware issue-#77 edge-endpoint validation.
+    ///
+    /// The current buffer alone does not hold all committed-but-unflushed
+    /// tombstones — a flush rotation moves them onto `pending_flush` until
+    /// the Lance write completes. A vertex is effectively deleted iff,
+    /// walking newest-first (tx → current → pending newest→oldest), the
+    /// first buffer that knows the vid says "tombstoned" (an insert clears
+    /// the tombstone within a buffer, so props/tombstone are mutually
+    /// exclusive per buffer).
+    ///
+    /// Must run under `flush_lock` so the overlay cannot change before the
+    /// merge, and BEFORE the durable WAL flush (see the call site).
+    fn validate_edge_endpoints_overlay(&self, tx_l0: &L0Buffer) -> Result<()> {
+        let chain = self.l0_manager.get_pending_flush();
+        let current = self.l0_manager.get_current();
+        let effectively_deleted = |vid: &Vid| -> bool {
+            if tx_l0.vertex_properties.contains_key(vid) {
+                return false;
+            }
+            if tx_l0.vertex_tombstones.contains(vid) {
+                return true;
+            }
+            {
+                let cur = current.read();
+                if cur.vertex_properties.contains_key(vid) {
+                    return false;
+                }
+                if cur.vertex_tombstones.contains(vid) {
+                    return true;
+                }
+            }
+            for frozen in chain.iter().rev() {
+                let g = frozen.read();
+                if g.vertex_properties.contains_key(vid) {
+                    return false;
+                }
+                if g.vertex_tombstones.contains(vid) {
+                    return true;
+                }
+            }
+            false
+        };
+        for (eid, (src_vid, dst_vid, _etype)) in &tx_l0.edge_endpoints {
+            if tx_l0.tombstones.contains_key(eid) {
+                continue; // a deletion, not an insertion — never resurrects a vertex
+            }
+            if effectively_deleted(src_vid) {
+                anyhow::bail!(
+                    "Cannot insert edge {}: source vertex {} has been deleted (issue #77)",
+                    eid,
+                    src_vid
+                );
+            }
+            if effectively_deleted(dst_vid) {
+                anyhow::bail!(
+                    "Cannot insert edge {}: destination vertex {} has been deleted (issue #77)",
+                    eid,
+                    dst_vid
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Seed `main_l0` (the current buffer) with the newest pending-overlay
+    /// value for each CRDT property the transaction writes, so the commit
+    /// merge MERGES against the committed CRDT state instead of shadowing it
+    /// (the carve-out lets concurrent CRDT writers commit on the assumption
+    /// that the merge sees the committed value — true only while that value
+    /// lives in current, not mid-flush on `pending_flush`). No-op when
+    /// nothing is pending or the property already exists in current. Vertex
+    /// properties only, mirroring the carve-out itself.
+    fn seed_crdt_state_from_chain(&self, tx_l0: &L0Buffer, main_l0: &mut L0Buffer) {
+        let chain = self.l0_manager.get_pending_flush();
+        if chain.is_empty() {
+            return;
+        }
+        for (vid, props) in &tx_l0.vertex_properties {
+            Self::seed_crdt_props(&chain, *vid, props, main_l0);
+        }
+    }
+
+    /// Per-vertex CRDT seeding (see [`Self::seed_crdt_state_from_chain`]).
+    /// Also used by the non-transactional vertex write path, which CRDT-merges
+    /// into the current buffer directly and has the same shadowing hazard
+    /// during a flush window.
+    fn seed_crdt_props(
+        chain: &[Arc<RwLock<L0Buffer>>],
+        vid: Vid,
+        props: &Properties,
+        target: &mut L0Buffer,
+    ) {
+        for (key, value) in props {
+            if crate::runtime::l0::try_as_crdt(value).is_none() {
+                continue;
+            }
+            if target
+                .vertex_properties
+                .get(&vid)
+                .is_some_and(|p| p.contains_key(key))
+            {
+                continue;
+            }
+            // Newest generation first: the first hit is the live state.
+            for frozen in chain.iter().rev() {
+                let g = frozen.read();
+                if let Some(v) = g.vertex_properties.get(&vid).and_then(|p| p.get(key)) {
+                    if crate::runtime::l0::try_as_crdt(v).is_some() {
+                        target
+                            .vertex_properties
+                            .entry(vid)
+                            .or_default()
+                            .insert(key.clone(), v.clone());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /// Commit an externally-owned transaction L0 buffer.
     ///
     /// Writes mutations to WAL, flushes, merges into main L0, and replays
@@ -595,18 +782,27 @@ impl Writer {
                 }
             }
 
-            // Validate against the committed main L0 under `flush_lock`:
-            // serializable MERGE uniqueness + CRDT carve-out soundness.
+            // Validate against the committed-but-unflushed overlay under
+            // `flush_lock`: serializable MERGE uniqueness + CRDT carve-out
+            // soundness. The current buffer alone does not hold all committed
+            // state — a flush rotation moves it onto `pending_flush` until the
+            // Lance write completes (the Bug #9A window, here at the
+            // commit-time layer) — so every check walks [current, pending…].
             {
+                let pending = self.l0_manager.get_pending_flush();
                 let main_l0 = self.l0_manager.get_current();
-                let main_l0 = main_l0.read();
+                let overlay: Vec<Arc<RwLock<L0Buffer>>> =
+                    std::iter::once(main_l0).chain(pending).collect();
 
                 // SSI / serializable MERGE: abort if a concurrent transaction has
                 // already committed a row with one of this transaction's unique
                 // keys. Commits serialize here, so this closes the race window
                 // left by the per-insert check. (Empty index → no iterations.)
                 for (key, vid) in &tx_l0.constraint_index {
-                    if main_l0.has_constraint_key(key, *vid) {
+                    if overlay
+                        .iter()
+                        .any(|b| b.read().has_constraint_key(key, *vid))
+                    {
                         metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
                         return Err(anyhow::Error::new(
                             uni_common::UniError::ConstraintConflict {
@@ -618,25 +814,65 @@ impl Writer {
                     }
                 }
 
+                // Same race window for global ext_id uniqueness: the per-insert
+                // check ran against an older main L0; re-probe the committed
+                // index here, where commits serialize.
+                for (ext_id, vid) in &tx_l0.extid_index {
+                    let taken = overlay.iter().any(|b| {
+                        matches!(b.read().extid_index.get(ext_id), Some(&owner) if owner != *vid)
+                    });
+                    if taken {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: format!(
+                                    "ext_id '{ext_id}' already committed by a concurrent \
+                                     transaction"
+                                ),
+                            },
+                        ));
+                    }
+                }
+
                 // CRDT carve-out soundness: a pure-CRDT write was dropped from the
-                // write-set assuming its merge commutes. If main L0 holds a
+                // write-set assuming its merge commutes. If the overlay holds a
                 // *different* CRDT variant for the same property, the merge would
                 // silently overwrite it — abort instead of losing the update.
-                if let Some(conflict) =
-                    crate::runtime::occ::crdt_carveout_overwrite(&tx_l0, &main_l0)
-                {
-                    metrics::counter!("uni_ssi_crdt_aborts_total").increment(1);
-                    return Err(anyhow::Error::new(
-                        uni_common::UniError::SerializationConflict {
-                            message: conflict.to_string(),
-                        },
-                    ));
+                // (Checked against every overlay buffer: conservative if an old
+                // generation held a different variant that a newer commit already
+                // replaced, but an abort+retry is always sound.)
+                for buf in &overlay {
+                    if let Some(conflict) =
+                        crate::runtime::occ::crdt_carveout_overwrite(&tx_l0, &buf.read())
+                    {
+                        metrics::counter!("uni_ssi_crdt_aborts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::SerializationConflict {
+                                message: conflict.to_string(),
+                            },
+                        ));
+                    }
                 }
             }
             Some(write_set)
         } else {
             None
         };
+
+        // Issue #77: an edge whose endpoint is effectively deleted makes the
+        // merge below bail. That bail MUST happen before the durable WAL flush —
+        // after it the transaction is committed-but-unmerged (a ghost commit),
+        // and WAL replay re-hits the same bail, making the database unopenable.
+        // SSI validation was deliberately placed before the flush for exactly
+        // this reason; the endpoint check belongs here too. Runs unconditionally
+        // (issue #77 is not SSI-gated) under `flush_lock`, so the overlay
+        // tombstone state cannot change between here and the merge. A
+        // tombstone may live in a flush-rotated pending buffer rather than
+        // the current buffer, so the check walks the overlay newest-first.
+        {
+            let tx_l0 = tx_l0_arc.read();
+            self.validate_edge_endpoints_overlay(&tx_l0)?;
+        }
 
         // Crash-recovery seam: SSI validation has passed; the transaction is
         // about to become durable. A crash here must leave NO trace (validation
@@ -658,7 +894,7 @@ impl Writer {
                 for (vid, properties) in &tx_l0.vertex_properties {
                     if !tx_l0.vertex_tombstones.contains(vid) {
                         let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                        wal.append(&crate::runtime::wal::Mutation::InsertVertex {
+                        wal.append(crate::runtime::wal::Mutation::InsertVertex {
                             vid: *vid,
                             properties: properties.clone(),
                             labels,
@@ -669,7 +905,7 @@ impl Writer {
                 // Vertex deletions
                 for vid in &tx_l0.vertex_tombstones {
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                    wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
+                    wal.append(crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
 
                 // Label-only mutations (SET n:Label / REMOVE n:Label). After
@@ -680,7 +916,7 @@ impl Writer {
                         continue;
                     }
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                    wal.append(&crate::runtime::wal::Mutation::SetVertexLabels {
+                    wal.append(crate::runtime::wal::Mutation::SetVertexLabels {
                         vid: *vid,
                         labels,
                     })?;
@@ -695,7 +931,7 @@ impl Writer {
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
                     if tx_l0.tombstones.contains_key(eid) {
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
-                        wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
+                        wal.append(crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
                             src_vid: *src_vid,
                             dst_vid: *dst_vid,
@@ -707,7 +943,7 @@ impl Writer {
                             tx_l0.edge_properties.get(eid).cloned().unwrap_or_default();
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
                         let edge_type_name = tx_l0.edge_types.get(eid).cloned();
-                        wal.append(&crate::runtime::wal::Mutation::InsertEdge {
+                        wal.append(crate::runtime::wal::Mutation::InsertEdge {
                             src_vid: *src_vid,
                             dst_vid: *dst_vid,
                             edge_type: *edge_type,
@@ -725,7 +961,7 @@ impl Writer {
                 for (eid, tombstone) in &tx_l0.tombstones {
                     if !tx_l0.edge_endpoints.contains_key(eid) {
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
-                        wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
+                        wal.append(crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
                             src_vid: tombstone.src_vid,
                             dst_vid: tombstone.dst_vid,
@@ -761,10 +997,25 @@ impl Writer {
 
         // 3. Merge into main L0 and make visible
         {
-            let tx_l0 = tx_l0_arc.read();
+            // Write-lock the tx buffer: `merge_take` moves its property maps
+            // into main L0 instead of cloning them. The commit consumes the
+            // transaction, so the drained maps are never observed afterwards;
+            // everything read below (endpoints, versions, tombstones) is left
+            // intact.
+            let mut tx_l0 = tx_l0_arc.write();
             let main_l0_arc = self.l0_manager.get_current();
             let mut main_l0 = main_l0_arc.write();
-            main_l0.merge(&tx_l0)?;
+            // A CRDT property's committed state may live only in a
+            // flush-rotated pending buffer (the post-rotation current is
+            // empty until the Lance write completes — the Bug #9A window).
+            // `merge_crdt_properties` merges against the CURRENT buffer's
+            // value — without seeding, the tx's CRDT state would SHADOW the
+            // pending buffer's at read time (newest buffer wins per property)
+            // and concurrent increments would be lost. Seed the newest
+            // overlay value for each CRDT property the tx writes that current
+            // lacks, so the merge below merges instead of replaces.
+            self.seed_crdt_state_from_chain(&tx_l0, &mut main_l0);
+            main_l0.merge_take(&mut tx_l0)?;
 
             // Replay transaction edges into the AdjacencyManager overlay
             for (eid, (src, dst, etype)) in &tx_l0.edge_endpoints {
@@ -841,10 +1092,22 @@ impl Writer {
             {
                 match coord.try_acquire_permit() {
                     Some(permit) => {
-                        let seq = coord.next_rotate_seq();
-                        coord.note_pending();
                         match self.flush_l0_rotate().await {
                             Ok(rotate_out) => {
+                                // Allocate the rotate seq and bump pending ONLY
+                                // after the rotate succeeds (Bug #3). A failed
+                                // rotate must consume neither: the finalizer
+                                // advances strictly in consecutive seq order and
+                                // only decrements pending on finalize, so a
+                                // leaked seq/pending from a failed rotate would
+                                // wedge the finalizer forever and climb pending
+                                // toward `max_pending_flushes`. The seq is still
+                                // allocated under `flush_lock` (immediately after
+                                // the rotate, before the guard drops below), so
+                                // concurrent rotates keep seq order == rotation
+                                // order, and the seq is not used until submit.
+                                let seq = coord.next_rotate_seq();
+                                coord.note_pending();
                                 // Release flush_lock BEFORE the spawn so concurrent
                                 // commits can proceed while the stream runs.
                                 drop(_flush_lock_guard);
@@ -877,7 +1140,10 @@ impl Writer {
                             }
                             Err(e) => {
                                 tracing::warn!("Async rotate failed (non-critical): {}", e);
-                                // permit drops here, freeing the slot
+                                // No seq was allocated and pending was not
+                                // bumped (both moved into the Ok arm for Bug
+                                // #3), so the finalizer is not wedged. The
+                                // permit drops here, freeing the slot.
                             }
                         }
                     }
@@ -1435,8 +1701,10 @@ impl Writer {
         };
 
         for l0 in &l0_buffers_to_check {
-            if let Some(vid) =
-                Self::find_extid_in_properties(&l0.read().vertex_properties, ext_id, current_vid)
+            // O(1) per buffer via the maintained `extid_index` (the previous
+            // full `vertex_properties` scan made constrained ingest O(n²)).
+            if let Some(&vid) = l0.read().extid_index.get(ext_id)
+                && vid != current_vid
             {
                 return Err(anyhow!(
                     "Constraint violation: ext_id '{}' already exists (vertex {:?})",
@@ -1460,21 +1728,6 @@ impl Writer {
         }
 
         Ok(())
-    }
-
-    /// Search vertex properties for a duplicate ext_id, excluding `current_vid`.
-    fn find_extid_in_properties(
-        vertex_properties: &HashMap<Vid, Properties>,
-        ext_id: &str,
-        current_vid: Vid,
-    ) -> Option<Vid> {
-        vertex_properties.iter().find_map(|(&vid, props)| {
-            if vid != current_vid && props.get("ext_id").and_then(|v| v.as_str()) == Some(ext_id) {
-                Some(vid)
-            } else {
-                None
-            }
-        })
     }
 
     /// Helper to get vertex labels from L0 buffer.
@@ -1684,6 +1937,22 @@ impl Writer {
             if l0_guard.has_constraint_key(&key, current_vid) {
                 return Err(anyhow!(
                     "Constraint violation: Duplicate composite key for label '{}'",
+                    label
+                ));
+            }
+        }
+
+        // 1b. Check pending-flush buffers (Bug #9A). A flush rotates a key's
+        // buffer onto `pending_flush` and installs a fresh empty current
+        // buffer; until the rotated rows reach Lance the key is invisible to
+        // both the current-buffer check above and the storage check below, so
+        // a duplicate could slip through that flush window. Mirror the read
+        // paths (e.g. `check_extid_globally_unique`, `get_vertex_labels`) that
+        // already consult `pending_flush`.
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            if pending_l0.read().has_constraint_key(&key, current_vid) {
+                return Err(anyhow!(
+                    "Constraint violation: Duplicate composite key for label '{}' (in pending flush)",
                     label
                 ));
             }
@@ -2029,8 +2298,30 @@ impl Writer {
         let labels_copy = labels.to_vec();
 
         {
+            // For a non-tx write, re-resolve the live `current` buffer and hold
+            // `flush_lock` across the (synchronous) write so a concurrent flush
+            // rotate (which takes `flush_lock` via `begin_flush`) cannot install
+            // a fresh `current` between resolve and write, dropping our write
+            // (Bug #4). For a tx write `resolve_l0` returns the tx-private
+            // buffer, never the rotating `current`, so no `flush_lock` is needed
+            // (and taking it would risk re-entrancy with the commit path).
+            let _flush_lock_guard = if tx_l0.is_none() {
+                Some(self.flush_lock.lock().await)
+            } else {
+                None
+            };
             let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
+            // Generation chaining: a non-tx CRDT write into the (post-freeze,
+            // possibly empty) current buffer must merge against the chained
+            // committed state, not shadow it. No-op when the chain is empty
+            // or this is a tx-private write.
+            if tx_l0.is_none() {
+                let pending = self.l0_manager.get_pending_flush();
+                if !pending.is_empty() {
+                    Self::seed_crdt_props(&pending, vid, &properties, &mut l0_guard);
+                }
+            }
             l0_guard.insert_vertex_with_labels(vid, properties, labels);
 
             // Populate constraint index for O(1) duplicate detection
@@ -2459,42 +2750,73 @@ impl Writer {
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
         self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
-        let l0 = self.resolve_l0(tx_l0);
 
-        // Before deleting, ensure we have the vertex's labels stored in L0
-        // so the tombstone can be properly flushed to the correct label datasets.
+        // Before deleting, ensure we have the vertex's labels stored in L0 so
+        // the tombstone can be flushed to the correct label datasets. Discover
+        // them up front (this may await storage) WITHOUT pinning the buffer we
+        // will eventually mutate — for non-tx writes the live `current` buffer
+        // is re-resolved below under `flush_lock`, so a concurrent rotate can't
+        // drop our write (Bug #4). `resolve_l0` here is only used for cheap
+        // reads that tolerate a racing rotate.
         let has_labels = {
-            let l0_guard = l0.read();
-            l0_guard.vertex_labels.contains_key(&vid)
+            let l0_guard = self.resolve_l0(tx_l0);
+            let guard = l0_guard.read();
+            guard.vertex_labels.contains_key(&vid)
         };
 
-        if !has_labels {
-            let resolved_labels = if let Some(provided) = labels {
-                // Caller provided labels — skip the lookup entirely
-                Some(provided)
-            } else {
-                // Discover labels from pending flush L0s, then storage
-                let mut found = None;
-                for pending_l0 in self.l0_manager.get_pending_flush() {
-                    let pending_guard = pending_l0.read();
-                    if let Some(l) = pending_guard.get_vertex_labels(vid) {
-                        found = Some(l.to_vec());
-                        break;
-                    }
+        let backfill_labels = if has_labels {
+            None
+        } else if let Some(provided) = labels {
+            // Caller provided labels — skip the lookup entirely
+            Some(provided)
+        } else {
+            // Discover labels from pending flush L0s, then storage
+            let mut found = None;
+            for pending_l0 in self.l0_manager.get_pending_flush() {
+                let pending_guard = pending_l0.read();
+                if let Some(l) = pending_guard.get_vertex_labels(vid) {
+                    found = Some(l.to_vec());
+                    break;
                 }
-                if found.is_none() {
-                    found = self.find_vertex_labels_in_storage(vid).await?;
-                }
-                found
-            };
-
-            if let Some(found_labels) = resolved_labels {
-                let mut l0_guard = l0.write();
-                l0_guard.vertex_labels.insert(vid, found_labels);
             }
-        }
+            if found.is_none() {
+                found = self.find_vertex_labels_in_storage(vid).await?;
+            }
+            found
+        };
 
-        l0.write().delete_vertex(vid)?;
+        // Test-only seam (no-op without the `failpoints` feature): pause a
+        // non-transactional delete AFTER the awaited label discovery but BEFORE
+        // it re-resolves the live buffer and writes the tombstone. A concurrent
+        // flush can rotate+complete a buffer in this window; the fix re-resolves
+        // `get_current()` and mutates it under `flush_lock`, so the tombstone
+        // always lands in the live buffer (Bug #4 — silent lost delete across
+        // L0 rotation).
+        fail::fail_point!("nontx::after-capture");
+
+        // Apply the label backfill and the tombstone together. For a non-tx
+        // write, hold `flush_lock` across the (synchronous) re-resolve + write
+        // so a concurrent flush rotate (which takes `flush_lock` via
+        // `begin_flush`) cannot install a fresh `current` between our resolve
+        // and our write. For a tx write `resolve_l0` returns the tx-private
+        // buffer (never the rotating `current`), so no `flush_lock` is needed
+        // — and taking it there would risk re-entrancy with the commit path.
+        if tx_l0.is_none() {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            let l0 = self.l0_manager.get_current();
+            let mut guard = l0.write();
+            if let Some(found_labels) = backfill_labels {
+                guard.vertex_labels.insert(vid, found_labels);
+            }
+            guard.delete_vertex(vid)?;
+        } else {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut guard = l0.write();
+            if let Some(found_labels) = backfill_labels {
+                guard.vertex_labels.insert(vid, found_labels);
+            }
+            guard.delete_vertex(vid)?;
+        }
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
@@ -3085,17 +3407,29 @@ impl Writer {
         // 1. Acquire permit FIRST (outside flush_lock) so we don't
         //    introduce a permit-while-holding-flush-lock convoy.
         let permit = coord.acquire_permit().await?;
-        let seq = coord.next_rotate_seq();
-        coord.note_pending();
-        // 2. Rotate under flush_lock (µs work).
-        let RotateOutput {
-            old_l0_arc,
-            wal_lsn,
-            current_version,
-            flush_in_progress_guard,
-        } = {
+        // 2. Rotate under flush_lock (µs work), then allocate the rotate seq
+        //    and bump pending ONLY after the rotate succeeds (Bug #3). A failed
+        //    rotate (the `?` below) must consume neither: the finalizer
+        //    advances in strictly consecutive seq order and only decrements
+        //    pending on finalize, so a leaked seq/pending would wedge it
+        //    forever. The seq is allocated under `flush_lock`, immediately
+        //    after the rotate and before the guard drops, so concurrent rotates
+        //    keep seq order == rotation order, and the seq is unused until
+        //    submit. On the `?` error path the permit drops, freeing the slot.
+        let (
+            RotateOutput {
+                old_l0_arc,
+                wal_lsn,
+                current_version,
+                flush_in_progress_guard,
+            },
+            seq,
+        ) = {
             let _flush_lock_guard = self.flush_lock.lock().await;
-            self.flush_l0_rotate().await?
+            let rotate_out = self.flush_l0_rotate().await?;
+            let seq = coord.next_rotate_seq();
+            coord.note_pending();
+            (rotate_out, seq)
         };
         // 3. Build the coordinator's RotatedFlush. parent_manifest is the
         //    cached_manifest snapshot at this moment.
@@ -3149,6 +3483,13 @@ impl Writer {
             let l0_guard = current_l0.read();
             l0_guard.wal.clone()
         };
+        // Test-only seam (no-op without the `failpoints` feature): inject a
+        // WAL-flush failure here to drive the "failed async rotate wedges the
+        // finalizer" regression (Bug #3). When configured to "return" it makes
+        // `flush_l0_rotate` return Err exactly as a real WAL-flush failure would.
+        fail::fail_point!("flush::rotate-fail", |_| {
+            Err(anyhow!("flush::rotate-fail injected WAL-flush failure"))
+        });
         let wal_lsn = if let Some(ref w) = wal_for_truncate {
             w.flush().await?
         } else {
@@ -3199,6 +3540,14 @@ impl Writer {
         current_version: u64,
         name: Option<String>,
     ) -> Result<FlushOutcome> {
+        // Test-only seam (no-op without the `failpoints` feature): the rotate
+        // (begin_flush) already moved the to-be-flushed buffer onto
+        // pending_flush and installed a fresh empty current buffer, but the
+        // rotated rows are NOT yet durable in Lance. Pausing here holds that
+        // window open to drive the unique-constraint-hole regression
+        // (Bug #9 Mechanism A).
+        fail::fail_point!("flush::after-rotate-before-lance");
+
         // Phase B: materialize any deferred embeddings before column
         // extraction. No-op when `defer_embeddings` is off (the set will
         // be empty). On-demand reads of the embedding column are a TODO
@@ -4031,9 +4380,30 @@ impl Writer {
         // I. Cache manifest for next flush to avoid re-reading from object store.
         *shared.cached_manifest.lock() = Some(manifest.clone());
 
+        // L. Invalidate the property cache BEFORE removing the flushed buffer
+        // from the L0 chain (Bug #10). `clear_cache` has no dependency on the
+        // complete_flush (J) / WAL-truncate (K) steps below, so clearing it
+        // first closes the non-monotonic-read window: once the buffer leaves
+        // the L0 chain at J a freshly-written value would otherwise miss the
+        // chain and fall through to a stale cache entry. By the time finalize
+        // runs the streamed rows are already durable in L1, so a post-clear
+        // read falls through to fresh storage instead. The finalizer holds
+        // `flush_lock` throughout, so reordering L ahead of J is safe.
+        if let Some(ref pm) = shared.property_manager {
+            pm.clear_cache().await;
+        }
+
         // J. Complete flush: remove old L0 from pending_flush. MUST happen
         // BEFORE WAL truncation so min_pending_wal_lsn is accurate.
         shared.l0_manager.complete_flush(&old_l0_arc);
+
+        // Test-only seam (no-op without the `failpoints` feature): pause AFTER
+        // complete_flush removed the buffer from the L0 chain (J) but BEFORE
+        // WAL truncation (K). The property cache is already cleared (L moved
+        // ahead of J above), so a read in this window falls through to fresh
+        // L1 storage rather than a stale cache entry (Bug #10 — non-monotonic
+        // read after flush finalize).
+        fail::fail_point!("flush::after-complete-before-cache-clear");
 
         // K. Truncate WAL up to the safe LSN.
         let wal_handle = shared.l0_manager.get_current().read().wal.clone();
@@ -4044,11 +4414,6 @@ impl Writer {
                 .map(|min_pending| min_pending.min(wal_lsn))
                 .unwrap_or(wal_lsn);
             w.truncate_before(safe_lsn).await?;
-        }
-
-        // L. Invalidate property cache after flush to prevent stale reads.
-        if let Some(ref pm) = shared.property_manager {
-            pm.clear_cache().await;
         }
 
         // M. Reset last flush time for time-based auto-flush.

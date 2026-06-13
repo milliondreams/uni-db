@@ -613,3 +613,51 @@ async fn test_derived_fact_set_inspection() -> Result<()> {
     );
     Ok(())
 }
+
+// ── Parse-error hint for bare registered-rule names ─────────────────────────
+
+#[tokio::test]
+async fn test_bare_registered_rule_name_yields_query_hint() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Node")
+        .edge_type("EDGE", &["Node"], &["Node"])
+        .done()
+        .apply()
+        .await?;
+    db.rules()
+        .register("CREATE RULE my_rule AS MATCH (a:Node)-[:EDGE]->(b:Node) YIELD KEY a, KEY b")
+        .await?;
+
+    // Invoking the rule by its bare name fails to parse, but the error should
+    // point at the QUERY goal-query form.
+    let err = db
+        .session()
+        .locy("my_rule")
+        .await
+        .expect_err("bare name should not parse");
+    let msg = err.to_string();
+    assert!(matches!(err, uni_db::UniError::Parse { .. }), "got: {msg}");
+    assert!(
+        msg.contains("QUERY my_rule"),
+        "error should hint the goal-query form, got: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bare_unknown_name_has_no_hint() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    // A bare identifier that matches no registered rule gets a plain parse
+    // error with no goal-query hint.
+    let err = db
+        .session()
+        .locy("not_a_rule")
+        .await
+        .expect_err("should not parse");
+    assert!(
+        !err.to_string().contains("QUERY"),
+        "no hint expected for an unregistered name, got: {err}"
+    );
+    Ok(())
+}

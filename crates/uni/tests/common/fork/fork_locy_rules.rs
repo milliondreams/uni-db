@@ -31,10 +31,12 @@ async fn fork_inherits_primary_db_rules_at_fork_point() -> Result<()> {
     let db = db_with_schema().await?;
 
     // Register on the primary db registry — this is the inheritable state.
-    db.rules().register(
-        "CREATE RULE rule_a AS \
+    db.rules()
+        .register(
+            "CREATE RULE rule_a AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
+        )
+        .await?;
 
     let primary = db.session();
     let forked = primary.fork("inherit").await?;
@@ -62,10 +64,13 @@ async fn fork_local_rules_do_not_leak_to_primary() -> Result<()> {
     let forked = primary.fork("isolated").await?;
 
     // Fork registers its own rule.
-    forked.rules().register(
-        "CREATE RULE fork_only AS \
+    forked
+        .rules()
+        .register(
+            "CREATE RULE fork_only AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
+        )
+        .await?;
 
     let fork_rules = forked.rules().list();
     let primary_rules = primary.rules().list();
@@ -96,10 +101,12 @@ async fn primary_rules_added_after_fork_are_invisible_to_fork() -> Result<()> {
 
     // Register on primary db AFTER fork is created — fork must not see it
     // (snapshot semantics at fork point).
-    db.rules().register(
-        "CREATE RULE post_fork AS \
+    db.rules()
+        .register(
+            "CREATE RULE post_fork AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
+        )
+        .await?;
 
     let fork_rules = forked.rules().list();
     let db_rules = db.rules().list();
@@ -122,23 +129,30 @@ async fn fork_and_primary_each_see_own_plus_inherited() -> Result<()> {
     let db = db_with_schema().await?;
 
     // Pre-fork shared rule.
-    db.rules().register(
-        "CREATE RULE shared AS \
+    db.rules()
+        .register(
+            "CREATE RULE shared AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
+        )
+        .await?;
 
     let primary = db.session();
     let forked = primary.fork("each_own").await?;
 
     // Each side adds its own rule after fork.
-    db.rules().register(
-        "CREATE RULE primary_only AS \
+    db.rules()
+        .register(
+            "CREATE RULE primary_only AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
-    forked.rules().register(
-        "CREATE RULE fork_only AS \
+        )
+        .await?;
+    forked
+        .rules()
+        .register(
+            "CREATE RULE fork_only AS \
          MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
-    )?;
+        )
+        .await?;
 
     let db_rules = db.rules().list();
     let fork_rules = forked.rules().list();

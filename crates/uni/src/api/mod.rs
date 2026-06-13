@@ -50,6 +50,7 @@ pub mod impl_query;
 pub mod indexes;
 pub mod locy_builder;
 pub mod locy_result;
+pub mod locy_rule_catalog;
 pub mod multi_agent;
 pub mod plugin_trust;
 /// Commit notifications — moved to `uni-plugin-host`; re-exported to keep the
@@ -524,6 +525,12 @@ pub struct UniInner {
     /// Cloned into every new Session. Use `db.register_rules()` to add rules
     /// globally, or `session.register_rules()` for session-scoped rules.
     pub(crate) locy_rule_registry: Arc<std::sync::RwLock<impl_locy::LocyRuleRegistry>>,
+    /// Durable backing for the database-level Locy rule registry.
+    ///
+    /// `Some` only on the primary database inner; `None` on session, fork, and
+    /// snapshot inners (set in [`Self::derived_clone`]) so those registries
+    /// stay ephemeral and never write the catalog.
+    pub(crate) locy_rule_persister: Option<Arc<locy_rule_catalog::LocyRulePersister>>,
     /// Timestamp when this database instance was built.
     pub(crate) start_time: Instant,
     /// Broadcast channel for commit notifications.
@@ -609,7 +616,26 @@ pub struct UniInner {
     pub(crate) cached_wal_lsn: AtomicU64,
     /// Temp directory guard — auto-deletes on drop. Only set for `Uni::temporary()`.
     pub(crate) _temp_dir: Option<TempDir>,
+    /// Transparent plan cache for the transaction write path.
+    ///
+    /// Caches the pre-rewrite logical plan keyed by query-text hash + schema
+    /// version, so repeated `Transaction::execute` of the same statement shape
+    /// (e.g. ingest `UNWIND … CREATE`) skips parse and planning. Shared db-wide
+    /// via `Arc`. Forks/snapshots get a fresh empty cache in `derived_clone`
+    /// because their storage layout (and thus the fork-fusion rewrite) differs.
+    /// The logical-plan rewrites (`rewrite_for_fork_fusion`, `fuse_create_set`)
+    /// and parameter binding still run per execution, so cached reuse is
+    /// parameter-value independent.
+    pub(crate) plan_cache: Arc<std::sync::Mutex<crate::api::session::PlanCache>>,
 }
+
+/// Capacity of the transaction-write-path plan cache (entries).
+///
+/// Matches the read-path [`crate::api::session`] cache (1000 entries, LFU
+/// eviction). Large enough to retain every distinct ingest statement shape a
+/// workload uses; raising it only helps when a session cycles through more than
+/// this many *distinct* query texts.
+pub(crate) const TX_PLAN_CACHE_CAPACITY: usize = 1000;
 
 /// Write throttle pressure as a value in 0.0–1.0.
 ///
@@ -780,6 +806,10 @@ impl UniInner {
             scheduler_host: Arc::clone(&self.scheduler_host),
             shutdown_handle: Arc::new(ShutdownHandle::new(Duration::from_secs(30))),
             locy_rule_registry,
+            // Fork/snapshot inners must not persist rule mutations: keep them
+            // ephemeral so a fork's registrations never touch the primary
+            // catalog.
+            locy_rule_persister: None,
             start_time: Instant::now(),
             commit_tx,
             write_lease: None,
@@ -799,6 +829,11 @@ impl UniInner {
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
             _temp_dir: None,
+            // Fork/snapshot inners read a different storage layout, so they
+            // must not reuse the primary's cached (fork-fusion-shaped) plans.
+            plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
+                TX_PLAN_CACHE_CAPACITY,
+            ))),
         }
     }
 
@@ -1733,7 +1768,13 @@ impl Uni {
     ///
     /// Rules registered here are cloned into every new Session.
     pub fn rules(&self) -> rule_registry::RuleRegistry<'_> {
-        rule_registry::RuleRegistry::new(&self.inner.locy_rule_registry)
+        match &self.inner.locy_rule_persister {
+            Some(persister) => rule_registry::RuleRegistry::with_persister(
+                &self.inner.locy_rule_registry,
+                persister,
+            ),
+            None => rule_registry::RuleRegistry::new(&self.inner.locy_rule_registry),
+        }
     }
 
     // ── Configuration & Introspection ─────────────────────────────────
@@ -2714,6 +2755,9 @@ pub struct UniBuilder {
     write_lease: Option<multi_agent::WriteLease>,
     plugin_trust: Arc<plugin_trust::PluginTrustConfig>,
     temp_dir: Option<TempDir>,
+    /// When true, persisted Locy rules that no longer compile are skipped
+    /// (with a warning) on open instead of failing the open.
+    skip_invalid_locy_rules: bool,
 }
 
 impl UniBuilder {
@@ -2733,7 +2777,20 @@ impl UniBuilder {
             write_lease: None,
             plugin_trust: Arc::new(plugin_trust::PluginTrustConfig::default()),
             temp_dir: None,
+            skip_invalid_locy_rules: false,
         }
+    }
+
+    /// Skips persisted Locy rules that no longer compile, instead of failing.
+    ///
+    /// By default, opening a database whose `catalog/locy_rules.json` contains
+    /// a rule that no longer compiles (for example after a grammar change)
+    /// fails with an error naming the offending rule. Enabling this skips such
+    /// rules with a warning and retains them in the catalog file, so a fixed
+    /// binary can recover them.
+    pub fn skip_invalid_locy_rules(mut self, skip: bool) -> Self {
+        self.skip_invalid_locy_rules = skip;
+        self
     }
 
     /// Load schema from JSON file on initialization.
@@ -2979,6 +3036,22 @@ impl UniBuilder {
                 .map_err(UniError::Internal)?,
         );
 
+        // Load and recompile persisted Locy rules (catalog/locy_rules.json).
+        // A missing file yields an empty registry; a rule that no longer
+        // compiles fails the open unless `skip_invalid_locy_rules` is set.
+        let locy_rules_obj_path = object_store::path::Path::from("catalog/locy_rules.json");
+        let persisted_locy_sources =
+            locy_rule_catalog::LocyRulePersister::load(data_store.clone(), &locy_rules_obj_path)
+                .await?;
+        let loaded_locy_registry = impl_locy::build_locy_registry_from_persisted(
+            &persisted_locy_sources,
+            self.skip_invalid_locy_rules,
+        )?;
+        let locy_rule_persister = Arc::new(locy_rule_catalog::LocyRulePersister::new(
+            data_store.clone(),
+            locy_rules_obj_path,
+        ));
+
         let lancedb_storage_options = self
             .cloud_config
             .as_ref()
@@ -3139,11 +3212,15 @@ impl UniBuilder {
         // storage layout (remote-only, hybrid, or local): the only
         // difference is which `wal_store` was resolved above, and
         // `local_store` maps to the FS even behind the ObjectStore trait.
+        // For local layouts the data directory is passed as the WAL's
+        // local root, enabling fsync-on-flush (LocalFileSystem `put` does
+        // not fsync; without it a power loss can drop acknowledged
+        // commits). Remote layouts rely on the PUT ack.
         let wal = if self.config.wal_enabled {
-            Some(Arc::new(WriteAheadLog::new(
-                wal_store,
-                object_store::path::Path::from("wal"),
-            )))
+            Some(Arc::new(
+                WriteAheadLog::new(wal_store, object_store::path::Path::from("wal"))
+                    .with_local_root(persistence_data_path.clone()),
+            ))
         } else {
             None
         };
@@ -3580,9 +3657,8 @@ impl UniBuilder {
                 defer_queue,
                 scheduler_host: Arc::clone(&scheduler_host),
                 shutdown_handle,
-                locy_rule_registry: Arc::new(std::sync::RwLock::new(
-                    impl_locy::LocyRuleRegistry::default(),
-                )),
+                locy_rule_registry: Arc::new(std::sync::RwLock::new(loaded_locy_registry)),
+                locy_rule_persister: Some(locy_rule_persister),
                 start_time: Instant::now(),
                 commit_tx,
                 write_lease: self.write_lease,
@@ -3604,6 +3680,9 @@ impl UniBuilder {
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),
                 _temp_dir: self.temp_dir,
+                plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
+                    TX_PLAN_CACHE_CAPACITY,
+                ))),
             }),
         };
 

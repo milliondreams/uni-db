@@ -23,7 +23,7 @@
 
 use anyhow::Result;
 use tempfile::TempDir;
-use uni_db::Uni;
+use uni_db::{Uni, UniConfig};
 
 /// Owns a temp directory and opens databases rooted at `<dir>/db`.
 pub struct DiskHarness {
@@ -48,5 +48,13 @@ impl DiskHarness {
     /// Call repeatedly to simulate reboots; each reopen replays the WAL.
     pub async fn open(&self) -> Result<Uni> {
         Ok(Uni::open(self.uri()).build().await?)
+    }
+
+    /// Like [`open`](Self::open) but with an explicit [`UniConfig`].
+    ///
+    /// Used by recovery tests that must pin flush behavior (e.g. keep a commit
+    /// in the WAL rather than letting a background auto-flush promote it to L1).
+    pub async fn open_with(&self, config: UniConfig) -> Result<Uni> {
+        Ok(Uni::open(self.uri()).config(config).build().await?)
     }
 }

@@ -27,6 +27,92 @@ fn active_tx<'a>(
 }
 
 // ============================================================================
+// AsyncRuleRegistry
+// ============================================================================
+
+/// Async, durable facade for the database-level Locy rule registry.
+///
+/// Mutating methods return awaitables because they persist registered rule
+/// sources to `catalog/locy_rules.json`. Read-only methods are synchronous.
+#[pyclass(name = "AsyncRuleRegistry")]
+pub struct AsyncRuleRegistry {
+    pub(crate) registry: Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
+    pub(crate) persister: Option<Arc<::uni_db::LocyRulePersister>>,
+}
+
+#[pymethods]
+impl AsyncRuleRegistry {
+    /// Register Locy rules from a program string (returns awaitable).
+    fn register<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .register(&program)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Remove a rule by name (returns awaitable resolving to a bool).
+    fn remove<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .remove(&name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Clear all registered rules (returns awaitable).
+    fn clear<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .clear()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// List names of all registered rules.
+    fn list(&self) -> Vec<String> {
+        ::uni_db::RuleRegistry::new(&self.registry).list()
+    }
+
+    /// Get metadata about a registered rule.
+    fn get(&self, name: &str) -> Option<crate::types::PyRuleInfo> {
+        ::uni_db::RuleRegistry::new(&self.registry)
+            .get(name)
+            .map(|info| crate::types::PyRuleInfo {
+                name: info.name,
+                clause_count: info.clause_count,
+                is_recursive: info.is_recursive,
+            })
+    }
+
+    /// Get the number of registered rules.
+    fn count(&self) -> usize {
+        ::uni_db::RuleRegistry::new(&self.registry).count()
+    }
+}
+
+// ============================================================================
 // AsyncDatabase
 // ============================================================================
 
@@ -403,10 +489,14 @@ impl AsyncDatabase {
         })
     }
 
-    /// Access the rule registry for managing pre-compiled Locy rules.
-    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
-        crate::sync_api::PyRuleRegistry {
+    /// Access the durable database-level rule registry.
+    ///
+    /// Mutating methods return awaitables because they persist to
+    /// `catalog/locy_rules.json`; rules survive restarts.
+    fn rules(&self) -> AsyncRuleRegistry {
+        AsyncRuleRegistry {
             registry: self.inner.rules().clone_registry_arc(),
+            persister: self.inner.rules().clone_persister_arc(),
         }
     }
 
@@ -862,6 +952,7 @@ pub struct AsyncDatabaseBuilder {
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
     write_lease: Option<crate::types::PyWriteLease>,
+    skip_invalid_locy_rules: bool,
 }
 
 impl Default for AsyncDatabaseBuilder {
@@ -880,6 +971,7 @@ impl Default for AsyncDatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 }
@@ -1013,6 +1105,12 @@ impl AsyncDatabaseBuilder {
         slf
     }
 
+    /// Skip persisted Locy rules that no longer compile, instead of failing.
+    fn skip_invalid_locy_rules(mut slf: PyRefMut<'_, Self>, skip: bool) -> PyRefMut<'_, Self> {
+        slf.skip_invalid_locy_rules = skip;
+        slf
+    }
+
     /// Configure write lease for multi-agent coordination.
     fn write_lease(
         mut slf: PyRefMut<'_, Self>,
@@ -1092,6 +1190,7 @@ impl AsyncDatabaseBuilder {
         let cloud_config = self.cloud_config.clone();
         let uni_config = self.uni_config.clone();
         let read_only = self.read_only;
+        let skip_invalid_locy_rules = self.skip_invalid_locy_rules;
         let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
             crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
             crate::types::WriteLeaseVariant::DynamoDB { table } => {
@@ -1116,6 +1215,7 @@ impl AsyncDatabaseBuilder {
                 uni_config,
                 read_only,
                 rust_write_lease,
+                skip_invalid_locy_rules,
             )
             .await
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -1139,6 +1239,10 @@ impl AsyncDatabaseBuilder {
 pub struct AsyncTransaction {
     pub(crate) inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
     pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
+    /// Cloned cancellation token, captured before the `Transaction` is moved
+    /// into the `Arc<Mutex<..>>`, so `cancel()` can fire without taking the
+    /// async lock (which may be held by the in-flight operation being cancelled).
+    pub(crate) cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 #[pymethods]
@@ -1249,7 +1353,12 @@ impl AsyncTransaction {
     }
 
     /// Apply a DerivedFactSet to this transaction.
-    #[pyo3(signature = (derived, require_fresh=false, max_version_gap=None))]
+    ///
+    /// Freshness is required by default (`require_fresh=True`): a commit
+    /// between DERIVE evaluation and apply raises a stale-derived-facts
+    /// error. Pass `require_fresh=False` to apply regardless of staleness,
+    /// or `max_version_gap=n` to bound the allowed gap.
+    #[pyo3(signature = (derived, require_fresh=true, max_version_gap=None))]
     fn apply<'py>(
         &self,
         py: Python<'py>,
@@ -1264,17 +1373,17 @@ impl AsyncTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
-            let result = if require_fresh || max_version_gap.is_some() {
+            let result = {
                 let mut builder = tx.apply_with(dfs);
-                if require_fresh {
-                    builder = builder.require_fresh();
+                // `require_fresh=False` without a gap bound is the explicit
+                // stale opt-out (the pre-2.0.7 default behavior).
+                if !require_fresh && max_version_gap.is_none() {
+                    builder = builder.allow_stale();
                 }
                 if let Some(gap) = max_version_gap {
                     builder = builder.max_version_gap(gap);
                 }
                 builder.run().await
-            } else {
-                tx.apply(dfs).await
             }
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyApplyResult {
@@ -1320,16 +1429,19 @@ impl AsyncTransaction {
     fn rules(&self) -> crate::sync_api::PyRuleRegistry {
         crate::sync_api::PyRuleRegistry {
             registry: self.rule_registry_arc.clone(),
+            // Session/transaction-scoped rules are ephemeral.
+            persister: None,
         }
     }
 
     /// Cancel in-progress operations on this transaction.
+    ///
+    /// Fires the cancellation token directly without taking the async lock,
+    /// which the in-flight operation being cancelled may still be holding.
     fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let token = self.cancellation_token.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = active_tx(&guard)?;
-            tx.cancel();
+            token.cancel();
             Ok(())
         })
     }
@@ -1459,20 +1571,18 @@ impl AsyncTransaction {
         Ok(AsyncApplyBuilder {
             inner: self.inner.clone(),
             derived: Some(dfs),
-            require_fresh: false,
+            allow_stale: false,
             max_version_gap: None,
         })
     }
 
     /// Get the transaction's cancellation token.
+    ///
+    /// Returns the cloned token directly without taking the async lock.
     fn cancellation_token<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let token = self.cancellation_token.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = active_tx(&guard)?;
-            Ok(crate::types::PyCancellationToken {
-                inner: tx.cancellation_token(),
-            })
+            Ok(crate::types::PyCancellationToken { inner: token })
         })
     }
 
@@ -1745,13 +1855,20 @@ impl AsyncStreamingAppender {
     fn abort<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // `abort` is a cheap synchronous drop on the core appender, so no
-            // `spawn_blocking` is needed.
-            let mut guard = inner
-                .lock()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            if let Some(appender) = guard.take() {
-                appender.abort();
+            // Take the appender out under the lock, then drop the guard before
+            // awaiting the async rollback so the non-Send guard never crosses an
+            // await point.
+            let appender = {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                guard.take()
+            };
+            if let Some(appender) = appender {
+                appender
+                    .abort()
+                    .await
+                    .map_err(crate::exceptions::uni_error_to_pyerr)?;
             }
             Ok(())
         })
@@ -1784,9 +1901,18 @@ impl AsyncStreamingAppender {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().unwrap();
-            if let Some(appender) = guard.take() {
-                appender.abort();
+            // Take the appender out under the lock, then drop the guard before
+            // awaiting the async rollback so the non-Send guard never crosses an
+            // await point.
+            let appender = {
+                let mut guard = inner.lock().unwrap();
+                guard.take()
+            };
+            if let Some(appender) = appender {
+                appender
+                    .abort()
+                    .await
+                    .map_err(crate::exceptions::uni_error_to_pyerr)?;
             }
             Ok(false)
         })
@@ -2200,9 +2326,11 @@ impl AsyncSession {
             }
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
             let rule_reg = tx.rules().clone_registry_arc();
+            let token = tx.cancellation_token();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
                 rule_registry_arc: rule_reg,
+                cancellation_token: token,
             })
         })
     }
@@ -2343,6 +2471,8 @@ impl AsyncSession {
     fn rules(&self) -> crate::sync_api::PyRuleRegistry {
         crate::sync_api::PyRuleRegistry {
             registry: self.rule_registry_arc.clone(),
+            // Session/transaction-scoped rules are ephemeral.
+            persister: None,
         }
     }
 
@@ -2711,9 +2841,11 @@ impl AsyncTransactionBuilder {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             let rule_reg = tx.rules().clone_registry_arc();
+            let token = tx.cancellation_token();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
                 rule_registry_arc: rule_reg,
+                cancellation_token: token,
             })
         })
     }
@@ -3757,19 +3889,31 @@ impl AsyncTxLocyBuilder {
 }
 
 /// Async builder for applying a DerivedFactSet with staleness controls.
+///
+/// Defaults to fresh-required; chain `allow_stale()` or
+/// `max_version_gap(n)` to opt out.
 #[pyclass(name = "AsyncApplyBuilder")]
 pub struct AsyncApplyBuilder {
     inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
     derived: Option<uni_locy::DerivedFactSet>,
-    require_fresh: bool,
+    allow_stale: bool,
     max_version_gap: Option<u64>,
 }
 
 #[pymethods]
 impl AsyncApplyBuilder {
-    /// Require fresh version (fail if version gap is non-zero).
+    /// Require fresh version (fail if version gap is non-zero). This is the
+    /// default; `require_fresh(False)` is the explicit stale opt-out (the
+    /// pre-2.0.7 default behavior).
     fn require_fresh(mut slf: PyRefMut<'_, Self>, require: bool) -> PyRefMut<'_, Self> {
-        slf.require_fresh = require;
+        slf.allow_stale = !require;
+        slf
+    }
+
+    /// Apply regardless of how many commits happened since the DERIVE was
+    /// evaluated.
+    fn allow_stale(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.allow_stale = true;
         slf
     }
 
@@ -3785,14 +3929,14 @@ impl AsyncApplyBuilder {
         let dfs = self.derived.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("DerivedFactSet already consumed")
         })?;
-        let require_fresh = self.require_fresh;
+        let allow_stale = self.allow_stale;
         let max_version_gap = self.max_version_gap;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
             let mut builder = tx.apply_with(dfs);
-            if require_fresh {
-                builder = builder.require_fresh();
+            if allow_stale && max_version_gap.is_none() {
+                builder = builder.allow_stale();
             }
             if let Some(gap) = max_version_gap {
                 builder = builder.max_version_gap(gap);

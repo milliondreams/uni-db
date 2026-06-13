@@ -156,6 +156,45 @@ async fn test_corrupted_manifest_handling() -> Result<()> {
     Ok(())
 }
 
+/// Regression for the 2026-06-10 review bug #3c: `find_snapshot_at_time` swallowed
+/// a manifest load error (`if let Ok(m)`), so a corrupt/unreadable *newer* snapshot
+/// was silently skipped and the query answered from an older one — wrong point in
+/// time with no signal. The candidate's load error must now propagate.
+#[tokio::test]
+async fn time_travel_errors_on_corrupt_candidate_instead_of_falling_back() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+    let manager = SnapshotManager::new(store.clone());
+
+    // An older, valid snapshot and a newer one (which we then corrupt).
+    let mut older = create_test_manifest("snap-old");
+    older.created_at = Utc::now() - chrono::Duration::hours(2);
+    let mut newer = create_test_manifest("snap-new");
+    newer.created_at = Utc::now() - chrono::Duration::minutes(10);
+    manager.save_snapshot(&older).await?;
+    manager.save_snapshot(&newer).await?;
+
+    // Corrupt the newer manifest's bytes in place.
+    store
+        .put(
+            &Path::from("catalog/manifests/snap-new.json"),
+            "{ corrupt }".into(),
+        )
+        .await?;
+
+    // Query a timestamp covering both. The newest candidate is unreadable, so the
+    // result must be an error — never a silent fall-back to the older snapshot.
+    let target = Utc::now();
+    let result = manager.find_snapshot_at_time(target).await;
+    assert!(
+        result.is_err(),
+        "time-travel over a corrupt newer snapshot must error, not silently \
+         return the older one; got {result:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_empty_latest_pointer_handling() -> Result<()> {
     let dir = tempfile::tempdir()?;

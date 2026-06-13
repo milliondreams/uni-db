@@ -9,10 +9,12 @@ Locy datalog evaluation, and columnar analytics.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
+
+_T = TypeVar("_T")
 
 # =============================================================================
 # Typed Exception Hierarchy
@@ -121,6 +123,62 @@ class UniCommitTimeoutError(UniError):
     """Transaction commit timed out waiting for the writer lock."""
 
     ...
+
+class UniConstraintConflictError(UniError):
+    """Commit-time uniqueness race (e.g. concurrent MERGE on the same key).
+
+    Retriable — unlike ``UniConstraintError``, which is a non-retriable
+    constraint violation.
+    """
+
+    ...
+
+class UniLockTimeoutError(UniError):
+    """Timed out waiting for a FOR UPDATE row lock. Retriable."""
+
+    ...
+
+# Conflict-retry helpers (mirror Rust's Session::transact_with_retry).
+RETRIABLE_EXCEPTIONS: tuple[type[BaseException], ...]
+
+def transact_with_retry(
+    session: Session,
+    fn: Callable[[Transaction], _T],
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> _T: ...
+def execute_with_retry(
+    session: Session,
+    cypher: str,
+    params: dict[str, Any] | None = None,
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> ExecuteResult: ...
+async def async_transact_with_retry(
+    session: AsyncSession,
+    fn: Callable[[AsyncTransaction], Awaitable[_T]],
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> _T: ...
+async def async_execute_with_retry(
+    session: AsyncSession,
+    cypher: str,
+    params: dict[str, Any] | None = None,
+    *,
+    max_attempts: int = 5,
+    base_backoff: float = 0.0002,
+    max_backoff: float = 0.05,
+    jitter: float = 0.5,
+) -> ApplyResult | Any: ...
 
 # Resource limits
 class UniMemoryLimitExceededError(UniError):
@@ -575,13 +633,32 @@ class RuleInfo:
     is_recursive: bool
 
 class RuleRegistry:
-    """Facade for managing pre-compiled Locy rules."""
+    """Facade for managing pre-compiled Locy rules.
+
+    Database-level registries persist registered rules to
+    ``catalog/locy_rules.json`` so they survive restarts; session-,
+    transaction-, and fork-scoped registries are ephemeral.
+    """
 
     def register(self, program: str) -> None: ...
     def remove(self, name: str) -> bool: ...
     def list(self) -> list[str]: ...
     def get(self, name: str) -> RuleInfo | None: ...
     def clear(self) -> None: ...
+    def count(self) -> int: ...
+
+class AsyncRuleRegistry:
+    """Async, durable facade for the database-level Locy rule registry.
+
+    Mutating methods are awaitable because they persist registered rule
+    sources to ``catalog/locy_rules.json``.
+    """
+
+    async def register(self, program: str) -> None: ...
+    async def remove(self, name: str) -> bool: ...
+    def list(self) -> list[str]: ...
+    def get(self, name: str) -> RuleInfo | None: ...
+    async def clear(self) -> None: ...
     def count(self) -> int: ...
 
 class Compaction:
@@ -976,6 +1053,7 @@ class UniBuilder:
     def batch_size(self, size: int) -> UniBuilder: ...
     def wal_enabled(self, enabled: bool) -> UniBuilder: ...
     def read_only(self) -> UniBuilder: ...
+    def skip_invalid_locy_rules(self, skip: bool) -> UniBuilder: ...
     def write_lease(self, lease: WriteLease) -> UniBuilder: ...
     def build(self) -> Uni: ...
 
@@ -1102,9 +1180,14 @@ class TxLocyBuilder:
     def run(self) -> LocyResult: ...
 
 class ApplyBuilder:
-    """Fluent builder for applying derived facts."""
+    """Fluent builder for applying derived facts.
+
+    Defaults to fresh-required (version gap must be 0); chain
+    ``allow_stale()`` or ``max_version_gap(n)`` to opt out.
+    """
 
     def require_fresh(self, require: bool) -> ApplyBuilder: ...
+    def allow_stale(self) -> ApplyBuilder: ...
     def max_version_gap(self, gap: int) -> ApplyBuilder: ...
     def run(self) -> ApplyResult: ...
 
@@ -1710,6 +1793,7 @@ class AsyncUniBuilder:
     def batch_size(self, size: int) -> AsyncUniBuilder: ...
     def wal_enabled(self, enabled: bool) -> AsyncUniBuilder: ...
     def read_only(self) -> AsyncUniBuilder: ...
+    def skip_invalid_locy_rules(self, skip: bool) -> AsyncUniBuilder: ...
     def write_lease(self, lease: WriteLease) -> AsyncUniBuilder: ...
     async def build(self) -> AsyncUni: ...
 
@@ -1770,7 +1854,7 @@ class AsyncUni:
     async def save_schema(self, path: str) -> None: ...
 
     # Facades
-    def rules(self) -> RuleRegistry: ...
+    def rules(self) -> AsyncRuleRegistry: ...
     def xervo(self) -> AsyncXervo: ...
     def compaction(self) -> AsyncCompaction: ...
     def indexes(self) -> AsyncIndexes: ...
@@ -1940,7 +2024,7 @@ class AsyncTransaction:
     async def apply(
         self,
         derived: DerivedFactSet,
-        require_fresh: bool = False,
+        require_fresh: bool = True,
         max_version_gap: int | None = None,
     ) -> ApplyResult: ...
     async def apply_with(self, derived: DerivedFactSet) -> AsyncApplyBuilder: ...
@@ -2073,9 +2157,14 @@ class AsyncTxLocyBuilder:
     async def run(self) -> LocyResult: ...
 
 class AsyncApplyBuilder:
-    """Async fluent builder for applying derived facts."""
+    """Async fluent builder for applying derived facts.
+
+    Defaults to fresh-required (version gap must be 0); chain
+    ``allow_stale()`` or ``max_version_gap(n)`` to opt out.
+    """
 
     def require_fresh(self, require: bool) -> AsyncApplyBuilder: ...
+    def allow_stale(self) -> AsyncApplyBuilder: ...
     def max_version_gap(self, gap: int) -> AsyncApplyBuilder: ...
     async def run(self) -> ApplyResult: ...
 

@@ -8,12 +8,14 @@
 //! - **Arrow IPC bridge** ([`ipc`]) — `RecordBatch` ↔ stream bytes,
 //!   shared between Extism's bytes-in/bytes-out boundary and the
 //!   Component Model's linear-memory boundary.
-//! - **Pre-warmed instance pool** ([`pool`]) — generic over the pooled
-//!   instance type and the loader's error type. Both loaders alias
-//!   this with their concrete `T` and error.
+//! - **Per-plugin instance cache** ([`pool`]) — generic over the
+//!   per-invoke instance type and the loader's error type. Both loaders
+//!   alias this with their concrete `T` and error. It builds a fresh
+//!   instance per acquire (so guest state can't leak across calls) and
+//!   enforces a concurrency cap.
 //!
 //! Neither piece depends on extism or wasmtime; both depend only on
-//! `arrow-ipc`, `crossbeam-queue`, and `parking_lot`. That keeps the
+//! `arrow-ipc` and `parking_lot`. That keeps the
 //! crate small and lets it stay below `uni-plugin` in the workspace
 //! dep graph, so the trait-only embedder pays nothing for plumbing
 //! they never invoke.

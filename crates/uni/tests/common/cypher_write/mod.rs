@@ -1,5 +1,6 @@
 pub mod bidirectional_create_test;
 pub mod bulk_loading_test;
+pub mod create_set_fusion_test;
 pub mod cypher_create;
 pub mod cypher_delete;
 pub mod cypher_merge;
@@ -11,8 +12,11 @@ pub mod defer_embeddings_test;
 pub mod delete_vertex_test;
 pub mod df_mutation_test;
 pub mod inlined_unwind_pushdown_test;
+pub mod merge_failclosed_test;
 pub mod mutation_stress_test;
 pub mod partial_lance_delete_test;
 pub mod partial_lance_edges_test;
 pub mod partial_lance_writes_test;
+pub mod plan_cache_param_fold_test;
 pub mod set_projection_test;
+pub mod tx_plan_cache_test;

@@ -144,10 +144,13 @@ impl SnapshotManager {
         let mut best: Option<SnapshotManifest> = None;
 
         for id in ids {
-            if let Ok(m) = self.load_snapshot(&id).await
-                && m.created_at <= target
-                && best.as_ref().is_none_or(|b| m.created_at > b.created_at)
-            {
+            // Fail closed: propagate a load error for a listed snapshot rather
+            // than silently skipping it. Swallowing the error (the old `if let
+            // Ok(m)`) let a corrupt/unreadable newer manifest fall through to an
+            // older snapshot, answering a time-travel query from the wrong point
+            // in time with no signal (review #3c).
+            let m = self.load_snapshot(&id).await?;
+            if m.created_at <= target && best.as_ref().is_none_or(|b| m.created_at > b.created_at) {
                 best = Some(m);
             }
         }

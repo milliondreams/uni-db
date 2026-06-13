@@ -29,6 +29,18 @@ use std::sync::Arc;
 use uni_common::Properties;
 use uni_common::core::id::{Eid, UniId, Vid};
 
+/// Which edge endpoint a pushed-down vid set constrains in
+/// [`MainEdgeDataset::find_edges_by_type_names`].
+///
+/// `Src` for outgoing traversals, `Dst` for incoming, `Either` for
+/// undirected (`Both`) traversals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSide {
+    Src,
+    Dst,
+    Either,
+}
+
 /// Main edge dataset for the unified `edges` table.
 ///
 /// This table contains all edges regardless of type, providing:
@@ -466,9 +478,14 @@ impl MainEdgeDataset {
     ///
     /// Returns all non-deleted edges with any of the given type names.
     /// This is used for OR relationship type queries like `[:KNOWS|HATES]`.
+    ///
+    /// `endpoint_filter` pushes a bounded endpoint set into the scan (review
+    /// perf #5: a 1-source schemaless traversal used to materialize the whole
+    /// edge type). `None` keeps the full-type scan.
     pub async fn find_edges_by_type_names(
         backend: &dyn StorageBackend,
         type_names: &[&str],
+        endpoint_filter: Option<(EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
         if type_names.is_empty() {
             return Ok(Vec::new());
@@ -479,17 +496,44 @@ impl MainEdgeDataset {
             .iter()
             .map(|t| format!("'{}'", t.replace('\'', "''")))
             .collect();
-        let filter = format!(
+        let base_filter = format!(
             "_deleted = false AND type IN ({})",
             escaped_types.join(", ")
         );
 
-        // Fetch all columns for edge data
-        let batches = Self::execute_query(backend, &filter, None).await?;
-
         let mut edges = Vec::new();
-        for batch in &batches {
-            Self::extract_edges_with_type_from_batch(batch, &mut edges)?;
+        match endpoint_filter {
+            None => {
+                // Fetch all columns for edge data
+                let batches = Self::execute_query(backend, &base_filter, None).await?;
+                for batch in &batches {
+                    Self::extract_edges_with_type_from_batch(batch, &mut edges)?;
+                }
+            }
+            Some((_, [])) => {}
+            Some((side, vids)) => {
+                // Chunked so the filter string stays parseable for large sets.
+                const VID_CHUNK: usize = 8192;
+                for chunk in vids.chunks(VID_CHUNK) {
+                    let list = chunk
+                        .iter()
+                        .map(|v| v.as_u64().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let endpoint_clause = match side {
+                        EndpointSide::Src => format!("src_vid IN ({list})"),
+                        EndpointSide::Dst => format!("dst_vid IN ({list})"),
+                        EndpointSide::Either => {
+                            format!("(src_vid IN ({list}) OR dst_vid IN ({list}))")
+                        }
+                    };
+                    let filter = format!("{base_filter} AND {endpoint_clause}");
+                    let batches = Self::execute_query(backend, &filter, None).await?;
+                    for batch in &batches {
+                        Self::extract_edges_with_type_from_batch(batch, &mut edges)?;
+                    }
+                }
+            }
         }
 
         Ok(edges)

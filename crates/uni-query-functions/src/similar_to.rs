@@ -276,6 +276,11 @@ pub fn normalize_bm25(score: f32, fts_k: f32) -> f32 {
 /// full precision for property-based vectors (e.g. in TCK and unit tests). For
 /// `Value::Vector` (pre-indexed f32 data) it falls back to the f32 path.
 pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
+    // NULL propagates: a NULL operand yields NULL, not an error. `values_to_array`
+    // renders `Value::Null` as an Arrow null, matching 3VL semantics.
+    if matches!(v1, Value::Null) || matches!(v2, Value::Null) {
+        return Ok(Value::Null);
+    }
     // Fast path: at least one input is a List — use f64 to avoid f32 precision loss.
     let has_list = matches!(v1, Value::List(_)) || matches!(v2, Value::List(_));
     let f64_vecs = has_list

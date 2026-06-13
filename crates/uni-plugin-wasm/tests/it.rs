@@ -10,3 +10,5 @@ mod example_wasm_geo_e2e;
 mod example_wasm_net_e2e;
 #[path = "it/instantiate_minimal_component.rs"]
 mod instantiate_minimal_component;
+#[path = "it/pooled_instance_isolation.rs"]
+mod pooled_instance_isolation;

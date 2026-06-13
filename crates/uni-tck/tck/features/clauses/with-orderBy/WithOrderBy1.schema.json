@@ -54,7 +54,7 @@
       },
       "num": {
         "nullable": true,
-        "type": "Float64"
+        "type": "CypherValue"
       },
       "time": {
         "nullable": true,
@@ -84,7 +84,7 @@
       },
       "num": {
         "nullable": true,
-        "type": "Float64"
+        "type": "CypherValue"
       },
       "time": {
         "nullable": true,
@@ -114,7 +114,7 @@
       },
       "num": {
         "nullable": true,
-        "type": "Float64"
+        "type": "CypherValue"
       },
       "time": {
         "nullable": true,
@@ -144,7 +144,7 @@
       },
       "num": {
         "nullable": true,
-        "type": "Float64"
+        "type": "CypherValue"
       },
       "time": {
         "nullable": true,
@@ -174,7 +174,7 @@
       },
       "num": {
         "nullable": true,
-        "type": "Float64"
+        "type": "CypherValue"
       },
       "time": {
         "nullable": true,

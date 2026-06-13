@@ -57,8 +57,21 @@ pub fn match_error(
         }
     }
 
+    // Compute the detail outcome first, because an *unclassified* actual error
+    // (`TckErrorType::Unknown`) is only allowed to satisfy a *specific* expected
+    // type when the detail substring genuinely matches. Without this, "couldn't
+    // classify" would be treated as "matches everything" — and combined with the
+    // wildcard ('*') detail scenarios (which skip the detail check entirely) that
+    // produces false passes against specific expected types like NumberOutOfRange.
+    let error_message = actual.to_string();
+    let detail_genuinely_matched = match detail_code {
+        // Wildcard or absent detail provides no corroborating evidence.
+        None | Some("*") => false,
+        Some(detail) => detail_matches(&error_message, detail),
+    };
+
     let actual_type = classify_error(actual);
-    if !error_types_match(&actual_type, &expected_type) {
+    if !error_types_match(&actual_type, &expected_type, detail_genuinely_matched) {
         return Err(format!(
             "Error type mismatch: expected {:?}, got {:?}",
             expected_type, actual_type
@@ -67,14 +80,11 @@ pub fn match_error(
 
     if let Some(detail) = detail_code {
         // Skip detail check if wildcard '*' is used
-        if detail != "*" {
-            let error_message = actual.to_string();
-            if !detail_matches(&error_message, detail) {
-                return Err(format!(
-                    "Error detail mismatch: expected message to contain '{}', got '{}'",
-                    detail, error_message
-                ));
-            }
+        if detail != "*" && !detail_genuinely_matched {
+            return Err(format!(
+                "Error detail mismatch: expected message to contain '{}', got '{}'",
+                detail, error_message
+            ));
         }
     }
 
@@ -214,14 +224,32 @@ fn classify_error(error: &UniError) -> TckErrorType {
 
 /// Be lenient with error type matching since Cypher classifies many semantic
 /// validations as SyntaxError, and our engine may use different error categories.
-fn error_types_match(actual: &TckErrorType, expected: &TckErrorType) -> bool {
+///
+/// `detail_genuinely_matched` reports whether the expected error's detail
+/// substring was actually found in the error message. It gates the otherwise
+/// dangerously-permissive `Unknown` actual case: an actual error the runner
+/// could not classify (`TckErrorType::Unknown`) must NOT be treated as matching
+/// every specific expected type. It is allowed to match a specific expected type
+/// only when the detail substring corroborates the match; an unspecified
+/// (`Unknown`) expected type is still accepted because the TCK itself declined to
+/// pin a standard error category there.
+fn error_types_match(
+    actual: &TckErrorType,
+    expected: &TckErrorType,
+    detail_genuinely_matched: bool,
+) -> bool {
     if actual == expected {
         return true;
     }
+    // An unclassified actual error matches a specific expected type only when the
+    // detail substring genuinely corroborates it. When the expected side is itself
+    // `Unknown` (a non-standard/unspecified TCK type name), accept it regardless.
+    if let TckErrorType::Unknown(_) = actual {
+        return matches!(expected, TckErrorType::Unknown(_)) || detail_genuinely_matched;
+    }
     matches!(
         (actual, expected),
-        (TckErrorType::Unknown(_), _)
-            | (_, TckErrorType::Unknown(_))
+        (_, TckErrorType::Unknown(_))
             // Cypher TCK classifies many semantic/type validations as SyntaxError
             | (TckErrorType::SemanticError, TckErrorType::SyntaxError)
             | (TckErrorType::SemanticError, TckErrorType::TypeError)
@@ -368,6 +396,79 @@ mod tests {
             query: None,
         };
         assert_eq!(classify_error(&err), TckErrorType::ArgumentError);
+    }
+
+    #[test]
+    fn test_unknown_actual_does_not_blanket_match_specific_expected() {
+        // An error the runner cannot classify (`Unknown`) must NOT satisfy a
+        // specific expected type when the detail does not correspond. Use a
+        // UniError variant that `classify_error` leaves as `Unknown(_)`.
+        let unclassified = UniError::Schema {
+            message: "some schema failure unrelated to ranges".to_string(),
+        };
+        assert!(
+            matches!(classify_error(&unclassified), TckErrorType::Unknown(_)),
+            "precondition: this error must classify as Unknown"
+        );
+
+        // Wildcard detail provides no corroboration -> must NOT match a specific
+        // type. `SyntaxError` is a real standard TCK error category (unlike the
+        // detail code `NumberOutOfRange`), so this exercises the false-pass path
+        // for the ~3 wildcard ('*') detail scenarios.
+        let res = match_error(
+            &unclassified,
+            "SyntaxError".parse::<TckErrorType>().unwrap(),
+            ErrorPhase::AnyTime,
+            Some("*"),
+        );
+        assert!(
+            res.is_err(),
+            "Unknown actual must not match specific SyntaxError under wildcard detail"
+        );
+
+        // Absent detail also provides no corroboration -> must NOT match.
+        let res_no_detail = match_error(
+            &unclassified,
+            "TypeError".parse::<TckErrorType>().unwrap(),
+            ErrorPhase::AnyTime,
+            None,
+        );
+        assert!(
+            res_no_detail.is_err(),
+            "Unknown actual must not match specific type when no detail is given"
+        );
+
+        // But a legitimately-classified error still matches when type + detail line up.
+        let classified = UniError::Query {
+            message: "Query error: SyntaxError: NumberOutOfRange - step cannot be zero".to_string(),
+            query: None,
+        };
+        let ok = match_error(
+            &classified,
+            "SyntaxError".parse::<TckErrorType>().unwrap(),
+            ErrorPhase::AnyTime,
+            Some("NumberOutOfRange"),
+        );
+        assert!(
+            ok.is_ok(),
+            "legitimately classified SyntaxError + matching detail must still pass: {ok:?}"
+        );
+
+        // And an Unknown actual whose detail genuinely corroborates a specific
+        // expected type is still allowed (the detail substring carries the match).
+        let unknown_with_detail = UniError::Schema {
+            message: "boom: step cannot be zero".to_string(),
+        };
+        let corroborated = match_error(
+            &unknown_with_detail,
+            "SyntaxError".parse::<TckErrorType>().unwrap(),
+            ErrorPhase::AnyTime,
+            Some("NumberOutOfRange"),
+        );
+        assert!(
+            corroborated.is_ok(),
+            "Unknown actual with corroborating detail must match specific type: {corroborated:?}"
+        );
     }
 
     #[test]

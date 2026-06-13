@@ -1474,18 +1474,23 @@ db.restore_snapshot(&snapshot_id).await?;
 
 Manage pre-compiled Locy rules at database, session, or transaction scope. Rules registered at the database level are cloned into every new session.
 
-```rust
-// Database-level (global)
-db.rules().register("CREATE RULE edge_rule AS MATCH (a:Node)-[:KNOWS]->(b:Node) YIELD KEY a, KEY b")?;
+Database-level rules are durable: their source is persisted to
+`catalog/locy_rules.json` and recompiled on open, so they survive restarts.
+Session-, transaction-, and fork-scoped rules are ephemeral. Mutating methods
+are `async` because the database-level variants persist.
 
-// Session-level
+```rust
+// Database-level (global, durable across restarts)
+db.rules().register("CREATE RULE edge_rule AS MATCH (a:Node)-[:KNOWS]->(b:Node) YIELD KEY a, KEY b").await?;
+
+// Session-level (ephemeral)
 let session = db.session();
 session.rules().register("
     CREATE RULE path_rule AS
     MATCH (a:Node)-[:KNOWS]->(mid:Node)
     WHERE mid IS edge_rule TO c
     YIELD KEY a, KEY c
-")?;
+").await?;
 
 // Query registered rules
 let names = session.rules().list();
@@ -1493,8 +1498,8 @@ let info = session.rules().get("edge_rule");
 println!("Rules: {:?}, count: {}", names, session.rules().count());
 
 // Remove and clear
-session.rules().remove("edge_rule")?;
-session.rules().clear();
+session.rules().remove("edge_rule").await?;
+session.rules().clear().await?;
 ```
 
 | Method | Returns | Description |

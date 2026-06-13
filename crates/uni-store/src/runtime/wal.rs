@@ -23,7 +23,77 @@ fn parse_lsn_from_filename(path: &Path) -> Option<u64> {
     if filename.len() < 20 {
         return None;
     }
-    filename[..20].parse::<u64>().ok()
+    // `str::get(..20)` yields `None` (instead of panicking) when byte index 20
+    // falls mid-UTF-8-character, so a foreign multibyte filename is skipped.
+    filename.get(..20).and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Magic prefix of checksummed (v2) WAL segments.
+///
+/// v2 layout: `UNIWAL2\n<64-hex-char blake3 of payload>\n<payload JSON>`.
+/// Segments without the magic are legacy (pre-2.0.7) raw JSON and are still
+/// readable; they just have no integrity protection.
+const WAL_V2_MAGIC: &[u8] = b"UNIWAL2\n";
+
+/// Length of the hex-encoded blake3 checksum in the v2 header.
+const WAL_V2_HASH_HEX_LEN: usize = 64;
+
+/// Wrap a serialized segment payload in the checksummed v2 envelope.
+fn encode_segment_envelope(payload_json: &[u8]) -> Vec<u8> {
+    let hash = blake3::hash(payload_json);
+    let mut out =
+        Vec::with_capacity(WAL_V2_MAGIC.len() + WAL_V2_HASH_HEX_LEN + 1 + payload_json.len());
+    out.extend_from_slice(WAL_V2_MAGIC);
+    out.extend_from_slice(hash.to_hex().as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(payload_json);
+    out
+}
+
+/// Decode a WAL segment from its on-disk bytes, verifying the checksum for
+/// v2 envelopes and falling back to legacy raw-JSON parsing otherwise.
+///
+/// Returns a human-readable corruption description on failure — the caller
+/// decides whether that is fatal (corrupt middle segment) or a tolerated
+/// torn tail (see [`WriteAheadLog::replay_since`]).
+///
+/// `pub` + `doc(hidden)` solely so `fuzz/fuzz_targets/wal_decode.rs` can
+/// drive it with arbitrary bytes; it is not part of the public API.
+#[doc(hidden)]
+pub fn decode_segment(bytes: &[u8]) -> std::result::Result<WalSegment, String> {
+    if let Some(rest) = bytes.strip_prefix(WAL_V2_MAGIC) {
+        if rest.len() < WAL_V2_HASH_HEX_LEN + 1 || rest[WAL_V2_HASH_HEX_LEN] != b'\n' {
+            return Err("truncated v2 segment header".to_string());
+        }
+        let (hex, payload_nl) = rest.split_at(WAL_V2_HASH_HEX_LEN);
+        let payload = &payload_nl[1..];
+        let expected =
+            std::str::from_utf8(hex).map_err(|_| "non-utf8 checksum header".to_string())?;
+        let actual = blake3::hash(payload);
+        if actual.to_hex().as_str() != expected {
+            return Err(format!(
+                "checksum mismatch (expected {expected}, computed {})",
+                actual.to_hex()
+            ));
+        }
+        serde_json::from_slice(payload).map_err(|e| format!("v2 payload parse: {e}"))
+    } else {
+        // Legacy (pre-2.0.7) segment: raw JSON, no checksum.
+        serde_json::from_slice(bytes).map_err(|e| format!("legacy segment parse: {e}"))
+    }
+}
+
+/// Fsync a freshly written file and its parent directory.
+///
+/// The directory fsync makes the new directory entry itself durable across
+/// a crash (pattern borrowed from uni-sidecar's atomic `store_value`).
+fn sync_file_and_parent(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -74,9 +144,27 @@ pub struct WalSegment {
     pub mutations: Vec<Mutation>,
 }
 
+/// Borrowed serialization view of [`WalSegment`].
+///
+/// Field names and order match `WalSegment` exactly, so the serde output is
+/// byte-identical; `flush` serializes through this to avoid deep-cloning the
+/// whole mutation batch per flush.
+#[derive(Serialize, Debug)]
+struct WalSegmentRef<'a> {
+    lsn: u64,
+    mutations: &'a [Mutation],
+}
+
 pub struct WriteAheadLog {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    /// Filesystem root backing `store` when it is a local store. When set,
+    /// every flushed segment is fsync'd (file + parent directory) before the
+    /// flush is reported durable — `object_store::LocalFileSystem` does not
+    /// fsync on `put`, so without this a power loss can drop acknowledged
+    /// commits. `None` for remote stores (the PUT ack is the durability
+    /// point there).
+    local_root: Option<std::path::PathBuf>,
     state: Mutex<WalState>,
 }
 
@@ -93,12 +181,21 @@ impl WriteAheadLog {
         Self {
             store,
             prefix,
+            local_root: None,
             state: Mutex::new(WalState {
                 buffer: Vec::new(),
                 next_lsn: 1, // Start at 1 so 0 means "no WAL"
                 flushed_lsn: 0,
             }),
         }
+    }
+
+    /// Set the local filesystem root backing the object store, enabling
+    /// fsync-on-flush. See the field docs on `local_root`.
+    #[must_use]
+    pub fn with_local_root(mut self, local_root: Option<std::path::PathBuf>) -> Self {
+        self.local_root = local_root;
+        self
     }
 
     /// Initialize WAL state from existing segments (called on startup)
@@ -134,8 +231,16 @@ impl WriteAheadLog {
                 if bytes.is_empty() {
                     continue;
                 }
-                let segment: WalSegment = serde_json::from_slice(&bytes)?;
-                max_lsn = max_lsn.max(segment.lsn);
+                // This is only a max-LSN probe; a corrupt segment is skipped
+                // here (with a warning) and adjudicated by `replay_since`'s
+                // tail-vs-middle policy during actual recovery.
+                match decode_segment(&bytes) {
+                    Ok(segment) => max_lsn = max_lsn.max(segment.lsn),
+                    Err(reason) => {
+                        warn!(path = %meta.location, reason = %reason,
+                            "Skipping corrupt WAL segment during max-LSN probe");
+                    }
+                }
             }
         }
 
@@ -143,9 +248,9 @@ impl WriteAheadLog {
     }
 
     #[instrument(skip(self, mutation), level = "trace")]
-    pub fn append(&self, mutation: &Mutation) -> Result<()> {
+    pub fn append(&self, mutation: Mutation) -> Result<()> {
         let mut state = acquire_mutex(&self.state, "wal_state")?;
-        state.buffer.push(mutation.clone());
+        state.buffer.push(mutation);
         metrics::counter!("uni_wal_entries_total").increment(1);
         Ok(())
     }
@@ -167,10 +272,13 @@ impl WriteAheadLog {
         tracing::Span::current().record("lsn", lsn);
         tracing::Span::current().record("mutations_count", batch.len());
 
-        // Create segment with LSN
-        let segment = WalSegment {
+        // Serialize a borrowed view of the segment (serde output is identical
+        // to `WalSegment` — see `wal_segment_ref_serializes_identically`), so
+        // the batch is not deep-cloned per flush. `batch` itself stays owned
+        // for the restore-on-failure paths below.
+        let segment = WalSegmentRef {
             lsn,
-            mutations: batch.clone(),
+            mutations: &batch,
         };
 
         // Serialize segment; restore buffer on failure
@@ -187,15 +295,18 @@ impl WriteAheadLog {
                 return Err(e.into());
             }
         };
-        tracing::Span::current().record("size_bytes", json.len());
-        metrics::counter!("uni_wal_bytes_written_total").increment(json.len() as u64);
+        // Wrap in the checksummed v2 envelope so torn/corrupt segments are
+        // detected at replay instead of surfacing as opaque parse errors.
+        let body = encode_segment_envelope(&json);
+        tracing::Span::current().record("size_bytes", body.len());
+        metrics::counter!("uni_wal_bytes_written_total").increment(body.len() as u64);
 
         // Include LSN in filename for easy ordering and identification
         let filename = format!("{:020}_{}.wal", lsn, Uuid::new_v4());
         let path = self.prefix.clone().join(filename);
 
         // Attempt to write; restore buffer on failure to prevent data loss
-        if let Err(e) = put_with_timeout(&self.store, &path, json.into(), DEFAULT_TIMEOUT).await {
+        if let Err(e) = put_with_timeout(&self.store, &path, body.into(), DEFAULT_TIMEOUT).await {
             warn!(
                 lsn,
                 error = %e,
@@ -210,6 +321,28 @@ impl WriteAheadLog {
             // Don't roll back LSN - gap is harmless and maintains strict monotonicity
             // All WAL consumers use `>` / `<=` comparisons, not equality checks
             return Err(e);
+        }
+
+        // Local stores: fsync the segment + its directory before reporting
+        // the flush durable. On fsync failure the buffer is NOT restored —
+        // the bytes are already written (re-flushing would duplicate them
+        // under a new LSN) — but the flush reports failure because
+        // durability cannot be guaranteed.
+        if let Some(root) = &self.local_root {
+            let file_path = root.join(path.as_ref());
+            let synced =
+                tokio::task::spawn_blocking(move || sync_file_and_parent(&file_path)).await;
+            match synced {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(lsn, error = %e, "WAL segment fsync failed — durability not guaranteed");
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    warn!(lsn, error = %e, "WAL fsync task failed");
+                    return Err(e.into());
+                }
+            }
         }
 
         // Update flushed LSN on success
@@ -252,6 +385,13 @@ impl WriteAheadLog {
     /// Replay WAL segments with LSN > high_water_mark.
     /// Returns mutations from segments that haven't been applied yet.
     /// Optimized to skip downloading segments with LSN <= high_water_mark (parsed from filename).
+    ///
+    /// Corruption policy: a corrupt (bad checksum / unparseable / empty)
+    /// segment at the **tail** of the log is the classic torn write from a
+    /// crash — it is logged prominently and treated as end-of-WAL, since the
+    /// commit it belonged to was never acknowledged. A corrupt segment with
+    /// valid segments **after** it is real data loss and fails recovery with
+    /// an error naming the file.
     #[instrument(skip(self), level = "debug")]
     pub async fn replay_since(&self, high_water_mark: u64) -> Result<Vec<Mutation>> {
         let start = std::time::Instant::now();
@@ -259,28 +399,53 @@ impl WriteAheadLog {
         let metas = list_with_timeout(&self.store, Some(&self.prefix), DEFAULT_TIMEOUT).await?;
         let mut mutations = Vec::new();
 
-        // Collect paths and sort by LSN (filename prefix)
-        let mut paths: Vec<_> = metas.into_iter().map(|m| m.location).collect();
-        paths.sort(); // Lexicographical sort works for LSN prefix (zero-padded)
+        // Collect candidate paths and sort by LSN (filename prefix).
+        // Lexicographical sort works for the zero-padded LSN prefix.
+        let mut paths: Vec<_> = metas
+            .into_iter()
+            .map(|m| m.location)
+            .filter(|p| {
+                // Skip segments identifiable as <= high_water_mark without
+                // downloading. Unparseable filenames stay in (legacy safety).
+                parse_lsn_from_filename(p).is_none_or(|lsn| lsn > high_water_mark)
+            })
+            .collect();
+        paths.sort();
 
         let mut segments_replayed = 0;
 
-        for path in paths {
-            // Skip downloading segments we can identify as below high_water_mark from filename
-            if let Some(lsn) = parse_lsn_from_filename(&path)
-                && lsn <= high_water_mark
-            {
-                continue; // Skip this segment without downloading
-            }
-
-            // Download segment (either LSN > high_water_mark or filename unparseable)
-            let get_result = get_with_timeout(&self.store, &path, DEFAULT_TIMEOUT).await?;
+        for (idx, path) in paths.iter().enumerate() {
+            let get_result = get_with_timeout(&self.store, path, DEFAULT_TIMEOUT).await?;
             let bytes = get_result.bytes().await?;
-            if bytes.is_empty() {
-                continue;
-            }
 
-            let segment: WalSegment = serde_json::from_slice(&bytes)?;
+            // Empty files and decode failures share one corruption policy.
+            let decoded = if bytes.is_empty() {
+                Err("empty segment file".to_string())
+            } else {
+                decode_segment(&bytes)
+            };
+
+            let segment = match decoded {
+                Ok(segment) => segment,
+                Err(reason) => {
+                    let is_tail = idx + 1 == paths.len();
+                    if is_tail {
+                        warn!(
+                            path = %path,
+                            reason = %reason,
+                            "Corrupt tail WAL segment — torn write from a crash; \
+                             treating as end of WAL (the commit was never acknowledged)"
+                        );
+                        break;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "corrupt WAL segment '{path}' ({reason}) with {} later segment(s) \
+                         present; refusing to skip — manual inspection required",
+                        paths.len() - idx - 1
+                    ));
+                }
+            };
+
             // Double-check LSN from segment content (handles fallback case)
             if segment.lsn > high_water_mark {
                 mutations.extend(segment.mutations);
@@ -329,8 +494,17 @@ impl WriteAheadLog {
                     // Empty segments should be deleted
                     true
                 } else {
-                    let segment: WalSegment = serde_json::from_slice(&bytes)?;
-                    segment.lsn <= high_water_mark
+                    match decode_segment(&bytes) {
+                        Ok(segment) => segment.lsn <= high_water_mark,
+                        Err(reason) => {
+                            // Never delete a corrupt segment during
+                            // truncation — keep the evidence; replay's
+                            // tail-vs-middle policy adjudicates it.
+                            warn!(path = %meta.location, reason = %reason,
+                                "Keeping corrupt WAL segment during truncation");
+                            false
+                        }
+                    }
                 }
             };
 
@@ -385,7 +559,7 @@ mod tests {
             labels: vec![],
         };
 
-        wal.append(&mutation.clone())?;
+        wal.append(mutation)?;
         wal.flush().await?;
 
         let mutations = wal.replay().await?;
@@ -429,15 +603,15 @@ mod tests {
         };
 
         // First flush
-        wal.append(&mutation1)?;
+        wal.append(mutation1)?;
         let lsn1 = wal.flush().await?;
 
         // Second flush
-        wal.append(&mutation2)?;
+        wal.append(mutation2)?;
         let lsn2 = wal.flush().await?;
 
         // Third flush
-        wal.append(&mutation3)?;
+        wal.append(mutation3)?;
         let lsn3 = wal.flush().await?;
 
         // Verify strict monotonicity
@@ -487,6 +661,26 @@ mod tests {
         assert_eq!(parse_lsn_from_filename(&path), None);
     }
 
+    /// Regression for Bug #30: `parse_lsn_from_filename` must not panic on a
+    /// filename whose byte 20 falls in the middle of a multi-byte UTF-8 char.
+    ///
+    /// The length guard uses [`str::len`] (byte length), but the subsequent
+    /// `filename[..20]` slice requires byte 20 to be a char boundary. A name of
+    /// 19 ASCII bytes plus one 2-byte char ('é', bytes 19..21) has a byte length
+    /// of at least 20, passes the guard, then slices mid-'é' and panics today.
+    /// The correct behavior is to return `None` for a non-numeric/unparsable name.
+    ///
+    /// We use [`Path::parse`] (not [`Path::from`]) because `from` percent-encodes
+    /// non-ASCII so that `filename()` would be pure ASCII and never reach the
+    /// mid-char slice; `parse` preserves the raw multi-byte segment verbatim,
+    /// which is exactly what a real on-disk listing can surface.
+    #[test]
+    fn test_parse_lsn_from_filename_multibyte_no_panic() {
+        let name = format!("{}{}.wal", "0".repeat(19), "é"); // byte 20 falls mid-'é'
+        let path = Path::parse(name).expect("multi-byte segment is a valid object_store path");
+        assert_eq!(parse_lsn_from_filename(&path), None); // RED: panics today; correct = None
+    }
+
     /// Test for Issue #6: WAL initialization should parse LSN from filenames
     /// without downloading all segments
     #[tokio::test]
@@ -504,7 +698,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -536,7 +730,7 @@ mod tests {
         let wal = WriteAheadLog::new(store.clone(), prefix.clone());
 
         // Flush mutation 1 successfully
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
@@ -545,7 +739,7 @@ mod tests {
         assert_eq!(lsn1, 1);
 
         // Flush mutation 2 successfully
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(2),
             properties: HashMap::new(),
             labels: vec![],
@@ -559,14 +753,14 @@ mod tests {
         // by checking that next_lsn increments even if we don't flush
 
         // Append mutation 3 but DON'T flush
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(3),
             properties: HashMap::new(),
             labels: vec![],
         })?;
 
         // Now flush mutation 4
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(4),
             properties: HashMap::new(),
             labels: vec![],
@@ -597,7 +791,7 @@ mod tests {
 
         // Perform 50 flushes
         for i in 1..=50 {
-            wal.append(&Mutation::InsertVertex {
+            wal.append(Mutation::InsertVertex {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
@@ -636,7 +830,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -679,7 +873,7 @@ mod tests {
                 properties: HashMap::new(),
                 labels: vec![],
             };
-            wal.append(&mutation)?;
+            wal.append(mutation)?;
             wal.flush().await?;
         }
 
@@ -711,7 +905,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append InsertVertex with labels
-        wal.append(&Mutation::InsertVertex {
+        wal.append(Mutation::InsertVertex {
             vid: Vid::new(42),
             properties: {
                 let mut props = HashMap::new();
@@ -754,7 +948,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append DeleteVertex with labels (needed for tombstone flushing - Issue #76)
-        wal.append(&Mutation::DeleteVertex {
+        wal.append(Mutation::DeleteVertex {
             vid: Vid::new(99),
             labels: vec!["Person".to_string(), "Admin".to_string()],
         })?;
@@ -789,7 +983,7 @@ mod tests {
         let wal = Arc::new(WriteAheadLog::new(store, prefix));
 
         // Append InsertEdge with edge_type_name
-        wal.append(&Mutation::InsertEdge {
+        wal.append(Mutation::InsertEdge {
             src_vid: Vid::new(1),
             dst_vid: Vid::new(2),
             edge_type: 100,
@@ -867,5 +1061,40 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// `flush` serializes through the borrowed `WalSegmentRef`; its bytes must
+    /// be identical to the owned `WalSegment` so replay (which deserializes
+    /// `WalSegment`) is unaffected.
+    #[test]
+    fn wal_segment_ref_serializes_identically() {
+        let mut props = HashMap::new();
+        props.insert("p".to_string(), uni_common::Value::Int(7));
+        let mutations = vec![
+            Mutation::InsertVertex {
+                vid: Vid::new(1),
+                properties: props,
+                labels: vec!["L".to_string()],
+            },
+            Mutation::DeleteEdge {
+                eid: Eid::new(2),
+                src_vid: Vid::new(1),
+                dst_vid: Vid::new(3),
+                edge_type: 4,
+                version: 5,
+            },
+        ];
+        let owned = WalSegment {
+            lsn: 42,
+            mutations: mutations.clone(),
+        };
+        let borrowed = WalSegmentRef {
+            lsn: 42,
+            mutations: &mutations,
+        };
+        assert_eq!(
+            serde_json::to_vec(&owned).unwrap(),
+            serde_json::to_vec(&borrowed).unwrap()
+        );
     }
 }

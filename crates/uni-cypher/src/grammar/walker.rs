@@ -1559,13 +1559,50 @@ fn build_parenthesized_pattern(pair: Pair<Rule>) -> Result<PatternElement, Parse
     })
 }
 
+/// Parses a parenthesized-path quantifier bound into a `u32`.
+///
+/// `u32::from_str` natively rejects negative (`-2`), hexadecimal (`0x2`), and
+/// overflowing (`4294967296`) inputs, so this returns an error rather than
+/// panicking on any of them.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when `s` is not a valid non-negative `u32`.
+fn parse_quantifier_bound(s: &str) -> Result<u32, ParseError> {
+    s.parse::<u32>()
+        .map_err(|_| ParseError::new(format!("invalid path quantifier bound: {s}")))
+}
+
+/// Builds a [`Range`] from a parenthesized-path quantifier (`+`, `*`, `{..}`).
+///
+/// openCypher semantics: `*`/`{,}` = `1..∞`, `+` = `1..∞`, `{n}` = `n..n`,
+/// `{n,}` = `n..∞`, `{n,m}` = `n..m`, `{,m}` = `1..m`. An empty lower bound is
+/// represented as `min: None` (mirroring how the relationship form `*..m` is
+/// built), which the executor treats as `1`.
+///
+/// The grammar makes the `{`, `,`, and `}` tokens silent, so the inner pairs
+/// only ever expose the optional `integer` bounds; the empty-lower `{,m}` form
+/// is therefore distinguished by sniffing the raw token text for a leading
+/// comma rather than by pair position.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when a bound is not a valid non-negative `u32`.
 fn build_path_quantifier(pair: Pair<Rule>) -> Result<Range, ParseError> {
     let has_comma = pair.as_str().contains(',');
+    // `{` and any leading whitespace are silent in the grammar, so a leading
+    // comma in the raw text means the lower bound was omitted (`{,m}`).
+    let empty_lower = pair
+        .as_str()
+        .trim_start_matches('{')
+        .trim_start()
+        .starts_with(',');
     let mut inner = pair.into_inner().peekable();
 
     let Some(first) = inner.next() else {
+        // `{,}` (and any all-silent form) means unbounded both ways: 1..∞.
         return Ok(Range {
-            min: Some(0),
+            min: None,
             max: None,
         });
     };
@@ -1576,33 +1613,34 @@ fn build_path_quantifier(pair: Pair<Rule>) -> Result<Range, ParseError> {
             max: None,
         }),
         Rule::star => Ok(Range {
-            min: Some(0),
+            min: None,
             max: None,
         }),
         Rule::integer => {
-            let n: u32 = first.as_str().parse().unwrap();
+            let n = parse_quantifier_bound(first.as_str())?;
+            if empty_lower {
+                // {,m} - empty lower bound, `n` is actually the max.
+                return Ok(Range {
+                    min: None,
+                    max: Some(n),
+                });
+            }
             if !has_comma {
-                // {n} - exactly n
+                // {n} - exactly n.
                 return Ok(Range {
                     min: Some(n),
                     max: Some(n),
                 });
             }
-            // {n,m} or {n,}
+            // {n,m} or {n,}.
             let max = inner
                 .next()
                 .filter(|p| p.as_rule() == Rule::integer)
-                .map(|p| p.as_str().parse::<u32>().unwrap());
+                .map(|p| parse_quantifier_bound(p.as_str()))
+                .transpose()?;
             Ok(Range { min: Some(n), max })
         }
-        _ => {
-            // {,m} - first token is not an integer, so it's the max
-            let max: u32 = first.as_str().parse().unwrap();
-            Ok(Range {
-                min: Some(0),
-                max: Some(max),
-            })
-        }
+        rule => unreachable!("unexpected rule in path quantifier: {rule:?}"),
     }
 }
 

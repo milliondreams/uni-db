@@ -120,6 +120,51 @@ async fn test_session_query_allows_reads() -> Result<()> {
     Ok(())
 }
 
+/// A write hidden inside a `CALL { … }` subquery must also be rejected — the
+/// read-only validator previously checked only top-level clauses and let
+/// `CALL { CREATE … }` through, executing a non-transactional write.
+/// Regression for the 2026-06-10 review #2.
+#[tokio::test]
+async fn test_session_query_rejects_write_in_call_subquery() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let session = db.session();
+
+    let err = session
+        .query("CALL { CREATE (:Foo {name: 'bar'}) } RETURN 1 AS one")
+        .await
+        .expect_err("session.query() should reject CREATE inside CALL { }");
+    assert!(
+        err.to_string().contains("read-only"),
+        "error should mention read-only, got: {err}"
+    );
+
+    // And nothing must have been written.
+    let n = session
+        .query("MATCH (f:Foo) RETURN count(f) AS c")
+        .await?
+        .rows()[0]
+        .get::<i64>("c")?;
+    assert_eq!(n, 0, "CALL {{ CREATE }} must not have created a node");
+    Ok(())
+}
+
+/// A read-only `CALL { … }` subquery must still be allowed.
+#[tokio::test]
+async fn test_session_query_allows_read_in_call_subquery() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .await?;
+    tx.commit().await?;
+
+    let session = db.session();
+    let result = session
+        .query("MATCH (p:Person) CALL { MATCH (p) RETURN p.age AS a } RETURN p.name AS name, a")
+        .await?;
+    assert_eq!(result.len(), 1);
+    Ok(())
+}
+
 /// Session.query_with() should also reject mutations.
 #[tokio::test]
 async fn test_session_query_with_rejects_mutations() -> Result<()> {

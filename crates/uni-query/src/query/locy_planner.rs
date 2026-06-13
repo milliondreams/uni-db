@@ -800,6 +800,7 @@ impl<'a> LocyPlanBuilder<'a> {
         // Step 3: IS-reference joins
         let mut is_refs = Vec::new();
         let mut along_bindings = Vec::new();
+        let mut positive_is_ref_occurrence: usize = 0;
 
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
@@ -864,10 +865,32 @@ impl<'a> LocyPlanBuilder<'a> {
                 // Non-negated: CrossJoin + Filter (inner join semantics)
                 // Negated: no plan nodes — FixpointExec handles anti-join
                 if !is_ref.negated {
+                    // Each positive IS-ref joins a derived scan whose columns
+                    // are named after the target rule's yield schema. From the
+                    // second positive ref onward those names can collide with
+                    // an earlier scan's (always, for two refs to the same
+                    // rule), and the unqualified join predicate would silently
+                    // resolve against the FIRST scan's columns — contradictory
+                    // predicates, empty result. Alias every scan after the
+                    // first with a per-occurrence prefix and point its
+                    // predicates at the aliased names. The clause's final
+                    // yield projection drops non-yield columns, so aliased
+                    // names never leak into derived facts.
+                    let col_prefix = if positive_is_ref_occurrence == 0 {
+                        String::new()
+                    } else {
+                        format!("__isref{}_", positive_is_ref_occurrence)
+                    };
+                    positive_is_ref_occurrence += 1;
+                    let scan_schema = if col_prefix.is_empty() {
+                        handle.schema.clone()
+                    } else {
+                        alias_derived_schema(&handle.schema, &col_prefix)
+                    };
                     let derived_scan = LogicalPlan::LocyDerivedScan {
                         scan_index: handle.scan_index,
                         data: handle.data.clone(),
-                        schema: handle.schema.clone(),
+                        schema: scan_schema,
                     };
                     plan = LogicalPlan::CrossJoin {
                         left: Box::new(plan),
@@ -880,6 +903,7 @@ impl<'a> LocyPlanBuilder<'a> {
                         &None,
                         &target_rule.yield_schema,
                         &clause_node_vars,
+                        &col_prefix,
                     )?;
                     plan = LogicalPlan::Filter {
                         input: Box::new(plan),
@@ -927,13 +951,18 @@ impl<'a> LocyPlanBuilder<'a> {
                             let target_binding = Expr::BinaryOp {
                                 left: Box::new(Expr::Variable(format!("{}._vid", target_var))),
                                 op: BinaryOp::Eq,
-                                right: Box::new(Expr::Variable(col_name)),
+                                right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
                             };
                             plan = LogicalPlan::Filter {
                                 input: Box::new(plan),
                                 predicate: target_binding,
                                 optional_variables: HashSet::new(),
                             };
+                            // The ScanAll above materialized `{target_var}._vid`,
+                            // so chained IS-refs later in this clause can use the
+                            // target as a node-variable subject (`x IS r TO mid,
+                            // mid IS r TO z`).
+                            clause_node_vars.insert(target_var.clone());
                         }
                     }
                 }
@@ -1322,14 +1351,37 @@ fn expr_references_any(e: &Expr, vars: &HashSet<String>) -> bool {
     }
 }
 
+/// Rename every field of a derived scan's schema with `prefix`.
+///
+/// Used for the second and later positive IS-refs of a clause so their
+/// columns cannot collide with an earlier scan's identically named yield
+/// columns (see the aliasing comment in `build_clause` Step 3).
+fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            f.as_ref()
+                .clone()
+                .with_name(format!("{prefix}{}", f.name()))
+        })
+        .collect();
+    Arc::new(ArrowSchema::new(fields))
+}
+
 /// Maps subjects → KEY yield columns by position, and target → remaining KEY
 /// or first non-KEY yield column. For node variables, compares `._vid` property
 /// (UInt64) instead of bare variable (which doesn't exist as a column).
+///
+/// `col_prefix` is the derived scan's column alias prefix (empty for the
+/// clause's first positive IS-ref); the yield-column side of every predicate
+/// is prefixed so it resolves against the right scan.
 fn build_is_ref_predicate(
     subjects: &[String],
     target: &Option<String>,
     yield_schema: &[YieldColumn],
     node_vars: &HashSet<String>,
+    col_prefix: &str,
 ) -> Result<Expr> {
     let key_cols: Vec<&YieldColumn> = yield_schema.iter().filter(|yc| yc.is_key).collect();
     let non_key_cols: Vec<&YieldColumn> = yield_schema.iter().filter(|yc| !yc.is_key).collect();
@@ -1362,7 +1414,7 @@ fn build_is_ref_predicate(
         predicates.push(Expr::BinaryOp {
             left: Box::new(make_var_expr(subject, node_vars)),
             op: BinaryOp::Eq,
-            right: Box::new(Expr::Variable(key_col.name.clone())),
+            right: Box::new(Expr::Variable(format!("{col_prefix}{}", key_col.name))),
         });
     }
 
@@ -1377,7 +1429,7 @@ fn build_is_ref_predicate(
             predicates.push(Expr::BinaryOp {
                 left: Box::new(make_var_expr(target_var, node_vars)),
                 op: BinaryOp::Eq,
-                right: Box::new(Expr::Variable(col.name.clone())),
+                right: Box::new(Expr::Variable(format!("{col_prefix}{}", col.name))),
             });
         }
     }

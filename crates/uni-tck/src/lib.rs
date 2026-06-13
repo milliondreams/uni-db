@@ -1,6 +1,7 @@
 pub mod fixtures;
 pub mod matcher;
 pub mod parser;
+pub mod run_summary;
 pub mod steps;
 pub mod world;
 

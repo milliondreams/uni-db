@@ -123,6 +123,20 @@ create_exception!(
     UniError,
     "Transaction commit timed out waiting for the writer lock."
 );
+create_exception!(
+    _uni_db,
+    UniConstraintConflictError,
+    UniError,
+    "Commit-time uniqueness race (e.g. concurrent MERGE on the same key). \
+     Retriable — unlike UniConstraintError, which is a non-retriable \
+     constraint violation."
+);
+create_exception!(
+    _uni_db,
+    UniLockTimeoutError,
+    UniError,
+    "Timed out waiting for a FOR UPDATE row lock. Retriable."
+);
 
 // Resource limits
 create_exception!(
@@ -297,6 +311,12 @@ pub fn uni_error_to_pyerr(e: uni_common::UniError) -> PyErr {
         Query { .. } => UniQueryError::new_err(msg),
         Transaction { .. } => UniTransactionError::new_err(msg),
         TransactionConflict { .. } => UniTransactionConflictError::new_err(msg),
+        // SSI/OCC conflicts: previously fell through to the generic
+        // `UniError` catch-all, making retriable contention impossible to
+        // catch distinctly from Python.
+        SerializationConflict { .. } => UniTransactionConflictError::new_err(msg),
+        ConstraintConflict { .. } => UniConstraintConflictError::new_err(msg),
+        LockTimeout { .. } => UniLockTimeoutError::new_err(msg),
         TransactionAlreadyCompleted => UniTransactionAlreadyCompletedError::new_err(msg),
         ReadOnly { .. } => UniReadOnlyError::new_err(msg),
         LabelNotFound { .. } => UniLabelNotFoundError::new_err(msg),
@@ -520,6 +540,11 @@ pub fn register_exceptions(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> 
         "UniCommitTimeoutError",
         py.get_type::<UniCommitTimeoutError>(),
     )?;
+    m.add(
+        "UniConstraintConflictError",
+        py.get_type::<UniConstraintConflictError>(),
+    )?;
+    m.add("UniLockTimeoutError", py.get_type::<UniLockTimeoutError>())?;
 
     // Resource limits
     m.add(

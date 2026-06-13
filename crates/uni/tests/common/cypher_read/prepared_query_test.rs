@@ -156,3 +156,88 @@ async fn test_prepared_query_concurrent_execution() -> Result<()> {
 
     Ok(())
 }
+
+// ── Regression: review #3 — prepared-statement validation + tx binding ──
+
+/// A session-prepared mutation must be rejected at prepare time — session
+/// prepared queries are read-only, like `session.query`. Previously
+/// `PreparedQuery::new` skipped validation, so this executed an unvalidated,
+/// non-transactional write.
+#[tokio::test]
+async fn test_session_prepare_rejects_write() -> Result<()> {
+    let db = setup_db().await?;
+    let session = db.session();
+
+    let err = session
+        .prepare("CREATE (:Person {name: 'Mallory'})")
+        .await
+        .expect_err("session.prepare() of a write must be rejected");
+    assert!(
+        err.to_string().contains("read-only"),
+        "error should mention read-only, got: {err}"
+    );
+
+    // And nothing was written.
+    let n = session
+        .query("MATCH (p:Person {name: 'Mallory'}) RETURN count(p) AS c")
+        .await?
+        .rows()[0]
+        .get::<i64>("c")?;
+    assert_eq!(n, 0, "rejected prepared write must not have created a node");
+    Ok(())
+}
+
+/// A transaction-prepared write must land in the transaction's L0 and be undone
+/// by `rollback()` — previously it leaked into main L0 and survived rollback.
+#[tokio::test]
+async fn test_tx_prepare_write_is_rolled_back() -> Result<()> {
+    let db = setup_db().await?;
+
+    let tx = db.session().tx().await?;
+    let pq = tx
+        .prepare("CREATE (:Person {name: 'Carol', age: 41})")
+        .await?;
+    pq.execute(&[]).await?;
+
+    // The write is visible within the tx (reads see uncommitted writes).
+    let in_tx = tx
+        .query("MATCH (p:Person {name: 'Carol'}) RETURN count(p) AS c")
+        .await?
+        .rows()[0]
+        .get::<i64>("c")?;
+    assert_eq!(in_tx, 1, "tx-prepared write must be visible within the tx");
+
+    tx.rollback();
+
+    // After rollback the write must be gone (it lived in tx_l0, not main L0).
+    let after = db
+        .session()
+        .query("MATCH (p:Person {name: 'Carol'}) RETURN count(p) AS c")
+        .await?
+        .rows()[0]
+        .get::<i64>("c")?;
+    assert_eq!(after, 0, "tx-prepared write must be undone by rollback()");
+    Ok(())
+}
+
+/// A transaction-prepared write that the transaction commits must persist.
+#[tokio::test]
+async fn test_tx_prepare_write_commits() -> Result<()> {
+    let db = setup_db().await?;
+
+    let tx = db.session().tx().await?;
+    let pq = tx
+        .prepare("CREATE (:Person {name: 'Dave', age: 52})")
+        .await?;
+    pq.execute(&[]).await?;
+    tx.commit().await?;
+
+    let after = db
+        .session()
+        .query("MATCH (p:Person {name: 'Dave'}) RETURN p.age AS age")
+        .await?
+        .rows()[0]
+        .get::<i32>("age")?;
+    assert_eq!(after, 52, "committed tx-prepared write must persist");
+    Ok(())
+}

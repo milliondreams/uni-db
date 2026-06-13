@@ -99,7 +99,13 @@ fn strip_certainty_prefix(s: &str) -> (&str, Certainty) {
 /// Check for and strip a "BCE" suffix (case-insensitive), tolerating an
 /// optional space before it (e.g. "500 BCE" or "500BCE").
 fn strip_bce_suffix(s: &str) -> Option<&str> {
-    if s.len() >= 3 && s[s.len() - 3..].eq_ignore_ascii_case("BCE") {
+    // `len - 3` is a byte index: without the char-boundary guard, a
+    // multi-byte UTF-8 character straddling it makes the slice panic
+    // (fuzz-found via `parse_btic_literal("Ҫ[?")`).
+    if s.len() >= 3
+        && s.is_char_boundary(s.len() - 3)
+        && s[s.len() - 3..].eq_ignore_ascii_case("BCE")
+    {
         Some(s[..s.len() - 3].trim_end())
     } else {
         None
@@ -503,5 +509,16 @@ mod tests {
     #[test]
     fn invalid_literal_rejected() {
         assert!(parse_btic_literal("not-a-date").is_err());
+    }
+
+    /// Fuzz-found (2026-06-10): a multi-byte UTF-8 character straddling the
+    /// `len - 3` byte index panicked the BCE-suffix check instead of
+    /// returning a parse error. User-reachable via any BTIC literal.
+    #[test]
+    fn multibyte_utf8_near_bce_suffix_is_rejected_not_panicking() {
+        assert!(parse_btic_literal("Ҫ[?").is_err());
+        assert!(parse_btic_literal("12Ҫ").is_err());
+        assert!(parse_btic_literal("ҪҪ").is_err());
+        assert!(parse_btic_literal("é").is_err());
     }
 }

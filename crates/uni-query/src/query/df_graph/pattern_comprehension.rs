@@ -716,12 +716,22 @@ impl PatternComprehensionExecExpr {
                 };
                 let dst_vid = expansion.step_target_vids[step_idx][row_idx];
 
+                // Report the relationship's STORED direction, not the traversal
+                // order (`src_vid` -> `dst_vid` along the expansion). Resolves
+                // flushed (L1-resident) edges too, where the L0 chain no longer
+                // holds the stored endpoints.
+                let (stored_src, stored_dst) = self.graph_ctx.resolve_stored_edge_endpoints(
+                    eid,
+                    Vid::from(src_vid),
+                    Vid::from(dst_vid),
+                    &[edge_type_id],
+                );
                 super::common::append_edge_to_struct(
                     rels_builder.values(),
                     eid,
                     &edge_type_name,
-                    src_vid,
-                    dst_vid,
+                    stored_src,
+                    stored_dst,
                     query_ctx,
                 );
             }

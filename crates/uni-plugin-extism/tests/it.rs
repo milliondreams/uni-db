@@ -12,3 +12,5 @@ mod host_svc;
 mod instantiate_with_minimal_wasm;
 #[path = "it/load_e2e.rs"]
 mod load_e2e;
+#[path = "it/pooled_instance_isolation.rs"]
+mod pooled_instance_isolation;

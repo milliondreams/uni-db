@@ -195,9 +195,6 @@ fn values_equal_inner(a: &Value, b: &Value, ignore_list_order: bool) -> bool {
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bytes(a), Value::Bytes(b)) => a == b,
         (Value::Temporal(a), Value::Temporal(b)) => a == b,
-        // Cross-type: Temporal vs String — compare via Display
-        (Value::Temporal(_), Value::String(s)) => a.to_string() == *s,
-        (Value::String(s), Value::Temporal(_)) => *s == b.to_string(),
         (Value::List(a), Value::List(b)) => {
             if a.len() != b.len() {
                 return false;
@@ -221,14 +218,20 @@ fn values_equal_inner(a: &Value, b: &Value, ignore_list_order: bool) -> bool {
         (Value::Node(a), Value::Node(b)) => nodes_equal(a, b, ignore_list_order),
         (Value::Edge(a), Value::Edge(b)) => edges_equal(a, b, ignore_list_order),
         (Value::Path(a), Value::Path(b)) => paths_equal(a, b, ignore_list_order),
-        // Cross-type numeric: Int vs Float — compare as f64
-        (Value::Int(a), Value::Float(b)) => floats_equal(*a as f64, *b),
-        (Value::Float(a), Value::Int(b)) => floats_equal(*a, *b as f64),
         (Value::Vector(a), Value::Vector(b)) => {
             a.len() == b.len()
                 && a.iter()
                     .zip(b.iter())
                     .all(|(av, bv)| (av - bv).abs() < FLOAT_EPSILON as f32)
+        }
+        // openCypher result tables render temporal/BTIC values as quoted strings
+        // (e.g. `'PT22H'`, `'1984-10-11'`) that are byte-identical to genuine string
+        // results such as `toString(d)`. The reference comparison is therefore
+        // rendering-based for temporals: a temporal matches its canonical string
+        // rendering (and vice versa). Numeric types stay strict above — `1` and
+        // `1.0` are syntactically distinct, typed cells in the corpus.
+        (Value::Temporal(t), Value::String(s)) | (Value::String(s), Value::Temporal(t)) => {
+            t.to_string() == *s
         }
         _ => false,
     }
@@ -292,17 +295,61 @@ fn edges_equal(a: &Edge, b: &Edge, ignore_list_order: bool) -> bool {
     a.edge_type == b.edge_type && maps_equal(&a.properties, &b.properties, ignore_list_order)
 }
 
+/// Orientation of `edge` relative to the path step from `from` to `to`.
+///
+/// Returns `Some(true)` when the edge points forward (`from -> to`), `Some(false)`
+/// when it points backward (`to -> from`), and `None` when the endpoints do not
+/// line up with this step (a malformed path). openCypher paths are directed, so
+/// orientation is part of path identity.
+fn edge_orientation(edge: &Edge, from: &Node, to: &Node) -> Option<bool> {
+    if edge.src == from.vid && edge.dst == to.vid {
+        Some(true)
+    } else if edge.src == to.vid && edge.dst == from.vid {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn paths_equal(a: &Path, b: &Path, ignore_list_order: bool) -> bool {
-    a.nodes.len() == b.nodes.len()
-        && a.edges.len() == b.edges.len()
-        && a.nodes
-            .iter()
-            .zip(&b.nodes)
-            .all(|(a, b)| nodes_equal(a, b, ignore_list_order))
-        && a.edges
-            .iter()
-            .zip(&b.edges)
-            .all(|(a, b)| edges_equal(a, b, ignore_list_order))
+    if a.nodes.len() != b.nodes.len() || a.edges.len() != b.edges.len() {
+        return false;
+    }
+
+    let nodes_match = a
+        .nodes
+        .iter()
+        .zip(&b.nodes)
+        .all(|(a, b)| nodes_equal(a, b, ignore_list_order));
+    if !nodes_match {
+        return false;
+    }
+
+    // openCypher paths are directed: each edge's orientation relative to the
+    // node sequence is significant, so a reversed path must NOT compare equal.
+    // Absolute vids differ between actual (real graph IDs) and expected (parsed
+    // positional IDs), so compare the *relative* orientation of each edge against
+    // its surrounding nodes rather than raw src/dst values.
+    a.edges
+        .iter()
+        .zip(&b.edges)
+        .enumerate()
+        .all(|(i, (ea, eb))| {
+            if !edges_equal(ea, eb, ignore_list_order) {
+                return false;
+            }
+            let (a_from, a_to) = (&a.nodes[i], &a.nodes[i + 1]);
+            let (b_from, b_to) = (&b.nodes[i], &b.nodes[i + 1]);
+            match (
+                edge_orientation(ea, a_from, a_to),
+                edge_orientation(eb, b_from, b_to),
+            ) {
+                (Some(oa), Some(ob)) => oa == ob,
+                // If either side's endpoints are unrecoverable, fall back to
+                // type+property equality only (already checked above).
+                _ => true,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -323,6 +370,49 @@ mod tests {
         assert!(values_equal(&Value::Float(3.15), &Value::Float(3.15)));
         assert!(values_equal(&Value::Float(1.0 + 1e-11), &Value::Float(1.0)));
         assert!(!values_equal(&Value::Float(1.0), &Value::Float(2.0)));
+    }
+
+    #[test]
+    fn test_values_equal_numeric_type_strict() {
+        // openCypher result tables are typed: Integer `1` and Float `1.0` are
+        // DISTINCT values, so the runner must NOT cross-type equate them.
+        assert!(!values_equal(&Value::Int(1), &Value::Float(1.0)));
+        assert!(!values_equal(&Value::Float(1.0), &Value::Int(1)));
+        // Same-type numeric equality still holds.
+        assert!(values_equal(&Value::Int(1), &Value::Int(1)));
+        assert!(values_equal(&Value::Float(1.0), &Value::Float(1.0)));
+        // Float/Float approximate equality (tolerance) is preserved.
+        assert!(values_equal(&Value::Float(1.0), &Value::Float(1.0 + 1e-11)));
+    }
+
+    #[test]
+    fn test_values_equal_temporal_matches_rendering() {
+        use uni_common::TemporalValue;
+        // `Date { days_since_epoch: 0 }` renders as the string "1970-01-01".
+        let date = Value::Temporal(TemporalValue::Date {
+            days_since_epoch: 0,
+        });
+        let rendered = Value::String(date.to_string());
+        assert_eq!(date.to_string(), "1970-01-01");
+        // openCypher renders temporals as quoted strings identical to genuine
+        // string results (e.g. `toString(d)`), so the runner matches a temporal
+        // against its canonical string rendering in either order.
+        assert!(values_equal(&date, &rendered));
+        assert!(values_equal(&rendered, &date));
+        // A temporal does NOT match a string that renders differently.
+        assert!(!values_equal(
+            &date,
+            &Value::String("1999-12-31".to_string())
+        ));
+        // Temporal-vs-Temporal structural equality still holds.
+        let date_again = Value::Temporal(TemporalValue::Date {
+            days_since_epoch: 0,
+        });
+        assert!(values_equal(&date, &date_again));
+        let other_date = Value::Temporal(TemporalValue::Date {
+            days_since_epoch: 1,
+        });
+        assert!(!values_equal(&date, &other_date));
     }
 
     #[test]
@@ -407,6 +497,65 @@ mod tests {
             properties: HashMap::new(),
         };
         assert!(!nodes_equal(&node1, &node2, false));
+    }
+
+    #[test]
+    fn test_paths_equal_respects_edge_direction() {
+        use uni_common::core::id::{Eid, Vid};
+
+        fn node(vid: u64) -> Node {
+            Node {
+                vid: Vid::from(vid),
+                labels: vec![],
+                properties: HashMap::new(),
+            }
+        }
+        // Build a 2-node path with one edge of the given orientation.
+        // `forward` => a -> b ; otherwise b -> a (reversed).
+        fn two_node_path(forward: bool) -> Path {
+            let a = node(0);
+            let b = node(1);
+            let edge = if forward {
+                Edge {
+                    eid: Eid::from(0),
+                    edge_type: "T".to_string(),
+                    src: a.vid,
+                    dst: b.vid,
+                    properties: HashMap::new(),
+                }
+            } else {
+                Edge {
+                    eid: Eid::from(0),
+                    edge_type: "T".to_string(),
+                    src: b.vid,
+                    dst: a.vid,
+                    properties: HashMap::new(),
+                }
+            };
+            Path {
+                nodes: vec![a, b],
+                edges: vec![edge],
+            }
+        }
+
+        let forward = two_node_path(true);
+        let forward2 = two_node_path(true);
+        let reversed = two_node_path(false);
+
+        // Identical directed paths match.
+        assert!(
+            paths_equal(&forward, &forward2, false),
+            "identical directed paths must be equal"
+        );
+        // A reversed path must NOT match: (a)-[:T]->(b) != (a)<-[:T]-(b).
+        assert!(
+            !paths_equal(&forward, &reversed, false),
+            "reversed path must NOT be equal to forward path (paths are directed)"
+        );
+        assert!(
+            !paths_equal(&reversed, &forward, false),
+            "direction mismatch must be symmetric"
+        );
     }
 
     #[test]

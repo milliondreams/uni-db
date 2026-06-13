@@ -43,7 +43,7 @@ pub use query::df_udfs_plugin::{
 };
 pub use query::planner::{
     CostEstimates, ExplainOutput, ForkIndexLookup, FusionKind, IndexUsage, LogicalPlan,
-    QueryPlanner, rewrite_for_fork_fusion,
+    QueryPlanner, fuse_create_set, rewrite_for_fork_fusion,
 };
 pub use types::{
     Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryMetrics, QueryResult,
@@ -54,17 +54,45 @@ pub use uni_cypher::ast::{Query as CypherQuery, TimeTravelSpec};
 /// Validate that a query AST contains only read clauses.
 ///
 /// Rejects any query that contains CREATE, MERGE, DELETE, SET, REMOVE,
-/// or schema commands.
+/// or schema commands, **including writes nested inside a `CALL { … }`
+/// subquery**.
+///
+/// Procedure calls (`CALL proc(...)`) are not classified here because their
+/// read/write nature is registry-dependent; use [`validate_read_only_with`] to
+/// also reject write procedures when a classifier is available.
 ///
 /// # Errors
 ///
 /// Returns `Err(message)` describing the first write clause found. Used to
 /// enforce read-only access for time-travel queries (`VERSION AS OF` /
-/// `TIMESTAMP AS OF`).
+/// `TIMESTAMP AS OF`) and for `Session::query`.
 pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
-    use uni_cypher::ast::{Clause, Query, Statement};
+    validate_read_only_with(query, &|_| false)
+}
 
-    fn check_statement(stmt: &Statement) -> Result<(), String> {
+/// Like [`validate_read_only`], but also rejects procedure calls that
+/// `is_write_procedure` classifies as mutating.
+///
+/// The predicate receives the procedure name (e.g. `"db.create.something"`) and
+/// returns `true` if invoking it could mutate the graph or schema. Callers that
+/// hold a plugin registry can back it with the registered `ProcedureMode`;
+/// callers without one should use [`validate_read_only`], which treats every
+/// procedure as read-only (AST-determinable writes are still rejected).
+///
+/// # Errors
+///
+/// Returns `Err(message)` describing the first write clause, write subquery, or
+/// write procedure found.
+pub fn validate_read_only_with(
+    query: &CypherQuery,
+    is_write_procedure: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    use uni_cypher::ast::{CallKind, Clause, Query, Statement};
+
+    fn check_statement(
+        stmt: &Statement,
+        is_write_procedure: &dyn Fn(&str) -> bool,
+    ) -> Result<(), String> {
         for clause in &stmt.clauses {
             match clause {
                 Clause::Create(_)
@@ -74,25 +102,38 @@ pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
                 | Clause::Remove(_) => {
                     return Err(
                         "Write clauses (CREATE, MERGE, DELETE, SET, REMOVE) are not allowed \
-                         with VERSION AS OF / TIMESTAMP AS OF"
+                         in a read-only context"
                             .to_string(),
                     );
                 }
+                Clause::Call(call) => match &call.kind {
+                    // A subquery can itself contain writes; the planner fully
+                    // supports them, so the validator must recurse to match.
+                    CallKind::Subquery(inner) => check_query(inner, is_write_procedure)?,
+                    CallKind::Procedure { procedure, .. } => {
+                        if is_write_procedure(procedure) {
+                            return Err(format!(
+                                "Write procedure CALL {procedure}(...) is not allowed \
+                                 in a read-only context"
+                            ));
+                        }
+                    }
+                },
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn check_query(q: &Query) -> Result<(), String> {
+    fn check_query(q: &Query, is_write_procedure: &dyn Fn(&str) -> bool) -> Result<(), String> {
         match q {
-            Query::Single(stmt) => check_statement(stmt),
+            Query::Single(stmt) => check_statement(stmt, is_write_procedure),
             Query::Union { left, right, .. } => {
-                check_query(left)?;
-                check_query(right)
+                check_query(left, is_write_procedure)?;
+                check_query(right, is_write_procedure)
             }
-            Query::Explain(inner) => check_query(inner),
-            Query::TimeTravel { query, .. } => check_query(query),
+            Query::Explain(inner) => check_query(inner, is_write_procedure),
+            Query::TimeTravel { query, .. } => check_query(query, is_write_procedure),
             Query::Schema(cmd) => {
                 use uni_cypher::ast::SchemaCommand;
                 match cmd.as_ref() {
@@ -111,5 +152,5 @@ pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
         }
     }
 
-    check_query(query)
+    check_query(query, is_write_procedure)
 }

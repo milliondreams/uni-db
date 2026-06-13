@@ -116,12 +116,12 @@ mod tests {
         // Append two mutations and flush. The exact Mutation shape
         // depends on the WAL crate's enum; we use a vertex-insert
         // mutation matching the smallest reasonable variant.
-        wal.append(&Mutation::DeleteVertex {
+        wal.append(Mutation::DeleteVertex {
             vid: Vid::new(7),
             labels: vec![],
         })
         .unwrap();
-        wal.append(&Mutation::DeleteVertex {
+        wal.append(Mutation::DeleteVertex {
             vid: Vid::new(8),
             labels: vec![],
         })
@@ -152,7 +152,7 @@ mod tests {
         let fork_wal = new_for_fork(store.clone(), &id);
         fork_wal.initialize().await.unwrap();
         fork_wal
-            .append(&Mutation::DeleteVertex {
+            .append(Mutation::DeleteVertex {
                 vid: Vid::new(99),
                 labels: vec![],
             })
@@ -176,7 +176,7 @@ mod tests {
         wal_a.initialize().await.unwrap();
         wal_b.initialize().await.unwrap();
         wal_a
-            .append(&Mutation::DeleteVertex {
+            .append(Mutation::DeleteVertex {
                 vid: Vid::new(1),
                 labels: vec![],
             })

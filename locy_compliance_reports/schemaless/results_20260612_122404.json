@@ -2586,6 +2586,96 @@
     ]
   },
   {
+    "name": "FoldMonotonicity",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/compile/FoldMonotonicity.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Non-monotonic SUM in self-recursive rule is rejected",
+        "line": 12,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-monotonic SUM in self-recursive rule is rejected",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Monotonic MMAX in self-recursive rule compiles",
+        "line": 22,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Monotonic MMAX in self-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Monotonic MSUM in self-recursive rule compiles",
+        "line": 33,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Monotonic MSUM in self-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Monotonic MNOR in self-recursive rule compiles",
+        "line": 44,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Monotonic MNOR in self-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-monotonic AVG in self-recursive rule is rejected",
+        "line": 55,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-monotonic AVG in self-recursive rule is rejected",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-monotonic SUM in non-recursive rule compiles",
+        "line": 65,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-monotonic SUM in non-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "Stratification",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
     "elements": [
@@ -3325,12 +3415,26 @@
       },
       {
         "type": "scenario",
-        "name": "Max iterations exceeded returns partial results",
+        "name": "Max iterations exceeded errors by default",
         "line": 49,
         "steps": [
           {
             "keyword": "Scenario ",
-            "name": "Max iterations exceeded returns partial results",
+            "name": "Max iterations exceeded errors by default",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Max iterations with allow_partial returns partial results",
+        "line": 62,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Max iterations with allow_partial returns partial results",
             "result": {
               "status": "passed"
             }
@@ -3379,6 +3483,40 @@
           {
             "keyword": "Scenario ",
             "name": "Cross-rule IS reference with value binding",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "NonLinearRecursion",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/NonLinearRecursion.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Non-linear transitive closure matches the linear formulation",
+        "line": 12,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-linear transitive closure matches the linear formulation",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Two chained IS-references to another rule in one clause",
+        "line": 28,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Two chained IS-references to another rule in one clause",
             "result": {
               "status": "passed"
             }
@@ -5645,6 +5783,40 @@
           {
             "keyword": "Scenario ",
             "name": "EXPLAIN output includes proof_probability when top_k active",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "RecursiveNegation",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/negation/RecursiveNegation.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "IS NOT excludes the full transitive closure, not just the last delta",
+        "line": 16,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "IS NOT excludes the full transitive closure, not just the last delta",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "IS NOT against a cyclic recursive rule excludes every reachable pair",
+        "line": 38,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "IS NOT against a cyclic recursive rule excludes every reachable pair",
             "result": {
               "status": "passed"
             }

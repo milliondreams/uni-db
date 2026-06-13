@@ -482,6 +482,7 @@ pub async fn build_database_core(
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
     write_lease: Option<::uni_db::api::multi_agent::WriteLease>,
+    skip_invalid_locy_rules: bool,
 ) -> Result<Uni, UniError> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
@@ -530,6 +531,10 @@ pub async fn build_database_core(
 
     if read_only {
         builder = builder.read_only();
+    }
+
+    if skip_invalid_locy_rules {
+        builder = builder.skip_invalid_locy_rules(true);
     }
 
     if let Some(wl) = write_lease {

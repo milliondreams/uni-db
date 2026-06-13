@@ -416,6 +416,11 @@ impl SchemalessEdgeTypeRegistry {
         self.name_to_id.contains_key(type_name)
     }
 
+    /// Looks up the schemaless ID for `type_name` (exact match, read-only).
+    pub fn id_by_name(&self, type_name: &str) -> Option<u32> {
+        self.name_to_id.get(type_name).copied()
+    }
+
     /// Looks up the edge type ID for `type_name` with case-insensitive matching.
     pub fn id_by_name_case_insensitive(&self, type_name: &str) -> Option<u32> {
         self.name_to_id
@@ -486,6 +491,18 @@ impl Default for Schema {
 }
 
 impl Schema {
+    /// Bumps `schema_version` to invalidate cached query plans.
+    ///
+    /// Called at the end of every DDL mutation that changes the schema's
+    /// shape (labels, edge types, properties, indexes, constraints). The
+    /// plan-cache eviction guard keys on `schema_version`, so a stale plan
+    /// built against an older shape is discarded once this advances. Uses
+    /// wrapping arithmetic: the value is a coarse change token, not a count,
+    /// so wraparound only risks a missed eviction after 2^32 DDL operations.
+    fn bump_version(&mut self) {
+        self.schema_version = self.schema_version.wrapping_add(1);
+    }
+
     /// Returns the label name for a given label ID.
     ///
     /// Performs a linear scan over all labels. This is efficient because
@@ -571,6 +588,19 @@ impl Schema {
             .map(|(_, v)| v)
     }
 
+    /// Get the schema-canonical spelling of a label, matched case-insensitively.
+    ///
+    /// Returns the stored label name whose spelling differs only in case from
+    /// `name`, or `None` if no such label is registered. Callers use this to
+    /// normalize a user-supplied label to the canonical form the storage tier
+    /// keys on, so case variants resolve to the same vertex table.
+    pub fn canonical_label_name(&self, name: &str) -> Option<String> {
+        self.labels
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(k, _)| k.clone())
+    }
+
     /// Get label ID with case-insensitive lookup.
     pub fn label_id_by_name_case_insensitive(&self, label_name: &str) -> Option<u16> {
         self.get_label_case_insensitive(label_name)
@@ -610,10 +640,21 @@ impl Schema {
     /// Requires `&mut self` because it may assign a new schemaless ID.
     /// Use [`edge_type_id_by_name`](Self::edge_type_id_by_name) for read-only schema lookups.
     pub fn get_or_assign_edge_type_id(&mut self, type_name: &str) -> u32 {
-        if let Some(id) = self.edge_type_id_by_name(type_name) {
+        if let Some(id) = self.edge_type_id_unified(type_name) {
             return id;
         }
         self.schemaless_registry.get_or_assign_id(type_name)
+    }
+
+    /// Read-only unified exact lookup: schema-defined edge type id, falling
+    /// back to an already-assigned schemaless id.
+    ///
+    /// Mirrors exactly the checks [`Self::get_or_assign_edge_type_id`]
+    /// performs before assigning, so a `Some` here means the assigning path
+    /// would be a no-op — the basis for `SchemaManager`'s read-lock fast path.
+    pub fn edge_type_id_unified(&self, type_name: &str) -> Option<u32> {
+        self.edge_type_id_by_name(type_name)
+            .or_else(|| self.schemaless_registry.id_by_name(type_name))
     }
 
     /// Returns the edge type name for `type_id`, checking both the schema
@@ -1180,6 +1221,7 @@ impl SchemaManager {
                 description,
             },
         );
+        schema.bump_version();
         Ok(id)
     }
 
@@ -1229,11 +1271,26 @@ impl SchemaManager {
                 description,
             },
         );
+        schema.bump_version();
         Ok(id)
     }
 
     /// Delegates to [`Schema::get_or_assign_edge_type_id`].
+    ///
+    /// Read-lock fast path: the type name is almost always already known
+    /// (it is constant per statement but resolved per row by the CREATE
+    /// executor), and the slow path's write lock + `Arc::make_mut` deep-clones
+    /// the whole `Schema` whenever the Arc is shared — which under SSI it
+    /// always is. Double-checked: on a miss, `Schema::get_or_assign_edge_type_id`
+    /// re-checks under the write lock, so two racing assigners converge on one id.
     pub fn get_or_assign_edge_type_id(&self, type_name: &str) -> u32 {
+        {
+            let guard = acquire_read(&self.schema, "schema")
+                .expect("Schema lock poisoned - a thread panicked while holding it");
+            if let Some(id) = guard.edge_type_id_unified(type_name) {
+                return id;
+            }
+        }
         let mut guard = acquire_write(&self.schema, "schema")
             .expect("Schema lock poisoned - a thread panicked while holding it");
         let schema = Arc::make_mut(&mut *guard);
@@ -1293,6 +1350,8 @@ impl SchemaManager {
                 description,
             },
         );
+        // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
         Ok(())
     }
 
@@ -1329,6 +1388,8 @@ impl SchemaManager {
                 description: None,
             },
         );
+        // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
         Ok(())
     }
 
@@ -1393,6 +1454,7 @@ impl SchemaManager {
         } else {
             schema.indexes.push(index_def);
         }
+        schema.bump_version();
         Ok(())
     }
 
@@ -1426,6 +1488,7 @@ impl SchemaManager {
         let schema = Arc::make_mut(&mut *guard);
         if let Some(pos) = schema.indexes.iter().position(|i| i.name() == name) {
             schema.indexes.remove(pos);
+            schema.bump_version();
             Ok(())
         } else {
             Err(anyhow!("Index '{}' not found", name))
@@ -1439,6 +1502,7 @@ impl SchemaManager {
             return Err(anyhow!("Constraint '{}' already exists", constraint.name));
         }
         schema.constraints.push(constraint);
+        schema.bump_version();
         Ok(())
     }
 
@@ -1447,6 +1511,7 @@ impl SchemaManager {
         let schema = Arc::make_mut(&mut *guard);
         if let Some(pos) = schema.constraints.iter().position(|c| c.name == name) {
             schema.constraints.remove(pos);
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())
@@ -1458,19 +1523,18 @@ impl SchemaManager {
     pub fn drop_property(&self, label_or_type: &str, prop_name: &str) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
-        if let Some(props) = schema.properties.get_mut(label_or_type) {
-            if props.remove(prop_name).is_some() {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "Property '{}' not found for '{}'",
-                    prop_name,
-                    label_or_type
-                ))
-            }
-        } else {
-            Err(anyhow!("Label or Edge Type '{}' not found", label_or_type))
+        let Some(props) = schema.properties.get_mut(label_or_type) else {
+            return Err(anyhow!("Label or Edge Type '{}' not found", label_or_type));
+        };
+        if props.remove(prop_name).is_none() {
+            return Err(anyhow!(
+                "Property '{}' not found for '{}'",
+                prop_name,
+                label_or_type
+            ));
         }
+        schema.bump_version();
+        Ok(())
     }
 
     pub fn rename_property(
@@ -1481,25 +1545,24 @@ impl SchemaManager {
     ) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
-        if let Some(props) = schema.properties.get_mut(label_or_type) {
-            if let Some(meta) = props.remove(old_name) {
-                if props.contains_key(new_name) {
-                    // Rollback removal? Or just error.
-                    props.insert(old_name.to_string(), meta); // Restore
-                    return Err(anyhow!("Property '{}' already exists", new_name));
-                }
-                props.insert(new_name.to_string(), meta);
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "Property '{}' not found for '{}'",
-                    old_name,
-                    label_or_type
-                ))
-            }
-        } else {
-            Err(anyhow!("Label or Edge Type '{}' not found", label_or_type))
+        let Some(props) = schema.properties.get_mut(label_or_type) else {
+            return Err(anyhow!("Label or Edge Type '{}' not found", label_or_type));
+        };
+        let Some(meta) = props.remove(old_name) else {
+            return Err(anyhow!(
+                "Property '{}' not found for '{}'",
+                old_name,
+                label_or_type
+            ));
+        };
+        if props.contains_key(new_name) {
+            // Rollback removal? Or just error.
+            props.insert(old_name.to_string(), meta); // Restore
+            return Err(anyhow!("Property '{}' already exists", new_name));
         }
+        props.insert(new_name.to_string(), meta);
+        schema.bump_version();
+        Ok(())
     }
 
     pub fn drop_label(&self, name: &str, if_exists: bool) -> Result<()> {
@@ -1508,6 +1571,7 @@ impl SchemaManager {
         if let Some(label_meta) = schema.labels.get_mut(name) {
             label_meta.state = SchemaElementState::Tombstone { since: Utc::now() };
             // Do not remove properties; they are implicitly tombstoned by the label
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())
@@ -1522,6 +1586,7 @@ impl SchemaManager {
         if let Some(edge_meta) = schema.edge_types.get_mut(name) {
             edge_meta.state = SchemaElementState::Tombstone { since: Utc::now() };
             // Do not remove properties; they are implicitly tombstoned by the edge type
+            schema.bump_version();
             Ok(())
         } else if if_exists {
             Ok(())
@@ -2132,6 +2197,39 @@ mod tests {
 
         // Primary unchanged.
         assert!(!primary.schema().labels.contains_key("NewLabel"));
+        Ok(())
+    }
+
+    /// N threads racing `get_or_assign_edge_type_id` for the same new name
+    /// must converge on a single id (the read-lock fast path double-checks
+    /// under the write lock); a schema-defined type must win over the
+    /// schemaless registry.
+    #[tokio::test]
+    async fn test_get_or_assign_edge_type_id_concurrent() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = Arc::new(SchemaManager::load_from_store(store, &path).await?);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let m = manager.clone();
+            handles.push(std::thread::spawn(move || {
+                m.get_or_assign_edge_type_id("RACED")
+            }));
+        }
+        let ids: Vec<u32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            ids.iter().all(|&id| id == ids[0]),
+            "all racers must observe one id, got {ids:?}"
+        );
+        // Fast path returns the same id afterwards.
+        assert_eq!(manager.get_or_assign_edge_type_id("RACED"), ids[0]);
+
+        // Schema-defined type wins over the schemaless registry.
+        manager.add_label("A")?;
+        let declared = manager.add_edge_type("DECLARED", vec!["A".into()], vec!["A".into()])?;
+        assert_eq!(manager.get_or_assign_edge_type_id("DECLARED"), declared);
         Ok(())
     }
 }

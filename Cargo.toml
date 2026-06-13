@@ -71,7 +71,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.6"
+version = "2.1.0"
 edition = "2024"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
@@ -108,6 +108,11 @@ uni-sidecar = { path = "crates/uni-sidecar", version = "2.0.0" }
 uni-bulk = { path = "crates/uni-bulk", version = "2.0.0" }
 uni-fork = { path = "crates/uni-fork", version = "2.0.0" }
 
+# LOCK PIN (transitive, not listed here): `time` is held at =0.3.47 in
+# Cargo.lock — time 0.3.48 adds `impl From<X> for <X as ModifierValue>::Type`
+# impls that fail coherence (E0119) against aws-smithy-types 1.5.0's blanket
+# `impl<T> From<T> for CanDisable<T>`. After any blanket `cargo update`, re-run
+# `cargo update -p time --precise 0.3.47` until aws-smithy-types ships a fix.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -138,7 +143,7 @@ semver = "1.0"
 blake3 = "1"
 cron = "0.16"
 ulid = { version = "1.2", features = ["serde"] }
-chrono = "0.4.44"
+chrono = "0.4.45"
 chrono-tz = "0.10"
 fxhash = "0.2"
 bytes = "1.11"
@@ -150,8 +155,8 @@ csv = "1.4"
 parquet = "58.3.0"
 regex = "1.12"
 metrics = "0.24"
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 rustyline = "18"
 colored = "3"
 prettytable-rs = "0.10"
@@ -160,7 +165,7 @@ url = "2.5"
 proptest = "1.11"
 datafusion = "53.1.0"
 lancedb = { version = "=0.30.0", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = "0.13.0", default-features = false }
+uni-xervo = { version = "0.13.1", default-features = false }
 biodivine-lib-bdd = "0.6"
 candle-core = "0.10"
 candle-nn = "0.10"

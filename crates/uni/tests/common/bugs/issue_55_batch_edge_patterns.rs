@@ -171,24 +171,29 @@ async fn run_one(label: &str, query: &str) {
         }
     }
 
-    // 2. PROFILE — executes the query, collecting per-operator stats.
-    // Goes through db.profile_internal, which bypasses the session's
-    // read-only validator and accepts CREATE/MERGE.
+    // 2. PROFILE — executes the write, collecting per-operator stats. Profiled
+    // through the transaction write path (`tx.execute_with(...).profile()`),
+    // since a CREATE is a mutation and the session read path correctly rejects
+    // it.
+    let tx = db.session().tx().await.unwrap();
     let t0 = Instant::now();
-    let (results, profile) = db
-        .session()
-        .query_with(query)
+    let (results, profile) = tx
+        .execute_with(query)
         .param("edges", edges_param)
         .profile()
         .await
         .unwrap();
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    tx.commit().await.unwrap();
 
     eprintln!("--- PROFILE ---");
     eprintln!("  total_time_ms (engine) : {}", profile.total_time_ms);
     eprintln!("  wallclock_ms (caller)  : {wall_ms:.2}");
     eprintln!("  peak_memory_bytes      : {}", profile.peak_memory_bytes);
-    eprintln!("  rows returned          : {}", results.rows().len());
+    eprintln!(
+        "  relationships created  : {}",
+        results.relationships_created()
+    );
 
     eprintln!("--- PROFILE per-operator (post-order: leaves -> roots) ---");
     eprintln!(

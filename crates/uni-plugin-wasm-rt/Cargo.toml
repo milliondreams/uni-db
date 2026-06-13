@@ -13,13 +13,12 @@ categories = ["database", "wasm"]
 
 # Deliberately minimal — this crate sits BELOW `uni-plugin` in the dep
 # graph so the trait surface stays light. No `uni-plugin` dep, no
-# wasmtime, no extism. Pure Arrow + crossbeam + parking_lot.
+# wasmtime, no extism. Pure Arrow + parking_lot.
 [dependencies]
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ipc = "58.3.0"
-crossbeam-queue = "0.3"
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

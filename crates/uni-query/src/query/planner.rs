@@ -290,6 +290,33 @@ fn collect_expr_variables(expr: &Expr) -> Vec<String> {
     vars
 }
 
+/// Collect the names of `$param` references in a constant-foldable expression.
+///
+/// Walks the variants that `eval_const_numeric_expr` accepts (the only shapes a
+/// successfully-folded `LIMIT`/`SKIP` expression can take): parameters,
+/// literals, unary/binary arithmetic, and the whitelisted numeric functions.
+/// Used to tell the plan cache which parameter values were baked into the plan.
+fn collect_expr_parameters(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::Parameter(name) => {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        Expr::UnaryOp { expr: e, .. } => collect_expr_parameters(e, names),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_parameters(left, names);
+            collect_expr_parameters(right, names);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_expr_parameters(a, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
     let mut add_var = |name: &String| {
         if !vars.contains(name) {
@@ -2425,6 +2452,12 @@ pub struct QueryPlanner {
     plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
     /// Gate for replacement-scan dispatch on unknown identifiers (M5b).
     replacement_scans_enabled: bool,
+    /// Names of parameters folded into a `LIMIT`/`SKIP` position during the
+    /// plan. The resulting `LogicalPlan::Limit` bakes the concrete values in, so
+    /// a plan cache keyed on query text must additionally key on these
+    /// parameters' values (see `folded_limit_skip_params`). Interior-mutable
+    /// because `plan` takes `&self`.
+    folded_limit_skip_params: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 struct TraverseParams<'a> {
@@ -2461,7 +2494,35 @@ impl QueryPlanner {
             params: HashMap::new(),
             plugin_registry: None,
             replacement_scans_enabled: false,
+            folded_limit_skip_params: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Record the parameters referenced by a successfully-folded `LIMIT`/`SKIP`
+    /// expression so the caller's plan cache can key on their values.
+    fn note_folded_limit_skip(&self, expr: &Expr) {
+        let mut names = Vec::new();
+        collect_expr_parameters(expr, &mut names);
+        if !names.is_empty()
+            && let Ok(mut acc) = self.folded_limit_skip_params.lock()
+        {
+            acc.extend(names);
+        }
+    }
+
+    /// Parameter names folded into `LIMIT`/`SKIP` positions during the last
+    /// [`plan`](Self::plan).
+    ///
+    /// The cached plan bakes these values in, so a text-keyed plan cache must
+    /// fold their current values into its key — otherwise two calls differing
+    /// only in a LIMIT/SKIP parameter would wrongly share one cached plan.
+    /// Returns an empty vector when no parameter was folded.
+    #[must_use]
+    pub fn folded_limit_skip_params(&self) -> Vec<String> {
+        self.folded_limit_skip_params
+            .lock()
+            .map(|acc| acc.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Set query parameters for resolving `$param` references in SKIP/LIMIT.
@@ -3164,13 +3225,19 @@ impl QueryPlanner {
             let skip = return_clause
                 .skip
                 .as_ref()
-                .map(|e| parse_non_negative_integer(e, "SKIP", &self.params))
+                .map(|e| {
+                    self.note_folded_limit_skip(e);
+                    parse_non_negative_integer(e, "SKIP", &self.params)
+                })
                 .transpose()?
                 .flatten();
             let fetch = return_clause
                 .limit
                 .as_ref()
-                .map(|e| parse_non_negative_integer(e, "LIMIT", &self.params))
+                .map(|e| {
+                    self.note_folded_limit_skip(e);
+                    parse_non_negative_integer(e, "LIMIT", &self.params)
+                })
                 .transpose()?
                 .flatten();
 
@@ -4118,16 +4185,22 @@ impl QueryPlanner {
     ///
     /// All three functions share the same shape: single-arg, argument
     /// must be a node/edge variable, returns the column value directly.
-    fn rewrite_id_to_vid(expr: Expr) -> Expr {
+    fn rewrite_id_to_vid(expr: Expr, vars_in_scope: &[VariableInfo]) -> Expr {
         match expr {
             Expr::FunctionCall {
                 name,
                 args,
                 distinct,
                 window_spec,
-            } if args.len() == 1 && Self::metadata_function_column(&name).is_some() => {
+            } if args.len() == 1 && Self::metadata_function_column(&name, None).is_some() => {
                 if let Expr::Variable(ref var) = args[0] {
-                    let column = Self::metadata_function_column(&name).unwrap().to_string();
+                    // `id()` resolves to `_eid` for an edge binding and `_vid`
+                    // for a node — edge rows expose `_eid`, not `_vid`. Mirror
+                    // the projection path (`df_expr.rs` translate of `id`).
+                    let var_type = find_var_in_scope(vars_in_scope, var).map(|v| v.var_type);
+                    let column = Self::metadata_function_column(&name, var_type)
+                        .unwrap()
+                        .to_string();
                     Expr::Property(Box::new(Expr::Variable(var.clone())), column)
                 } else {
                     Expr::FunctionCall {
@@ -4139,13 +4212,13 @@ impl QueryPlanner {
                 }
             }
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-                left: Box::new(Self::rewrite_id_to_vid(*left)),
+                left: Box::new(Self::rewrite_id_to_vid(*left, vars_in_scope)),
                 op,
-                right: Box::new(Self::rewrite_id_to_vid(*right)),
+                right: Box::new(Self::rewrite_id_to_vid(*right, vars_in_scope)),
             },
             Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
                 op,
-                expr: Box::new(Self::rewrite_id_to_vid(*inner)),
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
             },
             other => other,
         }
@@ -4153,9 +4226,20 @@ impl QueryPlanner {
 
     /// Return the internal column name for a system-metadata function, or
     /// `None` if the name is not one of the recognised metadata functions.
-    fn metadata_function_column(name: &str) -> Option<&'static str> {
+    ///
+    /// `id()` maps to `_eid` when its argument is a relationship
+    /// (`VariableType::Edge`) and `_vid` otherwise; `var_type` is `None` when the
+    /// caller only needs the is-metadata-function test.
+    fn metadata_function_column(
+        name: &str,
+        var_type: Option<VariableType>,
+    ) -> Option<&'static str> {
         if name.eq_ignore_ascii_case("id") {
-            Some("_vid")
+            if matches!(var_type, Some(VariableType::Edge)) {
+                Some("_eid")
+            } else {
+                Some("_vid")
+            }
         } else if name.eq_ignore_ascii_case("created_at") {
             Some("_created_at")
         } else if name.eq_ignore_ascii_case("updated_at") {
@@ -5989,8 +6073,9 @@ impl QueryPlanner {
         // Transform VALID_AT macro to function call
         let transformed_predicate = Self::transform_valid_at_to_function(predicate.clone());
 
-        // Rewrite id(var) to var._vid so PredicateAnalyzer can push it down
-        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate);
+        // Rewrite id(var) to var._vid (or var._eid for an edge) so
+        // PredicateAnalyzer can push it down.
+        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate, vars_in_scope);
 
         let mut current_predicate =
             self.rewrite_predicates_using_indexes(&transformed_predicate, &plan, vars_in_scope)?;
@@ -7116,13 +7201,19 @@ impl QueryPlanner {
         let skip = with_clause
             .skip
             .as_ref()
-            .map(|e| parse_non_negative_integer(e, "SKIP", &self.params))
+            .map(|e| {
+                self.note_folded_limit_skip(e);
+                parse_non_negative_integer(e, "SKIP", &self.params)
+            })
             .transpose()?
             .flatten();
         let fetch = with_clause
             .limit
             .as_ref()
-            .map(|e| parse_non_negative_integer(e, "LIMIT", &self.params))
+            .map(|e| {
+                self.note_folded_limit_skip(e);
+                parse_non_negative_integer(e, "LIMIT", &self.params)
+            })
             .transpose()?
             .flatten();
 
@@ -9285,6 +9376,251 @@ impl ForkIndexLookup for uni_store::storage::StorageManager {
         let schema = self.schema_manager().schema();
         let label_name = schema.label_name_by_id(label_id)?;
         self.fork_index_exists(label_name, column)
+    }
+}
+
+/// Fold a trailing `SET var.prop = value` into the freshly-created entity's
+/// inline property map, eliminating the separate `Set` write pass.
+///
+/// Rewrites `CREATE (a)-[r:T]->(b) SET r.x = e.v` into the equivalent of
+/// `CREATE (a)-[r:T {x: e.v}]->(b)`, so the plan collapses from `Set → Create`
+/// to a single `Create`. This removes an entire read-modify-write operator
+/// (`MutationSetExec`) — measured at ~38% of per-edge `UNWIND … CREATE … SET`
+/// execution — that the bulk write path never pays.
+///
+/// # Examples
+///
+/// ```ignore
+/// // CREATE (a)-[r:LINK]->(b) SET r.role = e.role   ==>
+/// // CREATE (a)-[r:LINK {role: e.role}]->(b)
+/// let fused = fuse_create_set(plan);
+/// ```
+///
+/// The fold is **all-or-nothing per `SET` clause** and only fires when every
+/// item is safe:
+/// - the item is the simple `Variable.property = value` form (not `+=`, label
+///   set `SET n:L`, or whole-entity map assignment `SET n = {...}`),
+/// - the target variable is introduced by the immediately-preceding
+///   `Create`/`CreateBatch` (a MATCHed variable is left untouched),
+/// - the target element's inline properties are absent or a map literal (a
+///   parameter-map form such as `CREATE (n $props)` cannot be merged),
+/// - the value references no variable created in the same statement, so
+///   evaluating it at create time is observably identical to SET time.
+///
+/// When any item fails these checks the whole `Set` node is preserved, keeping
+/// semantics unchanged. The pass is idempotent: a plan with no fusable
+/// `Set`/`Create` adjacency passes through untouched.
+#[must_use]
+pub fn fuse_create_set(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Set { input, items } => {
+            // Fuse any deeper adjacency first so chained
+            // `CREATE … SET … CREATE … SET` collapses bottom-up.
+            let input = fuse_create_set(*input);
+            match input {
+                LogicalPlan::Create {
+                    input: child,
+                    pattern,
+                } => {
+                    let bound_vars = crate::query::df_planner::collect_plan_variables(&child);
+                    match try_fuse_set_items(std::slice::from_ref(&pattern), &items, &bound_vars) {
+                        Some(mut patterns) => LogicalPlan::Create {
+                            input: child,
+                            // try_fuse_set_items returns exactly as many patterns
+                            // as it was given (one here).
+                            pattern: patterns
+                                .pop()
+                                .expect("one pattern in yields one pattern out"),
+                        },
+                        None => LogicalPlan::Set {
+                            input: Box::new(LogicalPlan::Create {
+                                input: child,
+                                pattern,
+                            }),
+                            items,
+                        },
+                    }
+                }
+                LogicalPlan::CreateBatch {
+                    input: child,
+                    patterns,
+                } => {
+                    let bound_vars = crate::query::df_planner::collect_plan_variables(&child);
+                    match try_fuse_set_items(&patterns, &items, &bound_vars) {
+                        Some(fused) => LogicalPlan::CreateBatch {
+                            input: child,
+                            patterns: fused,
+                        },
+                        None => LogicalPlan::Set {
+                            input: Box::new(LogicalPlan::CreateBatch {
+                                input: child,
+                                patterns,
+                            }),
+                            items,
+                        },
+                    }
+                }
+                other => LogicalPlan::Set {
+                    input: Box::new(other),
+                    items,
+                },
+            }
+        }
+        // Recurse through the operators that can sit above a write clause so a
+        // `Set` under RETURN/ORDER BY/LIMIT is still reached. This mirrors the
+        // pragmatic recursion of `rewrite_for_fork_fusion`: variants that never
+        // sit above a write clause fall through `other => other` unchanged.
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(fuse_create_set(*input)),
+            projections,
+        },
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
+            input: Box::new(fuse_create_set(*input)),
+            skip,
+            fetch,
+        },
+        LogicalPlan::Sort { input, order_by } => LogicalPlan::Sort {
+            input: Box::new(fuse_create_set(*input)),
+            order_by,
+        },
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } => LogicalPlan::Filter {
+            input: Box::new(fuse_create_set(*input)),
+            predicate,
+            optional_variables,
+        },
+        LogicalPlan::Create { input, pattern } => LogicalPlan::Create {
+            input: Box::new(fuse_create_set(*input)),
+            pattern,
+        },
+        LogicalPlan::CreateBatch { input, patterns } => LogicalPlan::CreateBatch {
+            input: Box::new(fuse_create_set(*input)),
+            patterns,
+        },
+        other => other,
+    }
+}
+
+/// Try to fold every `SET` item into the given CREATE patterns.
+///
+/// Returns the rewritten patterns when *all* items fuse safely (see
+/// [`fuse_create_set`] for the conditions); returns `None` the moment any item
+/// is unfusable, so the caller can keep the original `Set` node untouched.
+///
+/// `bound_vars` are the variables produced by the CREATE's input plan (e.g. an
+/// upstream MATCH). A CREATE pattern may *reuse* such a variable as an endpoint
+/// (`MATCH (a) CREATE (a)-[r:T]->(b)`), so `pattern_variable_names` alone cannot
+/// tell a freshly-created variable from a reused one. Reused variables are
+/// excluded from `owner`: a `SET` on them must not fuse, because the executor
+/// skips inline properties on already-bound elements (which would silently drop
+/// the write).
+fn try_fuse_set_items(
+    patterns: &[Pattern],
+    items: &[SetItem],
+    bound_vars: &HashSet<String>,
+) -> Option<Vec<Pattern>> {
+    // Map each freshly-created variable to the index of the pattern that
+    // introduces it, skipping any variable already bound upstream.
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    for (idx, pattern) in patterns.iter().enumerate() {
+        for var in crate::query::df_graph::mutation_common::pattern_variable_names(pattern) {
+            if bound_vars.contains(&var) {
+                continue;
+            }
+            owner.entry(var).or_insert(idx);
+        }
+    }
+
+    let mut out = patterns.to_vec();
+    for item in items {
+        let SetItem::Property { expr, value } = item else {
+            return None; // `+=`, label set, or whole-entity map assignment
+        };
+        let Expr::Property(base, prop) = expr else {
+            return None; // not a property target
+        };
+        let Expr::Variable(var) = base.as_ref() else {
+            return None; // e.g. `n[expr].x` or a deeper path
+        };
+        let Some(&idx) = owner.get(var) else {
+            return None; // target is a MATCHed (not created) variable
+        };
+        // Evaluating the value at create time must equal evaluating it at SET
+        // time: reject any reference to a variable created in this statement
+        // (its value may not yet exist when the element is constructed).
+        if collect_expr_variables(value)
+            .iter()
+            .any(|referenced| owner.contains_key(referenced))
+        {
+            return None;
+        }
+        if !merge_pattern_property(&mut out[idx], var, prop, value) {
+            return None; // element absent or has a non-map property form
+        }
+    }
+    Some(out)
+}
+
+/// Merge `var.prop = value` into the matching element's inline property map.
+///
+/// Returns `false` (leaving the pattern unchanged) when the variable's element
+/// is not found or its existing properties are a non-map expression that cannot
+/// be merged. Any pre-existing entry for `prop` is replaced so the SET's
+/// last-write-wins precedence is preserved.
+fn merge_pattern_property(pattern: &mut Pattern, var: &str, prop: &str, value: &Expr) -> bool {
+    for path in &mut pattern.paths {
+        if merge_into_elements(&mut path.elements, var, prop, value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recursive worker for [`merge_pattern_property`] over a list of elements.
+fn merge_into_elements(
+    elements: &mut [PatternElement],
+    var: &str,
+    prop: &str,
+    value: &Expr,
+) -> bool {
+    for element in elements {
+        match element {
+            PatternElement::Node(n) if n.variable.as_deref() == Some(var) => {
+                return set_map_property(&mut n.properties, prop, value.clone());
+            }
+            PatternElement::Relationship(r) if r.variable.as_deref() == Some(var) => {
+                return set_map_property(&mut r.properties, prop, value.clone());
+            }
+            PatternElement::Parenthesized { pattern, .. } => {
+                if merge_into_elements(&mut pattern.elements, var, prop, value) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Set `prop = value` on an optional inline property map, last-write-wins.
+///
+/// Returns `false` without mutating when the properties are present but are not
+/// a map literal (e.g. `CREATE (n $params)`), which cannot accept a single key.
+fn set_map_property(props: &mut Option<Expr>, prop: &str, value: Expr) -> bool {
+    match props {
+        None => {
+            *props = Some(Expr::Map(vec![(prop.to_string(), value)]));
+            true
+        }
+        Some(Expr::Map(entries)) => {
+            entries.retain(|(k, _)| k != prop);
+            entries.push((prop.to_string(), value));
+            true
+        }
+        Some(_) => false,
     }
 }
 

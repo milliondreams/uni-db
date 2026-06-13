@@ -184,6 +184,88 @@ async fn multi_property_pushes_indexed_conjunct() {
     );
 }
 
+// ============================================================================
+// Issue #57 × MVCC-append: the pushed property predicate is evaluated by
+// Lance per ROW, before the per-vid max-_version pick. A vid whose indexed
+// property was rewritten and re-flushed keeps its OLD row in the per-label
+// table — that row matches the old value and, without verification against
+// the vid's CURRENT version, stale-matches the filtered scan.
+// ============================================================================
+
+/// `MATCH … WHERE n.name = <old value>` must NOT return a node whose `name`
+/// was rewritten and re-flushed (the stale superseded row matches the pushed
+/// filter; the current row doesn't and is invisible to the scan).
+#[tokio::test]
+async fn pushed_filter_ignores_superseded_versions() {
+    let db = setup_db().await;
+    db.flush().await.unwrap();
+
+    // Rewrite the indexed key of one flushed node and flush again — the
+    // per-label table now holds two versions of this vid.
+    let tx = db.session().tx().await.unwrap();
+    tx.execute_with("MATCH (n:Item {name: $old}) SET n.name = $new")
+        .param("old", Value::String("name-0042".into()))
+        .param("new", Value::String("name-rewritten".into()))
+        .run()
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let stale = db
+        .session()
+        .query_with("MATCH (n:Item) WHERE n.name = $t RETURN n.name AS name")
+        .param("t", Value::String("name-0042".into()))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.rows().len(),
+        0,
+        "superseded version must not match the pushed filter"
+    );
+
+    let current = db
+        .session()
+        .query_with("MATCH (n:Item) WHERE n.name = $t RETURN n.name AS name")
+        .param("t", Value::String("name-rewritten".into()))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(current.rows().len(), 1, "current version must match");
+}
+
+/// A deleted-and-flushed node must not reappear through the pushed filter
+/// (its tombstone outranks the older live row, which still matches the
+/// predicate Lance-side).
+#[tokio::test]
+async fn pushed_filter_ignores_deleted_versions() {
+    let db = setup_db().await;
+    db.flush().await.unwrap();
+
+    let tx = db.session().tx().await.unwrap();
+    tx.execute_with("MATCH (n:Item {name: $t}) DELETE n")
+        .param("t", Value::String("name-0042".into()))
+        .run()
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let rows = db
+        .session()
+        .query_with("MATCH (n:Item) WHERE n.name = $t RETURN n.name AS name")
+        .param("t", Value::String("name-0042".into()))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows().len(),
+        0,
+        "deleted node must not resurrect through the pushed filter"
+    );
+}
+
 #[tokio::test]
 async fn explain_reports_hash_index_usage() {
     let db = setup_db().await;

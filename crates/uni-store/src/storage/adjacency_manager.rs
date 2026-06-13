@@ -282,6 +282,37 @@ impl AdjacencyManager {
         })
     }
 
+    /// Returns the distinct edge type ids known to this manager.
+    ///
+    /// Spans the Main CSR plus the active and frozen overlay segments, so it
+    /// covers both warmed (L1/L2-loaded) edge types and live overlay-resident
+    /// types (e.g. recently committed edges that a flush moved out of L0 but kept
+    /// in the dual-write overlay). Used when an endpoint resolver knows an edge
+    /// id but not its type: this is the small set of types this query has touched,
+    /// so it bounds an eid-orientation probe to a short candidate list rather than
+    /// the whole schema.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// for etype in adjacency_manager.known_edge_type_ids() {
+    ///     // probe etype for the edge of interest
+    /// }
+    /// ```
+    #[must_use]
+    pub fn known_edge_type_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.main_csr.iter().map(|entry| entry.key().0).collect();
+        for entry in self.active_overlay.read().inserts.iter() {
+            ids.push(entry.key().0);
+        }
+        for segment in self.frozen_segments.read().iter() {
+            ids.extend(segment.inserts.keys().map(|&(etype, _dir)| etype));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Returns the number of frozen segments awaiting compaction.
     pub fn frozen_segment_count(&self) -> usize {
         self.frozen_segments.read().len()
@@ -490,8 +521,11 @@ impl AdjacencyManager {
                             request = request.with_filter(format!("_version <= {}", hwm));
                         }
 
-                        let batches: Vec<arrow_array::RecordBatch> =
-                            backend.scan(request).await.unwrap_or_default();
+                        // Fail closed: a transient scan error must abort the warm,
+                        // not `unwrap_or_default()` into an empty L2 read that then
+                        // gets cached as the adjacency CSR — that silently drops
+                        // every base edge for this type until restart (review #3b).
+                        let batches: Vec<arrow_array::RecordBatch> = backend.scan(request).await?;
 
                         for batch in batches {
                             let src_col = batch
@@ -560,7 +594,11 @@ impl AdjacencyManager {
                     request = request.with_filter(format!("_version <= {}", hwm));
                 }
 
-                if let Ok(batches) = backend.scan(request).await {
+                // Fail closed: propagate a delta scan error rather than silently
+                // skipping it, which would drop unflushed edges from the cached
+                // adjacency CSR until restart (review #3b).
+                let batches = backend.scan(request).await?;
+                {
                     for batch in batches {
                         let src_col = batch
                             .column_by_name("src_vid")

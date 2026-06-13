@@ -73,6 +73,15 @@ pub struct StorageManager {
     pub flush_in_progress: std::sync::atomic::AtomicUsize,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
+    /// Optional row-version pin for transaction snapshot reads (C2).
+    ///
+    /// When set, L1 scans filter to `_version <= hwm` exactly like a pinned
+    /// snapshot, but WITHOUT a manifest: a read-write transaction pins the
+    /// version counter observed at begin (`SnapshotView.started_at_version`)
+    /// so an L0→L1 flush completing mid-transaction cannot leak
+    /// post-snapshot rows into its scans. Mutually exclusive with
+    /// `pinned_snapshot`.
+    pinned_version_hwm: Option<u64>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
     ///
     /// Mutually exclusive with `pinned_snapshot`: a single
@@ -280,6 +289,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
+            pinned_version_hwm: None,
             fork_scope: None,
             backend,
             vid_labels_index: None,
@@ -410,6 +420,19 @@ impl StorageManager {
         }
     }
 
+    /// Filesystem root backing this manager's object store, when the store
+    /// is a local filesystem (the non-`://` branch of
+    /// `build_store_from_uri`). Used to fsync WAL segments after PUT —
+    /// `object_store::LocalFileSystem` does not fsync on its own. `None`
+    /// for remote/URL-based stores.
+    pub fn local_fs_root(&self) -> Option<std::path::PathBuf> {
+        if self.base_uri.contains("://") {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&self.base_uri))
+        }
+    }
+
     pub fn pinned(&self, snapshot: SnapshotManifest) -> Self {
         // Phase 4a: pinning a forked session is now supported. The
         // resulting StorageManager keeps `fork_scope` so reads continue
@@ -431,6 +454,43 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
+            pinned_version_hwm: None,
+            fork_scope: self.fork_scope.clone(),
+            backend: self.backend.clone(),
+            vid_labels_index: self.vid_labels_index.clone(),
+        }
+    }
+
+    /// Construct a clone of this `StorageManager` pinned to a row-version
+    /// high-water mark (C2: transaction-level L1 pinning).
+    ///
+    /// Unlike [`Self::pinned`], this needs no `SnapshotManifest`: scans
+    /// filter to `_version <= hwm` via [`Self::version_high_water_mark`].
+    /// A read-write transaction builds one of these at begin with
+    /// `SnapshotView.started_at_version`, so an L0→L1 flush completing
+    /// mid-transaction cannot leak post-snapshot rows into its L1 scans
+    /// (the L0 tier is pinned separately by the `SnapshotView`).
+    ///
+    /// Unlike [`Self::pinned`], the live `AdjacencyManager` is SHARED, not
+    /// fresh: commits replay their edges into the live manager's overlay,
+    /// which is the traversal path's only source for L0-resident edges — a
+    /// fresh manager would make every unflushed edge invisible to the
+    /// transaction. The cost is that the edge tier is not version-pinned
+    /// (post-snapshot edges remain visible to traversals, exactly as before
+    /// C2); edge reads are recorded in the OCC read-set, so a conflicting
+    /// read-modify-write still aborts at commit.
+    pub fn pinned_at_version(&self, hwm: u64) -> Self {
+        Self {
+            base_uri: self.base_uri.clone(),
+            store: self.store.clone(),
+            schema_manager: self.schema_manager.clone(),
+            snapshot_manager: self.snapshot_manager.clone(),
+            adjacency_manager: self.adjacency_manager.clone(),
+            config: self.config.clone(),
+            compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
+            pinned_snapshot: None,
+            pinned_version_hwm: Some(hwm),
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),
@@ -484,6 +544,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
+            pinned_version_hwm: None,
             fork_scope: Some(scope),
             backend: branched_backend,
             vid_labels_index: self.vid_labels_index.clone(),
@@ -528,14 +589,39 @@ impl StorageManager {
         self.pinned_snapshot
             .as_ref()
             .and_then(|s| s.edges.get(name).map(|es| es.lance_version))
+            // The flush path stamps `lance_version: 0` ("LanceDB tables don't
+            // expose Lance version directly") — 0 is a stub sentinel, not a
+            // real dataset version. Returning it would route adjacency reads
+            // through `checkout_version(0)` (the empty initial version).
+            .filter(|v| *v != 0)
     }
 
-    /// Returns the version_high_water_mark from the pinned snapshot if present.
+    /// Returns the version high-water mark from the pinned snapshot or the
+    /// transaction-level version pin, if present.
     ///
-    /// This is used for time-travel queries to filter data by version.
-    /// When a snapshot is pinned, only rows with `_version <= version_high_water_mark`
-    /// should be considered visible.
+    /// Used by the SCAN tier (vertex tables, property reads) to filter data
+    /// by version: when set, only rows with
+    /// `_version <= version_high_water_mark` are visible. The edge/adjacency
+    /// path must use [`Self::snapshot_version_hwm`] instead.
     pub fn version_high_water_mark(&self) -> Option<u64> {
+        self.pinned_snapshot
+            .as_ref()
+            .map(|s| s.version_high_water_mark)
+            .or(self.pinned_version_hwm)
+    }
+
+    /// Version high-water mark from a manifest-pinned (time-travel) snapshot
+    /// ONLY — never from a transaction-level version pin.
+    ///
+    /// The edge/adjacency read path switches to version-filtered CSR reads
+    /// and skips the L0 overlays when a hwm is present. That is correct for
+    /// time-travel (a snapshot is flushed state, with its own fresh
+    /// `AdjacencyManager`), but a transaction pin shares the LIVE adjacency
+    /// manager and needs live CSR + L0 overlays + its tx-L0 — filtering
+    /// there would hide unflushed edges and poison the shared warm cache.
+    /// The edge tier is deliberately not version-pinned for transactions
+    /// (see [`Self::pinned_at_version`]).
+    pub fn snapshot_version_hwm(&self) -> Option<u64> {
         self.pinned_snapshot
             .as_ref()
             .map(|s| s.version_high_water_mark)
@@ -910,6 +996,18 @@ impl StorageManager {
         self.schema_manager.clone()
     }
 
+    /// Returns the backing `Arc<SchemaManager>` by reference.
+    ///
+    /// Unlike [`Self::schema_manager`] (which derefs to `&SchemaManager`),
+    /// this preserves the `Arc`'s pointer identity. A pinned transaction and
+    /// the live session clone the *same* `schema_manager` `Arc`, while forks
+    /// hold a distinct one — so this is the correct registry key for the
+    /// projection store (see `uni-query`'s `projection_store::for_storage`).
+    #[must_use]
+    pub fn schema_manager_arc_ref(&self) -> &Arc<SchemaManager> {
+        &self.schema_manager
+    }
+
     /// Get the adjacency manager for the dual-CSR architecture.
     pub fn adjacency_manager(&self) -> Arc<AdjacencyManager> {
         Arc::clone(&self.adjacency_manager)
@@ -1099,8 +1197,10 @@ impl StorageManager {
                 graph.add_vertex(vid);
 
                 for &etype_id in edge_types {
-                    // Warm adjacency with coalescing to prevent cache stampede (Issue #13)
-                    let edge_ver = self.version_high_water_mark();
+                    // Warm adjacency with coalescing to prevent cache stampede (Issue #13).
+                    // Manifest pin only: a tx version pin shares the LIVE adjacency
+                    // manager — warming it filtered would poison the shared cache.
+                    let edge_ver = self.snapshot_version_hwm();
                     self.adjacency_manager
                         .warm_coalesced(self, etype_id, dir, edge_ver)
                         .await?;
@@ -1193,18 +1293,20 @@ impl StorageManager {
             request = request.with_filter(f);
         }
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 
@@ -1217,6 +1319,12 @@ impl StorageManager {
         columns: &[&str],
         additional_filter: Option<&str>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
+        // Edge path: manifest pin only. A transaction version pin must NOT
+        // version-filter edge reads — the edge tier is not version-pinned
+        // (the live AdjacencyManager + tx-L0 overlay carry unflushed and
+        // in-transaction edges), so filtering here would hide a relationship
+        // the same transaction just created (MERGE read-your-writes).
+        let edge_hwm = self.snapshot_version_hwm();
         let backend = self.backend();
         let table_name = table_names::delta_table_name(edge_type, direction);
 
@@ -1242,7 +1350,7 @@ impl StorageManager {
                 return Ok(None);
             };
 
-        let filter = match (self.version_high_water_mark(), additional_filter) {
+        let filter = match (edge_hwm, additional_filter) {
             (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
             (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
             (None, Some(f)) => Some(f.to_string()),
@@ -1254,18 +1362,20 @@ impl StorageManager {
             request = request.with_filter(f);
         }
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 
@@ -1300,18 +1410,20 @@ impl StorageManager {
             None => request,
         };
 
-        match backend.scan(request).await {
-            Ok(batches) => {
-                if batches.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::compute::concat_batches(
-                        &batches[0].schema(),
-                        &batches,
-                    )?))
-                }
-            }
-            Err(_) => Ok(None),
+        // Fail closed: a scan error (transient I/O, an unparsable filter, a
+        // corrupt fragment) must propagate, never be silently mapped to
+        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+        // fast path would create a duplicate node on a transient failure (review
+        // bug #3a) — so an error here must surface as an error. A genuinely-
+        // absent table is already handled above.
+        let batches = backend.scan(request).await?;
+        if batches.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(arrow::compute::concat_batches(
+                &batches[0].schema(),
+                &batches,
+            )?))
         }
     }
 
@@ -1372,12 +1484,14 @@ impl StorageManager {
             .await
     }
 
-    /// Find edges from the main edge table by type names.
+    /// Find edges from the main edge table by type names, optionally pushing
+    /// a bounded endpoint vid set into the scan (review perf #5).
     pub async fn find_edges_by_type_names(
         &self,
         type_names: &[&str],
+        endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
-        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names).await
+        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names, endpoint_filter).await
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.
@@ -1783,7 +1897,7 @@ impl StorageManager {
                     // 2. L1: Delta
                     let delta_ds = self.delta_dataset(etype_name, dir_str)?;
                     let delta_entries = delta_ds
-                        .read_deltas(backend, vid, &schema, self.version_high_water_mark())
+                        .read_deltas(backend, vid, &schema, self.snapshot_version_hwm())
                         .await?;
                     Self::apply_delta_to_edges(&mut edges, delta_entries, neighbor_is_dst);
 

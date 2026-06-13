@@ -1495,7 +1495,19 @@ impl Executor {
         if entries.is_empty() {
             return None;
         }
-        Some((n, labels[0].clone()))
+        // Resolve the label to its schema-canonical case so the fast path agrees
+        // with the general MERGE path (which matches labels case-insensitively).
+        // Without this, `MERGE (:person …)` after a `:Person` row was flushed
+        // scans/keys a different label than the canonical one and creates a
+        // duplicate (review #3a). Falls back to the as-written label when the
+        // schema does not know it (schemaless).
+        let canonical = self
+            .storage
+            .schema_manager()
+            .schema()
+            .canonical_label_name(&labels[0])
+            .unwrap_or_else(|| labels[0].clone());
+        Some((n, canonical))
     }
 
     /// Build the persisted-scan filter for a MERGE key, or `None` if any value
@@ -1512,17 +1524,10 @@ impl Executor {
         }
         let mut parts = Vec::with_capacity(key_props.len() + 1);
         for (k, v) in key_props {
-            // Keys come from a static map literal, but validate anyway (issue #8).
-            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if !Self::is_safe_key_ident(k) {
                 return None;
             }
-            let lit = match v {
-                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                Value::Int(i) => i.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Bool(b) => b.to_string(),
-                _ => return None,
-            };
+            let lit = Self::render_key_literal(v)?;
             // Unquoted identifier: the Lance filter parser does not resolve a
             // double-quoted column name against the table here, so `"k" = v`
             // silently matches nothing. Keys are validated above to be safe
@@ -1533,11 +1538,106 @@ impl Executor {
         Some(parts.join(" AND "))
     }
 
+    /// True when a MERGE key name is a safe bare identifier for a Lance
+    /// filter (issue #8). Keys come from a static map literal, but validate
+    /// anyway.
+    fn is_safe_key_ident(k: &str) -> bool {
+        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Render a scalar MERGE-key value as a Lance filter literal, or `None`
+    /// for value types this fast path cannot represent (lists, maps,
+    /// temporals, nulls) — the caller then falls back to the general path.
+    fn render_key_literal(v: &Value) -> Option<String> {
+        Some(match v {
+            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => return None,
+        })
+    }
+
+    /// Build ONE scan filter matching every key tuple in `keys` (all tuples
+    /// sorted by `key_names` order, values canonicalized).
+    ///
+    /// Single-column keys render as type-grouped `k IN (…)` lists (a filter
+    /// never compares mixed literal types against one column); composite keys
+    /// render as an OR of per-tuple conjunctions. Both forms are wrapped with
+    /// the same `_deleted = false` clause the per-row filter used.
+    fn merge_batch_filter(key_names: &[String], keys: &[&MergeKey]) -> Option<String> {
+        if keys.is_empty() || key_names.iter().any(|k| !Self::is_safe_key_ident(k)) {
+            return None;
+        }
+        let disjunction = if let [key] = key_names {
+            // Group literals by value variant so each IN list is homogeneous.
+            let mut groups: HashMap<std::mem::Discriminant<Value>, Vec<String>> = HashMap::new();
+            for tuple in keys {
+                let (_, v) = tuple.first()?;
+                groups
+                    .entry(std::mem::discriminant(v))
+                    .or_default()
+                    .push(Self::render_key_literal(v)?);
+            }
+            groups
+                .into_values()
+                .map(|lits| {
+                    if let [lit] = lits.as_slice() {
+                        format!("{key} = {lit}")
+                    } else {
+                        format!("{key} IN ({})", lits.join(", "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        } else {
+            keys.iter()
+                .map(|tuple| {
+                    let conj = tuple
+                        .iter()
+                        .map(|(k, v)| Some(format!("{k} = {}", Self::render_key_literal(v)?)))
+                        .collect::<Option<Vec<_>>>()?
+                        .join(" AND ");
+                    Some(format!("({conj})"))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join(" OR ")
+        };
+        Some(format!("({disjunction}) AND _deleted = false"))
+    }
+
+    /// Canonicalize a numeric MERGE-key value for *matching only*.
+    ///
+    /// A finite `Float` with an integral value (e.g. `1.0`) is mapped to the
+    /// equivalent `Int`, so an `Int(1)` key matches a node stored with
+    /// `Float(1.0)` and vice versa — the coercion the general (DataFusion) MERGE
+    /// path already applies (review #3a). Non-numeric and non-integral values are
+    /// returned unchanged. Used only to build match keys / comparisons, never the
+    /// value written to a created node.
+    fn canonical_key_value(v: &Value) -> Value {
+        match v {
+            Value::Float(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f >= i64::MIN as f64
+                    && *f <= i64::MAX as f64 =>
+            {
+                Value::Int(*f as i64)
+            }
+            other => other.clone(),
+        }
+    }
+
     /// Canonical sorted `(name, value)` key tuple for a MERGE row's key map.
+    ///
+    /// Numeric values are canonicalized ([`Self::canonical_key_value`]) so the
+    /// tuple compares equal regardless of `Int`/`Float` spelling. This tuple is
+    /// used purely as a match key (intra-batch dedup, L0 overlay lookup); the
+    /// created node's properties come from the original, un-canonicalized map.
     fn merge_key_tuple(key_props: &HashMap<String, Value>) -> MergeKey {
         let mut tuple: MergeKey = key_props
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), Self::canonical_key_value(v)))
             .collect();
         tuple.sort_by(|a, b| a.0.cmp(&b.0));
         tuple
@@ -1577,7 +1677,7 @@ impl Executor {
                 .iter()
                 .map(|k| {
                     let v = l0_visibility::lookup_vertex_prop(vid, k, ctx).unwrap_or(Value::Null);
-                    (k.clone(), v)
+                    (k.clone(), Self::canonical_key_value(&v))
                 })
                 .collect();
             map.entry(tuple).or_default().push(vid);
@@ -1585,45 +1685,300 @@ impl Executor {
         map
     }
 
-    /// Persisted (flushed) vertices of `label` matching `key_props`.
+    /// Maximum key tuples per batched MERGE scan — bounds the filter-string
+    /// size and Lance/DataFusion parse cost; chunks run sequentially.
+    const MERGE_SCAN_CHUNK: usize = 1000;
+
+    /// Persisted (flushed) vertices of `label` for EVERY key tuple in `keys`,
+    /// resolved with one scan per [`Self::MERGE_SCAN_CHUNK`] tuples instead of
+    /// one scan per input row (review perf #4: `UNWIND … MERGE` issued N
+    /// independent Lance scans).
     ///
     /// Scans via [`uni_store::StorageManager::scan_vertex_table`] — the same
-    /// read path `MATCH` uses, so it honors the version high-water-mark and sees
-    /// flushed rows — then drops rows an L0 overlay deleted or whose key an L0
-    /// overlay rewrote. L0-only matches are supplied separately by the per-batch
-    /// snapshot ([`Self::merge_l0_existing`]).
+    /// read path `MATCH` uses, so it honors the version high-water-mark and
+    /// sees flushed rows. On the declared-label branch the key-filtered scan
+    /// only NOMINATES candidate vids; a second, unfiltered `_vid IN (…)` pass
+    /// picks each candidate's max-`_version` row and requires it to be live
+    /// and still keyed as requested (per-label tables are MVCC-append, so a
+    /// superseded version's row would otherwise stale-match a rewritten key).
+    /// Matched rows are grouped by their CANONICAL key tuple (stored values
+    /// run through [`Self::canonical_key_value`], so a stored `Float(1.0)`
+    /// lands under a requested `Int(1)` — the coercion Lance's numeric filter
+    /// equality applies). Liveness against L0 overlays (deletes, key rewrites
+    /// by earlier rows of the same statement) is NOT checked here — the
+    /// per-row consumer re-checks at row time, exactly as the old per-row
+    /// scan did.
+    ///
+    /// The second returned map carries the FULL property maps the schemaless
+    /// branch already decoded for each matched vid (empty on the declared-label
+    /// branch, which projects only key columns) — the caller seeds the
+    /// statement-level [`Prefetch`] from it at zero extra scans.
     ///
     /// # Errors
-    /// Propagates persisted-scan failures.
-    async fn merge_lookup_persisted(
+    /// Propagates persisted-scan and filter-build failures — fail-closed: a
+    /// MERGE must never treat a failed lookup as "no match" and create
+    /// duplicates.
+    async fn merge_lookup_persisted_batch(
         &self,
         label: &str,
-        key_props: &HashMap<String, Value>,
-        filter: &str,
-        ctx: Option<&QueryContext>,
-    ) -> Result<Vec<Vid>> {
-        let mut matches: Vec<Vid> = Vec::new();
-        let scanned = self
+        key_names: &[String],
+        keys: &HashSet<MergeKey>,
+    ) -> Result<(
+        HashMap<MergeKey, Vec<Vid>>,
+        HashMap<Vid, uni_common::Properties>,
+    )> {
+        let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        if keys.is_empty() {
+            return Ok((out, HashMap::new()));
+        }
+        // An undeclared (schemaless) label has no per-label table — its flushed
+        // rows live only in the unified main vertex table. Route to the
+        // main-table lookup, mirroring the planner's scan routing (a schemaless
+        // MATCH plans `ScanMainByLabels` on the same schema predicate).
+        if self
             .storage
-            .scan_vertex_table(label, &["_vid"], Some(filter))
-            .await?;
-        if let Some(batch) = scanned
-            && let Some(col) = batch
+            .schema_manager()
+            .schema()
+            .get_label_case_insensitive(label)
+            .is_none()
+        {
+            return self
+                .merge_lookup_persisted_batch_schemaless(label, key_names, keys)
+                .await;
+        }
+        // Declared label — the per-label table is MVCC-append (an update
+        // flush adds a higher-`_version` row for the same vid) and the key
+        // predicate is pushed into the Lance filter, so a SUPERSEDED version
+        // whose row still carries a requested key is returned while the vid's
+        // current row (key rewritten, fails the filter) is invisible to the
+        // scan. Version dedup among the returned rows cannot detect that, so
+        // the lookup runs in two passes: the key-filtered scan only nominates
+        // candidate vids, and an unfiltered `_vid IN (…)` scan then requires
+        // each candidate's max-`_version` row to be live and still keyed as
+        // requested.
+        let mut columns: Vec<&str> = vec!["_vid"];
+        columns.extend(key_names.iter().map(String::as_str));
+
+        let key_list: Vec<&MergeKey> = keys.iter().collect();
+        let mut candidates: Vec<Vid> = Vec::new();
+        let mut seen: HashSet<Vid> = HashSet::new();
+        for chunk in key_list.chunks(Self::MERGE_SCAN_CHUNK) {
+            let filter = Self::merge_batch_filter(key_names, chunk)
+                .ok_or_else(|| anyhow!("MERGE fast path could not build a batched key filter"))?;
+            let scanned = self
+                .storage
+                .scan_vertex_table(label, &columns, Some(&filter))
+                .await?;
+            let Some(batch) = scanned else { continue };
+            let Some(vid_col) = batch
                 .column_by_name("_vid")
                 .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
-        {
-            for i in 0..col.len() {
-                let vid = Vid::from(col.value(i));
-                if l0_visibility::is_vertex_deleted(vid, ctx) {
-                    continue;
+            else {
+                continue;
+            };
+            for i in 0..vid_col.len() {
+                let vid = Vid::from(vid_col.value(i));
+                if seen.insert(vid) {
+                    candidates.push(vid);
                 }
-                if Self::vid_overrides_break_key(vid, key_props, ctx) {
-                    continue;
-                }
-                matches.push(vid);
             }
         }
-        Ok(matches)
+
+        // Verification pass — tombstones are NOT filtered Lance-side (the
+        // max-version pick must see them so a deleted winner cannot let an
+        // older live version resurrect the match), exactly like the
+        // schemaless branch below.
+        let mut verify_columns: Vec<&str> = vec!["_vid", "_deleted", "_version"];
+        verify_columns.extend(key_names.iter().map(String::as_str));
+        for chunk in candidates.chunks(Self::MERGE_SCAN_CHUNK) {
+            let vid_list = chunk
+                .iter()
+                .map(|v| v.as_u64().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let filter = format!("_vid IN ({vid_list})");
+            let scanned = self
+                .storage
+                .scan_vertex_table(label, &verify_columns, Some(&filter))
+                .await?;
+            let Some(batch) = scanned else { continue };
+            let (Some(vid_col), Some(del_col), Some(ver_col)) = (
+                batch
+                    .column_by_name("_vid")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+                batch
+                    .column_by_name("_deleted")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>()),
+                batch
+                    .column_by_name("_version")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+            ) else {
+                return Err(anyhow!(
+                    "MERGE batched lookup: verification scan missing a required column"
+                ));
+            };
+            let key_cols: Vec<_> = key_names
+                .iter()
+                .map(|k| batch.column_by_name(k))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    anyhow!("MERGE batched lookup: projected key column missing from scan result")
+                })?;
+            // Per-vid MVCC dedup: keep the highest-version row for each vid.
+            let mut winners: HashMap<Vid, (u64, usize)> = HashMap::new();
+            for i in 0..batch.num_rows() {
+                let vid = Vid::from(vid_col.value(i));
+                let ver = ver_col.value(i);
+                let entry = winners.entry(vid).or_insert((ver, i));
+                if ver > entry.0 {
+                    *entry = (ver, i);
+                }
+            }
+            for (vid, (_ver, row)) in winners {
+                if del_col.value(row) {
+                    continue;
+                }
+                let tuple: MergeKey = key_names
+                    .iter()
+                    .zip(&key_cols)
+                    .map(|(k, col)| {
+                        let v = uni_store::storage::arrow_convert::arrow_to_value(
+                            col.as_ref(),
+                            row,
+                            None,
+                        );
+                        (k.clone(), Self::canonical_key_value(&v))
+                    })
+                    .collect();
+                if keys.contains(&tuple) {
+                    out.entry(tuple).or_default().push(vid);
+                }
+            }
+        }
+        Ok((out, HashMap::new()))
+    }
+
+    /// Persisted-match lookup for an UNDECLARED (schemaless) label.
+    ///
+    /// Schemaless rows live only in the unified main vertex table (per-label
+    /// tables exist only for declared labels), with all properties encoded in
+    /// the `props_json` CypherValue blob — so key values cannot be pushed into
+    /// the Lance filter; the key match happens in memory after decoding,
+    /// exactly like the schemaless MATCH scan. One main-table scan regardless
+    /// of key count.
+    ///
+    /// Mirrors `columnar_scan_schemaless_vertex_batch_static`: tombstones are
+    /// NOT filtered Lance-side (MVCC dedup must see them to pick the winning
+    /// version per vid); the per-vid max-`_version` dedup runs here, then
+    /// deleted winners are dropped.
+    ///
+    /// Also returns the full decoded property map per matched vid — the blob
+    /// is decoded here anyway, and the caller seeds the statement-level
+    /// [`Prefetch`] from it instead of re-reading per row.
+    ///
+    /// # Errors
+    /// Propagates scan and blob-decode failures — fail-closed: a MERGE must
+    /// never treat a failed lookup as "no match" and create duplicates.
+    async fn merge_lookup_persisted_batch_schemaless(
+        &self,
+        label: &str,
+        key_names: &[String],
+        keys: &HashSet<MergeKey>,
+    ) -> Result<(
+        HashMap<MergeKey, Vec<Vid>>,
+        HashMap<Vid, uni_common::Properties>,
+    )> {
+        let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        let mut props_by_vid: HashMap<Vid, uni_common::Properties> = HashMap::new();
+        let filter = format!("array_contains(labels, '{}')", label.replace('\'', "''"));
+        let Some(batch) = self
+            .storage
+            .scan_main_vertex_table(
+                &["_vid", "_deleted", "props_json", "_version"],
+                Some(&filter),
+            )
+            .await?
+        else {
+            return Ok((out, props_by_vid));
+        };
+        let (Some(vid_col), Some(del_col), Some(ver_col)) = (
+            batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+            batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>()),
+            batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+        ) else {
+            return Err(anyhow!(
+                "schemaless MERGE lookup: main vertex table scan missing a required column"
+            ));
+        };
+        let props_col = batch
+            .column_by_name("props_json")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>());
+
+        // Per-vid MVCC dedup: keep the highest-version row for each vid.
+        let mut winners: HashMap<Vid, (u64, usize)> = HashMap::new();
+        for i in 0..batch.num_rows() {
+            let vid = Vid::from(vid_col.value(i));
+            let ver = ver_col.value(i);
+            let entry = winners.entry(vid).or_insert((ver, i));
+            if ver > entry.0 {
+                *entry = (ver, i);
+            }
+        }
+        for (vid, (_ver, row)) in winners {
+            // Drop deletion tombstones AFTER picking the winner — a deleted
+            // winner must not let an older live version resurrect the match.
+            if del_col.value(row) {
+                continue;
+            }
+            // A row without properties matches only an all-Null key tuple.
+            let props = match props_col {
+                Some(arr) if !arrow_array::Array::is_null(arr, row) => {
+                    match uni_common::cypher_value_codec::decode(arr.value(row))
+                        .map_err(|e| anyhow!("schemaless MERGE lookup: props decode: {e}"))?
+                    {
+                        Value::Map(m) => m,
+                        _ => HashMap::new(),
+                    }
+                }
+                _ => HashMap::new(),
+            };
+            let tuple: MergeKey = key_names
+                .iter()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        Self::canonical_key_value(props.get(k).unwrap_or(&Value::Null)),
+                    )
+                })
+                .collect();
+            if keys.contains(&tuple) {
+                out.entry(tuple).or_default().push(vid);
+                props_by_vid.insert(vid, props);
+            }
+        }
+        Ok((out, props_by_vid))
+    }
+
+    /// True if the statement-level MERGE property prefetch is safe for `label`.
+    ///
+    /// False when the label declares any CRDT-typed property: a prefetch HIT in
+    /// [`read_vertex_props_with_prefetch`] skips the `normalize_crdt_properties`
+    /// pass that `get_all_vertex_props_with_ctx` applies, so CRDT-bearing
+    /// labels keep the per-row read path. Undeclared labels are trivially safe
+    /// (normalization is a no-op without schema CRDT entries).
+    fn merge_label_prefetch_safe(&self, label: &str) -> bool {
+        let schema = self.storage.schema_manager().schema();
+        schema.properties.get(label).is_none_or(|props| {
+            !props
+                .values()
+                .any(|pm| matches!(pm.r#type, DataType::Crdt(_)))
+        })
     }
 
     /// True if an L0 override rewrote any key column of a persisted match away
@@ -1634,7 +1989,10 @@ impl Executor {
         ctx: Option<&QueryContext>,
     ) -> bool {
         key_props.iter().any(|(k, want)| {
-            matches!(l0_visibility::lookup_vertex_prop(vid, k, ctx), Some(got) if &got != want)
+            matches!(
+                l0_visibility::lookup_vertex_prop(vid, k, ctx),
+                Some(got) if Self::canonical_key_value(&got) != Self::canonical_key_value(want)
+            )
         })
     }
 
@@ -1667,25 +2025,33 @@ impl Executor {
     ) -> bool {
         key_props.iter().all(
             |(k, want)| match l0_visibility::lookup_vertex_prop(vid, k, ctx) {
-                Some(got) => &got == want,
+                Some(got) => Self::canonical_key_value(&got) == Self::canonical_key_value(want),
                 None => *want == Value::Null,
             },
         )
     }
 
     /// Index fast-path execution for one MERGE row of the shape detected by
-    /// [`Self::merge_indexed_fastpath`].
+    /// [`Self::merge_single_node_fastpath`].
     ///
     /// Resolves matches from the per-batch L0 snapshot `existing` (O(1) lookup,
-    /// no per-row L0 enumeration) plus a persisted index scan
-    /// ([`Self::merge_lookup_persisted`]); applies ON MATCH SET to every match,
-    /// or creates the node and applies ON CREATE SET when there is none. A newly
-    /// created vertex is folded into `existing` so a later row of the same batch
-    /// with the same key matches it (intra-batch dedup). Returns the RETURN rows
-    /// for this input row (one per match, or one for a create).
+    /// no per-row L0 enumeration) plus the per-statement persisted prefetch
+    /// (`persisted`, built once by [`Self::merge_lookup_persisted_batch`]);
+    /// applies ON MATCH SET to every match, or creates the node and applies
+    /// ON CREATE SET when there is none. A newly created vertex is folded into
+    /// `existing` so a later row of the same batch with the same key matches it
+    /// (intra-batch dedup). Returns the RETURN rows for this input row (one per
+    /// match, or one for a create).
+    ///
+    /// `prefetched` is the statement-level property prefetch (`None` when the
+    /// label is CRDT-bearing, see [`Self::merge_label_prefetch_safe`]): matched
+    /// vids carry their persisted base row, freshly created vids are seeded
+    /// with an empty base — per-row reads then resolve as base + L0 layering
+    /// (every SET flush writes the full row to L0 before the next read, so a
+    /// prefetch hit equals a fresh read) instead of one storage scan each.
     ///
     /// # Errors
-    /// Propagates evaluation, lookup, create, and SET failures.
+    /// Propagates evaluation, create, and SET failures.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors execute_merge's threaded execution state"
@@ -1698,7 +2064,7 @@ impl Executor {
         temp_vars: &[String],
         mut row: HashMap<String, Value>,
         key_props: &HashMap<String, Value>,
-        filter: &str,
+        persisted: &HashMap<MergeKey, Vec<Vid>>,
         key_tuple: &MergeKey,
         existing: &mut HashMap<MergeKey, Vec<Vid>>,
         on_match: Option<&SetClause>,
@@ -1708,16 +2074,27 @@ impl Executor {
         ctx: Option<&QueryContext>,
         tx_l0_override: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
         writer: &Writer,
+        mut prefetched: Option<&mut Prefetch>,
     ) -> Result<Vec<HashMap<String, Value>>> {
+        let empty_prefetch = Prefetch::default();
         let mut seen: HashSet<Vid> = HashSet::new();
         let mut matches: Vec<Vid> = Vec::new();
-        // Persisted (flushed) matches via the index scan.
-        for vid in self
-            .merge_lookup_persisted(label, key_props, filter, ctx)
-            .await?
-        {
-            if seen.insert(vid) {
-                matches.push(vid);
+        // Persisted (flushed) matches from the per-statement prefetch. The
+        // prefetch is static for the statement, so re-verify liveness at row
+        // time — an earlier row of this batch may have deleted the candidate
+        // or rewritten its key (the old per-row scan saw those through its L0
+        // overlay checks; these are the same checks, moved to row time).
+        if let Some(vids) = persisted.get(key_tuple) {
+            for &vid in vids {
+                if l0_visibility::is_vertex_deleted(vid, ctx) {
+                    continue;
+                }
+                if Self::vid_overrides_break_key(vid, key_props, ctx) {
+                    continue;
+                }
+                if seen.insert(vid) {
+                    matches.push(vid);
+                }
             }
         }
         // L0 / intra-batch matches from the per-batch snapshot, re-verified live
@@ -1735,7 +2112,14 @@ impl Executor {
 
         let mut out = Vec::new();
         if matches.is_empty() {
-            // No match: create the node, then apply ON CREATE SET.
+            // No match: create the node, then apply ON CREATE SET. Fold the
+            // ON CREATE SET property assignments into seed props first so a
+            // NOT-NULL property supplied only by ON CREATE SET passes
+            // create-time validation (RC4); the post-create SET below settles
+            // the final values.
+            let seed_props = self
+                .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                .await?;
             self.execute_create_pattern(
                 path_pattern,
                 &mut row,
@@ -1744,8 +2128,23 @@ impl Executor {
                 params,
                 ctx,
                 tx_l0_override,
+                Some(&seed_props),
             )
             .await?;
+            // Fold the new vertex into the batch snapshot for intra-batch
+            // dedup, and seed the statement prefetch with an empty base: a
+            // fresh vid has nothing in storage, so ON CREATE SET's lazy read
+            // resolves from the L0 row the create just wrote instead of
+            // issuing a per-row storage scan that finds nothing.
+            if let Some(var) = &node.variable
+                && let Some(val) = row.get(var)
+                && let Ok(vid) = Self::vid_from_value(val)
+            {
+                existing.entry(key_tuple.clone()).or_default().push(vid);
+                if let Some(p) = prefetched.as_deref_mut() {
+                    p.vertex.entry(vid).or_default();
+                }
+            }
             if let Some(set) = on_create {
                 self.execute_set_items_locked(
                     &set.items,
@@ -1755,16 +2154,9 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0_override,
-                    &Prefetch::default(),
+                    prefetched.as_deref().unwrap_or(&empty_prefetch),
                 )
                 .await?;
-            }
-            // Fold the new vertex into the batch snapshot for intra-batch dedup.
-            if let Some(var) = &node.variable
-                && let Some(val) = row.get(var)
-                && let Ok(vid) = Self::vid_from_value(val)
-            {
-                existing.entry(key_tuple.clone()).or_default().push(vid);
             }
             Self::bind_path_variables(path_pattern, &mut row, temp_vars);
             out.push(row);
@@ -1791,15 +2183,18 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0_override,
-                        &Prefetch::default(),
+                        prefetched.as_deref().unwrap_or(&empty_prefetch),
                     )
                     .await?;
                 }
                 if let Some(var) = &node.variable {
-                    // Rebind with full, post-SET properties for RETURN fidelity.
+                    // Rebind with full, post-SET properties for RETURN
+                    // fidelity. The SET above flushed the full row to L0, so a
+                    // prefetch hit (base + L0 layering) reproduces exactly
+                    // what a fresh storage read would return.
                     let props = read_vertex_props_with_prefetch(
                         vid,
-                        &Prefetch::default(),
+                        prefetched.as_deref().unwrap_or(&empty_prefetch),
                         prop_manager,
                         ctx,
                     )
@@ -1846,6 +2241,20 @@ impl Executor {
         // instead of re-walking L0 for every row. `key_names` is the sorted
         // static key set, matching `merge_key_tuple`.
         let mut fast_existing: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        // Per-row pre-evaluated fast-path keys (None = that row falls back to
+        // the general path), and the per-statement persisted prefetch over the
+        // deduped key tuples — ONE chunked scan instead of one scan per row.
+        // Key expressions only see the row's own bindings + params, so
+        // evaluating them ahead of any creates cannot observe earlier rows.
+        let mut row_fast: Vec<Option<(HashMap<String, Value>, MergeKey)>> = Vec::new();
+        let mut fast_persisted: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
+        // Statement-level property prefetch for the fast path (review perf
+        // residual): every persisted match's full row is batch-read ONCE, so
+        // the per-row ON MATCH SET read and the post-SET rebind resolve as
+        // prefetch-base + L0 layering instead of one storage scan each.
+        // `None` disables it for CRDT-bearing labels (the prefetch-hit read
+        // skips CRDT normalization).
+        let mut merge_prefetch: Option<Prefetch> = None;
         if let Some((node, label)) = &fastpath {
             let mut key_names: Vec<String> = match &node.properties {
                 Some(Expr::Map(entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
@@ -1853,49 +2262,97 @@ impl Executor {
             };
             key_names.sort();
             fast_existing = self.merge_l0_existing(label, &key_names, ctx);
-        }
 
-        let mut results = Vec::new();
-        for mut row in rows {
-            if let Some((node, label)) = &fastpath {
-                // Evaluate the MERGE key for this row. Only take the fast path
-                // when every key value is a scalar the persisted scan can
-                // express; otherwise fall through to the general per-row path.
+            row_fast.reserve(rows.len());
+            for row in &rows {
                 let mut key_props: HashMap<String, Value> = HashMap::new();
                 if let Some(props_expr) = &node.properties
                     && let Value::Map(map) = self
-                        .evaluate_expr(props_expr, &row, prop_manager, params, ctx)
+                        .evaluate_expr(props_expr, row, prop_manager, params, ctx)
                         .await?
                 {
                     key_props = map;
                 }
-                if let Some(filter) = Self::merge_key_filter(&key_props) {
-                    let key_tuple = Self::merge_key_tuple(&key_props);
-                    let writer: &uni_store::Writer = writer_lock.as_ref();
-                    let row_out = self
-                        .execute_merge_row_indexed(
-                            label,
-                            node,
-                            &path_pattern,
-                            &temp_vars,
-                            row,
-                            &key_props,
-                            &filter,
-                            &key_tuple,
-                            &mut fast_existing,
-                            on_match,
-                            on_create,
-                            prop_manager,
-                            params,
-                            ctx,
-                            tx_l0_override,
-                            writer,
-                        )
-                        .await?;
-                    results.extend(row_out);
-                    continue;
+                // Only rows whose every key value is a scalar the persisted
+                // scan can express take the fast path (same gate as before,
+                // via the filter builder).
+                if Self::merge_key_filter(&key_props).is_some() {
+                    let tuple = Self::merge_key_tuple(&key_props);
+                    row_fast.push(Some((key_props, tuple)));
+                } else {
+                    row_fast.push(None);
                 }
-                // Non-scalar key value: fall through to the general path below.
+            }
+            let unique_keys: HashSet<MergeKey> = row_fast
+                .iter()
+                .flatten()
+                .map(|(_, tuple)| tuple.clone())
+                .collect();
+            let (persisted, schemaless_props) = self
+                .merge_lookup_persisted_batch(label, &key_names, &unique_keys)
+                .await?;
+            fast_persisted = persisted;
+            if self.merge_label_prefetch_safe(label) {
+                let mut pf = Prefetch::default();
+                if !schemaless_props.is_empty() {
+                    // The schemaless lookup already decoded each matched vid's
+                    // full property map — zero extra scans.
+                    pf.vertex.extend(schemaless_props);
+                } else {
+                    let vids: Vec<Vid> = fast_persisted
+                        .values()
+                        .flatten()
+                        .copied()
+                        .collect::<HashSet<Vid>>()
+                        .into_iter()
+                        .collect();
+                    if !vids.is_empty()
+                        && let Ok(batch_props) = prop_manager
+                            .get_batch_vertex_props_for_label(&vids, label, ctx)
+                            .await
+                    {
+                        // One `_vid IN (…)` scan for every matched row's base.
+                        // On Err the map stays empty — every read falls back to
+                        // the per-row path (fail-open, same posture as
+                        // prefetch_set_targets).
+                        pf.vertex.extend(batch_props);
+                    }
+                }
+                merge_prefetch = Some(pf);
+            }
+        }
+
+        let mut results = Vec::new();
+        for (idx, mut row) in rows.into_iter().enumerate() {
+            // Rows with a pre-evaluated scalar key take the fast path; rows
+            // with a non-scalar key fall through to the general path below.
+            if let Some((node, label)) = &fastpath
+                && let Some((key_props, key_tuple)) = row_fast.get(idx).and_then(|rf| rf.as_ref())
+            {
+                let writer: &uni_store::Writer = writer_lock.as_ref();
+                let row_out = self
+                    .execute_merge_row_indexed(
+                        label,
+                        node,
+                        &path_pattern,
+                        &temp_vars,
+                        row,
+                        key_props,
+                        &fast_persisted,
+                        key_tuple,
+                        &mut fast_existing,
+                        on_match,
+                        on_create,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0_override,
+                        writer,
+                        merge_prefetch.as_mut(),
+                    )
+                    .await?;
+                results.extend(row_out);
+                continue;
             }
 
             // General execution: match-or-create per row. (The index fast path
@@ -1928,6 +2385,12 @@ impl Executor {
                         batch.push(m);
                     }
                 } else {
+                    // Fold ON CREATE SET into seed props so a NOT-NULL property
+                    // set only by ON CREATE SET passes create-time validation
+                    // (RC4); the post-create SET below settles the final values.
+                    let seed_props = self
+                        .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                        .await?;
                     self.execute_create_pattern(
                         &path_pattern,
                         &mut row,
@@ -1936,6 +2399,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0_override,
+                        Some(&seed_props),
                     )
                     .await?;
                     if let Some(set) = on_create {
@@ -1963,6 +2427,53 @@ impl Executor {
         Ok(results)
     }
 
+    /// Pre-evaluate `ON CREATE SET` property assignments into per-variable seeds.
+    ///
+    /// Folds `SET <var>.<prop> = <expr>` items so a NOT-NULL property supplied
+    /// only by `ON CREATE SET` is present when the MERGE node is created and
+    /// passes constraint validation (RC4). The right-hand side is evaluated
+    /// against the current `row`.
+    ///
+    /// Items whose right-hand side references the target variable (e.g.
+    /// `ON CREATE SET n.c = coalesce(n.c, 0) + 1`) are NOT folded: seeding would
+    /// let the post-create SET read the seeded value and apply the assignment
+    /// twice. Such items run only post-create, exactly once (unchanged behavior).
+    ///
+    /// # Errors
+    /// Returns an error if evaluating an assignment's right-hand side fails.
+    pub(crate) async fn on_create_seed_props(
+        &self,
+        on_create: Option<&SetClause>,
+        row: &HashMap<String, Value>,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<String, HashMap<String, Value>>> {
+        let mut seed: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let Some(set) = on_create else {
+            return Ok(seed);
+        };
+        for item in &set.items {
+            if let SetItem::Property { expr, value } = item
+                && let Expr::Property(var_expr, prop_name) = expr
+                && let Expr::Variable(var_name) = &**var_expr
+                // Skip self-referential RHS so the post-create SET (which also
+                // runs) applies it exactly once rather than reading the seed.
+                && !crate::query::df_graph::locy_ast_builder::expr_references_var(
+                    value, var_name,
+                )
+            {
+                let val = self
+                    .evaluate_expr(value, row, prop_manager, params, ctx)
+                    .await?;
+                seed.entry(var_name.clone())
+                    .or_default()
+                    .insert(prop_name.clone(), val);
+            }
+        }
+        Ok(seed)
+    }
+
     /// Execute a CREATE pattern, inserting new vertices and edges into the graph.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_create_pattern(
@@ -1974,6 +2485,11 @@ impl Executor {
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        // Per-variable properties to gap-fill into newly-created nodes before
+        // constraint validation. Used by MERGE to fold `ON CREATE SET` so a
+        // NOT-NULL property supplied only by ON CREATE SET passes create-time
+        // validation (RC4). `None` for plain CREATE.
+        seed_props: Option<&HashMap<String, HashMap<String, Value>>>,
     ) -> Result<()> {
         for path in &pattern.paths {
             let mut prev_vid: Option<Vid> = None;
@@ -2007,6 +2523,21 @@ impl Executor {
                                     }
                                 } else {
                                     return Err(anyhow!("Properties must evaluate to a map"));
+                                }
+                            }
+
+                            // MERGE ON CREATE SET: gap-fill properties supplied
+                            // only by ON CREATE SET so a NOT-NULL property absent
+                            // from the merge key passes create-time validation
+                            // (RC4). `or_insert` keeps the merge-key/pattern props
+                            // authoritative; the post-create SET re-applies the
+                            // real values, so the final state is unchanged.
+                            if let Some(seed) = seed_props
+                                && let Some(var) = &n.variable
+                                && let Some(var_seed) = seed.get(var)
+                            {
+                                for (k, v) in var_seed {
+                                    props.entry(k.clone()).or_insert_with(|| v.clone());
                                 }
                             }
 

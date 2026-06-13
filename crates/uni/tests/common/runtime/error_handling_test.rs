@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use std::collections::HashMap;
 use std::time::Duration;
 use uni_db::{DataType, Uni, UniError};
 
@@ -140,7 +141,7 @@ async fn test_write_guard_released_on_appender_abort() -> anyhow::Result<()> {
     let tx = session.tx().await?;
     {
         let appender = tx.appender("Row").build()?;
-        appender.abort();
+        appender.abort().await?;
     }
     // The tx should still be usable after appender abort
     tx.execute("CREATE (:Row {x: 42})").await?;
@@ -158,6 +159,58 @@ async fn test_write_guard_released_on_appender_abort() -> anyhow::Result<()> {
     assert_eq!(result.len(), 2);
     assert_eq!(result.rows()[0].get::<i64>("x")?, 42);
     assert_eq!(result.rows()[1].get::<i64>("x")?, 99);
+
+    Ok(())
+}
+
+/// Regression repro (bug #10): aborting a [`StreamingAppender`] after a
+/// natural batch flush must discard the already-flushed rows.
+///
+/// With a small `batch_size`, appending more rows than `batch_size` forces an
+/// auto-flush of a full batch to durable storage while the remainder stays
+/// buffered. `abort()` is documented to discard "all buffered and previously
+/// flushed rows", so after abort no rows for the label may be durably present.
+///
+/// RED today: `abort()` only clears the in-memory buffer and drops the
+/// `BulkWriter` without invoking `BulkWriter::abort()`, so the flushed batch
+/// survives — the count is 2 instead of the expected 0.
+#[tokio::test]
+async fn streaming_appender_abort_discards_flushed_batches() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("Row")
+        .property("x", DataType::Int64)
+        .apply()
+        .await?;
+
+    let session = db.session();
+
+    // batch_size = 2, append 3 rows: rows 1 and 2 auto-flush to storage,
+    // row 3 remains buffered.
+    let tx = session.tx().await?;
+    {
+        let mut appender = tx.appender("Row").batch_size(2).build()?;
+        for x in 0..3i64 {
+            let mut props: HashMap<String, uni_db::Value> = HashMap::new();
+            props.insert("x".to_string(), uni_db::Value::Int(x));
+            appender.append(props).await?;
+        }
+        // Abort must roll back the flushed batch as well as the buffered row.
+        appender.abort().await?;
+    }
+    tx.commit().await?;
+
+    // No rows for the label may be durably present after an abort.
+    let result = db
+        .session()
+        .query("MATCH (r:Row) RETURN count(r) AS c")
+        .await?;
+    let count = result.rows()[0].get::<i64>("c")?;
+    assert_eq!(
+        count, 0,
+        "appender.abort() must discard the flushed batch; {count} rows survived"
+    );
 
     Ok(())
 }

@@ -520,7 +520,9 @@ impl GraphExecutionContext {
         direction: Direction,
     ) -> anyhow::Result<()> {
         let am = self.adjacency_manager();
-        let version = self.storage.version_high_water_mark();
+        // Manifest pin only: tx version pins must NOT filter adjacency
+        // warming/reads (see StorageManager::snapshot_version_hwm).
+        let version = self.storage.snapshot_version_hwm();
         for &etype_id in edge_type_ids {
             // Skip if AM already has data (CSR or overlay) for this edge type.
             // The overlay contains edges from dual-write (Writer), so warming
@@ -574,11 +576,19 @@ impl GraphExecutionContext {
     ///
     /// Vector of (neighbor VID, edge ID) pairs.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
-        let version_hwm = self.storage.version_high_water_mark();
+        // Manifest pin only (time-travel); tx pins read live edges + L0 overlays.
+        let version_hwm = self.storage.snapshot_version_hwm();
         // Single-vid case: acquire the transaction-L0 guard once for this
         // vertex (the batch path amortizes it across many vertices).
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
-        self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref())
+        self.neighbors_for_vid(
+            vid,
+            edge_type,
+            direction,
+            version_hwm,
+            tx_guard.as_deref(),
+            true,
+        )
     }
 
     /// Get neighbors for multiple vertices in batch.
@@ -601,20 +611,111 @@ impl GraphExecutionContext {
         edge_type: u32,
         direction: Direction,
     ) -> Vec<(Vid, Vid, Eid)> {
-        let version_hwm = self.storage.version_high_water_mark();
+        // Manifest pin only (time-travel); tx pins read live edges + L0 overlays.
+        let version_hwm = self.storage.snapshot_version_hwm();
         let tx_guard = self.l0_context.transaction_l0.as_ref().map(|l0| l0.read());
 
         let mut results = Vec::new();
         for &vid in vids {
-            let neighbors =
-                self.neighbors_for_vid(vid, edge_type, direction, version_hwm, tx_guard.as_deref());
+            // record_reads=false: the whole batch is recorded in one read-set
+            // lock below instead of two lock acquisitions per source vertex.
+            let neighbors = self.neighbors_for_vid(
+                vid,
+                edge_type,
+                direction,
+                version_hwm,
+                tx_guard.as_deref(),
+                false,
+            );
             results.extend(
                 neighbors
                     .into_iter()
                     .map(|(neighbor, eid)| (vid, neighbor, eid)),
             );
         }
+        drop(tx_guard);
+        self.record_neighbor_reads_batch(vids, &results);
         results
+    }
+
+    /// Resolve an edge's STORED `(src, dst)` orientation given a traversed hop.
+    ///
+    /// A relationship in a path must report its stored (start -> end) direction
+    /// even when the path traversed it backward (undirected `-[r]-` or incoming
+    /// `<-[r]-`). This first consults the L0 visibility chain (exact for
+    /// in-memory edges); if the edge has been flushed to durable storage and is
+    /// no longer L0-resident, it recovers the orientation with a bounded
+    /// directed-outgoing adjacency probe: the edge is stored
+    /// `(traversal_src -> traversal_dst)` iff `eid` appears among
+    /// `traversal_src`'s outgoing neighbours for one of `edge_type_ids`,
+    /// otherwise it is the reverse. Falls back to the traversal order only when
+    /// the probe is inconclusive (e.g. the type carries no CSR adjacency).
+    ///
+    /// The probe costs at most the out-degree of one vertex per candidate edge
+    /// type — never a full edge scan — and reads the adjacency manager directly,
+    /// so it does not perturb the SSI read-set.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let (src, dst) =
+    ///     ctx.resolve_stored_edge_endpoints(eid, node_path[i], node_path[i + 1], &edge_type_ids);
+    /// ```
+    #[must_use]
+    pub fn resolve_stored_edge_endpoints(
+        &self,
+        eid: Eid,
+        traversal_src: Vid,
+        traversal_dst: Vid,
+        edge_type_ids: &[u32],
+    ) -> (u64, u64) {
+        // 1. L0 visibility chain — exact stored endpoints for in-memory edges.
+        let query_ctx = self.query_context();
+        if let Some((src, dst)) =
+            uni_store::runtime::l0_visibility::get_edge_endpoints(eid, &query_ctx)
+        {
+            return (src.as_u64(), dst.as_u64());
+        }
+
+        // 2. Flushed (L1-resident) edge: recover orientation via a directed
+        //    outgoing adjacency probe. Read the adjacency manager / versioned
+        //    snapshot directly so the probe stays out of the SSI read-set.
+        //
+        //    When the caller could not supply the edge's type ids (e.g. an
+        //    anonymous `-[]-` relationship reaching BindFixedPath without a
+        //    `_type` column), fall back to the adjacency manager's warmed types
+        //    — exactly the set traversed by this query, so still a bounded probe.
+        let adjacency_manager = self.adjacency_manager();
+        let warmed_fallback: Vec<u32>;
+        let probe_types: &[u32] = if edge_type_ids.is_empty() {
+            warmed_fallback = adjacency_manager.known_edge_type_ids();
+            &warmed_fallback
+        } else {
+            edge_type_ids
+        };
+        let version_hwm = self.storage.snapshot_version_hwm();
+        let outgoing_contains = |vid: Vid| -> bool {
+            probe_types.iter().any(|&etype| {
+                let neighbors = match version_hwm {
+                    Some(hwm) => {
+                        self.storage
+                            .get_neighbors_at_version(vid, etype, Direction::Outgoing, hwm)
+                    }
+                    None => adjacency_manager.get_neighbors(vid, etype, Direction::Outgoing),
+                };
+                neighbors.iter().any(|&(_, e)| e == eid)
+            })
+        };
+
+        if outgoing_contains(traversal_src) {
+            (traversal_src.as_u64(), traversal_dst.as_u64())
+        } else if outgoing_contains(traversal_dst) {
+            (traversal_dst.as_u64(), traversal_src.as_u64())
+        } else {
+            // 3. Inconclusive (no CSR adjacency for this type): preserve the
+            //    long-standing traversal-order behaviour.
+            (traversal_src.as_u64(), traversal_dst.as_u64())
+        }
     }
 
     /// Resolve a single vertex's neighbours, overlaying the transaction L0
@@ -623,6 +724,11 @@ impl GraphExecutionContext {
     /// `tx_guard` is the already-acquired read guard over the transaction
     /// L0 buffer (if any), so batch callers acquire the lock once and pass
     /// the borrow in for every vertex.
+    /// When `record_reads` is false the caller takes responsibility for
+    /// recording the traversal into the SSI read-set (the batch path records
+    /// once per batch via [`record_neighbor_reads_batch`]).
+    ///
+    /// [`record_neighbor_reads_batch`]: Self::record_neighbor_reads_batch
     fn neighbors_for_vid(
         &self,
         vid: Vid,
@@ -630,6 +736,7 @@ impl GraphExecutionContext {
         direction: Direction,
         version_hwm: Option<u64>,
         tx_guard: Option<&L0Buffer>,
+        record_reads: bool,
     ) -> Vec<(Vid, Eid)> {
         // Use AdjacencyManager which reads Main CSR + overlay (dual-write).
         // For snapshot queries, filter by version via StorageManager delegate.
@@ -655,7 +762,9 @@ impl GraphExecutionContext {
             );
         }
 
-        self.record_neighbor_reads(vid, &neighbors);
+        if record_reads {
+            self.record_neighbor_reads(vid, &neighbors);
+        }
 
         neighbors
     }
@@ -677,6 +786,34 @@ impl GraphExecutionContext {
         let mut rs = read_set.lock();
         rs.vertices.insert(src);
         for (nbr, eid) in neighbors {
+            rs.vertices.insert(*nbr);
+            rs.edges.insert(*eid);
+        }
+    }
+
+    /// Batch variant of [`record_neighbor_reads`](Self::record_neighbor_reads):
+    /// records an entire expansion batch under ONE read-set lock instead of
+    /// two lock acquisitions per source vertex.
+    ///
+    /// `srcs` is recorded in full — a source with zero neighbours is still a
+    /// read ("no edges here") that a concurrent edge insert must conflict
+    /// with, exactly as the per-vertex recorder behaves.
+    fn record_neighbor_reads_batch(&self, srcs: &[Vid], triples: &[(Vid, Vid, Eid)]) {
+        if srcs.is_empty() && triples.is_empty() {
+            return;
+        }
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for src in srcs {
+            rs.vertices.insert(*src);
+        }
+        for (_, nbr, eid) in triples {
             rs.vertices.insert(*nbr);
             rs.edges.insert(*eid);
         }

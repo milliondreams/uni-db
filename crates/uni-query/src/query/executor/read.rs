@@ -400,6 +400,16 @@ impl Executor {
             None => L0Context::empty(),
         };
 
+        // C2: scans route through the version-pinned storage manager so
+        // post-snapshot L1 ROWS are invisible (the row-existence pin). The
+        // PropertyManager, by contrast, stays on LIVE storage: property
+        // point-reads must honor read-your-writes (a transaction's own
+        // uncommitted edge/vertex properties live in tx_l0, not L1, and a
+        // version filter would hide them — breaking e.g. MERGE's
+        // edge-property match). Cross-transaction property skew on an
+        // already-visible row is caught by OCC at commit, not the pin.
+        let effective_storage = self.effective_storage();
+
         // Prefer the shared `Arc<PropertyManager>` installed via
         // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
         // (~80 µs/query) of constructing a fresh, immediately-abandoned
@@ -543,10 +553,10 @@ impl Executor {
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
             session_ctx.clone(),
-            self.storage.clone(),
+            effective_storage.clone(),
             l0_context,
             prop_manager_arc.clone(),
-            self.storage.schema_manager().schema(),
+            effective_storage.schema_manager().schema(),
             params.clone(),
             HashMap::new(),
         );
@@ -3062,6 +3072,7 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    None,
                 )
                 .await?;
             }
@@ -3075,6 +3086,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        None,
                     )
                     .await?;
                 }
@@ -3085,6 +3097,12 @@ impl Executor {
                 on_create,
                 ..
             } => {
+                // Fold ON CREATE SET so a NOT-NULL property set only by
+                // ON CREATE SET passes create-time validation (RC4); the
+                // post-create SET below settles the final values.
+                let seed_props = self
+                    .on_create_seed_props(on_create.as_ref(), scope, prop_manager, params, ctx)
+                    .await?;
                 self.execute_create_pattern(
                     &pattern,
                     scope,
@@ -3093,6 +3111,7 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    Some(&seed_props),
                 )
                 .await?;
                 if let Some(on_create_clause) = on_create {

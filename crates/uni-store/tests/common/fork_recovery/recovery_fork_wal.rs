@@ -75,12 +75,12 @@ async fn fork_wal_replay_restores_persisted_mutations() {
     //    This mirrors what a Writer would do on commit_transaction_l0.
     let wal = fork_wal::new_for_fork(store.clone(), &fork_id);
     wal.initialize().await.unwrap();
-    wal.append(&Mutation::DeleteVertex {
+    wal.append(Mutation::DeleteVertex {
         vid: Vid::new(11),
         labels: vec!["L".into()],
     })
     .unwrap();
-    wal.append(&Mutation::DeleteVertex {
+    wal.append(Mutation::DeleteVertex {
         vid: Vid::new(12),
         labels: vec!["L".into()],
     })
@@ -112,7 +112,7 @@ async fn primary_wal_unaffected_by_fork_wal_segments() {
 
     let fork = fork_wal::new_for_fork(store.clone(), &fork_id);
     fork.initialize().await.unwrap();
-    fork.append(&Mutation::DeleteVertex {
+    fork.append(Mutation::DeleteVertex {
         vid: Vid::new(99),
         labels: vec![],
     })

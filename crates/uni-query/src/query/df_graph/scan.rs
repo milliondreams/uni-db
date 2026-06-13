@@ -747,6 +747,99 @@ fn merge_lance_and_l0(
     }
 }
 
+/// Drop rows superseded by a newer persisted version that the pushed
+/// property predicate filtered out (issue #57 × MVCC-append tables).
+///
+/// Lance evaluates a pushed property predicate per ROW, before the per-vid
+/// max-`_version` pick — so when a vid's property was rewritten and
+/// re-flushed, its CURRENT row fails the predicate and never reaches the
+/// dedup, while the stale still-matching row wins it by default. Re-reads
+/// `_vid`/`_version` for the candidate vids WITHOUT the property predicate
+/// (per-label table when `label_table` is `Some`, the main vertex table
+/// otherwise) and keeps only rows carrying their vid's true maximum
+/// persisted version. Must run on the RAW filtered batch, before
+/// [`mvcc_dedup_to_option`].
+async fn drop_superseded_pushdown_rows(
+    storage: &Arc<uni_store::storage::manager::StorageManager>,
+    label_table: Option<&str>,
+    batch: RecordBatch,
+) -> DFResult<RecordBatch> {
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let (Some(vid_col), Some(ver_col)) = (
+        batch
+            .column_by_name("_vid")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+        batch
+            .column_by_name("_version")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+    ) else {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "pushdown version verification: scan batch missing _vid/_version".to_string(),
+        ));
+    };
+
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for i in 0..vid_col.len() {
+        let vid = vid_col.value(i);
+        if seen.insert(vid) {
+            candidates.push(vid);
+        }
+    }
+
+    // True max persisted version per candidate vid — unfiltered apart from
+    // the vid list, so rewritten-key rows and deletion tombstones are seen.
+    // Chunked to bound the `_vid IN (…)` filter-string size.
+    const VERIFY_CHUNK: usize = 1000;
+    let mut max_ver: HashMap<u64, u64> = HashMap::with_capacity(candidates.len());
+    for chunk in candidates.chunks(VERIFY_CHUNK) {
+        let filter = format_vid_in_list(chunk);
+        let scanned = match label_table {
+            Some(label) => {
+                storage
+                    .scan_vertex_table(label, &["_vid", "_version"], Some(&filter))
+                    .await
+            }
+            None => {
+                storage
+                    .scan_main_vertex_table(&["_vid", "_version"], Some(&filter))
+                    .await
+            }
+        }
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let Some(vbatch) = scanned else { continue };
+        let (Some(v_vid), Some(v_ver)) = (
+            vbatch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+            vbatch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+        ) else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "pushdown version verification: rescan missing _vid/_version".to_string(),
+            ));
+        };
+        for i in 0..v_vid.len() {
+            let entry = max_ver.entry(v_vid.value(i)).or_insert(0);
+            *entry = (*entry).max(v_ver.value(i));
+        }
+    }
+
+    let keep: arrow_array::BooleanArray = (0..batch.num_rows())
+        .map(|i| {
+            Some(
+                max_ver
+                    .get(&vid_col.value(i))
+                    .is_none_or(|&max| ver_col.value(i) >= max),
+            )
+        })
+        .collect();
+    arrow::compute::filter_record_batch(&batch, &keep).map_err(arrow_err)
+}
+
 /// Push `col_name` into `columns` if not already present.
 ///
 /// Avoids the verbose `!columns.contains(&col_name.to_string())` pattern
@@ -828,19 +921,15 @@ fn resolve_l0_property(
 
 /// Append a `Value` to a `LargeBinaryBuilder` as CypherValue bytes.
 ///
-/// Non-null values are JSON-encoded then CypherValue-encoded.
-/// Null values (or encoding failures) produce null entries.
+/// Encoded directly via the CypherValue codec so typed values (temporals,
+/// nested lists/maps) round-trip losslessly. Null values produce null entries.
 fn append_value_as_cypher_binary(
     builder: &mut arrow_array::builder::LargeBinaryBuilder,
     val: Option<&Value>,
 ) {
     match val {
         Some(v) if !v.is_null() => {
-            let json_val: serde_json::Value = v.clone().into();
-            match encode_cypher_value(&json_val) {
-                Ok(bytes) => builder.append_value(bytes),
-                Err(_) => builder.append_null(),
-            }
+            builder.append_value(uni_common::cypher_value_codec::encode(v));
         }
         _ => builder.append_null(),
     }
@@ -863,17 +952,15 @@ fn build_all_props_column_with_l0_overlay(
     for i in 0..num_rows {
         let vid = Vid::from(vid_arr.value(i));
 
-        // 1. Decode props_json blob from storage
-        let mut merged_props = serde_json::Map::new();
+        // 1. Decode props_json blob from storage (stays in `Value` space so
+        //    typed values such as temporals are preserved).
+        let mut merged_props: HashMap<String, Value> = HashMap::new();
         if let Some(arr) = props_arr
             && !arr.is_null(i)
             && let Ok(uni_common::Value::Map(map)) =
                 uni_common::cypher_value_codec::decode(arr.value(i))
         {
-            for (k, v) in map {
-                let json_val: serde_json::Value = v.into();
-                merged_props.insert(k, json_val);
-            }
+            merged_props.extend(map);
         }
 
         // 2. Overlay L0 properties (visibility order: pending → current → transaction)
@@ -881,21 +968,18 @@ fn build_all_props_column_with_l0_overlay(
             let guard = l0.read();
             if let Some(l0_props) = guard.vertex_properties.get(&vid) {
                 for (k, v) in l0_props {
-                    let json_val: serde_json::Value = v.clone().into();
-                    merged_props.insert(k.clone(), json_val);
+                    merged_props.insert(k.clone(), v.clone());
                 }
             }
         }
 
-        // 3. Encode merged result
+        // 3. Encode merged result directly via the CypherValue codec.
         if merged_props.is_empty() {
             builder.append_null();
         } else {
-            let json_obj = serde_json::Value::Object(merged_props);
-            match encode_cypher_value(&json_obj) {
-                Ok(bytes) => builder.append_value(bytes),
-                Err(_) => builder.append_null(),
-            }
+            builder.append_value(uni_common::cypher_value_codec::encode(&Value::Map(
+                merged_props,
+            )));
         }
     }
     Arc::new(builder.finish())
@@ -923,15 +1007,16 @@ fn build_all_props_column_for_schema_scan(
     let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
     for i in 0..num_rows {
         let vid = Vid::from(vid_arr.value(i));
-        let mut merged_props = serde_json::Map::new();
+        // Build the merged map in `Value` space so typed values (temporals,
+        // nested lists/maps) are preserved through to the CypherValue blob.
+        let mut merged_props: HashMap<String, Value> = HashMap::new();
 
         // 1. Schema-defined columns
         for &prop in &schema_props {
             if let Some(col) = batch.column_by_name(prop) {
                 let val = uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), i, None);
                 if !val.is_null() {
-                    let json_val: serde_json::Value = val.into();
-                    merged_props.insert(prop.to_string(), json_val);
+                    merged_props.insert(prop.to_string(), val);
                 }
             }
         }
@@ -942,10 +1027,7 @@ fn build_all_props_column_for_schema_scan(
             && let Ok(uni_common::Value::Map(map)) =
                 uni_common::cypher_value_codec::decode(arr.value(i))
         {
-            for (k, v) in map {
-                let json_val: serde_json::Value = v.into();
-                merged_props.insert(k, json_val);
-            }
+            merged_props.extend(map);
         }
 
         // 3. L0 buffer overlay (pending → current → transaction)
@@ -953,8 +1035,7 @@ fn build_all_props_column_for_schema_scan(
             let guard = l0.read();
             if let Some(l0_props) = guard.vertex_properties.get(&vid) {
                 for (k, v) in l0_props {
-                    let json_val: serde_json::Value = v.clone().into();
-                    merged_props.insert(k.clone(), json_val);
+                    merged_props.insert(k.clone(), v.clone());
                 }
             }
         }
@@ -962,11 +1043,9 @@ fn build_all_props_column_for_schema_scan(
         if merged_props.is_empty() {
             builder.append_null();
         } else {
-            let json_obj = serde_json::Value::Object(merged_props);
-            match encode_cypher_value(&json_obj) {
-                Ok(bytes) => builder.append_value(bytes),
-                Err(_) => builder.append_null(),
-            }
+            builder.append_value(uni_common::cypher_value_codec::encode(&Value::Map(
+                merged_props,
+            )));
         }
     }
     Arc::new(builder.finish())
@@ -1422,24 +1501,21 @@ fn build_l0_vertex_batch(
                 let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                 for vid_u64 in &vids {
                     let (props, _) = &vid_data[vid_u64];
-                    let mut overflow = serde_json::Map::new();
+                    let mut overflow: HashMap<String, Value> = HashMap::new();
                     for (k, v) in props {
                         if k == "ext_id" || k.starts_with('_') {
                             continue;
                         }
                         if !schema_prop_names.contains(k.as_str()) {
-                            let json_val: serde_json::Value = v.clone().into();
-                            overflow.insert(k.clone(), json_val);
+                            overflow.insert(k.clone(), v.clone());
                         }
                     }
                     if overflow.is_empty() {
                         builder.append_null();
                     } else {
-                        let json_val = serde_json::Value::Object(overflow);
-                        match encode_cypher_value(&json_val) {
-                            Ok(bytes) => builder.append_value(bytes),
-                            Err(_) => builder.append_null(),
-                        }
+                        builder.append_value(uni_common::cypher_value_codec::encode(&Value::Map(
+                            overflow,
+                        )));
                     }
                 }
                 columns.push(Arc::new(builder.finish()));
@@ -1622,24 +1698,21 @@ fn build_l0_edge_batch(
                 let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                 for eid_u64 in &eids {
                     let (_, _, props, _) = &eid_data[eid_u64];
-                    let mut overflow = serde_json::Map::new();
+                    let mut overflow: HashMap<String, Value> = HashMap::new();
                     for (k, v) in props {
                         if k.starts_with('_') {
                             continue;
                         }
                         if !schema_prop_names.contains(k.as_str()) {
-                            let json_val: serde_json::Value = v.clone().into();
-                            overflow.insert(k.clone(), json_val);
+                            overflow.insert(k.clone(), v.clone());
                         }
                     }
                     if overflow.is_empty() {
                         builder.append_null();
                     } else {
-                        let json_val = serde_json::Value::Object(overflow);
-                        match encode_cypher_value(&json_val) {
-                            Ok(bytes) => builder.append_value(bytes),
-                            Err(_) => builder.append_null(),
-                        }
+                        builder.append_value(uni_common::cypher_value_codec::encode(&Value::Map(
+                            overflow,
+                        )));
                     }
                 }
                 columns.push(Arc::new(builder.finish()));
@@ -2071,12 +2144,26 @@ async fn columnar_scan_vertex_batch_static(
         None => None,
     };
 
-    let lance_batch = match plugin_batch {
-        Some(b) => Some(b),
-        None => storage
-            .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+    // Track whether the batch came through the property-filtered native scan:
+    // plugin batches ignore `combined_filter` (re-filtered by the planner), so
+    // they need no stale-version verification.
+    let (lance_batch, pushdown_filtered) = match plugin_batch {
+        Some(b) => (Some(b), false),
+        None => (
+            storage
+                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+            extra_lance_filter.is_some(),
+        ),
+    };
+
+    // A pushed property predicate hides a vid's CURRENT row from the scan when
+    // that row no longer matches (MVCC-append: the stale still-matching row
+    // would win the dedup by default) — drop superseded rows first.
+    let lance_batch = match (lance_batch, pushdown_filtered) {
+        (Some(b), true) => Some(drop_superseded_pushdown_rows(storage, Some(label), b).await?),
+        (b, _) => b,
     };
 
     // MVCC dedup the Lance batch
@@ -2392,6 +2479,14 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
+    // A pushed property predicate hides a vid's CURRENT row from the scan when
+    // that row no longer matches (MVCC-append: the stale still-matching row
+    // would win the dedup by default) — drop superseded rows first.
+    let lance_batch = match (lance_batch, extra_lance_filter.is_some()) {
+        (Some(b), true) => Some(drop_superseded_pushdown_rows(storage, None, b).await?),
+        (b, _) => b,
+    };
+
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;
 
@@ -2586,19 +2681,12 @@ fn build_l0_schemaless_vertex_batch(
                     if props.is_empty() {
                         builder.append_null();
                     } else {
-                        // Encode properties as CypherValue blob
-                        let json_obj: serde_json::Value = {
-                            let mut map = serde_json::Map::new();
-                            for (k, v) in props {
-                                let json_val: serde_json::Value = v.clone().into();
-                                map.insert(k.clone(), json_val);
-                            }
-                            serde_json::Value::Object(map)
-                        };
-                        match encode_cypher_value(&json_obj) {
-                            Ok(bytes) => builder.append_value(bytes),
-                            Err(_) => builder.append_null(),
-                        }
+                        // Encode properties as a CypherValue blob directly from
+                        // `Value` so typed values (temporals) are preserved.
+                        let map: HashMap<String, Value> =
+                            props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        builder
+                            .append_value(uni_common::cypher_value_codec::encode(&Value::Map(map)));
                     }
                 }
                 columns.push(Arc::new(builder.finish()));
@@ -2804,14 +2892,6 @@ pub(crate) fn get_property_value(
         .cloned()
 }
 
-/// Encode a `serde_json::Value` as CypherValue binary (MessagePack-tagged).
-///
-/// Converts from serde_json::Value -> uni_common::Value -> CypherValue bytes.
-pub(crate) fn encode_cypher_value(val: &serde_json::Value) -> Result<Vec<u8>, String> {
-    let uni_val: uni_common::Value = val.clone().into();
-    Ok(uni_common::cypher_value_codec::encode(&uni_val))
-}
-
 /// Build a numeric column from property values using the specified builder and extractor.
 macro_rules! build_numeric_column {
     ($vids:expr, $props_map:expr, $prop_name:expr, $builder_ty:ty, $extractor:expr, $cast:expr) => {{
@@ -2861,25 +2941,16 @@ pub(crate) fn build_property_column_static(
                         if uni_common::cypher_value_codec::decode(&bytes).is_ok() {
                             builder.append_value(&bytes);
                         } else {
-                            let json_val: serde_json::Value = Value::List(arr).into();
-                            match encode_cypher_value(&json_val) {
-                                Ok(encoded) => builder.append_value(encoded),
-                                Err(_) => builder.append_null(),
-                            }
+                            builder.append_value(uni_common::cypher_value_codec::encode(
+                                &Value::List(arr),
+                            ));
                         }
-                    }
-                    Some(val @ Value::Temporal(_)) => {
-                        // Temporal values (including BTIC) must be encoded directly
-                        // via CypherValue codec — serde_json round-trip loses the type.
-                        builder.append_value(uni_common::cypher_value_codec::encode(&val));
                     }
                     Some(val) => {
-                        // Value from PropertyManager — convert to serde_json and re-encode to CypherValue binary
-                        let json_val: serde_json::Value = val.into();
-                        match encode_cypher_value(&json_val) {
-                            Ok(bytes) => builder.append_value(bytes),
-                            Err(_) => builder.append_null(),
-                        }
+                        // Encode any other property value directly via the
+                        // CypherValue codec so typed values (temporals, including
+                        // BTIC, and nested lists/maps) round-trip losslessly.
+                        builder.append_value(uni_common::cypher_value_codec::encode(&val));
                     }
                 }
             }
@@ -3819,9 +3890,15 @@ mod tests {
 
     #[test]
     fn test_cypher_value_all_props_extraction() {
-        // Simulate _all_props encoding using encode_cypher_value helper
-        let json_obj = serde_json::json!({"age": 30, "name": "Alice"});
-        let cv_bytes = encode_cypher_value(&json_obj).unwrap();
+        // Encode a property map directly via the CypherValue codec (the path the
+        // `_all_props` builders use).
+        let map: HashMap<String, Value> = [
+            ("age".to_string(), Value::Int(30)),
+            ("name".to_string(), Value::String("Alice".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let cv_bytes = uni_common::cypher_value_codec::encode(&Value::Map(map));
 
         // Decode and extract "age" value
         let decoded = uni_common::cypher_value_codec::decode(&cv_bytes).unwrap();
@@ -3834,8 +3911,7 @@ mod tests {
         }
 
         // Also test single value encoding
-        let single_val = serde_json::json!(30);
-        let single_bytes = encode_cypher_value(&single_val).unwrap();
+        let single_bytes = uni_common::cypher_value_codec::encode(&Value::Int(30));
         let single_decoded = uni_common::cypher_value_codec::decode(&single_bytes).unwrap();
         assert_eq!(single_decoded, uni_common::Value::Int(30));
     }

@@ -198,8 +198,19 @@ impl ProjectionBuilder {
     }
 
     /// Build the projection.
+    ///
+    /// Isolation: the L0 tier is read through a snapshot pinned once at the
+    /// start of the build, so a concurrent commit cannot rotate buffers
+    /// between the Lance scan and the L0 overlay (torn projection). Lance
+    /// data committed *during* the build may still be picked up by the scan
+    /// — the projection is an analytics view, not a serializable read.
     pub async fn build(self) -> Result<GraphProjection> {
         let schema = self.storage.schema_manager().schema();
+
+        // Pin the L0 view for the whole build. Holding the SnapshotView's
+        // pin marker makes concurrent committers clone-on-freeze instead of
+        // mutating the captured generation.
+        let l0_snapshot = self.l0_manager.as_ref().map(|m| m.pin_snapshot());
 
         // 1. Resolve label and edge type IDs
         let (label_ids, edge_type_ids) = self.resolve_ids(&schema)?;
@@ -207,8 +218,10 @@ impl ProjectionBuilder {
         // 2. Warm cache for all requested edge types
         self.warm_caches(&label_ids, &edge_type_ids).await?;
 
-        // 3. Collect VIDs from storage and L0
-        let all_vids = self.collect_vertices(&schema, &label_ids).await?;
+        // 3. Collect VIDs from storage and the pinned L0 view
+        let all_vids = self
+            .collect_vertices(&schema, &label_ids, l0_snapshot.as_ref())
+            .await?;
 
         let mut id_map = IdMap::with_capacity(all_vids.len());
         for vid in all_vids {
@@ -295,6 +308,7 @@ impl ProjectionBuilder {
         &self,
         schema: &uni_common::core::schema::Schema,
         label_ids: &[u16],
+        l0_snapshot: Option<&uni_store::runtime::l0_manager::SnapshotView>,
     ) -> Result<Vec<Vid>> {
         use arrow_array::UInt64Array;
 
@@ -319,21 +333,22 @@ impl ProjectionBuilder {
             }
         }
 
-        // Overlay L0 vertices (not yet flushed to Lance)
-        if let Some(ref l0_mgr) = self.l0_manager {
+        // Overlay L0 vertices (not yet flushed to Lance) from the snapshot
+        // pinned at the start of the build — never from live manager
+        // accessors, which can rotate mid-build under concurrent commits.
+        if let Some(snapshot) = l0_snapshot {
             let label_names: Vec<&str> = label_ids
                 .iter()
                 .filter_map(|id| schema.label_name_by_id(*id))
                 .collect();
 
-            // Pending flush L0 buffers (oldest first)
-            for pending_l0_arc in l0_mgr.get_pending_flush() {
+            // Generations that were flushing at pin time (oldest first)
+            for pending_l0_arc in &snapshot.extra {
                 all_vids.extend(pending_l0_arc.read().vids_for_labels(&label_names));
             }
 
-            // Current L0 buffer
-            let current_l0 = l0_mgr.get_current();
-            all_vids.extend(current_l0.read().vids_for_labels(&label_names));
+            // The pinned main L0 generation
+            all_vids.extend(snapshot.main.read().vids_for_labels(&label_names));
         }
 
         // Sort and dedup to ensure IdMap is sorted for compaction

@@ -24,13 +24,119 @@ impl ParseError {
 #[grammar = "grammar/cypher.pest"]
 pub struct CypherParser;
 
+/// Maximum supported nesting depth of bracketing constructs and `CASE`
+/// expressions in a query.
+///
+/// Both the pest parser and the AST walker are recursive-descent, so a query
+/// with thousands of nested parens / lists / maps / `CASE` expressions (or
+/// nested parenthesized patterns) would otherwise exhaust the thread stack and
+/// `abort()` the host process — an uncatchable crash for an embedded library
+/// triggered by a query string. The ceiling sits far above any legitimate
+/// query's nesting yet well below the depth at which the parser overflows even
+/// a small (1 MiB) stack.
+const MAX_NESTING_DEPTH: u32 = 200;
+
+/// Rejects an `input` that nests bracketing constructs / `CASE` expressions
+/// deeper than [`MAX_NESTING_DEPTH`], before any recursive parsing begins.
+///
+/// Counts `(`/`[`/`{` and the `CASE` keyword as opening a level and `)`/`]`/`}`
+/// and the `END` keyword as closing one, tracking the maximum live depth.
+/// Brackets and keywords inside string / backtick literals and `//` or `/* */`
+/// comments are skipped. This is a deliberately conservative O(n) check: it may
+/// over-count, but never under-counts the nesting the parser would recurse into.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when nesting exceeds [`MAX_NESTING_DEPTH`].
+fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut depth: i32 = 0;
+    let mut max_depth: i32 = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                // String literal: skip to the matching quote, honoring `\` escapes.
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        c if c == quote => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'`' => {
+                // Backtick-quoted identifier (no escapes in the grammar).
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'`' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = (depth - 1).max(0);
+                i += 1;
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                // Read a whole word so only the bare keywords CASE / END count.
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &input[start..i];
+                if word.eq_ignore_ascii_case("case") {
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                } else if word.eq_ignore_ascii_case("end") {
+                    depth = (depth - 1).max(0);
+                }
+            }
+            _ => i += 1,
+        }
+
+        if max_depth as u32 > MAX_NESTING_DEPTH {
+            return Err(ParseError::new(format!(
+                "SyntaxError: NestingTooDeep - query nesting exceeds the maximum \
+                 supported depth ({MAX_NESTING_DEPTH})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn parse(input: &str) -> Result<Query, ParseError> {
+    check_nesting_depth(input)?;
     let pairs = CypherParser::parse(Rule::query, input).map_err(|e| map_pest_error(input, e))?;
 
     walker::build_query(pairs)
 }
 
 pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
+    check_nesting_depth(input)?;
     let pairs =
         CypherParser::parse(Rule::expression, input).map_err(|e| map_pest_error(input, e))?;
 
@@ -41,6 +147,7 @@ pub fn parse_locy(input: &str) -> Result<LocyProgram, ParseError> {
     use locy_parser::LocyParser;
     use locy_parser::Rule as LocyRule;
 
+    check_nesting_depth(input)?;
     let pairs = LocyParser::parse(LocyRule::locy_query, input)
         .map_err(|e| map_locy_pest_error(input, e))?;
 

@@ -4,7 +4,7 @@
 //! Helper for building Arrow property columns from row-based data.
 
 use crate::storage::arrow_convert::PropertyExtractor;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use arrow_array::ArrayRef;
 use arrow_array::builder::LargeBinaryBuilder;
 use std::collections::HashMap;
@@ -100,10 +100,11 @@ where
         if overflow_props.is_empty() {
             builder.append_null();
         } else {
-            let json_val = serde_json::to_value(&overflow_props)
-                .map_err(|e| anyhow!("Failed to serialize overflow properties: {}", e))?;
-            let uni_val: Value = json_val.into();
-            let jsonb = uni_common::cypher_value_codec::encode(&uni_val);
+            // Encode directly via the CypherValue codec. Routing through
+            // `serde_json::to_value` would use `Value`'s untagged Serialize and
+            // turn a temporal into its tagged-struct form (`{"Date": {..}}`),
+            // which then round-trips back as a `Value::Map`, losing the type.
+            let jsonb = uni_common::cypher_value_codec::encode(&Value::Map(overflow_props));
             builder.append_value(&jsonb);
         }
     }

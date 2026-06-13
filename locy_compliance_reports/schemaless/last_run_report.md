@@ -1,15 +1,15 @@
 # TCK Compliance Report
 
-**Generated:** 2026-05-20 11:11:41
-**Results:** `results_20260520_111141.json`
-**Compared to:** `results_20260520_085606.json`
+**Generated:** 2026-06-12 12:24:05
+**Results:** `results_20260612_122404.json`
+**Compared to:** `results_20260612_051236.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 490 | 490 |  |
-| Passed | 490 | 490 |  |
+| Scenarios | 501 | 501 |  |
+| Passed | 501 | 501 |  |
 | Failed | 0 | 0 |  |
 | Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
@@ -35,12 +35,13 @@
 | ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveVisibility | 7 | 7 | 0 | 100% |  |
-| ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
+| ✅ ErrorConditions | 6 | 6 | 0 | 100% |  |
 | ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
 | ✅ ExplainCombinations | 6 | 6 | 0 | 100% |  |
 | ✅ FeatureCombinationMatrix | 6 | 6 | 0 | 100% |  |
 | ✅ FoldExecutionPaths | 32 | 32 | 0 | 100% |  |
 | ✅ FoldInRecursivePath | 3 | 3 | 0 | 100% |  |
+| ✅ FoldMonotonicity | 6 | 6 | 0 | 100% |  |
 | ✅ FoldQueryProjection | 4 | 4 | 0 | 100% |  |
 | ✅ GoalDirected | 9 | 9 | 0 | 100% |  |
 | ✅ GraphStructuralFeatures | 16 | 16 | 0 | 100% |  |
@@ -56,6 +57,7 @@
 | ✅ NeuralFollowups | 7 | 7 | 0 | 100% |  |
 | ✅ NeuralProvenanceExplain | 4 | 4 | 0 | 100% |  |
 | ✅ NoisyOrComposition | 1 | 1 | 0 | 100% |  |
+| ✅ NonLinearRecursion | 2 | 2 | 0 | 100% |  |
 | ✅ NonRecursive | 4 | 4 | 0 | 100% |  |
 | ✅ OptimizedSelection | 6 | 6 | 0 | 100% |  |
 | ✅ ParameterBinding | 5 | 5 | 0 | 100% |  |
@@ -67,6 +69,7 @@
 | ✅ ProbabilisticComplement | 19 | 19 | 0 | 100% |  |
 | ✅ ProbabilisticStress | 10 | 10 | 0 | 100% |  |
 | ✅ ProofTraces | 3 | 3 | 0 | 100% |  |
+| ✅ RecursiveNegation | 2 | 2 | 0 | 100% |  |
 | ✅ RecursiveRules | 3 | 3 | 0 | 100% |  |
 | ✅ ReservedKeywords | 18 | 18 | 0 | 100% |  |
 | ✅ RetrievalFeatures | 4 | 4 | 0 | 100% |  |

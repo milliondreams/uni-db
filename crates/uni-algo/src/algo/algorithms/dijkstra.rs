@@ -33,22 +33,73 @@ pub struct DijkstraResult {
     pub path: Option<Vec<Vid>>,
 }
 
+/// Error returned when Dijkstra cannot produce a correct result.
+///
+/// Dijkstra's settled-on-first-pop invariant only holds for non-negative
+/// edge weights, so a negative weight is rejected rather than silently
+/// yielding a wrong shortest distance.
+#[derive(Debug, Clone)]
+pub enum DijkstraError {
+    /// An edge from `source` to `target` carries a negative `weight`.
+    NegativeEdge {
+        source: Vid,
+        target: Vid,
+        weight: f64,
+    },
+}
+
+impl std::fmt::Display for DijkstraError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DijkstraError::NegativeEdge {
+                source,
+                target,
+                weight,
+            } => write!(
+                f,
+                "Dijkstra rejects negative edge {source:?} -> {target:?} (weight {weight})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DijkstraError {}
+
 impl Algorithm for Dijkstra {
     type Config = DijkstraConfig;
-    type Result = DijkstraResult;
+    type Result = Result<DijkstraResult, DijkstraError>;
 
     fn name() -> &'static str {
         "shortestPath"
     }
 
     fn run(graph: &GraphProjection, config: Self::Config) -> Self::Result {
+        // Reject negative weights up front: Dijkstra's correctness relies on
+        // non-negative edges, so any negative weight is a hard error rather
+        // than a silently wrong answer.
+        if graph.has_weights() {
+            let n = graph.vertex_count();
+            for u in 0..n as u32 {
+                for (i, &v) in graph.out_neighbors(u).iter().enumerate() {
+                    let weight = graph.out_weight(u, i);
+                    if weight < 0.0 {
+                        return Err(DijkstraError::NegativeEdge {
+                            source: graph.to_vid(u),
+                            target: graph.to_vid(v),
+                            weight,
+                        });
+                    }
+                }
+            }
+        }
+
         let source_slot = match graph.to_slot(config.source) {
             Some(slot) => slot,
             None => {
-                return DijkstraResult {
+                return Ok(DijkstraResult {
                     distances: Vec::new(),
                     path: None,
-                };
+                });
             }
         };
 
@@ -121,9 +172,54 @@ impl Algorithm for Dijkstra {
             .map(|(slot, d)| (graph.to_vid(slot as u32), d))
             .collect();
 
-        DijkstraResult {
+        Ok(DijkstraResult {
             distances: results,
             path,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algo::test_utils::build_test_graph;
+
+    /// Regression: Dijkstra must reject negative edge weights with an error.
+    ///
+    /// Dijkstra's settled-on-first-pop guard (`if d > dist[u] { continue }`)
+    /// and `to_bits()` heap key are only valid for non-negative weights, so a
+    /// negative weight would silently yield a wrong shortest distance instead
+    /// of the true minimum. The chosen contract is to reject such input with a
+    /// clean [`DijkstraError::NegativeEdge`].
+    // Rust guideline compliant
+    #[test]
+    fn test_dijkstra_rejects_or_handles_negative_weight() {
+        // Edges: 0->1 = 2, 0->2 = 5, 2->1 = -4.
+        // True shortest 0 -> 2 -> 1 = 5 + (-4) = 1, beating the direct 0 -> 1 = 2.
+        let vids = vec![Vid::from(0), Vid::from(1), Vid::from(2)];
+        let edges = vec![
+            (Vid::from(0), Vid::from(1)),
+            (Vid::from(0), Vid::from(2)),
+            (Vid::from(2), Vid::from(1)),
+        ];
+
+        let mut graph = build_test_graph(vids, edges);
+        // Flattened CSR weights, matching out-adjacency layout:
+        // Node 0: [0->1 = 2.0, 0->2 = 5.0]
+        // Node 1: []
+        // Node 2: [2->1 = -4.0]
+        graph.out_weights = Some(vec![2.0, 5.0, -4.0]);
+
+        let config = DijkstraConfig {
+            source: Vid::from(0),
+            target: Some(Vid::from(1)),
+            max_distance: None,
+        };
+
+        // The negative edge 2 -> 1 must be rejected, not silently mis-routed.
+        assert!(matches!(
+            Dijkstra::run(&graph, config),
+            Err(DijkstraError::NegativeEdge { .. })
+        ));
     }
 }

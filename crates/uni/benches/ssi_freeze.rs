@@ -25,7 +25,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 use uni_db::{DataType, Uni};
 
-const L0_SIZES: &[usize] = &[1_000, 10_000];
+const L0_SIZES: &[usize] = &[1_000, 10_000, 50_000];
 
 async fn seed(n: usize) -> Arc<Uni> {
     let db = Uni::in_memory().build().await.unwrap();

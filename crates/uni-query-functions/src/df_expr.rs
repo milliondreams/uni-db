@@ -1330,7 +1330,11 @@ fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfE
             Ok(dummy_udf_expr("_cypher_xor", vec![left, right]))
         }
 
-        // Arithmetic operators
+        // Arithmetic operators — emitted as native DF ops here because types are
+        // not yet known at translation time. The Int64×Int64 checked-UDF routing
+        // (for overflow / division by zero) is applied later in
+        // `coerce_binary_expr`, the type-coercion convergence point. The `+`
+        // list-concat special case still routes to `_cypher_list_concat`.
         BinaryOp::Add => {
             if is_list_expr(&left) || is_list_expr(&right) {
                 Ok(dummy_udf_expr("_cypher_list_concat", vec![left, right]))
@@ -2333,11 +2337,21 @@ impl datafusion::logical_expr::ScalarUDFImpl for DummyUdf {
 
     fn return_type(
         &self,
-        _arg_types: &[datafusion::arrow::datatypes::DataType],
+        arg_types: &[datafusion::arrow::datatypes::DataType],
     ) -> datafusion::error::Result<datafusion::arrow::datatypes::DataType> {
-        // Return the UDF-name-based return type so that apply_type_coercion
-        // can correctly route nested expressions before resolve_udfs runs.
-        Ok(self.ret_type.clone())
+        // Arithmetic UDFs are type-preserving (Int64×Int64 → Int64,
+        // float/mixed → Float64, CypherValue → LargeBinary): resolve their
+        // return type dynamically from arg_types so logical type-coercion agrees
+        // with the resolved UDF's actual output and avoids a schema mismatch.
+        match self.name.as_str() {
+            "_cypher_add" | "_cypher_sub" | "_cypher_mul" | "_cypher_div" | "_cypher_mod" => {
+                Ok(crate::df_udfs::cypher_arith_return_type(arg_types))
+            }
+            // Other UDFs keep the UDF-name-based return type so that
+            // apply_type_coercion can correctly route nested expressions before
+            // resolve_udfs runs.
+            _ => Ok(self.ret_type.clone()),
+        }
     }
 
     fn invoke_with_args(
@@ -3209,6 +3223,23 @@ fn coerce_binary_expr(
             is_comparison,
         ) {
             return Ok(result);
+        }
+
+        // Int64×Int64 arithmetic convergence point (projections + WITH/group-by):
+        // route `+`/`-`/`*`/`/`/`%` on two statically-Int64 operands through the
+        // type-preserving checked Cypher UDFs so integer overflow / i64::MIN/-1 /
+        // division by zero error instead of silently wrapping (native Arrow int
+        // kernels wrap). Only integers can overflow, so the gate is surgical:
+        // float/string/mixed/non-numeric arithmetic falls through to the native
+        // path below, which preserves the native compile-time type errors and
+        // NaN-aware comparison routing that the UDF would otherwise bypass.
+        if let Some(name) = arithmetic_udf_name(binary.op)
+            && left_type == DataType::Int64
+            && right_type == DataType::Int64
+            && !is_list_expr(&left)
+            && !is_list_expr(&right)
+        {
+            return Ok(dummy_udf_expr(name, vec![left, right]));
         }
     }
 

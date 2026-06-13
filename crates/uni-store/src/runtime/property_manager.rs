@@ -1329,16 +1329,18 @@ impl PropertyManager {
 
         let jsonb_bytes = binary_array.value(row);
 
-        // Decode CypherValue binary
-        let uni_val = uni_common::cypher_value_codec::decode(jsonb_bytes)
-            .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-        let json_val: serde_json::Value = uni_val.into();
-
-        // Parse to Properties
-        let overflow_props: Properties = serde_json::from_value(json_val)
-            .map_err(|e| anyhow!("Failed to parse overflow properties: {}", e))?;
-
-        Ok(Some(overflow_props))
+        // Decode the CypherValue blob directly to `Value`. Routing through
+        // `serde_json` would stringify temporal values (and is unnecessary —
+        // the blob already decodes to a `Value::Map`).
+        match uni_common::cypher_value_codec::decode(jsonb_bytes)
+            .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?
+        {
+            Value::Map(map) => Ok(Some(map)),
+            Value::Null => Ok(None),
+            other => Err(anyhow!(
+                "overflow_json decoded to a non-map value: {other:?}"
+            )),
+        }
     }
 
     /// Merge overflow properties from the overflow_json column into an existing props map.
@@ -1548,8 +1550,12 @@ impl PropertyManager {
             }
         }
 
-        // Fallback to main table props_json for unknown/schemaless labels
+        // Fallback to main table props_json for unknown/schemaless labels.
+        // Gated on "no per-label verdict" (neither a live row nor a tombstone
+        // was seen), so a per-label deletion tombstone is never overridden by
+        // an older main-table row.
         if merged_props.is_none()
+            && global_best_version.is_none()
             && let Some(main_props) = MainVertexDataset::find_props_by_vid(
                 self.storage.backend(),
                 vid,
@@ -1819,6 +1825,24 @@ impl PropertyManager {
                 }
             }
         }
+
+        // Fallback to main-table props_json for unknown/schemaless labels —
+        // their rows have no per-label table at all (mirrors
+        // `fetch_all_props_from_storage`). Gated on "no per-label verdict"
+        // (neither a live value nor a tombstone was seen), so a per-label
+        // tombstone is never overridden by an older main-table row.
+        if best_value.is_none()
+            && best_version.is_none()
+            && let Some(main_props) = MainVertexDataset::find_props_by_vid(
+                self.storage.backend(),
+                vid,
+                self.storage.version_high_water_mark(),
+            )
+            .await?
+        {
+            return Ok(main_props.get(prop).cloned().unwrap_or(Value::Null));
+        }
+
         Ok(best_value.unwrap_or(Value::Null))
     }
 

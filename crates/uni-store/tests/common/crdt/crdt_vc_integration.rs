@@ -123,7 +123,7 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
 
     // 7. Verify Read (Merge of UpdateB and UpdateC)
     // Clocks merge: {A:1, B:1, C:1}
-    // Value: Tie-break logic in VCRegister (currently keeps self if concurrent, depends on merge order)
+    // Value: VCRegister breaks concurrent ties deterministically (larger serialized value), order-independent.
     // L0 has UpdateC. Storage (conceptually) has UpdateB (if flushed, but here B is in L0 too?).
     // Actually, Writer overwrites L0. So L0 now has UpdateC?
     // Wait, Writer logic:
@@ -147,13 +147,9 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
         assert_eq!(reg.clock.get("B"), 1);
         assert_eq!(reg.clock.get("C"), 1);
 
-        // Value depends on which one was "self" in merge.
-        // insert_vertex calls `new_crdt.merge(existing)`.
-        // new=UpdateC, existing=UpdateB.
-        // UpdateC vs UpdateB -> Concurrent.
-        // VCRegister merge implementation:
-        // Concurrent => merge clocks, keep self.value.
-        // So it should keep UpdateC.
+        // UpdateC vs UpdateB are concurrent. VCRegister breaks the tie
+        // deterministically on the larger serialized value (order-independent),
+        // so "UpdateC" > "UpdateB" wins.
         assert_eq!(reg.value, serde_json::to_value("UpdateC")?);
     } else {
         panic!("Expected VCRegister");

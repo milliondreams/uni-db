@@ -344,7 +344,7 @@ def normalize_key(raw_key: str) -> str:
 def infer_literal_type(raw_value: str) -> str:
     value = raw_value.strip()
     if not value:
-        return "Json"
+        return "CypherValue"
     lower = value.lower()
 
     if value.startswith("'") or value.startswith('"'):
@@ -352,9 +352,9 @@ def infer_literal_type(raw_value: str) -> str:
     if lower.startswith("true") or lower.startswith("false"):
         return "Bool"
     if lower.startswith("null"):
-        return "Json"
+        return "CypherValue"
     if value.startswith("[") or value.startswith("{"):
-        return "Json"
+        return "CypherValue"
 
     if re.match(r"^-?\d+$", value):
         return "Int64"
@@ -374,7 +374,7 @@ def infer_literal_type(raw_value: str) -> str:
         return "Duration"
 
     # Parameters, expressions, function calls, arithmetic, etc.
-    return "Json"
+    return "CypherValue"
 
 
 def merge_types(existing: str | None, new_type: str) -> str:
@@ -382,9 +382,12 @@ def merge_types(existing: str | None, new_type: str) -> str:
         return new_type
     if existing == new_type:
         return existing
-    if {existing, new_type} == {"Int64", "Float64"}:
-        return "Float64"
-    return "Json"
+    # Mixed concrete types (e.g. Int64 + Float64 across a feature's scenarios, or
+    # numeric + String) share no lossless common Arrow primitive. A typed
+    # supertype column would coerce stored values on read-back (e.g. Int -11 ->
+    # Float -11.0), mismatching openCypher's typed result tables. Fall back to
+    # CypherValue (lossless MessagePack codec), exactly as schemaless mode does.
+    return "CypherValue"
 
 
 def parse_map_properties(map_body: str) -> dict[str, str]:
@@ -707,12 +710,12 @@ def collect_bound_property_reference_types(
         if var in node_var_labels:
             for lbl in node_var_labels[var]:
                 bucket = label_props.setdefault(lbl, {})
-                # Reference-only properties default to Json when type can't be inferred.
-                bucket[prop] = merge_types(bucket.get(prop), "Json")
+                # Reference-only properties default to CypherValue when type can't be inferred.
+                bucket[prop] = merge_types(bucket.get(prop), "CypherValue")
         if var in rel_var_types:
             for et in rel_var_types[var]:
                 bucket = edge_props.setdefault(et, {})
-                bucket[prop] = merge_types(bucket.get(prop), "Json")
+                bucket[prop] = merge_types(bucket.get(prop), "CypherValue")
 
     return label_props, edge_props
 
@@ -818,17 +821,17 @@ def generate_for_feature(feature_path: Path) -> Path:
             for key in props:
                 bucket.add(key)
 
-    # Materialize reference-only properties as Json where concrete typing is absent.
+    # Materialize reference-only properties as CypherValue where concrete typing is absent.
     for lbl, props in ref_label_props.items():
         bucket = label_props.setdefault(lbl, {})
         for key in props:
             if key not in bucket:
-                bucket[key] = "Json"
+                bucket[key] = "CypherValue"
     for et, props in ref_edge_props.items():
         bucket = edge_props.setdefault(et, {})
         for key in props:
             if key not in bucket:
-                bucket[key] = "Json"
+                bucket[key] = "CypherValue"
 
     schema = build_schema(labels, edge_types, label_props, edge_props)
     out_path = feature_path.with_suffix(".schema.json")

@@ -114,7 +114,10 @@ pub async fn execute_query(db: &Uni, query: &str) {
         return;
     }
 
-    match db.session().query(query).await {
+    // `Session::run` auto-commits writes (CREATE/SET/MERGE/DELETE/DDL) and
+    // forwards reads to `query`, so the REPL and one-shot `uni query` both
+    // execute mutations instead of hitting the read-only `query` gate.
+    match db.session().run(query).await {
         Ok(results) => print_results(results, start.elapsed()),
         Err(e) => print_query_error(e),
     }

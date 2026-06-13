@@ -114,7 +114,17 @@ impl Algorithm for Louvain {
                 // Remove v from current community
                 community_weights[current_comm as usize] -= v_weight;
 
-                for (&target_comm, &k_i_in) in &neighbor_comm_weights {
+                // Iterate candidate communities in a deterministic (community-id)
+                // order so HashMap iteration-seed differences cannot flip an
+                // otherwise-tied best-community choice. This keeps the detected
+                // partition reproducible across runs.
+                let mut candidates: Vec<(u32, f64)> = neighbor_comm_weights
+                    .iter()
+                    .map(|(&c, &w)| (c, w))
+                    .collect();
+                candidates.sort_unstable_by_key(|&(c, _)| c);
+
+                for &(target_comm, k_i_in) in &candidates {
                     let target_comm_weight = community_weights[target_comm as usize];
 
                     // Modularity gain formula:
@@ -171,26 +181,95 @@ fn compute_modularity(graph: &GraphProjection, community: &[u32], m: f64, resolu
     let n = graph.vertex_count();
     let mut q = 0.0;
 
-    // Sum over communities
+    // Sum over communities.
+    //
+    // `comm_total_weights` accumulates each community's *full undirected
+    // degree* `D_c`: every edge `v -> u` adds 1 to both endpoints' community
+    // totals. Summing out-degree alone (as before) under-counts the degree of
+    // every node that only appears as an edge target on a single-direction
+    // projection, mis-scaling `Q` relative to the undirected `m` and internal
+    // counts. `comm_internal_weights` counts each undirected internal edge
+    // once (`L_c`), matching the single-direction edge layout.
     let mut comm_internal_weights: HashMap<u32, f64> = HashMap::new();
     let mut comm_total_weights: HashMap<u32, f64> = HashMap::new();
 
     for v in 0..n as u32 {
         let v_comm = community[v as usize];
-        let v_deg = graph.out_degree(v) as f64;
-        *comm_total_weights.entry(v_comm).or_insert(0.0) += v_deg;
-
         for &u in graph.out_neighbors(v) {
-            if community[u as usize] == v_comm {
+            let u_comm = community[u as usize];
+            // Undirected degree: the edge contributes to both endpoints.
+            *comm_total_weights.entry(v_comm).or_insert(0.0) += 1.0;
+            *comm_total_weights.entry(u_comm).or_insert(0.0) += 1.0;
+            if u_comm == v_comm {
                 *comm_internal_weights.entry(v_comm).or_insert(0.0) += 1.0;
             }
         }
     }
 
+    // The undirected modularity is `Q = Σ_c [ L_c / M − (D_c / 2M)^2 ]`, where
+    // `M = 2m` is the total number of undirected edges. Here `m` is the value
+    // `Louvain::run` derives (sum of out-degrees / 2), so `M = 2m` and the
+    // degree term denominator is `2M = 4m`.
+    let two_m = 2.0 * m;
     for (&comm, &internal) in &comm_internal_weights {
         let total = comm_total_weights[&comm];
-        q += (internal / (2.0 * m)) - resolution * (total / (2.0 * m)).powi(2);
+        q += (internal / two_m) - resolution * (total / (2.0 * two_m)).powi(2);
     }
 
     q
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algo::test_utils::build_test_graph;
+
+    /// Regression: `compute_modularity` mis-scales directed degree vs internal.
+    ///
+    /// `comm_total_weights` sums out-degree only while `comm_internal_weights`
+    /// counts each undirected internal edge once and `m = sum(out_degree) / 2`.
+    /// On a directed (single-direction) projection these conventions disagree,
+    /// so the reported modularity `Q` is wrong for the natural partition.
+    ///
+    /// Two triangles {0,1,2} and {3,4,5} joined by the single bridge edge 2-3,
+    /// represented as 7 single-direction edges, give `m = 3.5`. The natural
+    /// 2-community partition has correct undirected modularity `Q = 0.3571`
+    /// (M = 7, internal = 3 per community, D_c = 7 per community).
+    // Rust guideline compliant
+    #[test]
+    fn test_louvain_modularity_scaling() {
+        // Two triangles plus a bridge, each undirected edge written once.
+        // Triangle A: 0-1, 1-2, 0-2 ; Triangle B: 3-4, 4-5, 3-5 ; bridge 2-3.
+        let vids = (0..6).map(Vid::from).collect::<Vec<_>>();
+        let edges = vec![
+            (Vid::from(0), Vid::from(1)),
+            (Vid::from(1), Vid::from(2)),
+            (Vid::from(0), Vid::from(2)),
+            (Vid::from(3), Vid::from(4)),
+            (Vid::from(4), Vid::from(5)),
+            (Vid::from(3), Vid::from(5)),
+            (Vid::from(2), Vid::from(3)),
+        ];
+
+        let graph = build_test_graph(vids, edges);
+
+        // Natural 2-community partition: {0,1,2} -> 0, {3,4,5} -> 1.
+        let community: Vec<u32> = vec![0, 0, 0, 1, 1, 1];
+
+        // m as `Louvain::run` derives it for a no-reverse projection:
+        // sum of out-degrees / 2 = 7 / 2 = 3.5.
+        let m: f64 = (0..graph.vertex_count() as u32)
+            .map(|v| graph.out_degree(v) as f64)
+            .sum::<f64>()
+            / 2.0;
+
+        let q = compute_modularity(&graph, &community, m, 1.0);
+
+        // Correct undirected modularity for this partition is 0.3571.
+        // RED today: the directed degree/internal mis-scaling yields ~0.3469.
+        assert!(
+            (q - 0.3571).abs() < 1e-3,
+            "modularity should be ~0.3571, got {q}"
+        );
+    }
 }

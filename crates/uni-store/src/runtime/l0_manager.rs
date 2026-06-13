@@ -46,8 +46,16 @@ pub struct SnapshotView {
     pub extra: Vec<Arc<RwLock<L0Buffer>>>,
     /// Pin marker keeping the captured generation freeze-on-commit.
     pin: Arc<PinToken>,
-    /// Main-L0 version at capture; the hook a future C2 will feed to `open_at`.
+    /// Main-L0 version at capture (the C2 hwm fed into `pinned_storage`).
     pub started_at_version: u64,
+    /// C2: a `StorageManager` clone pinned to `started_at_version`
+    /// (`StorageManager::pinned_at_version`), so L1 scans filter to
+    /// `_version <= started_at_version` and an L0→L1 flush completing
+    /// mid-transaction cannot leak post-snapshot rows. Installed by the
+    /// transaction at begin (one per transaction — the pinned manager
+    /// carries a fresh `AdjacencyManager`); `None` for snapshots taken
+    /// without a storage pin.
+    pub pinned_storage: Option<Arc<crate::storage::manager::StorageManager>>,
 }
 
 impl std::fmt::Debug for SnapshotView {
@@ -224,6 +232,7 @@ impl L0Manager {
             extra,
             pin,
             started_at_version,
+            pinned_storage: None,
         }
     }
 

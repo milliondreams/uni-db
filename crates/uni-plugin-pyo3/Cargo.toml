@@ -44,7 +44,7 @@ semver = "1"
 # embedder is the host process. `auto-initialize` causes pyo3 to call
 # `Py_Initialize` on first `Python::attach`, which is required for
 # `cargo test -p uni-plugin-pyo3` to link.
-pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "auto-initialize"] }
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py310", "auto-initialize"] }
 
 [features]
 default = []

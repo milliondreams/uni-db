@@ -113,6 +113,37 @@ jobs:
             --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal
 
+  # openCypher conformance on PRs (schemaless mode only — the cheaper of
+  # the two modes; the sidecar-schema mode stays on the main-push CI run).
+  # Without this, a PR breaking Cypher conformance lands green and fails
+  # post-merge.
+  tck:
+    name: openCypher TCK (schemaless)
+    runs-on: ubuntu-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      - name: Run openCypher TCK (schemaless)
+        run: cargo nextest run -p uni-tck --test tck
+
   # Python bindings tests
   python-tests:
     name: Python Tests

@@ -44,6 +44,7 @@ pub mod synthetic_procedure {
 pub use api::builder::PropertiesBuilder;
 pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
 pub use api::impl_locy::LocyRuleRegistry;
+pub use api::locy_rule_catalog::{LocyRulePersister, RegisteredSource};
 pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
 pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
 pub use api::prepared::{PreparedLocy, PreparedLocyBinder, PreparedQuery, PreparedQueryBinder};
@@ -57,8 +58,9 @@ pub use api::session::{
     Session, SessionCapabilities, SessionMetrics, TransactionBuilder, WriteLeaseSummary,
 };
 pub use api::sync::{
-    ApplyBuilderSync, ExecuteBuilderSync, LocyBuilderSync, QueryBuilderSync, SessionSync,
-    TransactionBuilderSync, TransactionSync, TxLocyBuilderSync, TxQueryBuilderSync, UniSync,
+    ApplyBuilderSync, ExecuteBuilderSync, LocyBuilderSync, QueryBuilderSync, RuleRegistrySync,
+    SessionSync, TransactionBuilderSync, TransactionSync, TxLocyBuilderSync, TxQueryBuilderSync,
+    UniSync,
 };
 pub use api::template::{SessionTemplate, SessionTemplateBuilder};
 pub use api::transaction::{

@@ -21,7 +21,7 @@
 
 #![cfg(feature = "pyo3")]
 
-use std::ffi::CString;
+use std::ffi::CStr;
 
 use arrow_array::ffi::{FFI_ArrowArray, from_ffi};
 use arrow_array::{Array, ArrayRef, make_array};
@@ -32,8 +32,8 @@ use pyo3::types::{PyCapsule, PyCapsuleMethods, PyTuple};
 
 use crate::error::PyPluginError;
 
-const SCHEMA_CAPSULE_NAME: &str = "arrow_schema";
-const ARRAY_CAPSULE_NAME: &str = "arrow_array";
+const SCHEMA_CAPSULE_NAME: &CStr = c"arrow_schema";
+const ARRAY_CAPSULE_NAME: &CStr = c"arrow_array";
 
 /// Producer-side: build a `(schema_capsule, array_capsule)` 2-tuple
 /// PyTuple that pyarrow consumers (or any object exposing
@@ -190,14 +190,12 @@ pub fn pyarrow_to_arrow_array(
     // raw pointer. We then *move out* of the array capsule via
     // ptr::read + write-back of an empty struct so the producer's
     // destructor doesn't double-release.
-    let schema_name_c = CString::new(SCHEMA_CAPSULE_NAME).expect("static literal");
-    let array_name_c = CString::new(ARRAY_CAPSULE_NAME).expect("static literal");
     let schema_ptr = schema_cap
-        .pointer_checked(Some(schema_name_c.as_c_str()))
+        .pointer_checked(Some(SCHEMA_CAPSULE_NAME))
         .map_err(|e| PyPluginError::ArrowConversion(format!("schema capsule pointer: {e}")))?
         .as_ptr() as *const FFI_ArrowSchema;
     let array_ptr = array_cap
-        .pointer_checked(Some(array_name_c.as_c_str()))
+        .pointer_checked(Some(ARRAY_CAPSULE_NAME))
         .map_err(|e| PyPluginError::ArrowConversion(format!("array capsule pointer: {e}")))?
         .as_ptr() as *mut FFI_ArrowArray;
 
@@ -243,14 +241,12 @@ pub fn assert_array_datatype(arr: &dyn Array, expected: &DataType) -> Result<(),
 fn make_arrow_capsule<'py, T>(
     py: Python<'py>,
     value: T,
-    name: &str,
+    name: &'static CStr,
 ) -> Result<Bound<'py, PyCapsule>, PyPluginError>
 where
     T: 'static + Send,
 {
-    let cname = CString::new(name)
-        .map_err(|e| PyPluginError::ArrowConversion(format!("CString for `{name}`: {e}")))?;
-    PyCapsule::new(py, value, Some(cname)).map_err(PyPluginError::from)
+    PyCapsule::new_with_value(py, value, name).map_err(PyPluginError::from)
 }
 
 #[cfg(test)]

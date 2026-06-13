@@ -1,26 +1,44 @@
-//! Generic pre-warmed instance pool for wasm-backed plugins.
+//! Per-plugin instance cache with a concurrency cap.
 //!
-//! One pool per loaded plugin. Holds a fixed-size queue of warm
-//! instances; `acquire` is a wait-free `pop` in steady state. Cold
-//! first-call latency (10–100 ms wasmtime instantiation) amortizes to
-//! pool-size `O(1)` cost once the pool is primed.
+//! One [`InstancePool`] per loaded plugin. **It does not reuse live
+//! instances.** Every [`InstancePool::acquire`] constructs a *fresh*
+//! instance via the loader-supplied factory; the factory is expected to
+//! be cheap because the heavy artifacts (a compiled wasmtime `Component`
+//! plus its `InstancePre`, or extism's prepared `Manifest`) are cached
+//! by the loader and the factory only spins up a fresh `Store`+instance.
 //!
-//! Per the M6.shared lift, the pool is generic over both:
+//! Freshness per acquire is a *security* property, not just hygiene:
 //!
-//! - **`T`** — the pooled instance type (`extism::Plugin`,
-//!   `wasmtime::component::Instance`, or a dummy in tests).
+//! - A reused `Store<HostState>` would leak guest linear memory,
+//!   globals, and WASI context across unrelated invocations — a `Pure`
+//!   function could carry state between two unrelated queries (bug #2).
+//! - A trapped store recycled back into a warm pool would re-trap or
+//!   read poisoned memory on its next use (bug #3).
+//!
+//! Re-instantiating per acquire closes both: fresh state every call, and
+//! a trapped instance is simply dropped (its `Drop` decrements the live
+//! counter) and never handed out again.
+//!
+//! What remains of the old pool is the **concurrency cap**:
+//! `PoolConfig::max_instances` bounds how many instances may be live at
+//! once (so a flood of concurrent UDF calls can't exhaust wasmtime
+//! memory), enforced via the same CAS-guarded `live` counter the old
+//! capacity check used. [`PoolMetrics`] keeps a sane meaning —
+//! `misses` counts fresh constructions (every acquire), `hits` is now
+//! always zero (no warm reuse), `exhausted` counts cap rejections,
+//! `live` is the current in-flight count.
+//!
+//! Generic over both:
+//!
+//! - **`T`** — the per-invoke instance type (`extism::Plugin`, a
+//!   wasmtime component instance wrapper, or a dummy in tests).
 //! - **`E`** — the loader-specific error type. The factory returns
 //!   `Result<T, E>`; `acquire` constructs `E` from a
 //!   resource-exhaustion message via [`PoolResourceLimit`].
-//!
-//! Each loader supplies a one-line `impl PoolResourceLimit for ItsError`
-//! so the pool can raise its capacity errors without knowing the loader's
-//! error shape.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
 /// Per-pool configuration.
@@ -29,9 +47,17 @@ pub struct PoolConfig {
     /// Maximum concurrent live instances.
     ///
     /// Bounds the wasmtime memory footprint. Default `4` matches the
-    /// `Capability::ConcurrentInstances` default in the proposal.
+    /// `Capability::ConcurrentInstances` default in the proposal. Acts
+    /// as a concurrency semaphore: at most this many instances may be
+    /// in flight at once.
     pub max_instances: usize,
-    /// Number of instances eagerly instantiated at pool construction.
+    /// Retained for API compatibility; no longer pre-warms anything.
+    ///
+    /// Instances are now built fresh per [`InstancePool::acquire`] (so a
+    /// reused store can't leak guest state across calls), so there is no
+    /// warm pool to populate. The field stays so existing
+    /// `PoolConfig { max_instances, warm_count }` construction sites keep
+    /// compiling and downstream config surfaces keep their shape.
     pub warm_count: usize,
 }
 
@@ -47,13 +73,13 @@ impl Default for PoolConfig {
 /// Pool metrics surface — read by `host.metric_counter` host imports.
 #[derive(Debug, Default)]
 pub struct PoolMetrics {
-    /// Successful pool acquires (hit on warm instance).
+    /// Warm-reuse hits. Always `0` since instances are never reused.
     pub hits: AtomicU64,
-    /// Cold-path acquires (constructed fresh).
+    /// Fresh constructions — one per successful acquire.
     pub misses: AtomicU64,
     /// Acquires that failed because `max_instances` was reached.
     pub exhausted: AtomicU64,
-    /// Currently-live instances (warm + checked-out).
+    /// Currently-live (in-flight) instances.
     pub live: AtomicU64,
 }
 
@@ -74,18 +100,20 @@ pub trait PoolResourceLimit {
     fn resource_limit(msg: String) -> Self;
 }
 
-/// A pool of pre-warmed instances for one plugin.
+/// A per-plugin instance cache with a concurrency cap.
 ///
-/// Generic over the pooled instance type `T` and the loader's error
+/// Generic over the per-invoke instance type `T` and the loader's error
 /// type `E`. Production use: `InstancePool<extism::Plugin, ExtismError>`
-/// or `InstancePool<wasmtime::component::Instance, WasmError>`.
+/// or `InstancePool<ScalarPluginInstance, WasmError>`.
+///
+/// **Does not reuse instances** — every [`Self::acquire`] builds a fresh
+/// one and every release drops it. See the module docs for why.
 pub struct InstancePool<T, E>
 where
     T: Send + 'static,
     E: PoolResourceLimit + Send + Sync + 'static,
 {
     cfg: PoolConfig,
-    idle: ArrayQueue<T>,
     factory: Mutex<Box<dyn Fn() -> Result<T, E> + Send + Sync>>,
     metrics: Arc<PoolMetrics>,
 }
@@ -98,12 +126,11 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstancePool")
             .field("cfg", &self.cfg)
-            .field("idle.len", &self.idle.len())
-            .field("metrics.hits", &self.metrics.hits.load(Ordering::Relaxed))
             .field(
                 "metrics.misses",
                 &self.metrics.misses.load(Ordering::Relaxed),
             )
+            .field("metrics.live", &self.metrics.live.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -113,57 +140,41 @@ where
     T: Send + 'static,
     E: PoolResourceLimit + Send + Sync + 'static,
 {
-    /// Construct a pool that builds new instances via `factory`.
+    /// Construct a pool that builds fresh instances via `factory`.
     ///
-    /// Eagerly constructs `cfg.warm_count.min(cfg.max_instances)`
-    /// instances at construction time so first-call latency is the
-    /// pool's steady-state hit cost, not a fresh wasmtime compile.
+    /// `cfg.warm_count` is accepted for API compatibility but ignored:
+    /// nothing is pre-warmed, because instances are never reused.
     ///
     /// # Errors
     ///
-    /// Propagates factory errors from initial warm-up.
+    /// This constructor is infallible in practice; the `E` in the return
+    /// type is retained so the signature is stable across the refactor.
     pub fn new(
         cfg: PoolConfig,
         factory: impl Fn() -> Result<T, E> + Send + Sync + 'static,
     ) -> Result<Self, E> {
-        let idle = ArrayQueue::new(cfg.max_instances.max(1));
         let factory = Mutex::new(Box::new(factory) as Box<dyn Fn() -> Result<T, E> + Send + Sync>);
-        let metrics = Arc::new(PoolMetrics::default());
-
-        let pool = Self {
-            cfg: cfg.clone(),
-            idle,
+        Ok(Self {
+            cfg,
             factory,
-            metrics: Arc::clone(&metrics),
-        };
-
-        for _ in 0..cfg.warm_count.min(cfg.max_instances) {
-            let inst = (pool.factory.lock())()?;
-            let _ = pool.idle.push(inst);
-            metrics.live.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(pool)
+            metrics: Arc::new(PoolMetrics::default()),
+        })
     }
 
-    /// Acquire an instance from the pool.
+    /// Acquire a *fresh* instance, honoring the concurrency cap.
     ///
-    /// Pops a warm instance if available; otherwise constructs a new
-    /// one if `live < max_instances`. Returns a loader-specific
-    /// resource-limit error if the pool is at capacity.
+    /// Reserves a live slot (CAS against `max_instances`), then builds a
+    /// brand-new instance via the factory. No warm reuse — the returned
+    /// instance has clean state. Releasing it (via [`PooledInstance`]'s
+    /// drop) frees the slot.
     ///
     /// # Errors
     ///
     /// - `E::resource_limit(...)` when `max_instances` is reached.
-    /// - Whatever the factory returns on cold-construction failure.
+    /// - Whatever the factory returns on construction failure.
     pub fn acquire(&self) -> Result<T, E> {
-        if let Some(inst) = self.idle.pop() {
-            self.metrics.hits.fetch_add(1, Ordering::SeqCst);
-            return Ok(inst);
-        }
-        // Reserve a live slot atomically. The previous form had a
-        // check-then-act race between `load()` and `fetch_add()` that
-        // let two concurrent acquirers both pass the capacity check and
-        // briefly push `live` above `max_instances`.
+        // Reserve a live slot atomically. CAS-loop guarantees the
+        // invariant `live <= max` even under concurrent acquirers.
         let max = self.cfg.max_instances as u64;
         loop {
             let live = self.metrics.live.load(Ordering::SeqCst);
@@ -183,8 +194,8 @@ where
                 break;
             }
         }
-        // The slot is reserved; construct the instance. If construction
-        // fails, give the slot back so the next acquirer can try.
+        // The slot is reserved; construct a fresh instance. If
+        // construction fails, give the slot back.
         let inst = match (self.factory.lock())() {
             Ok(v) => v,
             Err(err) => {
@@ -196,14 +207,14 @@ where
         Ok(inst)
     }
 
-    /// Release an instance back to the pool.
+    /// Release an instance, freeing its concurrency slot.
     ///
-    /// On overflow (race with reaper), the instance is dropped — its
-    /// `Drop` impl is responsible for any cleanup.
+    /// The instance is dropped here (never recycled), so its `Drop` impl
+    /// runs any cleanup. A trapped instance is therefore discarded, not
+    /// handed back out.
     pub fn release(&self, inst: T) {
-        if self.idle.push(inst).is_err() {
-            self.metrics.live.fetch_sub(1, Ordering::SeqCst);
-        }
+        drop(inst);
+        self.metrics.live.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Snapshot the current metrics.
@@ -217,18 +228,15 @@ where
     pub fn config(&self) -> &PoolConfig {
         &self.cfg
     }
-
-    #[doc(hidden)]
-    pub fn idle_len(&self) -> usize {
-        self.idle.len()
-    }
 }
 
-/// RAII wrapper acquired from an [`InstancePool`]: holds the instance
-/// and returns it to the pool on drop.
+/// RAII handle to an instance acquired from an [`InstancePool`].
 ///
-/// Adapters use this to make "acquire-call-release" exception-safe — if
-/// the plugin call panics, the instance still returns home (drop runs).
+/// Holds the fresh instance and frees its concurrency slot on drop
+/// (dropping the instance — never recycling it). Adapters use this to
+/// make "acquire-call-drop" exception-safe: if the plugin call panics or
+/// traps, the slot still frees and the (possibly poisoned) instance is
+/// discarded.
 pub struct PooledInstance<T, E>
 where
     T: Send + 'static,
@@ -279,9 +287,14 @@ where
             .expect("PooledInstance accessed after take/drop")
     }
 
-    /// Consume the wrapper, returning the inner instance and **not**
-    /// releasing it to the pool. Use this if the instance is known to
-    /// be corrupted (e.g., trapped on epoch interrupt).
+    /// Consume the wrapper, returning the inner instance without freeing
+    /// its concurrency slot via the pool.
+    ///
+    /// Retained for API compatibility. With per-invoke instances there is
+    /// no "corrupted vs clean" distinction at the pool level (a dropped
+    /// instance is always discarded), but `take` still moves the instance
+    /// out and decrements the live counter so callers that need ownership
+    /// keep working.
     pub fn take(mut self) -> T {
         let inst = self.inst.take().expect("PooledInstance already taken");
         self.pool.metrics.live.fetch_sub(1, Ordering::SeqCst);
@@ -296,6 +309,8 @@ where
 {
     fn drop(&mut self) {
         if let Some(inst) = self.inst.take() {
+            // Always discards the instance and frees the slot — never
+            // recycles, so a trapped store can't be handed out again.
             self.pool.release(inst);
         }
     }
@@ -324,44 +339,51 @@ mod tests {
     type TestPool = InstancePool<Dummy, TestErr>;
 
     #[test]
-    fn warmup_populates_idle_queue() {
+    fn acquire_constructs_fresh_each_time() {
         let n = Arc::new(AtomicU64::new(0));
         let nc = Arc::clone(&n);
         let pool = TestPool::new(
             PoolConfig {
                 max_instances: 4,
-                warm_count: 2,
-            },
-            move || Ok(Dummy(nc.fetch_add(1, Ordering::SeqCst) as u32)),
-        )
-        .unwrap();
-        assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn acquire_release_round_trip_counts_hits_and_misses() {
-        let n = Arc::new(AtomicU64::new(0));
-        let nc = Arc::clone(&n);
-        let pool = TestPool::new(
-            PoolConfig {
-                max_instances: 2,
                 warm_count: 1,
             },
             move || Ok(Dummy(nc.fetch_add(1, Ordering::SeqCst) as u32)),
         )
         .unwrap();
 
+        // Nothing pre-warmed: live starts at zero.
+        assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 0);
+
         let a = pool.acquire().unwrap();
-        assert_eq!(pool.metrics.hits.load(Ordering::SeqCst), 1);
-
         let b = pool.acquire().unwrap();
-        assert_eq!(pool.metrics.misses.load(Ordering::SeqCst), 1);
+        // Distinct fresh instances, both counted as misses (no warm reuse).
+        assert_ne!(a.0, b.0);
+        assert_eq!(pool.metrics.misses.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.metrics.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 2);
+    }
 
-        pool.release(a);
-        pool.release(b);
-
-        let _ = pool.acquire().unwrap();
-        assert_eq!(pool.metrics.hits.load(Ordering::SeqCst), 2);
+    #[test]
+    fn release_frees_the_slot() {
+        let pool = Arc::new(
+            TestPool::new(
+                PoolConfig {
+                    max_instances: 1,
+                    warm_count: 0,
+                },
+                || Ok(Dummy(0)),
+            )
+            .unwrap(),
+        );
+        {
+            let _h = PooledInstance::acquire(Arc::clone(&pool)).unwrap();
+            assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 1);
+            // At capacity while held.
+            assert!(PooledInstance::acquire(Arc::clone(&pool)).is_err());
+        }
+        // Slot freed on drop — acquirable again.
+        assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 0);
+        let _h = PooledInstance::acquire(Arc::clone(&pool)).unwrap();
     }
 
     #[test]
@@ -369,7 +391,7 @@ mod tests {
         let pool = TestPool::new(
             PoolConfig {
                 max_instances: 1,
-                warm_count: 1,
+                warm_count: 0,
             },
             || Ok(Dummy(0)),
         )
@@ -381,44 +403,22 @@ mod tests {
     }
 
     #[test]
-    fn pooled_instance_releases_on_drop() {
-        let n = Arc::new(AtomicU64::new(0));
-        let nc = Arc::clone(&n);
+    fn pooled_instance_take_does_not_double_free() {
         let pool = Arc::new(
             TestPool::new(
                 PoolConfig {
                     max_instances: 2,
-                    warm_count: 1,
+                    warm_count: 0,
                 },
-                move || Ok(Dummy(nc.fetch_add(1, Ordering::SeqCst) as u32)),
-            )
-            .unwrap(),
-        );
-        assert_eq!(pool.idle_len(), 1);
-        {
-            let _h = PooledInstance::acquire(Arc::clone(&pool)).unwrap();
-            assert_eq!(pool.idle_len(), 0);
-        }
-        assert_eq!(pool.idle_len(), 1);
-    }
-
-    #[test]
-    fn pooled_instance_take_does_not_release() {
-        let n = Arc::new(AtomicU64::new(0));
-        let nc = Arc::clone(&n);
-        let pool = Arc::new(
-            TestPool::new(
-                PoolConfig {
-                    max_instances: 2,
-                    warm_count: 1,
-                },
-                move || Ok(Dummy(nc.fetch_add(1, Ordering::SeqCst) as u32)),
+                || Ok(Dummy(7)),
             )
             .unwrap(),
         );
         let h = PooledInstance::acquire(Arc::clone(&pool)).unwrap();
-        let _taken = h.take();
-        assert_eq!(pool.idle_len(), 0);
+        assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 1);
+        let taken = h.take();
+        assert_eq!(taken.0, 7);
+        // `take` decremented live; drop of `taken` does nothing extra.
         assert_eq!(pool.metrics.live.load(Ordering::SeqCst), 0);
     }
 
@@ -429,11 +429,10 @@ mod tests {
         assert_eq!(c.warm_count, 1);
     }
 
-    /// Regression: previously `acquire` was a check-then-increment
-    /// (`load`, then conditional `fetch_add`) under SeqCst — two
-    /// concurrent acquirers could both pass the capacity check and
-    /// briefly push `live` above `max_instances`. The CAS-loop form
-    /// guarantees the invariant `live <= max` even under contention.
+    /// The concurrency cap holds even under contention: at most
+    /// `max_instances` acquires succeed concurrently; the rest get
+    /// `resource_limit`. (The CAS-guarded `live` counter is the same one
+    /// the old capacity check used.)
     #[test]
     fn concurrent_acquire_never_exceeds_max() {
         use std::sync::Barrier;
@@ -471,9 +470,6 @@ mod tests {
             }
         }
 
-        // Exactly MAX acquires must have succeeded; the rest must have
-        // failed with `resource_limit`. The peak `live` count seen at
-        // any point must never have exceeded MAX.
         assert_eq!(held.len(), MAX, "exactly max_instances must be live");
         assert_eq!(pool.metrics.live.load(Ordering::SeqCst), MAX as u64);
         assert_eq!(

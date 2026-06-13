@@ -946,7 +946,7 @@ mod vc_register {
     }
 
     #[test]
-    fn test_merge_concurrent_keeps_self() {
+    fn test_merge_concurrent_converges_deterministically() {
         let base = VCRegister::new("Base".to_string(), "node1"); // {node1: 1}
 
         let mut r1 = base.clone();
@@ -955,12 +955,21 @@ mod vc_register {
         let mut r2 = base.clone();
         r2.set("B".to_string(), "node2"); // {node1: 1, node2: 1}
 
-        // r1 and r2 are concurrent
+        // r1 and r2 are concurrent. The tie-break is deterministic: the larger
+        // serialized value ("B" > "A") wins regardless of merge direction, so
+        // both replicas converge (review #4 — was an arbitrary "keep self").
         let mut r1_copy = r1.clone();
         let result = r1_copy.merge_register(&r2);
         assert_eq!(result, MergeResult::Concurrent);
-        // Tie-break: keeps self
-        assert_eq!(r1_copy.get(), "A");
+        assert_eq!(r1_copy.get(), "B");
+
+        let mut r2_copy = r2.clone();
+        r2_copy.merge_register(&r1);
+        assert_eq!(
+            r1_copy.get(),
+            r2_copy.get(),
+            "concurrent merge must converge to the same value in both directions"
+        );
     }
 
     #[test]

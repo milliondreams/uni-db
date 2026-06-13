@@ -1,5 +1,6 @@
 pub mod bug_bulk_edge_create_repro;
 pub mod bug_coalesce_utf8;
+pub mod bug_edge_id_in_where;
 pub mod bug_empty_typed_list_inference;
 pub mod bug_rebuild_indexes_path;
 pub mod bug_traversal_filtering;

@@ -4185,16 +4185,22 @@ impl QueryPlanner {
     ///
     /// All three functions share the same shape: single-arg, argument
     /// must be a node/edge variable, returns the column value directly.
-    fn rewrite_id_to_vid(expr: Expr) -> Expr {
+    fn rewrite_id_to_vid(expr: Expr, vars_in_scope: &[VariableInfo]) -> Expr {
         match expr {
             Expr::FunctionCall {
                 name,
                 args,
                 distinct,
                 window_spec,
-            } if args.len() == 1 && Self::metadata_function_column(&name).is_some() => {
+            } if args.len() == 1 && Self::metadata_function_column(&name, None).is_some() => {
                 if let Expr::Variable(ref var) = args[0] {
-                    let column = Self::metadata_function_column(&name).unwrap().to_string();
+                    // `id()` resolves to `_eid` for an edge binding and `_vid`
+                    // for a node — edge rows expose `_eid`, not `_vid`. Mirror
+                    // the projection path (`df_expr.rs` translate of `id`).
+                    let var_type = find_var_in_scope(vars_in_scope, var).map(|v| v.var_type);
+                    let column = Self::metadata_function_column(&name, var_type)
+                        .unwrap()
+                        .to_string();
                     Expr::Property(Box::new(Expr::Variable(var.clone())), column)
                 } else {
                     Expr::FunctionCall {
@@ -4206,13 +4212,13 @@ impl QueryPlanner {
                 }
             }
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-                left: Box::new(Self::rewrite_id_to_vid(*left)),
+                left: Box::new(Self::rewrite_id_to_vid(*left, vars_in_scope)),
                 op,
-                right: Box::new(Self::rewrite_id_to_vid(*right)),
+                right: Box::new(Self::rewrite_id_to_vid(*right, vars_in_scope)),
             },
             Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
                 op,
-                expr: Box::new(Self::rewrite_id_to_vid(*inner)),
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
             },
             other => other,
         }
@@ -4220,9 +4226,20 @@ impl QueryPlanner {
 
     /// Return the internal column name for a system-metadata function, or
     /// `None` if the name is not one of the recognised metadata functions.
-    fn metadata_function_column(name: &str) -> Option<&'static str> {
+    ///
+    /// `id()` maps to `_eid` when its argument is a relationship
+    /// (`VariableType::Edge`) and `_vid` otherwise; `var_type` is `None` when the
+    /// caller only needs the is-metadata-function test.
+    fn metadata_function_column(
+        name: &str,
+        var_type: Option<VariableType>,
+    ) -> Option<&'static str> {
         if name.eq_ignore_ascii_case("id") {
-            Some("_vid")
+            if matches!(var_type, Some(VariableType::Edge)) {
+                Some("_eid")
+            } else {
+                Some("_vid")
+            }
         } else if name.eq_ignore_ascii_case("created_at") {
             Some("_created_at")
         } else if name.eq_ignore_ascii_case("updated_at") {
@@ -6056,8 +6073,9 @@ impl QueryPlanner {
         // Transform VALID_AT macro to function call
         let transformed_predicate = Self::transform_valid_at_to_function(predicate.clone());
 
-        // Rewrite id(var) to var._vid so PredicateAnalyzer can push it down
-        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate);
+        // Rewrite id(var) to var._vid (or var._eid for an edge) so
+        // PredicateAnalyzer can push it down.
+        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate, vars_in_scope);
 
         let mut current_predicate =
             self.rewrite_predicates_using_indexes(&transformed_predicate, &plan, vars_in_scope)?;

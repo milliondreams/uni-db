@@ -3072,6 +3072,7 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    None,
                 )
                 .await?;
             }
@@ -3085,6 +3086,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        None,
                     )
                     .await?;
                 }
@@ -3095,6 +3097,12 @@ impl Executor {
                 on_create,
                 ..
             } => {
+                // Fold ON CREATE SET so a NOT-NULL property set only by
+                // ON CREATE SET passes create-time validation (RC4); the
+                // post-create SET below settles the final values.
+                let seed_props = self
+                    .on_create_seed_props(on_create.as_ref(), scope, prop_manager, params, ctx)
+                    .await?;
                 self.execute_create_pattern(
                     &pattern,
                     scope,
@@ -3103,6 +3111,7 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    Some(&seed_props),
                 )
                 .await?;
                 if let Some(on_create_clause) = on_create {

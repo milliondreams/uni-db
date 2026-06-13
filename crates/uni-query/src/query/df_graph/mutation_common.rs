@@ -894,7 +894,7 @@ async fn apply_mutations(
     match mutation_kind {
         MutationKind::Create { pattern } => {
             for row in rows.iter_mut() {
-                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
+                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0, None)
                     .await
                     .map_err(|e| df_err("CREATE failed", e))?;
             }
@@ -902,7 +902,7 @@ async fn apply_mutations(
         MutationKind::CreateBatch { patterns } => {
             for row in rows.iter_mut() {
                 for pattern in patterns {
-                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
+                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0, None)
                         .await
                         .map_err(|e| df_err("CREATE failed", e))?;
                 }

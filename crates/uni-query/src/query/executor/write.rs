@@ -2112,7 +2112,14 @@ impl Executor {
 
         let mut out = Vec::new();
         if matches.is_empty() {
-            // No match: create the node, then apply ON CREATE SET.
+            // No match: create the node, then apply ON CREATE SET. Fold the
+            // ON CREATE SET property assignments into seed props first so a
+            // NOT-NULL property supplied only by ON CREATE SET passes
+            // create-time validation (RC4); the post-create SET below settles
+            // the final values.
+            let seed_props = self
+                .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                .await?;
             self.execute_create_pattern(
                 path_pattern,
                 &mut row,
@@ -2121,6 +2128,7 @@ impl Executor {
                 params,
                 ctx,
                 tx_l0_override,
+                Some(&seed_props),
             )
             .await?;
             // Fold the new vertex into the batch snapshot for intra-batch
@@ -2377,6 +2385,12 @@ impl Executor {
                         batch.push(m);
                     }
                 } else {
+                    // Fold ON CREATE SET into seed props so a NOT-NULL property
+                    // set only by ON CREATE SET passes create-time validation
+                    // (RC4); the post-create SET below settles the final values.
+                    let seed_props = self
+                        .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                        .await?;
                     self.execute_create_pattern(
                         &path_pattern,
                         &mut row,
@@ -2385,6 +2399,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0_override,
+                        Some(&seed_props),
                     )
                     .await?;
                     if let Some(set) = on_create {
@@ -2412,6 +2427,53 @@ impl Executor {
         Ok(results)
     }
 
+    /// Pre-evaluate `ON CREATE SET` property assignments into per-variable seeds.
+    ///
+    /// Folds `SET <var>.<prop> = <expr>` items so a NOT-NULL property supplied
+    /// only by `ON CREATE SET` is present when the MERGE node is created and
+    /// passes constraint validation (RC4). The right-hand side is evaluated
+    /// against the current `row`.
+    ///
+    /// Items whose right-hand side references the target variable (e.g.
+    /// `ON CREATE SET n.c = coalesce(n.c, 0) + 1`) are NOT folded: seeding would
+    /// let the post-create SET read the seeded value and apply the assignment
+    /// twice. Such items run only post-create, exactly once (unchanged behavior).
+    ///
+    /// # Errors
+    /// Returns an error if evaluating an assignment's right-hand side fails.
+    pub(crate) async fn on_create_seed_props(
+        &self,
+        on_create: Option<&SetClause>,
+        row: &HashMap<String, Value>,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<String, HashMap<String, Value>>> {
+        let mut seed: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let Some(set) = on_create else {
+            return Ok(seed);
+        };
+        for item in &set.items {
+            if let SetItem::Property { expr, value } = item
+                && let Expr::Property(var_expr, prop_name) = expr
+                && let Expr::Variable(var_name) = &**var_expr
+                // Skip self-referential RHS so the post-create SET (which also
+                // runs) applies it exactly once rather than reading the seed.
+                && !crate::query::df_graph::locy_ast_builder::expr_references_var(
+                    value, var_name,
+                )
+            {
+                let val = self
+                    .evaluate_expr(value, row, prop_manager, params, ctx)
+                    .await?;
+                seed.entry(var_name.clone())
+                    .or_default()
+                    .insert(prop_name.clone(), val);
+            }
+        }
+        Ok(seed)
+    }
+
     /// Execute a CREATE pattern, inserting new vertices and edges into the graph.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_create_pattern(
@@ -2423,6 +2485,11 @@ impl Executor {
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        // Per-variable properties to gap-fill into newly-created nodes before
+        // constraint validation. Used by MERGE to fold `ON CREATE SET` so a
+        // NOT-NULL property supplied only by ON CREATE SET passes create-time
+        // validation (RC4). `None` for plain CREATE.
+        seed_props: Option<&HashMap<String, HashMap<String, Value>>>,
     ) -> Result<()> {
         for path in &pattern.paths {
             let mut prev_vid: Option<Vid> = None;
@@ -2456,6 +2523,21 @@ impl Executor {
                                     }
                                 } else {
                                     return Err(anyhow!("Properties must evaluate to a map"));
+                                }
+                            }
+
+                            // MERGE ON CREATE SET: gap-fill properties supplied
+                            // only by ON CREATE SET so a NOT-NULL property absent
+                            // from the merge key passes create-time validation
+                            // (RC4). `or_insert` keeps the merge-key/pattern props
+                            // authoritative; the post-create SET re-applies the
+                            // real values, so the final state is unchanged.
+                            if let Some(seed) = seed_props
+                                && let Some(var) = &n.variable
+                                && let Some(var_seed) = seed.get(var)
+                            {
+                                for (k, v) in var_seed {
+                                    props.entry(k.clone()).or_insert_with(|| v.clone());
                                 }
                             }
 

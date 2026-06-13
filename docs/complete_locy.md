@@ -1368,26 +1368,33 @@ tx.commit().await?;
 ### Rule Registry
 
 ```rust
-// Database-level (shared across sessions)
-db.rules().register("CREATE RULE reach AS ...")?;
+// Database-level (shared across sessions, durable across restarts —
+// persisted to catalog/locy_rules.json and recompiled on open)
+db.rules().register("CREATE RULE reach AS ...").await?;
 
-// Session-level (cloned from db on creation)
-session.rules().register("CREATE RULE local_rule AS ...")?;
+// Session-level (cloned from db on creation, ephemeral)
+session.rules().register("CREATE RULE local_rule AS ...").await?;
 
-// Transaction-level
-tx.rules().register("CREATE RULE tx_rule AS ...")?;
+// Transaction-level (ephemeral)
+tx.rules().register("CREATE RULE tx_rule AS ...").await?;
 
 // Operations
 let names: Vec<String> = session.rules().list();
 let info: Option<RuleInfo> = session.rules().get("reach");
 // RuleInfo { name, clause_count, is_recursive }
 
-let removed: bool = session.rules().remove("reach")?;
-session.rules().clear();
+let removed: bool = session.rules().remove("reach").await?;
+session.rules().clear().await?;
 let count: usize = session.rules().count();
 ```
 
-Registered rules are automatically merged into any subsequent `session.locy()` / `tx.locy()` calls. Rules from the registry are treated as external rules during compilation — they participate in dependency analysis and stratification.
+Mutating methods (`register` / `remove` / `clear`) are `async` so the durable
+database-level registry can persist. Registering an exact-duplicate program is
+a no-op; removing a rule that shares its source program with other rules is
+rejected. Registered rules are automatically merged into any subsequent
+`session.locy()` / `tx.locy()` calls. Rules from the registry are treated as
+external rules during compilation — they participate in dependency analysis and
+stratification.
 
 ## 16.2 Python API
 

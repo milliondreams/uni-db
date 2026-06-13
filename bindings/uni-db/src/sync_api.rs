@@ -274,6 +274,8 @@ impl Transaction {
         let tx = self.check_active()?;
         Ok(PyRuleRegistry {
             registry: tx.rules().clone_registry_arc(),
+            // Transaction-scoped rules are ephemeral.
+            persister: None,
         })
     }
 
@@ -985,6 +987,7 @@ impl Database {
     fn rules(&self) -> PyRuleRegistry {
         PyRuleRegistry {
             registry: self.inner.rules().clone_registry_arc(),
+            persister: self.inner.rules().clone_persister_arc(),
         }
     }
 
@@ -1310,52 +1313,62 @@ impl Xervo {
 #[pyclass(name = "RuleRegistry")]
 pub struct PyRuleRegistry {
     pub(crate) registry: std::sync::Arc<std::sync::RwLock<uni_db::LocyRuleRegistry>>,
+    /// Durable persister; `Some` only for the database-level registry, so
+    /// session-, transaction-, and fork-scoped registries stay ephemeral.
+    pub(crate) persister: Option<std::sync::Arc<uni_db::LocyRulePersister>>,
+}
+
+impl PyRuleRegistry {
+    /// Builds the borrowed Rust facade, wiring the persister when present.
+    fn facade(&self) -> uni_db::RuleRegistry<'_> {
+        match &self.persister {
+            Some(persister) => uni_db::RuleRegistry::with_persister(&self.registry, persister),
+            None => uni_db::RuleRegistry::new(&self.registry),
+        }
+    }
 }
 
 #[pymethods]
 impl PyRuleRegistry {
     /// Register Locy rules from a program string.
-    fn register(&self, program: &str) -> PyResult<()> {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade
-            .register(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    fn register(&self, py: Python<'_>, program: &str) -> PyResult<()> {
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.facade().register(program))
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Remove a rule by name. Returns True if found and removed.
-    fn remove(&self, name: &str) -> PyResult<bool> {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade
-            .remove(name)
+    fn remove(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.facade().remove(name)))
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// List names of all registered rules.
     fn list(&self) -> Vec<String> {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade.list()
+        self.facade().list()
     }
 
     /// Get metadata about a registered rule.
     fn get(&self, name: &str) -> Option<crate::types::PyRuleInfo> {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade.get(name).map(|info| crate::types::PyRuleInfo {
-            name: info.name,
-            clause_count: info.clause_count,
-            is_recursive: info.is_recursive,
-        })
+        self.facade()
+            .get(name)
+            .map(|info| crate::types::PyRuleInfo {
+                name: info.name,
+                clause_count: info.clause_count,
+                is_recursive: info.is_recursive,
+            })
     }
 
     /// Clear all registered rules.
-    fn clear(&self) {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade.clear();
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.facade().clear()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get the number of registered rules.
     fn count(&self) -> usize {
-        let facade = uni_db::RuleRegistry::new(&self.registry);
-        facade.count()
+        self.facade().count()
     }
 }
 

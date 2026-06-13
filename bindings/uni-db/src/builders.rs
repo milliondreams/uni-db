@@ -179,6 +179,7 @@ pub struct DatabaseBuilder {
     pub(crate) uni_config: Option<uni_common::UniConfig>,
     pub(crate) read_only: bool,
     pub(crate) write_lease: Option<crate::types::PyWriteLease>,
+    pub(crate) skip_invalid_locy_rules: bool,
 }
 
 #[pymethods]
@@ -200,6 +201,7 @@ impl DatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 
@@ -220,6 +222,7 @@ impl DatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 
@@ -240,6 +243,7 @@ impl DatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 
@@ -260,6 +264,7 @@ impl DatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 
@@ -365,6 +370,12 @@ impl DatabaseBuilder {
         slf
     }
 
+    /// Skip persisted Locy rules that no longer compile, instead of failing.
+    fn skip_invalid_locy_rules(mut slf: PyRefMut<'_, Self>, skip: bool) -> PyRefMut<'_, Self> {
+        slf.skip_invalid_locy_rules = skip;
+        slf
+    }
+
     /// Phase 4b — cap on total fork count (Active + Pending + Tombstoned).
     /// `None` means unbounded.
     fn max_forks(mut slf: PyRefMut<'_, Self>, cap: Option<usize>) -> PyRefMut<'_, Self> {
@@ -450,6 +461,7 @@ impl DatabaseBuilder {
                     self.uni_config.clone(),
                     self.read_only,
                     rust_write_lease,
+                    self.skip_invalid_locy_rules,
                 ))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -993,6 +1005,8 @@ impl Session {
     fn rules(&self) -> crate::sync_api::PyRuleRegistry {
         crate::sync_api::PyRuleRegistry {
             registry: self.inner.rules().clone_registry_arc(),
+            // Session-scoped rules are ephemeral.
+            persister: None,
         }
     }
 

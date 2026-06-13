@@ -27,6 +27,92 @@ fn active_tx<'a>(
 }
 
 // ============================================================================
+// AsyncRuleRegistry
+// ============================================================================
+
+/// Async, durable facade for the database-level Locy rule registry.
+///
+/// Mutating methods return awaitables because they persist registered rule
+/// sources to `catalog/locy_rules.json`. Read-only methods are synchronous.
+#[pyclass(name = "AsyncRuleRegistry")]
+pub struct AsyncRuleRegistry {
+    pub(crate) registry: Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
+    pub(crate) persister: Option<Arc<::uni_db::LocyRulePersister>>,
+}
+
+#[pymethods]
+impl AsyncRuleRegistry {
+    /// Register Locy rules from a program string (returns awaitable).
+    fn register<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .register(&program)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Remove a rule by name (returns awaitable resolving to a bool).
+    fn remove<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .remove(&name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Clear all registered rules (returns awaitable).
+    fn clear<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let registry = self.registry.clone();
+        let persister = self.persister.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let facade = match &persister {
+                Some(persister) => ::uni_db::RuleRegistry::with_persister(&registry, persister),
+                None => ::uni_db::RuleRegistry::new(&registry),
+            };
+            facade
+                .clear()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// List names of all registered rules.
+    fn list(&self) -> Vec<String> {
+        ::uni_db::RuleRegistry::new(&self.registry).list()
+    }
+
+    /// Get metadata about a registered rule.
+    fn get(&self, name: &str) -> Option<crate::types::PyRuleInfo> {
+        ::uni_db::RuleRegistry::new(&self.registry)
+            .get(name)
+            .map(|info| crate::types::PyRuleInfo {
+                name: info.name,
+                clause_count: info.clause_count,
+                is_recursive: info.is_recursive,
+            })
+    }
+
+    /// Get the number of registered rules.
+    fn count(&self) -> usize {
+        ::uni_db::RuleRegistry::new(&self.registry).count()
+    }
+}
+
+// ============================================================================
 // AsyncDatabase
 // ============================================================================
 
@@ -403,10 +489,14 @@ impl AsyncDatabase {
         })
     }
 
-    /// Access the rule registry for managing pre-compiled Locy rules.
-    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
-        crate::sync_api::PyRuleRegistry {
+    /// Access the durable database-level rule registry.
+    ///
+    /// Mutating methods return awaitables because they persist to
+    /// `catalog/locy_rules.json`; rules survive restarts.
+    fn rules(&self) -> AsyncRuleRegistry {
+        AsyncRuleRegistry {
             registry: self.inner.rules().clone_registry_arc(),
+            persister: self.inner.rules().clone_persister_arc(),
         }
     }
 
@@ -862,6 +952,7 @@ pub struct AsyncDatabaseBuilder {
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
     write_lease: Option<crate::types::PyWriteLease>,
+    skip_invalid_locy_rules: bool,
 }
 
 impl Default for AsyncDatabaseBuilder {
@@ -880,6 +971,7 @@ impl Default for AsyncDatabaseBuilder {
             uni_config: None,
             read_only: false,
             write_lease: None,
+            skip_invalid_locy_rules: false,
         }
     }
 }
@@ -1013,6 +1105,12 @@ impl AsyncDatabaseBuilder {
         slf
     }
 
+    /// Skip persisted Locy rules that no longer compile, instead of failing.
+    fn skip_invalid_locy_rules(mut slf: PyRefMut<'_, Self>, skip: bool) -> PyRefMut<'_, Self> {
+        slf.skip_invalid_locy_rules = skip;
+        slf
+    }
+
     /// Configure write lease for multi-agent coordination.
     fn write_lease(
         mut slf: PyRefMut<'_, Self>,
@@ -1092,6 +1190,7 @@ impl AsyncDatabaseBuilder {
         let cloud_config = self.cloud_config.clone();
         let uni_config = self.uni_config.clone();
         let read_only = self.read_only;
+        let skip_invalid_locy_rules = self.skip_invalid_locy_rules;
         let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
             crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
             crate::types::WriteLeaseVariant::DynamoDB { table } => {
@@ -1116,6 +1215,7 @@ impl AsyncDatabaseBuilder {
                 uni_config,
                 read_only,
                 rust_write_lease,
+                skip_invalid_locy_rules,
             )
             .await
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -1329,6 +1429,8 @@ impl AsyncTransaction {
     fn rules(&self) -> crate::sync_api::PyRuleRegistry {
         crate::sync_api::PyRuleRegistry {
             registry: self.rule_registry_arc.clone(),
+            // Session/transaction-scoped rules are ephemeral.
+            persister: None,
         }
     }
 
@@ -2369,6 +2471,8 @@ impl AsyncSession {
     fn rules(&self) -> crate::sync_api::PyRuleRegistry {
         crate::sync_api::PyRuleRegistry {
             registry: self.rule_registry_arc.clone(),
+            // Session/transaction-scoped rules are ephemeral.
+            persister: None,
         }
     }
 

@@ -62,6 +62,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sync_api::Database>()?;
     m.add_class::<sync_api::Xervo>()?;
     m.add_class::<sync_api::PyRuleRegistry>()?;
+    m.add_class::<async_api::AsyncRuleRegistry>()?;
     m.add_class::<sync_api::PyCompaction>()?;
     m.add_class::<sync_api::PyIndexes>()?;
     m.add_class::<sync_api::PyParams>()?;

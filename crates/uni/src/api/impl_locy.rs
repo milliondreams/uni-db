@@ -38,39 +38,240 @@ pub struct LocyRuleRegistry {
     pub rules: HashMap<String, uni_locy::types::CompiledRule>,
     /// Strata from registered programs, for execution ordering.
     pub strata: Vec<uni_locy::types::Stratum>,
-    /// Source program texts, stored for recompilation on rule removal.
-    pub sources: Vec<String>,
+    /// Registered source programs, the durable source of truth for the
+    /// registry. Compiled state is a pure function of this list.
+    pub sources: Vec<crate::api::locy_rule_catalog::RegisteredSource>,
 }
 
-/// Compile and register rules into an existing rule registry.
+/// Rebuilds a fresh registry by recompiling each source in order.
 ///
-/// Shared logic used by `Uni::register_rules()` and `Session::register_rules()`.
+/// The returned registry is a pure function of `sources`: rules, strata, and
+/// per-source `rule_names` are recomputed from scratch, so strata ids stay
+/// dense (no orphaned strata accumulate across re-registrations) and a stale
+/// `rule_names` loaded from disk is corrected. `rule_names` on the input is
+/// ignored.
+///
+/// # Errors
+///
+/// Returns a parse or compile error (as [`UniError`]) for the first source
+/// that no longer parses or compiles.
+pub(crate) fn rebuild_registry_from_sources(
+    sources: &[crate::api::locy_rule_catalog::RegisteredSource],
+) -> Result<LocyRuleRegistry> {
+    let mut registry = LocyRuleRegistry::default();
+    for src in sources {
+        let ast = uni_cypher::parse_locy(&src.source).map_err(map_parse_error)?;
+        let compiled = if registry.rules.is_empty() {
+            compile(&ast).map_err(map_compile_error)?
+        } else {
+            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+            uni_locy::compile_with_external_rules(&ast, &external_names)
+                .map_err(map_compile_error)?
+        };
+        let base_id = registry.strata.len();
+        let mut this_names: Vec<String> = Vec::with_capacity(compiled.rule_catalog.len());
+        for (name, rule) in compiled.rule_catalog {
+            this_names.push(name.clone());
+            registry.rules.insert(name, rule);
+        }
+        for mut stratum in compiled.strata {
+            stratum.id += base_id;
+            stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
+            registry.strata.push(stratum);
+        }
+        this_names.sort();
+        registry
+            .sources
+            .push(crate::api::locy_rule_catalog::RegisteredSource {
+                source: src.source.clone(),
+                rule_names: this_names,
+            });
+    }
+    Ok(registry)
+}
+
+/// Rebuilds a registry from persisted sources at database-open time.
+///
+/// With `skip_invalid` false, a single non-compiling source fails the open
+/// with guidance naming the offending rules. With `skip_invalid` true, each
+/// failing source is skipped with a warning and retained in the catalog file
+/// (the file is not rewritten on load), so a fixed binary can recover it.
+///
+/// # Errors
+///
+/// Returns [`UniError::Internal`] when `skip_invalid` is false and any
+/// persisted source no longer compiles.
+pub(crate) fn build_locy_registry_from_persisted(
+    sources: &[crate::api::locy_rule_catalog::RegisteredSource],
+    skip_invalid: bool,
+) -> Result<LocyRuleRegistry> {
+    if !skip_invalid {
+        return rebuild_registry_from_sources(sources).map_err(|e| {
+            UniError::Internal(anyhow::anyhow!(
+                "a persisted Locy rule in catalog/locy_rules.json no longer compiles: {e}. \
+                 Re-register the rule, or open with skip_invalid_locy_rules(true) to skip it."
+            ))
+        });
+    }
+
+    // Recompile incrementally, dropping (and warning about) any source that
+    // no longer compiles. Later sources may depend on earlier ones, so a
+    // skipped source can cascade — that is the intended behavior.
+    let mut good: Vec<crate::api::locy_rule_catalog::RegisteredSource> = Vec::new();
+    for src in sources {
+        let mut trial = good.clone();
+        trial.push(src.clone());
+        match rebuild_registry_from_sources(&trial) {
+            Ok(_) => good.push(src.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    rules = ?src.rule_names,
+                    error = %e,
+                    "skipping persisted Locy rule source that no longer compiles \
+                     (skip_invalid_locy_rules); it is retained in catalog/locy_rules.json"
+                );
+            }
+        }
+    }
+    rebuild_registry_from_sources(&good)
+}
+
+/// Registers a Locy program into a registry, rebuilding from sources.
+///
+/// Registration is idempotent: an exact-duplicate source text is a no-op and
+/// returns `Ok(false)`. Otherwise the program is appended and the whole
+/// registry is rebuilt and swapped atomically, returning `Ok(true)`. The
+/// boolean lets callers persist only when state actually changed.
+///
+/// Shared logic used by the [`RuleRegistry`](crate::RuleRegistry) facade and
+/// [`SessionTemplate`](crate::SessionTemplate). Performs no I/O.
+///
+/// # Errors
+///
+/// Returns a parse or compile error if `program` is invalid.
 pub(crate) fn register_rules_on_registry(
     registry_lock: &std::sync::RwLock<LocyRuleRegistry>,
     program: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    let existing = {
+        let registry = registry_lock.read().unwrap();
+        // Idempotent: exact-duplicate registration changes nothing.
+        if registry.sources.iter().any(|s| s.source == program) {
+            return Ok(false);
+        }
+        registry.sources.clone()
+    };
+
+    // Discover the rule names this program defines so that any prior source
+    // defining them is superseded — the last registration of a name wins, and
+    // each name is owned by exactly one source (keeping `remove` unambiguous).
+    let new_names = compile_defined_names(program, &existing)?;
+
+    let mut kept: Vec<crate::api::locy_rule_catalog::RegisteredSource> =
+        Vec::with_capacity(existing.len() + 1);
+    for src in existing {
+        let overlap = src
+            .rule_names
+            .iter()
+            .filter(|n| new_names.contains(n))
+            .count();
+        if overlap == 0 {
+            kept.push(src);
+        } else if overlap != src.rule_names.len() {
+            // Partial redefinition: the prior source defines names that are not
+            // being redefined, so silently dropping it would lose them.
+            let orphaned: Vec<&String> = src
+                .rule_names
+                .iter()
+                .filter(|n| !new_names.contains(n))
+                .collect();
+            return Err(UniError::Query {
+                message: format!(
+                    "cannot redefine rule(s) {new_names:?}: their existing source program also \
+                     defines {orphaned:?}. Clear the registry and re-register single-rule \
+                     programs."
+                ),
+                query: None,
+            });
+        }
+        // Fully superseded sources are dropped.
+    }
+    kept.push(crate::api::locy_rule_catalog::RegisteredSource {
+        source: program.to_string(),
+        rule_names: new_names,
+    });
+
+    let rebuilt = rebuild_registry_from_sources(&kept)?;
+    *registry_lock.write().unwrap() = rebuilt;
+    Ok(true)
+}
+
+/// Compiles `program` only to discover the rule names it defines.
+///
+/// Existing rule names are supplied as external context so references to
+/// already-registered rules resolve; the returned names are exactly the rules
+/// this program defines (its compiled rule catalog).
+///
+/// # Errors
+///
+/// Returns a parse or compile error if `program` is invalid.
+fn compile_defined_names(
+    program: &str,
+    existing: &[crate::api::locy_rule_catalog::RegisteredSource],
+) -> Result<Vec<String>> {
     let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
-    let registry = registry_lock.read().unwrap();
-    let compiled = if registry.rules.is_empty() {
-        drop(registry);
+    let external: Vec<String> = existing
+        .iter()
+        .flat_map(|s| s.rule_names.iter().cloned())
+        .collect();
+    let compiled = if external.is_empty() {
         compile(&ast).map_err(map_compile_error)?
     } else {
-        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-        drop(registry);
-        uni_locy::compile_with_external_rules(&ast, &external_names).map_err(map_compile_error)?
+        uni_locy::compile_with_external_rules(&ast, &external).map_err(map_compile_error)?
     };
-    let mut registry = registry_lock.write().unwrap();
-    for (name, rule) in compiled.rule_catalog {
-        registry.rules.insert(name, rule);
+    let mut names: Vec<String> = compiled.rule_catalog.keys().cloned().collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Returns an invocation hint when `program` is a bare registered rule name.
+///
+/// A common mistake is to invoke a registered rule by passing its bare name
+/// to `locy()`, which fails to parse. When the failed program is a lone
+/// identifier matching a registered rule, this produces a hint pointing at
+/// the `QUERY <name> … RETURN …` goal-query form. Returns `None` otherwise.
+fn bare_rule_hint(program: &str, registry: &std::sync::RwLock<LocyRuleRegistry>) -> Option<String> {
+    let trimmed = program.trim();
+    let is_bare_ident = !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !is_bare_ident {
+        return None;
     }
-    let base_id = registry.strata.len();
-    for mut stratum in compiled.strata {
-        stratum.id += base_id;
-        stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
-        registry.strata.push(stratum);
+    let registry = registry.read().ok()?;
+    if registry.rules.contains_key(trimmed) {
+        return Some(format!(
+            "Hint: '{trimmed}' is a registered Locy rule — invoke it with a goal query, \
+             e.g. `QUERY {trimmed} [WHERE …] [RETURN …]`"
+        ));
     }
-    registry.sources.push(program.to_string());
-    Ok(())
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(actual) = registry
+        .rules
+        .keys()
+        .find(|k| k.to_ascii_lowercase() == lower)
+    {
+        return Some(format!(
+            "Hint: did you mean the registered Locy rule '{actual}'? Invoke it with a goal \
+             query, e.g. `QUERY {actual} [WHERE …] [RETURN …]`"
+        ));
+    }
+    None
 }
 
 /// Evaluate a Locy program against the database with a specific rule registry.
@@ -83,7 +284,19 @@ pub(crate) async fn evaluate_with_db_and_config(
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
 ) -> Result<LocyResult> {
     // Compile with the given registry
-    let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
+    let ast = match uni_cypher::parse_locy(program) {
+        Ok(ast) => ast,
+        Err(e) => {
+            let mut err = map_parse_error(e);
+            if let (UniError::Parse { message, .. }, Some(hint)) =
+                (&mut err, bare_rule_hint(program, rule_registry))
+            {
+                message.push('\n');
+                message.push_str(&hint);
+            }
+            return Err(err);
+        }
+    };
     let external_names: Option<Vec<String>> = {
         let registry = rule_registry.read().unwrap();
         if registry.rules.is_empty() {

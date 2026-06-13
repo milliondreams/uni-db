@@ -747,6 +747,99 @@ fn merge_lance_and_l0(
     }
 }
 
+/// Drop rows superseded by a newer persisted version that the pushed
+/// property predicate filtered out (issue #57 × MVCC-append tables).
+///
+/// Lance evaluates a pushed property predicate per ROW, before the per-vid
+/// max-`_version` pick — so when a vid's property was rewritten and
+/// re-flushed, its CURRENT row fails the predicate and never reaches the
+/// dedup, while the stale still-matching row wins it by default. Re-reads
+/// `_vid`/`_version` for the candidate vids WITHOUT the property predicate
+/// (per-label table when `label_table` is `Some`, the main vertex table
+/// otherwise) and keeps only rows carrying their vid's true maximum
+/// persisted version. Must run on the RAW filtered batch, before
+/// [`mvcc_dedup_to_option`].
+async fn drop_superseded_pushdown_rows(
+    storage: &Arc<uni_store::storage::manager::StorageManager>,
+    label_table: Option<&str>,
+    batch: RecordBatch,
+) -> DFResult<RecordBatch> {
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let (Some(vid_col), Some(ver_col)) = (
+        batch
+            .column_by_name("_vid")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+        batch
+            .column_by_name("_version")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+    ) else {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "pushdown version verification: scan batch missing _vid/_version".to_string(),
+        ));
+    };
+
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for i in 0..vid_col.len() {
+        let vid = vid_col.value(i);
+        if seen.insert(vid) {
+            candidates.push(vid);
+        }
+    }
+
+    // True max persisted version per candidate vid — unfiltered apart from
+    // the vid list, so rewritten-key rows and deletion tombstones are seen.
+    // Chunked to bound the `_vid IN (…)` filter-string size.
+    const VERIFY_CHUNK: usize = 1000;
+    let mut max_ver: HashMap<u64, u64> = HashMap::with_capacity(candidates.len());
+    for chunk in candidates.chunks(VERIFY_CHUNK) {
+        let filter = format_vid_in_list(chunk);
+        let scanned = match label_table {
+            Some(label) => {
+                storage
+                    .scan_vertex_table(label, &["_vid", "_version"], Some(&filter))
+                    .await
+            }
+            None => {
+                storage
+                    .scan_main_vertex_table(&["_vid", "_version"], Some(&filter))
+                    .await
+            }
+        }
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let Some(vbatch) = scanned else { continue };
+        let (Some(v_vid), Some(v_ver)) = (
+            vbatch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+            vbatch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+        ) else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "pushdown version verification: rescan missing _vid/_version".to_string(),
+            ));
+        };
+        for i in 0..v_vid.len() {
+            let entry = max_ver.entry(v_vid.value(i)).or_insert(0);
+            *entry = (*entry).max(v_ver.value(i));
+        }
+    }
+
+    let keep: arrow_array::BooleanArray = (0..batch.num_rows())
+        .map(|i| {
+            Some(
+                max_ver
+                    .get(&vid_col.value(i))
+                    .is_none_or(|&max| ver_col.value(i) >= max),
+            )
+        })
+        .collect();
+    arrow::compute::filter_record_batch(&batch, &keep).map_err(arrow_err)
+}
+
 /// Push `col_name` into `columns` if not already present.
 ///
 /// Avoids the verbose `!columns.contains(&col_name.to_string())` pattern
@@ -2051,12 +2144,26 @@ async fn columnar_scan_vertex_batch_static(
         None => None,
     };
 
-    let lance_batch = match plugin_batch {
-        Some(b) => Some(b),
-        None => storage
-            .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+    // Track whether the batch came through the property-filtered native scan:
+    // plugin batches ignore `combined_filter` (re-filtered by the planner), so
+    // they need no stale-version verification.
+    let (lance_batch, pushdown_filtered) = match plugin_batch {
+        Some(b) => (Some(b), false),
+        None => (
+            storage
+                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+            extra_lance_filter.is_some(),
+        ),
+    };
+
+    // A pushed property predicate hides a vid's CURRENT row from the scan when
+    // that row no longer matches (MVCC-append: the stale still-matching row
+    // would win the dedup by default) — drop superseded rows first.
+    let lance_batch = match (lance_batch, pushdown_filtered) {
+        (Some(b), true) => Some(drop_superseded_pushdown_rows(storage, Some(label), b).await?),
+        (b, _) => b,
     };
 
     // MVCC dedup the Lance batch
@@ -2371,6 +2478,14 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         )
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // A pushed property predicate hides a vid's CURRENT row from the scan when
+    // that row no longer matches (MVCC-append: the stale still-matching row
+    // would win the dedup by default) — drop superseded rows first.
+    let lance_batch = match (lance_batch, extra_lance_filter.is_some()) {
+        (Some(b), true) => Some(drop_superseded_pushdown_rows(storage, None, b).await?),
+        (b, _) => b,
+    };
 
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;

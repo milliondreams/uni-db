@@ -1696,13 +1696,18 @@ impl Executor {
     ///
     /// Scans via [`uni_store::StorageManager::scan_vertex_table`] — the same
     /// read path `MATCH` uses, so it honors the version high-water-mark and
-    /// sees flushed rows. Returned rows are grouped by their CANONICAL key
-    /// tuple (stored values run through [`Self::canonical_key_value`], so a
-    /// stored `Float(1.0)` lands under a requested `Int(1)` — the coercion
-    /// Lance's numeric filter equality applies). Liveness against L0 overlays
-    /// (deletes, key rewrites by earlier rows of the same statement) is NOT
-    /// checked here — the per-row consumer re-checks at row time, exactly as
-    /// the old per-row scan did.
+    /// sees flushed rows. On the declared-label branch the key-filtered scan
+    /// only NOMINATES candidate vids; a second, unfiltered `_vid IN (…)` pass
+    /// picks each candidate's max-`_version` row and requires it to be live
+    /// and still keyed as requested (per-label tables are MVCC-append, so a
+    /// superseded version's row would otherwise stale-match a rewritten key).
+    /// Matched rows are grouped by their CANONICAL key tuple (stored values
+    /// run through [`Self::canonical_key_value`], so a stored `Float(1.0)`
+    /// lands under a requested `Int(1)` — the coercion Lance's numeric filter
+    /// equality applies). Liveness against L0 overlays (deletes, key rewrites
+    /// by earlier rows of the same statement) is NOT checked here — the
+    /// per-row consumer re-checks at row time, exactly as the old per-row
+    /// scan did.
     ///
     /// The second returned map carries the FULL property maps the schemaless
     /// branch already decoded for each matched vid (empty on the declared-label
@@ -1741,11 +1746,23 @@ impl Executor {
                 .merge_lookup_persisted_batch_schemaless(label, key_names, keys)
                 .await;
         }
+        // Declared label — the per-label table is MVCC-append (an update
+        // flush adds a higher-`_version` row for the same vid) and the key
+        // predicate is pushed into the Lance filter, so a SUPERSEDED version
+        // whose row still carries a requested key is returned while the vid's
+        // current row (key rewritten, fails the filter) is invisible to the
+        // scan. Version dedup among the returned rows cannot detect that, so
+        // the lookup runs in two passes: the key-filtered scan only nominates
+        // candidate vids, and an unfiltered `_vid IN (…)` scan then requires
+        // each candidate's max-`_version` row to be live and still keyed as
+        // requested.
         let mut columns: Vec<&str> = vec!["_vid"];
         columns.extend(key_names.iter().map(String::as_str));
 
-        let keys: Vec<&MergeKey> = keys.iter().collect();
-        for chunk in keys.chunks(Self::MERGE_SCAN_CHUNK) {
+        let key_list: Vec<&MergeKey> = keys.iter().collect();
+        let mut candidates: Vec<Vid> = Vec::new();
+        let mut seen: HashSet<Vid> = HashSet::new();
+        for chunk in key_list.chunks(Self::MERGE_SCAN_CHUNK) {
             let filter = Self::merge_batch_filter(key_names, chunk)
                 .ok_or_else(|| anyhow!("MERGE fast path could not build a batched key filter"))?;
             let scanned = self
@@ -1759,6 +1776,47 @@ impl Executor {
             else {
                 continue;
             };
+            for i in 0..vid_col.len() {
+                let vid = Vid::from(vid_col.value(i));
+                if seen.insert(vid) {
+                    candidates.push(vid);
+                }
+            }
+        }
+
+        // Verification pass — tombstones are NOT filtered Lance-side (the
+        // max-version pick must see them so a deleted winner cannot let an
+        // older live version resurrect the match), exactly like the
+        // schemaless branch below.
+        let mut verify_columns: Vec<&str> = vec!["_vid", "_deleted", "_version"];
+        verify_columns.extend(key_names.iter().map(String::as_str));
+        for chunk in candidates.chunks(Self::MERGE_SCAN_CHUNK) {
+            let vid_list = chunk
+                .iter()
+                .map(|v| v.as_u64().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let filter = format!("_vid IN ({vid_list})");
+            let scanned = self
+                .storage
+                .scan_vertex_table(label, &verify_columns, Some(&filter))
+                .await?;
+            let Some(batch) = scanned else { continue };
+            let (Some(vid_col), Some(del_col), Some(ver_col)) = (
+                batch
+                    .column_by_name("_vid")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+                batch
+                    .column_by_name("_deleted")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>()),
+                batch
+                    .column_by_name("_version")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>()),
+            ) else {
+                return Err(anyhow!(
+                    "MERGE batched lookup: verification scan missing a required column"
+                ));
+            };
             let key_cols: Vec<_> = key_names
                 .iter()
                 .map(|k| batch.column_by_name(k))
@@ -1766,21 +1824,35 @@ impl Executor {
                 .ok_or_else(|| {
                     anyhow!("MERGE batched lookup: projected key column missing from scan result")
                 })?;
-            for i in 0..vid_col.len() {
+            // Per-vid MVCC dedup: keep the highest-version row for each vid.
+            let mut winners: HashMap<Vid, (u64, usize)> = HashMap::new();
+            for i in 0..batch.num_rows() {
                 let vid = Vid::from(vid_col.value(i));
+                let ver = ver_col.value(i);
+                let entry = winners.entry(vid).or_insert((ver, i));
+                if ver > entry.0 {
+                    *entry = (ver, i);
+                }
+            }
+            for (vid, (_ver, row)) in winners {
+                if del_col.value(row) {
+                    continue;
+                }
                 let tuple: MergeKey = key_names
                     .iter()
                     .zip(&key_cols)
                     .map(|(k, col)| {
                         let v = uni_store::storage::arrow_convert::arrow_to_value(
                             col.as_ref(),
-                            i,
+                            row,
                             None,
                         );
                         (k.clone(), Self::canonical_key_value(&v))
                     })
                     .collect();
-                out.entry(tuple).or_default().push(vid);
+                if keys.contains(&tuple) {
+                    out.entry(tuple).or_default().push(vid);
+                }
             }
         }
         Ok((out, HashMap::new()))

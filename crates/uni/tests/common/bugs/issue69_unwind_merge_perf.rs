@@ -841,6 +841,114 @@ async fn merge_schemaless_deleted_after_flush_recreates() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Declared-label MVCC: per-label tables are append-only across flushes, so a
+// vid can have multiple persisted versions. The batched key-filter scan sees
+// every version whose row matches the key — the lookup must only trust a
+// candidate whose CURRENT (max-version, live) row still carries the key.
+// ============================================================================
+
+/// A flushed row whose MERGE key was later REWRITTEN and re-flushed must not
+/// match its stale superseded version: the old version's row still carries the
+/// old key value and passes the `_deleted = false` key filter, but the vid's
+/// current row holds the new key. MERGE on the old key must CREATE.
+#[tokio::test]
+async fn merge_declared_key_rewritten_after_flush_creates_new() -> Result<()> {
+    let db = setup().await?;
+
+    // v1: entity_id = "kr-old", flushed out of L0.
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "kr-old")
+        .param("n", "Rewritten")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // v2: key rewritten to "kr-new", flushed again (higher persisted version).
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $old}) SET n.entity_id = $new")
+        .param("old", "kr-old")
+        .param("new", "kr-new")
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // MERGE on the OLD key: no live row carries it, so this must CREATE.
+    let tx = db.session().tx().await?;
+    tx.query_with(MERGE_UPSERT)
+        .param("batch", Value::List(vec![entity("kr-old", "Fresh", 1)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        count_by_id(&db, "kr-old").await?,
+        1,
+        "stale superseded version must not match"
+    );
+    assert_eq!(
+        freq_by_id(&db, "kr-old").await?,
+        1,
+        "ON CREATE value, not an ON MATCH accumulation onto the old node"
+    );
+    assert_eq!(
+        count_by_id(&db, "kr-new").await?,
+        1,
+        "the rewritten node still exists under its new key"
+    );
+    assert_eq!(
+        freq_by_id(&db, "kr-new").await?,
+        10,
+        "the rewritten node must be untouched"
+    );
+    Ok(())
+}
+
+/// A DELETED-and-flushed DECLARED-label row must not MATCH: its per-label
+/// tombstone outranks the older live version, so MERGE creates a fresh node
+/// (declared-table sibling of `merge_schemaless_deleted_after_flush_recreates`).
+#[tokio::test]
+async fn merge_declared_deleted_after_flush_recreates() -> Result<()> {
+    let db = setup().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Entity {entity_id: $id, name: $n, freq: $f})")
+        .param("id", "dd")
+        .param("n", "Doomed")
+        .param("f", 10_i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $id}) DELETE n")
+        .param("id", "dd")
+        .run()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query_with(MERGE_UPSERT)
+        .param("batch", Value::List(vec![entity("dd", "Fresh", 5)]))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+
+    // ON CREATE fired: freq is the fresh 5, not 10 + 5.
+    assert_eq!(res.rows().len(), 1);
+    assert_eq!(res.rows()[0].get::<i64>("freq")?, 5);
+    assert_eq!(count_by_id(&db, "dd").await?, 1, "exactly the new node");
+    assert_eq!(freq_by_id(&db, "dd").await?, 5);
+    Ok(())
+}
+
 /// Int and non-integral Float key literals against one DECLARED Float64 key
 /// column in a single batch: the type-grouped batched filter must keep the
 /// two literal forms in separate IN lists, and Int/Float coercion must match

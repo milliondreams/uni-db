@@ -649,10 +649,9 @@ impl Schema {
     /// Read-only unified exact lookup: schema-defined edge type id, falling
     /// back to an already-assigned schemaless id.
     ///
-    /// Mirrors exactly the checks [`get_or_assign_edge_type_id`]
-    /// (Self::get_or_assign_edge_type_id) performs before assigning, so a
-    /// `Some` here means the assigning path would be a no-op — the basis for
-    /// `SchemaManager`'s read-lock fast path.
+    /// Mirrors exactly the checks [`Self::get_or_assign_edge_type_id`]
+    /// performs before assigning, so a `Some` here means the assigning path
+    /// would be a no-op — the basis for `SchemaManager`'s read-lock fast path.
     pub fn edge_type_id_unified(&self, type_name: &str) -> Option<u32> {
         self.edge_type_id_by_name(type_name)
             .or_else(|| self.schemaless_registry.id_by_name(type_name))

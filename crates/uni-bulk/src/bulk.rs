@@ -218,6 +218,7 @@ impl BulkWriterBuilder {
             touched_labels: HashSet::new(),
             touched_edge_types: HashSet::new(),
             initial_table_versions: HashMap::new(),
+            seen_unique_keys: HashMap::new(),
             buffer_size_bytes: 0,
             committed: false,
         })
@@ -335,9 +336,26 @@ pub struct BulkWriter {
     // Track LanceDB table versions before bulk load started (for abort rollback)
     // Key: table name, Value: version before first write (None = table created during bulk load)
     initial_table_versions: HashMap<String, Option<u64>>,
+    // UNIQUE-constraint keys accepted over the WHOLE load (not just the current
+    // buffer, which `flush_vertices_buffer` drains): without this, a duplicate
+    // spanning two flushes slipped through. Keyed by constraint identity
+    // (label + unique props), value = set of value-keys seen. (review H8)
+    seen_unique_keys: HashMap<String, HashSet<String>>,
     // Current buffer size in bytes (approximate)
     buffer_size_bytes: usize,
     committed: bool,
+}
+
+/// Stable identity for a UNIQUE constraint's seen-key namespace: its label plus
+/// its property list. `compute_unique_key` encodes only VALUES, so two different
+/// UNIQUE constraints on the same label must not share a key namespace.
+fn unique_set_key(label: &str, unique_props: &[String]) -> String {
+    let mut s = String::from(label);
+    for p in unique_props {
+        s.push('\u{1f}'); // unit separator — won't appear in a label/prop name
+        s.push_str(p);
+    }
+    s
 }
 
 impl BulkWriter {
@@ -469,11 +487,15 @@ impl BulkWriter {
     /// Checks NOT NULL, UNIQUE, and CHECK constraints. For UNIQUE constraints,
     /// validates both within the batch and against already-buffered data.
     async fn validate_vertex_batch_constraints(
-        &self,
+        &mut self,
         label: &str,
         vertices: &[Properties],
     ) -> Result<()> {
         let schema = self.backend.schema.schema();
+
+        // UNIQUE keys to commit to the writer-lifetime set once EVERY constraint
+        // on this batch has passed. (review H8)
+        let mut pending_unique_records: Vec<(String, Vec<String>)> = Vec::new();
 
         // Check NOT NULL and CHECK constraints for each vertex
         if let Some(props_meta) = schema.properties.get(label) {
@@ -521,25 +543,29 @@ impl BulkWriter {
                         }
                     }
 
-                    // Check against already-buffered data
-                    if let Some(buffered) = self.pending_vertices.get(label) {
-                        for (idx, props) in vertices.iter().enumerate() {
-                            let key = self.compute_unique_key(unique_props, props);
-                            if let Some(k) = key {
-                                for (_, buffered_props) in buffered {
-                                    let buffered_key =
-                                        self.compute_unique_key(unique_props, buffered_props);
-                                    if buffered_key.as_ref() == Some(&k) {
-                                        return Err(anyhow!(
-                                            "UNIQUE constraint violation at row {}: key '{}' conflicts with buffered data",
-                                            idx,
-                                            k
-                                        ));
-                                    }
-                                }
+                    // Check against EVERY vertex accepted so far in this load,
+                    // not just the current buffer (`pending_vertices` is drained
+                    // on each flush, so a duplicate spanning two flushes used to
+                    // slip through). (review H8)
+                    let set_key = unique_set_key(label, unique_props);
+                    let mut batch_keys = Vec::with_capacity(vertices.len());
+                    for (idx, props) in vertices.iter().enumerate() {
+                        if let Some(k) = self.compute_unique_key(unique_props, props) {
+                            if self
+                                .seen_unique_keys
+                                .get(&set_key)
+                                .is_some_and(|seen| seen.contains(&k))
+                            {
+                                return Err(anyhow!(
+                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    idx,
+                                    k
+                                ));
                             }
+                            batch_keys.push(k);
                         }
                     }
+                    pending_unique_records.push((set_key, batch_keys));
                 }
                 uni_common::core::schema::ConstraintType::Exists { property } => {
                     for (idx, props) in vertices.iter().enumerate() {
@@ -566,6 +592,15 @@ impl BulkWriter {
                 }
                 _ => {}
             }
+        }
+
+        // All constraints passed — commit the UNIQUE keys to the writer-lifetime
+        // set so a later batch (after a buffer flush) still sees them. (review H8)
+        for (set_key, keys) in pending_unique_records {
+            self.seen_unique_keys
+                .entry(set_key)
+                .or_default()
+                .extend(keys);
         }
 
         Ok(())

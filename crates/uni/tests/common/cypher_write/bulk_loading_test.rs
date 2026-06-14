@@ -710,3 +710,54 @@ async fn test_bulk_constraint_validation_disabled() -> Result<()> {
 
     Ok(())
 }
+
+/// H8: a UNIQUE constraint must hold across buffer flushes. With a small
+/// batch_size, the first batch flushes (draining the in-memory buffer); a
+/// duplicate key reintroduced in a later batch must still be rejected — the old
+/// check only compared against the (now-drained) buffer and let it through.
+#[tokio::test]
+async fn test_bulk_unique_constraint_spans_buffer_flushes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = Uni::open(temp.path().to_str().unwrap()).build().await?;
+
+    // Define a label with a UNIQUE constraint on `email`.
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING UNIQUE, name STRING)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    // batch_size = 2 so the first insert flushes and drains the buffer.
+    let mut bulk = tx.bulk_writer().batch_size(2).build()?;
+
+    let mk = |email: &str| {
+        let mut p: HashMap<String, uni_db::Value> = HashMap::new();
+        p.insert("email".to_string(), unival!(email));
+        p.insert("name".to_string(), unival!("n"));
+        p
+    };
+
+    // First batch of 2 reaches batch_size → flushes → buffer drained.
+    bulk.insert_vertices("User", vec![mk("a@x"), mk("b@x")])
+        .await?;
+
+    // Second batch reintroduces 'a@x' AFTER the first batch was flushed.
+    let result = bulk
+        .insert_vertices("User", vec![mk("c@x"), mk("a@x")])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a duplicate UNIQUE key spanning two flushes must be rejected"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("unique"),
+        "error should mention the UNIQUE violation"
+    );
+
+    Ok(())
+}

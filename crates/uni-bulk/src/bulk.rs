@@ -47,6 +47,17 @@ use uni_store::storage::manager::StorageManager;
 use uni_store::storage::{IndexManager, IndexRebuildManager};
 use uuid::Uuid;
 
+use crate::flush_intent;
+
+/// Test-only fault-injection: when set, `flush_vertices_buffer` returns an error
+/// *after* committing the per-label table but *before* the main table, exactly
+/// reproducing the crash-in-the-middle scenario H9 guards against. Always
+/// compiled (so integration tests across the crate boundary can arm it) but only
+/// ever set by tests.
+#[doc(hidden)]
+pub static FAIL_AFTER_PERLABEL_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Concrete handle bundle injected into the bulk write path.
 ///
 /// `BulkWriter`/`BulkWriterBuilder`/`StreamingAppender` need only field access
@@ -769,6 +780,11 @@ impl BulkWriter {
                     .insert(main_table_name.clone(), version);
             }
 
+            // Durably record the intent to mutate these tables BEFORE writing
+            // any of them, so a crash between the per-label and main commits is
+            // reconciled (rolled back) on reopen (H9).
+            self.persist_active_intent().await?;
+
             let ds = self
                 .backend
                 .storage
@@ -817,6 +833,13 @@ impl BulkWriter {
             ds.ensure_default_indexes(backend)
                 .await
                 .map_err(UniError::Internal)?;
+
+            // Test-only: simulate a crash between the per-label commit (done) and
+            // the main-table commit (below). The intent marker is already durable,
+            // so reopen recovery must roll the per-label table back.
+            if FAIL_AFTER_PERLABEL_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!("injected failure after per-label vertex commit"));
+            }
 
             // Dual-write to main vertices table
             let main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> =
@@ -989,6 +1012,10 @@ impl BulkWriter {
                 self.initial_table_versions
                     .insert(main_edge_table_name.clone(), version);
             }
+
+            // Record the intent before writing any of the three edge datasets
+            // (fwd delta, bwd delta, main edges) — see the vertex path (H9).
+            self.persist_active_intent().await?;
 
             // Write to FWD delta (sorted by src_vid)
             let mut fwd_entries = entries.clone();
@@ -1255,13 +1282,27 @@ impl BulkWriter {
             }
         }
 
-        // Save Snapshot
+        // Save Snapshot. The manifest body is durable after `save_snapshot`;
+        // only after that do we promote the recovery marker to `Committed`
+        // (carrying the new snapshot id) so that a crash before the latest
+        // pointer flip rolls *forward* to this snapshot rather than rolling the
+        // committed tables back (H9).
         self.backend
             .storage
             .snapshot_manager()
             .save_snapshot(&manifest)
             .await
             .map_err(UniError::Internal)?;
+        if !self.initial_table_versions.is_empty() {
+            let store = self.backend.storage.store();
+            flush_intent::write_committed(
+                &store,
+                &self.initial_table_versions,
+                &manifest.snapshot_id,
+            )
+            .await
+            .map_err(UniError::Internal)?;
+        }
         self.backend
             .storage
             .snapshot_manager()
@@ -1290,6 +1331,17 @@ impl BulkWriter {
                         .await;
                 }
             }
+        }
+
+        // The load is fully finalized — drop the recovery marker. (A crash
+        // before this point leaves the `Committed` marker, which reopen
+        // reconciliation rolls forward; a crash before the `Committed` write
+        // leaves the `Active` marker, which it rolls back.)
+        if !self.initial_table_versions.is_empty() {
+            let store = self.backend.storage.store();
+            flush_intent::clear(&store)
+                .await
+                .map_err(UniError::Internal)?;
         }
 
         self.committed = true;
@@ -1355,6 +1407,13 @@ impl BulkWriter {
         // 3. Clear backend cache to ensure next read picks up rolled-back state
         self.backend.storage.backend().clear_cache();
 
+        // 4. Drop the crash-recovery marker — this abort already did the
+        // rollback, so reopen must not try to roll back again.
+        let store = self.backend.storage.store();
+        if let Err(e) = flush_intent::clear(&store).await {
+            rollback_errors.push(format!("intent marker: {e}"));
+        }
+
         if rollback_errors.is_empty() {
             log::info!(
                 "Bulk load aborted successfully. Rolled back {} tables, dropped {} tables.",
@@ -1369,6 +1428,17 @@ impl BulkWriter {
                 rollback_errors.join("; ")
             ))
         }
+    }
+
+    /// Persist the crash-recovery intent marker (phase `Active`) with the
+    /// current set of touched tables and their pre-load versions. Called before
+    /// each multi-table flush writes anything.
+    async fn persist_active_intent(&self) -> Result<()> {
+        let store = self.backend.storage.store();
+        flush_intent::write_active(&store, &self.initial_table_versions)
+            .await
+            .map_err(UniError::Internal)?;
+        Ok(())
     }
 
     fn report_progress(&self, phase: BulkPhase, rows: usize, label: Option<String>) {

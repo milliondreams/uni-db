@@ -381,21 +381,34 @@ impl MainEdgeDataset {
         backend: &dyn StorageBackend,
         eid: Eid,
     ) -> Result<Option<Properties>> {
-        let filter = format!("_eid = {} AND _deleted = false", eid.as_u64());
-        let batches =
-            Self::execute_query(backend, &filter, Some(vec!["props_json", "_version"])).await?;
+        // MVCC (review C2): the scan must see deletion tombstones — the
+        // highest-version row wins, and a deleted winner yields `None`.
+        // Filtering `_deleted = false` here would let an OLDER live version
+        // resurrect an edge whose tombstone is the true (highest-version)
+        // winner.
+        let filter = format!("_eid = {}", eid.as_u64());
+        let batches = Self::execute_query(
+            backend,
+            &filter,
+            Some(vec!["props_json", "_version", "_deleted"]),
+        )
+        .await?;
 
         if batches.is_empty() {
             return Ok(None);
         }
 
-        // Find the row with highest version (latest)
+        // Find the row with highest version (latest), tombstones included.
         let mut best_props: Option<Properties> = None;
         let mut best_version: u64 = 0;
+        let mut best_deleted = false;
 
         for batch in &batches {
             let props_col = batch.column_by_name("props_json");
             let version_col = batch.column_by_name("_version");
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
 
             if let (Some(props_arr), Some(ver_arr)) = (
                 props_col.and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()),
@@ -410,12 +423,20 @@ impl MainEdgeDataset {
 
                     if version >= best_version {
                         best_version = version;
-                        best_props = Some(Self::parse_props_json(props_arr, i)?);
+                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
+                        best_props = if best_deleted {
+                            Some(Properties::new())
+                        } else {
+                            Some(Self::parse_props_json(props_arr, i)?)
+                        };
                     }
                 }
             }
         }
 
+        if best_deleted {
+            return Ok(None);
+        }
         Ok(best_props)
     }
 
@@ -436,20 +457,55 @@ impl MainEdgeDataset {
         backend: &dyn StorageBackend,
         eid: Eid,
     ) -> Result<Option<String>> {
-        let filter = format!("_eid = {} AND _deleted = false", eid.as_u64());
-        let batches = Self::execute_query(backend, &filter, Some(vec!["type"])).await?;
+        // MVCC (review C2): take the highest-version row — including tombstones —
+        // and return `None` if that winner is deleted. The old code filtered
+        // `_deleted = false` and took `value(0)` with no version comparison, so
+        // it could return an arbitrary (and possibly stale) edge type.
+        let filter = format!("_eid = {}", eid.as_u64());
+        let batches =
+            Self::execute_query(backend, &filter, Some(vec!["type", "_version", "_deleted"]))
+                .await?;
 
-        for batch in batches {
-            if batch.num_rows() > 0
-                && let Some(type_col) = batch.column_by_name("type")
-                && let Some(type_arr) = type_col.as_any().downcast_ref::<arrow_array::StringArray>()
-                && !type_arr.is_null(0)
-            {
-                return Ok(Some(type_arr.value(0).to_string()));
+        let mut best_type: Option<String> = None;
+        let mut best_version: u64 = 0;
+        let mut best_deleted = false;
+
+        for batch in &batches {
+            let type_col = batch
+                .column_by_name("type")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+            let ver_col = batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+
+            if let (Some(type_arr), Some(ver_arr)) = (type_col, ver_col) {
+                for i in 0..batch.num_rows() {
+                    let version = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
+
+                    if version >= best_version {
+                        best_version = version;
+                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
+                        best_type = if best_deleted || type_arr.is_null(i) {
+                            None
+                        } else {
+                            Some(type_arr.value(i).to_string())
+                        };
+                    }
+                }
             }
         }
 
-        Ok(None)
+        if best_deleted {
+            return Ok(None);
+        }
+        Ok(best_type)
     }
 
     /// Find edge data (eid, src_vid, dst_vid, props) by type name in the main edges table.
@@ -725,5 +781,88 @@ mod tests {
         // Timestamp columns should exist and not be all null
         let created_col = batch.column_by_name("_created_at").unwrap();
         assert!(!created_col.is_null(0), "created_at should be populated");
+    }
+
+    /// MVCC regression (review C2): a deletion tombstone written at a higher
+    /// version must win over the older live row. `find_props_by_eid` filtered
+    /// `_deleted = false` before version-ranking (so an older live version
+    /// resurrected a deleted edge), and `find_type_by_eid` took `value(0)` with
+    /// no version comparison.
+    #[tokio::test]
+    async fn test_edge_key_reads_respect_tombstone_winner() {
+        use crate::backend::lance::LanceDbBackend;
+        use uni_common::Value;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let be = LanceDbBackend::connect(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let backend: &dyn StorageBackend = &be;
+
+        let mut props = HashMap::new();
+        props.insert("weight".to_string(), Value::Float(0.5));
+
+        // v1: live edge.
+        let live = MainEdgeDataset::build_record_batch(
+            &[(
+                Eid::new(1),
+                Vid::new(1),
+                Vid::new(2),
+                "KNOWS".to_string(),
+                props.clone(),
+                false,
+                1u64,
+            )],
+            None,
+            None,
+        )
+        .unwrap();
+        MainEdgeDataset::write_batch(backend, live).await.unwrap();
+
+        // Sanity: visible while live.
+        assert!(
+            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            MainEdgeDataset::find_type_by_eid(backend, Eid::new(1))
+                .await
+                .unwrap(),
+            Some("KNOWS".to_string())
+        );
+
+        // v2: deletion tombstone at a higher version — the winning row.
+        let dead = MainEdgeDataset::build_record_batch(
+            &[(
+                Eid::new(1),
+                Vid::new(1),
+                Vid::new(2),
+                "KNOWS".to_string(),
+                props,
+                true,
+                2u64,
+            )],
+            None,
+            None,
+        )
+        .unwrap();
+        MainEdgeDataset::write_batch(backend, dead).await.unwrap();
+
+        assert_eq!(
+            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1))
+                .await
+                .unwrap(),
+            None,
+            "deleted (highest-version) winner must not resurrect edge props"
+        );
+        assert_eq!(
+            MainEdgeDataset::find_type_by_eid(backend, Eid::new(1))
+                .await
+                .unwrap(),
+            None,
+            "deleted winner must not return an edge type"
+        );
     }
 }

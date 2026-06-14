@@ -392,10 +392,23 @@ impl StorageBackend for LanceDbBackend {
     // ========================
 
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>> {
-        let stream = match self.execute_scan_stream(&request).await {
-            Ok(s) => s,
-            Err(_) => return Ok(vec![]),
-        };
+        // Fail closed (review C1): a scan error — transient I/O, an unparsable
+        // filter, a corrupt fragment — MUST propagate, never collapse into an
+        // empty result. Callers such as the MERGE existence-check treat "no
+        // rows" as "row absent" and would create a duplicate node on a silently
+        // swallowed error. The previous `Err(_) => Ok(vec![])` defeated that
+        // fail-closed contract.
+        //
+        // The one benign not-an-error is a not-yet-created table, which
+        // genuinely means "no rows". Detect that explicitly via `table_exists`
+        // (the existence cache is kept correct for fork/branch datasets by
+        // `notify_table_created`) so a missing table stays empty while every
+        // real failure surfaces.
+        if !self.table_exists(&request.table_name).await? {
+            return Ok(vec![]);
+        }
+
+        let stream = self.execute_scan_stream(&request).await?;
 
         stream
             .try_collect()
@@ -913,6 +926,38 @@ mod tests {
             .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    /// Fail-closed contract (review C1): a scan against an existing table that
+    /// errors (here: an unparsable SQL filter) must surface as `Err`, never be
+    /// silently masked into `Ok(vec![])` — otherwise the MERGE existence-check
+    /// would read "no rows" and create a duplicate. A scan against a table that
+    /// simply doesn't exist still legitimately returns an empty result.
+    #[tokio::test]
+    async fn test_scan_propagates_errors_but_tolerates_missing_table() {
+        let (_dir, backend) = create_test_backend().await;
+
+        // Missing table → empty, not an error.
+        let batches = backend.scan(ScanRequest::all("never_created")).await;
+        assert!(
+            matches!(batches, Ok(ref b) if b.is_empty()),
+            "scan of a non-existent table must be Ok(empty), got {batches:?}"
+        );
+
+        backend
+            .create_table("test", vec![test_batch(vec![1, 2, 3], vec![100, 200, 300])])
+            .await
+            .unwrap();
+
+        // A real scan failure on an existing table (unparsable filter referencing
+        // a non-existent column) must propagate as Err, not collapse to empty.
+        let result = backend
+            .scan(ScanRequest::all("test").with_filter("no_such_column = 1"))
+            .await;
+        assert!(
+            result.is_err(),
+            "a scan failure on an existing table must propagate as Err, got Ok"
+        );
     }
 
     #[tokio::test]

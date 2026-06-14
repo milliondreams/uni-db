@@ -87,7 +87,10 @@ pub fn decode_segment(bytes: &[u8]) -> std::result::Result<WalSegment, String> {
 ///
 /// The directory fsync makes the new directory entry itself durable across
 /// a crash (pattern borrowed from uni-sidecar's atomic `store_value`).
-fn sync_file_and_parent(path: &std::path::Path) -> std::io::Result<()> {
+///
+/// `pub(crate)` so the snapshot durability barrier (review C4) can reuse the
+/// exact same file+parent fsync the WAL uses for its own segments.
+pub(crate) fn sync_file_and_parent(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()?;
     #[cfg(unix)]
     if let Some(dir) = path.parent() {

@@ -643,7 +643,16 @@ impl Schema {
         if let Some(id) = self.edge_type_id_unified(type_name) {
             return id;
         }
-        self.schemaless_registry.get_or_assign_id(type_name)
+        // Reaching here means the type is brand-new to *both* the schema map and
+        // the schemaless registry (the early return above mirrors exactly what
+        // `edge_type_id_unified` checks). Minting a new schemaless edge type
+        // changes the result of `all_edge_type_ids()`, which untyped traversals
+        // bake into cached plans keyed on `schema_version`. Bump the version so
+        // those stale plans are evicted — otherwise a `MATCH ()-[r]->()` plan
+        // built before this type existed silently drops edges of the new type.
+        let id = self.schemaless_registry.get_or_assign_id(type_name);
+        self.bump_version();
+        id
     }
 
     /// Read-only unified exact lookup: schema-defined edge type id, falling
@@ -2231,5 +2240,39 @@ mod tests {
         let declared = manager.add_edge_type("DECLARED", vec!["A".into()], vec!["A".into()])?;
         assert_eq!(manager.get_or_assign_edge_type_id("DECLARED"), declared);
         Ok(())
+    }
+
+    /// Minting a brand-new schemaless edge type must bump `schema_version`
+    /// (the plan cache keys on it; untyped traversals bake `all_edge_type_ids()`
+    /// into the plan, so a stale plan would silently drop edges of the new
+    /// type). Re-resolving an existing type must NOT bump. (review C5)
+    #[test]
+    fn test_new_schemaless_edge_type_bumps_schema_version() {
+        let mut schema = Schema::default();
+        let v0 = schema.schema_version;
+
+        let id1 = schema.get_or_assign_edge_type_id("FRESH");
+        assert_eq!(
+            schema.schema_version,
+            v0.wrapping_add(1),
+            "minting a new edge type must bump schema_version"
+        );
+
+        // Re-resolving the same type is a no-op — no further bump.
+        let id1_again = schema.get_or_assign_edge_type_id("FRESH");
+        assert_eq!(id1, id1_again);
+        assert_eq!(
+            schema.schema_version,
+            v0.wrapping_add(1),
+            "resolving an existing edge type must not bump schema_version"
+        );
+
+        // A second distinct new type bumps again.
+        let _id2 = schema.get_or_assign_edge_type_id("OTHER");
+        assert_eq!(
+            schema.schema_version,
+            v0.wrapping_add(2),
+            "a second new edge type must bump schema_version again"
+        );
     }
 }

@@ -4209,7 +4209,12 @@ impl Writer {
                 if !uid_mappings.is_empty()
                     && let Ok(uid_index) = self.storage.uid_index(label_name)
                 {
-                    uid_index.write_mapping(&uid_mappings).await?;
+                    // Stamp mappings with this flush's MVCC version so a later
+                    // re-create of the same UID deterministically outranks the
+                    // stale mapping (review C3).
+                    uid_index
+                        .write_mapping_versioned(&uid_mappings, current_version)
+                        .await?;
                 }
             }
         }
@@ -4376,6 +4381,25 @@ impl Writer {
             .snapshot_manager()
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
+
+        // H2. Durability barrier (review C4). `save_snapshot` / `set_latest_snapshot`
+        // wrote the manifest body and the `catalog/latest` pointer through the
+        // object store, which does NOT fsync. WAL truncation (K, below) removes
+        // the only other durable copy of this flush's data, so a crash after K
+        // but before the OS flushed those writes would lose the snapshot —
+        // recovery could not resolve `latest`. Make them durable now (local-fs
+        // only; remote stores provide their own durability on `put`).
+        crate::snapshot::manager::fsync_snapshot_pointer(
+            shared.storage.local_fs_root().as_deref(),
+            &manifest.snapshot_id,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "fsync snapshot {} before WAL truncate: {}",
+                manifest.snapshot_id,
+                e
+            )
+        })?;
 
         // I. Cache manifest for next flush to avoid re-reading from object store.
         *shared.cached_manifest.lock() = Some(manifest.clone());

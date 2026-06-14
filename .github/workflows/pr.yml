@@ -1,13 +1,25 @@
 # Pull Request Workflow
 #
-# Runs essential tests and checks for pull requests.
-# Focused on fast feedback - only runs Rust and Python tests.
+# Cheap, fast verification for pull requests — the gates a contributor must
+# pass before merge: format, lint, the workspace test suite, one representative
+# openCypher TCK lane, and the Python binding tests.
+#
+# The thorough/expensive remainder (sidecar + Locy TCK, reranker, cloud,
+# cargo doc, flagship notebooks, release guards, cuda smoke) runs ONCE on push
+# to main in ci.yml and is deliberately NOT repeated here. This is safe because
+# branch protection requires PR branches to be up to date with main before
+# merging, so these gates run against the exact tree that will land on main.
 
 name: PR Checks
 
 on:
   pull_request:
     branches: [main]
+
+# Cancel superseded runs when a PR branch is pushed again.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,13 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify generated Locy notebooks
-        run: |
-          python3 website/scripts/generate_locy_notebooks.py --check
-          python3 website/scripts/generate_semiconductor_flagship_notebook.py --check
-          python3 website/scripts/generate_pharma_flagship_notebook.py --check
-          python3 website/scripts/generate_cyber_flagship_notebook.py --check
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,7 +69,7 @@ jobs:
             --exclude uni-python-onnx-metal \
             --all-targets -- -D warnings
 
-  # Rust tests
+  # Rust tests — the workspace suite (the core signal contributors gate on).
   rust-tests:
     name: Rust Tests
     runs-on: ubuntu-xlarge
@@ -113,10 +118,10 @@ jobs:
             --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal
 
-  # openCypher conformance on PRs (schemaless mode only — the cheaper of
-  # the two modes; the sidecar-schema mode stays on the main-push CI run).
-  # Without this, a PR breaking Cypher conformance lands green and fails
-  # post-merge.
+  # openCypher conformance on PRs — the schemaless lane only (the fast,
+  # representative mode). The sidecar mode and the Locy TCK lanes run on the
+  # main-push CI (ci.yml). Without this, a PR breaking Cypher conformance lands
+  # green and only fails post-merge.
   tck:
     name: openCypher TCK (schemaless)
     runs-on: ubuntu-xlarge
@@ -144,7 +149,9 @@ jobs:
       - name: Run openCypher TCK (schemaless)
         run: cargo nextest run -p uni-tck --test tck
 
-  # Python bindings tests
+  # Python bindings tests — ruff + pytest for both bindings (high-signal,
+  # shifted left onto the PR). The 6 flagship-notebook executions are heavier
+  # and run on the main-push CI (ci.yml), not here.
   python-tests:
     name: Python Tests
     runs-on: ubuntu-xlarge
@@ -172,32 +179,11 @@ jobs:
 
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
-        # `notebook-runtime` extra (numpy / pyarrow / onnxruntime) is required
-        # by the flagship Locy notebook verifier steps below. They're opt-in so
-        # the default wheel stays lean; the verifier job installs them here.
-        run: uv sync --group dev --extra notebook-runtime
+        run: uv sync --group dev
 
       - name: Build Python bindings (uni-db)
         working-directory: bindings/uni-db
         run: uv run maturin develop
-
-      - name: Execute flagship Locy notebook (semiconductor)
-        run: uv run --project bindings/uni-db python website/scripts/verify_semiconductor_flagship_notebook.py
-
-      - name: Execute flagship Locy notebook (pharma batch genealogy)
-        run: uv run --project bindings/uni-db python website/scripts/verify_pharma_flagship_notebook.py
-
-      - name: Execute flagship Locy notebook (cyber exposure twin)
-        run: uv run --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
-
-      - name: Execute flagship Locy notebook (predictive maintenance)
-        run: uv run --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
-
-      - name: Execute flagship Locy notebook (adverse drug reaction)
-        run: uv run --project bindings/uni-db python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
-
-      - name: Execute flagship Locy notebook (drug-drug interaction)
-        run: uv run --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
 
       - name: Check Python formatting (uni-db)
         working-directory: bindings/uni-db
@@ -226,86 +212,3 @@ jobs:
       - name: Run Python tests (uni-pydantic)
         working-directory: bindings/uni-pydantic
         run: uv run pytest tests/ -v -n auto
-
-  # CUDA wheel-graph smoke check — catches Cargo-dep-graph breakage in
-  # the `uni-db-cuda` variant (default-everything + CUDA, the largest CUDA
-  # dep graph) early, without paying the price of compiling its CUDA build
-  # scripts on every PR.
-  #
-  # We use `cargo metadata` instead of `cargo check` because:
-  #
-  #  - `cargo check` runs build scripts. `candle-kernels`'s build.rs
-  #    invokes `nvcc` to compile CUDA C++ kernels to PTX, and there's
-  #    no env-var bypass — it genuinely needs a working CUDA toolkit
-  #    (~3-5 GB install). Adding that to every PR run is heavy.
-  #  - `cargo metadata` only resolves features and reads Cargo.toml
-  #    files; it does not run any build scripts. Catches the "feature
-  #    X doesn't exist anymore" / "this dep is incompatible" class of
-  #    breakage that's most likely to come up in PRs.
-  #
-  # Real CUDA wheel builds (with full nvcc + cudarc + candle-kernels
-  # compilation) run in `release-wheels.yml::build-cuda-toolkit-linux`
-  # on tag-push or workflow_dispatch. Source-level CUDA-specific bugs
-  # are detected there.
-  wheels-cuda-smoke:
-    name: Wheel-graph smoke check (uni-db-cuda)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Resolve Cargo metadata for uni-db-cuda
-        run: |
-          cargo metadata --format-version=1 \
-            --manifest-path bindings/uni-db-cuda/Cargo.toml \
-            > /dev/null
-
-  # Release-path guards. `cargo clippy --workspace` (in the lint job) unifies
-  # features across all members, so the base wheel's plugin features leak onto
-  # `uni-db` and mask a variant that forgot to enable them — the deficiency
-  # only surfaces in the isolated, single-crate maturin wheel build at release
-  # time. These checks reproduce that isolation, plus verify the crates.io
-  # publish list is complete. See scripts/ci/.
-  release-guards:
-    name: Release Guards
-    runs-on: ubuntu-xlarge
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # Static check (no compile): every wheel variant must enable the plugin
-      # loader features its shared binding source calls unconditionally.
-      - name: Check wheel-variant plugin features
-        run: python3 scripts/ci/check_wheel_variant_features.py
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mold protobuf-compiler
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "ci"
-          cache-on-failure: true
-
-      # The crates.io publish list must be uni-db's full publishable
-      # dependency closure in topological order (uses `cargo metadata`).
-      - name: Check crates.io publish list
-        run: python3 scripts/ci/check_publish_list.py
-
-      # Compile guard for the slim `default-features = false` wheel path,
-      # built in ISOLATION (no --workspace) so feature unification can't mask
-      # a missing plugin feature. CUDA/Metal variants can't build on a plain
-      # Linux runner — the static check above covers their feature wiring.
-      - name: Compile-check slim ONNX wheel variant
-        run: cargo check -p uni-python-onnx

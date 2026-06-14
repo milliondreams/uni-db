@@ -93,6 +93,11 @@ fn do_request(
 ) -> Result<HttpResponse, FnError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        // Do NOT auto-follow redirects: the URL allow-list is enforced by the
+        // caller against the *initial* URL only, so a 3xx `Location` to an
+        // internal/link-local host (e.g. 169.254.169.254) would bypass it
+        // (SSRF). Surface the redirect response to the caller instead. (review H14)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| FnError::new(ERR_CLIENT_BUILD, format!("http client build: {e}")))?;
     let mut request = match body {
@@ -128,6 +133,41 @@ mod tests {
     fn build_and_default() {
         let _ = BlockingHttpEgress::new();
         let _ = BlockingHttpEgress;
+    }
+
+    /// H14: a 3xx response must NOT be auto-followed — the allow-list only
+    /// covers the initial URL, so following a `Location` to an internal host
+    /// would be SSRF. The client must return the redirect's status (302) rather
+    /// than chasing the (here, unroutable link-local) target.
+    #[test]
+    fn redirect_is_not_followed() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request line/headers enough to respond.
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                // 302 to a link-local address that must never be fetched.
+                let resp = "HTTP/1.1 302 Found\r\n\
+                            Location: http://169.254.169.254/latest/meta-data\r\n\
+                            Content-Length: 0\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let egress = BlockingHttpEgress::new();
+        let url = format!("http://{addr}/");
+        // Short timeout: if redirects WERE followed, the connect to the
+        // unroutable 169.254.169.254 would hang/error rather than return 302.
+        let resp = egress
+            .get(&url, Duration::from_millis(500), 1024, None)
+            .expect("redirect response should be returned, not followed");
+        assert_eq!(resp.status, 302, "redirect must be surfaced, not chased");
+        let _ = server.join();
     }
 
     #[test]

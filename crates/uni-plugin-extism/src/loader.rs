@@ -15,6 +15,16 @@ use serde::Deserialize;
 use crate::error::ExtismError;
 use crate::host_fns::HostFnRegistry;
 
+/// Host-imposed default wall-clock budget per call when the manifest does not
+/// declare `timeout_ms`. Mirrors `uni_plugin_wasm::loader::DEFAULT_TIMEOUT_MS`
+/// so the Extism and Component-Model loaders sandbox identically.
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Host-imposed default linear-memory cap (in 64 KiB pages, = 1 GiB) when the
+/// manifest does not declare `memory_max_pages`. Mirrors
+/// `uni_plugin_wasm::loader::DEFAULT_MEMORY_MAX_PAGES`.
+const DEFAULT_MEMORY_MAX_PAGES: u32 = 16_384;
+
 /// Plugin manifest in the Extism plugin's canonical JSON form.
 ///
 /// Returned from the plugin's `manifest` export. Mirrors the shape of
@@ -563,14 +573,19 @@ fn build_plugin_from_parts(
 }
 
 fn build_extism_manifest(bytes: &[u8], plugin_manifest: &ExtismPluginManifest) -> extism::Manifest {
-    let mut m = extism::Manifest::new([extism::Wasm::data(bytes.to_vec())]);
-    if let Some(pages) = plugin_manifest.memory_max_pages {
-        m = m.with_memory_max(pages);
-    }
-    if let Some(ms) = plugin_manifest.timeout_ms {
-        m = m.with_timeout(std::time::Duration::from_millis(ms));
-    }
-    m
+    // Apply the host memory cap and wall-clock timeout UNCONDITIONALLY: an
+    // undeclared limit resolves to the host default rather than "unbounded", so
+    // an untrusted manifest cannot opt out of its own sandbox (a manifest with
+    // all limits `None` previously ran with no memory cap and no timeout).
+    // Mirrors the Component-Model loader's `EffectiveLimits::resolve`. A plugin
+    // may still declare a *larger* value if it genuinely needs one. (review H15)
+    let pages = plugin_manifest
+        .memory_max_pages
+        .unwrap_or(DEFAULT_MEMORY_MAX_PAGES);
+    let ms = plugin_manifest.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    extism::Manifest::new([extism::Wasm::data(bytes.to_vec())])
+        .with_memory_max(pages)
+        .with_timeout(std::time::Duration::from_millis(ms))
 }
 
 fn build_pool(
@@ -774,5 +789,42 @@ mod tests {
             matches!(err, ExtismError::Instantiate(_)),
             "expected Instantiate(_), got: {err:?}"
         );
+    }
+
+    /// H15: a manifest that declares NO resource limits must still be sandboxed
+    /// — the host memory cap and timeout are applied unconditionally so an
+    /// untrusted plugin cannot opt out of its own limits.
+    #[test]
+    fn undeclared_limits_get_host_defaults() {
+        let l = ExtismLoader::new();
+        let json = manifest_json(&[]);
+        let prep = l.prepare(json.as_bytes(), &CapabilitySet::new()).unwrap();
+        // The manifest itself declares nothing.
+        assert_eq!(prep.manifest.memory_max_pages, None);
+        assert_eq!(prep.manifest.timeout_ms, None);
+
+        let m = build_extism_manifest(b"\0asm", &prep.manifest);
+        assert_eq!(
+            m.memory.max_pages,
+            Some(DEFAULT_MEMORY_MAX_PAGES),
+            "undeclared memory cap must fall back to the host default"
+        );
+        assert_eq!(
+            m.timeout_ms,
+            Some(DEFAULT_TIMEOUT_MS),
+            "undeclared timeout must fall back to the host default"
+        );
+    }
+
+    /// A manifest may still request its own (e.g. larger) limits — those are
+    /// honored rather than overwritten by the default.
+    #[test]
+    fn declared_limits_are_honored() {
+        let l = ExtismLoader::new();
+        let json = r#"{ "id": "ai.example.test", "version": "1.0.0", "capabilities": [], "memory_max_pages": 4, "timeout_ms": 500 }"#;
+        let prep = l.prepare(json.as_bytes(), &CapabilitySet::new()).unwrap();
+        let m = build_extism_manifest(b"\0asm", &prep.manifest);
+        assert_eq!(m.memory.max_pages, Some(4));
+        assert_eq!(m.timeout_ms, Some(500));
     }
 }

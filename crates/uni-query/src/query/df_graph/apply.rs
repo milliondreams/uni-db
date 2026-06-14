@@ -36,10 +36,8 @@ use datafusion::prelude::SessionContext;
 use futures::Stream;
 use parking_lot::RwLock;
 use std::any::Any;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -557,18 +555,15 @@ fn plan_contains_writes(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// Compute a hash for row parameters to enable deduplication.
+/// Build an owned, canonical cache key for a row's correlation parameters.
 ///
-/// Sorts entries by key for deterministic hashing regardless of iteration order.
-fn hash_row_params(params: &HashMap<String, Value>) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    let mut entries: Vec<_> = params.iter().collect();
-    entries.sort_unstable_by_key(|(k, _)| *k);
-    for (key, val) in entries {
-        key.hash(&mut hasher);
-        format!("{val:?}").hash(&mut hasher);
-    }
-    hasher.finish()
+/// A `BTreeMap` makes the key order-independent and gives real `Hash` + `Eq`
+/// over `Value`. The previous implementation keyed the dedup cache by a bare
+/// `u64` `DefaultHasher` digest of `format!("{val:?}")` with NO equality
+/// re-check, so any hash collision (or two values whose Debug renders
+/// identically) returned another row's subquery results. (review H7)
+fn canonical_params_key(params: &HashMap<String, Value>) -> BTreeMap<String, Value> {
+    params.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Check if batching is eligible for this apply operation.
@@ -802,8 +797,11 @@ async fn run_apply(
     let mut total_subplan_time = std::time::Duration::ZERO;
     let mut subplan_executions = 0;
 
-    // Cache to deduplicate subplan executions for identical row parameters
-    let mut subplan_cache: HashMap<u64, Vec<HashMap<String, Value>>> = HashMap::new();
+    // Cache to deduplicate subplan executions for identical row parameters.
+    // Keyed by the owned, sorted params (real Hash + Eq) — not a bare u64 hash —
+    // so a hash collision can never serve a different row's results. (review H7)
+    let mut subplan_cache: HashMap<BTreeMap<String, Value>, Vec<HashMap<String, Value>>> =
+        HashMap::new();
     let mut cache_hits = 0;
 
     for (batch, row_idx, row_params) in &filtered_entries {
@@ -821,14 +819,11 @@ async fn run_apply(
         };
 
         // Check cache for identical row params
-        let params_hash = hash_row_params(row_params);
-        let sub_rows = if let Some(cached_rows) = subplan_cache.get(&params_hash) {
+        let params_key = canonical_params_key(row_params);
+        let sub_rows = if let Some(cached_rows) = subplan_cache.get(&params_key) {
             // Cache hit: reuse previous results
             cache_hits += 1;
-            tracing::debug!(
-                "run_apply: cache hit for params hash {}, skipping execute_subplan",
-                params_hash
-            );
+            tracing::debug!("run_apply: cache hit for row params, skipping execute_subplan");
             cached_rows.clone()
         } else {
             // Cache miss: execute subplan
@@ -855,7 +850,7 @@ async fn run_apply(
             );
 
             let rows = batches_to_row_maps(&sub_batches);
-            subplan_cache.insert(params_hash, rows.clone());
+            subplan_cache.insert(params_key, rows.clone());
             rows
         };
 
@@ -1169,5 +1164,42 @@ impl Stream for ApplyStream {
 impl RecordBatchStream for ApplyStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// H7: the dedup cache key must distinguish rows by *value equality*, not by
+    /// a lossy `u64` hash. Distinct param sets get distinct cache entries;
+    /// identical params (regardless of insertion order) collapse to one.
+    #[test]
+    fn test_canonical_params_key_distinguishes_by_value() {
+        let a = canonical_params_key(&params(&[("x", Value::Int(1))]));
+        let b = canonical_params_key(&params(&[("x", Value::Int(2))]));
+        let c = canonical_params_key(&params(&[("x", Value::Int(1))]));
+        assert_ne!(a, b, "different values must yield different keys");
+        assert_eq!(a, c, "equal values must yield equal keys");
+
+        // Order-independence: same content, different insertion order → same key.
+        let m1 = params(&[("a", Value::Int(1)), ("b", Value::String("z".into()))]);
+        let m2 = params(&[("b", Value::String("z".into())), ("a", Value::Int(1))]);
+        assert_eq!(canonical_params_key(&m1), canonical_params_key(&m2));
+
+        // Used as a real cache key: two distinct rows never alias each other.
+        let mut cache: HashMap<BTreeMap<String, Value>, &str> = HashMap::new();
+        cache.insert(a.clone(), "row-1");
+        cache.insert(b.clone(), "row-2");
+        assert_eq!(cache.get(&a), Some(&"row-1"));
+        assert_eq!(cache.get(&b), Some(&"row-2"));
+        assert_eq!(cache.len(), 2);
     }
 }

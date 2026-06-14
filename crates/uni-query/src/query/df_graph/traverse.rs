@@ -2424,6 +2424,68 @@ async fn build_edge_adjacency_map(
     Ok(adjacency)
 }
 
+/// Build the edge-property `EidFilter` for a typed variable-length traversal.
+///
+/// For a pattern like `[r:KNOWS*1..3 {year: 1988}]` the inline edge-property
+/// conditions must filter *flushed* (CSR/Lance) edges too — not only L0
+/// in-memory edges as the original code did. We pre-scan every edge of the
+/// traversed type(s) — flushed edges via `find_edges_by_type_names`, L0 edges
+/// via the overlay, both handled (with tombstone/dedup semantics) by
+/// [`build_edge_adjacency_map`] — evaluate the conditions against each edge's
+/// materialized properties, and collect the passing Eids into an allow-set.
+///
+/// Returns [`EidFilter::AllAllowed`] when there are no conditions (nothing to
+/// filter) or when no edge type id resolves to a name (cannot pre-scan —
+/// degrade to the prior, less-restrictive behaviour rather than drop every
+/// edge).
+async fn build_edge_property_filter(
+    graph_ctx: &Arc<GraphExecutionContext>,
+    edge_type_ids: &[u32],
+    direction: Direction,
+    conditions: &[(String, UniValue)],
+) -> DFResult<EidFilter> {
+    if conditions.is_empty() {
+        return Ok(EidFilter::AllAllowed);
+    }
+
+    let uni_schema = graph_ctx.storage().schema_manager().schema();
+    let type_names: Vec<String> = edge_type_ids
+        .iter()
+        .filter_map(|id| uni_schema.edge_type_name_by_id_unified(*id))
+        .collect();
+    if type_names.is_empty() {
+        return Ok(EidFilter::AllAllowed);
+    }
+
+    // Enumerate every edge of these types (flushed + L0, tombstone-aware) with
+    // properties materialized. `None` source-vids => whole-type scan, matching
+    // the schemaless VLP path.
+    let adjacency = build_edge_adjacency_map(graph_ctx, &type_names, direction, None).await?;
+
+    let mut passing: Vec<u64> = Vec::new();
+    let mut max_eid: u64 = 0;
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    for edges in adjacency.values() {
+        for (_neighbor, eid, _etype, props) in edges {
+            let raw = eid.as_u64();
+            // `Direction::Both` lists each edge under both endpoints — dedup so
+            // the density heuristic in `from_eids` sees a true count.
+            if !seen.insert(raw) {
+                continue;
+            }
+            max_eid = max_eid.max(raw);
+            let passes = conditions
+                .iter()
+                .all(|(name, expected)| props.get(name).is_some_and(|actual| actual == expected));
+            if passes {
+                passing.push(raw);
+            }
+        }
+    }
+
+    Ok(EidFilter::from_eids(passing, max_eid as usize + 1))
+}
+
 impl Stream for GraphTraverseMainStream {
     type Item = DFResult<RecordBatch>;
 
@@ -2865,15 +2927,35 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
 
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
-        let warm_fut = self
-            .graph_ctx
-            .warming_future(self.edge_type_ids.clone(), self.direction);
+        // Warm the adjacency CSRs, then (when the pattern carries inline
+        // edge-property conditions) build the real `EidFilter` from a property
+        // pre-scan so that flushed CSR/Lance edges are filtered too — not just
+        // L0 in-memory edges. See `build_edge_property_filter`.
+        let graph_ctx = self.graph_ctx.clone();
+        let edge_type_ids = self.edge_type_ids.clone();
+        let direction = self.direction;
+        let edge_property_conditions = self.edge_property_conditions.clone();
+        let warm_fut: Pin<Box<dyn std::future::Future<Output = DFResult<EidFilter>> + Send>> =
+            Box::pin(async move {
+                graph_ctx
+                    .ensure_adjacency_warmed(&edge_type_ids, direction)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                build_edge_property_filter(
+                    &graph_ctx,
+                    &edge_type_ids,
+                    direction,
+                    &edge_property_conditions,
+                )
+                .await
+            });
 
         Ok(Box::pin(GraphVariableLengthTraverseStream {
             input: input_stream,
             exec: Arc::new(self.clone_for_stream()),
             schema: self.schema.clone(),
             state: VarLengthStreamState::Warming(warm_fut),
+            edge_property_filter: EidFilter::AllAllowed,
             metrics,
         }))
     }
@@ -2996,31 +3078,15 @@ impl GraphVariableLengthTraverseExecData {
                         continue;
                     }
 
-                    // Check EidFilter (edge property bitmap preselection)
+                    // Edge-property predicate gate. When the pattern carries
+                    // inline `{prop: value}` conditions, `eid_filter` is the
+                    // allow-set of edges (flushed *and* L0) that satisfy them,
+                    // built during warming by `build_edge_property_filter`. When
+                    // there are no conditions it is `AllAllowed`. This replaces
+                    // the old bifurcated check that filtered only L0 edges and
+                    // let every flushed CSR/Lance edge through (H4).
                     if !eid_filter.contains(eid) {
                         continue;
-                    }
-
-                    // Check edge property conditions (L0 in-memory properties)
-                    if !self.edge_property_conditions.is_empty() {
-                        let query_ctx = self.graph_ctx.query_context();
-                        let passes = if let Some(props) =
-                            l0_visibility::accumulate_edge_props(eid, Some(&query_ctx))
-                        {
-                            self.edge_property_conditions
-                                .iter()
-                                .all(|(name, expected)| {
-                                    props.get(name).is_some_and(|actual| actual == expected)
-                                })
-                        } else {
-                            // Edge not in L0 (CSR/Lance) — relies on EidFilter
-                            // for correctness. TODO: build EidFilter from Lance
-                            // during warming for flushed edges.
-                            true
-                        };
-                        if !passes {
-                            continue;
-                        }
                     }
 
                     // Check cross-pattern relationship uniqueness
@@ -3193,8 +3259,11 @@ impl GraphVariableLengthTraverseExecData {
 
 /// State machine for variable-length traverse stream.
 enum VarLengthStreamState {
-    /// Warming adjacency CSRs before first batch.
-    Warming(Pin<Box<dyn std::future::Future<Output = DFResult<()>> + Send>>),
+    /// Warming adjacency CSRs before first batch. Resolves to the prebuilt
+    /// edge-property `EidFilter` (the allow-set of edges — flushed *and* L0 —
+    /// that satisfy the inline `{prop: value}` conditions), or
+    /// `EidFilter::AllAllowed` when there are no conditions.
+    Warming(Pin<Box<dyn std::future::Future<Output = DFResult<EidFilter>> + Send>>),
     /// Processing input batches.
     Reading,
     /// Materializing target vertex properties asynchronously.
@@ -3209,6 +3278,10 @@ struct GraphVariableLengthTraverseStream {
     exec: Arc<GraphVariableLengthTraverseExecData>,
     schema: SchemaRef,
     state: VarLengthStreamState,
+    /// Edge-property allow-set built during warming (see [`VarLengthStreamState::Warming`]).
+    /// `AllAllowed` until warming completes (or when there are no edge-property
+    /// conditions).
+    edge_property_filter: EidFilter,
     metrics: BaselineMetrics,
 }
 
@@ -3223,7 +3296,8 @@ impl Stream for GraphVariableLengthTraverseStream {
 
             match state {
                 VarLengthStreamState::Warming(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(())) => {
+                    Poll::Ready(Ok(filter)) => {
+                        self.edge_property_filter = filter;
                         self.state = VarLengthStreamState::Reading;
                         // Continue loop to start reading
                     }
@@ -3246,12 +3320,16 @@ impl Stream for GraphVariableLengthTraverseStream {
 
                     match self.input.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            // Build base batch synchronously (BFS + expand)
-                            // TODO(Phase 3.5): Build real EidFilter/VidFilter during warming
-                            let eid_filter = EidFilter::AllAllowed;
+                            // Build base batch synchronously (BFS + expand).
+                            // `edge_property_filter` was built during warming and
+                            // gates flushed edges by their properties; VidFilter
+                            // is still unconstrained (TODO: source pre-scan).
                             let vid_filter = VidFilter::AllAllowed;
-                            let base_result =
-                                self.process_batch_base(batch, &eid_filter, &vid_filter);
+                            let base_result = self.process_batch_base(
+                                batch,
+                                &self.edge_property_filter,
+                                &vid_filter,
+                            );
                             let base_batch = match base_result {
                                 Ok(b) => b,
                                 Err(e) => {

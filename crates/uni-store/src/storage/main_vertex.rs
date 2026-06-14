@@ -397,16 +397,20 @@ impl MainVertexDataset {
         // (and taking `value(0)` with no version comparison, as the old code
         // did) would let an OLDER live version resurrect a vertex whose tombstone
         // is the true winner.
-        let filter =
-            with_version_bound(format!("ext_id = '{}'", ext_id.replace('\'', "''")), version);
+        let filter = with_version_bound(
+            format!("ext_id = '{}'", ext_id.replace('\'', "''")),
+            version,
+        );
 
         let results = backend
             .scan(
-                ScanRequest::all(table_name).with_filter(filter).with_columns(vec![
-                    "_vid".to_string(),
-                    "_version".to_string(),
-                    "_deleted".to_string(),
-                ]),
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
@@ -427,7 +431,11 @@ impl MainVertexDataset {
 
             if let (Some(vid_arr), Some(ver_arr)) = (vid_col, ver_col) {
                 for i in 0..batch.num_rows() {
-                    let v = if ver_arr.is_null(i) { 0 } else { ver_arr.value(i) };
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
                     if v >= best_version {
                         best_version = v;
                         best_deleted = deleted_col.is_some_and(|d| d.value(i));
@@ -482,11 +490,13 @@ impl MainVertexDataset {
 
         let results = backend
             .scan(
-                ScanRequest::all(table_name).with_filter(filter).with_columns(vec![
-                    "labels".to_string(),
-                    "_version".to_string(),
-                    "_deleted".to_string(),
-                ]),
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
@@ -507,7 +517,11 @@ impl MainVertexDataset {
 
             if let (Some(list_arr), Some(ver_arr)) = (labels_col, ver_col) {
                 for i in 0..batch.num_rows() {
-                    let v = if ver_arr.is_null(i) { 0 } else { ver_arr.value(i) };
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
                     if v >= best_version {
                         best_version = v;
                         best_deleted = deleted_col.is_some_and(|d| d.value(i));

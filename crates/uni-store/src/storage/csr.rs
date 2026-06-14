@@ -138,8 +138,17 @@ impl CompressedSparseRow {
             }
             last_src = src_idx;
 
-            // Store neighbor as DenseIdx (using VID's raw value as dense index)
-            neighbors.push(DenseIdx::new(neighbor.as_u64() as u32));
+            // Store neighbor as DenseIdx (using VID's raw value as dense index).
+            // This legacy dense index is a u32; a VID >= 2^32 cannot be
+            // represented here. The full-width VID is preserved in
+            // `neighbor_vids` (returned by `get_neighbors`), so rather than
+            // silently wrapping the raw value (corrupting the dense slice), we
+            // enforce the domain with a loud, documented failure. (review H13)
+            let dense = u32::try_from(neighbor.as_u64()).expect(
+                "CompressedSparseRow dense index is u32; VID exceeds u32 range \
+                 (use MainCsr/VidRemapper for full-width VIDs)",
+            );
+            neighbors.push(DenseIdx::new(dense));
             neighbor_vids.push(neighbor);
             edge_ids.push(eid);
             current_offset += 1;
@@ -427,5 +436,14 @@ mod main_csr_tests {
         let (vids, eids) = csr.get_neighbors_unversioned(Vid::new(0));
         assert_eq!(vids, vec![Vid::new(10), Vid::new(20)]);
         assert_eq!(eids, vec![Eid::new(100), Eid::new(101)]);
+    }
+
+    /// H13: a neighbor VID beyond u32 range must NOT be silently truncated into
+    /// the legacy dense-index slice — it fails loudly instead.
+    #[test]
+    #[should_panic(expected = "VID exceeds u32 range")]
+    fn test_csr_new_rejects_vid_beyond_u32() {
+        let big = Vid::new(1u64 << 33); // > u32::MAX
+        let _ = CompressedSparseRow::new(0, vec![(0u64, big, Eid::new(1))]);
     }
 }

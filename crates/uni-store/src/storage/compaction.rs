@@ -558,29 +558,20 @@ impl Compactor {
                 }
             }
 
-            // Clear the Delta L1 table by replacing with empty batch.
-            // Skip if a flush is in progress to avoid a race where flush appends
-            // new data between our read (above) and this replace, destroying it.
-            // Skipped deltas survive and are reprocessed next compaction (idempotent).
-            if self
-                .storage
-                .flush_in_progress
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-            {
-                log::info!(
-                    "Skipping delta clear for {}/{}: flush in progress",
-                    edge_type,
-                    direction
-                );
-            } else {
-                let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
-                let delta_schema = delta_ds.get_arrow_schema(&schema)?;
-                let empty_batch = RecordBatch::new_empty(delta_schema);
-                delta_ds
-                    .replace(self.storage.backend(), empty_batch)
-                    .await?;
-            }
+            // Clear ONLY the deltas we actually merged into L2 — those at or
+            // below the high-water-mark captured from the rows read at the top
+            // of this function. A concurrent flush that appended new deltas
+            // inside the read→clear window stamped them with a strictly higher
+            // `_version`, so the predicate-delete leaves them intact to be
+            // reprocessed next compaction. This replaces the old unconditional
+            // empty-batch wipe, whose only guard was an instantaneous
+            // `flush_in_progress` check that a flush starting AND finishing in
+            // the window slipped past — silently wiping its rows. (review H11)
+            let clear_hwm = deltas.iter().map(|e| e.version).max().unwrap_or(0);
+            let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
+            delta_ds
+                .delete_up_to_version(self.storage.backend(), clear_hwm)
+                .await?;
         }
 
         let duration = start.elapsed();

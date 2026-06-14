@@ -83,6 +83,13 @@ pub fn decode_segment(bytes: &[u8]) -> std::result::Result<WalSegment, String> {
     }
 }
 
+/// Test-only fault injection: when set, the next local-store segment fsync is
+/// treated as having failed, exercising the clean-abort delete path (review H3)
+/// without needing a real disk fault. Process-isolated under nextest.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_FSYNC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Fsync a freshly written file and its parent directory.
 ///
 /// The directory fsync makes the new directory entry itself durable across
@@ -327,24 +334,46 @@ impl WriteAheadLog {
         }
 
         // Local stores: fsync the segment + its directory before reporting
-        // the flush durable. On fsync failure the buffer is NOT restored —
-        // the bytes are already written (re-flushing would duplicate them
-        // under a new LSN) — but the flush reports failure because
-        // durability cannot be guaranteed.
+        // the flush durable. On fsync failure we report failure (durability
+        // cannot be guaranteed) AND delete the just-written segment: the bytes
+        // are already on disk, so leaving them would let a later crash + replay
+        // resurrect a transaction the caller was told had FAILED (ghost commit).
+        // `flushed_lsn` is intentionally left un-advanced. (review H3)
         if let Some(root) = &self.local_root {
             let file_path = root.join(path.as_ref());
+            #[cfg(test)]
+            let synced = if FAIL_NEXT_FSYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Ok(Err(std::io::Error::other("injected fsync failure")))
+            } else {
+                tokio::task::spawn_blocking(move || sync_file_and_parent(&file_path)).await
+            };
+            #[cfg(not(test))]
             let synced =
                 tokio::task::spawn_blocking(move || sync_file_and_parent(&file_path)).await;
-            match synced {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(lsn, error = %e, "WAL segment fsync failed — durability not guaranteed");
-                    return Err(e.into());
+            let fsync_err: Option<anyhow::Error> = match synced {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.into()),
+                Err(e) => Some(e.into()),
+            };
+            if let Some(err) = fsync_err {
+                warn!(
+                    lsn,
+                    error = %err,
+                    "WAL segment fsync failed — deleting the non-durable segment to avoid a ghost commit on replay"
+                );
+                // Best-effort clean abort. If the delete ALSO fails the WAL is
+                // in an indeterminate state (a non-durable segment may survive
+                // and replay); surface that as a hard error rather than a
+                // routine flush failure so the caller does not silently retry.
+                if let Err(del_err) = delete_with_timeout(&self.store, &path, DEFAULT_TIMEOUT).await
+                {
+                    return Err(anyhow::anyhow!(
+                        "WAL segment fsync failed ({err}) and the cleanup delete \
+                         of segment at lsn {lsn} also failed ({del_err}); the WAL \
+                         may contain a non-durable segment"
+                    ));
                 }
-                Err(e) => {
-                    warn!(lsn, error = %e, "WAL fsync task failed");
-                    return Err(e.into());
-                }
+                return Err(err);
             }
         }
 
@@ -625,6 +654,41 @@ mod tests {
         assert_eq!(lsn2, lsn1 + 1);
         assert_eq!(lsn3, lsn2 + 1);
 
+        Ok(())
+    }
+
+    /// H3: when a segment's fsync fails, the just-written (non-durable) segment
+    /// must be deleted so a later crash + replay cannot resurrect a transaction
+    /// the caller was told had failed (ghost commit). `flush()` reports failure.
+    #[tokio::test]
+    async fn fsync_failure_deletes_segment_no_ghost_commit() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let prefix = Path::from("wal");
+        // local_root must be set for the fsync barrier (and thus the H3 path) to run.
+        let wal = WriteAheadLog::new(store, prefix).with_local_root(Some(dir.path().to_path_buf()));
+
+        wal.append(Mutation::InsertVertex {
+            vid: Vid::new(1),
+            properties: HashMap::new(),
+            labels: vec![],
+        })?;
+
+        // Force the next segment fsync to fail.
+        FAIL_NEXT_FSYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = wal.flush().await;
+        assert!(
+            result.is_err(),
+            "flush must report failure when the segment fsync fails"
+        );
+
+        // The non-durable segment must have been deleted: replay surfaces nothing.
+        let replayed = wal.replay().await?;
+        assert!(
+            replayed.is_empty(),
+            "a segment whose fsync failed must not be replayable (ghost commit); got {} mutations",
+            replayed.len()
+        );
         Ok(())
     }
 

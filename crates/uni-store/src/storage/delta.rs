@@ -654,6 +654,26 @@ impl DeltaDataset {
             .await
     }
 
+    /// Delete every delta row at or below a version high-water-mark.
+    ///
+    /// Compaction uses this to clear ONLY the deltas it actually merged into L2
+    /// — the ones present at read time, whose max `_version` is `hwm`. Unlike a
+    /// full table wipe ([`replace`] with an empty batch), this preserves rows a
+    /// concurrent flush appended after the compaction read them: those carry a
+    /// strictly higher `_version` (flush versions are monotonic and a flush's
+    /// deltas land atomically), so `_version <= hwm` never matches them. This is
+    /// what makes the clear safe without depending on an instantaneous
+    /// `flush_in_progress` check. (review H11)
+    pub async fn delete_up_to_version(&self, backend: &dyn StorageBackend, hwm: u64) -> Result<()> {
+        let table_name = self.table_name();
+        if !backend.table_exists(&table_name).await? {
+            return Ok(());
+        }
+        backend
+            .delete_rows(&table_name, &format!("_version <= {hwm}"))
+            .await
+    }
+
     /// Read delta entries for a specific vertex ID.
     ///
     /// Returns an empty vector if the table doesn't exist or no entries match.
@@ -812,5 +832,55 @@ mod tests {
     fn test_op_values() {
         assert_eq!(Op::Insert as u8, 0);
         assert_eq!(Op::Delete as u8, 1);
+    }
+
+    fn entry(eid: u64, version: u64) -> L1Entry {
+        L1Entry {
+            src_vid: Vid::new(1),
+            dst_vid: Vid::new(2),
+            eid: Eid::new(eid),
+            op: Op::Insert,
+            version,
+            properties: Properties::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// H11: compaction must clear ONLY the deltas it read (those at or below the
+    /// high-water-mark), so a delta a concurrent flush appended with a higher
+    /// `_version` after the read survives instead of being wiped by a full
+    /// table replace.
+    #[tokio::test]
+    async fn delete_up_to_version_preserves_newer_deltas() -> Result<()> {
+        use crate::backend::lance::LanceDbBackend;
+
+        let dir = tempfile::tempdir()?;
+        let uri = dir.path().to_str().unwrap();
+        let be = LanceDbBackend::connect(uri, None).await?;
+        let backend: &dyn StorageBackend = &be;
+        let schema = Schema::default();
+        let ds = DeltaDataset::new(uri, "KNOWS", "fwd");
+
+        // Compaction-visible deltas at versions 1 and 2 (hwm = 2).
+        let merged = ds.build_record_batch(&[entry(10, 1), entry(11, 2)], &schema)?;
+        ds.write_run(backend, merged).await?;
+
+        // A concurrent flush appends a NEWER delta (version 3) after the read.
+        let newer = ds.build_record_batch(&[entry(12, 3)], &schema)?;
+        ds.write_run(backend, newer).await?;
+
+        // Clear what compaction merged (hwm = 2). The version-3 row must remain.
+        ds.delete_up_to_version(backend, 2).await?;
+
+        let remaining = ds.scan_all_backend(backend, &schema).await?;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the concurrently-appended version-3 delta should remain"
+        );
+        assert_eq!(remaining[0].eid, Eid::new(12));
+        assert_eq!(remaining[0].version, 3);
+        Ok(())
     }
 }

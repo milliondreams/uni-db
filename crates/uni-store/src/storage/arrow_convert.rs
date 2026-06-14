@@ -1132,7 +1132,11 @@ impl<'a> PropertyExtractor<'a> {
     {
         let mut values = Vec::with_capacity(len);
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_i64()).map(|v| v as i32);
+            // i64 -> i32 via try_from: an out-of-range value becomes NULL rather
+            // than silently wrapping to a different number. (review H13)
+            let val = get_props(i)
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok());
             if val.is_none() && is_deleted {
                 values.push(Some(0));
             } else {
@@ -1262,7 +1266,9 @@ impl<'a> PropertyExtractor<'a> {
             {
                 Some(*days_since_epoch)
             } else if let Some(v) = val.and_then(|v| v.as_i64()) {
-                Some(v as i32)
+                // i64 day count -> i32: an out-of-range value becomes NULL
+                // rather than silently wrapping to a different date. (review H13)
+                i32::try_from(v).ok()
             } else if let Some(s) = val.and_then(|v| v.as_str()) {
                 match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
                     Ok(date) => Some(date.signed_duration_since(epoch).num_days() as i32),
@@ -2524,5 +2530,38 @@ mod tests {
         assert_eq!(child.value(3), 4.0);
         assert_eq!(child.value(4), 5.0);
         assert_eq!(child.value(5), 6.0);
+    }
+
+    /// H13: out-of-range i64 values must become NULL in i32/date32 columns
+    /// instead of silently wrapping to a different number/date.
+    #[test]
+    fn test_int32_and_date32_columns_null_out_of_range() {
+        let dt = DataType::Int64;
+        let extractor = PropertyExtractor::new("x", &dt);
+
+        let over = Value::Int(i64::from(i32::MAX) + 1);
+        let ok = Value::Int(42);
+        let vals = [over, ok];
+        let deleted = [false, false];
+
+        let arr = extractor
+            .build_int32_column(2, &deleted, |i| Some(&vals[i]))
+            .unwrap();
+        let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(
+            arr.is_null(0),
+            "out-of-range i64 must be NULL in an int32 column, not wrapped"
+        );
+        assert_eq!(arr.value(1), 42);
+
+        let arr = extractor
+            .build_date32_column(2, &deleted, |i| Some(&vals[i]))
+            .unwrap();
+        let arr = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert!(
+            arr.is_null(0),
+            "out-of-range day count must be NULL in a date32 column, not wrapped"
+        );
+        assert_eq!(arr.value(1), 42);
     }
 }

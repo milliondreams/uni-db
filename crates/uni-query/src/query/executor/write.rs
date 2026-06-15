@@ -1510,6 +1510,84 @@ impl Executor {
         Some((n, canonical))
     }
 
+    /// RC3: detect the bound-endpoints, anonymous-edge relationship MERGE shape
+    /// `(a)-[:TYPE]->(b)` whose edge existence can be resolved with one O(1)
+    /// adjacency probe instead of building and running a per-row traversal
+    /// `LogicalPlan` (the general path is ~19x the bulk CREATE of the same edges).
+    ///
+    /// Returns `(source_var, target_var, edge_type_id, direction)` when the
+    /// pattern is exactly one path of `[Node, Rel, Node]` where the relationship
+    /// is a single concrete type, **anonymous** (no variable → no edge binding to
+    /// reproduce), fixed-length, and unfiltered, and both endpoint nodes are plain
+    /// variables with no re-specified MERGE properties or inline WHERE (those are
+    /// filters only the general path applies). Any deviation returns `None` and
+    /// the caller keeps the general path. The caller still verifies per row that
+    /// both endpoints are actually bound to vids.
+    fn merge_relationship_fastpath_shape(
+        &self,
+        pattern: &Pattern,
+    ) -> Option<(
+        String,
+        String,
+        u32,
+        uni_store::storage::direction::Direction,
+    )> {
+        if pattern.paths.len() != 1 {
+            return None;
+        }
+        let [
+            PatternElement::Node(a),
+            PatternElement::Relationship(r),
+            PatternElement::Node(b),
+        ] = pattern.paths[0].elements.as_slice()
+        else {
+            return None;
+        };
+        // Endpoints: plain variables, no extra MERGE-pattern properties / inline
+        // WHERE (a re-specified property is a filter the general path must apply).
+        let src_var = a.variable.as_ref()?;
+        let dst_var = b.variable.as_ref()?;
+        if a.properties.is_some()
+            || a.where_clause.is_some()
+            || b.properties.is_some()
+            || b.where_clause.is_some()
+        {
+            return None;
+        }
+        // Relationship: single concrete type, anonymous, fixed-length, unfiltered.
+        if r.variable.is_some()
+            || r.range.is_some()
+            || r.properties.is_some()
+            || r.where_clause.is_some()
+            || r.types.names().len() != 1
+        {
+            return None;
+        }
+        let type_name = &r.types.names()[0];
+        let type_id = if self.config.strict_schema {
+            self.storage
+                .schema_manager()
+                .schema()
+                .edge_type_id_by_name_case_insensitive(type_name)?
+        } else {
+            self.storage
+                .schema_manager()
+                .get_or_assign_edge_type_id(type_name)
+        };
+        let dir = match r.direction {
+            uni_cypher::ast::Direction::Outgoing => {
+                uni_store::storage::direction::Direction::Outgoing
+            }
+            uni_cypher::ast::Direction::Incoming => {
+                uni_store::storage::direction::Direction::Incoming
+            }
+            // Undirected existence is ambiguous to encode as one probe; the
+            // general path handles it.
+            uni_cypher::ast::Direction::Both => return None,
+        };
+        Some((src_var.clone(), dst_var.clone(), type_id, dir))
+    }
+
     /// Build the persisted-scan filter for a MERGE key, or `None` if any value
     /// is not a scalar this fast path can represent.
     ///
@@ -2144,6 +2222,21 @@ impl Executor {
                 if let Some(p) = prefetched.as_deref_mut() {
                     p.vertex.entry(vid).or_default();
                 }
+                // Phantom guard (RC2): register this MERGE-create's key so a
+                // concurrent MERGE of the same key aborts retriably at commit
+                // (converging to one node) instead of silently duplicating —
+                // even with no declared UNIQUE constraint. Only inside a
+                // transaction, where commit re-probes the guard; a plain CREATE
+                // never registers a key, so it is unaffected.
+                if let Some(tx_l0) = tx_l0_override {
+                    let key_values: Vec<(String, Value)> = key_props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let guard_key =
+                        uni_store::runtime::l0::serialize_constraint_key(label, &key_values);
+                    tx_l0.write().insert_merge_guard_key(guard_key, vid);
+                }
             }
             if let Some(set) = on_create {
                 self.execute_set_items_locked(
@@ -2322,6 +2415,43 @@ impl Executor {
             }
         }
 
+        // RC3: relationship-MERGE existence fast-path. The single-node fast path
+        // above does not cover `(a)-[:R]->(b)`; the general path rebuilds and runs
+        // a per-row traversal `LogicalPlan` just to check whether the edge exists
+        // (~19x the bulk CREATE of the same edges). For the bound-endpoints,
+        // anonymous-edge shape (and no ON MATCH SET, whose match-row semantics the
+        // general path materialises) we resolve existence with one MVCC-correct
+        // adjacency probe — `GraphExecutionContext::get_neighbors` merges CSR + all
+        // L0 buffers including the transaction's own writes, so intra-batch edges
+        // are seen — and reuse the general create / ON CREATE handling unchanged.
+        // An ON MATCH SET with actual items needs the general path's materialised
+        // match rows; a plain MERGE carries an *empty* on_match, which the fast
+        // path can serve (it emits the row directly, applying nothing on match).
+        let on_match_empty = on_match.is_none_or(|s| s.items.is_empty());
+        let rel_fast = if fastpath.is_none() && on_match_empty {
+            self.merge_relationship_fastpath_shape(pattern)
+        } else {
+            None
+        };
+        let rel_graph_ctx = rel_fast.as_ref().map(|_| {
+            let l0_context = match ctx {
+                Some(c) => crate::query::df_graph::L0Context::from_query_context(c),
+                None => crate::query::df_graph::L0Context::empty(),
+            };
+            let pm_arc = self.prop_manager_arc.clone().unwrap_or_else(|| {
+                Arc::new(PropertyManager::new(
+                    self.storage.clone(),
+                    self.storage.schema_manager_arc(),
+                    prop_manager.cache_size(),
+                ))
+            });
+            crate::query::df_graph::GraphExecutionContext::with_l0_context(
+                self.effective_storage(),
+                l0_context,
+                pm_arc,
+            )
+        });
+
         let mut results = Vec::new();
         for (idx, mut row) in rows.into_iter().enumerate() {
             // Rows with a pre-evaluated scalar key take the fast path; rows
@@ -2353,6 +2483,63 @@ impl Executor {
                     .await?;
                 results.extend(row_out);
                 continue;
+            }
+
+            // RC3 relationship fast path: bound endpoints → resolve edge
+            // existence with one adjacency probe and reuse the general
+            // create / ON CREATE handling, skipping the per-row traversal plan.
+            if let (Some((src_var, dst_var, type_id, dir)), Some(graph_ctx)) =
+                (rel_fast.as_ref(), rel_graph_ctx.as_ref())
+            {
+                let src_vid = row.get(src_var).and_then(|v| Self::vid_from_value(v).ok());
+                let dst_vid = row.get(dst_var).and_then(|v| Self::vid_from_value(v).ok());
+                if let (Some(src_vid), Some(dst_vid)) = (src_vid, dst_vid) {
+                    let exists = graph_ctx
+                        .get_neighbors(src_vid, *type_id, *dir)
+                        .into_iter()
+                        .any(|(n, _eid)| n == dst_vid);
+                    let writer: &uni_store::Writer = writer_lock.as_ref();
+                    if !exists {
+                        // Edge absent: create only the edge (endpoints are bound),
+                        // then apply ON CREATE SET — identical to the general
+                        // create branch below.
+                        let seed_props = self
+                            .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                            .await?;
+                        self.execute_create_pattern(
+                            &path_pattern,
+                            &mut row,
+                            writer,
+                            prop_manager,
+                            params,
+                            ctx,
+                            tx_l0_override,
+                            Some(&seed_props),
+                        )
+                        .await?;
+                        if let Some(set) = on_create {
+                            self.execute_set_items_locked(
+                                &set.items,
+                                &mut row,
+                                writer,
+                                prop_manager,
+                                params,
+                                ctx,
+                                tx_l0_override,
+                                &Prefetch::default(),
+                            )
+                            .await?;
+                        }
+                    }
+                    // Whether matched or just created, the edge now exists; bind
+                    // path variables and emit the row (the edge is anonymous, so
+                    // there is no edge binding to reproduce, and ON MATCH SET is
+                    // excluded from this fast path).
+                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                    results.push(row);
+                    continue;
+                }
+                // Endpoints not bound to vids → fall through to the general path.
             }
 
             // General execution: match-or-create per row. (The index fast path

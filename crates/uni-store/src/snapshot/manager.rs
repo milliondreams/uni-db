@@ -171,8 +171,8 @@ impl SnapshotManager {
 /// A no-op when `local_root` is `None` (remote/object stores), which provide
 /// their own durability on `put`. The two artifacts are fsync'd body-first then
 /// pointer, matching the publish order, so a crash mid-barrier never leaves
-/// `latest` pointing at a non-durable manifest. Paths mirror
-/// [`SnapshotManager::manifest_path`] / [`SnapshotManager::latest_ptr_path`].
+/// `latest` pointing at a non-durable manifest. Paths mirror the private
+/// `SnapshotManager::manifest_path` / `SnapshotManager::latest_ptr_path` helpers.
 pub fn fsync_snapshot_pointer(
     local_root: Option<&std::path::Path>,
     snapshot_id: &str,

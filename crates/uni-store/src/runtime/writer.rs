@@ -814,6 +814,29 @@ impl Writer {
                     }
                 }
 
+                // Implicit MERGE phantom guard: a `MERGE` that *created* a node
+                // registered its (label, key-props) here even with no declared
+                // UNIQUE constraint. If a concurrent transaction already committed
+                // the same MERGE key, abort retriably so the two converge to one
+                // node on retry (the loser's MATCH then finds the committed row).
+                // Only MERGE-creates register keys, so a plain CREATE of the same
+                // properties never lands here. (Empty index → no iterations.)
+                for (key, vid) in &tx_l0.merge_guard_index {
+                    if overlay
+                        .iter()
+                        .any(|b| b.read().has_merge_guard_key(key, *vid))
+                    {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: "MERGE key already committed by a concurrent \
+                                          transaction"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                }
+
                 // Same race window for global ext_id uniqueness: the per-insert
                 // check ran against an older main L0; re-probe the committed
                 // index here, where commits serialize.

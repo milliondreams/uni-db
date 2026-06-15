@@ -658,7 +658,7 @@ impl DeltaDataset {
     ///
     /// Compaction uses this to clear ONLY the deltas it actually merged into L2
     /// — the ones present at read time, whose max `_version` is `hwm`. Unlike a
-    /// full table wipe ([`replace`] with an empty batch), this preserves rows a
+    /// full table wipe ([`Self::replace`] with an empty batch), this preserves rows a
     /// concurrent flush appended after the compaction read them: those carry a
     /// strictly higher `_version` (flush versions are monotonic and a flush's
     /// deltas land atomically), so `_version <= hwm` never matches them. This is

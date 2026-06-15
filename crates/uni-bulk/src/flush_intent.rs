@@ -8,8 +8,9 @@
 //! each committed as its own Lance transaction. Lance has no cross-dataset
 //! atomic commit, so a crash *between* two of those commits would otherwise
 //! leave the tables permanently divergent (an entity in the per-label table but
-//! not the main table), with no reconciliation on reopen. [`BulkWriter::abort`]
-//! only helps if it is actually reached, which a crash skips.
+//! not the main table), with no reconciliation on reopen.
+//! [`crate::BulkWriter::abort`] only helps if it is actually reached, which a
+//! crash skips.
 //!
 //! This module makes the *whole bulk load* atomic with a durable intent marker
 //! plus reconciliation at database open:
@@ -17,7 +18,7 @@
 //! 1. Before the load commits any table it records that table's pre-load Lance
 //!    version in a marker (`catalog/bulk_flush_intent.json`, phase `Active`),
 //!    persisted durably *before* the table write.
-//! 2. [`BulkWriter::commit`] writes the marker as `Committed` (carrying the new
+//! 2. [`crate::BulkWriter::commit`] writes the marker as `Committed` (carrying the new
 //!    snapshot id) *after* the manifest is durably saved but *before* the latest
 //!    pointer is flipped, then deletes the marker once everything is finalized.
 //! 3. On reopen [`recover_interrupted_bulk_load`] reconciles:

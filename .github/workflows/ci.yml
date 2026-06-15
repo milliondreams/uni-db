@@ -1,17 +1,31 @@
-# Continuous Integration Workflow
+# Continuous Integration Workflow (push to main)
 #
-# Runs comprehensive tests, lints, cloud integration, and documentation builds.
-# Only runs on main branch pushes to avoid duplicate runs with PR workflow.
+# The thorough remainder of CI, run ONCE on push to main. The cheap PR gates
+# (format, clippy, the workspace test suite, openCypher TCK schemaless, and the
+# Python ruff + pytest) run on the PR in pr.yml and are deliberately NOT
+# repeated here — branch protection ("require branches to be up to date before
+# merging") guarantees those gates ran against this exact tree.
 #
-# Optimization: The test job runs first to build and cache all Rust dependencies.
-# Other jobs (cloud-tests, python-tests, docs) run in parallel after test completes,
-# reusing the cached dependencies for faster execution.
+# What runs here is everything the PR does NOT: the openCypher sidecar mode,
+# both Locy TCK lanes, the ONNX reranker suites, cloud integration, the rustdoc
+# gate, the flagship-notebook executions, the release-path guards, and the CUDA
+# wheel-graph smoke.
+#
+# The final `gate` job is named "Test" because release.yml's publish guard
+# asserts a passing check named "Test" on the tagged commit; keeping that name
+# makes this workflow's green the authoritative release signal with no change
+# to release.yml.
 
 name: CI
 
 on:
   push:
     branches: [main]
+
+# Serialize main runs (don't cancel — they feed the release gate).
+concurrency:
+  group: ci-main
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,19 +35,16 @@ permissions:
   contents: read
 
 jobs:
-  # Basic tests and lints
-  # Uses xlarge runner for faster builds (8 cores, 32GB RAM)
-  test:
-    name: Test
+  # Conformance modes the PR does not run: openCypher sidecar + both Locy lanes.
+  # This job is the cache "saver" for main's shared "ci" cache (no save-if:false).
+  tck-full:
+    name: TCK (sidecar + Locy)
     runs-on: linux-xlarge-64
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-          targets: wasm32-unknown-unknown, wasm32-wasip2
 
       - name: Install system dependencies
         run: |
@@ -49,57 +60,39 @@ jobs:
           shared-key: "ci"
           cache-on-failure: true
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Run openCypher TCK (sidecar schema)
+        run: UNI_TCK_SCHEMA_MODE=sidecar cargo nextest run -p uni-tck --test tck
 
-      # Wheel-matrix accelerator variants are excluded from `--workspace`
-      # operations on the regular CI runner:
-      #
-      # - The metal variants (`*-metal`) pull in `objc2` which is Apple-only
-      #   and won't compile on Linux at all.
-      # - The cuda variants (`*-cuda`) cause feature unification to activate
-      #   `gpu-cuda` on `uni-xervo`, which pulls in `cudarc` whose `build.rs`
-      #   requires `nvcc`. ubuntu-latest doesn't have CUDA installed.
-      #
-      # Both are workspace members so their feature lists can use
-      # `{ workspace = true }`, but `--workspace` operations on the regular
-      # CI runner must skip them. They get tested in dedicated jobs in
-      # `release-wheels.yml` (CUDA toolkit container for `*-cuda`, macOS
-      # arm64 runner for `*-metal`).
-      - name: Run clippy
+      - name: Run Locy TCK (schemaless + schema)
         run: |
-          cargo clippy --workspace \
-            --exclude uni-tck \
-            --exclude uni-python-cuda \
-            --exclude uni-python-metal \
-            --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal \
-            --all-targets -- -D warnings
+          cargo nextest run -p uni-locy-tck --test locy_tck
+          UNI_LOCY_TCK_SCHEMA_MODE=sidecar cargo nextest run -p uni-locy-tck --test locy_tck
 
-      # The uni-plugin-extism / uni-plugin-wasm e2e tests load pre-built
-      # WASM plugin artifacts from the `examples/example-*-geo` crates
-      # (each its own workspace, built for wasm32 targets). They read the
-      # artifacts at runtime and panic if missing, so build them before
-      # the workspace test run. See scripts/build-wasm-fixtures.sh.
-      - name: Build WASM plugin fixtures
-        run: ./scripts/build-wasm-fixtures.sh
+  # ONNX reranker integration — both linking modes (compiles uni-db with the
+  # opt-in provider-onnx features, so it reads but does not save the base cache).
+  reranker:
+    name: Reranker Integration (ONNX)
+    runs-on: linux-xlarge-64
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Run tests
-        # `uni-python` (bindings/uni-db) and `uni-python-onnx` are
-        # cdylib-only crates with zero Rust `#[test]` items — their tests
-        # are pytest in the python-tests job. We exclude them from the
-        # workspace cargo test because their `pyo3/extension-module` feature
-        # unifies with `uni-plugin-pyo3`'s test binaries and breaks the
-        # linker (no libpython linkage in extension-module mode).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
         run: |
-          cargo nextest run --workspace \
-            --exclude uni-tck \
-            --exclude uni-python \
-            --exclude uni-python-onnx \
-            --exclude uni-python-cuda \
-            --exclude uni-python-metal \
-            --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
 
       # Provider-onnx is opt-in (not in default features). The two ONNX
       # linking modes are mutually exclusive at compile time, so we test
@@ -112,47 +105,26 @@ jobs:
         # `test_real_onnx_cross_encoder_reranks_by_relevance` is filtered out:
         # `cross-encoder/ms-marco-MiniLM-L6-v2/onnx/model.onnx` is served only
         # via a 302 to `cas-bridge.xethub.hf.co` (xet-bridge LFS). `hf-hub
-        # 0.5.0`'s `relative_redirect_client` (api/tokio.rs:368-388) refuses
-        # absolute redirects, so the download 404s. `hf-hub 1.0.0-rc.1` is
-        # a full API rewrite; we'll re-enable this test once `uni-xervo` /
-        # `hf-hub` ship a compatible fix. The other 3 real-ONNX tests
-        # (Qwen3, BGE, cross-encoder facade) still run.
+        # 0.5.0`'s `relative_redirect_client` refuses absolute redirects, so
+        # the download 404s. The other 3 real-ONNX tests still run.
         run: |
           cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all \
             -E 'not test(=test_real_onnx_cross_encoder_reranks_by_relevance)'
 
       - name: Run reranker integration tests (load-dynamic ONNX)
-        # `provider-onnx-dynamic` requires an ONNX Runtime tarball at
-        # runtime. We download Microsoft's CPU build for CI; mock tests pass
-        # without it but we set ORT_DYLIB_PATH to keep the dep symmetrical.
-        #
-        # `--no-default-features` is required: `uni-db`'s defaults include
-        # `provider-onnx` (bundled, statically linked). `provider-onnx` and
-        # `provider-onnx-dynamic` are mutually exclusive at the `ort` crate
-        # level, and `uni-xervo`'s `build.rs` hard-panics when both are
-        # active. We re-enable only the providers the reranker test path
-        # touches.
+        # `provider-onnx-dynamic` requires an ONNX Runtime tarball at runtime.
+        # `--no-default-features` is required: defaults include `provider-onnx`
+        # (bundled), and the two ONNX modes are mutually exclusive at the `ort`
+        # crate level.
         run: |
           curl -sSL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
           tar xzf /tmp/ort.tgz -C /tmp
           export ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-1.20.1/lib/libonnxruntime.so
           cargo nextest run -p uni-db --no-default-features --features provider-onnx-dynamic --test reranker_integration
 
-      - name: Run TCK (schemaless + schema)
-        run: |
-          cargo nextest run -p uni-tck --test tck
-          UNI_TCK_SCHEMA_MODE=sidecar cargo nextest run -p uni-tck --test tck
-
-      - name: Run Locy TCK (schemaless + schema)
-        run: |
-          cargo nextest run -p uni-locy-tck --test locy_tck
-          UNI_LOCY_TCK_SCHEMA_MODE=sidecar cargo nextest run -p uni-locy-tck --test locy_tck
-
-  # Cloud storage integration tests with LocalStack
-  # Runs after test job to reuse cached dependencies
-  cloud-tests:
+  # Cloud storage integration tests with LocalStack.
+  cloud:
     name: Cloud Integration Tests
-    needs: test
     runs-on: linux-xlarge-32
     services:
       localstack:
@@ -211,10 +183,55 @@ jobs:
           cargo nextest run -p uni-db --test integration --run-ignored all \
             -E 'test(/^hybrid_localstack_e2e::/)'
 
-  # Python bindings tests
-  # Runs in parallel with test job (builds its own Rust extension via maturin)
-  python-tests:
-    name: Python Tests
+  # rustdoc gate + generated-notebook freshness check.
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify generated Locy notebooks
+        run: |
+          python3 website/scripts/generate_locy_notebooks.py --check
+          python3 website/scripts/generate_semiconductor_flagship_notebook.py --check
+          python3 website/scripts/generate_pharma_flagship_notebook.py --check
+          python3 website/scripts/generate_cyber_flagship_notebook.py --check
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      # All wheel-matrix variant crates share the same `[lib].name = "_uni_db"`,
+      # which cargo doc rejects as an output-filename collision; they reuse
+      # `bindings/uni-db/src/lib.rs` so excluding them loses no doc content.
+      - name: Build documentation
+        run: |
+          cargo doc --no-deps --workspace \
+            --exclude uni-python \
+            --exclude uni-tck \
+            --exclude uni-python-onnx \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Flagship Locy notebook executions (heavier than the PR Python tests; built
+  # from a release wheel and run serially-stable under the runtime guard).
+  notebooks:
+    name: Flagship Notebooks
     runs-on: linux-xlarge-32
     steps:
       - uses: actions/checkout@v4
@@ -242,8 +259,7 @@ jobs:
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
         # `notebook-runtime` extra (numpy / pyarrow / onnxruntime) is required
-        # by the flagship Locy notebook verifier steps below. They're opt-in so
-        # the default wheel stays lean; the verifier job installs them here.
+        # by the flagship Locy notebook verifiers below.
         run: uv sync --group dev --extra notebook-runtime
 
       - name: Build Python wheel (uni-db)
@@ -272,92 +288,11 @@ jobs:
       - name: Execute flagship Locy notebook (drug-drug interaction)
         run: uv run --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
 
-      - name: Check Python formatting (uni-db)
-        working-directory: bindings/uni-db
-        run: uv run ruff format --check .
-
-      - name: Lint Python code (uni-db)
-        working-directory: bindings/uni-db
-        run: uv run ruff check .
-
-      - name: Run Python tests (uni-db)
-        working-directory: bindings/uni-db
-        run: uv run pytest tests/ -v -n auto
-
-      - name: Install Python dependencies (uni-pydantic)
-        working-directory: bindings/uni-pydantic
-        run: uv sync --group dev
-
-      - name: Check Python formatting (uni-pydantic)
-        working-directory: bindings/uni-pydantic
-        run: uv run ruff format --check .
-
-      - name: Lint Python code (uni-pydantic)
-        working-directory: bindings/uni-pydantic
-        run: uv run ruff check .
-
-      - name: Run Python tests (uni-pydantic)
-        working-directory: bindings/uni-pydantic
-        run: uv run pytest tests/ -v -n auto
-
-  # Build documentation and check examples
-  # Runs after test job to reuse cached dependencies
-  docs:
-    name: Documentation
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify generated Locy notebooks
-        run: |
-          python3 website/scripts/generate_locy_notebooks.py --check
-          python3 website/scripts/generate_semiconductor_flagship_notebook.py --check
-          python3 website/scripts/generate_pharma_flagship_notebook.py --check
-          python3 website/scripts/generate_cyber_flagship_notebook.py --check
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mold protobuf-compiler
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "ci"
-          cache-on-failure: true
-          save-if: false
-
-      # All wheel-matrix variant crates share the same `[lib].name = "_uni_db"`
-      # (so the import name `uni_db` works across all wheels). cargo doc
-      # rejects that as a "document output filename collision," so we exclude
-      # the variants from the doc build. They have no original source — they
-      # all reuse `bindings/uni-db/src/lib.rs` via `[lib].path`, so excluding
-      # them loses no documentation content.
-      - name: Build documentation
-        run: |
-          cargo doc --no-deps --workspace \
-            --exclude uni-python \
-            --exclude uni-tck \
-            --exclude uni-python-onnx \
-            --exclude uni-python-cuda \
-            --exclude uni-python-metal \
-            --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  # Release-path guards. The wheel matrix and crates.io publish list are only
-  # exercised by the release workflows, which `nextest` never touches — so
-  # feature drift (a wheel variant missing a plugin feature) and an incomplete
-  # crates.io publish list slip through green CI and only fail at release time.
-  # These checks reproduce both failure modes cheaply on every push.
+  # Release-path guards. Feature drift (a wheel variant missing a plugin feature)
+  # and an incomplete crates.io publish list slip through the workspace build and
+  # only fail at release time; these reproduce both failure modes cheaply.
   release-guards:
     name: Release Guards
-    needs: test
     runs-on: linux-xlarge-32
     steps:
       - uses: actions/checkout@v4
@@ -392,9 +327,39 @@ jobs:
       - name: Check crates.io publish list
         run: python3 scripts/ci/check_publish_list.py
 
-      # Compile guard for the slim `default-features = false` wheel path, where
-      # plugin-feature drift surfaces. The CUDA/Metal variants can't build on a
-      # plain Linux runner (toolkit / Apple-only) — the static check above
-      # covers their feature wiring.
+      # Compile guard for the slim `default-features = false` wheel path, built
+      # in ISOLATION (no --workspace) so feature unification can't mask a missing
+      # plugin feature.
       - name: Compile-check slim ONNX wheel variant
         run: cargo check -p uni-python-onnx
+
+  # CUDA wheel-graph smoke — catches Cargo-dep-graph breakage in the
+  # `uni-db-cuda` variant early. `cargo metadata` resolves features without
+  # running build scripts (no nvcc / CUDA toolkit needed). Real CUDA wheel
+  # builds run in `release-wheels.yml` on tag-push.
+  wheels-cuda-smoke:
+    name: Wheel-graph smoke check (uni-db-cuda)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve Cargo metadata for uni-db-cuda
+        run: |
+          cargo metadata --format-version=1 \
+            --manifest-path bindings/uni-db-cuda/Cargo.toml \
+            > /dev/null
+
+  # Aggregator gate. release.yml's publish guard asserts a passing check-run
+  # named exactly "Test" on the tagged commit (gh api … select(.name == "Test")).
+  # Keep this literal name so release.yml is unchanged; it succeeds only if every
+  # thorough job above passed, making it the authoritative release signal.
+  gate:
+    name: Test
+    needs: [tck-full, reranker, cloud, docs, notebooks, release-guards, wheels-cuda-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Thorough CI passed
+        run: echo "All push-to-main CI jobs passed."

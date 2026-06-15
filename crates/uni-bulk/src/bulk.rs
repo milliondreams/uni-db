@@ -47,6 +47,17 @@ use uni_store::storage::manager::StorageManager;
 use uni_store::storage::{IndexManager, IndexRebuildManager};
 use uuid::Uuid;
 
+use crate::flush_intent;
+
+/// Test-only fault-injection: when set, `flush_vertices_buffer` returns an error
+/// *after* committing the per-label table but *before* the main table, exactly
+/// reproducing the crash-in-the-middle scenario H9 guards against. Always
+/// compiled (so integration tests across the crate boundary can arm it) but only
+/// ever set by tests.
+#[doc(hidden)]
+pub static FAIL_AFTER_PERLABEL_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Concrete handle bundle injected into the bulk write path.
 ///
 /// `BulkWriter`/`BulkWriterBuilder`/`StreamingAppender` need only field access
@@ -218,6 +229,7 @@ impl BulkWriterBuilder {
             touched_labels: HashSet::new(),
             touched_edge_types: HashSet::new(),
             initial_table_versions: HashMap::new(),
+            seen_unique_keys: HashMap::new(),
             buffer_size_bytes: 0,
             committed: false,
         })
@@ -335,9 +347,26 @@ pub struct BulkWriter {
     // Track LanceDB table versions before bulk load started (for abort rollback)
     // Key: table name, Value: version before first write (None = table created during bulk load)
     initial_table_versions: HashMap<String, Option<u64>>,
+    // UNIQUE-constraint keys accepted over the WHOLE load (not just the current
+    // buffer, which `flush_vertices_buffer` drains): without this, a duplicate
+    // spanning two flushes slipped through. Keyed by constraint identity
+    // (label + unique props), value = set of value-keys seen. (review H8)
+    seen_unique_keys: HashMap<String, HashSet<String>>,
     // Current buffer size in bytes (approximate)
     buffer_size_bytes: usize,
     committed: bool,
+}
+
+/// Stable identity for a UNIQUE constraint's seen-key namespace: its label plus
+/// its property list. `compute_unique_key` encodes only VALUES, so two different
+/// UNIQUE constraints on the same label must not share a key namespace.
+fn unique_set_key(label: &str, unique_props: &[String]) -> String {
+    let mut s = String::from(label);
+    for p in unique_props {
+        s.push('\u{1f}'); // unit separator — won't appear in a label/prop name
+        s.push_str(p);
+    }
+    s
 }
 
 impl BulkWriter {
@@ -469,11 +498,15 @@ impl BulkWriter {
     /// Checks NOT NULL, UNIQUE, and CHECK constraints. For UNIQUE constraints,
     /// validates both within the batch and against already-buffered data.
     async fn validate_vertex_batch_constraints(
-        &self,
+        &mut self,
         label: &str,
         vertices: &[Properties],
     ) -> Result<()> {
         let schema = self.backend.schema.schema();
+
+        // UNIQUE keys to commit to the writer-lifetime set once EVERY constraint
+        // on this batch has passed. (review H8)
+        let mut pending_unique_records: Vec<(String, Vec<String>)> = Vec::new();
 
         // Check NOT NULL and CHECK constraints for each vertex
         if let Some(props_meta) = schema.properties.get(label) {
@@ -521,25 +554,29 @@ impl BulkWriter {
                         }
                     }
 
-                    // Check against already-buffered data
-                    if let Some(buffered) = self.pending_vertices.get(label) {
-                        for (idx, props) in vertices.iter().enumerate() {
-                            let key = self.compute_unique_key(unique_props, props);
-                            if let Some(k) = key {
-                                for (_, buffered_props) in buffered {
-                                    let buffered_key =
-                                        self.compute_unique_key(unique_props, buffered_props);
-                                    if buffered_key.as_ref() == Some(&k) {
-                                        return Err(anyhow!(
-                                            "UNIQUE constraint violation at row {}: key '{}' conflicts with buffered data",
-                                            idx,
-                                            k
-                                        ));
-                                    }
-                                }
+                    // Check against EVERY vertex accepted so far in this load,
+                    // not just the current buffer (`pending_vertices` is drained
+                    // on each flush, so a duplicate spanning two flushes used to
+                    // slip through). (review H8)
+                    let set_key = unique_set_key(label, unique_props);
+                    let mut batch_keys = Vec::with_capacity(vertices.len());
+                    for (idx, props) in vertices.iter().enumerate() {
+                        if let Some(k) = self.compute_unique_key(unique_props, props) {
+                            if self
+                                .seen_unique_keys
+                                .get(&set_key)
+                                .is_some_and(|seen| seen.contains(&k))
+                            {
+                                return Err(anyhow!(
+                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    idx,
+                                    k
+                                ));
                             }
+                            batch_keys.push(k);
                         }
                     }
+                    pending_unique_records.push((set_key, batch_keys));
                 }
                 uni_common::core::schema::ConstraintType::Exists { property } => {
                     for (idx, props) in vertices.iter().enumerate() {
@@ -566,6 +603,15 @@ impl BulkWriter {
                 }
                 _ => {}
             }
+        }
+
+        // All constraints passed — commit the UNIQUE keys to the writer-lifetime
+        // set so a later batch (after a buffer flush) still sees them. (review H8)
+        for (set_key, keys) in pending_unique_records {
+            self.seen_unique_keys
+                .entry(set_key)
+                .or_default()
+                .extend(keys);
         }
 
         Ok(())
@@ -734,6 +780,11 @@ impl BulkWriter {
                     .insert(main_table_name.clone(), version);
             }
 
+            // Durably record the intent to mutate these tables BEFORE writing
+            // any of them, so a crash between the per-label and main commits is
+            // reconciled (rolled back) on reopen (H9).
+            self.persist_active_intent().await?;
+
             let ds = self
                 .backend
                 .storage
@@ -782,6 +833,13 @@ impl BulkWriter {
             ds.ensure_default_indexes(backend)
                 .await
                 .map_err(UniError::Internal)?;
+
+            // Test-only: simulate a crash between the per-label commit (done) and
+            // the main-table commit (below). The intent marker is already durable,
+            // so reopen recovery must roll the per-label table back.
+            if FAIL_AFTER_PERLABEL_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!("injected failure after per-label vertex commit"));
+            }
 
             // Dual-write to main vertices table
             let main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> =
@@ -954,6 +1012,10 @@ impl BulkWriter {
                 self.initial_table_versions
                     .insert(main_edge_table_name.clone(), version);
             }
+
+            // Record the intent before writing any of the three edge datasets
+            // (fwd delta, bwd delta, main edges) — see the vertex path (H9).
+            self.persist_active_intent().await?;
 
             // Write to FWD delta (sorted by src_vid)
             let mut fwd_entries = entries.clone();
@@ -1220,13 +1282,27 @@ impl BulkWriter {
             }
         }
 
-        // Save Snapshot
+        // Save Snapshot. The manifest body is durable after `save_snapshot`;
+        // only after that do we promote the recovery marker to `Committed`
+        // (carrying the new snapshot id) so that a crash before the latest
+        // pointer flip rolls *forward* to this snapshot rather than rolling the
+        // committed tables back (H9).
         self.backend
             .storage
             .snapshot_manager()
             .save_snapshot(&manifest)
             .await
             .map_err(UniError::Internal)?;
+        if !self.initial_table_versions.is_empty() {
+            let store = self.backend.storage.store();
+            flush_intent::write_committed(
+                &store,
+                &self.initial_table_versions,
+                &manifest.snapshot_id,
+            )
+            .await
+            .map_err(UniError::Internal)?;
+        }
         self.backend
             .storage
             .snapshot_manager()
@@ -1255,6 +1331,17 @@ impl BulkWriter {
                         .await;
                 }
             }
+        }
+
+        // The load is fully finalized — drop the recovery marker. (A crash
+        // before this point leaves the `Committed` marker, which reopen
+        // reconciliation rolls forward; a crash before the `Committed` write
+        // leaves the `Active` marker, which it rolls back.)
+        if !self.initial_table_versions.is_empty() {
+            let store = self.backend.storage.store();
+            flush_intent::clear(&store)
+                .await
+                .map_err(UniError::Internal)?;
         }
 
         self.committed = true;
@@ -1320,6 +1407,13 @@ impl BulkWriter {
         // 3. Clear backend cache to ensure next read picks up rolled-back state
         self.backend.storage.backend().clear_cache();
 
+        // 4. Drop the crash-recovery marker — this abort already did the
+        // rollback, so reopen must not try to roll back again.
+        let store = self.backend.storage.store();
+        if let Err(e) = flush_intent::clear(&store).await {
+            rollback_errors.push(format!("intent marker: {e}"));
+        }
+
         if rollback_errors.is_empty() {
             log::info!(
                 "Bulk load aborted successfully. Rolled back {} tables, dropped {} tables.",
@@ -1334,6 +1428,17 @@ impl BulkWriter {
                 rollback_errors.join("; ")
             ))
         }
+    }
+
+    /// Persist the crash-recovery intent marker (phase `Active`) with the
+    /// current set of touched tables and their pre-load versions. Called before
+    /// each multi-table flush writes anything.
+    async fn persist_active_intent(&self) -> Result<()> {
+        let store = self.backend.storage.store();
+        flush_intent::write_active(&store, &self.initial_table_versions)
+            .await
+            .map_err(UniError::Internal)?;
+        Ok(())
     }
 
     fn report_progress(&self, phase: BulkPhase, rows: usize, label: Option<String>) {

@@ -157,3 +157,61 @@ impl SnapshotManager {
         Ok(best)
     }
 }
+
+/// Make a just-published snapshot durable on local-filesystem stores by
+/// fsync'ing the manifest body and the `catalog/latest` pointer (and their
+/// parent directories) BEFORE the WAL — the only other durable copy of this
+/// flush's data — is truncated (review C4).
+///
+/// `save_snapshot` / `set_latest_snapshot` write through the object store,
+/// which does NOT fsync. Without this barrier a crash after WAL truncation but
+/// before the OS flushed those writes would lose the snapshot: recovery could
+/// not resolve `catalog/latest`.
+///
+/// A no-op when `local_root` is `None` (remote/object stores), which provide
+/// their own durability on `put`. The two artifacts are fsync'd body-first then
+/// pointer, matching the publish order, so a crash mid-barrier never leaves
+/// `latest` pointing at a non-durable manifest. Paths mirror the private
+/// `SnapshotManager::manifest_path` / `SnapshotManager::latest_ptr_path` helpers.
+pub fn fsync_snapshot_pointer(
+    local_root: Option<&std::path::Path>,
+    snapshot_id: &str,
+) -> std::io::Result<()> {
+    let Some(root) = local_root else {
+        return Ok(());
+    };
+    let manifest = root
+        .join("catalog")
+        .join("manifests")
+        .join(format!("{snapshot_id}.json"));
+    let latest = root.join("catalog").join("latest");
+    crate::runtime::wal::sync_file_and_parent(&manifest)?;
+    crate::runtime::wal::sync_file_and_parent(&latest)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Remote/object stores have no local root — the barrier is a no-op and
+    /// must never error (durability is the backend's responsibility there).
+    #[test]
+    fn test_fsync_snapshot_pointer_noop_for_remote() {
+        assert!(fsync_snapshot_pointer(None, "snap-1").is_ok());
+    }
+
+    /// On a local filesystem the manifest body and `catalog/latest` pointer are
+    /// fsync'd in place (review C4).
+    #[test]
+    fn test_fsync_snapshot_pointer_syncs_local_artifacts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let manifests = root.join("catalog").join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(manifests.join("snap-1.json"), b"{}").unwrap();
+        std::fs::write(root.join("catalog").join("latest"), b"snap-1").unwrap();
+
+        fsync_snapshot_pointer(Some(root), "snap-1").unwrap();
+    }
+}

@@ -379,17 +379,43 @@ impl GraphUnwindStream {
                                 Value::Int(1)
                             };
 
-                            if let (Some(s), Some(e), Some(st)) =
-                                (start.as_i64(), end.as_i64(), step.as_i64())
-                            {
-                                let mut result = Vec::new();
-                                let mut i = s;
-                                while (st > 0 && i <= e) || (st < 0 && i >= e) {
-                                    result.push(Value::Int(i));
-                                    i += st;
-                                }
-                                return Ok(Value::List(result));
+                            // Cypher null-propagation: any null bound yields null.
+                            if start.is_null() || end.is_null() || step.is_null() {
+                                return Ok(Value::Null);
                             }
+
+                            // range() requires integer arguments. `as_i64` returns
+                            // None for floats, so a non-integer numeric (or any
+                            // non-numeric) is a type error — NOT a silent empty list
+                            // (openCypher requires an error). (review H5)
+                            let (s, e, st) = match (start.as_i64(), end.as_i64(), step.as_i64()) {
+                                (Some(s), Some(e), Some(st)) => (s, e, st),
+                                _ => {
+                                    return Err(datafusion::error::DataFusionError::Execution(
+                                        format!(
+                                            "range() requires integer arguments, got start={start:?}, end={end:?}, step={step:?}"
+                                        ),
+                                    ));
+                                }
+                            };
+                            if st == 0 {
+                                return Err(datafusion::error::DataFusionError::Execution(
+                                    "range() step argument cannot be 0".to_string(),
+                                ));
+                            }
+                            let mut result = Vec::new();
+                            let mut i = s;
+                            while (st > 0 && i <= e) || (st < 0 && i >= e) {
+                                result.push(Value::Int(i));
+                                // Checked step: stop at the i64 boundary instead of
+                                // panicking (debug) or wrapping into an infinite loop
+                                // (release). (review H5)
+                                match i.checked_add(st) {
+                                    Some(next) => i = next,
+                                    None => break,
+                                }
+                            }
+                            return Ok(Value::List(result));
                         }
                         Ok(Value::List(vec![]))
                     }
@@ -424,7 +450,9 @@ impl GraphUnwindStream {
                             let val = self.evaluate_expr_impl(&args[0], batch, row_idx)?;
                             let sz = match &val {
                                 Value::List(arr) => arr.len() as i64,
-                                Value::String(s) => s.len() as i64,
+                                // Unicode character count, not byte length:
+                                // openCypher size('héllo') == 5, not 6. (review H6)
+                                Value::String(s) => s.chars().count() as i64,
                                 Value::Map(m) => m.len() as i64,
                                 _ => 0,
                             };
@@ -1055,5 +1083,87 @@ mod tests {
         let arr = LargeBinaryArray::from(vec![Some(encoded.as_slice())]);
         let value = arrow_to_json_value(&arr, 0);
         assert_eq!(value, Value::Map(HashMap::new()));
+    }
+
+    /// Evaluate a scalar function-call expression (e.g. `range(...)`, `size(...)`)
+    /// over a one-row batch — the harness for the H5/H6 regression tests.
+    fn eval_scalar_fn(name: &str, args: Vec<Expr>) -> DFResult<Value> {
+        use arrow_array::builder::UInt64Builder;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let mut vid_builder = UInt64Builder::new();
+        vid_builder.append_value(1);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n._vid",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(vid_builder.finish())]).unwrap();
+        let empty_stream = RecordBatchStreamAdapter::new(schema.clone(), futures::stream::empty());
+
+        let expr = Expr::FunctionCall {
+            name: name.to_string(),
+            args,
+            distinct: false,
+            window_spec: None,
+        };
+        let stream = GraphUnwindStream {
+            input: Box::pin(empty_stream),
+            expr: expr.clone(),
+            params: HashMap::new(),
+            schema,
+            metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+        };
+        stream.evaluate_expr_impl(&expr, &batch, 0)
+    }
+
+    fn int_lit(v: i64) -> Expr {
+        Expr::Literal(CypherLiteral::Integer(v))
+    }
+
+    /// H5: `i += st` near i64::MAX must terminate at the boundary, not panic
+    /// (debug) or wrap into an infinite loop (release).
+    #[test]
+    fn test_range_overflow_terminates() {
+        let result = eval_scalar_fn(
+            "range",
+            vec![int_lit(i64::MAX - 1), int_lit(i64::MAX), int_lit(2)],
+        )
+        .unwrap();
+        // Only i64::MAX-1 fits; the next step would overflow and is not emitted.
+        assert_eq!(result, Value::List(vec![Value::Int(i64::MAX - 1)]));
+    }
+
+    /// H5: a zero step is an error, not an infinite loop.
+    #[test]
+    fn test_range_zero_step_errors() {
+        let err = eval_scalar_fn("range", vec![int_lit(1), int_lit(5), int_lit(0)]);
+        assert!(err.is_err(), "range(1, 5, 0) must error, got {err:?}");
+    }
+
+    /// H5: float bounds are a type error (openCypher), NOT a silent empty list.
+    #[test]
+    fn test_range_float_args_error() {
+        let err = eval_scalar_fn(
+            "range",
+            vec![
+                Expr::Literal(CypherLiteral::Float(1.0)),
+                Expr::Literal(CypherLiteral::Float(3.0)),
+            ],
+        );
+        assert!(err.is_err(), "range(1.0, 3.0) must error, got {err:?}");
+    }
+
+    /// H6: size()/length() of a multi-byte string counts characters, not bytes.
+    #[test]
+    fn test_size_string_counts_chars_not_bytes() {
+        let result = eval_scalar_fn(
+            "size",
+            vec![Expr::Literal(CypherLiteral::String("héllo".to_string()))],
+        )
+        .unwrap();
+        // 5 chars, but 6 UTF-8 bytes — must be 5.
+        assert_eq!(result, Value::Int(5));
     }
 }

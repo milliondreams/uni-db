@@ -21,6 +21,12 @@ impl GraphAlgoAdapter for RandomWalkAdapter {
             ("walkLength", ValueType::Int, Some(json!(5))),
             ("walksPerNode", ValueType::Int, Some(json!(1))),
             ("startNodes", ValueType::List, Some(Value::Null)),
+            // node2vec second-order bias: p (returnFactor) / q (inOutFactor).
+            // Both 1.0 => unbiased first-order walk.
+            ("returnFactor", ValueType::Float, Some(json!(1.0))),
+            ("inOutFactor", ValueType::Float, Some(json!(1.0))),
+            // Optional RNG seed; null => deterministic default seed.
+            ("seed", ValueType::Int, Some(Value::Null)),
         ]
     }
 
@@ -45,12 +51,17 @@ impl GraphAlgoAdapter for RandomWalkAdapter {
             vids
         };
 
+        let return_param = args.get(3).and_then(Value::as_f64).unwrap_or(1.0);
+        let in_out_param = args.get(4).and_then(Value::as_f64).unwrap_or(1.0);
+        let seed = args.get(5).and_then(Value::as_u64);
+
         Ok(RandomWalkConfig {
             walk_length,
             walks_per_node,
             start_nodes,
-            return_param: 1.0,
-            in_out_param: 1.0,
+            return_param,
+            in_out_param,
+            seed,
         })
     }
 

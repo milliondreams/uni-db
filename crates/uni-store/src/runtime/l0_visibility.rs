@@ -27,6 +27,10 @@ pub fn is_vertex_deleted(vid: Vid, ctx: Option<&QueryContext>) -> bool {
         Some(c) => c,
         None => return false,
     };
+    // A write-tx whose RMW decision turns on a vertex's existence/liveness must
+    // record that observation, or a concurrent delete/insert escapes the SSI
+    // antidependency check (write-skew). No-op outside a write-tx. (review H1)
+    record_vertex_read(ctx, vid);
 
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -62,6 +66,9 @@ pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
         Some(c) => c,
         None => return false,
     };
+    // See is_vertex_deleted: liveness observations under a write-tx are part of
+    // the SSI read-set. No-op outside a write-tx. (review H1)
+    record_edge_read(ctx, eid);
 
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -420,6 +427,8 @@ pub fn vertex_exists_in_l0(vid: Vid, ctx: Option<&QueryContext>) -> bool {
         Some(c) => c,
         None => return false,
     };
+    // Existence is an SSI-relevant observation under a write-tx. (review H1)
+    record_vertex_read(ctx, vid);
 
     // Check transaction L0 first
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -452,6 +461,11 @@ pub fn vertex_exists_in_l0(vid: Vid, ctx: Option<&QueryContext>) -> bool {
 /// Returns labels from the most recent L0 buffer that has the vertex.
 /// Returns an empty vec if the vertex is not in any L0 buffer.
 pub fn get_vertex_labels(vid: Vid, ctx: &QueryContext) -> Vec<String> {
+    // A label-predicated RMW (e.g. `MATCH (n) WHERE n:Active SET ...`) depends
+    // on this read; record it so a concurrent label mutation conflicts. No-op
+    // outside a write-tx. (review H1)
+    record_vertex_read(ctx, vid);
+
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
@@ -483,6 +497,8 @@ pub fn get_vertex_labels(vid: Vid, ctx: &QueryContext) -> Vec<String> {
 /// Returns `None` if vertex is not in any L0 buffer.
 /// Returns `Some(labels)` if vertex is in L0 (may be empty for unlabeled nodes).
 pub fn get_vertex_labels_optional(vid: Vid, ctx: &QueryContext) -> Option<Vec<String>> {
+    // Label observation under a write-tx is part of the SSI read-set. (review H1)
+    record_vertex_read(ctx, vid);
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
         if let Some(labels) = tx_l0.get_vertex_labels(vid) {
@@ -508,6 +524,9 @@ pub fn get_vertex_labels_optional(vid: Vid, ctx: &QueryContext) -> Option<Vec<St
 /// Returns the type from the most recent L0 buffer that has the edge.
 /// Returns None if the edge is not in any L0 buffer.
 pub fn get_edge_type(eid: Eid, ctx: &QueryContext) -> Option<String> {
+    // Edge-type observation under a write-tx is part of the SSI read-set. (review H1)
+    record_edge_read(ctx, eid);
+
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
@@ -551,6 +570,11 @@ pub fn get_edge_type(eid: Eid, ctx: &QueryContext) -> Option<String> {
 /// }
 /// ```
 pub fn get_edge_endpoints(eid: Eid, ctx: &QueryContext) -> Option<(Vid, Vid)> {
+    // An RMW that reaches an edge's endpoints off the traverse path depends on
+    // this read; record it so a concurrent endpoint mutation conflicts. No-op
+    // outside a write-tx. (review H1)
+    record_edge_read(ctx, eid);
+
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
@@ -786,5 +810,58 @@ mod tests {
             all_props.unwrap().get("name"),
             Some(&Value::String("Bob".to_string()))
         );
+    }
+
+    /// H1: label / existence / liveness / edge-endpoint reads consulted under a
+    /// write-tx must land in the SSI read-set — otherwise a concurrent mutation
+    /// to the observed item escapes the antidependency check (write-skew).
+    #[test]
+    fn test_keyed_reads_recorded_in_ssi_read_set() {
+        use crate::runtime::l0::OccReadSet;
+
+        let main_l0 = L0Buffer::new(0, None);
+        let mut tx_l0 = L0Buffer::new(0, None);
+        let read_set = Arc::new(parking_lot::Mutex::new(OccReadSet::default()));
+        tx_l0.occ_read_set = Some(read_set.clone());
+        let ctx = QueryContext::new_with_tx(
+            Arc::new(RwLock::new(main_l0)),
+            Some(Arc::new(RwLock::new(tx_l0))),
+        );
+
+        // Ids need not exist — recording is existence-agnostic, exactly so a
+        // concurrent *insert* of a currently-absent id is also caught.
+        let _ = is_vertex_deleted(Vid::from(10), Some(&ctx));
+        let _ = vertex_exists_in_l0(Vid::from(11), Some(&ctx));
+        let _ = get_vertex_labels(Vid::from(12), &ctx);
+        let _ = get_vertex_labels_optional(Vid::from(13), &ctx);
+        let _ = is_edge_deleted(Eid::from(20), Some(&ctx));
+        let _ = get_edge_type(Eid::from(21), &ctx);
+        let _ = get_edge_endpoints(Eid::from(22), &ctx);
+
+        let guard = read_set.lock();
+        for v in [10u64, 11, 12, 13] {
+            assert!(
+                guard.vertices.contains(&Vid::from(v)),
+                "vertex {v} read was not recorded in the SSI read-set"
+            );
+        }
+        for e in [20u64, 21, 22] {
+            assert!(
+                guard.edges.contains(&Eid::from(e)),
+                "edge {e} read was not recorded in the SSI read-set"
+            );
+        }
+    }
+
+    /// The recording is a no-op outside a write-tx (no `occ_read_set`), so
+    /// read-only / analytical queries pay nothing.
+    #[test]
+    fn test_keyed_reads_noop_without_read_set() {
+        let mut l0 = L0Buffer::new(0, None);
+        l0.vertex_tombstones.insert(Vid::from(1));
+        let ctx = make_ctx_with_l0(l0);
+        // No transaction_l0 / occ_read_set: must not panic and must behave as before.
+        assert!(is_vertex_deleted(Vid::from(1), Some(&ctx)));
+        assert!(get_vertex_labels(Vid::from(2), &ctx).is_empty());
     }
 }

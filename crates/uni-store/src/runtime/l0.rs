@@ -184,6 +184,16 @@ pub struct L0Buffer {
     /// Key: constraint composite key (label + sorted property values serialized).
     /// Value: Vid that owns this key.
     pub constraint_index: HashMap<Vec<u8>, Vid>,
+    /// Implicit MERGE-key guard for phantom-free `MERGE` *without* a declared
+    /// `UNIQUE` constraint. Same key format as `constraint_index` (built by
+    /// [`serialize_constraint_key`]), but populated only by a `MERGE` that
+    /// *creates* a node, and re-probed at commit only against other concurrent
+    /// `MERGE`-creates — so two concurrent `MERGE`s of the same key converge to
+    /// one node (the loser aborts retriably) instead of silently duplicating,
+    /// while a plain `CREATE` of the same properties is unaffected (it never
+    /// registers a key). Tombstoned with the owning vid; transient (not rebuilt
+    /// on recovery).
+    pub merge_guard_index: HashMap<Vec<u8>, Vid>,
     /// Reverse index `ext_id` → owning vid for O(1) global ext_id uniqueness
     /// checks (`Writer::check_extid_globally_unique` previously scanned every
     /// `vertex_properties` map per insert — O(n²) ingest). Maintained by the
@@ -266,6 +276,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            merge_guard_index: self.merge_guard_index.clone(),
             extid_index: self.extid_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
             edge_partial_keys: self.edge_partial_keys.clone(),
@@ -497,6 +508,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            merge_guard_index: HashMap::new(),
             extid_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
             edge_partial_keys: HashMap::new(),
@@ -842,6 +854,9 @@ impl L0Buffer {
 
         // Remove constraint index entries for this vertex
         self.constraint_index.retain(|_, v| *v != vid);
+        // Same for the implicit MERGE guard, so a later re-MERGE of a deleted
+        // node's key does not false-conflict with the stale entry.
+        self.merge_guard_index.retain(|_, v| *v != vid);
 
         // 64 bytes per edge tombstone + 8 for vertex tombstone
         self.estimated_size += cascaded_edges_count * 72 + 8;
@@ -1248,6 +1263,19 @@ impl L0Buffer {
             .is_some_and(|&v| v != exclude_vid)
     }
 
+    /// Register a MERGE-create's key into the implicit phantom guard.
+    pub fn insert_merge_guard_key(&mut self, key: Vec<u8>, vid: Vid) {
+        self.merge_guard_index.insert(key, vid);
+    }
+
+    /// Check if a MERGE-guard key exists, owned by a different vertex than
+    /// `exclude_vid` — i.e. a concurrent MERGE already created this key.
+    pub fn has_merge_guard_key(&self, key: &[u8], exclude_vid: Vid) -> bool {
+        self.merge_guard_index
+            .get(key)
+            .is_some_and(|&v| v != exclude_vid)
+    }
+
     #[instrument(skip(self, other), level = "trace")]
     /// Validate that merging `other` into `self` will not bail on a tombstoned
     /// edge endpoint (issue #77), **without mutating** either buffer.
@@ -1432,6 +1460,12 @@ impl L0Buffer {
         // Merge constraint index
         for (key, vid) in &other.constraint_index {
             self.constraint_index.insert(key.clone(), *vid);
+        }
+
+        // Merge the implicit MERGE-key guard so a committed MERGE-create is
+        // visible to a concurrent transaction's commit-time re-probe.
+        for (key, vid) in &other.merge_guard_index {
+            self.merge_guard_index.insert(key.clone(), *vid);
         }
 
         Ok(())

@@ -22,6 +22,8 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
             ("maxIterations", ValueType::Int, Some(json!(10))),
             ("write", ValueType::Bool, Some(json!(false))),
             ("writeProperty", ValueType::String, Some(json!("community"))),
+            // Optional RNG seed; null => deterministic default seed.
+            ("seed", ValueType::Int, Some(Value::Null)),
         ]
     }
 
@@ -35,6 +37,7 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
             write: arg_bool(&args, 1, "write")?,
             write_property: arg_str(&args, 2, "writeProperty")?.to_string(),
             seed_property: None,
+            seed: args.get(3).and_then(Value::as_u64),
         })
     }
 

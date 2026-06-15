@@ -3130,6 +3130,15 @@ impl UniBuilder {
             .clone()
             .unwrap_or_else(|| data_store.clone());
 
+        // Reconcile an interrupted bulk load before reading the latest snapshot:
+        // a crash between the per-label and main table commits would otherwise
+        // leave them divergent. Recovery rolls an uncommitted load back, or rolls
+        // a committed-but-unfinalized one forward (it may flip the latest pointer,
+        // so it must run first). A no-op when no marker is present (H9).
+        uni_bulk::recover_interrupted_bulk_load(&storage)
+            .await
+            .map_err(UniError::Internal)?;
+
         // Determine start version and WAL high water mark from latest snapshot.
         // Detects and recovers from a lost manifest pointer.
         let latest_snapshot = storage

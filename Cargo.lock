@@ -2827,7 +2827,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -12585,7 +12585,7 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "uni-algo"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12604,7 +12604,7 @@ dependencies = [
 
 [[package]]
 name = "uni-btic"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -12614,12 +12614,16 @@ dependencies = [
 
 [[package]]
 name = "uni-bulk"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "bytes",
  "chrono",
  "log",
+ "object_store",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uni-common",
@@ -12630,7 +12634,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cli"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -12650,7 +12654,7 @@ dependencies = [
 
 [[package]]
 name = "uni-common"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -12672,7 +12676,7 @@ dependencies = [
 
 [[package]]
 name = "uni-crdt"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "fxhash",
  "proptest",
@@ -12686,7 +12690,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cypher"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "pest",
  "pest_derive",
@@ -12697,7 +12701,7 @@ dependencies = [
 
 [[package]]
 name = "uni-db"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12767,7 +12771,7 @@ dependencies = [
 
 [[package]]
 name = "uni-fork"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12783,7 +12787,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -12799,7 +12803,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy-tck"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12826,7 +12830,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -12864,7 +12868,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-apoc-core"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12884,7 +12888,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-builtin"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12913,7 +12917,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-conformance"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "semver",
  "serde",
@@ -12925,7 +12929,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-custom"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12948,7 +12952,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-extism"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12973,7 +12977,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-host"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13008,7 +13012,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-pyo3"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13031,7 +13035,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-rhai"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13057,7 +13061,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13083,7 +13087,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm-rt"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13096,7 +13100,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13121,7 +13125,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-cuda"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13144,7 +13148,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-metal"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13167,7 +13171,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13190,7 +13194,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-cuda"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13213,7 +13217,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-metal"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13236,7 +13240,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13285,7 +13289,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query-functions"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13315,7 +13319,7 @@ dependencies = [
 
 [[package]]
 name = "uni-sidecar"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -13325,7 +13329,7 @@ dependencies = [
 
 [[package]]
 name = "uni-store"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -13368,7 +13372,7 @@ dependencies = [
 
 [[package]]
 name = "uni-tck"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13392,9 +13396,9 @@ dependencies = [
 
 [[package]]
 name = "uni-xervo"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc6e28bf2c003230f108da0bfe12e6b0324520b96187fe8be532d3b56d4f2a5b"
+checksum = "dc452e88a52cc5129fb49d4af368b1845d1549dfe14278b5d136b3c2db539e00"
 dependencies = [
  "anyhow",
  "async-trait",

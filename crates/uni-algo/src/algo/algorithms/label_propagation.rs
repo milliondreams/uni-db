@@ -6,8 +6,14 @@
 use crate::algo::GraphProjection;
 use crate::algo::algorithms::Algorithm;
 use rand::prelude::*;
+use rand::rngs::StdRng;
 use std::collections::HashMap;
 use uni_common::core::id::Vid;
+
+/// Fixed default RNG seed so community assignments are reproducible run-to-run
+/// (deterministic by default). Callers set `LabelPropagationConfig::seed` for a
+/// different but still reproducible stream.
+const DEFAULT_SEED: u64 = 0x51F3_9C7B_2E4D_8A16;
 
 pub struct LabelPropagation;
 
@@ -18,6 +24,9 @@ pub struct LabelPropagationConfig {
     pub seed_property: Option<String>,
     pub write: bool,
     pub write_property: String,
+    /// RNG seed for the processing-order shuffle and tie-breaks. `None` =>
+    /// `DEFAULT_SEED` (deterministic by default).
+    pub seed: Option<u64>,
 }
 
 impl Default for LabelPropagationConfig {
@@ -27,6 +36,7 @@ impl Default for LabelPropagationConfig {
             seed_property: None,
             write: false,
             write_property: "community".to_string(),
+            seed: None,
         }
     }
 }
@@ -75,7 +85,7 @@ impl Algorithm for LabelPropagation {
         let mut converged = false;
         let mut iterations = 0;
         let mut node_indices: Vec<u32> = (0..num_nodes as u32).collect();
-        let mut rng = rand::rng();
+        let mut rng = StdRng::seed_from_u64(config.seed.unwrap_or(DEFAULT_SEED));
 
         while iterations < config.max_iterations {
             let mut changes = 0;
@@ -114,14 +124,19 @@ impl Algorithm for LabelPropagation {
                     }
                 }
 
-                // Collect best labels (ties)
-                let best_labels: Vec<u64> = label_counts
+                // Collect best labels (ties). Sort so the candidate order is
+                // canonical — `HashMap` iteration order is randomized per
+                // instance, which would otherwise make the seeded tie-break
+                // pick a different label run-to-run.
+                let mut best_labels: Vec<u64> = label_counts
                     .iter()
                     .filter(|(_, count)| **count == max_count)
                     .map(|(label, _)| *label)
                     .collect();
+                best_labels.sort_unstable();
 
-                // Pick one randomly
+                // Pick one randomly (deterministic given the seeded RNG and the
+                // now-canonical candidate order).
                 let new_label = if best_labels.len() == 1 {
                     best_labels[0]
                 } else {
@@ -153,5 +168,48 @@ impl Algorithm for LabelPropagation {
             iterations,
             converged,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algo::test_utils::build_test_graph;
+
+    fn two_cliques() -> GraphProjection {
+        // Two triangles {0,1,2} and {3,4,5} bridged by a single 2-3 edge,
+        // edges added both ways so the undirected community view is symmetric.
+        let undirected = [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (2, 3)];
+        let mut edges = Vec::new();
+        for (a, b) in undirected {
+            edges.push((Vid::from(a as u64), Vid::from(b as u64)));
+            edges.push((Vid::from(b as u64), Vid::from(a as u64)));
+        }
+        build_test_graph((0..6).map(Vid::from).collect(), edges)
+    }
+
+    #[test]
+    fn label_propagation_is_deterministic_with_seed() {
+        let graph = two_cliques();
+        let config = LabelPropagationConfig {
+            max_iterations: 20,
+            seed: Some(123),
+            ..Default::default()
+        };
+        let a = LabelPropagation::run(&graph, config.clone());
+        let b = LabelPropagation::run(&graph, config);
+        assert_eq!(
+            a.communities, b.communities,
+            "identical seed must yield identical communities"
+        );
+    }
+
+    #[test]
+    fn label_propagation_default_seed_is_deterministic() {
+        let graph = two_cliques();
+        let cfg = LabelPropagationConfig::default();
+        let a = LabelPropagation::run(&graph, cfg.clone());
+        let b = LabelPropagation::run(&graph, cfg);
+        assert_eq!(a.communities, b.communities);
     }
 }

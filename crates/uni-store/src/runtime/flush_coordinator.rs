@@ -312,7 +312,13 @@ impl FlushCoordinator {
         let current_version = rotated.current_version;
         let name = rotated.name.clone();
         let handle = tokio::spawn(async move {
-            let result = run_stream(old_l0, wal_lsn, current_version, name).await;
+            // Catch a panic in the stream future and turn it into a flush
+            // *failure* that is still submitted. Otherwise a panicking `seq`
+            // would never reach the finalizer, which finalizes strictly in
+            // consecutive seq order — the missing seq would block every later
+            // flush forever and `drain()`/`shutdown()` would hang. (review H2)
+            let result =
+                run_stream_catching(run_stream(old_l0, wal_lsn, current_version, name)).await;
             coord.submit(seq, rotated, result, Some(ack_tx));
         });
         // Track the handle so `shutdown()` can await all stream tasks'
@@ -365,6 +371,34 @@ pub trait FinalizeFn: Send + Sync {
         err: anyhow::Error,
         shared: SharedFlushCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>>;
+}
+
+/// Run a stream-phase future, converting a panic into an `Err` outcome instead
+/// of letting it unwind the spawned task.
+///
+/// The async-flush finalizer advances `expected` strictly in consecutive seq
+/// order and only when a `seq` is submitted. If a stream future panicked and the
+/// task died without submitting, that seq would be missing forever and every
+/// later flush — plus `drain()`/`shutdown()` — would block. Converting the panic
+/// to a failed `FlushOutcome` keeps the pipeline live (the flush still fails, but
+/// `finalize_failure` advances past it). (review H2)
+async fn run_stream_catching<Fut>(fut: Fut) -> anyhow::Result<FlushOutcome>
+where
+    Fut: std::future::Future<Output = anyhow::Result<FlushOutcome>>,
+{
+    use futures::FutureExt as _;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            tracing::error!(panic = %msg, "flush stream task panicked");
+            Err(anyhow::anyhow!("flush stream task panicked: {msg}"))
+        }
+    }
 }
 
 async fn finalizer_loop(
@@ -428,5 +462,42 @@ impl PartialOrd for FlushSubmit {
 impl Ord for FlushSubmit {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.seq.cmp(&other.seq)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H2: a panic inside the stream future must be converted into an `Err`
+    /// outcome (so the seq can still be submitted and the finalizer advances),
+    /// not propagated to abort the spawned task. A normal `Err` passes through
+    /// unchanged.
+    #[tokio::test]
+    async fn run_stream_catching_converts_panic_to_err() {
+        // (FlushOutcome isn't Debug, so we match instead of using expect_err.)
+        // A normal failure is forwarded verbatim.
+        let normal = run_stream_catching(async { Err(anyhow::anyhow!("normal failure")) }).await;
+        let normal_err = match normal {
+            Ok(_) => panic!("normal failure should stay an error"),
+            Err(e) => e,
+        };
+        assert!(normal_err.to_string().contains("normal failure"));
+
+        // A panic becomes an Err mentioning the panic, never unwinding.
+        let panicked = run_stream_catching(async {
+            panic!("boom in stream");
+            #[allow(unreachable_code)]
+            Ok(unreachable!())
+        })
+        .await;
+        let panic_err = match panicked {
+            Ok(_) => panic!("panic must be caught as an error"),
+            Err(e) => e,
+        };
+        assert!(
+            panic_err.to_string().contains("panicked"),
+            "error should identify the panic, got: {panic_err}"
+        );
     }
 }

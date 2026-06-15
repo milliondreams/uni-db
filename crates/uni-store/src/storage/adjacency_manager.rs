@@ -73,6 +73,10 @@ pub struct AdjacencyManager {
     /// Coalescing locks for warm() operations — prevents cache stampede.
     /// Key: (edge_type_id, Direction), Value: Mutex guard for that warm operation.
     warm_guards: DashMap<(u32, Direction), Arc<tokio::sync::Mutex<()>>>,
+
+    /// Serializes `compact()` so two compactions can't interleave their
+    /// freeze→snapshot→clear sequences and lose a frozen segment. (review H12)
+    compact_lock: parking_lot::Mutex<()>,
 }
 
 impl AdjacencyManager {
@@ -86,6 +90,7 @@ impl AdjacencyManager {
             current_bytes: AtomicUsize::new(0),
             max_bytes,
             warm_guards: DashMap::new(),
+            compact_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -332,6 +337,11 @@ impl AdjacencyManager {
     /// CRITICAL: Frozen segments remain readable until the new CSR is installed,
     /// eliminating the visibility gap where edges would be invisible.
     pub fn compact(&self) {
+        // Serialize compaction: two concurrent compacts would each freeze, take
+        // their own snapshot, then clear — the second clear wiping segments the
+        // first had not yet merged. (review H12)
+        let _compact_guard = self.compact_lock.lock();
+
         // Step 1: Freeze active overlay and push to frozen list
         let frozen = {
             let mut active = self.active_overlay.write();
@@ -457,9 +467,16 @@ impl AdjacencyManager {
             self.current_bytes.fetch_add(size, Ordering::Relaxed);
         }
 
-        // Step 5: ONLY NOW clear frozen segments and reset active overlay
-        // New CSR contains all their data, so they're safe to discard
-        self.frozen_segments.write().clear();
+        // Step 5: drain EXACTLY the segments we snapshotted in Step 2 — not a
+        // blanket clear(). A concurrent `freeze()` may have pushed a new frozen
+        // segment after the snapshot; that segment was NOT merged into the new
+        // CSR, so clearing it would silently lose its topology. Retain anything
+        // not in the snapshot (compared by Arc identity). (review H12)
+        let snapshot_ptrs: HashSet<*const FrozenCsrSegment> =
+            segments.iter().map(Arc::as_ptr).collect();
+        self.frozen_segments
+            .write()
+            .retain(|s| !snapshot_ptrs.contains(&Arc::as_ptr(s)));
     }
 
     /// Warms the Main CSR from storage (L2 adjacency + L1 delta) for a specific edge type and direction.
@@ -890,6 +907,51 @@ mod tests {
         // At version 5: deleted, not visible
         let n = am.get_neighbors_at_version(Vid::new(0), 1, Direction::Outgoing, 5);
         assert!(n.is_empty());
+    }
+
+    /// H12: concurrent compaction must never drop an edge. `compact()` is the
+    /// only writer of `frozen_segments`, now serialized under `compact_lock`,
+    /// and Step 5 drains exactly the snapshotted segments rather than clearing
+    /// all — so a segment frozen by an interleaving compact survives. Asserts
+    /// edge conservation under many concurrent compacts racing inserts.
+    #[test]
+    fn test_concurrent_compaction_conserves_edges() {
+        let am = std::sync::Arc::new(AdjacencyManager::new(64 * 1024 * 1024));
+        let n: u64 = 150;
+
+        let inserter = {
+            let am = am.clone();
+            std::thread::spawn(move || {
+                for i in 1..=n {
+                    am.insert_edge(Vid::new(0), Vid::new(i), Eid::new(i), 1, i);
+                    if i % 8 == 0 {
+                        am.compact();
+                    }
+                }
+            })
+        };
+        let compactor = {
+            let am = am.clone();
+            std::thread::spawn(move || {
+                for _ in 0..40 {
+                    am.compact();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        inserter.join().unwrap();
+        compactor.join().unwrap();
+        am.compact();
+
+        let neighbors = am.get_neighbors(Vid::new(0), 1, Direction::Outgoing);
+        let got: HashSet<u64> = neighbors.iter().map(|(v, _)| v.as_u64()).collect();
+        for i in 1..=n {
+            assert!(
+                got.contains(&i),
+                "edge to {i} was lost under concurrent compaction"
+            );
+        }
+        assert_eq!(got.len(), n as usize, "no spurious or duplicate neighbors");
     }
 
     #[test]

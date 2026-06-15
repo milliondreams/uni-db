@@ -392,11 +392,13 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
+        // MVCC (review C2): scan tombstones too — the highest-version row wins,
+        // and a deleted winner yields `None`. Filtering `_deleted = false` here
+        // (and taking `value(0)` with no version comparison, as the old code
+        // did) would let an OLDER live version resurrect a vertex whose tombstone
+        // is the true winner.
         let filter = with_version_bound(
-            format!(
-                "ext_id = '{}' AND _deleted = false",
-                ext_id.replace('\'', "''")
-            ),
+            format!("ext_id = '{}'", ext_id.replace('\'', "''")),
             version,
         );
 
@@ -404,20 +406,49 @@ impl MainVertexDataset {
             .scan(
                 ScanRequest::all(table_name)
                     .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string()]),
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
+        let mut best_vid: Option<Vid> = None;
+        let mut best_version: u64 = 0;
+        let mut best_deleted = false;
+
         for batch in results {
-            if batch.num_rows() > 0
-                && let Some(vid_col) = batch.column_by_name("_vid")
-                && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
-            {
-                return Ok(Some(Vid::from(vid_arr.value(0))));
+            let vid_col = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let ver_col = batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+
+            if let (Some(vid_arr), Some(ver_arr)) = (vid_col, ver_col) {
+                for i in 0..batch.num_rows() {
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
+                    if v >= best_version {
+                        best_version = v;
+                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
+                        best_vid = Some(Vid::from(vid_arr.value(i)));
+                    }
+                }
             }
         }
 
-        Ok(None)
+        if best_deleted {
+            return Ok(None);
+        }
+        Ok(best_vid)
     }
 
     /// Check if an ext_id already exists in the main vertices table.
@@ -451,30 +482,63 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let filter = with_version_bound(
-            format!("_vid = {} AND _deleted = false", vid.as_u64()),
-            version,
-        );
+        // MVCC (review C2): the highest-version row wins, tombstones included,
+        // and a deleted winner yields `None`. Filtering `_deleted = false` (and
+        // taking `value(0)` with no version comparison, as the old code did)
+        // would let an OLDER live version resurrect a deleted vertex.
+        let filter = with_version_bound(format!("_vid = {}", vid.as_u64()), version);
 
         let results = backend
             .scan(
                 ScanRequest::all(table_name)
                     .with_filter(filter)
-                    .with_columns(vec!["labels".to_string()]),
+                    .with_columns(vec![
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
+        let mut best_labels: Option<Vec<String>> = None;
+        let mut best_version: u64 = 0;
+        let mut best_deleted = false;
+
         for batch in results {
-            if batch.num_rows() > 0
-                && let Some(labels_col) = batch.column_by_name("labels")
-                && let Some(list_arr) = labels_col.as_any().downcast_ref::<arrow_array::ListArray>()
-                && let Some(labels) = list_array_to_labels(list_arr, 0)
-            {
-                return Ok(Some(labels));
+            let labels_col = batch
+                .column_by_name("labels")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::ListArray>());
+            let ver_col = batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+
+            if let (Some(list_arr), Some(ver_arr)) = (labels_col, ver_col) {
+                for i in 0..batch.num_rows() {
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
+                    if v >= best_version {
+                        best_version = v;
+                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
+                        best_labels = if best_deleted {
+                            Some(Vec::new())
+                        } else {
+                            Some(list_array_to_labels(list_arr, i).unwrap_or_default())
+                        };
+                    }
+                }
             }
         }
 
-        Ok(None)
+        if best_deleted {
+            return Ok(None);
+        }
+        Ok(best_labels)
     }
 
     /// Find all non-deleted VIDs in the main vertices table.
@@ -846,6 +910,86 @@ mod tests {
         assert_ne!(
             uid1, uid2,
             "Different properties should produce different UIDs"
+        );
+    }
+
+    /// MVCC regression (review C2): a deletion tombstone written at a higher
+    /// version must win over the older live row. `find_by_ext_id` /
+    /// `ext_id_exists` / `find_labels_by_vid` previously filtered
+    /// `_deleted = false` and took `value(0)` with no version comparison, so the
+    /// older live version resurrected a deleted vertex.
+    #[tokio::test]
+    async fn test_vertex_key_reads_respect_tombstone_winner() {
+        use crate::backend::lance::LanceDbBackend;
+        use uni_common::Value;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let be = LanceDbBackend::connect(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let backend: &dyn StorageBackend = &be;
+
+        let mut props = HashMap::new();
+        props.insert("ext_id".to_string(), Value::String("u1".to_string()));
+        props.insert("name".to_string(), Value::String("Alice".to_string()));
+
+        // v1: live row.
+        let live = MainVertexDataset::build_record_batch(
+            &[(
+                Vid::new(1),
+                vec!["Person".to_string()],
+                props.clone(),
+                false,
+                1u64,
+            )],
+            None,
+            None,
+        )
+        .unwrap();
+        MainVertexDataset::write_batch(backend, live).await.unwrap();
+
+        // Sanity: visible while live.
+        assert_eq!(
+            MainVertexDataset::find_by_ext_id(backend, "u1", None)
+                .await
+                .unwrap(),
+            Some(Vid::new(1))
+        );
+        assert!(
+            MainVertexDataset::find_labels_by_vid(backend, Vid::new(1), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // v2: deletion tombstone at a higher version — the winning row.
+        let dead = MainVertexDataset::build_record_batch(
+            &[(Vid::new(1), vec!["Person".to_string()], props, true, 2u64)],
+            None,
+            None,
+        )
+        .unwrap();
+        MainVertexDataset::write_batch(backend, dead).await.unwrap();
+
+        assert_eq!(
+            MainVertexDataset::find_by_ext_id(backend, "u1", None)
+                .await
+                .unwrap(),
+            None,
+            "deleted (highest-version) winner must not be resurrected via ext_id"
+        );
+        assert!(
+            !MainVertexDataset::ext_id_exists(backend, "u1", None)
+                .await
+                .unwrap(),
+            "ext_id_exists must report absent once the winner is a tombstone"
+        );
+        assert_eq!(
+            MainVertexDataset::find_labels_by_vid(backend, Vid::new(1), None)
+                .await
+                .unwrap(),
+            None,
+            "deleted winner must not return labels"
         );
     }
 }

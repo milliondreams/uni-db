@@ -109,10 +109,25 @@ impl Algorithm for Louvain {
                 }
 
                 let mut best_comm = current_comm;
-                let mut max_gain = 0.0;
 
                 // Remove v from current community
                 community_weights[current_comm as usize] -= v_weight;
+
+                // Baseline: the gain of returning v to its OWN community. A move
+                // is only worthwhile if it beats staying put, so we score moves
+                // by the delta relative to this baseline. Seeding the best score
+                // at a bare `0.0` (the old code) ignored the current community
+                // entirely: it could relocate v to a community that scored
+                // positive in absolute terms yet WORSE than where v already was,
+                // and could strand v in a negative-gain community when a strictly
+                // better (still-negative-absolute) move existed. (review H16c)
+                let current_k_i_in = neighbor_comm_weights
+                    .get(&current_comm)
+                    .copied()
+                    .unwrap_or(0.0);
+                let current_gain = current_k_i_in
+                    - (community_weights[current_comm as usize] * v_weight * config.resolution)
+                        / (2.0 * m);
 
                 // Iterate candidate communities in a deterministic (community-id)
                 // order so HashMap iteration-seed differences cannot flip an
@@ -124,22 +139,29 @@ impl Algorithm for Louvain {
                     .collect();
                 candidates.sort_unstable_by_key(|&(c, _)| c);
 
+                // Best improvement over staying put. A move must strictly improve
+                // modularity (delta > 0) to be considered at all.
+                let mut best_delta = 0.0;
+
                 for &(target_comm, k_i_in) in &candidates {
+                    if target_comm == current_comm {
+                        continue;
+                    }
                     let target_comm_weight = community_weights[target_comm as usize];
 
-                    // Modularity gain formula:
-                    // delta_Q = [ (Sigma_tot + k_i,in) / 2m - ((Sigma_tot + k_i)/2m)^2 ] - [ Sigma_tot/2m - (Sigma_tot/2m)^2 - (k_i/2m)^2 ]
-                    // Simplified: delta_Q = (1/2m) * (k_i,in - (Sigma_tot * k_i) / m)
+                    // Modularity gain of inserting v into `target_comm`:
+                    // delta_Q = (1/2m) * (k_i,in - (Sigma_tot * k_i) / m)
                     let gain =
                         k_i_in - (target_comm_weight * v_weight * config.resolution) / (2.0 * m);
+                    let delta = gain - current_gain;
 
-                    if gain > max_gain {
-                        max_gain = gain;
+                    if delta > best_delta {
+                        best_delta = delta;
                         best_comm = target_comm;
                     }
                 }
 
-                if max_gain > config.min_modularity_gain && best_comm != current_comm {
+                if best_delta > config.min_modularity_gain && best_comm != current_comm {
                     community[v_idx] = best_comm;
                     improved = true;
                 }
@@ -270,6 +292,48 @@ mod tests {
         assert!(
             (q - 0.3571).abs() < 1e-3,
             "modularity should be ~0.3571, got {q}"
+        );
+    }
+
+    /// H16c: the baseline-aware local move must recover the optimal two-community
+    /// partition of the two-triangle/bridge graph (each triangle its own
+    /// community), reaching the natural-partition modularity (~0.357 > 0). The
+    /// old seed-at-0.0 move scored candidates without ever scoring the current
+    /// community as a baseline, so it could strand a node or make a move worse
+    /// than staying — landing on a lower-modularity partition.
+    #[test]
+    fn local_move_recovers_optimal_communities() {
+        let vids = (0..6).map(Vid::from).collect::<Vec<_>>();
+        // Undirected two-triangle/bridge graph: each edge written in BOTH
+        // directions so the no-reverse projection sees a symmetric structure
+        // (out-degree captures every neighbor). Single-direction edges would
+        // skew the gain (the projection has no reverse adjacency).
+        let undirected = [(0u64, 1u64), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5), (2, 3)];
+        let mut edges = Vec::new();
+        for (a, b) in undirected {
+            edges.push((Vid::from(a), Vid::from(b)));
+            edges.push((Vid::from(b), Vid::from(a)));
+        }
+        let graph = build_test_graph(vids, edges);
+
+        let result = Louvain::run(&graph, LouvainConfig::default());
+        let comm: HashMap<u64, u64> = result
+            .communities
+            .iter()
+            .map(|(v, c)| (v.as_u64(), *c))
+            .collect();
+
+        // Each triangle ends in one community; the two triangles are distinct.
+        assert_eq!(comm[&0], comm[&1]);
+        assert_eq!(comm[&1], comm[&2]);
+        assert_eq!(comm[&3], comm[&4]);
+        assert_eq!(comm[&4], comm[&5]);
+        assert_ne!(comm[&0], comm[&3], "the two triangles must not be merged");
+        assert_eq!(result.community_count, 2);
+        assert!(
+            result.modularity > 0.3,
+            "should reach the natural-partition modularity, got {}",
+            result.modularity
         );
     }
 }

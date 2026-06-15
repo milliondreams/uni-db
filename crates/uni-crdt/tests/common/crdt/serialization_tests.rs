@@ -242,9 +242,10 @@ mod json_format {
 
         assert_eq!(json.get("t"), Some(&serde_json::json!("os")));
         assert!(json.get("d").is_some());
+        // v2 ORSWOT wire format: dots + version vector (tombstone-free).
         let data = json.get("d").unwrap();
-        assert!(data.get("elements").is_some());
-        assert!(data.get("tombstones").is_some());
+        assert!(data.get("dots").is_some());
+        assert!(data.get("vv").is_some());
     }
 
     #[test]

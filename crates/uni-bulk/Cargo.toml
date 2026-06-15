@@ -20,3 +20,7 @@ arrow-array = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }

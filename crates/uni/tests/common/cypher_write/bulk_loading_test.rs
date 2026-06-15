@@ -710,3 +710,146 @@ async fn test_bulk_constraint_validation_disabled() -> Result<()> {
 
     Ok(())
 }
+
+/// H8: a UNIQUE constraint must hold across buffer flushes. With a small
+/// batch_size, the first batch flushes (draining the in-memory buffer); a
+/// duplicate key reintroduced in a later batch must still be rejected — the old
+/// check only compared against the (now-drained) buffer and let it through.
+#[tokio::test]
+async fn test_bulk_unique_constraint_spans_buffer_flushes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = Uni::open(temp.path().to_str().unwrap()).build().await?;
+
+    // Define a label with a UNIQUE constraint on `email`.
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING UNIQUE, name STRING)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    // batch_size = 2 so the first insert flushes and drains the buffer.
+    let mut bulk = tx.bulk_writer().batch_size(2).build()?;
+
+    let mk = |email: &str| {
+        let mut p: HashMap<String, uni_db::Value> = HashMap::new();
+        p.insert("email".to_string(), unival!(email));
+        p.insert("name".to_string(), unival!("n"));
+        p
+    };
+
+    // First batch of 2 reaches batch_size → flushes → buffer drained.
+    bulk.insert_vertices("User", vec![mk("a@x"), mk("b@x")])
+        .await?;
+
+    // Second batch reintroduces 'a@x' AFTER the first batch was flushed.
+    let result = bulk
+        .insert_vertices("User", vec![mk("c@x"), mk("a@x")])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a duplicate UNIQUE key spanning two flushes must be rejected"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("unique"),
+        "error should mention the UNIQUE violation"
+    );
+
+    Ok(())
+}
+
+/// H9: a bulk load writes the per-label table and the main table as separate
+/// Lance commits. A crash between them leaves the tables divergent with no
+/// reconciliation. The durable intent marker + reopen recovery must roll an
+/// interrupted load back so the tables stay consistent.
+#[tokio::test]
+async fn bulk_partial_flush_rolled_back_on_reopen() -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Uni::open(&path).build().await?;
+        // Apply schema via the builder so it is durably persisted *before* the
+        // (about-to-fail) bulk load — load_schema only persists on a successful
+        // commit, which the injected fault prevents.
+        db.schema()
+            .label("Person")
+            .property("name", uni_db::DataType::String)
+            .apply()
+            .await?;
+
+        // Arm the fault: the vertex flush commits the per-label `vertices_Person`
+        // table, then errors before the main `vertices` table — exactly the
+        // crash-in-the-middle the marker guards against.
+        uni_db::api::bulk::FAIL_AFTER_PERLABEL_WRITE.store(true, SeqCst);
+
+        let s = db.session();
+        let tx = s.tx().await?;
+        let mut bulk = tx.bulk_writer().batch_size(1000).build()?;
+        let mut props = Vec::new();
+        for i in 0..5 {
+            let mut p: HashMap<String, uni_db::Value> = HashMap::new();
+            p.insert("name".to_string(), unival!(format!("item_{i}")));
+            props.push(p);
+        }
+        bulk.insert_vertices("Person", props).await?;
+        let commit_result = bulk.commit().await;
+        assert!(
+            commit_result.is_err(),
+            "commit must fail at the injected fault"
+        );
+
+        uni_db::api::bulk::FAIL_AFTER_PERLABEL_WRITE.store(false, SeqCst);
+
+        // Simulate a crash: drop without abort() / clean shutdown so the marker
+        // is left behind for recovery.
+        drop(tx);
+        drop(db);
+    }
+
+    // Reopen: recovery must roll the interrupted load back so the per-label and
+    // main tables are consistent (both empty), not divergent.
+    let db = Uni::open(&path).build().await?;
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(
+        result.rows()[0].get::<i64>("c")?,
+        0,
+        "interrupted bulk load must be rolled back on reopen (no divergent rows)"
+    );
+
+    // And the database is healthy: a clean load after recovery yields exactly
+    // its rows, proving no orphaned per-label rows survived the rollback.
+    let s = db.session();
+    let tx = s.tx().await?;
+    let mut bulk = tx.bulk_writer().batch_size(1000).build()?;
+    let mut props = Vec::new();
+    for i in 0..3 {
+        let mut p: HashMap<String, uni_db::Value> = HashMap::new();
+        p.insert("name".to_string(), unival!(format!("clean_{i}")));
+        props.push(p);
+    }
+    bulk.insert_vertices("Person", props).await?;
+    bulk.commit().await?;
+    drop(tx);
+
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(
+        result.rows()[0].get::<i64>("c")?,
+        3,
+        "clean load after recovery must yield exactly its rows"
+    );
+
+    Ok(())
+}

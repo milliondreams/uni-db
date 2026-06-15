@@ -802,6 +802,15 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut along_bindings = Vec::new();
         let mut positive_is_ref_occurrence: usize = 0;
 
+        // Bare→aliased name map for non-KEY value columns of non-first positive
+        // IS-refs (whose scan columns get an `__isref{n}_` prefix). Used to
+        // rewrite FOLD inputs / YIELD exprs / deferred WHERE filters that
+        // reference those columns by bare name. `bare_is_ref_cols` tracks names
+        // already exposed unprefixed (by an occurrence-0 ref) so they keep
+        // shadowing later identically named columns.
+        let mut is_ref_col_aliases: HashMap<String, String> = HashMap::new();
+        let mut bare_is_ref_cols: HashSet<String> = HashSet::new();
+
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
                 let target_rule_name = is_ref.rule_name.to_string();
@@ -882,6 +891,23 @@ impl<'a> LocyPlanBuilder<'a> {
                         format!("__isref{}_", positive_is_ref_occurrence)
                     };
                     positive_is_ref_occurrence += 1;
+
+                    // Record bare→aliased names for this ref's non-KEY value
+                    // columns so later FOLD/YIELD/WHERE references resolve to
+                    // the prefixed scan column. First-occurrence wins: an
+                    // unprefixed (occurrence-0) column shadows identically
+                    // named later columns, matching join-predicate resolution.
+                    for col in target_rule.yield_schema.iter().filter(|c| !c.is_key) {
+                        if col_prefix.is_empty() {
+                            bare_is_ref_cols.insert(col.name.clone());
+                        } else if !bare_is_ref_cols.contains(&col.name)
+                            && !is_ref_col_aliases.contains_key(&col.name)
+                        {
+                            is_ref_col_aliases
+                                .insert(col.name.clone(), format!("{col_prefix}{}", col.name));
+                        }
+                    }
+
                     let scan_schema = if col_prefix.is_empty() {
                         handle.schema.clone()
                     } else {
@@ -933,21 +959,33 @@ impl<'a> LocyPlanBuilder<'a> {
                         };
 
                         if let Some(col_name) = target_col_name {
-                            // Always add a node scan so `target_var` becomes a
-                            // proper node with `._vid`, `._labels`, and property
-                            // columns.  Without this, the derived scan only
-                            // provides the VID and property access (e.g.
-                            // `b.embedding`) would fail at runtime.
-                            let target_node_scan = LogicalPlan::ScanAll {
-                                variable: target_var.clone(),
-                                filter: None,
-                                optional: false,
-                            };
-                            plan = LogicalPlan::CrossJoin {
-                                left: Box::new(plan),
-                                right: Box::new(target_node_scan),
-                            };
-                            // Bind: target_var._vid = derived_col (UInt64 equality)
+                            // Materialize `target_var` as a proper node (with
+                            // `._vid`, `._labels`, and property columns) the
+                            // FIRST time it appears, so property access (e.g.
+                            // `b.embedding`) works and later subjects can use it.
+                            // If the target is already a node variable — a
+                            // MATCH-bound var, or the shared target of an earlier
+                            // IS-ref (`... TO ce, ... TO ce`) — do NOT re-scan it:
+                            // a second `ScanAll` cross-joins the node with itself,
+                            // inflating any aggregate over the joined value columns
+                            // (e.g. `MPROD(mapping_conf)` over the cartesian square
+                            // of the shared element set).
+                            if !clause_node_vars.contains(target_var) {
+                                let target_node_scan = LogicalPlan::ScanAll {
+                                    variable: target_var.clone(),
+                                    filter: None,
+                                    optional: false,
+                                };
+                                plan = LogicalPlan::CrossJoin {
+                                    left: Box::new(plan),
+                                    right: Box::new(target_node_scan),
+                                };
+                            }
+                            // Bind: target_var._vid = derived_col (UInt64
+                            // equality). For an already-bound target this ties
+                            // this ref's derived scan to the same node the earlier
+                            // ref bound, turning a shared `TO ce` into a join
+                            // constraint rather than a fresh cross product.
                             let target_binding = Expr::BinaryOp {
                                 left: Box::new(Expr::Variable(format!("{}._vid", target_var))),
                                 op: BinaryOp::Eq,
@@ -958,10 +996,9 @@ impl<'a> LocyPlanBuilder<'a> {
                                 predicate: target_binding,
                                 optional_variables: HashSet::new(),
                             };
-                            // The ScanAll above materialized `{target_var}._vid`,
-                            // so chained IS-refs later in this clause can use the
-                            // target as a node-variable subject (`x IS r TO mid,
-                            // mid IS r TO z`).
+                            // Record the target as a node variable so chained
+                            // IS-refs later in this clause can use it as a subject
+                            // (`x IS r TO mid, mid IS r TO z`).
                             clause_node_vars.insert(target_var.clone());
                         }
                     }
@@ -972,6 +1009,9 @@ impl<'a> LocyPlanBuilder<'a> {
         // Step 3.5: Apply deferred WHERE conditions (those referencing IS-ref target vars).
         if !deferred_filter_exprs.is_empty() {
             let predicate = combine_with_and(&deferred_filter_exprs);
+            // Rewrite bare references to non-first IS-refs' value columns to
+            // their aliased scan names (e.g. `relevance` → `__isref1_relevance`).
+            let predicate = rewrite_is_ref_cols(predicate, &is_ref_col_aliases);
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate,
@@ -1091,6 +1131,9 @@ impl<'a> LocyPlanBuilder<'a> {
                 let e = Expr::Variable(yc.name.clone());
                 substitute_along_vars(e, &rewritten_along)
             };
+            // Resolve bare references to non-first IS-refs' aliased value
+            // columns (covers FOLD aggregate inputs and plain YIELD exprs).
+            let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
             projections.push((expr, Some(yc.name.clone())));
             target_types.push(infer_yield_type(
                 &yc.name,
@@ -1128,6 +1171,7 @@ impl<'a> LocyPlanBuilder<'a> {
             if let Some(orig_expr) = yield_expr_map.get(hidden) {
                 let e = (*orig_expr).clone();
                 let e = substitute_along_vars(e, &rewritten_along);
+                let e = rewrite_is_ref_cols(e, &is_ref_col_aliases);
                 projections.push((e, Some(hidden.clone())));
             }
         }
@@ -1458,6 +1502,84 @@ pub(crate) fn rewrite_locy_expr(expr: &LocyExpr) -> Result<Expr> {
             op: *op,
             expr: Box::new(rewrite_locy_expr(inner)?),
         }),
+    }
+}
+
+/// Recursively rename `Variable(name)` nodes that refer to a non-first
+/// positive IS-ref's non-KEY value column to that column's per-occurrence
+/// aliased name (`__isref{n}_name`).
+///
+/// The second and later positive IS-refs of a clause have their derived-scan
+/// columns aliased with an `__isref{n}_` prefix (see `alias_derived_schema`
+/// and the aliasing comment in `build_clause` Step 3). FOLD aggregate inputs,
+/// YIELD expressions, and deferred WHERE filters that reference such a column
+/// by its bare yield name — e.g. `MPROD(mapping_conf)` where `mapping_conf`
+/// is yielded by a non-first `... IS element_mapped TO ce` — must be rewritten
+/// to the prefixed name, otherwise they resolve against a field that does not
+/// exist in the aliased scan schema and planning fails with a "No field named
+/// …" DataFusion error.
+fn rewrite_is_ref_cols(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
+    if aliases.is_empty() {
+        return expr;
+    }
+    let recur = |e: Expr| rewrite_is_ref_cols(e, aliases);
+    let boxed = |e: Box<Expr>| Box::new(rewrite_is_ref_cols(*e, aliases));
+    match expr {
+        Expr::Variable(ref name) if aliases.contains_key(name) => {
+            Expr::Variable(aliases[name].clone())
+        }
+        Expr::Property(inner, prop) => Expr::Property(boxed(inner), prop),
+        Expr::List(items) => Expr::List(items.into_iter().map(recur).collect()),
+        Expr::Map(entries) => Expr::Map(entries.into_iter().map(|(k, v)| (k, recur(v))).collect()),
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            window_spec,
+        } => Expr::FunctionCall {
+            name,
+            args: args.into_iter().map(recur).collect(),
+            distinct,
+            window_spec,
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: boxed(left),
+            op,
+            right: boxed(right),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op,
+            expr: boxed(inner),
+        },
+        Expr::Case {
+            expr: scrutinee,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            expr: scrutinee.map(boxed),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (recur(w), recur(t)))
+                .collect(),
+            else_expr: else_expr.map(boxed),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(boxed(inner)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(boxed(inner)),
+        Expr::IsUnique(inner) => Expr::IsUnique(boxed(inner)),
+        Expr::In { expr: e, list } => Expr::In {
+            expr: boxed(e),
+            list: boxed(list),
+        },
+        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
+            array: boxed(array),
+            index: boxed(index),
+        },
+        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
+            array: boxed(array),
+            start: start.map(boxed),
+            end: end.map(boxed),
+        },
+        other => other,
     }
 }
 

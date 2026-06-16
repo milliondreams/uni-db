@@ -4,7 +4,7 @@ This document provides a comprehensive reference for all Uni configuration optio
 
 ## Configuration Overview
 
-**Status (2026-06-03):** Configuration is currently applied **programmatically** via the Rust API (`UniConfig`) or the Python builder. Configuration files (`uni.toml`) and `UNI_*` environment overrides are **planned** but not wired into the CLI/server yet.
+**Status (2.2.1, 2026-06-16):** Configuration is currently applied **programmatically** via the Rust API (`UniConfig`) or the Python builder. Configuration files (`uni.toml`) and `UNI_*` environment overrides are **planned** but not wired into the CLI/server yet.
 
 Uni can be configured through:
 1. **Rust API** — `UniConfig` (available)

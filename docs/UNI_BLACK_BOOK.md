@@ -566,11 +566,13 @@ Use case: Tags, labels, or categories that are only added, never removed.
 ### ORSet (Observed-Remove Set)
 
 ```
-Structure: Elements with unique UUID tags
+Structure: Elements tagged with causal dots + a version vector (ORSWOT)
 Merge: add-wins conflict resolution
 ```
 
 Use case: Mutable sets where elements can be added and removed. If concurrent add and remove, add wins.
+
+Since 2.2.0 the ORSet is **tombstone-free** — it uses an ORSWOT (Observed-Remove Set Without Tombstones) encoding where elements carry causal dots and removals are tracked by the version vector rather than explicit tombstones, keeping the structure compact under churn. The legacy v1 (tombstoned) wire format is still read for backward compatibility; new writes use the tombstone-free format.
 
 ### LWWRegister (Last-Write-Wins Register)
 
@@ -3127,7 +3129,7 @@ Two monotonic aggregators for combining probabilities in recursive rules:
 | Aggregator | Formula | Identity | Semantics |
 |---|---|---|---|
 | `MNOR` | `1 − ∏(1 − pᵢ)` | 0.0 | "Any one cause can produce the effect" (Noisy-OR) |
-| `MPROD` | `∏ pᵢ` | 1.0 | "All conditions must hold simultaneously" |
+| `MPROD` | `∏ pᵢ` | 1.0 | "All matched conditions hold simultaneously" (product of independent successes) |
 
 Both are monotonic (safe in recursive strata), clamp inputs to [0, 1], skip nulls, and are commutative.
 
@@ -3146,6 +3148,25 @@ CREATE RULE joint_reliability AS
 ```
 
 MPROD uses log-space computation when the product drops below 1e-15 to prevent underflow. MNOR and MPROD are incompatible with `BEST BY` (compiler error).
+
+> **MPROD multiplies over *matched* rows, not over an expected set.** A condition that produces no matching row is simply absent from the product — it does **not** force the result to zero. MPROD alone therefore does not encode "every required element must be present." To express a true all-elements conjunction (e.g. a patent claim is infringed only when a product maps *every* claim element), pair MPROD with a completeness guard: count matched vs. total and keep only equal-count groups, or exclude incomplete groups with an `IS NOT` complement.
+>
+> ```cypher
+> CREATE RULE claim_size AS
+>     MATCH (c:Claim) WHERE c IS claim_elements TO ce
+>     FOLD n_total = COUNT(ce) YIELD KEY c, n_total
+>
+> CREATE RULE pc_mapped AS
+>     MATCH (p:Product), (c:Claim)
+>     WHERE c IS claim_elements TO ce, p IS element_mapped TO ce
+>     FOLD n_mapped = COUNT(ce), infringement = MPROD(mapping_conf)
+>     YIELD KEY p, KEY c, n_mapped, infringement
+>
+> CREATE RULE claim_infringed AS         -- all-elements guard: n_mapped = n_total
+>     MATCH (p:Product), (c:Claim)
+>     WHERE (p, c) IS pc_mapped, c IS claim_size TO n_total, n_mapped = n_total
+>     YIELD KEY p, KEY c, infringement
+> ```
 
 ### PROB Columns and Probabilistic `IS NOT`
 
@@ -5867,5 +5888,5 @@ Quick reference of all anti-patterns from every chapter:
 
 ---
 
-*The Uni Black Book — Version 1.0*
+*The Uni Black Book — Version 2.2.1*
 *Generated from Uni DB codebase analysis*

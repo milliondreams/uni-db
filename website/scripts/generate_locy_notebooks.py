@@ -573,7 +573,8 @@ def _cases() -> list[LocyUseCase]:
             expected_outcomes=[
                 "`non_compliant` should include `api` and `db` (reachable from internet and CVE >= 7).",
                 "`worker` should not appear in remediation rows because its CVE score is below threshold.",
-                "`Queries executed` should be 1 for this program.",
+                "The `non_compliant` QUERY returns `action = 'patch-now'`; this literal is computed in the query projection, so it may display as `None` in the raw derived-relation snapshot (which materializes KEY columns).",
+                "`Queries executed` counts internal SLG clause evaluations during query resolution (not the number of `QUERY` statements), so expect a small positive count rather than 1.",
             ],
         ),
         LocyUseCase(
@@ -738,9 +739,9 @@ def _cases() -> list[LocyUseCase]:
                 "CREATE (:Account {id: 'A2', flagged: false})",
                 "CREATE (:Account {id: 'A3', flagged: false})",
                 "CREATE (:Account {id: 'A4', flagged: false})",
-                "MATCH (a1:Account {id:'A1'}), (a2:Account {id:'A2'}) CREATE (a1)-[:TRANSFER]->(a2)",
-                "MATCH (a2:Account {id:'A2'}), (a3:Account {id:'A3'}) CREATE (a2)-[:TRANSFER]->(a3)",
-                "MATCH (a4:Account {id:'A4'}), (a3:Account {id:'A3'}) CREATE (a4)-[:TRANSFER]->(a3)",
+                "MATCH (a2:Account {id:'A2'}), (a1:Account {id:'A1'}) CREATE (a2)-[:TRANSFER]->(a1)",
+                "MATCH (a4:Account {id:'A4'}), (a2:Account {id:'A2'}) CREATE (a4)-[:TRANSFER]->(a2)",
+                "MATCH (a1:Account {id:'A1'}), (a3:Account {id:'A3'}) CREATE (a1)-[:TRANSFER]->(a3)",
             ],
             program_lines=[
                 "CREATE RULE risky_seed AS",
@@ -767,9 +768,9 @@ def _cases() -> list[LocyUseCase]:
                 "QUERY clean WHERE a.id = a.id RETURN a.id AS clean_account",
             ],
             expected_outcomes=[
-                "`A1` is risky by seed; `A2` and `A4` become risky by backward propagation through `TRANSFER`.",
-                "`A3` should remain in `clean` because it does not transfer to a risky account.",
-                "Two query result blocks should appear: one for `risky`, one for `clean`.",
+                "`A1` is risky by seed. `A2` is risky because it transfers to `A1`; `A4` is risky *transitively* because it transfers to `A2`. This is **backward propagation** — risk flows from a flagged account to the accounts that transfer into it (directly or through a chain).",
+                "`A3` should remain in `clean`: it only *receives* from `A1` and never transfers to a risky account.",
+                "Two query result blocks should appear: one for `risky` (A1, A2, A4), one for `clean` (A3).",
             ],
         ),
         LocyUseCase(

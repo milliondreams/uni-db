@@ -4,7 +4,7 @@
 Demonstrates Phase D neural-predicate capabilities applied to
 pharmacovigilance signal detection on a **real Hetionet v1.0 subgraph**:
 
-  - Compound nodes (50 most-connected drugs from Hetionet).
+  - Compound nodes (30 most-connected drugs from Hetionet).
   - Gene + Pathway + SideEffect nodes from the Hetionet neighbourhood.
   - Real CbG / GpPW / CcSE edges (no synthetic biology edges).
   - Synthetic FAERS-shaped Report stream drawn from the extract's
@@ -104,7 +104,7 @@ def _build_notebook() -> dict[str, Any]:
                 "",
                 "Pharmacovigilance teams triage thousands of adverse-event reports per week. Most are noise; a handful are real signals that, missed, become regulatory actions. This notebook delivers:",
                 "",
-                "- A **real Hetionet v1.0 subgraph** (50 most-connected compounds + their bound genes + participating pathways + caused side effects, all real edges from the Hetionet TSV).",
+                "- A **real Hetionet v1.0 subgraph** (30 most-connected compounds + their bound genes + participating pathways + caused side effects, all real edges from the Hetionet TSV).",
                 "- A **registered Python classifier** scoring per-report signal credibility from `report_count` and a precomputed narrative-similarity feature (the `similar_to` lookup vs historical confirmed-signal narratives).",
                 "- A **`mechanistic_path` rule** using the Vilar-style shared-mechanism heuristic: a drug has mechanism plausibility for causing a side effect if it shares a pathway with another drug that's known to cause it. Real Hetionet `CbG`, `GpPW`, `CcSE` edges back the traversal.",
                 "- In-Locy **`CALIBRATE`** against held-out `is_signal` ground-truth labels and **`VALIDATE`** reporting Brier + accuracy.",
@@ -181,7 +181,7 @@ def _build_notebook() -> dict[str, Any]:
             [
                 "## 2) Load the Hetionet ADR Subgraph from Vendored CSVs",
                 "",
-                "The vendored CSVs are produced by `website/scripts/prepare_adverse_drug_reaction_notebook_data.py`. They contain the 50 most-connected Hetionet compounds, the genes they bind, the pathways those genes participate in, and the side effects those compounds cause — all real Hetionet edges. The report stream is synthesised from the real `CcSE` pairs in the extract.",
+                "The vendored CSVs are produced by `website/scripts/prepare_adverse_drug_reaction_notebook_data.py`. They contain the 30 most-connected Hetionet compounds, the genes they bind, the pathways those genes participate in, and the side effects those compounds cause — all real Hetionet edges. The report stream is synthesised from the real `CcSE` pairs in the extract.",
             ],
         )
     )

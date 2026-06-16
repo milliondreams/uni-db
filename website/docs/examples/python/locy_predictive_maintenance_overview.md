@@ -12,16 +12,16 @@ Reliability engineers run vibration analysis, temperature trending, and oil samp
 
 ## With Uni
 
-The notebook ingests AI4I 2020 sensor data plus a synthesized process-line topology directly into Uni's graph. A failure-likelihood classifier runs as a Locy neural predicate registered via `LocyConfig.register_classifier`. The classifier output is calibrated in-language using `CALIBRATE ... METHOD platt_scaling` against held-out historical failures, then validated with Brier and accuracy. Component-level risk composes through `FOLD MNOR(unhealth)` over a `HAS_PART` child set; line-level reliability composes through `FOLD MPROD(1 - asset_risk)` across `UPSTREAM_OF` chains using inline classifier invocation. The `EXPLAIN` trace surfaces every classifier call's `NeuralProvenance` for audit, with the rule chain that composed the per-asset score into the line-level rollup.
+The notebook ingests AI4I 2020 sensor data plus a synthesized process-line topology directly into Uni's graph. A failure-likelihood classifier runs as a Locy neural predicate registered via `LocyConfig.register_classifier`. The classifier output is calibrated in-language using `CALIBRATE ... METHOD platt_scaling` against the dataset's ground-truth `actual_failed` labels, then validated with `VALIDATE` on Brier score and accuracy — the notebook demonstrates the full calibrate/validate loop end to end (on this small slice, Platt scaling does not necessarily improve Brier). Component-level risk composes through `FOLD MNOR(1.0 - c.health)` over a `HAS_PART` child set; line-level reliability composes through `FOLD MPROD(1.0 - failure_likelihood(...))` across `UPSTREAM_OF` chains using inline classifier invocation, and a recursive `upstream_reaches` rule plus `IS NOT` stratified negation derive blast-radius and healthy-asset sets. The `EXPLAIN RULE` trace surfaces a classifier call's `NeuralProvenance` (model name and raw score) for audit.
 
 ## What You'll See
 
 - Calibrated per-asset failure probabilities from a registered Python classifier (in production, an ONNX-exported XGBoost or similar)
-- Line-level joint reliability rollups computed by composing per-asset probabilities through `FOLD MPROD(1 - asset_risk)` across `UPSTREAM_OF` chains
-- Component-level risk aggregation via `FOLD MNOR(unhealth)` over a `HAS_PART` child set
-- Calibration delta: raw Brier vs Platt-calibrated Brier on held-out outcomes
-- Validation report with Brier and accuracy
-- Audit trail (`EXPLAIN` with `NeuralProvenance`) on demand for any recommendation: sensor evidence, the classifier's calibrated probability, the rule chain that produced the score
+- Line-level joint reliability rollups computed by composing per-asset probabilities through `FOLD MPROD(1.0 - failure_likelihood(...))` across `UPSTREAM_OF` chains
+- Component-level risk aggregation via `FOLD MNOR(1.0 - c.health)` over a `HAS_PART` child set
+- Calibration delta: raw Brier vs Platt-calibrated Brier on the labeled dataset
+- Validation report (`VALIDATE`) with Brier score and accuracy
+- Audit trail (`EXPLAIN RULE` with `NeuralProvenance`) on demand: the rule bindings and the classifier call's model name and raw score
 
 ## Why It Matters
 

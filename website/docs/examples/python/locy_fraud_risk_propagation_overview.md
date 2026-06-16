@@ -12,13 +12,13 @@ Transaction monitoring systems score accounts independently. When fraud is confi
 
 ## With Uni
 
-The notebook defines backward risk propagation through transfer edges: risk flows from flagged accounts to their counterparties, decaying with each hop. Accounts with no path to any flagged entity are explicitly isolated as clean using negation — not just unscored, but provably uninvolved. Every risk score carries a derivation trace showing the exact chain of transfers that produced it. The entire model is 12 declarative rules covering propagation, decay, clean-account isolation, and threshold classification.
+The notebook defines backward risk propagation through transfer edges: an account that transfers to a flagged or already-risky account becomes risky too, transitively along the chain. Accounts with no path to any flagged entity are explicitly isolated as clean using negation — not just unflagged, but provably uninvolved. The entire model is a handful of declarative rules covering seed flagging, transitive propagation, and clean-account isolation.
 
 ## What You'll See
 
-- Risk-scored accounts across the full transaction network, not just direct counterparties
+- Risky accounts identified across the full transaction network, not just direct counterparties
 - A clean account whitelist — accounts provably isolated from flagged entities, reducing false freezes
-- A propagation audit trail for each risk score, showing the exact transfer chain and decay calculation
+- Transitive propagation through chains of intermediary accounts, computed declaratively from the transfer graph
 
 ## Why It Matters
 

@@ -12,22 +12,23 @@ Pharmacovigilance teams run disproportionality analysis (PRR, ROR) on FAERS-styl
 
 ## With Uni
 
-The notebook ingests a drug-target-side-effect subgraph drawn from Hetionet directly into Uni. A Locy neural predicate scores each candidate signal using property features (report counts, demographic enrichment), embedding similarity (`similar_to` between the reported narrative text and a corpus of historical confirmed-signal narratives), and graph-structural features (the drug's connectivity to the affected adverse-event class through known target pathways). Calibration in-language brings raw scores in line with historical confirmation rates; validation reports Brier and ECE. The EXPLAIN trace produces the audit artifact regulators ask for: which signal, which similar past confirmed report, which mechanistic path supports the alert, and the calibrated probability with confidence band.
+The notebook ingests a drug-target-side-effect subgraph drawn from Hetionet directly into Uni. A registered Locy neural predicate (`signal_score`) scores each candidate report from its combined evidence (report count times precomputed narrative similarity). A separate `similar_to` rule scores each report's narrative embedding against a historical-confirmed-signal centroid. Graph-structural plausibility is composed separately: a `mechanistic_path` rule traverses real Hetionet `CbG`/`GpPW`/`CcSE` edges (the Vilar shared-pathway heuristic), and a `FOLD MNOR(...)` rollup turns the bridging paths into a per-pair mechanism-plausibility score. Calibration in-language (Platt scaling) fits the raw classifier outputs to the held-out `is_signal` labels and reports raw-vs-calibrated Brier + ECE; a separate `VALIDATE` step reports Brier and accuracy. The `EXPLAIN` trace produces the audit artifact regulators ask for: the derivation tree for a scored report, including the model name, the raw probability, the calibrated probability (when a calibrator is registered), and the exact feature dict the classifier saw.
 
 ## What You'll See
 
-- Calibrated signal scores with confidence bands instead of raw disproportionality numbers
-- Semantic-matched comparable historical reports for every candidate signal -- investigators see the closest past case
-- Mechanistic path explanations: which drug target, which pathway, which adverse-event class
-- Calibration improvement against held-out confirmed-vs-rejected signals
-- Audit-grade derivation traces ready for regulatory submission -- every score is reproducible
-- Ranked investigation queue: top signals for the week's case review
+- Calibrated signal scores (Platt scaling) instead of raw disproportionality numbers
+- Narrative-similarity scores (`similar_to`) ranking each report against a historical-confirmed-signal centroid
+- Mechanistic path explanations: which bridging drug, which shared pathway, which adverse event -- composed with `FOLD MNOR`
+- In-language `CALIBRATE` (raw vs calibrated Brier + ECE) and `VALIDATE` (Brier + accuracy) against held-out `is_signal` labels
+- `BEST BY` selection: the single highest-evidence report per adverse event
+- Audit-grade `EXPLAIN` derivation traces ready for regulatory submission -- every score is reproducible
+- Ranked investigation queue: top (drug, AE) pairs by calibrated credibility times mechanism plausibility
 
 ## Why It Matters
 
 A single missed safety signal that surfaces later as a regulatory action costs tens to hundreds of millions in remediation, recalls, and reputational damage. Calibrated scoring plus audit-ready provenance is the difference between defensible pharmacovigilance and pharmacovigilance theater.
 
-**Data**: [Hetionet v1.0](https://het.io/) (CC0 1.0 Universal) -- 47k biomedical entities, 2.2M relationships, 11 node types, 24 edge types. The narrative report stream is synthesized for the notebook and clearly marked as such; the drug → side-effect signal graph and mechanistic paths come from Hetionet's curated edges. Sentence embeddings use [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (Apache-2.0). Citation: Himmelstein DS et al., *eLife* 2017.
+**Data**: [Hetionet v1.0](https://het.io/) (CC0 1.0 Universal). The notebook uses a curated extract -- the 30 most-connected compounds plus their bound genes, participating pathways, and caused side effects, drawn from Hetionet's real `CbG`/`GpPW`/`CcSE` edges (no synthetic edges). The narrative report stream is synthesized from those real drug → side-effect pairs and clearly marked as such; the 16-dimensional narrative embeddings are synthetic vectors biased toward (or away from) a historical-signal centroid, used by the `similar_to` lookup. Citation: Himmelstein DS et al., *eLife* 2017 (DOI: 10.7554/eLife.26726).
 
 ---
 

@@ -4,7 +4,7 @@
 
 ## The Problem
 
-Money laundering rings move funds through chains of accounts designed to look like unrelated transactions. Shared-device patterns -- where multiple supposedly unrelated accounts log in from the same device or IP -- are a strong signal of coordinated fraud. Traditional systems catch individual suspicious transactions but miss the network structure that connects them.
+Money laundering rings move funds through chains of accounts designed to look like unrelated transactions. Shared-device patterns -- where multiple supposedly unrelated accounts log in from the same device -- are a strong signal of coordinated fraud. Traditional systems catch individual suspicious transactions but miss the network structure that connects them.
 
 ## The Traditional Approach
 
@@ -12,13 +12,13 @@ Rule engines flag transactions above static thresholds (e.g., transfers over $10
 
 ## With Uni
 
-Cycle detection and shared-device pattern matching run in a single graph query. The system identifies 3-node transfer cycles (A pays B, B pays C, C pays A) directly from transaction data, then overlays device and IP sharing patterns to find accounts that are structurally connected. Risk signals from both analyses are combined per account, so investigators see the full picture -- network position, transaction flow, and device overlap -- in one result set.
+Cycle detection and shared-device pattern matching run in a single graph query. The system identifies 3-node transfer cycles (A pays B, B pays C, C pays A) directly from transaction data, then overlays device-sharing patterns to find accounts that are structurally connected. The two signals are intersected to flag accounts that appear in both a transfer cycle and a device-sharing cluster, so investigators see the full picture -- network position, transaction flow, and device overlap -- in one result set.
 
 ## What You'll See
 
 - Detection of 3-cycle laundering rings with the specific accounts and transaction amounts involved
-- Shared-device clusters identifying accounts linked by common devices or IP addresses
-- Combined risk signals that weight both network topology and device anomalies per account
+- Shared-device clusters identifying accounts linked by a common device
+- Combined alerts that flag accounts appearing in both a transfer cycle and a device-sharing cluster
 
 ## Why It Matters
 

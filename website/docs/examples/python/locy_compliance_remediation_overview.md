@@ -12,17 +12,17 @@ Teams run vulnerability scanners (Qualys, Nessus, Tenable) on a schedule, export
 
 ## With Uni and Locy
 
-Declarative rules define what "compliant" and "non-compliant" mean: an exposed service handling sensitive data without required controls is a gap. The system ingests service inventories, data classification tags, and control status, then materializes every gap as a concrete finding with a remediation action. Prioritization rules weight business context (data sensitivity, exposure level, regulatory scope) alongside technical severity. The output is a ranked remediation list with full provenance -- every finding traces back to the specific rule and data that produced it.
+Declarative rules define what "compliant" and "non-compliant" mean: a service that is internet-reachable through its dependency chain and carries a high-severity vulnerability is a gap. The rules combine transitive exposure (a service reachable from the internet directly or via the services it depends on) with a severity threshold, then materialize every gap as a concrete finding with a remediation action. The output is a list of non-compliant services, each derived from the same rule set rather than assembled from disconnected spreadsheets.
 
 ## What You'll See
 
-- Prioritized remediation list ranked by combined business and technical risk, not just CVSS scores
-- Automated gap detection that identifies services failing specific compliance controls with the evidence chain
-- Audit-ready evidence: each finding includes the rule that flagged it, the data it matched, and the recommended remediation action
+- A remediation list of non-compliant services, each with a concrete remediation action
+- Automated gap detection combining transitive internet exposure with a vulnerability-severity threshold
+- Services that are vulnerable but not internet-reachable correctly excluded, so the team fixes what is actually exposed
 
 ## Why It Matters
 
-Audit preparation that takes 2-4 weeks compresses to hours when findings are materialized from declarative rules rather than assembled from spreadsheets. More critically, the remediation list reflects actual business risk, so the team fixes what matters first instead of chasing the highest CVSS score.
+Audit preparation that takes 2-4 weeks compresses to hours when findings are materialized from declarative rules rather than assembled from spreadsheets. More critically, the rules combine severity with real internet exposure, so the team focuses on services that are genuinely reachable instead of every high-CVSS finding in isolation.
 
 ---
 

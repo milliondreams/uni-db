@@ -294,6 +294,31 @@ async fn test_end_to_end_smoke() -> Result<()> {
     Ok(())
 }
 
+/// Regression: a purely non-recursive program records its single evaluation
+/// pass, so `total_iterations` is >= 1. Before the fix, non-recursive strata
+/// never wrote the iteration-count slot, so the stat read 0 — making it look
+/// like nothing was evaluated.
+#[tokio::test]
+async fn test_non_recursive_reports_iterations() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30}), (:Person {name: 'Bob', age: 16})")
+        .await?;
+    tx.commit().await?;
+
+    let result = db
+        .session()
+        .locy("CREATE RULE adult AS MATCH (p:Person) WHERE p.age >= 18 YIELD KEY p")
+        .await?;
+
+    assert!(
+        result.stats.total_iterations >= 1,
+        "non-recursive program must report >= 1 iteration, got {}",
+        result.stats.total_iterations
+    );
+    Ok(())
+}
+
 // ── LocyBuilder (evaluate_with) ────────────────────────────────────────────
 
 #[tokio::test]

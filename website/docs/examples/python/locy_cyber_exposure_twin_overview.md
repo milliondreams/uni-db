@@ -12,19 +12,19 @@ Most teams start with CVSS and layer on manual context: asset owners tag critica
 
 ## With Uni
 
-The notebook encodes exposure scoring as declarative rules that combine CVSS base scores, EPSS exploit probability, asset criticality tiers, and SLA urgency into a single prioritized ranking. Blast radius analysis uses graph traversal rules to trace reachability — which critical assets are downstream of each vulnerable host. Remediation candidates are ranked by risk-reduction-per-dollar, accounting for the fact that patching one upstream host may eliminate exposure for dozens of downstream assets. Every score comes with a full derivation: you can trace exactly why a vulnerability was ranked where it was.
+The notebook computes an exposure score for each finding by combining CVSS base severity, EPSS exploit probability, CISA KEV status, and observed exploit evidence, then layers on a hybrid-retrieval (vector + full-text) evidence boost drawn from advisory and runbook documents. Findings above a critical threshold are flagged, and declarative Locy rules propagate blast risk along asset dependencies (recursive `ALONG` traversal) to find which assets are reachable downstream of each compromised host. For every urgent finding, a `BEST BY` rule selects a single best remediation action, ranked first by residual risk and then by cost and downtime. Every result comes with a full derivation: `EXPLAIN RULE` traces exactly why a blast path or score was produced.
 
 ## What You'll See
 
-- Exposure-ranked vulnerability list that accounts for topology, criticality, and exploit likelihood — not just CVSS
-- Blast radius per finding showing which business-critical assets are reachable from each vulnerable host
-- Team-level rollup dashboards grouping exposure by remediation owner and SLA deadline
-- Optimal remediation plan maximizing risk reduction within a fixed engineering budget
-- Containment scenario simulation showing how network segmentation changes reduce blast radius
+- Exposure-ranked vulnerability list that blends CVSS, EPSS, KEV status, exploit evidence, and hybrid-retrieval advisory evidence — not just CVSS
+- Blast radius per source asset, traced by recursive `ALONG` propagation across dependency edges (paths up to several hops deep)
+- Team-level exposure rollups grouping findings by remediation owner, with average, max, and urgent-finding counts
+- A best-action remediation plan that picks one action per urgent finding by lowest residual risk, then cost and downtime (`BEST BY`)
+- Counterfactual containment with `ASSUME` (applying virtual patches to high-criticality assets) and minimal-change search with `ABDUCE` to find what would remove an urgent patch requirement
 
 ## Why It Matters
 
-Security teams that prioritize by exposure context instead of raw CVSS scores typically reduce realized risk by 3-5x with the same remediation capacity. The audit trail means every prioritization decision is defensible.
+Prioritizing by exposure context — topology, exploit likelihood, and advisory evidence — instead of raw CVSS scores focuses scarce remediation capacity on the findings that actually reduce risk. The full derivation trail means every prioritization decision is defensible.
 
 ---
 

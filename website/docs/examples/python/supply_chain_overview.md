@@ -12,13 +12,13 @@ Teams export BOM data from the ERP system into spreadsheets, then write custom s
 
 ## With Uni
 
-Recursive graph queries traverse the full assembly hierarchy in one pass, from finished goods down to raw materials. Cost rollup aggregates unit costs, quantities, and supplier pricing at every level automatically. Single-source risk detection identifies components where only one supplier exists, linked directly to the affected finished goods. All three analyses -- BOM explosion, cost rollup, and risk identification -- run from the same data and the same query layer.
+Recursive graph queries traverse the full assembly hierarchy in one pass, from finished goods down to raw materials. Cost rollup aggregates part costs across every level automatically. Supplier risk analysis ranks each supplier by how many finished products depend on it, identifying the vendors whose failure would affect the most goods. All three analyses -- BOM explosion, cost rollup, and supplier risk -- run from the same data and the same query layer.
 
 ## What You'll See
 
-- Complete multi-level BOM tree with per-level and total rolled-up costs
-- Total landed cost calculation that accounts for quantity multipliers across assembly levels
-- Identification of risk-exposed suppliers: which components depend on a single source, and which finished goods they affect
+- Complete multi-level BOM listing with each part's cost and the total rolled-up cost per product
+- Total BOM cost per product, summing part costs across all assembly levels (Smartphone X $175.13, TabletPro 10 $165.13)
+- Identification of risk-exposed suppliers: which suppliers are critical to the most finished products, and which goods they affect
 
 ## Why It Matters
 

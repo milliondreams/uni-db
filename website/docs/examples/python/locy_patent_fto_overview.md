@@ -4,7 +4,7 @@
 
 ## The Problem
 
-You are about to launch a product. Your IP team needs to assess whether it infringes existing patents. For a typical analysis covering 8 patents with 18 independent claims and 48 claim elements, this means evaluating hundreds of feature-to-element mappings — and a single missing mapping can mean the difference between infringement and freedom to operate.
+You are about to launch a product. Your IP team needs to assess whether it infringes existing patents. For a typical analysis covering 8 patents with 18 claims and 48 claim elements, this means evaluating dozens of feature-to-element mappings — and a single missing mapping can mean the difference between infringement and freedom to operate.
 
 ## The Traditional Approach
 
@@ -20,7 +20,7 @@ The notebook models claim infringement as a joint probability — the product of
 - Patent risk per product combining independent claims — any single infringed claim creates exposure
 - Computational claim charts with full derivation of which features map to which elements and at what confidence
 - Design-around simulations answering "what if we redesign this feature?" with quantified risk impact
-- 12 minimal design change candidates ranked by their effectiveness at eliminating infringement
+- Minimal design-change candidates ranked by cost, each validated to eliminate infringement
 
 ## Why It Matters
 

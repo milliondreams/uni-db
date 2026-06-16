@@ -78,6 +78,37 @@ FOLD reliability = MPROD(1.0 - component_failure_risk.risk)
 YIELD KEY v, reliability
 ```
 
+!!! note "MPROD multiplies over *matched* rows, not over an expected set"
+    MPROD takes the product of the rows that actually match the clause body for each
+    group. A condition that produces **no matching row** is simply *absent from the
+    product* — it does **not** force the result to zero. So MPROD alone does not encode
+    "every required element must be present."
+
+    To express a true all-elements conjunction — e.g. a patent claim is infringed only
+    when a product maps **every** one of its elements — pair MPROD with an explicit
+    completeness guard: count the matched elements and the total elements and keep only
+    groups where they are equal, or exclude incomplete groups with an `IS NOT` complement.
+
+    ```cypher
+    // total elements per claim
+    CREATE RULE claim_size AS
+      MATCH (c:Claim) WHERE c IS claim_elements TO ce
+      FOLD n_total = COUNT(ce) YIELD KEY c, n_total
+
+    // product over the elements this product actually maps
+    CREATE RULE pc_mapped AS
+      MATCH (p:Product), (c:Claim)
+      WHERE c IS claim_elements TO ce, p IS element_mapped TO ce
+      FOLD n_mapped = COUNT(ce), infringement = MPROD(mapping_conf)
+      YIELD KEY p, KEY c, n_mapped, infringement
+
+    // keep only fully-mapped (p, c) pairs — the all-elements guard
+    CREATE RULE claim_infringed AS
+      MATCH (p:Product), (c:Claim)
+      WHERE (p, c) IS pc_mapped, c IS claim_size TO n_total, n_mapped = n_total
+      YIELD KEY p, KEY c, infringement
+    ```
+
 ## When to Use Which
 
 | Operator | Semantics | Direction | Use When |

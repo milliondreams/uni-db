@@ -12,17 +12,17 @@ Teams build custom middleware with nested if/else chains that encode precedence 
 
 ## With Uni
 
-The notebook defines allow and deny as declarative rules, each annotated with an explicit priority. Uni's engine resolves conflicts automatically: when both allow and deny fire for the same principal-resource pair, the higher-priority rule wins deterministically. Every access decision includes a derivation trace showing exactly which rules fired and why one prevailed. Changing precedence means editing a priority annotation, not refactoring middleware.
+The notebook defines allow and deny as two declarative rules with the same name, each annotated with an explicit `PRIORITY`. Uni's engine resolves conflicts automatically: when both allow and deny fire for the same principal-resource pair, the higher-priority rule wins deterministically, leaving one decision per pair in the materialized `access` relation. Changing precedence means editing a priority annotation, not refactoring middleware.
 
 ## What You'll See
 
 - Correct access decisions when allow and deny rules overlap, with no manual precedence logic
-- Explicit deny-override-allow semantics declared in 8 rules, not 800 lines of branching code
-- A full derivation trace for every decision, ready for SOC 2 or ISO 27001 evidence requests
+- Explicit deny-override-allow semantics declared in 2 prioritized rules, not 800 lines of branching code
+- An inspectable, declarative rule set whose precedence is a single `PRIORITY` annotation
 
 ## Why It Matters
 
-Misconfigured access control is the root cause in 40% of cloud breaches. Replacing hand-coded precedence with auditable, priority-annotated rules eliminates an entire class of security defects without adding headcount.
+Misconfigured access control is a leading root cause of cloud breaches. Replacing hand-coded precedence with auditable, priority-annotated rules eliminates an entire class of security defects without adding headcount.
 
 ---
 

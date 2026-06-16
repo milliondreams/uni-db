@@ -12,15 +12,15 @@ EHR systems flag pairwise interactions from curated databases. The interface sho
 
 ## With Uni
 
-The notebook ingests a drug + interaction subgraph extracted from Hetionet directly into Uni. Drug embeddings are derived offline from the graph (a small `TruncatedSVD` on the drug-target adjacency matrix in the prep script, mirroring the production "offline graph learning → lightweight runtime head" pattern). The runtime model is a small MLP head that takes the concatenated embeddings of two drugs and predicts P(interact); it's exported to ONNX and wrapped as a registered Python classifier. Locy rules treat each patient's regimen as a clique and use inline classifier invocation in `FOLD MPROD(1 - p_interact)` across all drug-pairs to produce a joint regimen-safety probability. Calibration uses Vilar-style shared-target labels (drugs sharing ≥2 targeted genes flagged as dangerous) derived from the Hetionet `CbG` edges via `CALIBRATE ... METHOD platt_scaling`. `EXPLAIN` produces a trace combining the contributing pair predictions with the rule-derivation provenance.
+The notebook ingests a drug + interaction subgraph extracted from Hetionet directly into Uni. Drug embeddings are derived offline from the graph (a small `TruncatedSVD` on the drug-target adjacency matrix in the prep script, mirroring the production "offline graph learning → lightweight runtime head" pattern). The runtime model is a small MLP head that takes the concatenated embeddings of two drugs and predicts P(interact); it's exported to ONNX and wrapped as a registered Python classifier. Locy rules treat each patient's regimen as a clique and use inline classifier invocation in `FOLD MPROD(1.0 - interaction_score(rec.pair_id))` across all drug-pairs to produce a joint regimen-safety probability. Calibration uses Vilar-style shared-target labels (drugs sharing ≥2 targeted genes flagged as dangerous) derived from the Hetionet `CbG` edges via `CALIBRATE ... METHOD platt_scaling`. `EXPLAIN` produces a trace for the highest-risk interaction pair, surfacing the per-pair classifier prediction within the rule-derivation provenance.
 
 ## What You'll See
 
-- Patient-level joint regimen risk computed from per-pair model predictions composed through Locy rules (`FOLD MPROD(1 - p_interact)` across all drug pairs in the regimen)
+- Patient-level joint regimen risk computed from per-pair model predictions composed through Locy rules (`FOLD MPROD(1.0 - interaction_score(rec.pair_id))` across all drug pairs in the regimen)
 - Ranked pairwise interactions within the regimen — which two drugs contribute the highest calibrated interaction probability to joint risk
-- Calibrated binary danger probabilities against held-out shared-target labels (raw vs Platt-calibrated Brier delta)
-- Validation report with Brier and accuracy on held-out dangerous-interaction labels
-- Audit-grade `EXPLAIN` trace combining per-pair predictions with rule provenance, surfacing the classifier's `NeuralProvenance` per derivation
+- Calibrated binary danger probabilities against the Vilar-derived shared-target labels (raw vs Platt-calibrated Brier delta)
+- Validation report with Brier and accuracy on the dangerous-interaction labels
+- Audit-grade `EXPLAIN` trace for the highest-risk pair, surfacing the classifier's `NeuralProvenance` (model name and raw prediction) for that derivation
 
 ## Why It Matters
 

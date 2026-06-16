@@ -950,6 +950,14 @@ async fn run_program(
                     continue;
                 }
 
+                // Record the single evaluation pass for this non-recursive rule.
+                // The recursive branch writes per-rule fixpoint counts to this slot;
+                // a non-recursive rule is evaluated exactly once, so without this a
+                // purely non-recursive program would report `total_iterations == 0`.
+                if let Ok(mut counts) = iteration_counts_slot.write() {
+                    counts.insert(rule.name.clone(), 1);
+                }
+
                 // Process each clause independently (per-clause IS NOT).
                 let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
                 for (clause_idx, (clause, fp_clause)) in

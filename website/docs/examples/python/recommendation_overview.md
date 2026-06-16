@@ -12,12 +12,12 @@ Most teams run a collaborative filtering service (typically 2,000-5,000 lines of
 
 ## With Uni
 
-A single query combines graph traversal over purchase history with vector search over book descriptions. Purchase patterns surface "customers who bought X also bought Y" connections, while semantic similarity finds thematically related titles that no customer has paired yet. The result set is scored and ranked in one pass -- no external stitching layer, no batch retraining. Rules are declarative: you state what a good recommendation looks like, not how to compute one.
+A single query combines graph traversal over purchase history with vector search over book descriptions. Purchase patterns surface "customers who bought X also bought Y" connections, while semantic similarity finds thematically related titles that no customer has paired yet. The result set is ranked in one pass -- by co-purchase count for collaborative queries and by vector distance for semantic queries -- with no external stitching layer and no batch retraining. Queries are declarative: you state what a good recommendation looks like, not how to compute one.
 
 ## What You'll See
 
 - Hybrid recommendations that blend behavioral co-purchase signals with semantic relevance
-- Discovery of non-obvious connections (e.g., a technical manual surfaced alongside a novel because of shared thematic structure)
+- Discovery of semantically related titles (e.g., other technical books surfaced by embedding proximity), then linked to the customers who actually bought them
 - Real-time scoring that reflects the latest purchase data without pipeline delays
 
 ## Why It Matters

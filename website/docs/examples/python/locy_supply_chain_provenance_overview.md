@@ -12,13 +12,13 @@ Procurement teams maintain supplier lists in spreadsheets or ERP modules that tr
 
 ## With Uni
 
-The notebook loads component-to-supplier edges across multiple tiers and defines a recursive upstream traversal rule. For any finished product or sub-assembly, Uni traces the complete supplier lineage — every entity that contributed material, no matter how many tiers removed. Country-of-origin data propagates through the chain, and single-source risks are identified where a component depends on exactly one supplier at any tier. The logic is 10 declarative rules, not a custom graph database deployment.
+The notebook loads component-to-supplier edges across multiple tiers and defines a recursive upstream traversal rule. For any finished product or sub-assembly, Uni traces the complete supplier lineage — every entity that contributed material, no matter how many tiers removed (the seed data spans three tiers, from finished part through sub-assembly to raw material). Each part's kind (finished, sub-assembly, or raw) is visible at every tier of the trace. The logic is 2 declarative rules — a base case plus one recursive case — not a custom graph database deployment.
 
 ## What You'll See
 
 - Complete provenance chain for any component, from finished product back to raw material suppliers
-- Country-of-origin compliance flags propagated through multi-tier relationships automatically
-- Single-source risk identification where one supplier failure at any tier would halt production
+- Recursive multi-tier traversal that surfaces every upstream entity in a single declarative query
+- Each upstream part's kind (finished, sub-assembly, raw) visible at every tier of the trace
 
 ## Why It Matters
 

@@ -12,15 +12,14 @@ Teams typically assign weights to each signal and compute a weighted average. Th
 
 ## With Uni
 
-The notebook models each quality signal as an independent probabilistic fact with its own confidence. Noisy-OR aggregation computes the probability that at least one signal indicates risk — the "any-failure" score. Joint reliability computes the probability that all checks pass simultaneously. Both are expressed as declarative rules, not custom aggregation code. Adding a new signal source means adding one fact; the aggregation updates automatically. Every vendor score includes a full derivation showing exactly which signals contributed and how.
+The notebook models each quality signal as an independent probabilistic fact with its own confidence. Noisy-OR aggregation (MNOR) computes each component's failure risk — the probability that at least one of its signals indicates a problem, the "any-failure" score. Joint reliability (MPROD) then rolls those component risks up to a per-vendor reliability — the probability that all of a vendor's components hold simultaneously. Both are expressed as declarative `FOLD` rules, not custom aggregation code. Adding a new signal source means adding one fact and re-evaluating; the aggregation follows automatically.
 
 ## What You'll See
 
-- Vendor risk scores using noisy-OR that correctly model independent failure modes
-- Joint reliability scores showing the probability all quality checks pass simultaneously
+- Component risk scores using noisy-OR (MNOR) that correctly model independent failure modes
+- Joint vendor reliability scores (MPROD) showing the probability all of a vendor's components hold simultaneously
 - Clear semantic separation between "any-failure" risk and "all-must-pass" reliability
-- Per-signal contribution breakdown explaining which signals drive the score
-- Automatic re-scoring when signal confidences are updated — no recalibration needed
+- Aggregation expressed as declarative `FOLD` rules rather than hand-tuned scoring code
 
 ## Why It Matters
 

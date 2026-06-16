@@ -18,7 +18,7 @@ A single query layer combines vector similarity search with graph traversal over
 
 - Contextually enriched retrieval that surfaces not just similar passages but related entities and their connections
 - Entity-bridged answers where information from Document A is connected to Document B through shared entities
-- Measurably higher relevance compared to vector-only baselines, particularly for multi-hop questions
+- Richer retrieval context than vector-only search, pulling in related chunks reachable only through shared entities
 
 ## Why It Matters
 

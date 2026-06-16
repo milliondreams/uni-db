@@ -12,13 +12,13 @@ A data warehouse stores transactional data across normalized tables. A BI tool (
 
 ## With Uni
 
-Graph traversal connects orders to customers to regions, while columnar aggregation computes revenue totals, category rankings, and order-level metrics in one query layer. New dimensions are added by extending the graph, not by rewriting SQL. A product manager can read the query logic -- it describes the business question, not the join mechanics. Results come back structured for direct use: sorted, ranked, and filtered.
+Graph traversal connects orders to regions and product categories, while columnar aggregation computes revenue totals, category rankings, and order-level metrics in one query layer. New dimensions are added by extending the graph, not by rewriting SQL. A product manager can read the query logic -- it describes the business question, not the join mechanics. Results come back structured for direct use: sorted, ranked, and filtered.
 
 ## What You'll See
 
-- Regional revenue breakdowns with totals, averages, and order counts per geography
+- Regional revenue breakdowns with totals and order counts per geography
 - Category rankings showing top-performing product lines by revenue and volume
-- Top order identification with full context: customer, region, product mix, and total value
+- Top order identification per region with order value
 
 ## Why It Matters
 

@@ -12,13 +12,13 @@ Teams maintain dependency graphs in Confluence or a CMDB, updated quarterly if a
 
 ## With Uni
 
-The notebook loads service-to-service dependency edges and business criticality scores, then defines a recursive traversal rule. Given any failing service, Uni computes the complete set of transitively impacted downstream services in milliseconds. Results are ranked by business criticality so the incident commander knows which teams to page first. The entire analysis is 12 declarative rules with no imperative graph-walking code.
+The notebook loads service-to-service `CALLS` dependency edges, then defines a recursive traversal rule. Given any failing service, Uni computes the complete set of transitively impacted downstream services. The entire analysis is two declarative rules plus a query, with no imperative graph-walking code.
 
 ## What You'll See
 
-- Complete transitive blast radius for any service, including indirect dependencies 4-5 hops deep
-- Impact ranking by business criticality, so response effort goes to the highest-value systems first
-- A derivation path for each impacted service, showing the exact chain of dependencies that propagates the failure
+- Complete transitive blast radius for any service, including indirect dependencies several hops deep
+- A single recursive rule that captures direct neighbors and all transitively reachable downstream services
+- A flat list of every impacted service for a given failing service, derived from the dependency edges rather than hand-traced
 
 ## Why It Matters
 

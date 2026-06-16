@@ -75,11 +75,10 @@ async fn forwarded_is_ref_value_column_is_consumable_downstream() -> Result<()> 
         .await?;
 
     // The downstream rule must materialize (it errored before the fix).
-    let rollup = result
-        .derived
-        .get("rollup")
-        .expect("rule 'rollup' missing — downstream consumption of a forwarded \
-                 IS-ref value column failed");
+    let rollup = result.derived.get("rollup").expect(
+        "rule 'rollup' missing — downstream consumption of a forwarded \
+                 IS-ref value column failed",
+    );
     assert_eq!(
         rollup.len(),
         1,
@@ -90,9 +89,7 @@ async fn forwarded_is_ref_value_column_is_consumable_downstream() -> Result<()> 
 
     // pc_scored folds the two a→b weights into MPROD(0.5, 0.4) = 0.2; forwarded
     // re-exports 0.2; rollup is MNOR over the single forwarded score = 0.2.
-    let total = rollup[0]
-        .get("total")
-        .expect("rollup row missing 'total'");
+    let total = rollup[0].get("total").expect("rollup row missing 'total'");
     match total {
         uni_common::Value::Float(f) => assert!(
             (f - 0.2).abs() < 1e-9,

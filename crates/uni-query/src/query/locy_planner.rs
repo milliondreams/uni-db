@@ -71,12 +71,42 @@ fn collect_match_node_vars(clause: &CompiledClause, node_vars: &mut HashSet<Stri
 }
 
 /// Infer the Arrow DataType for a yield column based on its expression in the first clause.
+///
+/// `rule_catalog` lets a yield column that merely forwards a NON-KEY value column
+/// brought in by a positive IS-reference (e.g. `WHERE (p,c) IS pc_mapped YIELD ... infringement`)
+/// resolve to that source column's real type instead of defaulting to LargeUtf8.
+/// Without this, the derived-scan schema of such a rule mis-types the column as
+/// Utf8 while its materialized data carries the true type (Float64/Int64), and a
+/// downstream rule that scans it fails with an Arrow schema mismatch.
 fn infer_yield_type(
     name: &str,
     first_clause: &CompiledClause,
     node_vars: &HashSet<String>,
     fold_output_names: &HashSet<&str>,
     along_names: &HashSet<&str>,
+    rule_catalog: &HashMap<String, CompiledRule>,
+) -> DataType {
+    let mut visited = HashSet::new();
+    infer_yield_type_rec(
+        name,
+        first_clause,
+        node_vars,
+        fold_output_names,
+        along_names,
+        rule_catalog,
+        &mut visited,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_yield_type_rec(
+    name: &str,
+    first_clause: &CompiledClause,
+    node_vars: &HashSet<String>,
+    fold_output_names: &HashSet<&str>,
+    along_names: &HashSet<&str>,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    visited: &mut HashSet<String>,
 ) -> DataType {
     // Node variables → UInt64 (stores VID)
     if node_vars.contains(name) {
@@ -108,19 +138,82 @@ fn infer_yield_type(
                 _ => String::new(),
             });
             if item_name == name {
-                // If the expression is a bare Variable referencing an ALONG name,
-                // infer as Float64 (ALONG bindings are numeric). Without this,
-                // `ew AS link_weight` would infer Variable("ew") as LargeUtf8.
-                if let Expr::Variable(v) = &item.expr
-                    && along_names.contains(v.as_str())
-                {
-                    return DataType::Float64;
+                if let Expr::Variable(v) = &item.expr {
+                    // A bare Variable referencing an ALONG name → Float64
+                    // (ALONG bindings are numeric). Without this,
+                    // `ew AS link_weight` would infer Variable("ew") as LargeUtf8.
+                    if along_names.contains(v.as_str()) {
+                        return DataType::Float64;
+                    }
+                    // A bare Variable naming a NON-KEY value column carried in by a
+                    // positive IS-reference: resolve its type from the source rule
+                    // rather than defaulting to LargeUtf8.
+                    if let Some(dt) =
+                        infer_is_ref_value_col_type(v, first_clause, rule_catalog, visited)
+                    {
+                        return dt;
+                    }
                 }
                 return infer_expr_type(&item.expr, node_vars);
             }
         }
     }
+    // No explicit yield item matched (e.g. `YIELD KEY ..., col` where `col` is a
+    // value column forwarded from an IS-ref): resolve from the source rule.
+    if let Some(dt) = infer_is_ref_value_col_type(name, first_clause, rule_catalog, visited) {
+        return dt;
+    }
     DataType::LargeUtf8
+}
+
+/// If `col` is a NON-KEY value column produced by one of `clause`'s positive
+/// IS-references, return that column's type as inferred from the referenced
+/// rule. `visited` (keyed `rule::col`) guards against cyclic inference through
+/// recursive rules.
+fn infer_is_ref_value_col_type(
+    col: &str,
+    clause: &CompiledClause,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    visited: &mut HashSet<String>,
+) -> Option<DataType> {
+    for cond in &clause.where_conditions {
+        let RuleCondition::IsReference(ir) = cond else {
+            continue;
+        };
+        if ir.negated {
+            continue;
+        }
+        let rule_name = ir.rule_name.to_string();
+        let Some(rule) = rule_catalog.get(&rule_name) else {
+            continue;
+        };
+        if !rule
+            .yield_schema
+            .iter()
+            .any(|yc| !yc.is_key && yc.name == col)
+        {
+            continue;
+        }
+        if !visited.insert(format!("{rule_name}::{col}")) {
+            return Some(DataType::LargeUtf8); // cycle guard
+        }
+        let Some(src_clause) = rule.clauses.first() else {
+            return Some(DataType::LargeUtf8);
+        };
+        let src_node_vars = collect_node_vars(&rule.clauses);
+        let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
+        let src_along: HashSet<&str> = src_clause.along.iter().map(|a| a.name.as_str()).collect();
+        return Some(infer_yield_type_rec(
+            col,
+            src_clause,
+            &src_node_vars,
+            &src_fold,
+            &src_along,
+            rule_catalog,
+            visited,
+        ));
+    }
+    None
 }
 
 /// Infer Arrow DataType from a Cypher expression.
@@ -658,9 +751,14 @@ impl<'a> LocyPlanBuilder<'a> {
             .iter()
             .map(|yc| {
                 let data_type = match first_clause {
-                    Some(fc) => {
-                        infer_yield_type(&yc.name, fc, &node_vars, &fold_output_names, &along_names)
-                    }
+                    Some(fc) => infer_yield_type(
+                        &yc.name,
+                        fc,
+                        &node_vars,
+                        &fold_output_names,
+                        &along_names,
+                        rule_catalog,
+                    ),
                     None => DataType::LargeUtf8,
                 };
                 LocyYieldColumn {
@@ -843,6 +941,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     &target_rule_name,
                     target_rule,
                     is_self_ref,
+                    rule_catalog,
                 );
 
                 // Look up target rule's PROB column (if any)
@@ -1141,6 +1240,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 node_vars,
                 &fold_output_names,
                 &along_names_set,
+                rule_catalog,
             ));
         }
 
@@ -1207,8 +1307,12 @@ impl<'a> LocyPlanBuilder<'a> {
                             pc.source_rule
                         )
                     })?;
-                    let handle =
-                        self.get_or_create_derived_scan_handle(&pc.source_rule, target_rule, false);
+                    let handle = self.get_or_create_derived_scan_handle(
+                        &pc.source_rule,
+                        target_rule,
+                        false,
+                        rule_catalog,
+                    );
                     path_context_handles.insert(
                         pc.source_rule.clone(),
                         super::df_graph::locy_model_invoke::PathContextHandle {
@@ -1283,6 +1387,7 @@ impl<'a> LocyPlanBuilder<'a> {
         rule_name: &str,
         target_rule: &CompiledRule,
         is_self_ref: bool,
+        rule_catalog: &HashMap<String, CompiledRule>,
     ) -> DerivedScanHandle {
         let mut handles = self.derived_scan_handles.borrow_mut();
 
@@ -1295,7 +1400,7 @@ impl<'a> LocyPlanBuilder<'a> {
         }
 
         let scan_index = handles.len();
-        let schema = yield_schema_to_arrow_from_rule(target_rule);
+        let schema = yield_schema_to_arrow_from_rule(target_rule, rule_catalog);
         let data = Arc::new(RwLock::new(Vec::new()));
         let handle = DerivedScanHandle {
             rule_name: rule_name.to_string(),
@@ -1682,7 +1787,10 @@ pub(crate) fn locy_op_to_cypher_op(op: &LocyBinaryOp) -> BinaryOp {
 /// Computes target-rule node vars and infers types using the same logic as `build_rule`,
 /// ensuring the derived scan schema matches `yield_columns_to_arrow_schema()` in
 /// `locy_program.rs`.
-fn yield_schema_to_arrow_from_rule(target_rule: &CompiledRule) -> SchemaRef {
+fn yield_schema_to_arrow_from_rule(
+    target_rule: &CompiledRule,
+    rule_catalog: &HashMap<String, CompiledRule>,
+) -> SchemaRef {
     let target_node_vars = collect_node_vars(&target_rule.clauses);
     let first_clause = target_rule.clauses.first();
     let fold_names: HashSet<&str> = first_clause
@@ -1697,9 +1805,14 @@ fn yield_schema_to_arrow_from_rule(target_rule: &CompiledRule) -> SchemaRef {
         .iter()
         .map(|yc| {
             let dt = match first_clause {
-                Some(fc) => {
-                    infer_yield_type(&yc.name, fc, &target_node_vars, &fold_names, &along_names)
-                }
+                Some(fc) => infer_yield_type(
+                    &yc.name,
+                    fc,
+                    &target_node_vars,
+                    &fold_names,
+                    &along_names,
+                    rule_catalog,
+                ),
                 None => DataType::LargeUtf8,
             };
             Field::new(&yc.name, dt, true)
@@ -2032,7 +2145,8 @@ mod tests {
         let builder = LocyPlanBuilder::new(&planner);
         let cols = [yield_col("n", true), yield_col("m", false)];
         let rule = test_compiled_rule(&cols);
-        let handle = builder.get_or_create_derived_scan_handle("reachable", &rule, false);
+        let handle =
+            builder.get_or_create_derived_scan_handle("reachable", &rule, false, &HashMap::new());
         assert_eq!(handle.scan_index, 0);
         assert_eq!(handle.rule_name, "reachable");
         assert!(handle.data.read().is_empty());
@@ -2044,8 +2158,10 @@ mod tests {
         let builder = LocyPlanBuilder::new(&planner);
         let cols = [yield_col("n", true), yield_col("m", false)];
         let rule = test_compiled_rule(&cols);
-        let h1 = builder.get_or_create_derived_scan_handle("reachable", &rule, false);
-        let h2 = builder.get_or_create_derived_scan_handle("reachable", &rule, false);
+        let h1 =
+            builder.get_or_create_derived_scan_handle("reachable", &rule, false, &HashMap::new());
+        let h2 =
+            builder.get_or_create_derived_scan_handle("reachable", &rule, false, &HashMap::new());
         assert!(Arc::ptr_eq(&h1.data, &h2.data));
         assert_eq!(h1.scan_index, h2.scan_index);
     }
@@ -2056,8 +2172,10 @@ mod tests {
         let builder = LocyPlanBuilder::new(&planner);
         let cols = [yield_col("n", true)];
         let rule = test_compiled_rule(&cols);
-        let h1 = builder.get_or_create_derived_scan_handle("reachable", &rule, false);
-        let h2 = builder.get_or_create_derived_scan_handle("connected", &rule, false);
+        let h1 =
+            builder.get_or_create_derived_scan_handle("reachable", &rule, false, &HashMap::new());
+        let h2 =
+            builder.get_or_create_derived_scan_handle("connected", &rule, false, &HashMap::new());
         assert_eq!(h1.scan_index, 0);
         assert_eq!(h2.scan_index, 1);
         assert!(!Arc::ptr_eq(&h1.data, &h2.data));
@@ -2069,8 +2187,8 @@ mod tests {
         let builder = LocyPlanBuilder::new(&planner);
         let cols = [yield_col("n", true)];
         let rule = test_compiled_rule(&cols);
-        builder.get_or_create_derived_scan_handle("rule_a", &rule, false);
-        builder.get_or_create_derived_scan_handle("rule_b", &rule, true);
+        builder.get_or_create_derived_scan_handle("rule_a", &rule, false, &HashMap::new());
+        builder.get_or_create_derived_scan_handle("rule_b", &rule, true, &HashMap::new());
 
         let registry = builder.build_registry();
         assert!(registry.get(0).is_some());
@@ -2085,8 +2203,8 @@ mod tests {
         let builder = LocyPlanBuilder::new(&planner);
         let cols = [yield_col("n", true)];
         let rule = test_compiled_rule(&cols);
-        builder.get_or_create_derived_scan_handle("self_rule", &rule, true);
-        builder.get_or_create_derived_scan_handle("cross_rule", &rule, false);
+        builder.get_or_create_derived_scan_handle("self_rule", &rule, true, &HashMap::new());
+        builder.get_or_create_derived_scan_handle("cross_rule", &rule, false, &HashMap::new());
 
         let registry = builder.build_registry();
         assert!(registry.get(0).unwrap().is_self_ref);

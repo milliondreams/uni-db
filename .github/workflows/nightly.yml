@@ -54,13 +54,21 @@ jobs:
 
       - name: Run ignored soak/stress tier
         env:
-          # Documented nightly knobs (see fork_writes_soak.rs).
-          UNI_FORK_SOAK_FORKS: 100
-          UNI_FORK_SOAK_MUTATIONS: 1000
-          UNI_FORK_SOAK_RESTARTS: 10
+          # Soak knobs calibrated to complete reliably within the job budget
+          # (fork_writes_soak ~5 min; see fork_writes_soak.rs). The prior
+          # 100/1000/10 ran well over 40 min and was killed by the per-test
+          # timeout, so the soak never actually completed.
+          UNI_FORK_SOAK_FORKS: 40
+          UNI_FORK_SOAK_MUTATIONS: 300
+          UNI_FORK_SOAK_RESTARTS: 4
         run: |
-          cargo nextest run --profile ci -p uni-db -p uni-store \
-            --run-ignored ignored-only
+          # Scope to the actual soak/stress tests. `--run-ignored ignored-only`
+          # alone also sweeps in unrelated #[ignore]'d tests (autoembed model
+          # downloads needing HF auth, LocalStack e2e) that this job does not
+          # provision — LocalStack has its own `cloud` job below.
+          cargo nextest run --profile soak -p uni-db -p uni-store \
+            --run-ignored ignored-only \
+            -E 'test(/soak/) | test(/stress/)'
 
   cloud:
     name: Cloud Integration (LocalStack)
@@ -136,7 +144,13 @@ jobs:
           sudo apt-get install -y mold protobuf-compiler
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        # Use the explicit `tool:` form, not the `@cargo-fuzz` shorthand: the
+        # shorthand can resolve to a version ref that drops the implicit tool
+        # selection (install-action warns "no tool specified"), leaving
+        # `cargo fuzz` uninstalled -> "no such command: fuzz".
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - name: Cache fuzz build
         uses: Swatinem/rust-cache@v2

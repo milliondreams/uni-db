@@ -182,11 +182,14 @@ impl ProcedureRegistry {
         &self,
         user_qname: &str,
     ) -> Option<std::sync::Arc<uni_plugin::registry::ProcedureEntry>> {
-        // Exact namespace.local match first.
-        if let Some((ns, local)) = user_qname.split_once('.')
-            && let Some(p) = self.get_plugin(&uni_plugin::QName::new(ns, local))
-        {
-            return Some(p);
+        // Exact namespace.local match first, trying every split point
+        // (first-dot → last-dot) so plugin ids that themselves contain dots
+        // (e.g. `ai.example`) resolve alongside single-segment ids and the
+        // first-dot M9/builtin convention. See `QName::candidate_splits`.
+        for q in uni_plugin::QName::candidate_splits(user_qname) {
+            if let Some(p) = self.get_plugin(&q) {
+                return Some(p);
+            }
         }
         // Strip `uni.` prefix and try each known built-in plugin namespace.
         // The `uni` namespace itself is reserved for host-coupled procedures

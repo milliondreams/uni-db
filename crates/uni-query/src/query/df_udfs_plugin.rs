@@ -288,6 +288,124 @@ impl std::fmt::Debug for PluginScalarUdf {
     }
 }
 
+/// Resolve the declared [`ArgType`] for positional argument `i`, transparently
+/// unwrapping a trailing `Variadic(..)` so arguments beyond the fixed prefix
+/// inherit the variadic element type.
+fn declared_arg_type(
+    args: &[uni_plugin::traits::scalar::ArgType],
+    i: usize,
+) -> Option<&uni_plugin::traits::scalar::ArgType> {
+    use uni_plugin::traits::scalar::ArgType;
+    let raw = match args.get(i) {
+        Some(a) => Some(a),
+        // Past the fixed args: only a trailing variadic keeps matching.
+        None => match args.last() {
+            Some(v @ ArgType::Variadic(_)) => Some(v),
+            _ => None,
+        },
+    };
+    match raw {
+        Some(ArgType::Variadic(inner)) => Some(inner.as_ref()),
+        other => other,
+    }
+}
+
+/// Coerce one plugin-scalar argument column from the schemaless `LargeBinary`
+/// CypherValue transport into the primitive Arrow type the manifest declares
+/// (`Int64`/`Float64`) for that argument.
+///
+/// A raw integer/float node or edge property reaches expression evaluation as a
+/// `LargeBinary` variant column (schemaless storage). A plugin scalar that
+/// declares `Primitive(Int64)` downcasts its argument to `Int64Array` and fails
+/// on `LargeBinary` — previously forcing callers to wrap the property in
+/// `toInteger(...)`/`toFloat(...)`. This performs that coercion automatically
+/// (REQ-4). A value that genuinely cannot be coerced (e.g. a string where an
+/// integer is declared) yields a precise error naming the argument, the declared
+/// type, and the explicit-coercion hint, instead of an opaque downcast failure.
+///
+/// Columns whose declared type is not a numeric primitive, or that already
+/// arrive as a non-`LargeBinary` (i.e. natively typed) array, pass through
+/// untouched.
+fn coerce_plugin_scalar_arg(
+    col: ColumnarValue,
+    declared: Option<&uni_plugin::traits::scalar::ArgType>,
+    rows: usize,
+    arg_idx: usize,
+    fn_name: &str,
+) -> DFResult<ColumnarValue> {
+    use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, LargeBinaryArray};
+    use uni_common::Value;
+    use uni_plugin::traits::scalar::ArgType;
+
+    let target = match declared {
+        Some(ArgType::Primitive(t @ (DataType::Int64 | DataType::Float64))) => t.clone(),
+        _ => return Ok(col),
+    };
+
+    let array = col.to_array(rows)?;
+    // Already natively typed (or some other non-variant transport): nothing to do.
+    if array.data_type() != &DataType::LargeBinary {
+        return Ok(col);
+    }
+    let lb = array
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .expect("data_type checked to be LargeBinary");
+
+    let non_numeric_err = |row: usize, got: &Value| {
+        let hint = if target == DataType::Int64 {
+            "toInteger(...)"
+        } else {
+            "toFloat(...)"
+        };
+        datafusion::error::DataFusionError::Execution(format!(
+            "plugin fn `{fn_name}`: argument {} declares {target} but row {row} carried a \
+             non-numeric value ({got:?}); wrap the property with {hint}",
+            arg_idx + 1,
+        ))
+    };
+
+    let decoded =
+        |row: usize| uni_store::storage::arrow_convert::arrow_to_value(array.as_ref(), row, None);
+
+    let out: ArrayRef = match target {
+        DataType::Int64 => {
+            let mut b = Int64Array::builder(array.len());
+            for row in 0..array.len() {
+                if lb.is_null(row) || lb.value(row).is_empty() {
+                    b.append_null();
+                    continue;
+                }
+                match decoded(row) {
+                    Value::Int(i) => b.append_value(i),
+                    Value::Float(f) => b.append_value(f as i64),
+                    Value::Null => b.append_null(),
+                    other => return Err(non_numeric_err(row, &other)),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Float64 => {
+            let mut b = Float64Array::builder(array.len());
+            for row in 0..array.len() {
+                if lb.is_null(row) || lb.value(row).is_empty() {
+                    b.append_null();
+                    continue;
+                }
+                match decoded(row) {
+                    Value::Float(f) => b.append_value(f),
+                    Value::Int(i) => b.append_value(i as f64),
+                    Value::Null => b.append_null(),
+                    other => return Err(non_numeric_err(row, &other)),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        _ => unreachable!("target restricted to Int64/Float64 above"),
+    };
+    Ok(ColumnarValue::Array(out))
+}
+
 impl PartialEq for PluginScalarUdf {
     fn eq(&self, other: &Self) -> bool {
         self.signature == other.signature
@@ -322,7 +440,18 @@ impl ScalarUDFImpl for PluginScalarUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let entry = Arc::clone(&self.entry);
         let rows = args.number_rows;
-        let cols = args.args;
+        // Auto-coerce raw schemaless (LargeBinary) numeric property args to the
+        // primitive type the plugin's manifest declares, so a property can be
+        // passed without an explicit toInteger()/toFloat() wrapper (REQ-4).
+        let declared = &entry.signature.args;
+        let cols = args
+            .args
+            .into_iter()
+            .enumerate()
+            .map(|(i, col)| {
+                coerce_plugin_scalar_arg(col, declared_arg_type(declared, i), rows, i, &self.name)
+            })
+            .collect::<DFResult<Vec<_>>>()?;
         entry.function.invoke(&cols, rows).map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(
                 "plugin `{}` fn `{}` failed: {e}",

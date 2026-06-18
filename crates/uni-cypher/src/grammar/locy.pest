@@ -180,7 +180,7 @@ rule_match_clause = { MATCH ~ pattern }
 //   - is_not_rule_reference requires IS NOT followed by a rule_name.
 //     "x IS NOT NULL" falls through because NULL is not a rule_name.
 
-rule_where_clause = { WHERE ~ rule_condition ~ ("," ~ rule_condition)* }
+rule_where_clause = { WHERE ~ rule_condition ~ ((AND | ",") ~ rule_condition)* }
 
 rule_condition = {
     is_not_rule_reference
@@ -194,9 +194,19 @@ rule_condition = {
 //   x IS reachable
 //   x IS reachable TO y
 //   (x, y, cost) IS control
+//   (it, m) IS reach TO b      — prefix-TO: tuple subject + TO target.
+//                                Binds `b` to the KEY column after the subjects
+//                                (or the first non-KEY column when the subjects
+//                                already span all KEY columns), enabling per-group
+//                                transitive closure where leading KEYs are carried.
+//
+// NOTE (PEG ordering): the tuple + TO alternative MUST precede the tuple-only
+// alternative. Ordered choice commits to the first match, so listing the shorter
+// `(...) IS rule` first would orphan a trailing `TO b`.
 
 is_rule_reference = {
-    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name
+    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name ~ TO ~ locy_identifier
+    | "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name
     | locy_identifier ~ IS ~ rule_name ~ TO ~ locy_identifier
     | locy_identifier ~ IS ~ rule_name
 }
@@ -207,11 +217,16 @@ is_rule_reference = {
 // supported for all forms: unary, binary (TO), and tuple.
 
 is_not_rule_reference = {
-    // Postfix NOT forms: x IS NOT rule, x IS NOT rule TO y, (x,y) IS NOT rule
-    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ NOT ~ rule_name
+    // Postfix NOT forms: x IS NOT rule, x IS NOT rule TO y, (x,y) IS NOT rule,
+    //                    (x,y) IS NOT rule TO z.
+    // (tuple + TO must precede tuple-only — see PEG ordering note above.)
+    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ NOT ~ rule_name ~ TO ~ locy_identifier
+    | "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ NOT ~ rule_name
     | locy_identifier ~ IS ~ NOT ~ rule_name ~ TO ~ locy_identifier
     | locy_identifier ~ IS ~ NOT ~ rule_name
-    // Prefix NOT forms: NOT x IS rule, NOT x IS rule TO y, NOT (x,y) IS rule
+    // Prefix NOT forms: NOT x IS rule, NOT x IS rule TO y, NOT (x,y) IS rule,
+    //                   NOT (x,y) IS rule TO z.
+    | NOT ~ "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name ~ TO ~ locy_identifier
     | NOT ~ "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name
     | NOT ~ locy_identifier ~ IS ~ rule_name ~ TO ~ locy_identifier
     | NOT ~ locy_identifier ~ IS ~ rule_name

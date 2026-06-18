@@ -719,6 +719,7 @@ impl<'a> LocyEngine<'a> {
             planner.session_ctx().clone(),
             config.params.clone(),
             self.tx_l0_override.clone(),
+            self.read_snapshot.clone(),
         );
         // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
         *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
@@ -951,6 +952,13 @@ struct NativeExecutionAdapter<'a> {
     params: HashMap<String, Value>,
     /// Private transaction L0 override for commit-time serialization.
     tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Pinned MVCC read snapshot (C1 frozen L0 generations + C2 version-pinned
+    /// L1 storage), cloned from the `LocyEngine`. When present, command-dispatch
+    /// pattern matching (`execute_pattern`) must read base facts from the frozen
+    /// snapshot rather than live storage, so a Locy program's result does not
+    /// depend on whether it runs via `session.locy()` (no snapshot) or
+    /// `tx.locy()` (snapshot) — see REQ-1b. `None` for the session path.
+    read_snapshot: Option<uni_store::runtime::SnapshotView>,
     /// Locy-scoped L0 buffer. DERIVE mutations go here. ASSUME/ABDUCE fork from here.
     /// Protected by std::sync::Mutex for interior mutability (fork/restore swap the Arc).
     locy_l0: std::sync::Mutex<Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
@@ -960,6 +968,10 @@ struct NativeExecutionAdapter<'a> {
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Threads the fixpoint planner's contexts, params, tx L0, and pinned read snapshot into the command-dispatch adapter; grouping into a struct would just move the argument list."
+    )]
     fn new(
         db: &'a crate::api::UniInner,
         native_store: &'a uni_query::query::df_graph::DerivedStore,
@@ -968,6 +980,7 @@ impl<'a> NativeExecutionAdapter<'a> {
         session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
         params: HashMap<String, Value>,
         tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        read_snapshot: Option<uni_store::runtime::SnapshotView>,
     ) -> Self {
         Self {
             db,
@@ -977,9 +990,21 @@ impl<'a> NativeExecutionAdapter<'a> {
             session_ctx,
             params,
             tx_l0_override,
+            read_snapshot,
             locy_l0: std::sync::Mutex::new(None),
             l0_save_stack: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Storage pinned to the transaction's snapshot version (C2) when a read
+    /// snapshot is installed, else live storage. Mirrors
+    /// `Executor::effective_storage` so command-dispatch reads honor the same L1
+    /// version boundary the fixpoint planner used.
+    fn effective_storage(&self) -> Arc<uni_store::storage::manager::StorageManager> {
+        self.read_snapshot
+            .as_ref()
+            .and_then(|s| s.pinned_storage.clone())
+            .unwrap_or_else(|| self.db.storage.clone())
     }
 
     /// Execute a Query AST via execute_subplan, reusing the fixpoint contexts.
@@ -1000,7 +1025,9 @@ impl<'a> NativeExecutionAdapter<'a> {
             &HashMap::new(),
             &self.graph_ctx,
             &self.session_ctx,
-            &self.db.storage,
+            // Honor the pinned snapshot storage (C2) so fact-extraction reads the
+            // same L1 version boundary the fixpoint used (REQ-1b).
+            &self.effective_storage(),
             &self.db.schema.schema(),
             None, // Locy fact-extraction path is read-only
         )
@@ -1047,9 +1074,25 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
                     message: e.to_string(),
                 })?;
 
-        // When a locy_l0 or transaction L0 is active, the stored graph_ctx may not
-        // include the local L0 buffer. Rebuild a temporary context that includes it
-        // so pattern queries see the uncommitted/hypothetical state.
+        // Storage pinned to the transaction's snapshot version (C2) when a read
+        // snapshot is installed, else live storage.
+        let effective_storage = self.effective_storage();
+
+        // When a locy_l0 or transaction L0 is active, OR a read snapshot is
+        // pinned, the stored graph_ctx may not reflect the right L0/storage view
+        // for this dispatch. Rebuild a temporary context.
+        //
+        // REQ-1b: when a read snapshot is pinned (the `tx.locy()` path), the
+        // rebuilt context MUST read base facts from the FROZEN snapshot
+        // generations (`snap.main` + `snap.extra`) and the version-pinned
+        // storage, exactly like the fixpoint planner did — not live storage and
+        // live L0. Otherwise a concurrent commit (or a flush completing
+        // mid-transaction) would leak into command-dispatch pattern matching,
+        // making a program's result depend on whether it ran via `session.locy()`
+        // (no snapshot ⇒ live) vs `tx.locy()` (snapshot ⇒ frozen). The
+        // transaction L0 stays live for read-your-writes. PropertyManager
+        // intentionally stays on live storage (read-your-writes on properties),
+        // matching `Executor::create_datafusion_planner`.
         let tx_l0_for_ctx = self
             .locy_l0
             .lock()
@@ -1057,16 +1100,23 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             .clone()
             .or_else(|| self.tx_l0_override.clone());
         let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
-            if let Some(tx_l0) = tx_l0_for_ctx {
+            if tx_l0_for_ctx.is_some() || self.read_snapshot.is_some() {
                 if let Some(writer) = self.db.writer.as_ref() {
+                    let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
+                        Some(snap) => (snap.main.clone(), snap.extra.clone()),
+                        None => (
+                            writer.l0_manager.get_current(),
+                            writer.l0_manager.get_pending_flush(),
+                        ),
+                    };
                     let l0_ctx = uni_query::query::df_graph::L0Context {
-                        current_l0: Some(writer.l0_manager.get_current()),
-                        transaction_l0: Some(tx_l0),
-                        pending_flush_l0s: writer.l0_manager.get_pending_flush(),
+                        current_l0: Some(current_l0),
+                        transaction_l0: tx_l0_for_ctx,
+                        pending_flush_l0s,
                     };
                     Some(Arc::new(
                         uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
-                            self.db.storage.clone(),
+                            effective_storage.clone(),
                             l0_ctx,
                             self.graph_ctx.property_manager().clone(),
                         ),
@@ -1087,7 +1137,7 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             &HashMap::new(),
             effective_ctx,
             &self.session_ctx,
-            &self.db.storage,
+            &effective_storage,
             &self.db.schema.schema(),
             None, // Locy fixpoint path is read-only
         )
@@ -1613,7 +1663,12 @@ async fn enrich_vids_with_nodes(
                     &HashMap::new(),
                     graph_ctx,
                     session_ctx,
-                    &db.storage,
+                    // Use the (snapshot-pinned, when in a tx) storage carried by
+                    // graph_ctx rather than live `db.storage`, so node enrichment
+                    // honors the same L1 version boundary as the fixpoint and
+                    // does not leak post-snapshot rows from a mid-tx flush
+                    // (REQ-1b, C2 storage pin).
+                    graph_ctx.storage(),
                     &db.schema.schema(),
                     None, // Locy inline Cypher path is read-only
                 )

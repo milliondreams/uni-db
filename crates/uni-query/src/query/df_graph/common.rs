@@ -1156,6 +1156,10 @@ fn infer_expr_type(expr: &Expr, schema_info: &UniSchema) -> DataType {
             | "substring" | "replace" | "reverse" | "type" => DataType::Utf8,
             "tointeger" | "toint" | "size" | "length" | "id" => DataType::Int64,
             "tofloat" => DataType::Float64,
+            // Numeric statistical aggregates always yield Float64.
+            "stdev" | "stddev" | "stdevp" | "stddevp" | "variance" | "variancep" => {
+                DataType::Float64
+            }
             "toboolean" => DataType::Boolean,
             _ => DataType::LargeBinary,
         },

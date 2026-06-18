@@ -167,6 +167,21 @@ fn expects_identifier(e: &pest::error::Error<Rule>) -> bool {
     }
 }
 
+/// Locy analogue of [`expects_identifier`]: true only when the parser failed at a
+/// position where an identifier was a valid next token. Used to gate the
+/// reserved-keyword diagnostic so a genuine syntax error (e.g. a misplaced
+/// operator) is not mislabelled as "X is a reserved keyword". Mirrors the guard
+/// the Cypher path already applies (`map_pest_error`).
+fn expects_locy_identifier(e: &pest::error::Error<locy_parser::Rule>) -> bool {
+    use pest::error::ErrorVariant;
+    match &e.variant {
+        ErrorVariant::ParsingError { positives, .. } => positives
+            .iter()
+            .any(|r| matches!(r, locy_parser::Rule::locy_identifier)),
+        _ => false,
+    }
+}
+
 fn error_position<R: pest::RuleType>(e: &pest::error::Error<R>) -> usize {
     match e.location {
         pest::error::InputLocation::Pos(p) => p,
@@ -410,7 +425,10 @@ fn map_locy_pest_error(input: &str, e: pest::error::Error<locy_parser::Rule>) ->
             "LocySyntaxError: InvalidUnicodeCharacter - Invalid character '{ch}'"
         ));
     }
-    if let Some(kw) = reserved_keyword_at(input, pos, LOCY_RESERVED_KEYWORDS) {
+    if let Some(kw) = expects_locy_identifier(&e)
+        .then(|| reserved_keyword_at(input, pos, LOCY_RESERVED_KEYWORDS))
+        .flatten()
+    {
         return ParseError::new(format!(
             "LocySyntaxError: ReservedKeyword - \"{kw}\" is a reserved keyword \
              and cannot be used as a variable name. Use backtick-quoting: `{kw}`\n{e}"

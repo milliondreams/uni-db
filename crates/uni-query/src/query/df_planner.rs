@@ -4739,7 +4739,9 @@ impl HybridPhysicalPlanner {
         state: &SessionState,
         ctx: &TranslationContext,
     ) -> Result<Vec<PhysicalAggregate>> {
-        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
+        use datafusion::functions_aggregate::expr_fn::{
+            avg, count, max, min, stddev, stddev_pop, sum, var_pop, var_sample,
+        };
 
         let mut result: Vec<PhysicalAggregate> = Vec::new();
 
@@ -4830,6 +4832,29 @@ impl HybridPhysicalPlanner {
                         )))
                     }
                 }
+                // Numerically-stable standard-deviation / variance aggregates
+                // (Neo4j naming `stDev`/`stDevP`; openCypher `stdev`/`stdevp`).
+                // DataFusion's implementations use Welford's online algorithm,
+                // so they avoid the catastrophic cancellation of the
+                // `sqrt(avg(x*x) - avg(x)^2)` identity for large means. Inputs
+                // are coerced to Float64 the same way `avg` is, so a raw
+                // schemaless (LargeBinary) numeric property works directly.
+                "stdev" | "stddev" => {
+                    let arg = get_arg()?;
+                    stddev(Self::coerce_numeric_for_stat(arg, schema, self))
+                }
+                "stdevp" | "stddevp" => {
+                    let arg = get_arg()?;
+                    stddev_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                }
+                "variance" => {
+                    let arg = get_arg()?;
+                    var_sample(Self::coerce_numeric_for_stat(arg, schema, self))
+                }
+                "variancep" => {
+                    let arg = get_arg()?;
+                    var_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                }
                 "min" => {
                     // Use Cypher-aware min for LargeBinary columns (mixed types)
                     let arg = Self::wrap_temporal_sort_key(get_arg()?, schema)?;
@@ -4911,18 +4936,21 @@ impl HybridPhysicalPlanner {
                     // `uni.plugin.declareAggregate` is the primary
                     // user) dispatch through the
                     // `PluginAggregateUdaf` adapter.
-                    if let Some((ns, local)) = name_lower.split_once('.')
-                        && let Some(entry) = self
-                            .plugin_registry
-                            .aggregate(&uni_plugin::QName::new(ns, local))
-                    {
+                    // Resolve the dotted name against the registry trying every
+                    // namespace/local split (first-dot → last-dot), so plugin
+                    // ids that themselves contain dots (e.g. `ai.example`)
+                    // resolve as well as single-segment ids. See
+                    // `QName::candidate_splits`.
+                    let resolved = uni_plugin::QName::candidate_splits(&name_lower)
+                        .find_map(|q| self.plugin_registry.aggregate(&q).map(|e| (q, e)));
+                    if let Some((qname, entry)) = resolved {
                         let arg_exprs: Vec<DfExpr> = args
                             .iter()
                             .map(|a| cypher_expr_to_df(a, Some(ctx)))
                             .collect::<Result<Vec<_>>>()?;
                         let udaf = Arc::new(datafusion::logical_expr::AggregateUDF::from(
                             crate::query::df_udaf_plugin::PluginAggregateUdaf::new(
-                                uni_plugin::QName::new(ns, local),
+                                qname,
                                 Arc::clone(&self.plugin_registry),
                                 entry.signature.clone(),
                             ),
@@ -6134,6 +6162,23 @@ impl HybridPhysicalPlanner {
         // For any other expression type, conservatively return true
         // since schemaless properties are stored as LargeBinary
         true
+    }
+
+    /// Coerce an aggregate argument to `Float64` for numeric statistical
+    /// aggregates (stDev/variance). A schemaless property arrives as a
+    /// `LargeBinary` CypherValue column and is decoded via the Cypher→Float64
+    /// UDF; a schema-typed numeric column is cast directly. Mirrors the
+    /// coercion `avg` applies so the two agree on which rows are numeric.
+    fn coerce_numeric_for_stat(arg: DfExpr, schema: &SchemaRef, this: &Self) -> DfExpr {
+        if this.is_large_binary_col(&arg, schema) {
+            crate::query::df_udfs::cypher_to_float64_expr(arg)
+        } else {
+            use datafusion::logical_expr::Cast;
+            DfExpr::Cast(Cast::new(
+                Box::new(arg),
+                datafusion::arrow::datatypes::DataType::Float64,
+            ))
+        }
     }
 }
 

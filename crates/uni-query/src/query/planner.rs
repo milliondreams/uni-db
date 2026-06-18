@@ -638,7 +638,11 @@ fn is_aggregate_function_name(name: &str) -> bool {
             | "max"
             | "collect"
             | "stdev"
+            | "stddev"
             | "stdevp"
+            | "stddevp"
+            | "variance"
+            | "variancep"
             | "percentiledisc"
             | "percentilecont"
             | "btic_min"
@@ -2679,10 +2683,10 @@ impl QueryPlanner {
         let Some(registry) = self.plugin_registry.as_ref() else {
             return false;
         };
-        if let Some((ns, local)) = user_name.split_once('.')
-            && registry
-                .procedure(&uni_plugin::QName::new(ns, local))
-                .is_some()
+        // Try every namespace/local split (first-dot → last-dot) so dotted
+        // plugin ids resolve alongside the first-dot M9/builtin convention.
+        // Mirrors `ProcedureRegistry::resolve_user_procedure`.
+        if uni_plugin::QName::candidate_splits(user_name).any(|q| registry.procedure(&q).is_some())
         {
             return true;
         }

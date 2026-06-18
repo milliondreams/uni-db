@@ -123,6 +123,41 @@ impl QName {
         })
     }
 
+    /// Every way to split a dotted name into `(namespace, local)`, yielded
+    /// from the **first** dot to the **last** dot.
+    ///
+    /// Resolution must be convention-agnostic because two registration
+    /// conventions coexist: dynamic loaders register the *whole* (possibly
+    /// dotted) plugin id as the namespace (`ai.example` + `myfn` ⇒
+    /// `("ai.example", "myfn")`, a last-dot split), while the M9-declared and
+    /// builtin/apoc paths use a first-dot split (`apoc-core` + `bitwise.and`,
+    /// `uni` + `plugin.declareAggregate`). Neither a pure first-dot nor a pure
+    /// last-dot split resolves both. A caller looks up each candidate against
+    /// the registry (exact `QName` keyed) and takes the first hit.
+    ///
+    /// First-dot is yielded first so that, in the (vanishingly unlikely) event
+    /// two registrations would both match, resolution stays identical to the
+    /// historical `split_once('.')` behavior.
+    ///
+    /// A name with no `.` (or with an empty side at every split) yields nothing.
+    ///
+    /// ```
+    /// # use uni_plugin::QName;
+    /// let cands: Vec<_> = QName::candidate_splits("a.b.c").collect();
+    /// assert_eq!(cands, vec![QName::new("a", "b.c"), QName::new("a.b", "c")]);
+    /// assert_eq!(QName::candidate_splits("bare").count(), 0);
+    /// ```
+    pub fn candidate_splits(name: &str) -> impl Iterator<Item = QName> + '_ {
+        name.match_indices('.').filter_map(move |(i, _)| {
+            let (ns, local) = (&name[..i], &name[i + 1..]);
+            if ns.is_empty() || local.is_empty() {
+                None
+            } else {
+                Some(QName::new(ns, local))
+            }
+        })
+    }
+
     /// Returns the namespace portion (the plugin id).
     #[must_use]
     pub fn namespace(&self) -> &str {
@@ -214,6 +249,43 @@ mod tests {
         let q = QName::builtin("MIN");
         assert!(q.is_builtin());
         assert_eq!(q.local(), "MIN");
+    }
+
+    #[test]
+    fn candidate_splits_orders_first_dot_to_last() {
+        let cands: Vec<_> = QName::candidate_splits("a.b.c").collect();
+        assert_eq!(
+            cands,
+            vec![QName::new("a", "b.c"), QName::new("a.b", "c")],
+            "candidates must run first-dot → last-dot"
+        );
+    }
+
+    #[test]
+    fn candidate_splits_single_dot() {
+        let cands: Vec<_> = QName::candidate_splits("mycorp.fn").collect();
+        assert_eq!(cands, vec![QName::new("mycorp", "fn")]);
+    }
+
+    #[test]
+    fn candidate_splits_covers_both_registration_conventions() {
+        // Dotted-id loader plugin registers ("ai.example", "agg") — last-dot;
+        // M9 declared registers ("ai", "example.agg") — first-dot. Both forms
+        // must appear among the candidates so resolution finds whichever the
+        // registry actually holds.
+        let cands: Vec<_> = QName::candidate_splits("ai.example.agg").collect();
+        assert!(cands.contains(&QName::new("ai", "example.agg")));
+        assert!(cands.contains(&QName::new("ai.example", "agg")));
+    }
+
+    #[test]
+    fn candidate_splits_skips_empty_sides_and_bare_names() {
+        assert_eq!(QName::candidate_splits("bare").count(), 0);
+        assert_eq!(QName::candidate_splits(".bar").count(), 0);
+        assert_eq!(QName::candidate_splits("foo.").count(), 0);
+        // The interior split of "a..b" has an empty side on each adjacent dot.
+        let cands: Vec<_> = QName::candidate_splits("a..b").collect();
+        assert_eq!(cands, vec![QName::new("a", ".b"), QName::new("a.", "b")]);
     }
 
     #[test]

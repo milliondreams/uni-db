@@ -343,7 +343,17 @@ async fn synchronous_before_commit_reject_aborts_tx() -> Result<()> {
 #[tokio::test]
 async fn async_fire_mode_does_not_block_commit() -> Result<()> {
     let db = db_with_audit_schema().await?;
-    let (trigger, counter) = DelayedAsyncTrigger::new(Duration::from_millis(150));
+    // Use a long trigger delay so the assertion does not depend on absolute
+    // commit latency. The previous version asserted `commit < 120ms`, which
+    // conflated "non-blocking" with "fast, uncontended machine" and flaked on
+    // loaded CI runners (a trivial commit can take ~1s under full-core
+    // nextest contention). The real invariant — commit does not wait for the
+    // async trigger's work — is tested directly below: with a 3s delay, a
+    // non-blocking commit returns long before the trigger's work lands, so the
+    // counter is still zero; a blocking commit would have waited the full 3s
+    // and observed counter == 1.
+    let delay = Duration::from_secs(3);
+    let (trigger, counter) = DelayedAsyncTrigger::new(delay);
     register_trigger(&db, "test-async", Arc::new(trigger))?;
 
     let tx = db.session().tx().await?;
@@ -353,13 +363,21 @@ async fn async_fire_mode_does_not_block_commit() -> Result<()> {
     tx.commit().await?;
     let elapsed = before.elapsed();
 
+    // Machine-speed-independent proof that commit did not block on the async
+    // trigger: its delayed work cannot have completed yet.
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "async trigger fired during commit — commit blocked on it (elapsed {elapsed:?})"
+    );
+    // Secondary sanity: commit returned before the trigger delay elapsed.
     assert!(
-        elapsed < Duration::from_millis(120),
-        "async trigger must not block commit (took {elapsed:?})"
+        elapsed < delay,
+        "commit took {elapsed:?}, not clearly faster than the {delay:?} async trigger"
     );
 
-    // Poll for up to 2s for the spawned async task to land.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The spawned task must still eventually fire — poll past the delay.
+    let deadline = Instant::now() + delay + Duration::from_secs(2);
     while Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= 1 {
             return Ok(());

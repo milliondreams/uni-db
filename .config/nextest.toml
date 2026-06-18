@@ -14,3 +14,13 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Soak profile: the nightly "Soak & Stress" job opts the long-running
+# `#[ignore]`'d soak/stress tests in via `--run-ignored`. They legitimately run
+# for many minutes (cranked knobs: 10k-op stress, 100-fork soak), so the 3-min
+# ci ceiling kills them spuriously. Raise the per-test ceiling to 40 minutes
+# (period 120s x terminate-after 20); the job's `timeout-minutes` is the real
+# backstop. Select with `--profile soak`.
+[profile.soak]
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 20 }

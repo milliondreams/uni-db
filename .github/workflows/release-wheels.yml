@@ -126,12 +126,13 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             TARGET="${{ inputs.target }}"
           else
-            # Default publish target for tag-push releases. Currently 'none'
-            # because PyPI per-project file-size-limit increases are pending
-            # (wheels exceed the 100 MB default). Tag-push builds the matrix and
-            # attaches it to the GitHub Release as the interim install channel.
-            # >>> Switch this to 'pypi' once the PyPI limit increases are granted. <<<
-            TARGET="none"
+            # Default publish target for tag-push releases. PyPI is now the
+            # primary install channel: the per-project file-size-limit increases
+            # have been granted for all six uni-db* projects, so the wheels
+            # (which exceed the 100 MB default) can be uploaded. Tag-push builds
+            # the matrix, publishes it to PyPI, and ALSO attaches it to the
+            # GitHub Release (see attach-to-release) as a fallback channel.
+            TARGET="pypi"
           fi
           echo "publish_target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Resolved publish target: $TARGET"

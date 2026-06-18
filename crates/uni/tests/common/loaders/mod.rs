@@ -1,3 +1,4 @@
+pub mod dotted_plugin_id_resolution;
 pub mod m4_host_procedures_dispatch;
 pub mod m6_cross_abi_parity;
 pub mod m6a3_authz_write_verbs;
@@ -8,3 +9,4 @@ pub mod m8_pyo3_cross_loader_parity;
 pub mod m8_pyo3_load_e2e;
 pub mod m8_pyo3_session_scope;
 pub mod multi_version_abi;
+pub mod req2_req4_rhai_cypher;

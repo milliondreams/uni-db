@@ -131,7 +131,25 @@ pub(crate) fn with_loading_registrar<T>(
     use uni_plugin::{PluginId, PluginRegistrar};
     let mut r = PluginRegistrar::new(PluginId::new(placeholder), caps, registry);
     let outcome = f(&mut r)?;
+    // Snapshot the aggregate qnames staged by the loader *before* the commit
+    // consumes the registrar, so we can publish their Cypher routing hints
+    // once the commit succeeds.
+    let staged_aggregates: Vec<String> = r
+        .staged_aggregate_qnames()
+        .iter()
+        .map(|q| format!("{}.{}", q.namespace(), q.local()))
+        .collect();
     r.commit_to_registry().map_err(plugin_err_to_uni)?;
+    // Publish each committed aggregate to the Cypher planner's plugin-aggregate
+    // hint set so `RETURN ns.myAgg(x)` (and `GROUP BY`) routes through aggregate
+    // translation instead of scalar-UDF resolution. This is the single point
+    // every dynamic loader (rhai / pyo3 / wasm / extism) passes through, so all
+    // of them are covered without each depending on `uni-cypher`. Mirrors the
+    // declared-aggregate path in `uni-plugin-custom` (`declareAggregate`).
+    // Idempotent: the hint set is a deduplicating set.
+    for dotted in staged_aggregates {
+        uni_cypher::register_plugin_aggregate(dotted);
+    }
     Ok(outcome)
 }
 

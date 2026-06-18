@@ -1202,7 +1202,11 @@ impl Expr {
                             | "max"
                             | "collect"
                             | "stdev"
+                            | "stddev"
                             | "stdevp"
+                            | "stddevp"
+                            | "variance"
+                            | "variancep"
                             | "percentiledisc"
                             | "percentilecont"
                     ) || crate::plugin_aggregates::is_known_plugin_aggregate(name))

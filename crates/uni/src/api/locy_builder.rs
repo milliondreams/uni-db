@@ -32,12 +32,24 @@ impl<'a> InnerLocyBuilder<'a> {
     }
 
     /// Bind a single parameter.  The name should not include the `$` prefix.
+    ///
+    /// Parameters bound here resolve `$name` references in the program and are
+    /// forwarded by [`Self::run`] exactly like the positional `params` argument
+    /// of `session.locy(program, params)` / `tx.locy(...)`. The builder does
+    /// **not** pick up params implicitly: if a program references `$seed`, you
+    /// must call `.param("seed", …)` (or `.params(…)`) on the builder —
+    /// otherwise evaluation fails with `Unresolved parameter: $seed`.
+    ///
+    /// Note that a `$param` binding is distinct from a `LocyConfig` field: e.g.
+    /// `$seed` (a query parameter) is unrelated to any `seed` set via
+    /// `.with_config(...)`; setting the latter does not bind the former.
     pub fn param(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
         self.config.params.insert(name.into(), value.into());
         self
     }
 
-    /// Bind multiple parameters from an iterator.
+    /// Bind multiple parameters from an iterator. See [`Self::param`] for how
+    /// bindings resolve `$name` references and are forwarded by [`Self::run`].
     pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
         for (k, v) in params {
             self.config.params.insert(k.to_string(), v);

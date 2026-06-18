@@ -56,6 +56,13 @@ pub struct PluginRegistrar<'a> {
     effective_caps: &'a CapabilitySet,
     registry: &'a PluginRegistry,
     pending: Vec<Box<dyn DynPendingRegistration>>,
+    /// QNames of aggregate functions staged via [`Self::aggregate_fn`]. The
+    /// pending registrations are type-erased, so we record aggregate qnames
+    /// separately to let the host loader publish each one's Cypher
+    /// routing hint (`uni_cypher::register_plugin_aggregate`) after a
+    /// successful commit — without this, the Cypher planner classifies
+    /// `RETURN myAgg(x)` as a scalar UDF and fails to resolve it.
+    aggregate_qnames: Vec<QName>,
 }
 
 impl<'a> std::fmt::Debug for PluginRegistrar<'a> {
@@ -83,7 +90,18 @@ impl<'a> PluginRegistrar<'a> {
             effective_caps,
             registry,
             pending: Vec::new(),
+            aggregate_qnames: Vec::new(),
         }
+    }
+
+    /// QNames of aggregate functions staged on this registrar (in registration
+    /// order). The host loader uses these, after a successful
+    /// [`Self::commit_to_registry`], to publish each aggregate's Cypher
+    /// routing hint so `RETURN myAgg(x)` is planned as an aggregate rather
+    /// than a scalar UDF. Empty until [`Self::aggregate_fn`] is called.
+    #[must_use]
+    pub fn staged_aggregate_qnames(&self) -> &[QName] {
+        &self.aggregate_qnames
     }
 
     /// Returns the plugin id being registered.
@@ -157,6 +175,7 @@ impl<'a> PluginRegistrar<'a> {
     ) -> Result<&mut Self, PluginError> {
         self.require(&Capability::AggregateFn)?;
         self.validate_qname(&qname)?;
+        self.aggregate_qnames.push(qname.clone());
         self.pending
             .push(Box::new(NamedUniqueReg::<AggregateSurface> {
                 q: qname,

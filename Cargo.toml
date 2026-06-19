@@ -23,6 +23,10 @@ members = [
     "crates/uni-cypher",
     "crates/uni-tck",
     "crates/uni-locy-tck",
+    # Naive-Datalog reference oracle for differential-testing the Locy engine.
+    # Excluded from `default-members` (like the *-tck crates) so default/release/
+    # doc builds skip it; run explicitly with `-p uni-locy-oracle`.
+    "crates/uni-locy-oracle",
     "crates/uni-locy",
     "crates/uni-plugin",
     "crates/uni-plugin-builtin",

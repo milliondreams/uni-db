@@ -61,12 +61,17 @@ jobs:
           UNI_FORK_SOAK_FORKS: 40
           UNI_FORK_SOAK_MUTATIONS: 300
           UNI_FORK_SOAK_RESTARTS: 4
+          # Number of generated programs the Locy naive-oracle soak diffs against
+          # the engine. ~10k completes in ~10-15 min (each case pays a full DB
+          # build, which dominates); higher would risk the soak per-test kill
+          # window. Dedicated var so it can't perturb other crates' PROPTEST_CASES.
+          ORACLE_SOAK_CASES: 10000
         run: |
           # Scope to the actual soak/stress tests. `--run-ignored ignored-only`
           # alone also sweeps in unrelated #[ignore]'d tests (autoembed model
           # downloads needing HF auth, LocalStack e2e) that this job does not
           # provision — LocalStack has its own `cloud` job below.
-          cargo nextest run --profile soak -p uni-db -p uni-store \
+          cargo nextest run --profile soak -p uni-db -p uni-store -p uni-locy-oracle \
             --run-ignored ignored-only \
             -E 'test(/soak/) | test(/stress/)'
 

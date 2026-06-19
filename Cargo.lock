@@ -12802,6 +12802,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "uni-locy-oracle"
+version = "2.2.3"
+dependencies = [
+ "anyhow",
+ "proptest",
+ "tokio",
+ "uni-common",
+ "uni-db",
+]
+
+[[package]]
 name = "uni-locy-tck"
 version = "2.2.3"
 dependencies = [

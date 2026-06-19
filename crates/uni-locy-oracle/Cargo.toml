@@ -1,0 +1,31 @@
+[package]
+name = "uni-locy-oracle"
+description = "Naive-Datalog reference oracle for differential-testing the Locy engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Internal test machinery — never published.
+publish = false
+
+# INDEPENDENCE INVARIANT (the reason this is its own crate): the library must
+# share zero evaluation code with the Locy engine, so a bug in the engine cannot
+# hide in both sides of the differential. Therefore the engine (`uni-db`) and its
+# compiler (`uni-locy`, `uni-query`) MUST NOT appear under `[dependencies]` — only
+# `uni-common` (the shared `Value` data type) and `proptest`. The engine is a
+# `[dev-dependencies]` entry, reachable only from `tests/`.
+[dependencies]
+uni-common = { workspace = true }
+proptest = { workspace = true }
+
+[dev-dependencies]
+# Engine under test — used ONLY by tests/differential.rs to run real Locy
+# programs and diff their output against this crate's oracle.
+uni-db = { path = "../uni" }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+anyhow = { workspace = true }

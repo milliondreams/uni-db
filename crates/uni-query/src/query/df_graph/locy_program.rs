@@ -10,7 +10,7 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    collect_all_partitions, compute_plan_properties, execute_subplan,
+    collect_all_partitions, compute_plan_properties, execute_subplan, execute_subplan_collecting,
 };
 use crate::query::df_graph::locy_best_by::SortCriterion;
 use crate::query::df_graph::locy_explain::ProvenanceStore;
@@ -18,6 +18,10 @@ use crate::query::df_graph::locy_fixpoint::{
     DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, resolve_locy_aggregate};
+use crate::query::df_graph::locy_profile::{
+    LocyExecProfile, LocyProfileCollector, LocyStratumProfile,
+};
+use crate::query::executor::core::OperatorStats;
 use crate::query::planner_locy_types::{
     LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum, LocyYieldColumn,
 };
@@ -159,6 +163,14 @@ pub struct LocyProgramExec {
     /// stop reason plus the skipped / unsound-complement rule lists; read after
     /// execution to populate `LocyResult.incomplete`. `None` for a complete run.
     incomplete_slot: Arc<StdRwLock<Option<uni_common::LocyIncomplete>>>,
+    /// Whether to collect a structured execution profile. `false` for a plain
+    /// `run()` (zero overhead); set to `true` by the `profile()` path. Atomic so
+    /// it can be toggled through `&self` after construction (the exec is held
+    /// behind an `Arc`), mirroring `set_derivation_tracker`.
+    profile_enabled: std::sync::atomic::AtomicBool,
+    /// Shared slot written with the structured execution profile when
+    /// `profile_enabled` is set. Read after execution to build `LocyProfileOutput`.
+    profile_slot: Arc<StdRwLock<Option<LocyExecProfile>>>,
 }
 
 /// Encoding for the shared interruption signal threaded through the stratum
@@ -445,7 +457,26 @@ impl LocyProgramExec {
             top_k_proofs,
             timeout_flag: Arc::new(std::sync::atomic::AtomicU8::new(interruption::NONE)),
             incomplete_slot: Arc::new(StdRwLock::new(None)),
+            profile_enabled: std::sync::atomic::AtomicBool::new(false),
+            profile_slot: Arc::new(StdRwLock::new(None)),
         }
+    }
+
+    /// Enable structured execution profiling for this run.
+    ///
+    /// Must be called before `execute()`. When enabled, the stratum loop records
+    /// per-stratum / per-rule / per-iteration timing, delta facts, and
+    /// clause-body operator metrics into [`Self::profile_slot`]. Uses interior
+    /// mutability so it works through `&self` (the exec is held behind an `Arc`).
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.profile_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the shared execution-profile slot, populated after execution when
+    /// profiling was enabled.
+    pub fn profile_slot(&self) -> Arc<StdRwLock<Option<LocyExecProfile>>> {
+        Arc::clone(&self.profile_slot)
     }
 
     /// Returns a shared handle to the derived store slot.
@@ -610,6 +641,10 @@ impl ExecutionPlan for LocyProgramExec {
         let classifier_registry = Arc::clone(&self.classifier_registry);
         let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
         let classifier_provenance_store = self.classifier_provenance_store.as_ref().map(Arc::clone);
+        let profile_enabled = self
+            .profile_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let profile_slot = Arc::clone(&self.profile_slot);
 
         let fut = async move {
             run_program(
@@ -645,6 +680,8 @@ impl ExecutionPlan for LocyProgramExec {
                 classifier_registry,
                 classifier_cache,
                 classifier_provenance_store,
+                profile_enabled,
+                profile_slot,
             )
             .await
         };
@@ -794,9 +831,13 @@ async fn run_program(
     classifier_registry: Arc<ClassifierRegistry>,
     classifier_cache: Option<Arc<ModelInvocationCache>>,
     classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    profile_enabled: bool,
+    profile_slot: Arc<StdRwLock<Option<LocyExecProfile>>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
+    // Per-stratum profile rows, accumulated only when profiling is enabled.
+    let mut stratum_profiles: Vec<LocyStratumProfile> = Vec::new();
 
     // IMPORTANT: per rollout D-9 the FuzzyNotProbabilistic warning is
     // unsuppressible. Emit one warning per PROB-bearing rule at program
@@ -841,6 +882,11 @@ async fn run_program(
         // Write cross-stratum facts into registry handles for strata we depend on
         write_cross_stratum_facts(&registry, &derived_store, stratum);
 
+        // Profiling (profile() path only): time this stratum and collect its
+        // per-rule, per-iteration detail. `None` → zero overhead on `run()`.
+        let stratum_start = Instant::now();
+        let collector = profile_enabled.then(|| Arc::new(LocyProfileCollector::default()));
+
         let remaining_timeout = timeout.saturating_sub(start.elapsed());
         if remaining_timeout.is_zero() {
             tracing::warn!("Locy program timeout exceeded during stratum evaluation");
@@ -858,7 +904,7 @@ async fn run_program(
             )?;
             let fixpoint_schema = build_fixpoint_output_schema(&stratum.rules);
 
-            let exec = FixpointExec::new_with_semiring_classifiers_and_cache(
+            let mut exec = FixpointExec::new_with_semiring_classifiers_and_cache(
                 fixpoint_rules,
                 max_iterations,
                 remaining_timeout,
@@ -886,6 +932,9 @@ async fn run_program(
                 classifier_provenance_store.as_ref().map(Arc::clone),
             );
 
+            if let Some(ref c) = collector {
+                exec.set_profile_collector(Arc::clone(c));
+            }
             let task_ctx = session_ctx.read().task_ctx();
             let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
             let batches = collect_all_partitions(&exec_arc, task_ctx).await?;
@@ -959,6 +1008,10 @@ async fn run_program(
                 }
 
                 // Process each clause independently (per-clause IS NOT).
+                // Profiling: time this rule's single pass and collect its
+                // clause-body operator trees.
+                let rule_start = Instant::now();
+                let mut iter_ops: Vec<OperatorStats> = Vec::new();
                 let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
                 for (clause_idx, (clause, fp_clause)) in
                     rule.clauses.iter().zip(fp_rule.clauses.iter()).enumerate()
@@ -966,17 +1019,33 @@ async fn run_program(
                     // Phase B A4 follow-up: the planner inserts
                     // `LocyModelInvoke` between body and `LocyProject`
                     // when the clause has neural invocations.
-                    let mut batches = execute_subplan(
-                        &clause.body,
-                        &params,
-                        &HashMap::new(),
-                        &graph_ctx,
-                        &session_ctx,
-                        &storage,
-                        &schema_info,
-                        None, // Locy clause body is read-only
-                    )
-                    .await?;
+                    let mut batches = if collector.is_some() {
+                        let (b, ops) = execute_subplan_collecting(
+                            &clause.body,
+                            &params,
+                            &HashMap::new(),
+                            &graph_ctx,
+                            &session_ctx,
+                            &storage,
+                            &schema_info,
+                            None, // Locy clause body is read-only
+                        )
+                        .await?;
+                        iter_ops.extend(ops);
+                        b
+                    } else {
+                        execute_subplan(
+                            &clause.body,
+                            &params,
+                            &HashMap::new(),
+                            &graph_ctx,
+                            &session_ctx,
+                            &storage,
+                            &schema_info,
+                            None, // Locy clause body is read-only
+                        )
+                        .await?
+                    };
 
                     // Apply negated IS-ref semantics per-clause.
                     for binding in &fp_clause.is_ref_bindings {
@@ -1110,10 +1179,38 @@ async fn run_program(
                 )
                 .await?;
 
+                // Profiling: record this rule's single non-recursive pass.
+                if let Some(ref c) = collector {
+                    let fact_count: usize = facts.iter().map(|b| b.num_rows()).sum();
+                    c.record(
+                        &rule.name,
+                        0,
+                        fact_count,
+                        rule_start.elapsed().as_secs_f64() * 1000.0,
+                        std::mem::take(&mut iter_ops),
+                    );
+                    c.set_final_facts(&rule.name, fact_count);
+                }
+
                 // Write facts into registry handles for later strata
                 write_facts_to_registry(&registry, &rule.name, &facts);
                 derived_store.insert(rule.name.clone(), facts);
             }
+        }
+
+        // Profiling: assemble this stratum's profile row from the collector.
+        if let Some(c) = collector {
+            let rules = c.into_rules();
+            let iterations = rules.iter().map(|r| r.iterations.len()).max().unwrap_or(0);
+            let facts_derived: usize = rules.iter().map(|r| r.facts).sum();
+            stratum_profiles.push(LocyStratumProfile {
+                index: stratum_idx,
+                recursive: stratum.is_recursive,
+                elapsed_ms: stratum_start.elapsed().as_secs_f64() * 1000.0,
+                iterations,
+                facts_derived,
+                rules,
+            });
         }
 
         // The recursive fixpoint can set the interruption flag mid-stratum (the
@@ -1184,6 +1281,15 @@ async fn run_program(
         })
         .sum();
     *peak_memory_slot.write().unwrap() = peak_bytes;
+
+    // Assemble the full execution profile when profiling was enabled.
+    if profile_enabled && let Ok(mut slot) = profile_slot.write() {
+        *slot = Some(LocyExecProfile {
+            total_elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+            peak_memory_bytes: peak_bytes,
+            strata: std::mem::take(&mut stratum_profiles),
+        });
+    }
 
     // Execute inline Cypher commands via execute_subplan.
     // QUERY is deferred to the orchestrator: the DerivedStore uses inferred types

@@ -212,6 +212,33 @@ impl<'a> LocyBuilder<'a> {
             &compiled,
         ))
     }
+
+    /// Evaluate the program and return the result plus a structured execution
+    /// profile (per-stratum / per-rule / per-iteration timing, fact deltas, and
+    /// per-operator metrics). The Locy analog of Cypher's `query.profile()`.
+    pub async fn profile(self) -> Result<(LocyResult, crate::api::locy_result::LocyProfileOutput)> {
+        let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
+            &self.session.compile_locy(&self.program)?,
+        );
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = crate::api::impl_locy::evaluate_with_db_and_config_capturing(
+            &self.session.db,
+            &self.program,
+            &self.config,
+            self.session.rule_registry(),
+            Some(&capture),
+        )
+        .await?;
+        let profile = capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        Ok((
+            result,
+            crate::api::locy_result::LocyProfileOutput::new(explain, profile),
+        ))
+    }
 }
 
 /// Builder for constructing and evaluating Locy programs (Transaction-level).
@@ -307,5 +334,33 @@ impl<'a> TxLocyBuilder<'a> {
         engine
             .evaluate_with_config(&self.program, &self.config)
             .await
+    }
+
+    /// Evaluate the program and return the result plus a structured execution
+    /// profile. Transaction-level analog of [`LocyBuilder::profile`].
+    pub async fn profile(self) -> Result<(LocyResult, crate::api::locy_result::LocyProfileOutput)> {
+        let engine = crate::api::impl_locy::LocyEngine {
+            db: &self.tx.db,
+            tx_l0_override: Some(self.tx.tx_l0.clone()),
+            locy_l0: Some(self.tx.tx_l0.clone()),
+            collect_derive: false,
+            read_snapshot: self.tx.read_snapshot(),
+        };
+        let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
+            &engine.compile_only(&self.program)?,
+        );
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = engine
+            .evaluate_with_config_capturing(&self.program, &self.config, Some(&capture))
+            .await?;
+        let profile = capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        Ok((
+            result,
+            crate::api::locy_result::LocyProfileOutput::new(explain, profile),
+        ))
     }
 }

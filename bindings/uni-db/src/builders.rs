@@ -1577,6 +1577,44 @@ impl SessionLocyBuilder {
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(convert::locy_explain_to_py_class(result))
     }
+
+    /// Profile the Locy program: run it and return `(result, profile)`.
+    ///
+    /// The Locy analog of `query.profile()` — `profile` is a
+    /// [`LocyProfileOutput`](crate::types::PyLocyProfile) carrying the
+    /// stratum → rule → fixpoint-iteration timing and per-operator metrics.
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyLocyResult, crate::types::PyLocyProfile)> {
+        let session = self.session.borrow(py);
+        let mut builder = session.inner.locy_with(&self.program);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(n) = self.max_iterations {
+            builder = builder.max_iterations(n);
+        }
+        if let Some(ref config) = self.locy_config {
+            builder = builder.with_config(config.clone());
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
+        // Release the GIL across `block_on` (the executor may call back into
+        // Python; see `run`).
+        let (result, profile) = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok((
+            convert::locy_result_to_py_class(py, result)?,
+            convert::locy_profile_to_py_class(profile),
+        ))
+    }
 }
 
 /// Builder for transaction configuration.
@@ -1883,6 +1921,43 @@ impl PyTxLocyBuilder {
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
+    }
+
+    /// Profile the Locy program in this transaction: run it and return
+    /// `(result, profile)`. Transaction-level analog of
+    /// [`SessionLocyBuilder::profile`].
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyLocyResult, crate::types::PyLocyProfile)> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let mut builder = tx.locy_with(&self.program);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(n) = self.max_iterations {
+            builder = builder.max_iterations(n);
+        }
+        if let Some(ref config) = self.locy_config {
+            builder = builder.with_config(config.clone());
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
+        let (result, profile) = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok((
+            convert::locy_result_to_py_class(py, result)?,
+            convert::locy_profile_to_py_class(profile),
+        ))
     }
 }
 

@@ -2318,7 +2318,7 @@ impl PhysicalExpr for ExistsExecExpr {
                         }
                     }
 
-                    let batches = rt.block_on(execute_subplan_with_outer_vars(
+                    let (batches, _plan) = rt.block_on(execute_subplan_with_outer_vars(
                         &logical_plan,
                         &sub_params,
                         &HashMap::new(), // No outer values for EXISTS subquery

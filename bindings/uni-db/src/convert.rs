@@ -1275,6 +1275,15 @@ pub fn locy_explain_to_py_class(
     }
 }
 
+/// Wrap a Rust [`LocyProfileOutput`] in its Python class.
+///
+/// [`LocyProfileOutput`]: uni_db::api::locy_result::LocyProfileOutput
+pub fn locy_profile_to_py_class(
+    output: uni_db::api::locy_result::LocyProfileOutput,
+) -> crate::types::PyLocyProfile {
+    crate::types::PyLocyProfile { inner: output }
+}
+
 /// Extract a CloudStorageConfig from a Python dict.
 ///
 /// The dict must have a `"provider"` key: `"s3"`, `"gcs"`, or `"azure"`.

@@ -20,8 +20,11 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use parking_lot::RwLock;
 
+use uni_common::core::schema::Schema;
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, PatternElement};
-use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput};
+use uni_cypher::locy_ast::{
+    LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput, resolve_yield_column_names,
+};
 use uni_locy::types::{
     CompiledClause, CompiledCommand, CompiledProgram, CompiledRule, Stratum, YieldColumn,
 };
@@ -70,6 +73,38 @@ fn collect_match_node_vars(clause: &CompiledClause, node_vars: &mut HashSet<Stri
     }
 }
 
+/// Map node variables in a clause's MATCH pattern to their first declared label.
+///
+/// Used to resolve a property-access expression's declared type from the graph
+/// schema (e.g. `a.id` where `a` is `(:Node)` → `Node.id`).
+fn clause_var_labels(clause: &CompiledClause) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    for path in &clause.match_pattern.paths {
+        for elem in &path.elements {
+            if let PatternElement::Node(np) = elem
+                && let Some(var) = &np.variable
+                && let Some(label) = np.labels.names().first()
+            {
+                labels.entry(var.clone()).or_insert_with(|| label.clone());
+            }
+        }
+    }
+    labels
+}
+
+/// Resolve the Arrow type of a property access from the graph schema, given the
+/// node variable's label. Returns `None` when the label or property is unknown.
+fn property_arrow_type(
+    schema: &Schema,
+    var_labels: &HashMap<String, String>,
+    var: &str,
+    prop: &str,
+) -> Option<DataType> {
+    let label = var_labels.get(var)?;
+    let meta = schema.properties.get(label)?.get(prop)?;
+    Some(meta.r#type.to_arrow())
+}
+
 /// Infer the Arrow DataType for a yield column based on its expression in the first clause.
 ///
 /// `rule_catalog` lets a yield column that merely forwards a NON-KEY value column
@@ -78,6 +113,11 @@ fn collect_match_node_vars(clause: &CompiledClause, node_vars: &mut HashSet<Stri
 /// Without this, the derived-scan schema of such a rule mis-types the column as
 /// Utf8 while its materialized data carries the true type (Float64/Int64), and a
 /// downstream rule that scans it fails with an Arrow schema mismatch.
+///
+/// `is_key`, `schema`, and `var_labels` let an integer-typed property in a KEY
+/// position keep its `Int64` type instead of being widened to the default
+/// `Float64` (issue #94); `var_labels` describes `first_clause`'s node vars.
+#[allow(clippy::too_many_arguments)]
 fn infer_yield_type(
     name: &str,
     first_clause: &CompiledClause,
@@ -85,6 +125,9 @@ fn infer_yield_type(
     fold_output_names: &HashSet<&str>,
     along_names: &HashSet<&str>,
     rule_catalog: &HashMap<String, CompiledRule>,
+    is_key: bool,
+    schema: &Schema,
+    var_labels: &HashMap<String, String>,
 ) -> DataType {
     let mut visited = HashSet::new();
     infer_yield_type_rec(
@@ -94,6 +137,9 @@ fn infer_yield_type(
         fold_output_names,
         along_names,
         rule_catalog,
+        is_key,
+        schema,
+        var_labels,
         &mut visited,
     )
 }
@@ -106,12 +152,11 @@ fn infer_yield_type_rec(
     fold_output_names: &HashSet<&str>,
     along_names: &HashSet<&str>,
     rule_catalog: &HashMap<String, CompiledRule>,
+    is_key: bool,
+    schema: &Schema,
+    var_labels: &HashMap<String, String>,
     visited: &mut HashSet<String>,
 ) -> DataType {
-    // Node variables → UInt64 (stores VID)
-    if node_vars.contains(name) {
-        return DataType::UInt64;
-    }
     // FOLD outputs — type depends on the aggregate function.
     // COUNT/MCOUNT produce Int64; SUM/MSUM/AVG produce Float64.
     if fold_output_names.contains(name) {
@@ -129,16 +174,20 @@ fn infer_yield_type_rec(
     if along_names.contains(name) {
         return DataType::Float64;
     }
-    // Look at the yield expression from the first clause
+    // Look at the yield expression from the first clause. The UInt64 (node-VID)
+    // shortcut is gated on the expression being a bare node Variable — NOT on the
+    // column name — so a property-access KEY whose name happens to equal a node
+    // var (e.g. `YIELD KEY a.id AS a`) is typed from its property expression
+    // instead of being mis-typed as a VID (issue #94).
     if let RuleOutput::Yield(yc) = &first_clause.output {
-        for item in &yc.items {
-            let item_name = item.alias.clone().unwrap_or_else(|| match &item.expr {
-                Expr::Variable(n) => n.clone(),
-                Expr::Property(_, prop) => prop.clone(),
-                _ => String::new(),
-            });
+        let item_names = resolve_yield_column_names(&yc.items);
+        for (item, item_name) in yc.items.iter().zip(item_names.iter()) {
             if item_name == name {
                 if let Expr::Variable(v) = &item.expr {
+                    // A bare Variable naming a node var is a whole-node KEY → UInt64.
+                    if node_vars.contains(v) {
+                        return DataType::UInt64;
+                    }
                     // A bare Variable referencing an ALONG name → Float64
                     // (ALONG bindings are numeric). Without this,
                     // `ew AS link_weight` would infer Variable("ew") as LargeUtf8.
@@ -149,18 +198,33 @@ fn infer_yield_type_rec(
                     // positive IS-reference: resolve its type from the source rule
                     // rather than defaulting to LargeUtf8.
                     if let Some(dt) =
-                        infer_is_ref_value_col_type(v, first_clause, rule_catalog, visited)
+                        infer_is_ref_value_col_type(v, first_clause, rule_catalog, schema, visited)
                     {
                         return dt;
                     }
+                }
+                // An integer-typed property in a KEY position keeps its Int64
+                // type; the default Property→Float64 rule would otherwise widen
+                // it to a float (issue #94). The `LargeBinary → Int64` decoder
+                // in `coerce_physical_expr` preserves the integer value.
+                if is_key
+                    && let Expr::Property(object, prop) = &item.expr
+                    && let Expr::Variable(var) = object.as_ref()
+                    && property_arrow_type(schema, var_labels, var, prop) == Some(DataType::Int64)
+                {
+                    return DataType::Int64;
                 }
                 return infer_expr_type(&item.expr, node_vars);
             }
         }
     }
-    // No explicit yield item matched (e.g. `YIELD KEY ..., col` where `col` is a
-    // value column forwarded from an IS-ref): resolve from the source rule.
-    if let Some(dt) = infer_is_ref_value_col_type(name, first_clause, rule_catalog, visited) {
+    // No explicit yield item matched. A column named after a node var carries its
+    // VID (UInt64); otherwise try an IS-ref-forwarded value column.
+    if node_vars.contains(name) {
+        return DataType::UInt64;
+    }
+    if let Some(dt) = infer_is_ref_value_col_type(name, first_clause, rule_catalog, schema, visited)
+    {
         return dt;
     }
     DataType::LargeUtf8
@@ -174,6 +238,7 @@ fn infer_is_ref_value_col_type(
     col: &str,
     clause: &CompiledClause,
     rule_catalog: &HashMap<String, CompiledRule>,
+    schema: &Schema,
     visited: &mut HashSet<String>,
 ) -> Option<DataType> {
     for cond in &clause.where_conditions {
@@ -203,6 +268,8 @@ fn infer_is_ref_value_col_type(
         let src_node_vars = collect_node_vars(&rule.clauses);
         let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
         let src_along: HashSet<&str> = src_clause.along.iter().map(|a| a.name.as_str()).collect();
+        let src_var_labels = clause_var_labels(src_clause);
+        // Forwarded columns are NON-KEY (filtered above), so `is_key = false`.
         return Some(infer_yield_type_rec(
             col,
             src_clause,
@@ -210,6 +277,9 @@ fn infer_is_ref_value_col_type(
             &src_fold,
             &src_along,
             rule_catalog,
+            false,
+            schema,
+            &src_var_labels,
             visited,
         ));
     }
@@ -745,6 +815,8 @@ impl<'a> LocyPlanBuilder<'a> {
         let along_names: HashSet<&str> = first_clause
             .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
             .unwrap_or_default();
+        let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
+        let graph_schema = self.planner.schema();
 
         let yield_schema: Vec<LocyYieldColumn> = rule
             .yield_schema
@@ -758,6 +830,9 @@ impl<'a> LocyPlanBuilder<'a> {
                         &fold_output_names,
                         &along_names,
                         rule_catalog,
+                        yc.is_key,
+                        graph_schema,
+                        &var_labels,
                     ),
                     None => DataType::LargeUtf8,
                 };
@@ -1176,17 +1251,10 @@ impl<'a> LocyPlanBuilder<'a> {
         // This preserves literals (`'low' AS label`) and property accesses
         // (`e.cost AS cost`) that would otherwise be lost as bare Variable lookups.
         let yield_expr_map: HashMap<String, &Expr> = match &clause.output {
-            RuleOutput::Yield(yc) => yc
-                .items
-                .iter()
-                .map(|item| {
-                    let name = item.alias.clone().unwrap_or_else(|| match &item.expr {
-                        Expr::Variable(n) => n.clone(),
-                        Expr::Property(_, prop) => prop.clone(),
-                        _ => "?".to_string(),
-                    });
-                    (name, &item.expr)
-                })
+            RuleOutput::Yield(yc) => resolve_yield_column_names(&yc.items)
+                .into_iter()
+                .zip(yc.items.iter())
+                .map(|(name, item)| (name, &item.expr))
                 .collect(),
             _ => HashMap::new(),
         };
@@ -1205,6 +1273,8 @@ impl<'a> LocyPlanBuilder<'a> {
 
         let mut projections = Vec::new();
         let mut target_types = Vec::new();
+        let var_labels = clause_var_labels(clause);
+        let graph_schema = self.planner.schema();
         for yc in yield_cols {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
                 rewrite_locy_expr(locy_expr)?
@@ -1241,6 +1311,9 @@ impl<'a> LocyPlanBuilder<'a> {
                 &fold_output_names,
                 &along_names_set,
                 rule_catalog,
+                yc.is_key,
+                graph_schema,
+                &var_labels,
             ));
         }
 
@@ -1400,7 +1473,8 @@ impl<'a> LocyPlanBuilder<'a> {
         }
 
         let scan_index = handles.len();
-        let schema = yield_schema_to_arrow_from_rule(target_rule, rule_catalog);
+        let schema =
+            yield_schema_to_arrow_from_rule(target_rule, rule_catalog, self.planner.schema());
         let data = Arc::new(RwLock::new(Vec::new()));
         let handle = DerivedScanHandle {
             rule_name: rule_name.to_string(),
@@ -1790,6 +1864,7 @@ pub(crate) fn locy_op_to_cypher_op(op: &LocyBinaryOp) -> BinaryOp {
 fn yield_schema_to_arrow_from_rule(
     target_rule: &CompiledRule,
     rule_catalog: &HashMap<String, CompiledRule>,
+    schema: &Schema,
 ) -> SchemaRef {
     let target_node_vars = collect_node_vars(&target_rule.clauses);
     let first_clause = target_rule.clauses.first();
@@ -1799,6 +1874,7 @@ fn yield_schema_to_arrow_from_rule(
     let along_names: HashSet<&str> = first_clause
         .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
         .unwrap_or_default();
+    let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
 
     let fields: Vec<Field> = target_rule
         .yield_schema
@@ -1812,6 +1888,9 @@ fn yield_schema_to_arrow_from_rule(
                     &fold_names,
                     &along_names,
                     rule_catalog,
+                    yc.is_key,
+                    schema,
+                    &var_labels,
                 ),
                 None => DataType::LargeUtf8,
             };

@@ -2502,6 +2502,11 @@ impl QueryPlanner {
         }
     }
 
+    /// Graph schema this planner resolves labels and property types against.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Record the parameters referenced by a successfully-folded `LIMIT`/`SKIP`
     /// expression so the caller's plan cache can key on their values.
     fn note_folded_limit_skip(&self, expr: &Expr) {

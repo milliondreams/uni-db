@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, Expr};
-use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput};
+use uni_cypher::locy_ast::{
+    LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput, resolve_yield_column_names,
+};
 use uni_locy::types::{CompiledClause, CompiledRule};
 use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
@@ -384,15 +386,16 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
         return raw_rows;
     }
 
+    // De-collided output names, shared with the type checker and planner so the
+    // SLG resolver's column names match the rule's yield schema.
+    let names = resolve_yield_column_names(yield_items);
+
     raw_rows
         .into_iter()
         .map(|raw_row| {
             let mut projected = FactRow::new();
-            for item in yield_items {
-                let name = item
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| expr_name_for_yield(&item.expr));
+            for (item, name) in yield_items.iter().zip(names.iter()) {
+                let name = name.clone();
 
                 if item.is_key {
                     // KEY columns: copy from raw row (node/edge variables)
@@ -446,15 +449,6 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
             projected
         })
         .collect()
-}
-
-/// Derive a column name from a YIELD expression (mirrors typecheck.rs `expr_name`).
-fn expr_name_for_yield(expr: &Expr) -> String {
-    match expr {
-        Expr::Variable(name) => name.clone(),
-        Expr::Property(_, prop) => prop.clone(),
-        _ => "?".to_string(),
-    }
 }
 
 /// Store resolved facts into derived_store (free function to avoid borrow conflicts).

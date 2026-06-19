@@ -200,6 +200,89 @@ pub struct LocyYieldItem {
     pub alias: Option<String>,
 }
 
+/// Default output column name for a YIELD expression (before de-collision).
+///
+/// A bare variable yields its own name, a property access yields the bare
+/// property name (e.g. `a.id` → `id`), and anything else yields `"?"`.
+///
+/// # Examples
+///
+/// ```
+/// use uni_cypher::ast::Expr;
+/// use uni_cypher::locy_ast::default_yield_name;
+///
+/// let var = Expr::Variable("a".to_string());
+/// assert_eq!(default_yield_name(&var), "a");
+/// ```
+pub fn default_yield_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(name) => name.clone(),
+        Expr::Property(_, prop) => prop.clone(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Resolve the output column name for each YIELD item, de-colliding clashes.
+///
+/// Each item's default name is its alias if present, otherwise
+/// [`default_yield_name`]. When two or more un-aliased property accesses would
+/// collapse onto the same bare property name (e.g. `KEY a.id, KEY b.id` both
+/// defaulting to `id`), the colliding ones are qualified as `<var>_<prop>`
+/// (e.g. `a_id`, `b_id`). Explicit aliases always win and are never rewritten,
+/// and non-colliding names are returned unchanged.
+///
+/// This is the single source of truth for YIELD column naming; the type
+/// checker, planner, and SLG resolver all call it so their column names agree
+/// (the names double as the fixpoint join keys).
+///
+/// # Examples
+///
+/// ```
+/// use uni_cypher::ast::Expr;
+/// use uni_cypher::locy_ast::{resolve_yield_column_names, LocyYieldItem};
+///
+/// let prop = |var: &str| LocyYieldItem {
+///     is_key: true,
+///     is_prob: false,
+///     expr: Expr::Property(Box::new(Expr::Variable(var.to_string())), "id".to_string()),
+///     alias: None,
+/// };
+/// let names = resolve_yield_column_names(&[prop("a"), prop("b")]);
+/// assert_eq!(names, vec!["a_id".to_string(), "b_id".to_string()]);
+/// ```
+pub fn resolve_yield_column_names(items: &[LocyYieldItem]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let base: Vec<String> = items
+        .iter()
+        .map(|item| {
+            item.alias
+                .clone()
+                .unwrap_or_else(|| default_yield_name(&item.expr))
+        })
+        .collect();
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for name in &base {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    base.iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let item = &items[i];
+            if item.alias.is_none()
+                && counts.get(name.as_str()).copied().unwrap_or(0) > 1
+                && let Expr::Property(object, prop) = &item.expr
+                && let Expr::Variable(var) = object.as_ref()
+            {
+                return format!("{var}_{prop}");
+            }
+            name.clone()
+        })
+        .collect()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DERIVE (graph derivation in rule heads)
 // ═══════════════════════════════════════════════════════════════════════════

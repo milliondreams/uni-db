@@ -34,7 +34,7 @@ use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     arrow_err, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
-use crate::query::df_graph::scan::resolve_property_type;
+use crate::query::df_graph::scan::{property_field, resolve_property_type};
 
 /// Maps a user-provided yield name to a canonical name.
 ///
@@ -139,7 +139,11 @@ fn expand_node_yield_fields(
                         .map(|_| resolve_property_type(prop_name, Some(label_props)))
                 })
                 .unwrap_or(arrow_type);
-            fields.push(Field::new(&col_name, resolved_type, true));
+            let uni_type = uni_schema
+                .properties
+                .values()
+                .find_map(|label_props| label_props.get(prop_name.as_str()).map(|m| &m.r#type));
+            fields.push(property_field(&col_name, resolved_type, uni_type));
         }
     }
 }

@@ -37,7 +37,7 @@ use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
-use crate::query::df_graph::scan::resolve_property_type;
+use crate::query::df_graph::scan::{property_field, resolve_property_type};
 
 /// Vector-retrieval source for a [`GraphVectorKnnExec`].
 ///
@@ -258,7 +258,10 @@ impl GraphVectorKnnExec {
         for prop_name in target_properties {
             let col_name = format!("{}.{}", variable, prop_name);
             let arrow_type = resolve_property_type(prop_name, label_props);
-            fields.push(Field::new(&col_name, arrow_type, true));
+            let uni_type = label_props
+                .and_then(|p| p.get(prop_name))
+                .map(|m| &m.r#type);
+            fields.push(property_field(&col_name, arrow_type, uni_type));
         }
 
         Arc::new(Schema::new(fields))

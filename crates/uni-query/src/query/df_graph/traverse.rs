@@ -38,7 +38,9 @@ use crate::query::df_graph::common::{
 };
 use crate::query::df_graph::nfa::{NfaStateId, PathNfa, PathSelector, VlpOutputMode};
 use crate::query::df_graph::pred_dag::PredecessorDag;
-use crate::query::df_graph::scan::{build_property_column_static, resolve_property_type};
+use crate::query::df_graph::scan::{
+    build_property_column_static, property_field, resolve_property_type,
+};
 use arrow::compute::take;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -395,7 +397,10 @@ impl GraphTraverseExec {
         for prop_name in target_properties {
             let col_name = format!("{}.{}", target_variable, prop_name);
             let arrow_type = resolve_property_type(prop_name, label_props);
-            fields.push(Field::new(&col_name, arrow_type, true));
+            let uni_type = label_props
+                .and_then(|p| p.get(prop_name))
+                .map(|m| &m.r#type);
+            fields.push(property_field(&col_name, arrow_type, uni_type));
         }
 
         // Add edge ID column if edge variable is bound
@@ -414,7 +419,8 @@ impl GraphTraverseExec {
             for prop_name in edge_properties {
                 let prop_col_name = format!("{}.{}", edge_var, prop_name);
                 let arrow_type = resolve_edge_property_type(prop_name, edge_props);
-                fields.push(Field::new(&prop_col_name, arrow_type, true));
+                let uni_type = edge_props.and_then(|p| p.get(prop_name)).map(|m| &m.r#type);
+                fields.push(property_field(&prop_col_name, arrow_type, uni_type));
             }
         } else {
             // Add internal edge ID column for relationship uniqueness tracking
@@ -2829,7 +2835,10 @@ impl GraphVariableLengthTraverseExec {
             let col_name = format!("{}.{}", target_variable, prop_name);
             if input_schema.column_with_name(&col_name).is_none() {
                 let arrow_type = resolve_property_type(prop_name, label_props);
-                fields.push(Field::new(&col_name, arrow_type, true));
+                let uni_type = label_props
+                    .and_then(|p| p.get(prop_name))
+                    .map(|m| &m.r#type);
+                fields.push(property_field(&col_name, arrow_type, uni_type));
             }
         }
 

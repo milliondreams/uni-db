@@ -3566,6 +3566,54 @@ impl AsyncSessionLocyBuilder {
             Ok(convert::locy_explain_to_py_class(result))
         })
     }
+
+    /// Profile the Locy program: returns an awaitable `(LocyResult, profile)`.
+    ///
+    /// Async analog of the sync `SessionLocyBuilder.profile()` and the read-path
+    /// `AsyncSessionQueryBuilder.profile()`.
+    fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = convert::convert_params_ref(py, &self.params)?;
+        let inner = self.inner.clone();
+        let program = self.program.clone();
+        let timeout_secs = self.timeout_secs;
+        let max_iterations = self.max_iterations;
+        let locy_config = self.locy_config.clone();
+        let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
+        // Locy future is !Send — use spawn_blocking
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (result, profile) = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let guard = inner.lock().await;
+                    let mut builder = guard.locy_with(&program);
+                    for (k, v) in rust_params {
+                        builder = builder.param(k, v);
+                    }
+                    if let Some(t) = timeout_secs {
+                        builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+                    }
+                    if let Some(n) = max_iterations {
+                        builder = builder.max_iterations(n);
+                    }
+                    if let Some(c) = locy_config {
+                        builder = builder.with_config(c);
+                    }
+                    if let Some(ct) = cancel_token {
+                        builder = builder.cancellation_token(ct);
+                    }
+                    builder.profile().await
+                })
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                let locy_result = convert::locy_result_to_py_class(py, result)?;
+                let profile_output = convert::locy_profile_to_py_class(profile);
+                let tuple = (locy_result, profile_output);
+                tuple.into_py_any(py)
+            })
+        })
+    }
 }
 
 // ============================================================================
@@ -3884,6 +3932,56 @@ impl AsyncTxLocyBuilder {
             .await
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
             Python::attach(|py| convert::locy_result_to_py_class(py, result))
+        })
+    }
+
+    /// Profile the Locy program: returns an awaitable `(LocyResult, profile)`.
+    ///
+    /// Async analog of the sync `TxLocyBuilder.profile()`.
+    fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = convert::convert_params_ref(py, &self.params)?;
+        let inner = self.inner.clone();
+        let program = self.program.clone();
+        let timeout_secs = self.timeout_secs;
+        let max_iterations = self.max_iterations;
+        let locy_config = self.locy_config.clone();
+        let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
+        // Locy future is !Send — use spawn_blocking
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (result, profile) = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let guard = inner.lock().await;
+                    let tx = active_tx(&guard)?;
+                    let mut builder = tx.locy_with(&program);
+                    for (k, v) in rust_params {
+                        builder = builder.param(k, v);
+                    }
+                    if let Some(t) = timeout_secs {
+                        builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+                    }
+                    if let Some(n) = max_iterations {
+                        builder = builder.max_iterations(n);
+                    }
+                    if let Some(c) = locy_config {
+                        builder = builder.with_config(c);
+                    }
+                    if let Some(ct) = cancel_token {
+                        builder = builder.cancellation_token(ct);
+                    }
+                    builder
+                        .profile()
+                        .await
+                        .map_err(crate::exceptions::uni_error_to_pyerr)
+                })
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
+            Python::attach(|py| {
+                let locy_result = convert::locy_result_to_py_class(py, result)?;
+                let profile_output = convert::locy_profile_to_py_class(profile);
+                let tuple = (locy_result, profile_output);
+                tuple.into_py_any(py)
+            })
         })
     }
 }

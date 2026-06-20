@@ -430,7 +430,9 @@ def test_fork_with_block_tx_unflushed():
     tx.commit()
 
     fork = s.fork("scn").build()
-    assert _count(fork) == 2, "fork must inherit both with-block and raw unflushed writes"
+    assert _count(fork) == 2, (
+        "fork must inherit both with-block and raw unflushed writes"
+    )
 
     del fork
     db.drop_fork("scn")

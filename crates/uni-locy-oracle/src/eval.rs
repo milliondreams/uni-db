@@ -1,6 +1,6 @@
 //! The naive Datalog fixpoint evaluator — the reference the engine must match.
 //!
-//! Evaluates an [`OracleProgram`](crate::ir::OracleProgram) stratum by stratum,
+//! Evaluates an [`OracleProgram`] stratum by stratum,
 //! re-deriving every clause to a least fixpoint with structural set semantics.
 //! Unoptimized and obviously correct by construction; that is the whole point.
 //!

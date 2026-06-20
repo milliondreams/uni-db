@@ -932,7 +932,7 @@ pub async fn execute_subplan(
 /// Used by the Locy `profile()` path to capture a Cypher-style operator tree
 /// ([`OperatorStats`]) for each rule clause body, per fixpoint iteration. The
 /// metrics are read from the plan's `BaselineMetrics` after execution via
-/// [`collect_plan_metrics`], so this MUST run the plan to completion first
+/// `collect_plan_metrics`, so this MUST run the plan to completion first
 /// (which it does, like `execute_subplan`). The non-profiled path calls
 /// [`execute_subplan`] instead and pays nothing.
 #[expect(

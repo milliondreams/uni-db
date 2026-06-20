@@ -19,16 +19,23 @@ mod algo;
 mod bugs;
 #[path = "common/crdt/mod.rs"]
 mod crdt;
+// Order-insensitive row-bag comparator shared by the metamorphic oracles.
 #[path = "common/cypher_path/mod.rs"]
 mod cypher_path;
 #[path = "common/cypher_read/mod.rs"]
 mod cypher_read;
 #[path = "common/cypher_write/mod.rs"]
 mod cypher_write;
+#[path = "common/diff/mod.rs"]
+mod diff;
 #[path = "common/e2e/mod.rs"]
 mod e2e;
 #[path = "common/fork/mod.rs"]
 mod fork;
+// Metamorphic query-correctness oracles (G2 / Track B): query generator +
+// renderer (`querygen`) and the TLP/NoREC oracles + seed (`metamorphic`), plus
+// the shared order-insensitive row-bag comparator (`diff`) they depend on.
+// (`gen` is a reserved keyword in edition 2024, hence `querygen`.)
 #[path = "common/hybrid_localstack_e2e.rs"]
 mod hybrid_localstack_e2e;
 #[path = "common/index/mod.rs"]
@@ -37,8 +44,12 @@ mod index;
 mod l0_snapshot_e2e;
 #[path = "common/locy/mod.rs"]
 mod locy;
+#[path = "common/metamorphic/mod.rs"]
+mod metamorphic;
 #[path = "common/perf/mod.rs"]
 mod perf;
+#[path = "common/querygen/mod.rs"]
+mod querygen;
 #[path = "common/runtime/mod.rs"]
 mod runtime;
 #[path = "common/session_tx/mod.rs"]

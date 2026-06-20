@@ -153,6 +153,43 @@ jobs:
           LOOM_MAX_PREEMPTIONS: 2
         run: cargo nextest run -p uni-store --features loom --test occ_model
 
+  # Metamorphic query-correctness smoke — the TLP + NoREC oracles
+  # (crates/uni/tests/common/metamorphic/) at a small case budget, catching
+  # silent-wrong-answer regressions (pushdown drops, three-valued-logic bugs) on
+  # the PR that introduces them. The high-volume soak runs nightly
+  # (nightly.yml metamorphic). Only the non-ignored smoke tests run here.
+  metamorphic-smoke:
+    name: Metamorphic Query Oracles (smoke)
+    runs-on: ubuntu-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      # Runs the non-ignored smoke tier; METAMORPHIC_CASES governs the per-test
+      # case count (default 64). The targeted teeth/non-vacuity tests run too.
+      - name: Metamorphic smoke (TLP + NoREC)
+        env:
+          METAMORPHIC_CASES: 64
+        run: |
+          cargo nextest run -p uni-db --test integration \
+            -E 'test(/metamorphic::/) and not test(soak)'
+
   # openCypher conformance on PRs — the schemaless lane only (the fast,
   # representative mode). The sidecar mode and the Locy TCK lanes run on the
   # main-push CI (ci.yml). Without this, a PR breaking Cypher conformance lands

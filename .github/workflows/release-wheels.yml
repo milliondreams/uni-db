@@ -803,8 +803,15 @@ jobs:
     needs: [validate, build-pydantic]
     runs-on: ubuntu-latest
     environment: testpypi
+    # `build-pydantic` survives the skipped mutually-exclusive wheel-publish
+    # sibling (publish-pypi/publish-testpypi) only via `always()`. That skip
+    # still propagates transitively down the needs graph, so this job must
+    # ALSO override skip-propagation with a status-check function or it is
+    # skipped before its custom gate is evaluated. `!cancelled()` + the
+    # explicit `result == 'success'` gate publishes only on a clean success.
     if: |
-      needs.build-pydantic.result == 'success'
+      !cancelled()
+      && needs.build-pydantic.result == 'success'
       && needs.validate.outputs.publish_target == 'testpypi'
     steps:
       - name: Download pydantic dist
@@ -826,8 +833,15 @@ jobs:
     needs: [validate, build-pydantic]
     runs-on: ubuntu-latest
     environment: pypi
+    # See publish-pydantic-testpypi: `build-pydantic` runs past the skipped
+    # mutually-exclusive wheel-publish sibling via `always()`, but that skip
+    # propagates transitively, so this job must override skip-propagation with
+    # a status-check function (`!cancelled()`) or it is skipped despite a
+    # successful build. The `result == 'success'` gate keeps publishing
+    # conditional on a clean build.
     if: |
-      needs.build-pydantic.result == 'success'
+      !cancelled()
+      && needs.build-pydantic.result == 'success'
       && needs.validate.outputs.publish_target == 'pypi'
     steps:
       - name: Download pydantic dist

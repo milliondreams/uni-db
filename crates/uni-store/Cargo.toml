@@ -19,6 +19,15 @@ lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linal
 # a crash at a precise point. No-op and zero-cost unless enabled. The `fail`
 # crate is always linked but its macros expand to `{}` without this feature.
 failpoints = ["fail/failpoints"]
+# Test-only concurrency model checking of the OCC commit core (`runtime/occ.rs`
+# via the `runtime/sync.rs` shim). Each pulls its optional model checker and swaps
+# the shim to that tool's instrumented primitives. Gated as features (not a global
+# `--cfg loom`) so the instrumentation never leaks into dependencies — loom-aware
+# crates like `concurrent-queue` must NOT see `cfg(loom)`. Run ONLY
+# `--test occ_model` with these: the rest of the suite drives real `Writer`s whose
+# loom atomics would panic outside a model.
+loom = ["dep:loom"]
+shuttle = ["dep:shuttle"]
 
 [dependencies]
 uni-common = { workspace = true }
@@ -64,6 +73,11 @@ tokio-util = { workspace = true }
 # Commit-path fault injection for crash-recovery tests. Macros are no-ops (and
 # the crate links to nothing measurable) unless the `failpoints` feature is on.
 fail = "0.5"
+
+# OCC model checkers — optional, pulled only by the `loom`/`shuttle` features, so
+# default builds never compile them. See the feature docs above.
+loom = { version = "0.7", optional = true }
+shuttle = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

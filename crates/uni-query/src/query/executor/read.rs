@@ -774,15 +774,25 @@ impl Executor {
 
                 for (col_idx, field) in schema.fields().iter().enumerate() {
                     let column = batch.column(col_idx);
-                    // Infer Uni DataType from Arrow type for DateTime/Time struct decoding
-                    let data_type =
-                        if uni_common::core::schema::is_datetime_struct(field.data_type()) {
-                            Some(&uni_common::DataType::DateTime)
-                        } else if uni_common::core::schema::is_time_struct(field.data_type()) {
-                            Some(&uni_common::DataType::Time)
-                        } else {
-                            None
-                        };
+                    // Recover the Uni DataType so LargeBinary/struct columns decode
+                    // correctly. Raw `Bytes` columns are tagged with `uni_raw_bytes` at
+                    // scan time (scan.rs `property_field`) because `Bytes`, `CypherValue`,
+                    // and `Duration` all map to Arrow `LargeBinary` and are otherwise
+                    // indistinguishable here; without this hint a raw `Bytes` value would
+                    // be run through the CypherValue codec and corrupted (issue #93).
+                    let data_type = if field
+                        .metadata()
+                        .get("uni_raw_bytes")
+                        .is_some_and(|v| v == "true")
+                    {
+                        Some(&uni_common::DataType::Bytes)
+                    } else if uni_common::core::schema::is_datetime_struct(field.data_type()) {
+                        Some(&uni_common::DataType::DateTime)
+                    } else if uni_common::core::schema::is_time_struct(field.data_type()) {
+                        Some(&uni_common::DataType::Time)
+                    } else {
+                        None
+                    };
                     let mut value =
                         arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type);
 

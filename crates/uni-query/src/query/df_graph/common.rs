@@ -27,6 +27,7 @@ use super::procedure_call::map_yield_to_canonical;
 use super::unwind::arrow_to_json_value;
 use crate::query::df_graph::MutationContext;
 use crate::query::df_planner::HybridPhysicalPlanner;
+use crate::query::executor::core::{OperatorStats, collect_plan_metrics};
 use crate::query::planner::LogicalPlan;
 
 /// Convert an `ArrowError` into a `DataFusionError`.
@@ -910,7 +911,7 @@ pub async fn execute_subplan(
     schema_info: &Arc<UniSchema>,
     mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<Vec<RecordBatch>> {
-    execute_subplan_with_outer_vars(
+    let (batches, _plan) = execute_subplan_with_outer_vars(
         plan,
         params,
         outer_values,
@@ -921,7 +922,47 @@ pub async fn execute_subplan(
         &std::collections::HashSet::new(),
         mutation_ctx,
     )
-    .await
+    .await?;
+    Ok(batches)
+}
+
+/// Like [`execute_subplan`], but also returns the per-operator metrics of the
+/// clause-body physical plan for profiling.
+///
+/// Used by the Locy `profile()` path to capture a Cypher-style operator tree
+/// ([`OperatorStats`]) for each rule clause body, per fixpoint iteration. The
+/// metrics are read from the plan's `BaselineMetrics` after execution via
+/// `collect_plan_metrics`, so this MUST run the plan to completion first
+/// (which it does, like `execute_subplan`). The non-profiled path calls
+/// [`execute_subplan`] instead and pays nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors execute_subplan's parameter list; profiling adds only the return value"
+)]
+pub async fn execute_subplan_collecting(
+    plan: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    outer_values: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
+) -> DFResult<(Vec<RecordBatch>, Vec<OperatorStats>)> {
+    let (batches, plan) = execute_subplan_with_outer_vars(
+        plan,
+        params,
+        outer_values,
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+        &std::collections::HashSet::new(),
+        mutation_ctx,
+    )
+    .await?;
+    let operators = collect_plan_metrics(&plan);
+    Ok((batches, operators))
 }
 
 #[expect(
@@ -943,7 +984,10 @@ pub async fn execute_subplan_with_outer_vars(
     schema_info: &Arc<UniSchema>,
     outer_entity_vars: &std::collections::HashSet<String>,
     mutation_ctx: Option<&Arc<MutationContext>>,
-) -> DFResult<Vec<RecordBatch>> {
+) -> DFResult<(
+    Vec<RecordBatch>,
+    Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+)> {
     let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
         storage.clone(),
@@ -981,7 +1025,7 @@ pub async fn execute_subplan_with_outer_vars(
     let task_ctx = session_ctx.read().task_ctx();
     let all_batches = collect_all_partitions(&execution_plan, task_ctx).await?;
 
-    Ok(all_batches)
+    Ok((all_batches, execution_plan))
 }
 
 /// Extract a single row from a RecordBatch as a HashMap of column name → Value.

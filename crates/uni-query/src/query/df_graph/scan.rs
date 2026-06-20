@@ -408,11 +408,11 @@ impl GraphScanExec {
 
         for prop in properties {
             let col_name = format!("{}.{}", variable, prop);
-            let arrow_type = merged
-                .get(prop.as_str())
-                .map(|meta| meta.r#type.to_arrow())
+            let uni_type = merged.get(prop.as_str()).map(|meta| &meta.r#type);
+            let arrow_type = uni_type
+                .map(|t| t.to_arrow())
                 .unwrap_or(DataType::LargeBinary);
-            fields.push(Field::new(&col_name, arrow_type, true));
+            fields.push(property_field(&col_name, arrow_type, uni_type));
         }
 
         Arc::new(Schema::new(fields))
@@ -470,7 +470,10 @@ impl GraphScanExec {
         for prop in properties {
             let col_name = format!("{}.{}", variable, prop);
             let arrow_type = resolve_property_type(prop, label_props);
-            fields.push(Field::new(&col_name, arrow_type, true));
+            let uni_type = label_props
+                .and_then(|props| props.get(prop))
+                .map(|m| &m.r#type);
+            fields.push(property_field(&col_name, arrow_type, uni_type));
         }
         Arc::new(Schema::new(fields))
     }
@@ -491,7 +494,10 @@ impl GraphScanExec {
         for prop in properties {
             let col_name = format!("{}.{}", variable, prop);
             let arrow_type = resolve_property_type(prop, edge_props);
-            fields.push(Field::new(&col_name, arrow_type, true));
+            let uni_type = edge_props
+                .and_then(|props| props.get(prop))
+                .map(|m| &m.r#type);
+            fields.push(property_field(&col_name, arrow_type, uni_type));
         }
         Arc::new(Schema::new(fields))
     }
@@ -688,6 +694,30 @@ pub(crate) fn resolve_property_type(
             .and_then(|props| props.get(prop))
             .map(|meta| meta.r#type.to_arrow())
             .unwrap_or(DataType::LargeBinary)
+    }
+}
+
+/// Build a scan-output `Field`, tagging raw `Bytes` columns for the final read.
+///
+/// `DataType::Bytes`, `DataType::CypherValue`, and `DataType::Duration` all map to Arrow
+/// `LargeBinary`, but only `Bytes` stores raw (un-codec'd) bytes. The projection read
+/// (`record_batches_to_rows`) cannot tell them apart from the Arrow type alone, so it
+/// would decode a raw `Bytes` column with the CypherValue MessagePack codec and corrupt
+/// it. Stamping `uni_raw_bytes=true` lets the read route the column to the raw-bytes
+/// branch of `arrow_to_value` instead.
+pub(crate) fn property_field(
+    col_name: &str,
+    arrow_type: DataType,
+    uni_type: Option<&uni_common::DataType>,
+) -> Field {
+    let field = Field::new(col_name, arrow_type, true);
+    if matches!(uni_type, Some(uni_common::DataType::Bytes)) {
+        field.with_metadata(std::collections::HashMap::from([(
+            "uni_raw_bytes".to_string(),
+            "true".to_string(),
+        )]))
+    } else {
+        field
     }
 }
 

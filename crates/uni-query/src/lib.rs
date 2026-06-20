@@ -27,6 +27,9 @@ pub mod projection_store;
 pub mod query;
 pub mod types;
 
+pub use query::df_graph::locy_profile::{
+    LocyExecProfile, LocyIterationProfile, LocyRuleProfile, LocyStratumProfile,
+};
 pub use query::executor::core::{OperatorStats, ProfileOutput};
 pub use query::executor::procedure::{
     ProcedureOutput, ProcedureParam, ProcedureRegistry, ProcedureValueType, RegisteredProcedure,

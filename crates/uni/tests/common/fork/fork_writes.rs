@@ -115,3 +115,45 @@ async fn fork_and_primary_writes_remain_isolated_under_interleaving() -> Result<
     db.shutdown().await?;
     Ok(())
 }
+
+/// #97 regression: a scoped-then-committed transaction (the Rust
+/// analogue of Python's `with s.tx() as tx: ...; tx.commit()`) leaves
+/// its writes in L0 just like a straight-line `tx().commit()`. Forking
+/// without an intervening flush must still inherit those writes. This
+/// covers the "with-block tx" variant called out in the issue.
+#[tokio::test]
+async fn with_block_tx_unflushed_fork_visibility() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+
+    let session = db.session();
+
+    // Scoped transaction: the tx handle is created, used, committed, and
+    // dropped inside this block. No db.flush() is issued.
+    {
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Scoped'})").await?;
+        tx.commit().await?;
+    }
+
+    let fork = session.fork("scn").await?;
+    let names: Vec<String> = fork
+        .query("MATCH (p:Person) RETURN p.name")
+        .await?
+        .rows()
+        .iter()
+        .filter_map(|r| r.get::<String>("p.name").ok())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Scoped".to_string()],
+        "fork must inherit the scoped-tx unflushed write; got {names:?}"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

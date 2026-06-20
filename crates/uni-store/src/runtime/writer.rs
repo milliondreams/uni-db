@@ -189,7 +189,10 @@ pub struct Writer {
     /// current value at begin as its read sequence (`L0Buffer::occ_read_seq`).
     ///
     /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
-    commit_sequence: Arc<AtomicU64>,
+    ///
+    /// Typed through the [`crate::runtime::sync`] shim so the OCC commit core can
+    /// be model-checked under loom/shuttle; aliases to `std::AtomicU64` normally.
+    commit_sequence: Arc<crate::runtime::sync::AtomicU64>,
     /// Bounded log of recently-committed write-sets for OCC conflict detection.
     /// Read and updated only under `flush_lock`.
     ///
@@ -296,7 +299,7 @@ impl Writer {
             None
         };
 
-        let commit_sequence = Arc::new(AtomicU64::new(0));
+        let commit_sequence = Arc::new(crate::runtime::sync::AtomicU64::new(0));
         let committed_writes = Arc::new(PlMutex::new(crate::runtime::occ::CommitRegistry::new(
             OCC_REGISTRY_CAPACITY,
         )));
@@ -364,7 +367,8 @@ impl Writer {
     /// fresh transaction's `occ_read_seq` to this so its conflict-detection
     /// baseline advances to lock-acquisition time (read-latest under the lock).
     pub fn current_commit_sequence(&self) -> u64 {
-        self.commit_sequence.load(Ordering::Relaxed)
+        self.commit_sequence
+            .load(crate::runtime::sync::Ordering::Relaxed)
     }
 
     /// Build a fresh `SharedFlushCtx` from this Writer's current state.
@@ -557,7 +561,9 @@ impl Writer {
         // read-set recording / commit validation self-gates to a no-op.
         let buf = if self.config.ssi_enabled {
             let mut buf = buf;
-            buf.occ_read_seq = self.commit_sequence.load(Ordering::Relaxed);
+            buf.occ_read_seq = self
+                .commit_sequence
+                .load(crate::runtime::sync::Ordering::Relaxed);
             // The read path records observed ids here for SSI antidependency
             // detection; commit consults it.
             buf.occ_read_set = Some(Arc::new(parking_lot::Mutex::new(
@@ -1089,8 +1095,11 @@ impl Writer {
         if let Some(write_set) = occ_write_set
             && !write_set.is_empty()
         {
-            let seq = self.commit_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-            self.committed_writes.lock().record(seq, write_set);
+            // Bump-then-record via the shared OCC seam (see `CommitRegistry::commit`)
+            // so production and the loom/shuttle models exercise identical logic.
+            self.committed_writes
+                .lock()
+                .commit(&self.commit_sequence, write_set);
         }
 
         self.update_metrics();

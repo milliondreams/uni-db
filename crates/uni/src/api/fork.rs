@@ -184,18 +184,28 @@ async fn create_fork_2pc(
     name: String,
     ttl: Option<Duration>,
 ) -> Result<ForkInfo> {
-    // Phase 3: when the parent is a forked session, flush its L0 to
-    // the fork's Lance branches before branching. Without this the
-    // child branches off a stale Lance tip and never sees the
-    // parent's L0-buffered writes through `base_paths`. Primary's
-    // case is handled by user convention (`db.flush()` before
-    // forking) — we apply the convention automatically for nested
-    // forks because there is no caller-friendly way to flush a fork
-    // (`Session::flush()` exists, but expecting every nested-fork
-    // call site to invoke it would surprise users).
-    if parent.is_forked()
-        && let Some(writer_lock) = &parent.db.writer
-    {
+    // Materialize the fork point. A fork branches off concrete Lance
+    // dataset versions and resolves reads through `base_paths`; it never
+    // consults the parent's in-memory L0 buffer. Any writes the parent
+    // committed but has not flushed (L0) are therefore invisible to the
+    // child unless we flush them to L1 (Lance) first. `flush_to_l1(None)`
+    // is idempotent and a no-op when L0 is empty, so it is safe and cheap
+    // for both primary and nested parents. It runs before we capture
+    // `parent_snapshot_id` and the allocator HWM below, so branches are
+    // created from the post-flush version.
+    //
+    // Snapshot isolation is unaffected: this only materializes writes the
+    // parent had *already committed* at fork time. Writes committed after
+    // the fork are not flushed here and stay invisible to the fork (see
+    // `fork_read_only::fork_sees_fork_point_state_after_primary_writes`).
+    //
+    // Fixes #97: before this, a primary-parent fork (and especially an
+    // in-memory DB, which never auto-flushes) branched off a stale/empty
+    // Lance tip and read zero rows for data the parent read correctly.
+    // The flush used to be gated on `parent.is_forked()`, leaving the
+    // primary case to a `db.flush()`-before-fork convention that uni-db
+    // neither requires nor recommends.
+    if let Some(writer_lock) = &parent.db.writer {
         let writer: &uni_store::Writer = writer_lock.as_ref();
         writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
     }

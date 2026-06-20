@@ -1,0 +1,34 @@
+# ThreadSanitizer suppressions — uni SSI concurrency lane (G1 A0).
+#
+# Consumed by the `tsan` job in .github/workflows/nightly.yml via
+#   TSAN_OPTIONS=suppressions=$GITHUB_WORKSPACE/.config/tsan-suppressions.txt
+# Format reference:
+#   https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
+#
+# Scope: this lane runs the *real-thread* SSI suites (ssi_invariants / ssi_occ_e2e
+# / ssi_stress) under ThreadSanitizer to catch data races on the live async commit
+# path that the loom/shuttle models (model-check job) cannot reach.
+#
+# LIFECYCLE: the entries below are a best-effort seed for the *known* noise
+# sources — native C/C++ FFI compiled WITHOUT TSan instrumentation, plus
+# parking_lot's internal atomics (a documented Rust-sanitizer false-positive
+# source). They are intentionally narrow: each frame is a known-benign library
+# internal, never our own crates. The first nightly run uploads `tsan.log` as an
+# artifact; tighten/extend this file from that triage rather than broadening a
+# pattern to silence a real report. A race in uni-* frames must NEVER be
+# suppressed here — fix it.
+
+# --- Uninstrumented native FFI ---------------------------------------------
+# The SSI tests do not perform inference, so onnxruntime/candle kernels should
+# not load at all; these guard against the binary merely linking them.
+called_from_lib:libonnxruntime
+race:onnxruntime
+race:gemm                       # candle / matmul native microkernels
+
+# --- parking_lot internal atomics ------------------------------------------
+# parking_lot uses relaxed atomics + word-based parking internally that TSan
+# cannot reason about; reports rooted in its own frames are benign. Our locks
+# are still observed through the guarded data, so real races on protected state
+# remain visible.
+race:parking_lot
+deadlock:parking_lot

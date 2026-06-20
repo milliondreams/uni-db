@@ -59,6 +59,7 @@ pub mod locy_fixpoint;
 pub mod locy_fold;
 pub mod locy_model_invoke;
 pub mod locy_priority;
+pub mod locy_profile;
 pub mod locy_program;
 pub mod locy_query;
 pub mod locy_slg;

@@ -283,6 +283,18 @@ pub(crate) async fn evaluate_with_db_and_config(
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
 ) -> Result<LocyResult> {
+    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None).await
+}
+
+/// Like [`evaluate_with_db_and_config`], but optionally captures a structured
+/// execution profile into `profile_capture` (the session `profile()` path).
+pub(crate) async fn evaluate_with_db_and_config_capturing(
+    db: &crate::api::UniInner,
+    program: &str,
+    config: &LocyConfig,
+    rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
+    profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+) -> Result<LocyResult> {
     // Compile with the given registry
     let ast = match uni_cypher::parse_locy(program) {
         Ok(ast) => ast,
@@ -350,7 +362,9 @@ pub(crate) async fn evaluate_with_db_and_config(
         collect_derive: true,
         read_snapshot: None,
     };
-    engine.evaluate_compiled_with_config(compiled, config).await
+    engine
+        .evaluate_compiled_capturing(compiled, config, profile_capture)
+        .await
 }
 
 /// Engine for evaluating Locy programs against a real database.
@@ -480,6 +494,18 @@ impl<'a> LocyEngine<'a> {
         program: &str,
         config: &LocyConfig,
     ) -> Result<LocyResult> {
+        self.evaluate_with_config_capturing(program, config, None)
+            .await
+    }
+
+    /// Like [`Self::evaluate_with_config`], but optionally captures a structured
+    /// execution profile into `profile_capture` (the `profile()` builder path).
+    pub(crate) async fn evaluate_with_config_capturing(
+        &self,
+        program: &str,
+        config: &LocyConfig,
+        profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+    ) -> Result<LocyResult> {
         let mut compiled = self.compile_only(program)?;
 
         // Merge registered rules into the compiled program.
@@ -503,7 +529,8 @@ impl<'a> LocyEngine<'a> {
             }
         }
 
-        self.evaluate_compiled_with_config(compiled, config).await
+        self.evaluate_compiled_capturing(compiled, config, profile_capture)
+            .await
     }
 
     /// Evaluate an already-compiled Locy program with custom config.
@@ -515,6 +542,23 @@ impl<'a> LocyEngine<'a> {
         &self,
         compiled: CompiledProgram,
         config: &LocyConfig,
+    ) -> Result<LocyResult> {
+        self.evaluate_compiled_capturing(compiled, config, None)
+            .await
+    }
+
+    /// Like [`Self::evaluate_compiled_with_config`], but optionally captures a
+    /// structured execution profile.
+    ///
+    /// When `profile_capture` is `Some`, the `LocyProgramExec` is run with
+    /// profiling enabled and the resulting [`uni_query::LocyExecProfile`] is
+    /// stored into the slot for the caller (the `profile()` builder path) to
+    /// read. `None` → zero profiling overhead.
+    pub(crate) async fn evaluate_compiled_capturing(
+        &self,
+        compiled: CompiledProgram,
+        config: &LocyConfig,
+        profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
     ) -> Result<LocyResult> {
         let start = Instant::now();
 
@@ -642,12 +686,16 @@ impl<'a> LocyEngine<'a> {
             command_results_slot,
             timeout_flag,
             incomplete_slot,
+            profile_slot,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
         ) {
             if let Some(ref t) = tracker {
                 program_exec.set_derivation_tracker(Arc::clone(t));
+            }
+            if profile_capture.is_some() {
+                program_exec.set_profile_enabled(true);
             }
             (
                 program_exec.derived_store_slot(),
@@ -658,6 +706,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.command_results_slot(),
                 program_exec.timeout_flag(),
                 program_exec.incomplete_slot(),
+                Some(program_exec.profile_slot()),
             )
         } else {
             (
@@ -669,6 +718,7 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::atomic::AtomicU8::new(0)),
                 Arc::new(std::sync::RwLock::new(None)),
+                None,
             )
         };
 
@@ -676,6 +726,14 @@ impl<'a> LocyEngine<'a> {
         let _stats_batches = uni_query::Executor::collect_batches(&session_ctx, exec_plan)
             .await
             .map_err(map_native_df_error)?;
+
+        // 5b. Hand the captured execution profile back to the profile() caller.
+        if let (Some(capture), Some(slot)) = (profile_capture, profile_slot.as_ref())
+            && let Ok(mut p) = slot.write()
+            && let Some(prof) = p.take()
+        {
+            *capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(prof);
+        }
 
         // 6. Extract native DerivedStore
         let native_store = derived_store_slot

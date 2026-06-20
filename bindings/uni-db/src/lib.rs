@@ -135,6 +135,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyExplainOutput>()?;
     m.add_class::<types::PyProfileOutput>()?;
     m.add_class::<types::PyLocyExplainOutput>()?;
+    m.add_class::<types::PyLocyProfile>()?;
 
     // New result types
     m.add_class::<types::PyExecuteResult>()?;

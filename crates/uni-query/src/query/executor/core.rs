@@ -880,7 +880,7 @@ pub struct OperatorStats {
 ///
 /// Children are visited before parents so the resulting `Vec` flows from
 /// data-producers (leaf scans) up to consumers (projections, filters).
-fn collect_plan_metrics(
+pub(crate) fn collect_plan_metrics(
     plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 ) -> Vec<OperatorStats> {
     let mut stats = Vec::new();

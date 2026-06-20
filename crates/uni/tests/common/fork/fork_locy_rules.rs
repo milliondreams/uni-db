@@ -182,3 +182,48 @@ async fn fork_and_primary_each_see_own_plus_inherited() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+/// #97 regression: a Locy QUERY on a fork must resolve over data the
+/// parent committed but never flushed (L0). Before the fix the fork
+/// branched off an empty Lance tip, so the rule matched zero inherited
+/// nodes/edges and `derived` came back empty.
+#[tokio::test]
+async fn fork_locy_derive_over_inherited_unflushed_l0() -> Result<()> {
+    let db = db_with_schema().await?;
+
+    // Commit graph data WITHOUT flushing — it lives only in L0.
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute(
+        "CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'}), \
+         (:N {name: 'B2'})-[:E]->(:N {name: 'C'})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    // Register the rule on the inheritable primary registry, then fork.
+    db.rules()
+        .register(
+            "CREATE RULE connected AS \
+         MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b",
+        )
+        .await?;
+
+    let forked = primary.fork("locy_unflushed").await?;
+    let result = forked.locy("QUERY connected").await?;
+
+    assert!(
+        result.derived.contains_key("connected"),
+        "fork QUERY should produce the 'connected' relation"
+    );
+    let facts = &result.derived["connected"];
+    assert_eq!(
+        facts.len(),
+        2,
+        "rule must match both inherited unflushed edges; got {}",
+        facts.len()
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

@@ -13,6 +13,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::runtime::l0::{L0Buffer, OccReadSet, try_as_crdt};
+use crate::runtime::sync::{AtomicU64, Ordering};
 use uni_common::core::id::{Eid, Vid};
 
 /// The set of items a transaction wrote, used for conflict detection.
@@ -237,6 +238,20 @@ impl CommitRegistry {
         }
     }
 
+    /// Allocates the next commit sequence and records `write_set` under it,
+    /// returning the assigned sequence.
+    ///
+    /// This is the single shared mutation a committer performs on the OCC state.
+    /// The production commit path and the loom/shuttle models call exactly this
+    /// method, so the checked bump-then-record step cannot drift from production.
+    /// Must be called under the Writer's `flush_lock` (the registry `Mutex`
+    /// serializes the `record`, and the bump is the sole writer of `seq`).
+    pub(crate) fn commit(&mut self, seq: &AtomicU64, write_set: WriteSet) -> u64 {
+        let next = seq.fetch_add(1, Ordering::Relaxed) + 1;
+        self.record(next, write_set);
+        next
+    }
+
     /// Checks a committing transaction against all commits newer than its read
     /// sequence. Returns the first [`Conflict`] found, or `None` if it may commit.
     ///
@@ -281,6 +296,14 @@ mod tests {
         WriteSet {
             vertices: vids.iter().map(|&v| Vid::from(v)).collect(),
             edges: HashSet::new(),
+        }
+    }
+
+    /// An edge-only write-set (mirror of [`ws`] for the edge conflict path).
+    fn es(eids: &[u64]) -> WriteSet {
+        WriteSet {
+            vertices: HashSet::new(),
+            edges: eids.iter().map(|&e| Eid::from(e)).collect(),
         }
     }
 
@@ -336,6 +359,44 @@ mod tests {
                 oldest: 2
             })
         ));
+    }
+
+    #[test]
+    fn commit_bumps_sequence_and_records() {
+        let seq = AtomicU64::new(0);
+        let mut reg = CommitRegistry::new(16);
+        // Sequences are allocated 1, 2, … (the bump returns the new value).
+        assert_eq!(reg.commit(&seq, ws(&[1])), 1);
+        assert_eq!(reg.commit(&seq, ws(&[2])), 2);
+        assert_eq!(seq.load(Ordering::Relaxed), 2);
+        // The recorded write to vertex 1 is now visible to a stale committer.
+        assert!(matches!(
+            reg.check(0, &ws(&[1]), None),
+            Some(Conflict::WriteWrite { seq: 1 })
+        ));
+    }
+
+    #[test]
+    fn intersects_detects_overlapping_edges() {
+        // `intersects` must check the edge sets, not just the vertices.
+        assert!(es(&[1, 2]).intersects(&es(&[2, 3])));
+        assert!(!es(&[1, 2]).intersects(&es(&[3, 4])));
+        // Vertices and edges live in separate namespaces: vertex id 1 and edge
+        // id 1 must NOT be mistaken for an overlap.
+        assert!(!ws(&[1]).intersects(&es(&[1])));
+    }
+
+    #[test]
+    fn overlapping_edge_write_after_read_seq_conflicts() {
+        let mut reg = CommitRegistry::new(16);
+        reg.record(1, es(&[10, 11]));
+        // A tx that began at read_seq 0 and writes edge 11 must abort.
+        assert!(matches!(
+            reg.check(0, &es(&[11]), None),
+            Some(Conflict::WriteWrite { seq: 1 })
+        ));
+        // A disjoint edge write does not conflict.
+        assert!(reg.check(0, &es(&[12]), None).is_none());
     }
 
     // ── CRDT carve-out (`from_l0`) ───────────────────────────────────────────

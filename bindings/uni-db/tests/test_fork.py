@@ -44,6 +44,19 @@ def _seed_person_schema(db):
     return s
 
 
+def _person_schema_no_flush(db):
+    """Declare the Person schema and return a session — but DO NOT seed
+    or flush. #97 regression tests commit their own data and must never
+    flush before forking; flushing would mask the bug.
+    """
+    db.schema().label("Person").property("name", "string").apply()
+    return db.session()
+
+
+def _count(scope):
+    return scope.query("MATCH (n:Person) RETURN count(n) AS c")[0]["c"]
+
+
 # ---------------------------------------------------------------------------
 # Basic lifecycle
 # ---------------------------------------------------------------------------
@@ -345,3 +358,137 @@ def test_fork_schema_on_primary_session_errors():
 def test_fork_info_returns_none_for_missing():
     db = _make_db(disable_fork_sweeper=True)
     assert db.fork_info("does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# #97 — fork inherits the parent's committed-but-unflushed (L0) writes.
+# These tests must NOT flush before forking; that is the whole point. Each
+# "sees base data" test asserts the fork sees inherited rows BEFORE the
+# fork mutates anything (a delete-then-assert-zero shape passes trivially
+# under the bug, so it cannot detect it).
+# ---------------------------------------------------------------------------
+
+
+def test_fork_inherits_unflushed_single_node():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _person_schema_no_flush(db)
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Alice'})")
+    tx.commit()  # no db.flush()
+
+    assert _count(s) == 1
+    fork = s.fork("scn").build()
+    assert _count(fork) == 1, "fork must inherit the parent's unflushed L0 write"
+
+    del fork
+    db.drop_fork("scn")
+
+
+def test_fork_inherits_unflushed_many_nodes():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _person_schema_no_flush(db)
+    tx = s.tx()
+    tx.execute("UNWIND range(1, 25) AS i CREATE (:Person {name: toString(i)})")
+    tx.commit()
+
+    fork = s.fork("scn").build()
+    assert _count(fork) == 25
+
+    del fork
+    db.drop_fork("scn")
+
+
+def test_fork_inherits_unflushed_relationship():
+    db = _make_db(disable_fork_sweeper=True)
+    db.schema().label("Person").property("name", "string").apply()
+    db.schema().edge_type("KNOWS", ["Person"], ["Person"]).apply()
+    s = db.session()
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'A'})-[:KNOWS]->(:Person {name: 'B'})")
+    tx.commit()  # no flush
+
+    fork = s.fork("scn").build()
+    assert _count(fork) == 2, "fork must see both endpoints"
+    rel = fork.query("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r) AS c")
+    assert rel[0]["c"] == 1, "fork must inherit the unflushed relationship"
+
+    del fork
+    db.drop_fork("scn")
+
+
+def test_fork_with_block_tx_unflushed():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _person_schema_no_flush(db)
+
+    # with-block tx: rolls back on exit, so commit explicitly inside.
+    with s.tx() as tx:
+        tx.execute("CREATE (:Person {name: 'WithBlock'})")
+        tx.commit()
+    # Raw tx variant in the same DB.
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Raw'})")
+    tx.commit()
+
+    fork = s.fork("scn").build()
+    assert _count(fork) == 2, (
+        "fork must inherit both with-block and raw unflushed writes"
+    )
+
+    del fork
+    db.drop_fork("scn")
+
+
+def test_parent_writes_after_fork_invisible_no_flush():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _person_schema_no_flush(db)
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Alice'})")
+    tx.commit()
+
+    fork = s.fork("scn").build()
+    # Parent commits more AFTER the fork — must not leak in.
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Bob'})")
+    tx.commit()
+
+    assert _count(fork) == 1, "fork sees only the fork-point row"
+    assert _count(s) == 2, "parent sees both rows"
+
+    del fork
+    db.drop_fork("scn")
+
+
+def test_fork_the_writing_session_unflushed():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _person_schema_no_flush(db)
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Writer'})")
+    tx.commit()
+
+    # Fork the very session that performed the writes.
+    fork = s.fork("self").build()
+    rows = fork.query("MATCH (n:Person) RETURN n.name AS name")
+    assert [r["name"] for r in rows] == ["Writer"]
+
+    del fork
+    db.drop_fork("self")
+
+
+def test_nested_unflushed_chain():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _person_schema_no_flush(db)
+    tx = primary.tx()
+    tx.execute("CREATE (:Person {name: 'P'})")
+    tx.commit()  # no flush anywhere
+
+    a = primary.fork("a").build()
+    tx = a.tx()
+    tx.execute("CREATE (:Person {name: 'a'})")
+    tx.commit()  # no flush
+
+    b = a.fork("b").build()
+    assert _count(b) == 2, "B must see P + a via the unflushed chain before writing"
+
+    del b
+    del a
+    db.drop_fork_cascade("a")

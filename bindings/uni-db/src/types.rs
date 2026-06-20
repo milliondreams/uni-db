@@ -659,6 +659,62 @@ impl PyLocyExplainOutput {
     }
 }
 
+/// Structured execution profile from `session.locy_with(...).profile()`.
+///
+/// The Locy analog of Cypher's profile: a stratum → rule → fixpoint-iteration
+/// tree, each iteration carrying per-operator metrics. Scalar summaries are
+/// exposed as attributes; the full tree is available via `strata` as nested
+/// dicts/lists, and `str(profile)` renders a readable report.
+#[pyclass(name = "LocyProfileOutput", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyLocyProfile {
+    pub(crate) inner: uni_db::api::locy_result::LocyProfileOutput,
+}
+
+#[pymethods]
+impl PyLocyProfile {
+    /// Total program evaluation wall-clock time, in milliseconds.
+    #[getter]
+    fn total_time_ms(&self) -> f64 {
+        self.inner.total_time_ms
+    }
+
+    /// Peak derived-fact memory, in bytes.
+    #[getter]
+    fn peak_memory_bytes(&self) -> usize {
+        self.inner.peak_memory_bytes
+    }
+
+    /// Compile-time plan text (identical to `explain()`).
+    #[getter]
+    fn plan_text(&self) -> String {
+        self.inner.explain.plan_text.clone()
+    }
+
+    /// The per-stratum / per-rule / per-iteration profile as nested Python
+    /// dicts and lists (snake_case keys; operators carry `operator`,
+    /// `actual_rows`, `time_ms`).
+    #[getter]
+    fn strata(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let json = serde_json::to_value(&self.inner.profile.strata)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        crate::convert::json_value_to_py(py, &json)
+    }
+
+    fn __str__(&self) -> String {
+        format!("{}", self.inner)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LocyProfileOutput(total_time_ms={:.3}, peak_memory_bytes={}, strata={})",
+            self.inner.total_time_ms,
+            self.inner.peak_memory_bytes,
+            self.inner.profile.strata.len()
+        )
+    }
+}
+
 /// Information about a vertex label in the schema.
 #[pyclass(get_all, from_py_object)]
 #[derive(Debug, Clone)]

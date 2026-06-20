@@ -61,12 +61,17 @@ jobs:
           UNI_FORK_SOAK_FORKS: 40
           UNI_FORK_SOAK_MUTATIONS: 300
           UNI_FORK_SOAK_RESTARTS: 4
+          # Number of generated programs the Locy naive-oracle soak diffs against
+          # the engine. ~10k completes in ~10-15 min (each case pays a full DB
+          # build, which dominates); higher would risk the soak per-test kill
+          # window. Dedicated var so it can't perturb other crates' PROPTEST_CASES.
+          ORACLE_SOAK_CASES: 10000
         run: |
           # Scope to the actual soak/stress tests. `--run-ignored ignored-only`
           # alone also sweeps in unrelated #[ignore]'d tests (autoembed model
           # downloads needing HF auth, LocalStack e2e) that this job does not
           # provision — LocalStack has its own `cloud` job below.
-          cargo nextest run --profile soak -p uni-db -p uni-store \
+          cargo nextest run --profile soak -p uni-db -p uni-store -p uni-locy-oracle \
             --run-ignored ignored-only \
             -E 'test(/soak/) | test(/stress/)'
 
@@ -175,6 +180,115 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  model-check:
+    name: Concurrency Model Check (loom + shuttle)
+    runs-on: ubuntu-xlarge
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      # Exhaustively model-checks the OCC commit core (write-write + read-write
+      # conflict detection in crates/uni-store/src/runtime/occ.rs) over all
+      # 2- and 3-committer interleavings. See src/occ_loom_model.rs. Must run
+      # ONLY --test occ_model: other suites drive real Writers, whose loom
+      # atomics panic outside a model.
+      - name: loom (exhaustive, 2 & 3 committers)
+        env:
+          LOOM_MAX_PREEMPTIONS: 3
+        run: cargo nextest run -p uni-store --features loom --test occ_model
+
+      # Randomized scheduler over the same models — scales past loom's
+      # exhaustive limit (10k iterations/model; reproducible by seed on failure).
+      - name: shuttle (randomized)
+        run: cargo nextest run -p uni-store --features shuttle --test occ_model
+
+  tsan:
+    name: ThreadSanitizer (SSI commit path)
+    runs-on: ubuntu-xlarge
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # build-std needs the nightly toolchain + rust-src to recompile std with
+      # the sanitizer instrumentation.
+      - name: Setup Rust (nightly + rust-src, for -Zbuild-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "tsan"
+          cache-on-failure: true
+
+      # Run the genuinely multi-threaded SSI suites (real tokio worker threads +
+      # tokio::spawn) under ThreadSanitizer — the live async commit path the
+      # loom/shuttle models (model-check job) structurally cannot reach. std is
+      # rebuilt instrumented via -Zbuild-std so cross-thread sync inside std/tokio
+      # is visible. The single-threaded ssi_occ_test (uni-store) is deliberately
+      # excluded: no parallelism → no races to find.
+      #
+      # halt_on_error=0 collects every report into tsan.log (uploaded for triage);
+      # exitcode=66 still fails the job on any non-suppressed race, so the lane
+      # keeps teeth. Suppressions are scoped to known-benign FFI/parking_lot
+      # frames only — never our own crates.
+      # --test-threads 1 runs the test PROCESSES serially. Each SSI test already
+      # spins its own multi-thread tokio runtime (8 workers) + spawned writers,
+      # so TSan still sees full in-process cross-thread interleavings — serial
+      # execution costs zero race coverage. Running two instrumented heavy
+      # processes at once instead thrashes under TSan's 5-10x memory/CPU overhead
+      # and stalls the MERGE retry-storm test past nextest's 180s ceiling. Serial
+      # keeps every test ~1-4s, well inside the default slow-timeout.
+      - name: ThreadSanitizer on the SSI suite
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTFLAGS: "-Zsanitizer=thread"
+          PROPTEST_CASES: "16"
+          TSAN_OPTIONS: "suppressions=${{ github.workspace }}/.config/tsan-suppressions.txt:halt_on_error=0:exitcode=66:second_deadlock_stack=1:history_size=4"
+        run: |
+          cargo +nightly nextest run -Z build-std \
+            --target x86_64-unknown-linux-gnu \
+            -p uni-db --test integration \
+            --test-threads 1 \
+            -E 'test(/ssi_invariants::/) | test(/ssi_occ_e2e::/) | test(/ssi_stress::/)' \
+            2>&1 | tee tsan.log
+
+      # The log IS the triage input for tightening .config/tsan-suppressions.txt.
+      - name: Upload ThreadSanitizer log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-log
+          path: tsan.log
+          if-no-files-found: warn
 
   bench:
     name: Benchmarks (artifact upload)

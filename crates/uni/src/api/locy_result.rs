@@ -146,3 +146,86 @@ fn format_locy_plan(compiled: &CompiledProgram) -> String {
 
     out
 }
+
+// ── Profile Output ──────────────────────────────────────────────────────
+
+/// Output of Locy `profile()` — an execution-plan explanation plus a
+/// structured, per-iteration runtime profile.
+///
+/// The analog of Cypher's `ProfileOutput`, shaped to Locy's cost model: the
+/// runtime detail is a stratum → rule → fixpoint-iteration tree, each iteration
+/// carrying the same per-operator metrics Cypher reports. Use the [`Display`]
+/// impl for a readable rendering.
+///
+/// [`Display`]: std::fmt::Display
+#[derive(Debug, Clone)]
+pub struct LocyProfileOutput {
+    /// Compile-time plan introspection (identical to `explain()`).
+    pub explain: LocyExplainOutput,
+    /// Structured per-stratum / per-rule / per-iteration runtime profile.
+    pub profile: uni_query::LocyExecProfile,
+    /// Total program evaluation wall-clock time, in milliseconds.
+    pub total_time_ms: f64,
+    /// Peak derived-fact memory, in bytes.
+    pub peak_memory_bytes: usize,
+}
+
+impl LocyProfileOutput {
+    /// Combine a compile-time explanation with the runtime execution profile.
+    pub(crate) fn new(explain: LocyExplainOutput, profile: uni_query::LocyExecProfile) -> Self {
+        let total_time_ms = profile.total_elapsed_ms;
+        let peak_memory_bytes = profile.peak_memory_bytes;
+        Self {
+            explain,
+            profile,
+            total_time_ms,
+            peak_memory_bytes,
+        }
+    }
+}
+
+impl std::fmt::Display for LocyProfileOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "Locy Profile  total {:.3} ms  peak {} bytes  {} strata",
+            self.total_time_ms,
+            self.peak_memory_bytes,
+            self.profile.strata.len()
+        )?;
+        for s in &self.profile.strata {
+            let kind = if s.recursive {
+                "recursive"
+            } else {
+                "non-recursive"
+            };
+            writeln!(
+                f,
+                "  Stratum {} [{kind}]  {:.3} ms  {} iter{}  {} facts",
+                s.index,
+                s.elapsed_ms,
+                s.iterations,
+                if s.iterations == 1 { "" } else { "s" },
+                s.facts_derived,
+            )?;
+            for r in &s.rules {
+                writeln!(f, "    rule {}  {} facts", r.name, r.facts)?;
+                for it in &r.iterations {
+                    writeln!(
+                        f,
+                        "      iter {}: +{} facts ({:.3} ms)",
+                        it.iteration, it.delta_facts, it.elapsed_ms,
+                    )?;
+                    for op in &it.operators {
+                        writeln!(
+                            f,
+                            "        {}  {} rows  {:.3} ms",
+                            op.operator, op.actual_rows, op.time_ms,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

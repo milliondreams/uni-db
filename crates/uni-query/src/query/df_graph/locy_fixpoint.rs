@@ -9,7 +9,7 @@
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan,
-    extract_scalar_key,
+    execute_subplan_collecting, extract_scalar_key,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
@@ -18,7 +18,9 @@ use crate::query::df_graph::locy_explain::{
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
+use crate::query::df_graph::locy_profile::LocyProfileCollector;
 use crate::query::df_graph::locy_program::interruption;
+use crate::query::executor::core::OperatorStats;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
@@ -1205,6 +1207,7 @@ async fn run_fixpoint_loop(
     classifier_registry: Arc<ClassifierRegistry>,
     classifier_cache: Option<Arc<ModelInvocationCache>>,
     classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    profile_collector: Option<Arc<LocyProfileCollector>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -1287,23 +1290,43 @@ async fn run_fixpoint_loop(
             // Evaluate clause bodies, tracking per-clause candidates for provenance.
             let mut all_candidates = Vec::new();
             let mut clause_candidates: Vec<Vec<RecordBatch>> = Vec::new();
+            // Profiling (profile() path only): time this rule's evaluation in
+            // this iteration and accumulate the clause-body operator trees.
+            let rule_start = Instant::now();
+            let mut iter_ops: Vec<OperatorStats> = Vec::new();
             for clause in &rule.clauses {
                 // Phase B A4 follow-up: the planner inserts
                 // `LogicalPlan::LocyModelInvoke` between the body and
                 // `LocyProject` when this clause has neural-model
                 // invocations, so `execute_subplan` runs the invocation
                 // inline as part of the body plan tree.
-                let mut batches = execute_subplan(
-                    &clause.body_logical,
-                    &params,
-                    &HashMap::new(),
-                    &graph_ctx,
-                    &session_ctx,
-                    &storage,
-                    &schema_info,
-                    None, // Locy fixpoint clause body is read-only
-                )
-                .await?;
+                let mut batches = if profile_collector.is_some() {
+                    let (b, ops) = execute_subplan_collecting(
+                        &clause.body_logical,
+                        &params,
+                        &HashMap::new(),
+                        &graph_ctx,
+                        &session_ctx,
+                        &storage,
+                        &schema_info,
+                        None, // Locy fixpoint clause body is read-only
+                    )
+                    .await?;
+                    iter_ops.extend(ops);
+                    b
+                } else {
+                    execute_subplan(
+                        &clause.body_logical,
+                        &params,
+                        &HashMap::new(),
+                        &graph_ctx,
+                        &session_ctx,
+                        &storage,
+                        &schema_info,
+                        None, // Locy fixpoint clause body is read-only
+                    )
+                    .await?
+                };
                 // Apply negated IS-ref semantics: probabilistic complement or anti-join.
                 for binding in &clause.is_ref_bindings {
                     if binding.negated
@@ -1401,6 +1424,23 @@ async fn run_fixpoint_loop(
                     .await;
                 }
             }
+
+            // Profiling: record this rule's per-iteration row (delta = net-new
+            // facts merged this pass, plus the captured clause-body operators).
+            if let Some(ref collector) = profile_collector {
+                let delta_facts: usize = states[rule_idx]
+                    .all_delta()
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum();
+                collector.record(
+                    &rule.name,
+                    iteration,
+                    delta_facts,
+                    rule_start.elapsed().as_secs_f64() * 1000.0,
+                    iter_ops,
+                );
+            }
         }
 
         // Check convergence
@@ -1425,6 +1465,14 @@ async fn run_fixpoint_loop(
     if let Ok(mut counts) = iteration_counts.write() {
         for rule in &rules {
             counts.insert(rule.name.clone(), total_iters);
+        }
+    }
+
+    // Profiling: record each rule's final converged fact count.
+    if let Some(ref collector) = profile_collector {
+        for (idx, rule) in rules.iter().enumerate() {
+            let facts: usize = states[idx].all_facts().iter().map(|b| b.num_rows()).sum();
+            collector.set_final_facts(&rule.name, facts);
         }
     }
 
@@ -5150,6 +5198,10 @@ pub struct FixpointExec {
         reason = "boundary plumbing; read by EXPLAIN via LocyModelInvokeExec"
     )]
     classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    /// Optional per-stratum profile collector. `Some` only on the `profile()`
+    /// path; when set, each fixpoint iteration records per-rule timing, delta
+    /// facts, and the clause-body operator tree into it. `None` → zero overhead.
+    profile_collector: Option<Arc<LocyProfileCollector>>,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -5409,12 +5461,22 @@ impl FixpointExec {
             classifier_registry,
             classifier_cache,
             classifier_provenance_store,
+            profile_collector: None,
         }
     }
 
     /// Returns the shared iteration counts slot for post-execution inspection.
     pub fn iteration_counts(&self) -> Arc<StdRwLock<HashMap<String, usize>>> {
         Arc::clone(&self.iteration_counts)
+    }
+
+    /// Attach a profile collector so this stratum's fixpoint records per-rule,
+    /// per-iteration timing, delta facts, and clause-body operator metrics.
+    ///
+    /// Mirrors `set_derivation_tracker`: call before wrapping the exec in an
+    /// `Arc` and executing. Only the Locy `profile()` path sets this.
+    pub fn set_profile_collector(&mut self, collector: Arc<LocyProfileCollector>) {
+        self.profile_collector = Some(collector);
     }
 }
 
@@ -5536,6 +5598,7 @@ impl ExecutionPlan for FixpointExec {
         let classifier_registry = Arc::clone(&self.classifier_registry);
         let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
         let classifier_provenance_store = self.classifier_provenance_store.as_ref().map(Arc::clone);
+        let profile_collector = self.profile_collector.as_ref().map(Arc::clone);
 
         let fut = async move {
             run_fixpoint_loop(
@@ -5564,6 +5627,7 @@ impl ExecutionPlan for FixpointExec {
                 classifier_registry,
                 classifier_cache,
                 classifier_provenance_store,
+                profile_collector,
             )
             .await
         };

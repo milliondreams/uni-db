@@ -754,8 +754,14 @@ jobs:
             INDEX_ARGS=""
           fi
           # The uni-db wheel is already published (this job `needs:` the publish
-          # job), so we only wait on PyPI's brief upload->index propagation lag,
-          # not the multi-platform wheel build. A short retry suffices.
+          # job), so we only wait on PyPI's upload->index propagation lag, not the
+          # multi-platform wheel build. Index propagation has been observed to
+          # exceed the retry budget on a cold first attempt, failing this job and
+          # stranding the uni-pydantic publish (the downstream publish job is then
+          # skipped and "re-run failed jobs" will not revive it). Wait out the bulk
+          # of the propagation lag once up front, then retry for any residual.
+          echo "Waiting 5m for uni-db==${VERSION} to propagate to ${REGISTRY} before the first install attempt..."
+          sleep 300
           ATTEMPTS=10
           for i in $(seq 1 "$ATTEMPTS"); do
             uv pip install $INDEX_ARGS "uni-db==${VERSION}" && break

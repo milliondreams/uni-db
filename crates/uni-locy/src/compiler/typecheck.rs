@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use uni_cypher::ast::Expr;
 use uni_cypher::locy_ast::{
     AlongBinding, FoldBinding, LocyExpr, LocyYieldItem, RuleCondition, RuleDefinition, RuleOutput,
+    resolve_yield_column_names,
 };
 
 use super::errors::LocyCompileError;
@@ -340,25 +341,15 @@ fn infer_yield_schema(
 }
 
 fn yield_columns_from_items(items: &[LocyYieldItem]) -> Vec<YieldColumn> {
-    items
-        .iter()
-        .map(|item| {
-            let name = item.alias.clone().unwrap_or_else(|| expr_name(&item.expr));
-            YieldColumn {
-                name,
-                is_key: item.is_key,
-                is_prob: item.is_prob,
-            }
+    resolve_yield_column_names(items)
+        .into_iter()
+        .zip(items.iter())
+        .map(|(name, item)| YieldColumn {
+            name,
+            is_key: item.is_key,
+            is_prob: item.is_prob,
         })
         .collect()
-}
-
-fn expr_name(expr: &Expr) -> String {
-    match expr {
-        Expr::Variable(name) => name.clone(),
-        Expr::Property(_, prop) => prop.clone(),
-        _ => "?".to_string(),
-    }
 }
 
 // ─── prev in base case ──────────────────────────────────────────────────────

@@ -116,6 +116,43 @@ def test_recursive_rule(social_db_populated):
     assert len(reachable_rows) >= 3
 
 
+def test_profile_recursive(social_db_populated):
+    """profile() returns the result plus a structured execution profile."""
+    db = social_db_populated
+    session = db.session()
+    result, profile = session.locy_with(REACHABLE_PROGRAM).profile()
+
+    # Same derived facts as run().
+    assert len(result.derived.get("reachable", [])) >= 3
+
+    # Scalar summaries.
+    assert profile.total_time_ms >= 0.0
+    assert profile.peak_memory_bytes >= 0
+    assert isinstance(profile.plan_text, str) and profile.plan_text
+
+    # Structured strata tree: list of dicts down to per-operator metrics.
+    strata = profile.strata
+    assert isinstance(strata, list) and len(strata) >= 1
+    recursive = [s for s in strata if s["recursive"]]
+    assert recursive, "expected a recursive stratum"
+    s = recursive[0]
+    assert s["iterations"] >= 2, "transitive closure needs multiple passes"
+    assert s["rules"], "stratum should have rules"
+
+    rule = s["rules"][0]
+    iters = rule["iterations"]
+    assert len(iters) == s["iterations"], "per-rule iterations match the stratum"
+    total_ops = sum(len(it["operators"]) for it in iters)
+    assert total_ops > 0, "per-iteration operator trees should be retained"
+
+    # Operator entries carry the Cypher-style metric fields.
+    op = next(op for it in iters for op in it["operators"])
+    assert "operator" in op and "actual_rows" in op and "time_ms" in op
+
+    # __str__ renders a readable report.
+    assert "Locy Profile" in str(profile)
+
+
 def test_multi_rule_program(social_db_populated):
     """Multiple rules can be defined in one program."""
     db = social_db_populated

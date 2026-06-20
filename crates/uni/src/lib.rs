@@ -156,12 +156,15 @@ pub mod xervo {
 
 pub mod locy {
     pub use crate::api::impl_locy::LocyEngine;
-    pub use crate::api::locy_result::{LocyExplainOutput, LocyResult};
+    pub use crate::api::locy_result::{LocyExplainOutput, LocyProfileOutput, LocyResult};
     pub use uni_cypher::locy_ast::LocyProgram;
     pub use uni_cypher::{ParseError, parse_locy};
     pub use uni_locy::LocyResult as RawLocyResult;
     pub use uni_locy::{
         CommandResult, CompiledProgram, DerivedEdge, DerivedFactSet, LocyCompileError, LocyConfig,
         LocyError,
+    };
+    pub use uni_query::{
+        LocyExecProfile, LocyIterationProfile, LocyRuleProfile, LocyStratumProfile,
     };
 }

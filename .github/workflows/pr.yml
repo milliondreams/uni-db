@@ -118,6 +118,41 @@ jobs:
             --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal
 
+  # Concurrency model check — fast loom smoke over the OCC commit core. Catches
+  # regressions to the write-write / read-write conflict-detection logic
+  # (crates/uni-store/src/runtime/occ.rs) on the PR that introduces them. The
+  # exhaustive 3-committer model + shuttle run nightly (nightly.yml model-check).
+  loom-smoke:
+    name: Concurrency Model Check (loom smoke)
+    runs-on: ubuntu-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      # Bounded preemptions keep the smoke fast; nightly raises it to 3. Must run
+      # ONLY --test occ_model (other suites drive real Writers whose loom atomics
+      # panic outside a model).
+      - name: loom (exhaustive, bounded preemptions)
+        env:
+          LOOM_MAX_PREEMPTIONS: 2
+        run: cargo nextest run -p uni-store --features loom --test occ_model
+
   # openCypher conformance on PRs — the schemaless lane only (the fast,
   # representative mode). The sidecar mode and the Locy TCK lanes run on the
   # main-push CI (ci.yml). Without this, a PR breaking Cypher conformance lands

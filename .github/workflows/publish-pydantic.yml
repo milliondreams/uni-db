@@ -1,0 +1,121 @@
+name: Publish uni-pydantic (recovery)
+
+# Standalone recovery path for the uni-pydantic publish, decoupled from the
+# wheel matrix in release-wheels.yml.
+#
+# uni-pydantic is pure-Python and depends only on the uni-db wheel already being
+# on the index — it does NOT need the multi-platform wheel build. release-wheels
+# chains it after the wheel publish (build-pydantic -> publish-pydantic-*), which
+# means a transient failure (e.g. PyPI upload->index propagation lag exceeding
+# build-pydantic's retry budget) fails build-pydantic, skips the publish jobs,
+# and "re-run failed jobs" cannot revive a *skipped* job — stranding the publish
+# (as happened for v2.2.3). Trigger this workflow to publish uni-pydantic on its
+# own, with no wheel rebuild and none of that cross-job `needs` fragility.
+#
+# Dispatch FROM the release tag so the correct source is built, e.g.:
+#   gh workflow run publish-pydantic.yml --ref v2.2.3 -f version=2.2.3 -f target=pypi
+# (The checkout uses the dispatch ref; the version input is asserted against the
+# checked-out pyproject so a wrong ref/version pairing fails fast.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'uni-pydantic version to build & publish (e.g. 2.2.3). Must match the checked-out tag/ref pyproject.'
+        required: true
+        type: string
+      target:
+        description: 'Publish target'
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+      dry_run:
+        description: 'Build and validate without publishing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-pydantic:
+    name: Build & publish uni-pydantic ${{ inputs.version }} to ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    # Gates secret access (and any required reviewer approval) behind the chosen
+    # index's environment, mirroring release-wheels.yml.
+    environment: ${{ inputs.target }}
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: ${{ inputs.target }}
+    steps:
+      - name: Validate version input
+        # Defence-in-depth: reject anything that is not a plain semver-ish
+        # string before it reaches a shell or an index specifier.
+        run: |
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.0-9A-Za-z+-]*)$'; then
+            echo "Refusing non-semver version input: $VERSION"
+            exit 1
+          fi
+
+      # No explicit `ref:` — workflow_dispatch checks out the ref it was
+      # dispatched from, so dispatching from the release tag builds that tag's
+      # source (and avoids interpolating the input into `ref:`).
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Assert pyproject version matches the requested version
+        run: |
+          PY=$(grep '^version = ' bindings/uni-pydantic/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$PY" ]; then
+            echo "Requested version $VERSION but checked-out uni-pydantic pyproject is $PY."
+            echo "Dispatch this workflow from the matching tag, e.g. --ref v$VERSION."
+            exit 1
+          fi
+
+      - name: Build uni-pydantic
+        run: uv build bindings/uni-pydantic
+
+      - name: Verify uni-db is installable from the target index (with retry)
+        run: |
+          if [ "$TARGET" = "testpypi" ]; then
+            INDEX_ARGS="--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/"
+          else
+            INDEX_ARGS=""
+          fi
+          uv venv
+          ATTEMPTS=20
+          for i in $(seq 1 "$ATTEMPTS"); do
+            uv pip install $INDEX_ARGS "uni-db==${VERSION}" && break
+            if [ "$i" -eq "$ATTEMPTS" ]; then
+              echo "uni-db==${VERSION} not visible on ${TARGET} after ${ATTEMPTS} attempts — publish the uni-db wheels first."
+              exit 1
+            fi
+            echo "uni-db==${VERSION} not yet on ${TARGET} (attempt ${i}/${ATTEMPTS}), retrying in 30s..."
+            sleep 30
+          done
+
+      - name: Publish to TestPyPI (dry run)
+        if: inputs.dry_run == true && inputs.target == 'testpypi'
+        run: uv publish --dry-run --publish-url https://test.pypi.org/legacy/ bindings/uni-pydantic/dist/*
+
+      - name: Publish to PyPI (dry run)
+        if: inputs.dry_run == true && inputs.target == 'pypi'
+        run: uv publish --dry-run bindings/uni-pydantic/dist/*
+
+      - name: Publish to TestPyPI
+        if: inputs.dry_run != true && inputs.target == 'testpypi'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        # --check-url makes the publish idempotent: files already on the index
+        # are skipped rather than erroring, so a re-trigger is safe.
+        run: uv publish --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ bindings/uni-pydantic/dist/*
+
+      - name: Publish to PyPI
+        if: inputs.dry_run != true && inputs.target == 'pypi'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --check-url https://pypi.org/simple/ bindings/uni-pydantic/dist/*

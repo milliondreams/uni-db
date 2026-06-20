@@ -187,3 +187,36 @@ QUERY adults WHERE age > $min_age RETURN nm
     names = {r["nm"] for r in rows}
     assert "Charlie" in names  # age 35
     assert "Bob" not in names  # age 25
+
+
+async def test_session_profile(async_social_db_populated):
+    """Async: `session.locy_with(prog).profile()` returns (result, profile).
+
+    Mirrors the sync `test_profile_recursive`; guards the async Locy
+    profile() parity gap (sync builders had profile(), async did not).
+    """
+    db = async_social_db_populated
+    session = db.session()
+    result, profile = await session.locy_with(REACHABLE_PROGRAM).profile()
+
+    # Same derived facts as run().
+    assert len(result.derived.get("reachable", [])) >= 3
+
+    # Structured profile down to a recursive stratum.
+    assert profile.total_time_ms >= 0.0
+    recursive = [s for s in profile.strata if s["recursive"]]
+    assert recursive, "expected a recursive stratum"
+    assert recursive[0]["iterations"] >= 2
+    assert "Locy Profile" in str(profile)
+
+
+async def test_tx_profile(async_social_db_populated):
+    """Async: `tx.locy_with(prog).profile()` returns (result, profile)."""
+    db = async_social_db_populated
+    session = db.session()
+    tx = await session.tx()
+    result, profile = await tx.locy_with(REACHABLE_PROGRAM).profile()
+
+    assert len(result.derived.get("reachable", [])) >= 3
+    assert profile.total_time_ms >= 0.0
+    assert isinstance(profile.strata, list) and len(profile.strata) >= 1

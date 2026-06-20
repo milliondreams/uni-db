@@ -41,6 +41,19 @@ async def _seed_person_schema(db):
     return s
 
 
+async def _person_schema_no_flush(db):
+    """Declare the Person schema and return a session — no seed, no flush.
+    #97 regression tests must never flush before forking.
+    """
+    await db.schema().label("Person").property("name", "string").apply()
+    return db.session()
+
+
+async def _count(scope):
+    rows = await scope.query("MATCH (n:Person) RETURN count(n) AS c")
+    return rows[0]["c"]
+
+
 # ---------------------------------------------------------------------------
 # Basic lifecycle
 # ---------------------------------------------------------------------------
@@ -250,3 +263,62 @@ async def test_fork_schema_label_strict():
 
     del forked
     await db.drop_fork("scenario")
+
+
+# ---------------------------------------------------------------------------
+# #97 — fork inherits the parent's committed-but-unflushed (L0) writes.
+# No flush before forking; assert the fork sees inherited rows before it
+# mutates anything.
+# ---------------------------------------------------------------------------
+
+
+async def test_async_fork_inherits_unflushed_single_node():
+    db = await _make_db(disable_fork_sweeper=True)
+    s = await _person_schema_no_flush(db)
+    tx = await s.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice'})")
+    await tx.commit()  # no flush
+
+    assert await _count(s) == 1
+    fork = await s.fork("scn").build()
+    assert await _count(fork) == 1, "fork must inherit the parent's unflushed L0 write"
+
+    del fork
+    await db.drop_fork("scn")
+
+
+async def test_async_fork_inherits_unflushed_relationship():
+    db = await _make_db(disable_fork_sweeper=True)
+    await db.schema().label("Person").property("name", "string").apply()
+    await db.schema().edge_type("KNOWS", ["Person"], ["Person"]).apply()
+    s = db.session()
+    tx = await s.tx()
+    await tx.execute("CREATE (:Person {name: 'A'})-[:KNOWS]->(:Person {name: 'B'})")
+    await tx.commit()  # no flush
+
+    fork = await s.fork("scn").build()
+    assert await _count(fork) == 2, "fork must see both endpoints"
+    rel = await fork.query("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r) AS c")
+    assert rel[0]["c"] == 1, "fork must inherit the unflushed relationship"
+
+    del fork
+    await db.drop_fork("scn")
+
+
+async def test_async_parent_writes_after_fork_invisible_no_flush():
+    db = await _make_db(disable_fork_sweeper=True)
+    s = await _person_schema_no_flush(db)
+    tx = await s.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice'})")
+    await tx.commit()
+
+    fork = await s.fork("scn").build()
+    tx = await s.tx()
+    await tx.execute("CREATE (:Person {name: 'Bob'})")
+    await tx.commit()
+
+    assert await _count(fork) == 1, "fork sees only the fork-point row"
+    assert await _count(s) == 2, "parent sees both rows"
+
+    del fork
+    await db.drop_fork("scn")

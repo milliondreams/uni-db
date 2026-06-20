@@ -32,6 +32,7 @@ pub mod fork_schema_evolution;
 pub mod fork_strict_schema;
 pub mod fork_tag;
 pub mod fork_ttl;
+pub mod fork_unflushed_l0;
 pub mod fork_use_cases;
 pub mod fork_watch;
 pub mod fork_writes;

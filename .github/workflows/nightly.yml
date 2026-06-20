@@ -181,6 +181,46 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
+  model-check:
+    name: Concurrency Model Check (loom + shuttle)
+    runs-on: ubuntu-xlarge
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      # Exhaustively model-checks the OCC commit core (write-write + read-write
+      # conflict detection in crates/uni-store/src/runtime/occ.rs) over all
+      # 2- and 3-committer interleavings. See src/occ_loom_model.rs. Must run
+      # ONLY --test occ_model: other suites drive real Writers, whose loom
+      # atomics panic outside a model.
+      - name: loom (exhaustive, 2 & 3 committers)
+        env:
+          LOOM_MAX_PREEMPTIONS: 3
+        run: cargo nextest run -p uni-store --features loom --test occ_model
+
+      # Randomized scheduler over the same models — scales past loom's
+      # exhaustive limit (10k iterations/model; reproducible by seed on failure).
+      - name: shuttle (randomized)
+        run: cargo nextest run -p uni-store --features shuttle --test occ_model
+
   bench:
     name: Benchmarks (artifact upload)
     runs-on: ubuntu-xlarge

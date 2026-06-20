@@ -519,6 +519,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "assoc"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfdc70193dadb9d7287fa4b633f15f90c876915b31f6af17da307fc59c9859a8"
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,6 +2060,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-siphasher"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03efed02df0504d71e44bfd51d3329f401b8303a2fd14254acf05c95a0af0153"
+
+[[package]]
 name = "const-str"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2129,6 +2141,19 @@ dependencies = [
  "bitflags 1.3.2",
  "core-foundation 0.9.4",
  "libc",
+]
+
+[[package]]
+name = "corosensei"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6886a0c0f263965933c438626e7179139a62b978a33aa18281cbf0cd5a975f34"
+dependencies = [
+ "autocfg",
+ "cfg-if",
+ "libc",
+ "scopeguard",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8429,6 +8454,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
+name = "owo-colors"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
+
+[[package]]
 name = "packedvec"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9564,6 +9595,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3382fc9f0aad4f2e2a56b53d9133c8c810b4dbf21e7e370e24346161a5b2c7bd"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_pcg"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59cad018caf63deb318e5a4586d99a24424a364f40f1e5778c29aca23f4fc73e"
+dependencies = [
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -10928,6 +10968,27 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "shuttle"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba93071c1b720be2505f4c8ce2863502cb9a26a3819e268df1932458a755152c"
+dependencies = [
+ "assoc",
+ "bitvec",
+ "cfg-if",
+ "const-siphasher",
+ "corosensei",
+ "hex",
+ "owo-colors",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "rand_pcg",
+ "scoped-tls",
+ "smallvec 1.15.2",
+ "tracing",
+]
 
 [[package]]
 name = "signal-hook"
@@ -13359,6 +13420,7 @@ dependencies = [
  "lance-linalg",
  "lancedb",
  "log",
+ "loom",
  "lru",
  "metrics",
  "metrics-util",
@@ -13368,6 +13430,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+ "shuttle",
  "tempfile",
  "tokio",
  "tokio-util",

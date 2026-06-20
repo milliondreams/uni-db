@@ -22,3 +22,8 @@ pub use runtime::context::QueryContext;
 pub use runtime::property_manager::PropertyManager;
 pub use runtime::writer::Writer;
 pub use snapshot::manager::SnapshotManager;
+
+/// loom/shuttle model-checking harness for the OCC commit core. Compiled only
+/// under `--features loom` / `--features shuttle`; see `runtime/sync.rs`.
+#[cfg(any(feature = "loom", feature = "shuttle"))]
+pub mod occ_loom_model;

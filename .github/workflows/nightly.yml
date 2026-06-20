@@ -221,6 +221,75 @@ jobs:
       - name: shuttle (randomized)
         run: cargo nextest run -p uni-store --features shuttle --test occ_model
 
+  tsan:
+    name: ThreadSanitizer (SSI commit path)
+    runs-on: ubuntu-xlarge
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # build-std needs the nightly toolchain + rust-src to recompile std with
+      # the sanitizer instrumentation.
+      - name: Setup Rust (nightly + rust-src, for -Zbuild-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "tsan"
+          cache-on-failure: true
+
+      # Run the genuinely multi-threaded SSI suites (real tokio worker threads +
+      # tokio::spawn) under ThreadSanitizer — the live async commit path the
+      # loom/shuttle models (model-check job) structurally cannot reach. std is
+      # rebuilt instrumented via -Zbuild-std so cross-thread sync inside std/tokio
+      # is visible. The single-threaded ssi_occ_test (uni-store) is deliberately
+      # excluded: no parallelism → no races to find.
+      #
+      # halt_on_error=0 collects every report into tsan.log (uploaded for triage);
+      # exitcode=66 still fails the job on any non-suppressed race, so the lane
+      # keeps teeth. Suppressions are scoped to known-benign FFI/parking_lot
+      # frames only — never our own crates.
+      # --test-threads 1 runs the test PROCESSES serially. Each SSI test already
+      # spins its own multi-thread tokio runtime (8 workers) + spawned writers,
+      # so TSan still sees full in-process cross-thread interleavings — serial
+      # execution costs zero race coverage. Running two instrumented heavy
+      # processes at once instead thrashes under TSan's 5-10x memory/CPU overhead
+      # and stalls the MERGE retry-storm test past nextest's 180s ceiling. Serial
+      # keeps every test ~1-4s, well inside the default slow-timeout.
+      - name: ThreadSanitizer on the SSI suite
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTFLAGS: "-Zsanitizer=thread"
+          PROPTEST_CASES: "16"
+          TSAN_OPTIONS: "suppressions=${{ github.workspace }}/.config/tsan-suppressions.txt:halt_on_error=0:exitcode=66:second_deadlock_stack=1:history_size=4"
+        run: |
+          cargo +nightly nextest run -Z build-std \
+            --target x86_64-unknown-linux-gnu \
+            -p uni-db --test integration \
+            --test-threads 1 \
+            -E 'test(/ssi_invariants::/) | test(/ssi_occ_e2e::/) | test(/ssi_stress::/)' \
+            2>&1 | tee tsan.log
+
+      # The log IS the triage input for tightening .config/tsan-suppressions.txt.
+      - name: Upload ThreadSanitizer log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-log
+          path: tsan.log
+          if-no-files-found: warn
+
   bench:
     name: Benchmarks (artifact upload)
     runs-on: ubuntu-xlarge

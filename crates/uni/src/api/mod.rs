@@ -3688,9 +3688,15 @@ impl UniBuilder {
         fork_registry.set_max_forks(self.config.max_forks).await;
         let storage_uri_for_recovery = storage_uri.clone();
         let recovery_store = storage.store();
+        // L3: pass the schema-derived candidate dataset names so recovery can
+        // reconstruct and reclaim zombie `fork_{id}_{dataset}` branches left
+        // by a create that crashed before recording them in the registry.
+        let recovery_candidates =
+            crate::api::fork::fork_candidate_dataset_names(&schema_manager.schema());
         let recovered = uni_store::fork::recovery::recover_forks(
             &fork_registry,
             &recovery_store,
+            &recovery_candidates,
             uni_store::fork::recovery::join_uri_with(storage_uri_for_recovery),
         )
         .await

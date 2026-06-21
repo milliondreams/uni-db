@@ -34,10 +34,14 @@ use super::registry::ForkRegistryHandle;
 /// failure. Recovery is intentionally best-effort for individual
 /// branches: a missing branch on a `Pending` rollback path is
 /// success.
-#[instrument(skip(registry, storage_store, dataset_uri_for), level = "info")]
+#[instrument(
+    skip(registry, storage_store, candidate_datasets, dataset_uri_for),
+    level = "info"
+)]
 pub async fn recover_forks<F>(
     registry: &ForkRegistryHandle,
     storage_store: &Arc<dyn ObjectStore>,
+    candidate_datasets: &[String],
     mut dataset_uri_for: F,
 ) -> Result<usize, UniError>
 where
@@ -61,7 +65,7 @@ where
     for info in pending {
         info!(fork_name = %info.name, fork_id = %info.id, "rolling back Pending create");
         // Walk any partial branches and force-delete them.
-        rollback_branches(&info, &mut dataset_uri_for).await;
+        rollback_branches(&info, candidate_datasets, &mut dataset_uri_for).await;
         registry.rollback_create(&info.name).await?;
         reconciled += 1;
     }
@@ -133,13 +137,42 @@ where
 /// names already recorded; un-recorded zombie branches are surfaced
 /// in the spike binary's fault-injection scenario rather than
 /// silently force-deleted, since we don't know what name to use.
-async fn rollback_branches<F>(info: &ForkInfo, dataset_uri_for: &mut F)
-where
+async fn rollback_branches<F>(
+    info: &ForkInfo,
+    candidate_datasets: &[String],
+    dataset_uri_for: &mut F,
+) where
     F: FnMut(&str) -> String,
 {
+    // Recorded branches (the writer got far enough to persist `datasets`).
     if !info.datasets.is_empty() {
         delete_all_branches(info, dataset_uri_for).await;
     }
+
+    // L3: a create that failed before recording any branch leaves a Pending
+    // entry with an EMPTY `datasets` map plus `fork_{id}_{dataset}` branches
+    // that no record references — zombies. Reconstruct the candidate branch
+    // names from the schema-derived dataset list and force-delete them
+    // (idempotent, so re-deleting an already-recorded branch is harmless and
+    // an absent branch is a no-op). Caller passes the current schema's
+    // candidate datasets; a branch whose dataset has since left the schema
+    // is not reconstructable here (accepted: schema is persisted, so drift
+    // between the crashed create and recovery is unlikely).
+    #[cfg(feature = "lance-backend")]
+    for dataset in candidate_datasets {
+        let branch = format!("fork_{}_{}", info.id, dataset);
+        let uri = dataset_uri_for(dataset);
+        if let Err(e) = crate::backend::lance_branch::delete_branch(&uri, &branch).await {
+            warn!(
+                dataset = %dataset,
+                branch = %branch,
+                "zombie-branch reclamation during recovery failed: {e}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "lance-backend"))]
+    let _ = candidate_datasets;
 }
 
 /// Convenience for tests: a `dataset_uri_for` closure that joins a

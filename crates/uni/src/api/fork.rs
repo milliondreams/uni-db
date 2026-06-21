@@ -369,7 +369,9 @@ async fn create_fork_2pc(
 /// `edges` tables, per-label `vertices_{label}`, and per-edge-type
 /// `deltas_{type}_{dir}` / `adjacency_{type}_{dir}` tables. Membership is
 /// schema-derived; on-disk existence is checked by the consumer.
-fn fork_candidate_dataset_names(schema: &uni_common::core::schema::Schema) -> Vec<String> {
+pub(crate) fn fork_candidate_dataset_names(
+    schema: &uni_common::core::schema::Schema,
+) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
 
     // Main label-agnostic tables. `flush_to_l1` always writes here.
@@ -426,85 +428,111 @@ async fn build_datasets_for_fork(
     // and the legacy `current_version` / `create_branch` helpers apply.
     let parent_scope = parent.fork_scope();
 
-    for dataset_name in candidate_names {
-        let dataset_uri = join_uri(&storage_uri, &dataset_name);
-        if !path_exists(&dataset_uri) {
-            continue;
-        }
-
-        let branch_name = format!("fork_{fork_id}_{dataset_name}");
-        match parent_scope
-            .as_ref()
-            .and_then(|s| s.branch_for(&dataset_name))
-        {
-            Some(parent_branch) => {
-                // Nested fork: branch off the parent fork's branch tip.
-                let parent_v =
-                    lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
-                        .await
-                        .map_err(|e| UniError::ForkLifecycle {
-                            name: format!("<fork:{fork_id}>"),
-                            stage: "current_version_on_branch",
-                            source: e.into(),
-                        })?;
-                lance_branch::create_branch_from(
-                    &dataset_uri,
-                    &branch_name,
-                    &parent_branch,
-                    parent_v,
-                )
-                .await
-                .map_err(|e| UniError::ForkLifecycle {
-                    name: format!("<fork:{fork_id}>"),
-                    stage: "create_branch_from",
-                    source: e.into(),
-                })?;
+    // L3: every branch we *attempt* to create, recorded before the call so a
+    // partially-created branch on a mid-loop failure can be force-deleted —
+    // otherwise it would orphan as a "zombie" (no registry entry references
+    // it, so neither in-process rollback nor recovery would reclaim it).
+    let mut attempted: Vec<(String, String)> = Vec::new();
+    let build_result: Result<()> = async {
+        for dataset_name in candidate_names {
+            let dataset_uri = join_uri(&storage_uri, &dataset_name);
+            if !path_exists(&dataset_uri) {
+                continue;
             }
-            None => {
-                // Either parent is primary (no scope), or parent is a
-                // fork that has no branch for this dataset yet. In both
-                // cases the legacy "branch off main" path is correct:
-                // - primary case: we want main as the child's ancestor.
-                // - nested-but-unbranched case: we'd otherwise need to
-                //   branch off "main with no parent fork branch", which
-                //   means the parent fork never wrote this dataset, so
-                //   main *is* the correct ancestor for the child as
-                //   well. (The child can write through on-the-fly
-                //   creation later; the registry record we build here
-                //   reflects only the primary-known dataset.)
-                if parent_scope.is_some() {
-                    // No parent branch for this dataset — defer to
-                    // on-the-fly creation when the child first writes,
-                    // exactly like a primary-parent fork would for a
-                    // brand-new label. Skip eager branching here.
-                    continue;
-                }
-                // Primary-parent fork (M1): branch at the version captured
-                // atomically with the flush, not a re-read of the live
-                // tip. The captured map is built from the same candidate
-                // list + existence check, so the fallback (a dataset that
-                // somehow materialized after capture) should never fire,
-                // but keep it for robustness.
-                let parent_v = match captured_versions.get(&dataset_name) {
-                    Some(v) => *v,
-                    None => lance_branch::current_version(&dataset_uri)
-                        .await
-                        .map_err(|e| UniError::ForkLifecycle {
-                            name: format!("<fork:{fork_id}>"),
-                            stage: "current_version",
-                            source: e.into(),
-                        })?,
-                };
-                lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
+
+            let branch_name = format!("fork_{fork_id}_{dataset_name}");
+            attempted.push((dataset_name.clone(), branch_name.clone()));
+            match parent_scope
+                .as_ref()
+                .and_then(|s| s.branch_for(&dataset_name))
+            {
+                Some(parent_branch) => {
+                    // Nested fork: branch off the parent fork's branch tip.
+                    let parent_v =
+                        lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
+                            .await
+                            .map_err(|e| UniError::ForkLifecycle {
+                                name: format!("<fork:{fork_id}>"),
+                                stage: "current_version_on_branch",
+                                source: e.into(),
+                            })?;
+                    lance_branch::create_branch_from(
+                        &dataset_uri,
+                        &branch_name,
+                        &parent_branch,
+                        parent_v,
+                    )
                     .await
                     .map_err(|e| UniError::ForkLifecycle {
                         name: format!("<fork:{fork_id}>"),
-                        stage: "create_branch",
+                        stage: "create_branch_from",
                         source: e.into(),
                     })?;
+                }
+                None => {
+                    // Either parent is primary (no scope), or parent is a
+                    // fork that has no branch for this dataset yet. In both
+                    // cases the legacy "branch off main" path is correct:
+                    // - primary case: we want main as the child's ancestor.
+                    // - nested-but-unbranched case: we'd otherwise need to
+                    //   branch off "main with no parent fork branch", which
+                    //   means the parent fork never wrote this dataset, so
+                    //   main *is* the correct ancestor for the child as
+                    //   well. (The child can write through on-the-fly
+                    //   creation later; the registry record we build here
+                    //   reflects only the primary-known dataset.)
+                    if parent_scope.is_some() {
+                        // No parent branch for this dataset — defer to
+                        // on-the-fly creation when the child first writes,
+                        // exactly like a primary-parent fork would for a
+                        // brand-new label. Skip eager branching here.
+                        continue;
+                    }
+                    // Primary-parent fork (M1): branch at the version captured
+                    // atomically with the flush, not a re-read of the live
+                    // tip. The captured map is built from the same candidate
+                    // list + existence check, so the fallback (a dataset that
+                    // somehow materialized after capture) should never fire,
+                    // but keep it for robustness.
+                    let parent_v = match captured_versions.get(&dataset_name) {
+                        Some(v) => *v,
+                        None => lance_branch::current_version(&dataset_uri)
+                            .await
+                            .map_err(|e| UniError::ForkLifecycle {
+                                name: format!("<fork:{fork_id}>"),
+                                stage: "current_version",
+                                source: e.into(),
+                            })?,
+                    };
+                    lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
+                        .await
+                        .map_err(|e| UniError::ForkLifecycle {
+                            name: format!("<fork:{fork_id}>"),
+                            stage: "create_branch",
+                            source: e.into(),
+                        })?;
+                }
+            }
+            branches.insert(dataset_name, branch_name);
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = build_result {
+        // Force-delete every branch we attempted (idempotent: a never-created
+        // branch is a no-op). This keeps a failed fork-create from leaking
+        // zombie branches while the process keeps running; recovery provides
+        // the same guarantee across a crash (see `recovery::rollback_branches`).
+        for (dataset_name, branch_name) in &attempted {
+            let dataset_uri = join_uri(&storage_uri, dataset_name);
+            if let Err(rb) = lance_branch::delete_branch(&dataset_uri, branch_name).await {
+                tracing::warn!(
+                    "fork-create cleanup: delete_branch '{branch_name}' on '{dataset_uri}' failed: {rb}"
+                );
             }
         }
-        branches.insert(dataset_name, branch_name);
+        return Err(e);
     }
 
     Ok(branches)

@@ -188,3 +188,67 @@ async fn cascade_surfaces_delete_failures_and_stays_recoverable() -> Result<()> 
 
     Ok(())
 }
+
+/// L3: a fork creation that fails partway (the fault trips the second
+/// `create_branch`) force-deletes the branches it already created in-process
+/// — no recovery, no restart — so no zombie branch is leaked.
+#[tokio::test]
+#[ignore = "mutates the process-wide UNI_FORK_INJECT_FAIL_AFTER counter; run with --test-threads=1 or --run-ignored ignored-only"]
+async fn fork_create_failure_cleans_up_partial_branches_in_process() -> Result<()> {
+    use uni_store::backend::lance_branch;
+
+    fault_injection::reset();
+    clear_fail_create_after();
+
+    let dir = tempfile::tempdir()?;
+    let uri = dir.path().display().to_string();
+
+    let db = Uni::open(&uri).build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Person {name: 'seed'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Arm the hook so the SECOND `create_branch` inside
+    // `build_datasets_for_fork` fails (after the first succeeded).
+    fault_injection::reset();
+    set_fail_create_after(1);
+
+    let result = primary.fork("partial").await;
+
+    clear_fail_create_after();
+    fault_injection::reset();
+
+    assert!(
+        result.is_err(),
+        "fork() must fail under the create_branch fault"
+    );
+
+    // No zombie fork branch remains on any dataset — the in-process cleanup
+    // reclaimed the branch it had already created before the failure.
+    for dataset in ["vertices", "edges", "vertices_Person"] {
+        let dataset_uri = format!("{uri}/{dataset}.lance");
+        if std::path::Path::new(&dataset_uri).exists() {
+            let branches = lance_branch::list_branches(&dataset_uri).await?;
+            assert!(
+                !branches.iter().any(|b| b.starts_with("fork_")),
+                "dataset '{dataset}' leaked a zombie fork branch: {branches:?}"
+            );
+        }
+    }
+
+    // And the registry has no leftover entry.
+    assert!(
+        db.list_forks().await.is_empty(),
+        "a failed fork-create must leave no registry entry"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

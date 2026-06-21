@@ -32,7 +32,7 @@ pub use id_reservoir::{DEFAULT_RESERVOIR_BATCH, TxIdReservoir};
 pub use uni_common::graph::simple_graph::{Direction, SimpleGraph};
 pub use wal::WriteAheadLog;
 pub use working_graph::WorkingGraph;
-pub use writer::Writer;
+pub use writer::{ForkPoint, Writer};
 
 use uni_common::core::id::{Eid, Vid};
 

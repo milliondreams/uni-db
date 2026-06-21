@@ -205,10 +205,27 @@ async fn create_fork_2pc(
     // The flush used to be gated on `parent.is_forked()`, leaving the
     // primary case to a `db.flush()`-before-fork convention that uni-db
     // neither requires nor recommends.
-    if let Some(writer_lock) = &parent.db.writer {
+    // Materialize *and* atomically capture the fork point (M1). A single
+    // `flush_and_capture_fork_point` call flushes the parent's
+    // committed-but-unflushed L0 and, under the same held `flush_lock`,
+    // reads the allocator HWM and every existing dataset's Lance version.
+    // Capturing under the lock closes the window in which a concurrent
+    // parent commit/flush could advance the allocator or a dataset tip
+    // between the flush and the reads — otherwise the fork could branch
+    // off post-fork-point rows or bootstrap a stale HWM and collide VIDs.
+    // The captured per-dataset versions are passed into
+    // `build_datasets_for_fork` so branches are cut at the fork-point
+    // version rather than a re-read live tip.
+    let candidate_datasets = fork_candidate_dataset_names(&parent.db.schema.schema());
+    let fork_point = if let Some(writer_lock) = &parent.db.writer {
         let writer: &uni_store::Writer = writer_lock.as_ref();
-        writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
-    }
+        writer
+            .flush_and_capture_fork_point(&candidate_datasets)
+            .await
+            .map_err(UniError::Internal)?
+    } else {
+        uni_store::ForkPoint::default()
+    };
 
     // Capture parent state at fork-point: snapshot id and schema version.
     let snapshot_manager = parent.db.storage.snapshot_manager();
@@ -246,20 +263,14 @@ async fn create_fork_2pc(
     // with primary's pre-existing rows visible through the `base_paths`
     // chain — Lance read-merge then shadows the fork's writes. See
     // module rustdoc on `uni_store::fork::id_alloc` for the full
-    // discussion. We read primary's HWM from in-memory state because
-    // primary's allocator file may live on a different `ObjectStore`
-    // than the fork's path resolves through.
-    let (vid_hwm, eid_hwm) = if let Some(writer_lock) = &parent.db.writer {
-        let writer: &uni_store::Writer = writer_lock.as_ref();
-        writer.allocator.current_hwm().await
-    } else {
-        (0, 0)
-    };
+    // discussion. The HWM was captured atomically with the flush above
+    // (under `flush_lock`), so it cannot have drifted from the dataset
+    // versions the branches are cut at.
     if let Err(e) = uni_store::fork::id_alloc::bootstrap_fork_from_primary_hwm(
         parent.db.storage.store(),
         &fork_id,
-        vid_hwm,
-        eid_hwm,
+        fork_point.vid_hwm,
+        fork_point.eid_hwm,
     )
     .await
     {
@@ -273,23 +284,56 @@ async fn create_fork_2pc(
     // collects the dataset list from the *current* schema's labels +
     // edge types. New labels created on a forked session land in
     // Phase 2 (on-the-fly dataset+branch creation).
-    let datasets = match build_datasets_for_fork(parent, fork_id).await {
-        Ok(ds) => ds,
-        Err(e) => {
-            // Recovery on next boot will roll back the Pending entry
-            // and force-delete any partial branches. We also try a
-            // best-effort rollback here so the state is clean if the
-            // process keeps running.
-            if let Err(rb) = registry.rollback_create(&name).await {
-                tracing::warn!("rollback after partial create_branch failed: {rb}");
+    let datasets =
+        match build_datasets_for_fork(parent, fork_id, &fork_point.dataset_versions).await {
+            Ok(ds) => ds,
+            Err(e) => {
+                // Recovery on next boot will roll back the Pending entry
+                // and force-delete any partial branches. We also try a
+                // best-effort rollback here so the state is clean if the
+                // process keeps running.
+                if let Err(rb) = registry.rollback_create(&name).await {
+                    tracing::warn!("rollback after partial create_branch failed: {rb}");
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
 
     // Step 4: promote to Active with the full datasets map.
     let active = registry.finish_create(&name, datasets).await?;
     Ok(active)
+}
+
+/// Candidate Lance dataset names a fork may branch, derived from `schema`.
+///
+/// The single source of truth for fork dataset naming, shared by the
+/// fork-point version capture ([`uni_store::Writer::flush_and_capture_fork_point`])
+/// and [`build_datasets_for_fork`] so the captured versions key exactly
+/// the datasets the fork later branches. Includes the main `vertices` /
+/// `edges` tables, per-label `vertices_{label}`, and per-edge-type
+/// `deltas_{type}_{dir}` / `adjacency_{type}_{dir}` tables. Membership is
+/// schema-derived; on-disk existence is checked by the consumer.
+fn fork_candidate_dataset_names(schema: &uni_common::core::schema::Schema) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+
+    // Main label-agnostic tables. `flush_to_l1` always writes here.
+    names.push("vertices".to_string());
+    names.push("edges".to_string());
+
+    // Per-label vertex tables.
+    for label in schema.labels.keys() {
+        names.push(format!("vertices_{label}"));
+    }
+
+    // Per-edge-type delta + adjacency tables.
+    for edge_type in schema.edge_types.keys() {
+        names.push(format!("deltas_{edge_type}_fwd"));
+        names.push(format!("deltas_{edge_type}_bwd"));
+        names.push(format!("adjacency_{edge_type}_fwd"));
+        names.push(format!("adjacency_{edge_type}_bwd"));
+    }
+
+    names
 }
 
 /// Walk the schema's labels and edge types, calling `lance_branch::create_branch`
@@ -311,29 +355,13 @@ async fn create_fork_2pc(
 async fn build_datasets_for_fork(
     parent: &Session,
     fork_id: ForkId,
+    captured_versions: &BTreeMap<String, u64>,
 ) -> Result<BTreeMap<String, String>> {
     let schema = parent.db.schema.schema();
     let storage_uri = parent.db.storage.base_uri().to_string();
 
     let mut branches: BTreeMap<String, String> = BTreeMap::new();
-    let mut candidate_names: Vec<String> = Vec::new();
-
-    // Main label-agnostic tables. `flush_to_l1` always writes here.
-    candidate_names.push("vertices".to_string());
-    candidate_names.push("edges".to_string());
-
-    // Per-label vertex tables.
-    for label in schema.labels.keys() {
-        candidate_names.push(format!("vertices_{label}"));
-    }
-
-    // Per-edge-type delta + adjacency tables.
-    for edge_type in schema.edge_types.keys() {
-        candidate_names.push(format!("deltas_{edge_type}_fwd"));
-        candidate_names.push(format!("deltas_{edge_type}_bwd"));
-        candidate_names.push(format!("adjacency_{edge_type}_fwd"));
-        candidate_names.push(format!("adjacency_{edge_type}_bwd"));
-    }
+    let candidate_names = fork_candidate_dataset_names(&schema);
 
     // Phase 3: when the parent is a forked session, route every Lance
     // `create_branch` call through the parent's branch so the child's
@@ -395,13 +423,22 @@ async fn build_datasets_for_fork(
                     // brand-new label. Skip eager branching here.
                     continue;
                 }
-                let parent_v = lance_branch::current_version(&dataset_uri)
-                    .await
-                    .map_err(|e| UniError::ForkLifecycle {
-                        name: format!("<fork:{fork_id}>"),
-                        stage: "current_version",
-                        source: e.into(),
-                    })?;
+                // Primary-parent fork (M1): branch at the version captured
+                // atomically with the flush, not a re-read of the live
+                // tip. The captured map is built from the same candidate
+                // list + existence check, so the fallback (a dataset that
+                // somehow materialized after capture) should never fire,
+                // but keep it for robustness.
+                let parent_v = match captured_versions.get(&dataset_name) {
+                    Some(v) => *v,
+                    None => lance_branch::current_version(&dataset_uri)
+                        .await
+                        .map_err(|e| UniError::ForkLifecycle {
+                            name: format!("<fork:{fork_id}>"),
+                            stage: "current_version",
+                            source: e.into(),
+                        })?,
+                };
                 lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
                     .await
                     .map_err(|e| UniError::ForkLifecycle {

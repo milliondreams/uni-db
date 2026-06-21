@@ -1,6 +1,7 @@
 pub mod fork_budget;
 pub mod fork_cancel;
 pub mod fork_concurrent_writers;
+pub mod fork_create_concurrent_writes;
 pub mod fork_creation_concurrency;
 pub mod fork_custom_functions;
 pub mod fork_diff;

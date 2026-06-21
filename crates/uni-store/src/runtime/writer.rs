@@ -19,7 +19,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use metrics;
 use parking_lot::{Mutex as PlMutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info, instrument};
@@ -64,6 +64,30 @@ impl Default for WriterConfig {
     }
 }
 
+/// Parent state captured atomically at a fork point under `flush_lock`.
+///
+/// Holds the allocator high-water marks and every existing dataset's
+/// Lance main-branch version at the instant the parent's L0 was
+/// flushed. Because [`Writer::flush_and_capture_fork_point`] reads these
+/// while still holding `flush_lock`, no concurrent commit or flush can
+/// advance the allocator or any dataset tip between the flush and the
+/// reads. A fork built from these values therefore cannot collide VIDs
+/// with the parent nor inherit rows committed after the fork point.
+#[derive(Clone, Debug, Default)]
+pub struct ForkPoint {
+    /// Next vertex id the parent would allocate at the fork point.
+    pub vid_hwm: u64,
+    /// Next edge id the parent would allocate at the fork point.
+    pub eid_hwm: u64,
+    /// `dataset_name` → Lance main-branch version at the fork point.
+    ///
+    /// Keys use the same dataset naming as the fork branch loop
+    /// (`vertices`, `edges`, `vertices_{label}`, `deltas_{type}_{dir}`,
+    /// `adjacency_{type}_{dir}`). A dataset with no `.lance` directory
+    /// on disk at the fork point has no entry.
+    pub dataset_versions: BTreeMap<String, u64>,
+}
+
 /// RAII latch on [`StorageManager::flush_in_progress`].
 ///
 /// Sets the flag to `true` on construction (via CAS) and back to `false` on
@@ -97,6 +121,31 @@ fn props_subset(props: &Properties, keys: &HashSet<String>) -> Properties {
         }
     }
     out
+}
+
+/// Join a storage base URI and a dataset name into a `.lance` URI.
+///
+/// Mirrors the fork branch loop's `join_uri` so the versions captured
+/// by [`Writer::flush_and_capture_fork_point`] key the exact same
+/// datasets the fork later branches.
+fn join_lance_uri(base: &str, dataset: &str) -> String {
+    if base.ends_with('/') {
+        format!("{base}{dataset}.lance")
+    } else {
+        format!("{base}/{dataset}.lance")
+    }
+}
+
+/// Cheap on-disk existence check for a dataset `.lance` directory.
+///
+/// Local-fs heuristic: a URI with a `://` scheme is assumed remote and
+/// reported present, deferring the real check to `current_version`.
+/// Mirrors the fork branch loop's `path_exists`.
+fn lance_path_exists(uri: &str) -> bool {
+    if uri.contains("://") {
+        return true;
+    }
+    std::path::Path::new(uri).exists()
 }
 
 /// Output of [`Writer::flush_stream_l1`]: the built (but not yet
@@ -3420,6 +3469,61 @@ impl Writer {
         self.flush_inline_under_lock(name).await
     }
 
+    /// Flush L0→L1 and capture the fork point under one held `flush_lock`.
+    ///
+    /// Drains in-flight async flushes, takes `flush_lock`, runs the inline
+    /// flush, and then — still holding the lock — reads the allocator
+    /// high-water marks and each existing candidate dataset's Lance
+    /// version. Capturing under the held lock is what makes the fork point
+    /// atomic: no concurrent commit can advance the allocator and no
+    /// concurrent flush can advance a dataset tip between the flush and the
+    /// reads. See [`ForkPoint`].
+    ///
+    /// `candidate_dataset_names` are resolved to `{base_uri}/{name}.lance`;
+    /// names with no `.lance` directory on disk are skipped (returned map
+    /// has no entry for them), matching the fork branch loop's existence
+    /// check.
+    ///
+    /// # Errors
+    /// Propagates flush failures from `flush_inline_under_lock` and any
+    /// per-dataset version read failure from `lance_branch::current_version`.
+    ///
+    /// # Deadlocks
+    /// Must not be called by a task already holding `flush_lock` (e.g.
+    /// `commit_transaction_l0`); the `tokio::sync::Mutex` is not reentrant.
+    /// Fork creation never holds the lock, so the sole call site is safe.
+    pub async fn flush_and_capture_fork_point(
+        &self,
+        candidate_dataset_names: &[String],
+    ) -> Result<ForkPoint> {
+        if let Some(coord) = self.flush_coordinator.as_ref() {
+            let _ = coord.drain(self.config.drop_fork_drain_timeout).await;
+        }
+        let _flush_lock_guard = self.flush_lock.lock().await;
+        self.flush_inline_under_lock(None).await?;
+
+        // Still under `flush_lock`: capture the allocator HWM and every
+        // existing dataset's Lance version so nothing can interleave.
+        let (vid_hwm, eid_hwm) = self.allocator.current_hwm().await;
+
+        let base = self.storage.base_uri();
+        let mut dataset_versions = BTreeMap::new();
+        for name in candidate_dataset_names {
+            let uri = join_lance_uri(base, name);
+            if !lance_path_exists(&uri) {
+                continue;
+            }
+            let version = crate::backend::lance_branch::current_version(&uri).await?;
+            dataset_versions.insert(name.clone(), version);
+        }
+
+        Ok(ForkPoint {
+            vid_hwm,
+            eid_hwm,
+            dataset_versions,
+        })
+    }
+
     /// Async-flush entry point: rotate under `flush_lock`, release the
     /// lock, then submit the stream phase to the [`FlushCoordinator`].
     /// Returns a [`FlushTicket`](crate::runtime::flush_coordinator::FlushTicket)
@@ -3881,7 +3985,7 @@ impl Writer {
         }
 
         // 2.2 Main vertices table
-        let main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> = {
+        let mut main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> = {
             let old_l0 = old_l0_arc.read();
             let mut vertices = Vec::new();
 
@@ -3906,6 +4010,88 @@ impl Writer {
 
             vertices
         };
+
+        // M8: durable label-only mutations across flush windows.
+        //
+        // `SET n:Label` / `REMOVE n:Label` mark the vid in
+        // `vertex_label_overwrites` and update `vertex_labels`, but for a
+        // vid flushed in a PRIOR window they never re-add it to
+        // `vertex_properties`. The loops above key off `vertex_properties`,
+        // so such a relabel would be silently lost: absent from the main
+        // table, the per-label datasets, and the VidLabelsIndex (and so
+        // `rebuild_vid_labels_index` reads stale labels after a restart).
+        // The same-window create+relabel case already works because the
+        // create put the vid in `vertex_properties`.
+        //
+        // Re-derive each overwrite-only vid by fetching its persisted props
+        // and labels, then route it into `main_vertices` (main table +
+        // index), the new per-label datasets, and a tombstone in any
+        // per-label dataset it left. `MATCH (n:OldLabel)` scans the
+        // per-label table directly, so the old-label tombstone is required.
+        let overwrite_only: Vec<(Vid, Vec<String>, u64)> = {
+            let old_l0 = old_l0_arc.read();
+            old_l0
+                .vertex_label_overwrites
+                .iter()
+                .filter(|vid| {
+                    !old_l0.vertex_properties.contains_key(*vid)
+                        && !old_l0.vertex_tombstones.contains(*vid)
+                })
+                .map(|vid| {
+                    let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
+                    let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
+                    (*vid, labels, version)
+                })
+                .collect()
+        };
+        for (vid, new_labels, version) in overwrite_only {
+            // Persisted props of the prior-window row — required so the
+            // re-Appended main row does not blank the vertex's properties.
+            let Some(props) = MainVertexDataset::find_props_by_vid(
+                self.storage.backend(),
+                vid,
+                self.storage.version_high_water_mark(),
+            )
+            .await?
+            else {
+                tracing::warn!(
+                    vid = vid.as_u64(),
+                    "label-only mutation for a vid with no persisted main row; skipping flush \
+                     of its relabel"
+                );
+                continue;
+            };
+            // Labels the vid carried BEFORE this relabel; the storage read
+            // reflects pre-flush state. Any label no longer present must be
+            // tombstoned in its per-label dataset.
+            let old_labels = self
+                .find_vertex_labels_in_storage(vid)
+                .await?
+                .unwrap_or_default();
+
+            main_vertices.push((vid, new_labels.clone(), props.clone(), false, version));
+            for label in &new_labels {
+                if let Some(label_id) = schema.label_id_by_name(label) {
+                    vertices_by_label.entry(label_id).or_default().push((
+                        vid,
+                        new_labels.clone(),
+                        props.clone(),
+                        false,
+                        version,
+                    ));
+                }
+            }
+            for label in &old_labels {
+                if !new_labels.contains(label)
+                    && let Some(label_id) = schema.label_id_by_name(label)
+                {
+                    tombstones_by_label
+                        .entry(label_id)
+                        .or_default()
+                        .push((vid, version));
+                }
+            }
+        }
 
         if !main_vertices.is_empty() {
             let main_vertex_batch = MainVertexDataset::build_record_batch(

@@ -1159,6 +1159,34 @@ impl Database {
         .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
+    /// Promote matched fork rows onto primary with explicit merge options.
+    ///
+    /// `options` is a `PromoteOptions` (enable `upsert` to update existing
+    /// primary vertices in place by `(label, ext_id)`, or
+    /// `delete_promotion` to also propagate fork deletions and surface
+    /// conflicts). The default options reproduce `promote_from_fork`.
+    fn promote_from_fork_with_options(
+        &self,
+        py: Python<'_>,
+        fork_name: &str,
+        patterns: Vec<crate::types::PyPromotePattern>,
+        options: crate::types::PyPromoteOptions,
+    ) -> PyResult<crate::types::PyPromoteReport> {
+        let rust_patterns: Vec<uni_db::PromotePattern> =
+            patterns.into_iter().map(|p| p.inner).collect();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(
+                self.inner.promote_from_fork_with_options(
+                    fork_name,
+                    &rust_patterns,
+                    &options.inner,
+                ),
+            )
+        })
+        .map(crate::types::PyPromoteReport::from_rust)
+        .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> PyCompaction {
         PyCompaction {

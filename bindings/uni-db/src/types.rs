@@ -4023,6 +4023,77 @@ impl PyForkDiff {
 /// Construct via the class methods:
 ///   - `PromotePattern.label("Person", where_clause="n.age > 30")`
 ///   - `PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020")`
+/// How a baseline-aware merge resolves a concurrent divergent edit
+/// (the fork and primary both changed a vertex since the fork point).
+#[pyclass(eq, eq_int, name = "ConflictPolicy", from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyConflictPolicy {
+    /// Leave primary's value; count the conflict. The safe default.
+    Skip,
+    /// Apply the fork's value over primary's.
+    Overwrite,
+}
+
+impl PyConflictPolicy {
+    fn to_rust(self) -> uni_db::ConflictPolicy {
+        match self {
+            Self::Skip => uni_db::ConflictPolicy::Skip,
+            Self::Overwrite => uni_db::ConflictPolicy::Overwrite,
+        }
+    }
+}
+
+/// Options for `Uni.promote_from_fork_with_options`.
+///
+/// `upsert=True` updates an existing primary vertex (matched by
+/// `(label, ext_id)`) in place instead of inserting a twin.
+/// `delete_promotion=True` additionally propagates fork deletions and
+/// detects concurrent conflicts against the fork-point baseline
+/// (resolved per `on_conflict`).
+#[pyclass(name = "PromoteOptions", from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyPromoteOptions {
+    pub(crate) inner: uni_db::PromoteOptions,
+}
+
+#[pymethods]
+impl PyPromoteOptions {
+    #[new]
+    #[pyo3(signature = (upsert=false, delete_promotion=false, on_conflict=PyConflictPolicy::Skip))]
+    fn new(upsert: bool, delete_promotion: bool, on_conflict: PyConflictPolicy) -> Self {
+        let mut inner = if delete_promotion {
+            uni_db::PromoteOptions::with_merge()
+        } else if upsert {
+            uni_db::PromoteOptions::with_upsert()
+        } else {
+            uni_db::PromoteOptions::insert_only()
+        };
+        inner = inner.on_conflict(on_conflict.to_rust());
+        // Honor an explicit `upsert`/`delete_promotion` combination even
+        // when it doesn't match a named preset.
+        inner.upsert = upsert || delete_promotion;
+        inner.delete_promotion = delete_promotion;
+        Self { inner }
+    }
+
+    #[getter]
+    fn upsert(&self) -> bool {
+        self.inner.upsert
+    }
+
+    #[getter]
+    fn delete_promotion(&self) -> bool {
+        self.inner.delete_promotion
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PromoteOptions(upsert={}, delete_promotion={})",
+            self.inner.upsert, self.inner.delete_promotion
+        )
+    }
+}
+
 #[pyclass(name = "PromotePattern", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPromotePattern {
@@ -4088,6 +4159,12 @@ impl PyPromotePattern {
 #[derive(Debug, Clone)]
 pub struct PyPromoteReport {
     pub vertices_inserted: usize,
+    pub vertices_updated: usize,
+    pub vertices_skipped_no_op: usize,
+    pub vertices_inserted_unverified: usize,
+    pub vertices_deleted: usize,
+    pub vertices_skipped_no_ext_id_for_delete: usize,
+    pub vertices_conflicting: usize,
     pub vertices_skipped_uid_conflict: usize,
     pub vertices_skipped_no_uid: usize,
     pub edges_inserted: usize,
@@ -4116,6 +4193,12 @@ impl PyPromoteReport {
     pub(crate) fn from_rust(r: uni_db::PromoteReport) -> Self {
         Self {
             vertices_inserted: r.vertices_inserted,
+            vertices_updated: r.vertices_updated,
+            vertices_skipped_no_op: r.vertices_skipped_no_op,
+            vertices_inserted_unverified: r.vertices_inserted_unverified,
+            vertices_deleted: r.vertices_deleted,
+            vertices_skipped_no_ext_id_for_delete: r.vertices_skipped_no_ext_id_for_delete,
+            vertices_conflicting: r.vertices_conflicting,
             vertices_skipped_uid_conflict: r.vertices_skipped_uid_conflict,
             // Reserved field on the Python side — the Rust `PromoteReport`
             // no longer carries it; it was always 0.

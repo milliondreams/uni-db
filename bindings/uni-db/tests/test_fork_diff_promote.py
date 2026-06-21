@@ -184,3 +184,91 @@ def test_promote_edges_lands_both_endpoints_and_edge():
     ).rows
     assert len(rows) == 1
     assert rows[0].get("since") == 2020
+
+
+# ---------------------------------------------------------------------------
+# Promote with options (M4 merge: upsert / delete-promotion / conflict)
+# ---------------------------------------------------------------------------
+
+
+def test_promote_options_and_conflict_policy():
+    """PromoteOptions + ConflictPolicy construct and expose their fields."""
+    o = uni_db.PromoteOptions(upsert=True)
+    assert o.upsert is True
+    assert o.delete_promotion is False
+
+    m = uni_db.PromoteOptions(delete_promotion=True)
+    assert m.upsert is True  # delete implies the ext_id resolution
+    assert m.delete_promotion is True
+
+    assert uni_db.ConflictPolicy.Skip != uni_db.ConflictPolicy.Overwrite
+    uni_db.PromoteOptions(
+        upsert=True,
+        delete_promotion=True,
+        on_conflict=uni_db.ConflictPolicy.Overwrite,
+    )
+
+
+def test_promote_with_options_reports_new_fields():
+    """promote_from_fork_with_options is callable and the report exposes the
+    new merge counters."""
+    db = _make_db()
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("publish").build()
+    tx = fork.tx()
+    tx.execute("CREATE (:Person {name: 'NewKid'})")
+    tx.commit()
+    del fork
+
+    report = db.promote_from_fork_with_options(
+        "publish",
+        [uni_db.PromotePattern.label("Person")],
+        uni_db.PromoteOptions(upsert=True),
+    )
+    assert report.vertices_inserted >= 1, repr(report)
+    # New M4/M5 counters are accessible.
+    assert report.vertices_updated == 0
+    assert report.vertices_skipped_no_op == 0
+    assert report.vertices_inserted_unverified == 0
+    assert report.vertices_deleted == 0
+    assert report.vertices_conflicting == 0
+
+
+def test_promote_merge_delete_promotion(tmp_path):
+    """Full merge: a fork deletion propagates to primary, a primary-only row
+    the fork never saw survives (anti-spurious-delete)."""
+    db = uni_db.Uni.open(str(tmp_path / "db"))
+    db.schema().label("Person").property("name", "string").apply()
+    primary = db.session()
+    tx = primary.tx()
+    tx.execute("CREATE (:Person {ext_id: 'p1', name: 'Alice'})")
+    tx.execute("CREATE (:Person {ext_id: 'p2', name: 'Bob'})")
+    tx.commit()
+    db.flush()
+
+    # Fork deletes the inherited p1.
+    fork = primary.fork("del").build()
+    ftx = fork.tx()
+    ftx.execute("MATCH (n:Person {name: 'Alice'}) DETACH DELETE n")
+    ftx.commit()
+    del fork
+
+    # Primary adds p3 after the fork — never seen by the fork.
+    tx = primary.tx()
+    tx.execute("CREATE (:Person {ext_id: 'p3', name: 'Carol'})")
+    tx.commit()
+    db.flush()
+
+    report = db.promote_from_fork_with_options(
+        "del",
+        [uni_db.PromotePattern.label("Person")],
+        uni_db.PromoteOptions(delete_promotion=True),
+    )
+    assert report.vertices_deleted == 1, repr(report)
+
+    names = sorted(
+        r.get("name")
+        for r in primary.query("MATCH (p:Person) RETURN p.name AS name").rows
+    )
+    assert names == ["Bob", "Carol"], names  # Alice deleted; Carol survives

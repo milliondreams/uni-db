@@ -711,6 +711,28 @@ impl AsyncDatabase {
         })
     }
 
+    /// Promote matched fork rows onto primary with explicit merge options.
+    ///
+    /// See the sync `promote_from_fork_with_options`. `options` is a
+    /// `PromoteOptions`; default options reproduce `promote_from_fork`.
+    fn promote_from_fork_with_options<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+        patterns: Vec<crate::types::PyPromotePattern>,
+        options: crate::types::PyPromoteOptions,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        let rust_patterns: Vec<uni_db::PromotePattern> =
+            patterns.into_iter().map(|p| p.inner).collect();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.promote_from_fork_with_options(&fork_name, &rust_patterns, &options.inner)
+                .await
+                .map(crate::types::PyPromoteReport::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> AsyncCompaction {
         AsyncCompaction {

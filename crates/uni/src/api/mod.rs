@@ -1833,16 +1833,55 @@ impl Uni {
     pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
         let info = self.inner.fork_registry.get(fork_name).await?;
         let storage_uri = self.inner.storage.base_uri().to_string();
-        for (dataset, branch) in &info.datasets {
+
+        // L9: a fork tag spans one Lance tag per dataset, and `create_tag`
+        // is not atomic across them. Pre-validate that none of the target
+        // tags already exist (fail fast with no partial state on the common
+        // "already tagged" case), then create while tracking what THIS call
+        // created so a mid-loop failure rolls back only those — never a
+        // pre-existing tag on another dataset.
+        for dataset in info.datasets.keys() {
             let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
-            uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch)
+            let existing = uni_store::backend::lance_branch::list_tags(&dataset_uri)
                 .await
                 .map_err(|e| UniError::ForkLifecycle {
                     name: fork_name.to_string(),
                     stage: "tag",
                     source: e.into(),
                 })?;
+            if existing.iter().any(|(n, _)| n == &lance_tag) {
+                return Err(UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: format!("tag '{tag}' already present on dataset '{dataset}'").into(),
+                });
+            }
+        }
+
+        let mut created: Vec<(String, String)> = Vec::new();
+        for (dataset, branch) in &info.datasets {
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            if let Err(e) =
+                uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch).await
+            {
+                for (uri, tag_name) in &created {
+                    if let Err(rb) =
+                        uni_store::backend::lance_branch::delete_tag(uri, tag_name).await
+                    {
+                        tracing::warn!(
+                            "tag_fork rollback: delete_tag '{tag_name}' on '{uri}' failed: {rb}"
+                        );
+                    }
+                }
+                return Err(UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: e.into(),
+                });
+            }
+            created.push((dataset_uri, lance_tag));
         }
         Ok(())
     }

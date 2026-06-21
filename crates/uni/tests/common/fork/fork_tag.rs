@@ -61,6 +61,65 @@ async fn tag_list_untag_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// L9: re-tagging an already-tagged fork fails CLEANLY at the pre-check
+/// (before mutating any dataset), instead of partially re-tagging and then
+/// hitting a mid-loop `RefConflict`. The existing tag is left untouched.
+#[tokio::test]
+async fn tag_fork_pre_check_prevents_partial_retag() -> Result<()> {
+    use uni_common::api::error::UniError;
+
+    let dir = tempfile::tempdir()?;
+    let uri = dir.path().display().to_string();
+    let db = Uni::open(&uri).build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Person {name: 'seed'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let fork = primary.fork("scenario").await?;
+    let tx = fork.tx().await?;
+    tx.execute("CREATE (:Person {name: 'fork-row'})").await?;
+    tx.commit().await?;
+    fork.flush().await?;
+    drop(fork);
+
+    // First tag spans every fork dataset.
+    db.tag_fork("scenario", "hold").await?;
+
+    // Re-tagging the SAME name must fail at the pre-check (the tag already
+    // exists on at least one dataset), not mid-loop.
+    match db.tag_fork("scenario", "hold").await {
+        Err(UniError::ForkLifecycle { stage: "tag", .. }) => {}
+        Err(other) => panic!("expected a tag ForkLifecycle error, got {other:?}"),
+        Ok(()) => panic!("re-tagging an already-tagged fork must error"),
+    }
+
+    // The tag is still present exactly once — nothing was duplicated or left
+    // in a partial state.
+    let tags = db.list_fork_tags("scenario").await?;
+    assert_eq!(
+        tags.iter().filter(|t| *t == "hold").count(),
+        1,
+        "the original tag must be intact and unique; got {tags:?}"
+    );
+
+    // Untag cleanly removes it everywhere.
+    db.untag_fork("scenario", "hold").await?;
+    assert!(
+        db.list_fork_tags("scenario").await?.is_empty(),
+        "untag must remove the tag from every dataset"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn tag_fork_unknown_fork_errors() -> Result<()> {
     let db = Uni::in_memory().build().await?;

@@ -70,7 +70,11 @@ pub struct VertexDiff {
     pub added: Vec<DiffVertex>,
     /// Rows present in `a` but not `b`.
     pub deleted: Vec<DiffVertex>,
-    /// Rows with matching identity in both sides but differing properties.
+    /// **Reserved; always empty.** Identity is content-addressed (the UID
+    /// folds in the properties), so two rows with matching identity have
+    /// identical properties by construction — a property change surfaces as
+    /// a paired `deleted` + `added` instead. Kept for forward compatibility
+    /// with a future stable-id diff. (L12)
     pub changed: Vec<VertexPropertyChange>,
 }
 
@@ -105,7 +109,9 @@ pub struct EdgeDiff {
     pub added: Vec<DiffEdge>,
     /// Edges present in `a` but not `b`.
     pub deleted: Vec<DiffEdge>,
-    /// Edges with matching `(src_uid, dst_uid, type)` but differing properties.
+    /// **Reserved; always empty.** The edge UID folds in the properties, so
+    /// a property change surfaces as a paired `deleted` + `added`, not here.
+    /// Kept for forward compatibility. (L12)
     pub changed: Vec<EdgePropertyChange>,
 }
 

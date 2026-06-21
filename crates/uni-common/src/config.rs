@@ -557,6 +557,13 @@ pub struct UniConfig {
     /// with `UniError::ForkBudgetExceeded` once the cap is reached.
     /// Tombstoned forks count because they still hold branch state on
     /// disk until recovery completes; counting them prevents churn-thrash.
+    ///
+    /// **Production guidance (L11):** the default is `None` (unbounded) to
+    /// avoid surprising existing embedders, but each fork's branches scale
+    /// with schema size and persist until dropped, so unbounded fork churn
+    /// is an on-disk growth risk. Production deployments that create forks
+    /// from untrusted/automated callers SHOULD set an explicit `max_forks`
+    /// (and ideally `fork_default_ttl`).
     pub max_forks: Option<usize>,
 
     /// Phase 4a: default TTL applied to forks when the user does not

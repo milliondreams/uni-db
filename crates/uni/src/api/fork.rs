@@ -74,6 +74,11 @@ impl<'a> ForkBuilder<'a> {
     /// `pub(crate)` for an explicit call site if ever needed.
     #[instrument(skip(self), fields(fork_name = %self.name, must_create = self.must_create))]
     pub(crate) async fn build(self) -> Result<Session> {
+        // Validate the name before touching the registry / name-lock — it
+        // becomes a registry key and is written into the on-disk catalog
+        // (L5). Reject empty/whitespace/over-long/control-char names.
+        validate_fork_name(&self.name)?;
+
         let parent = self.parent;
         let registry = parent.db.fork_registry.clone();
 
@@ -175,6 +180,33 @@ impl<'a> IntoFuture for ForkBuilder<'a> {
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.build())
     }
+}
+
+/// Maximum fork-name length. Generous; the cap is hygiene (the name is a
+/// registry key and lands in the on-disk catalog), not a storage limit.
+const MAX_FORK_NAME_LEN: usize = 255;
+
+/// Validate a fork name before any registry/catalog state is created (L5).
+///
+/// Rejects empty/all-whitespace names, names over [`MAX_FORK_NAME_LEN`]
+/// bytes, and names containing control characters (e.g. `\n`, `\0`).
+fn validate_fork_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.chars().all(char::is_whitespace) {
+        return Err(UniError::ForkNameInvalid {
+            reason: "name must be non-empty and not all whitespace".to_string(),
+        });
+    }
+    if name.len() > MAX_FORK_NAME_LEN {
+        return Err(UniError::ForkNameInvalid {
+            reason: format!("name exceeds {MAX_FORK_NAME_LEN} bytes"),
+        });
+    }
+    if let Some(c) = name.chars().find(|c| c.is_control()) {
+        return Err(UniError::ForkNameInvalid {
+            reason: format!("name contains a control character ({c:?})"),
+        });
+    }
+    Ok(())
 }
 
 /// Run the 4-step create 2PC and return the now-`Active` ForkInfo.

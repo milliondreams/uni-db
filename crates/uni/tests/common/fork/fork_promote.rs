@@ -91,25 +91,27 @@ async fn promote_dedupes_uid_conflict() -> Result<()> {
         .promote_from_fork("rebind", &[PromotePattern::label("Person")])
         .await?;
 
-    // Expect Brand-New inserted; Alice (UID conflict) skipped. The
-    // dedup may or may not fire depending on UID-index build timing;
-    // we tolerate either, but require that we don't double-insert
-    // *both* fork Alices on top of primary's Alice.
+    // Exact dedup (L10): the fork flush (done inside promote) builds the
+    // UID index, so the content-UID match is deterministic — only Brand-New
+    // is inserted, every same-content Alice the fork sees (its own plus the
+    // inherited one) is skipped as a UID conflict, and primary keeps exactly
+    // one Alice.
+    assert_eq!(
+        report.vertices_inserted, 1,
+        "only Brand-New should insert: {report:?}"
+    );
+    assert!(
+        report.vertices_skipped_uid_conflict >= 1,
+        "the duplicate Alice should be skipped: {report:?}"
+    );
     let rows = session
         .query("MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name")
         .await?;
-    assert!(
-        rows.rows().len() <= 2,
+    assert_eq!(
+        rows.rows().len(),
+        1,
         "Alice was duplicated by promote: rows = {:?}",
         rows.rows()
-    );
-
-    // Counters should sum to the count of fork-only nodes considered.
-    let total_seen = report.vertices_inserted + report.vertices_skipped_uid_conflict;
-    assert!(
-        total_seen >= 1,
-        "promote should have considered at least 1 fork row: {:?}",
-        report
     );
 
     db.shutdown().await?;

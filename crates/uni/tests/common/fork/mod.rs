@@ -40,6 +40,7 @@ pub mod fork_target_endpoint_label;
 pub mod fork_ttl;
 pub mod fork_unflushed_l0;
 pub mod fork_use_cases;
+pub mod fork_validation;
 pub mod fork_watch;
 pub mod fork_writes;
 pub mod fork_writes_soak;

@@ -544,7 +544,12 @@ impl ForkRegistryHandle {
         // Outside the cache lock — IO must not block primary.
         if let Some(id) = removed_id {
             self.delete_schema_overlay(&id).await;
+            // L4: reap the holder counter for the rolled-back fork.
+            self.inner.holders.remove(&id);
         }
+        self.inner
+            .name_locks
+            .remove_if(name, |_, lock| Arc::strong_count(lock) == 1);
         Ok(())
     }
 
@@ -600,6 +605,16 @@ impl ForkRegistryHandle {
         }
         self.delete_tombstone(&info.id, &info.name).await?;
         self.delete_schema_overlay(&info.id).await;
+        // L4: reap per-fork bookkeeping so the maps don't grow with fork
+        // churn. `holders` is keyed by the fork's fresh ULID (so it grows
+        // even under same-name churn); the fork is gone now, so no
+        // concurrent `register_holder` can race it. `name_locks` is shared
+        // by concurrent callers, so only reap it when no one else holds the
+        // Arc (strong_count 1 = just the map entry).
+        self.inner.holders.remove(&info.id);
+        self.inner
+            .name_locks
+            .remove_if(info.name.as_str(), |_, lock| Arc::strong_count(lock) == 1);
         // Note: the fork's WAL (`wal_forks/{id}/`), id allocator, and fork-scoped
         // snapshot manifests live on the STORAGE object store, not the registry's
         // metadata store, so they are cleaned by `delete_fork_artifacts` from the

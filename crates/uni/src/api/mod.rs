@@ -965,11 +965,25 @@ impl UniInner {
         // Phase 2 Day 6: replay any persisted WAL entries for this
         // fork into the freshly-built L0. Without this, a process
         // restart would silently drop committed-but-not-yet-flushed
-        // fork mutations. `replay_wal(0)` replays from the beginning;
-        // the WAL's own LSN tracking (initialized inside the writer
-        // factory) advances correctly past durable segments.
+        // fork mutations.
+        //
+        // Gate replay on the fork's own persisted `wal_high_water_mark`
+        // (review M2). The fork-scoped SnapshotManager (review C1) records
+        // it at each fork flush under `catalog/forks/{fork_id}/latest`; a
+        // crash between the durable branch write and complete WAL truncation
+        // would otherwise replay already-flushed segments from 0 and
+        // double-apply them. A fork that has never flushed (or a pre-fix
+        // on-disk fork) has no per-fork snapshot, so we fall back to 0 —
+        // correct, since nothing has been moved out of the WAL yet.
+        let fork_wal_hwm = forked_storage
+            .snapshot_manager()
+            .load_latest_snapshot()
+            .await
+            .map_err(UniError::Internal)?
+            .map(|s| s.wal_high_water_mark)
+            .unwrap_or(0);
         let replayed = forked_writer
-            .replay_wal(0)
+            .replay_wal(fork_wal_hwm)
             .await
             .map_err(UniError::Internal)?;
         if replayed > 0 {
@@ -1280,6 +1294,16 @@ impl Uni {
     /// # }
     /// ```
     pub async fn drop_fork(&self, name: &str) -> Result<()> {
+        // Hold the per-name lock for the whole drop sequence. `fork(name).build()`
+        // holds the same lock for its entire open-or-create flow (api/fork.rs),
+        // so create/open and drop are mutually exclusive per name: a concurrent
+        // builder can never observe `Active` + register a holder while we are
+        // tombstoning and force-deleting the Lance branches (review H2/M9). The
+        // cascade path (`drop_fork_cascade`) drops each node through here, so it
+        // inherits the same per-node serialization.
+        let name_lock = self.inner.fork_registry.name_lock(name).await;
+        let _name_guard = name_lock.lock().await;
+
         // Phase 2 Day 11: surface in-flight transactions before the
         // registry transitions to Tombstoned. The `ForkInUse` check in
         // `begin_drop` catches *session* holders; this catches the
@@ -1369,8 +1393,13 @@ impl Uni {
         // this eviction is purely cleanup so the map doesn't accumulate
         // dead Weak entries across the lifetime of the database.
         self.inner.fork_inners.remove(&info.id);
-        // Step 3: walk branches and force-delete each.
+        // Step 3: walk branches and force-delete each. Track failures: if any
+        // branch delete fails we must NOT finish_drop, because finish_drop
+        // deletes the recovery tombstone — the only anchor that lets boot-time
+        // recovery retry the deletion. Dropping it would orphan the surviving
+        // branches permanently (review M3). Leave the fork Tombstoned instead.
         let storage_uri = self.inner.storage.base_uri().to_string();
+        let mut delete_failure: Option<String> = None;
         for (dataset, branch) in &info.datasets {
             let dataset_uri = dataset_uri(&storage_uri, dataset);
             if let Err(e) =
@@ -1381,11 +1410,28 @@ impl Uni {
                     branch = %branch,
                     "delete_branch during drop_fork failed: {e}"
                 );
+                delete_failure = Some(format!("{dataset}/{branch}: {e}"));
             }
         }
-        // Step 4 + 5: clear the registry entry, delete tombstone +
-        // schema overlay files.
+        if let Some(detail) = delete_failure {
+            // Tombstone + registry entry remain; `recover_forks` will retry
+            // delete_all_branches + finish_drop on the next open.
+            return Err(UniError::ForkLifecycle {
+                name: name.to_string(),
+                stage: "delete_branch",
+                source: format!(
+                    "branch delete failed; fork left Tombstoned for recovery ({detail})"
+                )
+                .into(),
+            });
+        }
+        // Step 4 + 5: clear the registry entry, delete tombstone + schema
+        // overlay files.
         self.inner.fork_registry.finish_drop(&info).await?;
+        // Step 6: remove the fork's storage-side artifacts (WAL, id allocator,
+        // fork-scoped snapshot manifests) so a dropped fork leaves no disk
+        // residue (review H3). On the storage object store, not the registry's.
+        uni_store::fork::delete_fork_artifacts(&self.inner.storage.store(), &info.id).await;
         Ok(())
     }
 
@@ -3469,8 +3515,10 @@ impl UniBuilder {
         // Phase 4a: apply the configured fork budget cap.
         fork_registry.set_max_forks(self.config.max_forks).await;
         let storage_uri_for_recovery = storage_uri.clone();
+        let recovery_store = storage.store();
         let recovered = uni_store::fork::recovery::recover_forks(
             &fork_registry,
+            &recovery_store,
             uni_store::fork::recovery::join_uri_with(storage_uri_for_recovery),
         )
         .await

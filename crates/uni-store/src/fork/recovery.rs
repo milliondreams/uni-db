@@ -14,6 +14,9 @@
 
 // Rust guideline compliant
 
+use std::sync::Arc;
+
+use object_store::ObjectStore;
 use tracing::{info, instrument, warn};
 use uni_common::api::error::UniError;
 use uni_common::core::fork::{ForkInfo, ForkStatus};
@@ -31,9 +34,10 @@ use super::registry::ForkRegistryHandle;
 /// failure. Recovery is intentionally best-effort for individual
 /// branches: a missing branch on a `Pending` rollback path is
 /// success.
-#[instrument(skip(registry, dataset_uri_for), level = "info")]
+#[instrument(skip(registry, storage_store, dataset_uri_for), level = "info")]
 pub async fn recover_forks<F>(
     registry: &ForkRegistryHandle,
+    storage_store: &Arc<dyn ObjectStore>,
     mut dataset_uri_for: F,
 ) -> Result<usize, UniError>
 where
@@ -75,6 +79,7 @@ where
         info!(fork_name = %info.name, fork_id = %info.id, "completing tombstoned drop");
         delete_all_branches(&info, &mut dataset_uri_for).await;
         registry.finish_drop(&info).await?;
+        super::delete_fork_artifacts(storage_store, &info.id).await;
         reconciled += 1;
     }
 
@@ -90,6 +95,7 @@ where
         );
         delete_all_branches(&info, &mut dataset_uri_for).await;
         registry.finish_drop(&info).await?;
+        super::delete_fork_artifacts(storage_store, &info.id).await;
         reconciled += 1;
     }
 

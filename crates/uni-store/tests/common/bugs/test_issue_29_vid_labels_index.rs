@@ -3,8 +3,10 @@
 
 //! Tests for Issue #29: VidLabelsIndex integration
 //!
-//! Verifies that the VID-to-labels index provides O(1) lookups with
-//! LanceDB fallback when the index is disabled or VIDs are not found.
+//! Verifies that the VID-to-labels index provides O(1) lookups. The index is
+//! always enabled (see Issue #99): the planner relies on it to resolve
+//! traversal-time label predicates for vertices that live only in Lance
+//! storage, so it can no longer be disabled.
 
 use anyhow::Result;
 use object_store::local::LocalFileSystem;
@@ -12,7 +14,6 @@ use object_store::path::Path as ObjectStorePath;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
-use uni_common::UniConfig;
 use uni_common::core::schema::{DataType, SchemaManager};
 use uni_store::runtime::Writer;
 use uni_store::runtime::property_manager::PropertyManager;
@@ -112,7 +113,11 @@ async fn test_vid_labels_index_delete_removes_from_index() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_vid_labels_index_disabled_fallback() -> Result<()> {
+async fn test_vid_labels_index_always_enabled_after_flush() -> Result<()> {
+    // The index can no longer be disabled (Issue #99). After a flush a
+    // persisted vertex must resolve through the index, not just the L0
+    // fallback — this is what lets a fork match a traversal-time label
+    // predicate against Lance-only vertices.
     let dir = tempdir()?;
     let path = dir.path().to_str().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
@@ -123,14 +128,7 @@ async fn test_vid_labels_index_disabled_fallback() -> Result<()> {
     schema_manager.add_property("Person", "name", DataType::String, false)?;
     schema_manager.save().await?;
 
-    // Create config with index disabled
-    let config = UniConfig {
-        enable_vid_labels_index: false,
-        ..Default::default()
-    };
-
-    let storage =
-        Arc::new(StorageManager::new_with_config(path, schema_manager.clone(), config).await?);
+    let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
     let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
@@ -143,10 +141,13 @@ async fn test_vid_labels_index_disabled_fallback() -> Result<()> {
         .await?;
     writer.flush_to_l1(None).await?;
 
-    // Index should return None (disabled)
-    assert_eq!(storage.get_labels_from_index(vid), None);
+    // The index is populated at flush time and returns the real labels.
+    assert_eq!(
+        storage.get_labels_from_index(vid),
+        Some(vec!["Person".to_string()])
+    );
 
-    // But PropertyManager should still work via LanceDB fallback
+    // PropertyManager resolves the same labels.
     let property_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let labels = property_manager.get_batch_labels(&[vid], None).await?;
     assert_eq!(labels.get(&vid), Some(&vec!["Person".to_string()]));
@@ -202,6 +203,65 @@ async fn test_vid_labels_index_rebuild_on_open() -> Result<()> {
     assert_eq!(
         storage2.get_labels_from_index(vid2),
         Some(vec!["Person".to_string()])
+    );
+
+    Ok(())
+}
+
+/// A derived (pinned / fork) StorageManager must get its OWN label index, not an
+/// `Arc`-clone of the parent's — otherwise a fork-local relabel/delete + flush
+/// mutates the parent's traversal-time label resolution (production-readiness
+/// review H1/L2). `at_fork_with_schema` uses the identical deep-copy; `pinned`
+/// is the cheapest constructible witness of the mechanism.
+#[tokio::test]
+async fn pinned_view_label_index_is_isolated_from_parent() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().to_str().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+    let schema_path = ObjectStorePath::from("schema.json");
+
+    let schema_manager = Arc::new(SchemaManager::load_from_store(store, &schema_path).await?);
+    schema_manager.add_label("Person")?;
+    schema_manager.add_property("Person", "name", DataType::String, false)?;
+    schema_manager.save().await?;
+
+    let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+
+    let vid = writer.next_vid().await?;
+    let mut props = HashMap::new();
+    props.insert("name".to_string(), "Alice".into());
+    writer
+        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
+        .await?;
+    writer.flush_to_l1(None).await?;
+    assert_eq!(
+        storage.get_labels_from_index(vid),
+        Some(vec!["Person".to_string()])
+    );
+
+    // Derive a pinned view from a real published snapshot.
+    let snapshot = storage
+        .snapshot_manager()
+        .load_latest_snapshot()
+        .await?
+        .expect("a snapshot was published by flush_to_l1");
+    let pinned = storage.pinned(snapshot);
+    assert_eq!(
+        pinned.get_labels_from_index(vid),
+        Some(vec!["Person".to_string()]),
+        "pinned view inherits the parent's labels (preserves #99 inheritance)"
+    );
+
+    // Mutate the derived view's index, as a fork-local delete/relabel flush would.
+    pinned.remove_from_vid_labels_index(vid);
+    assert_eq!(pinned.get_labels_from_index(vid), None);
+
+    // The parent MUST be unaffected (deep-copy isolation).
+    assert_eq!(
+        storage.get_labels_from_index(vid),
+        Some(vec!["Person".to_string()]),
+        "parent label index must not be mutated by a derived view (review H1/L2)"
     );
 
     Ok(())

@@ -64,7 +64,9 @@ async fn tombstoned_drop_completes_on_recovery() {
     // Restart and recover.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let reconciled = recover_forks(&h2, &store, join_uri_with(base))
+        .await
+        .unwrap();
     assert_eq!(reconciled, 1);
 
     // Registry empty, branch gone, no tombstones left.
@@ -113,7 +115,9 @@ async fn orphan_tombstone_with_no_registry_entry_is_swept() {
     // tombstoned-recovery path. This still validates the recovery
     // contract: tombstone present → recovery completes the drop.
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let reconciled = recover_forks(&h2, &store, join_uri_with(base))
+        .await
+        .unwrap();
     assert!(
         reconciled >= 1,
         "expected at least one reconciliation for {info:?}"
@@ -153,13 +157,15 @@ async fn recover_forks_is_idempotent() {
 
     let base = format!("{}/", dir.path().display());
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
-    let first = recover_forks(&h2, join_uri_with(base.clone()))
+    let first = recover_forks(&h2, &store, join_uri_with(base.clone()))
         .await
         .unwrap();
     assert_eq!(first, 1);
 
     // Second invocation should be a no-op.
-    let second = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let second = recover_forks(&h2, &store, join_uri_with(base))
+        .await
+        .unwrap();
     assert_eq!(second, 0);
     assert!(h2.snapshot().await.forks.is_empty());
     assert!(h2.list_tombstones().await.unwrap().is_empty());

@@ -3929,6 +3929,19 @@ impl Writer {
             MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
+        // Keep the VidLabelsIndex current for every flushed vertex. This is the
+        // single place that sees all vertices: the per-label fan-out below skips
+        // undeclared (schemaless) labels, so updating the index there would miss
+        // them. Traversal-time label predicates read this index to resolve
+        // labels for vertices that live only in Lance — notably on a fork, whose
+        // data is flushed to Lance before branching. (GitHub #99)
+        for (vid, labels, _props, _deleted, _version) in &main_vertices {
+            self.storage.update_vid_labels_index(*vid, labels.clone());
+        }
+        for (vid, _version) in &main_vertex_tombstones {
+            self.storage.remove_from_vid_labels_index(*vid);
+        }
+
         // 3. For each edge type, write FWD and BWD delta runs
         for (&edge_type_id, entries) in entries_by_type.iter() {
             // Get edge type name from unified lookup (handles both schema'd and schemaless)
@@ -4179,19 +4192,8 @@ impl Writer {
 
             ds.ensure_default_indexes(backend).await?;
 
-            // Update VidLabelsIndex (if enabled). v_data carries live
-            // vertices; tombstone removals come from the
-            // `tombstone_rows` captured above the MergeInsert call.
-            for ((vid, labels, _props), &deleted) in v_data.iter().zip(d_data.iter()) {
-                if deleted {
-                    self.storage.remove_from_vid_labels_index(*vid);
-                } else {
-                    self.storage.update_vid_labels_index(*vid, labels.clone());
-                }
-            }
-            for (vid, _) in &tombstone_rows {
-                self.storage.remove_from_vid_labels_index(*vid);
-            }
+            // VidLabelsIndex maintenance is centralized at the main-vertex
+            // flush above (it sees both schema'd and schemaless vertices).
 
             // Update Manifest
             let current_snap =
@@ -4403,6 +4405,13 @@ impl Writer {
 
         // H. Publish manifest (body first, then pointer — recovery is
         // idempotent if we crash between the two).
+        // A fork writer must publish to a fork-scoped namespace, never the
+        // global `catalog/latest` that the primary reopen reads (review C1).
+        debug_assert_eq!(
+            shared.fork_id.is_some(),
+            shared.storage.snapshot_manager().is_fork_scoped(),
+            "fork writer must publish to a fork-scoped snapshot namespace (review C1)"
+        );
         shared
             .storage
             .snapshot_manager()
@@ -4423,6 +4432,7 @@ impl Writer {
         // only; remote stores provide their own durability on `put`).
         crate::snapshot::manager::fsync_snapshot_pointer(
             shared.storage.local_fs_root().as_deref(),
+            shared.fork_id.as_ref(),
             &manifest.snapshot_id,
         )
         .map_err(|e| {

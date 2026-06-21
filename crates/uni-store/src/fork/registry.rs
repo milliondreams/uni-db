@@ -600,6 +600,10 @@ impl ForkRegistryHandle {
         }
         self.delete_tombstone(&info.id, &info.name).await?;
         self.delete_schema_overlay(&info.id).await;
+        // Note: the fork's WAL (`wal_forks/{id}/`), id allocator, and fork-scoped
+        // snapshot manifests live on the STORAGE object store, not the registry's
+        // metadata store, so they are cleaned by `delete_fork_artifacts` from the
+        // drop / recovery paths that hold the storage store (review H3).
         Ok(())
     }
 

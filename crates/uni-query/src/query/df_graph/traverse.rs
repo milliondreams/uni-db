@@ -703,19 +703,21 @@ impl GraphTraverseStream {
                         }
                     }
 
-                    // Filter by target label using L0 visibility.
-                    // VIDs no longer embed label information, so we must look up labels.
+                    // Filter by target label. VIDs no longer embed label
+                    // information, so we resolve labels from the L0 chain and
+                    // then the persisted VidLabelsIndex (the latter covers
+                    // Lance-only vertices, e.g. on forks).
                     if let Some(ref label_name) = self.target_label_name {
                         let query_ctx = self.graph_ctx.query_context();
                         if let Some(vertex_labels) =
-                            l0_visibility::get_vertex_labels_optional(target_vid, &query_ctx)
+                            self.graph_ctx.resolve_vertex_labels(target_vid, &query_ctx)
                         {
-                            // Vertex is in L0 — require actual label match
+                            // Labels resolved — require an actual match.
                             if !vertex_labels.contains(label_name) {
                                 continue;
                             }
                         }
-                        // else: vertex not in L0 → trust storage-level filtering
+                        // else: unknown to L0 and the index → trust storage-level filtering
                     }
 
                     expanded_rows.push((row_idx, target_vid, eid_u64, edge_type));
@@ -727,7 +729,12 @@ impl GraphTraverseStream {
     }
 }
 
-/// Build target vertex labels column from L0 buffers.
+/// Build the target-vertex labels column for `hasLabel` filters.
+///
+/// Resolves each target's labels from the L0 chain and then the persisted
+/// `VidLabelsIndex`, so `hasLabel(b, "B")` evaluates correctly for vertices
+/// that live only in Lance storage (e.g. on a fork). Only when a vertex is
+/// absent from both does it fall back to the label that scoped the traversal.
 fn build_target_labels_column(
     target_vids: &[Vid],
     target_label_name: &Option<String>,
@@ -737,18 +744,18 @@ fn build_target_labels_column(
     let mut labels_builder = ListBuilder::new(StringBuilder::new());
     let query_ctx = graph_ctx.query_context();
     for vid in target_vids {
-        let row_labels: Vec<String> =
-            match l0_visibility::get_vertex_labels_optional(*vid, &query_ctx) {
-                Some(labels) => labels,
-                None => {
-                    // Vertex not in L0 — trust schema label (storage already filtered)
-                    if let Some(label_name) = target_label_name {
-                        vec![label_name.clone()]
-                    } else {
-                        vec![]
-                    }
+        let row_labels: Vec<String> = match graph_ctx.resolve_vertex_labels(*vid, &query_ctx) {
+            Some(labels) => labels,
+            None => {
+                // Unknown to both L0 and the index — trust the schema label
+                // that scoped the traversal (storage already filtered to it).
+                if let Some(label_name) = target_label_name {
+                    vec![label_name.clone()]
+                } else {
+                    vec![]
                 }
-            };
+            }
+        };
         let values = labels_builder.values();
         for lbl in &row_labels {
             values.append_value(lbl);
@@ -2078,20 +2085,18 @@ impl GraphTraverseMainStream {
             .is_none()
         {
             use arrow_array::builder::{ListBuilder, StringBuilder};
-            let l0_ctx = self.graph_ctx.l0_context();
+            // Resolve labels from the L0 chain and then the persisted
+            // VidLabelsIndex. The index covers vertices that live only in Lance
+            // storage — notably on a fork, whose data is flushed to Lance before
+            // branching — so a `hasLabel(b, "B")` filter over this column matches
+            // there too. (GitHub #99)
+            let query_ctx = self.graph_ctx.query_context();
             let mut labels_builder = ListBuilder::new(StringBuilder::new());
             for (_, target_vid, _, _, _) in &expansions {
-                let mut row_labels: Vec<String> = Vec::new();
-                for l0 in l0_ctx.iter_l0_buffers() {
-                    let guard = l0.read();
-                    if let Some(l0_labels) = guard.vertex_labels.get(target_vid) {
-                        for lbl in l0_labels {
-                            if !row_labels.contains(lbl) {
-                                row_labels.push(lbl.clone());
-                            }
-                        }
-                    }
-                }
+                let row_labels = self
+                    .graph_ctx
+                    .resolve_vertex_labels(*target_vid, &query_ctx)
+                    .unwrap_or_default();
                 let values = labels_builder.values();
                 for lbl in &row_labels {
                     values.append_value(lbl);

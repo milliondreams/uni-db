@@ -475,10 +475,6 @@ pub struct UniConfig {
     /// Configurable OOM guard to prevent memory exhaustion during compaction.
     pub max_compaction_rows: usize,
 
-    /// Enable in-memory VID-to-labels index for O(1) lookups (default: true).
-    /// Memory cost: ~42 bytes per vertex (1M vertices ≈ 42MB).
-    pub enable_vid_labels_index: bool,
-
     /// Maximum iterations for recursive CTE evaluation (default: 1000).
     pub max_recursive_cte_iterations: usize,
 
@@ -646,7 +642,6 @@ impl Default for UniConfig {
             max_query_memory: 1024 * 1024 * 1024,       // 1GB
             max_transaction_memory: 1024 * 1024 * 1024, // 1GB
             max_compaction_rows: 5_000_000,             // 5M rows
-            enable_vid_labels_index: true,              // Enable by default
             max_recursive_cte_iterations: 1000,
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),

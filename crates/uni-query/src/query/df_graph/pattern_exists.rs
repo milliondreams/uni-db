@@ -29,7 +29,6 @@ use uni_common::core::id::Vid;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_common::value::Value;
 use uni_cypher::ast::{Expr as CypherExpr, Pattern, PatternElement, Query};
-use uni_store::runtime::l0_visibility;
 use uni_store::storage::direction::Direction;
 
 use super::GraphExecutionContext;
@@ -284,10 +283,12 @@ impl PhysicalExpr for PatternExistsExecExpr {
             let mut next_frontier: Vec<(u32, u64)> = Vec::new();
 
             // Helper closure: check if a target VID passes the label filter.
+            // Resolves labels from the L0 chain then the persisted index, so
+            // Lance-only vertices (e.g. on a fork) are matched correctly.
             let passes_label_filter = |target_vid: Vid| -> bool {
                 if let Some(ref label_name) = step.target_label_name
                     && let Some(vertex_labels) =
-                        l0_visibility::get_vertex_labels_optional(target_vid, &query_ctx)
+                        self.graph_ctx.resolve_vertex_labels(target_vid, &query_ctx)
                     && !vertex_labels.contains(label_name)
                 {
                     return false;

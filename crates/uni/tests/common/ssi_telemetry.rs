@@ -17,6 +17,23 @@ use uni_db::{DataType, RetryOptions, Uni};
 use crate::ssi_support::metrics::{self, CounterProbe};
 use crate::ssi_support::schedule::{assert_committed, assert_serialization_conflict};
 
+/// Skip a telemetry test unless the process is isolated (nextest).
+///
+/// SSI counters are process-global, so under the shared-process `cargo test`
+/// runner a concurrent test pollutes them or wins the recorder install. Returns
+/// `true` (and logs) when the caller should bail out early; under nextest it
+/// returns `false` so the test runs at full strength. See
+/// [`metrics::counters_isolated`].
+fn skip_unless_isolated(test: &str) -> bool {
+    if metrics::counters_isolated() {
+        return false;
+    }
+    eprintln!(
+        "skipping {test}: SSI counter telemetry needs process isolation; run via `cargo nextest`"
+    );
+    true
+}
+
 async fn counter_db() -> Result<Uni> {
     let db = Uni::in_memory().build().await?;
     db.schema()
@@ -37,6 +54,9 @@ async fn counter_db() -> Result<Uni> {
 /// validation. (Empty label slice matches the counter regardless of its `kind`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflict_increments_serialization_counter() -> Result<()> {
+    if skip_unless_isolated("conflict_increments_serialization_counter") {
+        return Ok(());
+    }
     metrics::init();
     let conflicts = CounterProbe::start("uni_ssi_serialization_conflicts_total", &[]);
     let validations = CounterProbe::start("uni_ssi_commit_validations_total", &[]);
@@ -64,6 +84,9 @@ async fn conflict_increments_serialization_counter() -> Result<()> {
 /// flat when no concurrent transaction pins the generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncontended_commit_does_not_freeze() -> Result<()> {
+    if skip_unless_isolated("uncontended_commit_does_not_freeze") {
+        return Ok(());
+    }
     metrics::init();
     let freezes = CounterProbe::start("uni_l0_snapshot_freezes_total", &[]);
 
@@ -85,6 +108,9 @@ async fn uncontended_commit_does_not_freeze() -> Result<()> {
 /// the generation aside (so the reader stays isolated) — the counter increments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contended_commit_freezes_once() -> Result<()> {
+    if skip_unless_isolated("contended_commit_freezes_once") {
+        return Ok(());
+    }
     metrics::init();
     let freezes = CounterProbe::start("uni_l0_snapshot_freezes_total", &[]);
 
@@ -114,6 +140,9 @@ async fn contended_commit_freezes_once() -> Result<()> {
 /// the retry counter, and still converges to the correct value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn contention_drives_retries() -> Result<()> {
+    if skip_unless_isolated("contention_drives_retries") {
+        return Ok(());
+    }
     metrics::init();
     let retries = CounterProbe::start("uni_ssi_retries_total", &[]);
 

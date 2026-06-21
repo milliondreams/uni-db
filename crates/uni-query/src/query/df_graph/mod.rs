@@ -469,6 +469,28 @@ impl GraphExecutionContext {
         &self.l0_context
     }
 
+    /// Resolve a vertex's labels for a traversal-time label predicate.
+    ///
+    /// Checks the L0 chain first (which also records the read for SSI), then
+    /// the persisted `VidLabelsIndex`. The L0 chain covers fork-local and
+    /// committed-but-unflushed writes; the index covers vertices that live
+    /// only in Lance storage — notably every vertex on a fork, whose data is
+    /// flushed to Lance before branching. Returns `None` only when the vertex
+    /// is absent from both, in which case callers fall back to the label that
+    /// scoped the traversal.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// if let Some(labels) = ctx.resolve_vertex_labels(target_vid, &query_ctx) {
+    ///     keep = labels.iter().any(|l| l == "B");
+    /// }
+    /// ```
+    pub fn resolve_vertex_labels(&self, vid: Vid, query_ctx: &QueryContext) -> Option<Vec<String>> {
+        uni_store::runtime::l0_visibility::get_vertex_labels_optional(vid, query_ctx)
+            .or_else(|| self.storage.get_labels_from_index(vid))
+    }
+
     /// Wall-clock deadline for the surrounding query, if any.
     ///
     /// Internal accessor used by [`crate::query::executor::procedure_host::QueryProcedureHost`]

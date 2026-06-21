@@ -88,8 +88,6 @@ pub struct UniConfig {
     /// Maximum rows allowed for in-memory compaction (default: 5M)
     pub max_compaction_rows: usize,
 
-    /// Enable in-memory VID→labels index for O(1) lookups (default: true)
-    pub enable_vid_labels_index: bool,
 
     /// Object store resilience configuration
     pub object_store: ObjectStoreConfig,
@@ -179,7 +177,6 @@ pub struct UniConfig {
 | `max_query_memory` | bytes | 1 GB | Maximum memory per query |
 | `max_transaction_memory` | bytes | 1 GB | Maximum memory per transaction |
 | `max_compaction_rows` | rows | 5,000,000 | OOM guard for in-memory compaction |
-| `enable_vid_labels_index` | bool | true | Enable O(1) VID→labels lookups |
 | `max_recursive_cte_iterations` | count | 1,000 | Maximum iterations for recursive CTE evaluation |
 | `strict_schema` | bool | false | Reject writes with undeclared labels or edge types |
 | `ssi_enabled` | bool | true | Serializable Snapshot Isolation / OCC (false = last-writer-wins) |

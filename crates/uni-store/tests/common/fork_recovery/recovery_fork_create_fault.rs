@@ -91,13 +91,15 @@ async fn partial_create_branch_rolls_back_on_recovery() {
     // recorded `datasets`, and dataset A has a zombie branch named
     // `fork_partial_A`. Reload the registry to simulate restart and
     // run recovery.
-    let h2 = ForkRegistryHandle::load(store).await.unwrap();
+    let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     {
         let snap = h2.snapshot().await;
         assert_eq!(snap.forks["partial"].status, ForkStatus::Pending);
     }
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let reconciled = recover_forks(&h2, &store, join_uri_with(base))
+        .await
+        .unwrap();
     assert_eq!(reconciled, 1);
 
     // Registry: empty.

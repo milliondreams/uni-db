@@ -38,13 +38,18 @@ use crate::types::{
 pub async fn compute_diff<Q: ForkQueryHost + ?Sized>(a: &Q, b: &Q) -> Result<ForkDiff> {
     let mut diff = ForkDiff::default();
 
+    // vid → ext_id per side: ext_id is folded into the content UID but stripped
+    // from query results, so look it up from storage (review H4).
+    let ext_a = a.storage().get_vertex_ext_ids().await.unwrap_or_default();
+    let ext_b = b.storage().get_vertex_ext_ids().await.unwrap_or_default();
+
     let labels_a: HashSet<String> = a.schema().schema().labels.keys().cloned().collect();
     let labels_b: HashSet<String> = b.schema().schema().labels.keys().cloned().collect();
     let labels_union: Vec<&String> = labels_a.union(&labels_b).collect();
 
     for label in labels_union {
-        let rows_a = scan_label_nodes(a, label).await?;
-        let rows_b = scan_label_nodes(b, label).await?;
+        let rows_a = scan_label_nodes(a, label, &ext_a).await?;
+        let rows_b = scan_label_nodes(b, label, &ext_b).await?;
         diff_label(label, rows_a, rows_b, &mut diff.vertices);
     }
 
@@ -53,27 +58,28 @@ pub async fn compute_diff<Q: ForkQueryHost + ?Sized>(a: &Q, b: &Q) -> Result<For
     let edges_union: Vec<&String> = edges_a.union(&edges_b).collect();
 
     for edge_type in edges_union {
-        let rows_a = scan_edge_type(a, edge_type).await?;
-        let rows_b = scan_edge_type(b, edge_type).await?;
+        let rows_a = scan_edge_type(a, edge_type, &ext_a).await?;
+        let rows_b = scan_edge_type(b, edge_type, &ext_b).await?;
         diff_edge_type(edge_type, rows_a, rows_b, &mut diff.edges);
     }
 
     Ok(diff)
 }
 
-/// Extract a vertex's `ext_id` for content-UID computation.
+/// A vertex's `ext_id` for content-UID computation, from a `vid → ext_id` map
+/// sourced from storage (`StorageManager::get_vertex_ext_ids`).
 ///
-/// NOTE (review H4): `ext_id` is a distinct field in the storage `_uid` but is
-/// stripped from query results and not projectable through the query layer the
-/// diff uses, so this is currently always `None` in practice — two vertices
-/// differing only by `ext_id` (settable only via the OGM / bulk layer, not
-/// Cypher `CREATE`) still collapse to one diff identity. The `bucket.insert`
-/// collision warnings make that observable. A full fix requires exposing
-/// `ext_id` through projection so it can be folded in consistently across L0
-/// and flushed rows (keying off the storage `_uid` is NOT viable: it diverges
-/// from the query-recomputed UID, breaking L0/flushed consistency).
-fn ext_id_of(props: &Properties) -> Option<&str> {
-    props.get("ext_id").and_then(|v| v.as_str())
+/// `ext_id` is folded into the storage `_uid` but is stripped from query
+/// results, so the diff can't recover it by re-hashing query rows — two
+/// vertices differing only by `ext_id` would collapse to one identity (review
+/// H4). We fold it back into the *recomputed* UID (not the storage `_uid`,
+/// which diverges from a recompute and breaks L0/flushed consistency). Vertices
+/// without an `ext_id` are absent from the map → `None`, i.e. unchanged
+/// behavior. Limitation: covers flushed rows; a vertex created fork-local and
+/// not yet flushed is absent from the map (its `ext_id` collapse only matters
+/// for promote, and flushing the fork closes it).
+fn ext_id_for(map: &HashMap<Vid, String>, vid: Vid) -> Option<&str> {
+    map.get(&vid).map(String::as_str)
 }
 
 /// One bucketed vertex row keyed by content UID.
@@ -99,7 +105,11 @@ struct EdgeRow {
     properties: Properties,
 }
 
-async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(s: &Q, label: &str) -> Result<VertexBucket> {
+async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(
+    s: &Q,
+    label: &str,
+    ext_ids: &HashMap<Vid, String>,
+) -> Result<VertexBucket> {
     use uni_store::storage::vertex::VertexDataset;
     let cypher = format!("MATCH (n:`{}`) RETURN n", escape_backticks(label));
     let result = s.query(&cypher).await?;
@@ -108,12 +118,14 @@ async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(s: &Q, label: &str) -> Resu
         let Some(Value::Node(node)) = row.value("n") else {
             continue;
         };
-        // The MATCH already filters to nodes carrying `label`, so the
-        // bucketed row's label is always `label`. (`ext_id` is not available
-        // here — see `ext_id_of`; the collision warning below surfaces any
-        // resulting content-UID collapse.)
-        let uid =
-            VertexDataset::compute_vertex_uid(label, ext_id_of(&node.properties), &node.properties);
+        // The MATCH already filters to nodes carrying `label`, so the bucketed
+        // row's label is always `label`. Fold the stored `ext_id` into the UID
+        // so ext_id-distinct vertices don't collapse (review H4).
+        let uid = VertexDataset::compute_vertex_uid(
+            label,
+            ext_id_for(ext_ids, node.vid),
+            &node.properties,
+        );
         if bucket
             .insert(
                 uid,
@@ -138,7 +150,11 @@ async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(s: &Q, label: &str) -> Resu
     Ok(bucket)
 }
 
-async fn scan_edge_type<Q: ForkQueryHost + ?Sized>(s: &Q, edge_type: &str) -> Result<EdgeBucket> {
+async fn scan_edge_type<Q: ForkQueryHost + ?Sized>(
+    s: &Q,
+    edge_type: &str,
+    ext_ids: &HashMap<Vid, String>,
+) -> Result<EdgeBucket> {
     use uni_store::storage::main_edge::MainEdgeDataset;
     use uni_store::storage::vertex::VertexDataset;
     let cypher = format!(
@@ -156,9 +172,9 @@ async fn scan_edge_type<Q: ForkQueryHost + ?Sized>(s: &Q, edge_type: &str) -> Re
         let a_label = a.labels.first().cloned().unwrap_or_default();
         let b_label = b.labels.first().cloned().unwrap_or_default();
         let src_uid =
-            VertexDataset::compute_vertex_uid(&a_label, ext_id_of(&a.properties), &a.properties);
+            VertexDataset::compute_vertex_uid(&a_label, ext_id_for(ext_ids, a.vid), &a.properties);
         let dst_uid =
-            VertexDataset::compute_vertex_uid(&b_label, ext_id_of(&b.properties), &b.properties);
+            VertexDataset::compute_vertex_uid(&b_label, ext_id_for(ext_ids, b.vid), &b.properties);
         let edge_uid =
             MainEdgeDataset::compute_edge_uid(&src_uid, &dst_uid, edge_type, &edge.properties);
         if bucket
@@ -501,6 +517,17 @@ where
     };
 
     let primary_storage = primary.storage();
+    // vid → ext_id maps so promote keys candidates by the same ext_id-aware
+    // content UID, distinguishing ext_id-distinct rows (review H4).
+    let fork_ext_ids = fork
+        .storage()
+        .get_vertex_ext_ids()
+        .await
+        .unwrap_or_default();
+    let primary_ext_ids = primary_storage
+        .get_vertex_ext_ids()
+        .await
+        .unwrap_or_default();
     let mut any_edge_pattern = false;
     // Cache of vertices just promoted inside this call. Edge patterns
     // check this before falling back to primary's UidIndex + Cypher
@@ -539,7 +566,7 @@ where
                     };
                     let uid = VertexDataset::compute_vertex_uid(
                         label,
-                        ext_id_of(&node.properties),
+                        ext_id_for(&fork_ext_ids, node.vid),
                         &node.properties,
                     );
                     if just_inserted.contains_key(&(label.clone(), uid)) {
@@ -630,12 +657,12 @@ where
                     };
                     let src_uid = VertexDataset::compute_vertex_uid(
                         &a_label,
-                        ext_id_of(&a.properties),
+                        ext_id_for(&fork_ext_ids, a.vid),
                         &a.properties,
                     );
                     let dst_uid = VertexDataset::compute_vertex_uid(
                         &b_label,
-                        ext_id_of(&b.properties),
+                        ext_id_for(&fork_ext_ids, b.vid),
                         &b.properties,
                     );
                     let edge_uid = MainEdgeDataset::compute_edge_uid(
@@ -726,12 +753,12 @@ where
                             let eb_label = eb.labels.first().cloned().unwrap_or_default();
                             let esrc = VertexDataset::compute_vertex_uid(
                                 &ea_label,
-                                ext_id_of(&ea.properties),
+                                ext_id_for(&primary_ext_ids, ea.vid),
                                 &ea.properties,
                             );
                             let edst = VertexDataset::compute_vertex_uid(
                                 &eb_label,
-                                ext_id_of(&eb.properties),
+                                ext_id_for(&primary_ext_ids, eb.vid),
                                 &eb.properties,
                             );
                             let euid = MainEdgeDataset::compute_edge_uid(

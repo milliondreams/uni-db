@@ -1511,6 +1511,54 @@ impl StorageManager {
             .await
     }
 
+    /// Map every live vertex that has an external id to its `ext_id`
+    /// (`_vid` → `ext_id`).
+    ///
+    /// `ext_id` is folded into a vertex's content `_uid` but is stripped from
+    /// query results, so the fork diff/promote engine can't recover it by
+    /// re-hashing query rows — two vertices differing only by `ext_id` would
+    /// collapse to one identity (review H4). This exposes the stored `ext_id`
+    /// so the diff can fold it back into its recomputed UID. Reads through the
+    /// (branched) backend, so a forked manager sees its own + inherited rows.
+    /// Covers flushed (Lance) rows; `ext_id` is immutable so no version
+    /// reconciliation is needed.
+    pub async fn get_vertex_ext_ids(&self) -> Result<std::collections::HashMap<Vid, String>> {
+        use arrow_array::StringArray;
+        let backend = self.backend.as_ref();
+        let vtable = table_names::main_vertex_table_name();
+        let mut out = std::collections::HashMap::new();
+        if !backend.table_exists(vtable).await.unwrap_or(false) {
+            return Ok(out);
+        }
+        let request = ScanRequest::all(vtable)
+            .with_filter("_deleted = false")
+            .with_columns(vec!["_vid".to_string(), "ext_id".to_string()]);
+        let batches = backend
+            .scan(request)
+            .await
+            .map_err(|e| anyhow!("get_vertex_ext_ids: {}", e))?;
+        for batch in batches {
+            let vids = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| anyhow!("get_vertex_ext_ids: missing/invalid _vid column"))?;
+            let exts = batch
+                .column_by_name("ext_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow!("get_vertex_ext_ids: missing/invalid ext_id column"))?;
+            for i in 0..batch.num_rows() {
+                if exts.is_null(i) {
+                    continue;
+                }
+                let ext = exts.value(i);
+                if !ext.is_empty() {
+                    out.insert(Vid::from(vids.value(i)), ext.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Find labels for a vertex by VID. Uses pinned snapshot HWM if present.
     pub async fn find_vertex_labels_by_vid(&self, vid: Vid) -> Result<Option<Vec<String>>> {
         MainVertexDataset::find_labels_by_vid(self.backend(), vid, self.version_high_water_mark())

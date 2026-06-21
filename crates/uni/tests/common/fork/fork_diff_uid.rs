@@ -203,3 +203,51 @@ async fn diff_inversion_holds_under_uid_identity() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+/// H4: two vertices differing ONLY by `ext_id` must not collapse to one diff
+/// identity. The diff folds the stored `ext_id` into the recomputed content UID.
+/// Uses snapshot isolation (fork-point) instead of a delete: `one` is forked
+/// when primary has only ext_id 'a'; `two` after 'a' and 'b' both exist, so the
+/// 'b' row is present in `two` only. Before the fix, 'a' and 'b' shared a UID
+/// and the diff saw no difference.
+#[tokio::test]
+async fn diff_honors_ext_id() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+    let s = db.session();
+
+    let tx = s.tx().await?;
+    tx.execute("CREATE (:N {ext_id: 'a', name: 'Same'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    let _one = s.fork("one").await?; // fork-point sees only ext_id 'a'
+
+    let tx = s.tx().await?;
+    tx.execute("CREATE (:N {ext_id: 'b', name: 'Same'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    let _two = s.fork("two").await?; // fork-point sees ext_id 'a' and 'b'
+
+    // 'a' is shared; 'b' is present only in `two`. With the bug both 'a' and 'b'
+    // hash to the same UID, so the diff reports no added rows.
+    let diff = db.diff_forks("one", "two").await?;
+    assert_eq!(
+        diff.vertices.added.len(),
+        1,
+        "ext_id-distinct vertices must not collapse to one diff identity (review H4); got added={:?}",
+        diff.vertices
+            .added
+            .iter()
+            .map(|v| v.properties.clone())
+            .collect::<Vec<_>>()
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

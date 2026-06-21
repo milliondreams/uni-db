@@ -266,22 +266,21 @@ impl StorageBackend for BranchedBackend {
         // When no branch exists (label never written through the
         // fork), delegate to primary's vector_search.
         //
-        // The `metric` parameter is honored implicitly: Lance picks
-        // the metric from the index built on the column. `filter`
-        // is dropped on the branch path for now — Phase 5b's MVP
-        // doesn't push predicates through to lance::Dataset::scan,
-        // and the caller layer above re-applies filters in
-        // post-processing. Tighten in a 5b-followup if filter
-        // pushdown shows up in benchmarks.
+        // The `metric` parameter is honored implicitly: Lance picks the
+        // metric from the index built on the column. The `filter` (M6) is
+        // threaded into the branch scan so the user predicate, the
+        // `_deleted = false` guard, and the version HWM pin are all
+        // honored — matching the non-branch path's semantics.
         if let Some(branch) = self.scope.branch_for(table) {
             let dataset_uri = self.dataset_uri(table);
-            let _ = (metric, filter);
+            let _ = metric;
             return super::lance_branch::vector_search_on_branch(
                 &dataset_uri,
                 &branch,
                 column,
                 query,
                 k,
+                &filter,
             )
             .await;
         }
@@ -300,17 +299,17 @@ impl StorageBackend for BranchedBackend {
     ) -> Result<Vec<RecordBatch>> {
         // Phase 5b: same per-branch routing as vector_search. Lance's
         // FTS query on a branch surfaces fork-local + parent-inherited
-        // rows via `base_paths`. Filter pushdown deferred to a
-        // 5b-followup.
+        // rows via `base_paths`. The `filter` (M6) is threaded through so
+        // the predicate, `_deleted = false`, and the HWM pin are honored.
         if let Some(branch) = self.scope.branch_for(table) {
             let dataset_uri = self.dataset_uri(table);
-            let _ = filter;
             return super::lance_branch::full_text_search_on_branch(
                 &dataset_uri,
                 &branch,
                 column,
                 query,
                 k,
+                &filter,
             )
             .await;
         }

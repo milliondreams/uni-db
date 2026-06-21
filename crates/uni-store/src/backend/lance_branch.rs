@@ -20,6 +20,7 @@
 
 // Rust guideline compliant
 
+use crate::backend::types::FilterExpr;
 use anyhow::{Context, Result};
 use lance::Dataset;
 
@@ -276,6 +277,7 @@ pub async fn vector_search_on_branch(
     column: &str,
     query: &[f32],
     k: usize,
+    filter: &FilterExpr,
 ) -> Result<Vec<arrow_array::RecordBatch>> {
     use arrow_array::Float32Array;
     use futures::TryStreamExt;
@@ -286,6 +288,16 @@ pub async fn vector_search_on_branch(
     scanner
         .nearest(column, &key, k)
         .map_err(|e| anyhow::anyhow!("vector_search_on_branch nearest({column}, k={k}): {e}"))?;
+    // M6: honor the caller's filter (user predicate + `_deleted = false`
+    // + version HWM pin). Prefilter so excluded rows never consume a
+    // top-k slot — otherwise a soft-deleted or out-of-version row could
+    // shadow a live match and shrink the result below k.
+    if let FilterExpr::Sql(sql) = filter {
+        scanner.prefilter(true);
+        scanner
+            .filter(sql)
+            .map_err(|e| anyhow::anyhow!("vector_search_on_branch filter('{sql}'): {e}"))?;
+    }
     let stream = scanner
         .try_into_stream()
         .await
@@ -310,6 +322,7 @@ pub async fn full_text_search_on_branch(
     column: &str,
     query: &str,
     k: usize,
+    filter: &FilterExpr,
 ) -> Result<Vec<arrow_array::RecordBatch>> {
     use futures::TryStreamExt;
     use lance_index::scalar::FullTextSearchQuery;
@@ -326,6 +339,14 @@ pub async fn full_text_search_on_branch(
     scanner
         .full_text_search(fts_query)
         .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;
+    // M6: honor the caller's filter (user predicate + `_deleted = false`
+    // + version HWM pin), prefiltered so excluded rows don't take a slot.
+    if let FilterExpr::Sql(sql) = filter {
+        scanner.prefilter(true);
+        scanner
+            .filter(sql)
+            .map_err(|e| anyhow::anyhow!("full_text_search_on_branch filter('{sql}'): {e}"))?;
+    }
     let stream = scanner
         .try_into_stream()
         .await

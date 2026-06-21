@@ -86,6 +86,12 @@ pub struct ForkPoint {
     /// `adjacency_{type}_{dir}`). A dataset with no `.lance` directory
     /// on disk at the fork point has no entry.
     pub dataset_versions: BTreeMap<String, u64>,
+    /// Parent's MVCC version high-water-mark at the fork point: the
+    /// largest `_version` any inherited row can carry. A fork bootstraps
+    /// its own version counter to this floor so a fork transaction's
+    /// `_version <= pin` read still sees inherited (base_paths) rows,
+    /// while the fork's own writes get versions above it.
+    pub version_hwm: u64,
 }
 
 /// RAII latch on [`StorageManager::flush_in_progress`].
@@ -1598,6 +1604,21 @@ impl Writer {
                         ext_id,
                         first_idx,
                         idx
+                    ));
+                }
+                // Also check the main vertices table — the L0 scans above
+                // miss vertices already flushed to L1, so without this a
+                // batch insert (e.g. a fork promote onto primary) silently
+                // twins a duplicate ext_id instead of erroring. Mirrors the
+                // single-vertex `check_extid_globally_unique`.
+                if let Ok(Some(found_vid)) =
+                    MainVertexDataset::find_by_ext_id(self.storage.backend(), ext_id, None).await
+                {
+                    return Err(anyhow!(
+                        "Constraint violation at index {}: ext_id '{}' already exists (vertex {:?})",
+                        idx,
+                        ext_id,
+                        found_vid
                     ));
                 }
                 batch_extids.insert(ext_id.to_string(), idx);
@@ -3502,9 +3523,15 @@ impl Writer {
         let _flush_lock_guard = self.flush_lock.lock().await;
         self.flush_inline_under_lock(None).await?;
 
-        // Still under `flush_lock`: capture the allocator HWM and every
-        // existing dataset's Lance version so nothing can interleave.
+        // Still under `flush_lock`: capture the allocator HWM, the MVCC
+        // version HWM, and every existing dataset's Lance version so
+        // nothing can interleave.
         let (vid_hwm, eid_hwm) = self.allocator.current_hwm().await;
+        // The parent's current L0 version is the largest `_version` any
+        // inherited row can carry (flushed or in-memory). A fork bootstraps
+        // its version floor to this so a fork tx read still sees inherited
+        // rows. Cheap read lock; no buffer clone.
+        let version_hwm = self.l0_manager.get_current().read().current_version;
 
         let base = self.storage.base_uri();
         let mut dataset_versions = BTreeMap::new();
@@ -3521,6 +3548,7 @@ impl Writer {
             vid_hwm,
             eid_hwm,
             dataset_versions,
+            version_hwm,
         })
     }
 

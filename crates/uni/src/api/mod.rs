@@ -957,6 +957,10 @@ impl UniInner {
             forked_storage.clone(),
             merged_schema.clone(),
             &scope.fork_id(),
+            // Bootstrap the fork's MVCC version floor to the parent's
+            // fork-point HWM so in-tx fork reads see inherited rows. WAL
+            // replay below advances the counter for the fork's own writes.
+            scope.fork_info().fork_point_version_hwm,
             self.config.clone(),
         )
         .await
@@ -2809,11 +2813,21 @@ impl Uni {
     /// This method flushes any pending data and waits for all background tasks to complete
     /// (with a timeout). After calling this method, the database instance should not be used.
     pub async fn shutdown(self) -> Result<()> {
-        // Flush pending data
-        if let Some(writer) = &self.inner.writer
-            && let Err(e) = writer.flush_to_l1(None).await
-        {
-            tracing::error!("Error flushing during shutdown: {}", e);
+        // Flush pending data.
+        if let Some(writer) = &self.inner.writer {
+            if let Err(e) = writer.flush_to_l1(None).await {
+                tracing::error!("Error flushing during shutdown: {}", e);
+            }
+            // Close the async-flush coordinator's submit channel so its
+            // finalizer task exits now. The finalizer's JoinHandle is
+            // tracked by `shutdown_handle`, but the loop blocks on
+            // `submit_rx.recv()` and never sees the shutdown broadcast — so
+            // without this the `shutdown_async` below would await it for the
+            // full grace period. `shutdown()` drops the sender (the
+            // finalizer then receives `None` and exits) and is idempotent.
+            if let Some(coord) = writer.flush_coordinator() {
+                coord.shutdown().await;
+            }
         }
 
         self.inner

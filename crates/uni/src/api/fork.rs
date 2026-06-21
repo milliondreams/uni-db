@@ -244,6 +244,11 @@ async fn create_fork_2pc(
         parent_snapshot_id.clone(),
         schema_version,
     );
+    // Bootstrap the fork's MVCC version floor to the parent's fork-point
+    // version HWM so a fork transaction's `_version <= pin` read still sees
+    // inherited (base_paths) rows. Without this the fork starts at version
+    // 0 and in-tx reads filter out every inherited row.
+    info.fork_point_version_hwm = fork_point.version_hwm;
     // Phase 3: record the parent fork id when this is a nested fork.
     // `parent_fork_id == None` ⇒ parent is primary.
     info.parent_fork_id = parent.fork_scope().map(|s| s.fork_id());

@@ -20,6 +20,8 @@
 
 // Rust guideline compliant
 
+use std::sync::Arc;
+
 use crate::backend::types::FilterExpr;
 use anyhow::{Context, Result};
 use lance::Dataset;
@@ -615,6 +617,61 @@ pub async fn delete_from_branch(uri: &str, branch: &str, predicate: &str) -> Res
     on_branch.delete(predicate).await.with_context(|| {
         format!("delete on branch {branch} on {uri} with predicate `{predicate}`")
     })?;
+    Ok(())
+}
+
+/// Merge-insert (update-only) `batches` into the dataset's named branch.
+///
+/// Opens the dataset on `branch` and runs Lance's `MergeInsertBuilder`
+/// keyed on `on`, applying `WhenMatched::UpdateAll`. Like the primary
+/// [`crate::backend::lance::LanceDbBackend::merge_insert`], it deliberately
+/// does NOT insert unmatched source rows (CREATE goes through the Append
+/// path); the partial/tombstone source only updates existing rows. The
+/// commit lands on the branch tip; primary's main branch is untouched.
+///
+/// This is what lets a fork update or soft-delete an *inherited*
+/// (base_paths) vertex: the flush emits a partial `_deleted`/`_version`
+/// (or touched-column) batch keyed by `_vid`, which matches the inherited
+/// row visible through the branch chain and shadows it on the branch.
+///
+/// # Errors
+///
+/// - The dataset or branch does not exist.
+/// - The merge build/execute fails (schema mismatch, IO, commit conflict).
+pub async fn merge_insert_on_branch<R>(
+    uri: &str,
+    branch: &str,
+    on: &[&str],
+    batches: R,
+) -> Result<()>
+where
+    R: arrow_array::RecordBatchReader + Send + 'static,
+{
+    use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+    let on_branch = open_branch(uri, branch)
+        .await
+        .with_context(|| format!("open branch {branch} on {uri} for merge_insert"))?;
+    let mut builder = MergeInsertBuilder::try_new(
+        Arc::new(on_branch),
+        on.iter().map(|s| (*s).to_string()).collect(),
+    )
+    .with_context(|| format!("merge_insert builder on branch {branch} of {uri}"))?;
+    builder.when_matched(WhenMatched::UpdateAll);
+    // Update-only: drop unmatched source rows. The flush source is a
+    // partial-column batch (e.g. tombstone `_vid`/`_deleted`/`_version`),
+    // so inserting unmatched rows would fail on non-nullable target columns
+    // and is wrong anyway — CREATE goes through the Append path. The lance
+    // `Dataset` builder defaults to InsertAll (unlike the lancedb `Table`),
+    // so this must be set explicitly.
+    builder.when_not_matched(WhenNotMatched::DoNothing);
+    let job = builder
+        .try_build()
+        .with_context(|| format!("merge_insert build on branch {branch} of {uri}"))?;
+    let boxed: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(batches);
+    job.execute_reader(boxed)
+        .await
+        .with_context(|| format!("merge_insert execute on branch {branch} of {uri}"))?;
     Ok(())
 }
 

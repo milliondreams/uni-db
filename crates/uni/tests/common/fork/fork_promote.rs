@@ -306,8 +306,10 @@ async fn promote_upsert_idempotent_after_flush() -> Result<()> {
 
 /// Review M4: the legacy (default) promote never upserts — the same
 /// divergence the upsert path merges in place is instead inserted as a
-/// twin under the default options. Locks the backward-compatible contract
-/// and documents the twin behavior the upsert option exists to avoid.
+/// (content) twin under the default options. Locks the backward-compatible
+/// contract. (The promote insert carries no `ext_id` — it is stripped from
+/// the scanned props — so it does not collide on `ext_id`; see the
+/// separate `bulk_create_*` ext_id-uniqueness test for that path.)
 #[tokio::test]
 async fn promote_default_is_insert_only_twin() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -325,8 +327,8 @@ async fn promote_default_is_insert_only_twin() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
-    // Fork pins age 30; primary diverges to 99 (same setup as the upsert
-    // test). Under the default options promote must NOT update primary.
+    // Fork pins age 30; primary diverges to 99. Under the default options
+    // promote must NOT update primary.
     let _fork = session.fork("edit").await?;
     let tx = session.tx().await?;
     tx.execute("MATCH (p:Person {name: 'Alice'}) SET p.age = 99")
@@ -346,7 +348,6 @@ async fn promote_default_is_insert_only_twin() -> Result<()> {
         "default insert-only twins the divergent fork vertex: {report:?}"
     );
 
-    // Both the diverged primary value and the promoted fork value coexist.
     let rows = session
         .query("MATCH (p:Person {name: 'Alice'}) RETURN p.age AS age ORDER BY age")
         .await?;

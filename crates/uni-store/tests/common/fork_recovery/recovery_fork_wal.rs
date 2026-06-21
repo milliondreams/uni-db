@@ -91,7 +91,7 @@ async fn fork_wal_replay_restores_persisted_mutations() {
     // 2. Build a new Writer via the factory — the same flow that
     //    `UniInner::at_fork` uses. Then call `replay_wal(0)` to load
     //    persisted mutations into the freshly-built L0 buffer.
-    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, UniConfig::default())
+    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, 0, UniConfig::default())
         .await
         .unwrap();
     let replayed = writer.replay_wal(0).await.unwrap();
@@ -131,7 +131,7 @@ async fn replay_with_no_persisted_mutations_is_noop() {
     let (_dir, _store, storage, schema) = fixture().await;
     let fork_id = ForkId::new();
 
-    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, UniConfig::default())
+    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, 0, UniConfig::default())
         .await
         .unwrap();
     let replayed = writer.replay_wal(0).await.unwrap();

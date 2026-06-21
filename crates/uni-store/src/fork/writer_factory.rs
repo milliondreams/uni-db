@@ -35,7 +35,10 @@ use super::{id_alloc, wal as fork_wal};
 /// uses a per-fork `IdAllocator` (Day 3) persisted under
 /// `catalog/forks/{fork_id}/id_allocator.json`, a per-fork
 /// `WriteAheadLog` (Day 5) rooted at `wal/forks/{fork_id}/`, and
-/// a fresh L0 buffer at `start_version=0`.
+/// an L0 buffer whose version counter starts at `start_version` — the
+/// parent's fork-point version HWM, so a fork transaction's
+/// `_version <= pin` read still sees inherited (base_paths) rows while the
+/// fork's own writes get versions above it.
 ///
 /// # Errors
 ///
@@ -45,6 +48,7 @@ pub async fn new_for_fork(
     storage: Arc<StorageManager>,
     schema_manager: Arc<SchemaManager>,
     fork_id: &ForkId,
+    start_version: u64,
     config: UniConfig,
 ) -> Result<Writer> {
     let store = storage.store();
@@ -61,8 +65,9 @@ pub async fn new_for_fork(
     let mut writer = Writer::new_with_config(
         storage,
         schema_manager,
-        // Fork's own version namespace; not interleaved with primary.
-        0,
+        // Bootstrap the fork's version floor to the parent's fork-point
+        // HWM so a fork tx read sees inherited rows (fork writes go above).
+        start_version,
         config,
         Some(wal),
         Some(allocator),
@@ -116,6 +121,7 @@ mod tests {
             storage.clone(),
             schema.clone(),
             &fork_id,
+            0,
             UniConfig::default(),
         )
         .await
@@ -132,12 +138,24 @@ mod tests {
         let id_a = ForkId::new();
         let id_b = ForkId::new();
 
-        let writer_a = new_for_fork(storage.clone(), schema.clone(), &id_a, UniConfig::default())
-            .await
-            .unwrap();
-        let writer_b = new_for_fork(storage.clone(), schema.clone(), &id_b, UniConfig::default())
-            .await
-            .unwrap();
+        let writer_a = new_for_fork(
+            storage.clone(),
+            schema.clone(),
+            &id_a,
+            0,
+            UniConfig::default(),
+        )
+        .await
+        .unwrap();
+        let writer_b = new_for_fork(
+            storage.clone(),
+            schema.clone(),
+            &id_b,
+            0,
+            UniConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // Each starts at VID 0, independently — promotion later
         // resolves any collisions via UniId dedup.

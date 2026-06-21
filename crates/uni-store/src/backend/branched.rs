@@ -433,6 +433,28 @@ impl StorageBackend for BranchedBackend {
         super::lance_branch::delete_from_branch(&uri, &branch, filter).await
     }
 
+    async fn merge_insert(
+        &self,
+        table_name: &str,
+        on: &[&str],
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        // Merge-insert is update-only, so it targets rows that already
+        // exist in the dataset (on the fork branch or inherited via
+        // base_paths). The dataset therefore exists on primary; route to
+        // the fork's branch exactly like `delete_rows`. This is what lets a
+        // fork flush a soft-delete or partial-column edit of an INHERITED
+        // vertex — without it the flush bailed "merge_insert not supported".
+        let branch = self.ensure_branch_for_existing(table_name).await?;
+        let uri = self.dataset_uri(table_name);
+        let schema = batches[0].schema();
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        super::lance_branch::merge_insert_on_branch(&uri, &branch, on, reader).await
+    }
+
     async fn replace_table_atomic(
         &self,
         name: &str,

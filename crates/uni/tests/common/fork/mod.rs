@@ -22,6 +22,7 @@ pub mod fork_index_sorted;
 pub mod fork_index_vector;
 pub mod fork_index_vid_uid;
 pub mod fork_locy_rules;
+pub mod fork_mutate_inherited;
 pub mod fork_nested;
 pub mod fork_nested_perf;
 pub mod fork_nested_recovery;

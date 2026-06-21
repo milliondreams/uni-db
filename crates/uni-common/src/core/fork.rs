@@ -116,6 +116,16 @@ pub struct ForkInfo {
     /// directory in Lance's on-disk layout.
     pub datasets: BTreeMap<String, String>,
 
+    /// Parent's MVCC version high-water-mark at the fork point. The fork
+    /// bootstraps its own version counter to this floor so a fork
+    /// transaction's `_version <= pin` read still sees inherited
+    /// (base_paths) rows, while fork writes get versions above it. Read on
+    /// every fork-session build; persisted so it is stable across re-opens
+    /// (it must be the *fork-point* version, never the live parent's).
+    /// `0` for legacy forks created before this field existed.
+    #[serde(default)]
+    pub fork_point_version_hwm: u64,
+
     /// Lifecycle state. See [`ForkStatus`].
     pub status: ForkStatus,
 }
@@ -138,6 +148,7 @@ impl ForkInfo {
             ttl_expires_at: None,
             schema_version_at_creation: schema_version,
             datasets: BTreeMap::new(),
+            fork_point_version_hwm: 0,
             status: ForkStatus::Pending,
         }
     }

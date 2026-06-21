@@ -1,6 +1,7 @@
 pub mod adjacency_cache_edge_cases;
 pub mod adjacency_cache_test;
 pub mod adjacency_snapshot_isolation;
+pub mod batch_extid_uniqueness;
 pub mod composite_index_test;
 pub mod edge_type_properties_test;
 pub mod expression_index_test;

@@ -1676,7 +1676,13 @@ impl StorageManager {
         label: &str,
         direction: &str,
     ) -> Result<AdjacencyDataset> {
-        let key = format!("adjacency_{direction}_{edge_type}_{label}");
+        // The fork registers adjacency branches under the canonical table
+        // name (`adjacency_{edge_type}_{direction}`), so the lookup key must
+        // match it — not the historical `adjacency_{direction}_{edge_type}_
+        // {label}`, which never resolved a branch. Adjacency is per-`(edge_
+        // type, direction)`, not per-label. The canonical form is pinned by
+        // `table_names::tests::adjacency_table_name_is_canonical`. (L8)
+        let key = crate::backend::table_names::adjacency_table_name(edge_type, direction);
         match self.fork_branch_for(&key) {
             Some(branch) => Ok(AdjacencyDataset::new_branched(
                 &self.base_uri,

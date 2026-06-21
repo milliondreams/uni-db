@@ -188,6 +188,14 @@ pub enum PropertyOwnerKind {
 /// non-goals (§14). Always read together with primary's schema:
 /// `merged = primary ⊕ delta`. The merge implementation lives in
 /// [`crate::core::schema::SchemaManager::with_overlay`].
+///
+/// # Invariant: fork-origin ids are fork-local (L7)
+///
+/// A label/edge-type id minted in this delta can collide with a primary id
+/// allocated after the fork point (both use `max(existing)+1` over their own
+/// view). This is benign: promote and storage resolve by NAME, never by a
+/// fork-origin numeric id. Do not trust these ids across the fork↔primary
+/// boundary.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SchemaDelta {
     /// Vertex labels new to this fork's schema.

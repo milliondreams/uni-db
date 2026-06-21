@@ -69,6 +69,17 @@ pub struct ForkScope {
     /// edge types without touching primary's `catalog/schema.json`.
     /// `ArcSwap` makes reads cheap and atomic; the `overlay_lock`
     /// below serializes the read-modify-write on the persistence side.
+    ///
+    /// # Invariant: fork-origin numeric ids are fork-local (L7)
+    ///
+    /// The overlay is frozen at fork time, so a label/edge-type id minted
+    /// inside a fork (via `max(existing)+1`) does not observe primary's
+    /// later additions and **can collide** with a primary id allocated
+    /// after the fork point. This is benign because nothing trusts a
+    /// fork-origin id across the fork↔primary boundary: promote
+    /// (`uni_fork::diff`) re-creates by NAME, primary re-allocates its own
+    /// id, and storage keys rows by label name. A fork-origin numeric id
+    /// MUST NOT be trusted outside the fork's own view.
     overlay: Arc<ArcSwap<SchemaDelta>>,
     /// Serializes overlay updates *within a single fork* so two
     /// concurrent `add_label_to_overlay` calls don't clobber each

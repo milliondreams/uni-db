@@ -216,6 +216,25 @@ async fn create_fork_2pc(
     name: String,
     ttl: Option<Duration>,
 ) -> Result<ForkInfo> {
+    // L6 backstop: every schema label/edge-type name becomes a `vertices_
+    // {label}` / `deltas_…` / `adjacency_…` dataset path and a `fork_{id}_…`
+    // Lance branch name, so a name with a path separator/whitespace/control
+    // char would fail Lance branch creation mid-loop and leave residue.
+    // `add_label`/`add_edge_type` already reject such names, but the
+    // schemaless `get_or_assign_edge_type_id` interning path is infallible
+    // and bypasses that — so re-validate here, before any flush, registry
+    // entry, or branch is created. Fails fast with no residue.
+    {
+        use uni_common::core::schema::SchemaManager;
+        let schema = parent.db.schema.schema();
+        for label in schema.labels.keys() {
+            SchemaManager::validate_schema_element_name("Label", label)?;
+        }
+        for edge_type in schema.edge_types.keys() {
+            SchemaManager::validate_schema_element_name("Edge type", edge_type)?;
+        }
+    }
+
     // Materialize the fork point. A fork branches off concrete Lance
     // dataset versions and resolves reads through `base_paths`; it never
     // consults the parent's in-memory L0 buffer. Any writes the parent

@@ -34,6 +34,7 @@ pub mod fork_promote;
 pub mod fork_promote_edges;
 pub mod fork_read_only;
 pub mod fork_schema_evolution;
+pub mod fork_schema_hardening;
 pub mod fork_strict_schema;
 pub mod fork_tag;
 pub mod fork_target_endpoint_label;

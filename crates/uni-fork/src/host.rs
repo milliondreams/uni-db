@@ -43,6 +43,16 @@ pub trait ForkPromoteSink: Send + Sync {
     /// Bulk-insert promoted vertices; returns the allocated VIDs in order.
     async fn bulk_insert_vertices(&self, label: &str, rows: Vec<Properties>) -> Result<Vec<Vid>>;
 
+    /// Overwrite an existing primary vertex's properties in place, keeping
+    /// its VID. Used by the upsert path when a fork edit resolves to an
+    /// existing primary vertex by `(label, ext_id)`.
+    async fn update_vertex_properties(
+        &self,
+        label: &str,
+        vid: Vid,
+        props: Properties,
+    ) -> Result<()>;
+
     /// Bulk-insert promoted edges between resolved primary endpoints.
     async fn bulk_insert_edges(
         &self,

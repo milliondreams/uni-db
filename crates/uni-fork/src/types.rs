@@ -363,11 +363,53 @@ impl fmt::Display for PromotePattern {
     }
 }
 
+/// Options controlling `Uni::promote_from_fork` merge behavior.
+///
+/// Additive and `#[non_exhaustive]`: the legacy `promote_from_fork`
+/// entry point uses `PromoteOptions::default()` (insert-only), so existing
+/// callers are unaffected.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct PromoteOptions {
+    /// When `true`, a fork edit to a vertex that already exists on primary
+    /// (matched by `(label, ext_id)`) is applied as an in-place property
+    /// update instead of inserting a twin. Vertices without an `ext_id`
+    /// keep the legacy content-UID insert-or-skip behavior. Default
+    /// `false` preserves the historical insert-only contract.
+    pub upsert: bool,
+}
+
+impl PromoteOptions {
+    /// Insert-only (legacy) options — the default.
+    #[must_use]
+    pub fn insert_only() -> Self {
+        Self { upsert: false }
+    }
+
+    /// Enable ext_id-keyed upsert of existing primary vertices.
+    #[must_use]
+    pub fn with_upsert() -> Self {
+        Self { upsert: true }
+    }
+}
+
 /// Outcome of `Uni::promote_from_fork`.
 #[derive(Debug, Clone, Default)]
 pub struct PromoteReport {
     /// Number of vertices inserted into primary.
     pub vertices_inserted: usize,
+    /// Number of existing primary vertices updated in place (upsert by
+    /// `(label, ext_id)`; only populated when `PromoteOptions::upsert`).
+    pub vertices_updated: usize,
+    /// Number of fork rows that matched an existing primary vertex by
+    /// `(label, ext_id)` with identical properties — nothing written.
+    pub vertices_skipped_no_op: usize,
+    /// Number of vertices inserted while their primary presence could
+    /// NOT be confirmed (a transient resolve failure degraded to
+    /// "absent → insert"). A non-zero value means some of
+    /// `vertices_inserted` may be duplicates; see the warning logged at
+    /// promote time. (M5)
+    pub vertices_inserted_unverified: usize,
     /// Number of fork rows skipped because primary already has the same UID.
     pub vertices_skipped_uid_conflict: usize,
     /// Number of edges inserted into primary.

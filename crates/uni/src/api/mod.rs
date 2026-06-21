@@ -1656,6 +1656,34 @@ impl Uni {
         fork_name: &str,
         patterns: &[fork_diff::PromotePattern],
     ) -> Result<fork_diff::PromoteReport> {
+        self.promote_from_fork_with_options(
+            fork_name,
+            patterns,
+            &fork_diff::PromoteOptions::default(),
+        )
+        .await
+    }
+
+    /// Promote fork changes to primary with explicit merge [`options`].
+    ///
+    /// Same as [`Self::promote_from_fork`] but lets the caller enable
+    /// ext_id-keyed upsert (`PromoteOptions::with_upsert`): a fork edit to
+    /// a vertex that already exists on primary is applied in place instead
+    /// of inserting a twin. The default options reproduce the insert-only
+    /// behavior of `promote_from_fork`, so existing callers are unaffected.
+    ///
+    /// # Errors
+    /// Returns [`UniError::LabelNotFound`] / [`UniError::EdgeTypeNotFound`]
+    /// when a pattern targets a label or edge type absent on primary, or
+    /// any error from the underlying fork flush, transaction, or commit.
+    ///
+    /// [`options`]: fork_diff::PromoteOptions
+    pub async fn promote_from_fork_with_options(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+        options: &fork_diff::PromoteOptions,
+    ) -> Result<fork_diff::PromoteReport> {
         let primary = self.session();
         let fork = primary.fork(fork_name).await?;
         // Persist any pending tx commits on the fork to Lance so the
@@ -1685,7 +1713,8 @@ impl Uni {
             }
         }
         let primary_tx = primary.tx().await?;
-        let report = fork_diff::run_promote(&fork, &primary, &primary_tx, patterns).await?;
+        let report =
+            fork_diff::run_promote(&fork, &primary, &primary_tx, patterns, options).await?;
         primary_tx.commit().await?;
         Ok(report)
     }

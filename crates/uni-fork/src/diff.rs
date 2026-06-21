@@ -22,8 +22,8 @@ use uni_common::core::id::{UniId, Vid};
 
 use crate::host::{ForkPromoteSink, ForkQueryHost};
 use crate::types::{
-    DiffEdge, DiffVertex, EdgeDiff, ForkDiff, PromotePattern, PromoteReport, PropertyChange,
-    VertexDiff, VertexPropertyChange,
+    DiffEdge, DiffVertex, EdgeDiff, ForkDiff, PromoteOptions, PromotePattern, PromoteReport,
+    PropertyChange, VertexDiff, VertexPropertyChange,
 };
 
 /// Compute the structural delta between two views.
@@ -344,16 +344,18 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     primary_storage: &Arc<uni_store::storage::manager::StorageManager>,
     label: &str,
     uids: &[UniId],
-) -> HashMap<UniId, Vid> {
+) -> (HashMap<UniId, Vid>, bool) {
     // NOTE: every error path below degrades to whatever has been
     // resolved so far (an empty or partial map) rather than
     // propagating. This is deliberate: `run_promote` treats an
     // unresolved UID as "not present on primary" and inserts it, so a
-    // transient resolve failure must not abort the promote. Changing
-    // this to propagate would alter promote semantics.
+    // transient resolve failure must not abort the promote. The returned
+    // `degraded` flag (M5) tells the caller that "absent" was inferred
+    // from a failed resolve, so the resulting inserts are unverified and
+    // may be duplicates — surfaced as `vertices_inserted_unverified`.
     let mut out: HashMap<UniId, Vid> = HashMap::new();
     if uids.is_empty() {
-        return out;
+        return (out, false);
     }
     // Collect *all* candidate VIDs per UID by scanning the shared
     // UidIndex with an IN filter. The shared index is not
@@ -363,12 +365,12 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     let candidates_per_uid: HashMap<UniId, Vec<Vid>> = match primary_storage.uid_index(label).ok() {
         Some(uix) => match resolve_all_candidate_vids(&uix, uids).await {
             Ok(m) => m,
-            Err(_) => return out,
+            Err(_) => return (out, true),
         },
-        None => return out,
+        None => return (out, true),
     };
     if candidates_per_uid.is_empty() {
-        return out;
+        return (out, false);
     }
     // Single Cypher with IN clause over every candidate VID across
     // every UID. Primary's branched backend filters out fork-only
@@ -385,7 +387,7 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     );
     let rs = match primary.query(&cypher).await {
         Ok(rs) => rs,
-        Err(_) => return out,
+        Err(_) => return (out, true),
     };
     let primary_vids: HashSet<u64> = rs
         .rows()
@@ -401,6 +403,69 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
             .find(|v| primary_vids.contains(&v.as_u64()))
         {
             out.insert(uid, vid);
+        }
+    }
+    (out, false)
+}
+
+/// Resolve fork candidate vertices to existing primary VIDs by their
+/// stable `(label, ext_id)` identity, returning each match's current
+/// primary properties for the upsert equality check.
+///
+/// Unlike [`batch_resolve_primary_vids`] (which keys by mutable
+/// content-UID and so cannot recognize an *edited* vertex), this keys by
+/// the immutable `ext_id`, so a fork edit resolves to the same primary
+/// vertex instead of looking like a brand-new row. Fork rows whose
+/// `ext_id` is absent are not returned here and fall back to the
+/// content-UID path.
+///
+/// A failed primary round-trip degrades to an empty map (treated as "not
+/// present" → insert), matching the deliberate non-aborting contract.
+async fn batch_resolve_primary_by_ext_id<Q: ForkQueryHost + ?Sized>(
+    primary: &Q,
+    primary_ext_ids: &HashMap<Vid, String>,
+    label: &str,
+    ext_ids: &HashSet<String>,
+) -> HashMap<String, (Vid, Properties)> {
+    let mut out: HashMap<String, (Vid, Properties)> = HashMap::new();
+    if ext_ids.is_empty() {
+        return out;
+    }
+    // Invert primary's vid→ext_id map for just the candidate ext_ids.
+    // `get_vertex_ext_ids` is not label-scoped, so the Cypher below
+    // confirms the label (and fetches current props).
+    let mut ext_to_vid: HashMap<String, Vid> = HashMap::new();
+    for (vid, eid) in primary_ext_ids {
+        if ext_ids.contains(eid) {
+            ext_to_vid.insert(eid.clone(), *vid);
+        }
+    }
+    if ext_to_vid.is_empty() {
+        return out;
+    }
+    let vid_list: Vec<String> = ext_to_vid
+        .values()
+        .map(|v| v.as_u64().to_string())
+        .collect();
+    let cypher = format!(
+        "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN id(n) AS vid, n AS node",
+        escape_backticks(label),
+        vid_list.join(", ")
+    );
+    let Ok(rs) = primary.query(&cypher).await else {
+        return out;
+    };
+    let mut vid_to_props: HashMap<u64, Properties> = HashMap::new();
+    for row in rs.rows() {
+        if let Ok(vid) = row.get::<i64>("vid")
+            && let Some(Value::Node(node)) = row.value("node")
+        {
+            vid_to_props.insert(vid as u64, node.properties.clone());
+        }
+    }
+    for (eid, vid) in ext_to_vid {
+        if let Some(props) = vid_to_props.get(&vid.as_u64()) {
+            out.insert(eid, (vid, props.clone()));
         }
     }
     out
@@ -504,6 +569,7 @@ pub async fn run_promote<Q, S>(
     primary: &Q,
     primary_tx: &S,
     patterns: &[PromotePattern],
+    options: &PromoteOptions,
 ) -> Result<PromoteReport>
 where
     Q: ForkQueryHost + ?Sized,
@@ -556,37 +622,75 @@ where
                     continue;
                 }
 
-                // First pass: extract (uid, props) for every fork row,
-                // skipping rows already in the within-call cache.
-                let mut candidates: Vec<(UniId, Properties)> =
+                // First pass: extract (uid, props, ext_id) for every fork
+                // row, skipping rows already in the within-call cache.
+                let mut candidates: Vec<(UniId, Properties, Option<String>)> =
                     Vec::with_capacity(result.rows().len());
                 for row in result.rows() {
                     let Some(Value::Node(node)) = row.value("n") else {
                         continue;
                     };
+                    let ext_id = ext_id_for(&fork_ext_ids, node.vid).map(str::to_string);
                     let uid = VertexDataset::compute_vertex_uid(
                         label,
-                        ext_id_for(&fork_ext_ids, node.vid),
+                        ext_id.as_deref(),
                         &node.properties,
                     );
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;
                     }
-                    candidates.push((uid, node.properties.clone()));
+                    candidates.push((uid, node.properties.clone(), ext_id));
                 }
 
-                // Batch-resolve every candidate UID against primary.
-                // Two queries total per pattern (UidIndex.resolve_uids
-                // + Cypher IN-clause verify) instead of 2N.
-                let uids_to_check: Vec<UniId> = candidates.iter().map(|(u, _)| *u).collect();
-                let on_primary =
+                // M4 upsert: resolve ext_id-bearing candidates against
+                // primary by their stable `(label, ext_id)` identity so a
+                // fork EDIT updates the existing vertex instead of inserting
+                // a twin. Only consulted when `options.upsert`.
+                let ext_resolved: HashMap<String, (Vid, Properties)> = if options.upsert {
+                    let ext_ids: HashSet<String> = candidates
+                        .iter()
+                        .filter_map(|(_, _, e)| e.clone())
+                        .collect();
+                    batch_resolve_primary_by_ext_id(primary, &primary_ext_ids, label, &ext_ids)
+                        .await
+                } else {
+                    HashMap::new()
+                };
+
+                // Partition: ext_id matches become in-place upserts; every
+                // other candidate flows through the content-UID
+                // insert-or-skip path (unchanged legacy behavior).
+                let mut uid_candidates: Vec<(UniId, Properties)> =
+                    Vec::with_capacity(candidates.len());
+                for (uid, props, ext_id) in candidates {
+                    match ext_id.as_ref().and_then(|e| ext_resolved.get(e)) {
+                        Some((pvid, pprops)) => {
+                            if props == *pprops {
+                                report.vertices_skipped_no_op += 1;
+                            } else {
+                                primary_tx
+                                    .update_vertex_properties(label, *pvid, props)
+                                    .await?;
+                                report.vertices_updated += 1;
+                            }
+                        }
+                        None => uid_candidates.push((uid, props)),
+                    }
+                }
+
+                // Batch-resolve the remaining candidates by content-UID.
+                // Two queries total per pattern (UidIndex.resolve_uids +
+                // Cypher IN-clause verify) instead of 2N. `degraded` (M5)
+                // signals the resolve could not confirm presence.
+                let uids_to_check: Vec<UniId> = uid_candidates.iter().map(|(u, _)| *u).collect();
+                let (on_primary, degraded) =
                     batch_resolve_primary_vids(primary, &primary_storage, label, &uids_to_check)
                         .await;
 
-                let mut to_insert: Vec<Properties> = Vec::with_capacity(candidates.len());
-                let mut insert_uids: Vec<UniId> = Vec::with_capacity(candidates.len());
-                for (uid, props) in candidates {
+                let mut to_insert: Vec<Properties> = Vec::with_capacity(uid_candidates.len());
+                let mut insert_uids: Vec<UniId> = Vec::with_capacity(uid_candidates.len());
+                for (uid, props) in uid_candidates {
                     if on_primary.contains_key(&uid) {
                         report.vertices_skipped_uid_conflict += 1;
                     } else {
@@ -603,6 +707,18 @@ where
                     }
                     report.vertices_inserted += n;
                     report.per_pattern_inserted[idx] = n;
+                    // M5: presence could not be confirmed for this batch, so
+                    // some of these inserts may be duplicates of existing
+                    // primary rows. Surface it instead of silently dup'ing.
+                    if degraded {
+                        report.vertices_inserted_unverified += n;
+                        warn!(
+                            label = %label,
+                            count = n,
+                            "promote inserted vertices whose primary presence could not be \
+                             confirmed (resolve degraded); they may be duplicates"
+                        );
+                    }
                 }
             }
             PromotePattern::Edge {
@@ -701,7 +817,7 @@ where
                 let mut endpoint_resolved: HashMap<(String, UniId), Vid> = HashMap::new();
                 for (lbl, uid_set) in to_resolve {
                     let uid_vec: Vec<UniId> = uid_set.into_iter().collect();
-                    let resolved =
+                    let (resolved, _degraded) =
                         batch_resolve_primary_vids(primary, &primary_storage, &lbl, &uid_vec).await;
                     for (uid, vid) in resolved {
                         endpoint_resolved.insert((lbl.clone(), uid), vid);

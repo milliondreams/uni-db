@@ -27,6 +27,6 @@ pub use diff::{compute_diff, run_promote};
 pub use host::{ForkPromoteSink, ForkQueryHost};
 pub use maintenance::{ForkMaintenanceHost, spawn_index_builder, spawn_sweeper};
 pub use types::{
-    DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromotePattern, PromoteReport,
-    PropertyChange, VertexDiff, VertexPropertyChange,
+    DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromoteOptions, PromotePattern,
+    PromoteReport, PropertyChange, VertexDiff, VertexPropertyChange,
 };

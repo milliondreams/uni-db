@@ -22,8 +22,8 @@ use uni_common::core::id::{UniId, Vid};
 
 use crate::host::{ForkPromoteSink, ForkQueryHost};
 use crate::types::{
-    DiffEdge, DiffVertex, EdgeDiff, ForkDiff, PromoteOptions, PromotePattern, PromoteReport,
-    PropertyChange, VertexDiff, VertexPropertyChange,
+    ConflictPolicy, DiffEdge, DiffVertex, EdgeDiff, ForkDiff, PromoteBaseline, PromoteOptions,
+    PromotePattern, PromoteReport, PropertyChange, VertexDiff, VertexPropertyChange,
 };
 
 /// Compute the structural delta between two views.
@@ -570,6 +570,7 @@ pub async fn run_promote<Q, S>(
     primary_tx: &S,
     patterns: &[PromotePattern],
     options: &PromoteOptions,
+    baseline: Option<&PromoteBaseline>,
 ) -> Result<PromoteReport>
 where
     Q: ForkQueryHost + ?Sized,
@@ -658,14 +659,54 @@ where
                     HashMap::new()
                 };
 
+                // Per-label fork-point baseline (merge mode only).
+                let label_baseline = baseline.and_then(|b| b.ext.get(label));
+
                 // Partition: ext_id matches become in-place upserts; every
                 // other candidate flows through the content-UID
                 // insert-or-skip path (unchanged legacy behavior).
                 let mut uid_candidates: Vec<(UniId, Properties)> =
                     Vec::with_capacity(candidates.len());
                 for (uid, props, ext_id) in candidates {
-                    match ext_id.as_ref().and_then(|e| ext_resolved.get(e)) {
-                        Some((pvid, pprops)) => {
+                    let resolved = ext_id
+                        .as_ref()
+                        .and_then(|e| ext_resolved.get(e).map(|r| (e.clone(), r)));
+                    let Some((eid, (pvid, pprops))) = resolved else {
+                        uid_candidates.push((uid, props));
+                        continue;
+                    };
+                    match label_baseline.and_then(|m| m.get(&eid)) {
+                        // Baseline-aware merge (with_merge): reconcile the
+                        // fork value `props` against primary-now `pprops` and
+                        // the fork-point baseline `b`.
+                        Some(b) => {
+                            if props == *pprops {
+                                // Already converged — keeps re-promote
+                                // idempotent. Must be checked first.
+                                report.vertices_skipped_no_op += 1;
+                            } else if props == *b {
+                                // Fork left this vertex untouched since the
+                                // fork point — never revert primary's edit.
+                                report.vertices_skipped_no_op += 1;
+                            } else if *pprops != *b {
+                                // Both sides moved off baseline → conflict.
+                                report.vertices_conflicting += 1;
+                                if options.on_conflict == ConflictPolicy::Overwrite {
+                                    primary_tx
+                                        .update_vertex_properties(label, *pvid, props)
+                                        .await?;
+                                    report.vertices_updated += 1;
+                                }
+                            } else {
+                                // Only the fork changed → clean fast-forward.
+                                primary_tx
+                                    .update_vertex_properties(label, *pvid, props)
+                                    .await?;
+                                report.vertices_updated += 1;
+                            }
+                        }
+                        // No baseline for this ext_id: fork-wins upsert.
+                        None => {
                             if props == *pprops {
                                 report.vertices_skipped_no_op += 1;
                             } else {
@@ -675,7 +716,6 @@ where
                                 report.vertices_updated += 1;
                             }
                         }
-                        None => uid_candidates.push((uid, props)),
                     }
                 }
 
@@ -923,6 +963,83 @@ where
                     report.edges_inserted += n;
                 }
                 report.per_pattern_inserted[idx] = pattern_inserted;
+            }
+        }
+    }
+
+    // Delete-promotion (M4): a vertex present at the fork point but removed
+    // on the fork is deleted on primary. Opt-in and ext_id-keyed. We scan
+    // the FULL fork label (ignoring per-pattern where-clauses, which select
+    // which present rows to *promote*, not which to keep), so a filtered-out
+    // but still-present fork row is never read as a deletion. A row primary
+    // added after the fork point is absent from the baseline and so is never
+    // a delete candidate — the anti-spurious-delete guarantee. Runs after
+    // the pattern loop so vertex deletes are issued last in tx order.
+    if options.delete_promotion
+        && let Some(baseline) = baseline
+    {
+        let mut del_labels: Vec<&str> = patterns
+            .iter()
+            .filter(|p| !p.is_edge())
+            .map(|p| p.label_name())
+            .collect();
+        del_labels.sort_unstable();
+        del_labels.dedup();
+
+        for label in del_labels {
+            let cypher = format!("MATCH (n:`{}`) RETURN n", escape_backticks(label));
+            let result = fork.query(&cypher).await?;
+            let mut fork_now_ext: HashSet<String> = HashSet::new();
+            let mut fork_now_noext: HashSet<UniId> = HashSet::new();
+            for row in result.rows() {
+                if let Some(Value::Node(node)) = row.value("n") {
+                    match ext_id_for(&fork_ext_ids, node.vid) {
+                        Some(eid) if !eid.is_empty() => {
+                            fork_now_ext.insert(eid.to_string());
+                        }
+                        _ => {
+                            fork_now_noext.insert(VertexDataset::compute_vertex_uid(
+                                label,
+                                None,
+                                &node.properties,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // ext_id rows present at the fork point, absent on the fork now.
+            if let Some(base_ext) = baseline.ext.get(label) {
+                let deleted_ext: HashSet<String> = base_ext
+                    .keys()
+                    .filter(|eid| !fork_now_ext.contains(*eid))
+                    .cloned()
+                    .collect();
+                if !deleted_ext.is_empty() {
+                    // Resolve against primary NOW; delete only those still
+                    // present (idempotent if primary already removed them).
+                    let resolved = batch_resolve_primary_by_ext_id(
+                        primary,
+                        &primary_ext_ids,
+                        label,
+                        &deleted_ext,
+                    )
+                    .await;
+                    for (_eid, (pvid, _props)) in resolved {
+                        primary_tx.delete_vertex(label, pvid).await?;
+                        report.vertices_deleted += 1;
+                    }
+                }
+            }
+
+            // Non-ext_id fork-point rows that vanished can't be safely
+            // delete-promoted (no stable identity); surface the count.
+            if let Some(base_noext) = baseline.no_ext.get(label) {
+                let gone = base_noext
+                    .iter()
+                    .filter(|u| !fork_now_noext.contains(*u))
+                    .count();
+                report.vertices_skipped_no_ext_id_for_delete += gone;
             }
         }
     }

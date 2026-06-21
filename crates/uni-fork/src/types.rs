@@ -26,6 +26,7 @@
 //! (label + optional Cypher WHERE clause); future phases may grow
 //! relationship-aware patterns.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use uni_common::Properties;
@@ -377,19 +378,88 @@ pub struct PromoteOptions {
     /// keep the legacy content-UID insert-or-skip behavior. Default
     /// `false` preserves the historical insert-only contract.
     pub upsert: bool,
+
+    /// When `true`, after the pattern loop, primary vertices present at the
+    /// fork point but removed on the fork are deleted from primary
+    /// (ext_id-keyed; rows without an `ext_id` are reported, never deleted).
+    /// Requires a fork-point baseline; the host builds it and passes it to
+    /// [`run_promote`]. Off by default because it removes primary rows.
+    pub delete_promotion: bool,
+
+    /// How to resolve a vertex that diverged on BOTH primary and the fork
+    /// since the fork point (a concurrent edit). Only consulted in the
+    /// baseline-aware merge (i.e. when a baseline is supplied).
+    pub on_conflict: ConflictPolicy,
+}
+
+/// Policy for a concurrent divergent edit during a baseline-aware merge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConflictPolicy {
+    /// Leave primary's value untouched; count it in `vertices_conflicting`.
+    /// The safe default.
+    #[default]
+    Skip,
+    /// Apply the fork's value over primary's; count in both
+    /// `vertices_conflicting` and `vertices_updated`.
+    Overwrite,
 }
 
 impl PromoteOptions {
     /// Insert-only (legacy) options — the default.
     #[must_use]
     pub fn insert_only() -> Self {
-        Self { upsert: false }
+        Self::default()
     }
 
-    /// Enable ext_id-keyed upsert of existing primary vertices.
+    /// Enable ext_id-keyed upsert of existing primary vertices (fork-wins,
+    /// no baseline).
     #[must_use]
     pub fn with_upsert() -> Self {
-        Self { upsert: true }
+        Self {
+            upsert: true,
+            ..Self::default()
+        }
+    }
+
+    /// Enable baseline-aware merge: ext_id upsert + conflict detection +
+    /// delete-promotion. The host supplies a [`PromoteBaseline`].
+    #[must_use]
+    pub fn with_merge() -> Self {
+        Self {
+            upsert: true,
+            delete_promotion: true,
+            on_conflict: ConflictPolicy::Skip,
+        }
+    }
+
+    /// Set the conflict policy (builder).
+    #[must_use]
+    pub fn on_conflict(mut self, policy: ConflictPolicy) -> Self {
+        self.on_conflict = policy;
+        self
+    }
+}
+
+/// Fork-point snapshot of primary, keyed for the merge/delete passes.
+///
+/// Built by reading primary pinned at the fork's `parent_snapshot_id`.
+/// `ext` keys rows by their stable `(label, ext_id)`; `no_ext` tracks
+/// `ext_id`-less rows by content-UID so they can be reported as
+/// un-promotable on delete, never deleted.
+#[derive(Debug, Clone, Default)]
+pub struct PromoteBaseline {
+    /// label → (ext_id → properties at the fork point).
+    pub ext: HashMap<String, HashMap<String, Properties>>,
+    /// label → content-UIDs of fork-point rows that had no `ext_id`.
+    pub no_ext: HashMap<String, HashSet<UniId>>,
+}
+
+impl PromoteBaseline {
+    /// `true` when the baseline holds no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ext.is_empty() && self.no_ext.is_empty()
     }
 }
 
@@ -412,6 +482,18 @@ pub struct PromoteReport {
     pub vertices_inserted_unverified: usize,
     /// Number of fork rows skipped because primary already has the same UID.
     pub vertices_skipped_uid_conflict: usize,
+    /// Number of primary vertices deleted because they existed at the fork
+    /// point but the fork has since removed them (delete-promotion; only
+    /// populated when `PromoteOptions::delete_promotion`).
+    pub vertices_deleted: usize,
+    /// Number of fork-point rows without an `ext_id` that vanished from the
+    /// fork — they cannot be safely resolved on primary for deletion, so
+    /// they are reported here rather than deleted.
+    pub vertices_skipped_no_ext_id_for_delete: usize,
+    /// Number of ext_id targets where both primary and the fork diverged
+    /// from the fork-point baseline (a concurrent divergent edit), resolved
+    /// per `PromoteOptions::on_conflict`.
+    pub vertices_conflicting: usize,
     /// Number of edges inserted into primary.
     pub edges_inserted: usize,
     /// Number of fork edges skipped because primary already has an

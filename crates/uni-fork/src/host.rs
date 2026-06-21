@@ -53,6 +53,10 @@ pub trait ForkPromoteSink: Send + Sync {
         props: Properties,
     ) -> Result<()>;
 
+    /// Soft-delete an existing primary vertex. Used by delete-promotion
+    /// when a vertex present at the fork point was removed on the fork.
+    async fn delete_vertex(&self, label: &str, vid: Vid) -> Result<()>;
+
     /// Bulk-insert promoted edges between resolved primary endpoints.
     async fn bulk_insert_edges(
         &self,

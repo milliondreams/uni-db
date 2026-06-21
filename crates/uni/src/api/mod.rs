@@ -1716,11 +1716,101 @@ impl Uni {
                 }
             }
         }
+        // Delete-promotion and conflict detection need the fork-point
+        // baseline: primary's state as of the fork point, read by pinning a
+        // session at the fork's parent snapshot. Built only for merge mode.
+        let baseline = if options.delete_promotion {
+            Some(self.build_promote_baseline(fork_name, patterns).await?)
+        } else {
+            None
+        };
+
         let primary_tx = primary.tx().await?;
-        let report =
-            fork_diff::run_promote(&fork, &primary, &primary_tx, patterns, options).await?;
+        let report = fork_diff::run_promote(
+            &fork,
+            &primary,
+            &primary_tx,
+            patterns,
+            options,
+            baseline.as_ref(),
+        )
+        .await?;
         primary_tx.commit().await?;
         Ok(report)
+    }
+
+    /// Read primary as of a fork's creation point into a [`PromoteBaseline`].
+    ///
+    /// Pins a session to the fork's `parent_snapshot_id` and scans each
+    /// vertex-pattern label, keying rows by `ext_id` (and `ext_id`-less rows
+    /// by content UID). Returns an empty baseline when the fork has no
+    /// fork-point snapshot (an in-memory primary that never flushed before
+    /// forking — there is no prior primary state to delete against).
+    ///
+    /// [`PromoteBaseline`]: fork_diff::PromoteBaseline
+    async fn build_promote_baseline(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+    ) -> Result<fork_diff::PromoteBaseline> {
+        use uni_common::Value;
+        use uni_fork::ForkQueryHost;
+        use uni_store::storage::vertex::VertexDataset;
+
+        let mut baseline = fork_diff::PromoteBaseline::default();
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        if info.parent_snapshot_id == "uninitialized" {
+            return Ok(baseline);
+        }
+
+        let mut base_session = self.session();
+        base_session
+            .pin_to_version(&info.parent_snapshot_id)
+            .await?;
+        let ext_ids = base_session
+            .storage()
+            .get_vertex_ext_ids()
+            .await
+            .unwrap_or_default();
+
+        let mut labels: Vec<&str> = patterns
+            .iter()
+            .filter(|p| !p.is_edge())
+            .map(|p| p.label_name())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+
+        for label in labels {
+            let escaped = label.replace('`', "``");
+            let cypher = format!("MATCH (n:`{escaped}`) RETURN n");
+            let rs = base_session.query(&cypher).await?;
+            for row in rs.rows() {
+                if let Some(Value::Node(node)) = row.value("n") {
+                    match ext_ids.get(&node.vid) {
+                        Some(eid) if !eid.is_empty() => {
+                            baseline
+                                .ext
+                                .entry(label.to_string())
+                                .or_default()
+                                .insert(eid.clone(), node.properties.clone());
+                        }
+                        _ => {
+                            baseline
+                                .no_ext
+                                .entry(label.to_string())
+                                .or_default()
+                                .insert(VertexDataset::compute_vertex_uid(
+                                    label,
+                                    None,
+                                    &node.properties,
+                                ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(baseline)
     }
 
     /// Tag a fork with a Lance tag (Phase 4a).

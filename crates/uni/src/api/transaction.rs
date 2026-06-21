@@ -708,6 +708,28 @@ impl Transaction {
         self.mark_on_err(result)
     }
 
+    /// Soft-delete an existing vertex by VID within this transaction.
+    ///
+    /// Routed through the transaction's private L0 so it commits atomically
+    /// with the upserts/inserts; used by fork promote's delete-promotion
+    /// pass. The `label` scopes the tombstone's flush to the right table.
+    pub async fn delete_vertex_by_vid(
+        &self,
+        label: &str,
+        vid: uni_common::core::id::Vid,
+    ) -> Result<()> {
+        self.check_completed()?;
+        let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
+            operation: "delete_vertex_by_vid".to_string(),
+        })?;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
+        let result = writer
+            .delete_vertex(vid, Some(vec![label.to_string()]), Some(&self.tx_l0))
+            .await
+            .map_err(UniError::Internal);
+        self.mark_on_err(result)
+    }
+
     /// Bulk insert edges for a given edge type within this transaction.
     ///
     /// Mutations are written to the transaction's private L0 and become
@@ -1669,5 +1691,9 @@ impl uni_fork::ForkPromoteSink for Transaction {
         props: uni_common::Properties,
     ) -> Result<()> {
         Transaction::update_vertex_properties(self, label, vid, props).await
+    }
+
+    async fn delete_vertex(&self, label: &str, vid: uni_common::core::id::Vid) -> Result<()> {
+        Transaction::delete_vertex_by_vid(self, label, vid).await
     }
 }

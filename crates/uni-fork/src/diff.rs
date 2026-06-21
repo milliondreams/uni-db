@@ -61,6 +61,21 @@ pub async fn compute_diff<Q: ForkQueryHost + ?Sized>(a: &Q, b: &Q) -> Result<For
     Ok(diff)
 }
 
+/// Extract a vertex's `ext_id` for content-UID computation.
+///
+/// NOTE (review H4): `ext_id` is a distinct field in the storage `_uid` but is
+/// stripped from query results and not projectable through the query layer the
+/// diff uses, so this is currently always `None` in practice — two vertices
+/// differing only by `ext_id` (settable only via the OGM / bulk layer, not
+/// Cypher `CREATE`) still collapse to one diff identity. The `bucket.insert`
+/// collision warnings make that observable. A full fix requires exposing
+/// `ext_id` through projection so it can be folded in consistently across L0
+/// and flushed rows (keying off the storage `_uid` is NOT viable: it diverges
+/// from the query-recomputed UID, breaking L0/flushed consistency).
+fn ext_id_of(props: &Properties) -> Option<&str> {
+    props.get("ext_id").and_then(|v| v.as_str())
+}
+
 /// One bucketed vertex row keyed by content UID.
 type VertexBucket = HashMap<UniId, VertexRow>;
 /// One bucketed edge row keyed by content-addressed edge UID
@@ -94,16 +109,31 @@ async fn scan_label_nodes<Q: ForkQueryHost + ?Sized>(s: &Q, label: &str) -> Resu
             continue;
         };
         // The MATCH already filters to nodes carrying `label`, so the
-        // bucketed row's label is always `label`.
-        let uid = VertexDataset::compute_vertex_uid(label, None, &node.properties);
-        bucket.insert(
-            uid,
-            VertexRow {
-                label: label.to_string(),
-                vid: node.vid,
-                properties: node.properties.clone(),
-            },
-        );
+        // bucketed row's label is always `label`. (`ext_id` is not available
+        // here — see `ext_id_of`; the collision warning below surfaces any
+        // resulting content-UID collapse.)
+        let uid =
+            VertexDataset::compute_vertex_uid(label, ext_id_of(&node.properties), &node.properties);
+        if bucket
+            .insert(
+                uid,
+                VertexRow {
+                    label: label.to_string(),
+                    vid: node.vid,
+                    properties: node.properties.clone(),
+                },
+            )
+            .is_some()
+        {
+            // Two distinct vertices hashed to the same content UID — one will be
+            // dropped from the diff. Observable signal for residual identity
+            // collisions (review H4).
+            warn!(
+                label,
+                vid = node.vid.as_u64(),
+                "fork diff: vertex content-UID collision; a row is being shadowed"
+            );
+        }
     }
     Ok(bucket)
 }
@@ -125,18 +155,28 @@ async fn scan_edge_type<Q: ForkQueryHost + ?Sized>(s: &Q, edge_type: &str) -> Re
         };
         let a_label = a.labels.first().cloned().unwrap_or_default();
         let b_label = b.labels.first().cloned().unwrap_or_default();
-        let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
-        let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+        let src_uid =
+            VertexDataset::compute_vertex_uid(&a_label, ext_id_of(&a.properties), &a.properties);
+        let dst_uid =
+            VertexDataset::compute_vertex_uid(&b_label, ext_id_of(&b.properties), &b.properties);
         let edge_uid =
             MainEdgeDataset::compute_edge_uid(&src_uid, &dst_uid, edge_type, &edge.properties);
-        bucket.insert(
-            edge_uid,
-            EdgeRow {
-                src_uid,
-                dst_uid,
-                properties: edge.properties.clone(),
-            },
-        );
+        if bucket
+            .insert(
+                edge_uid,
+                EdgeRow {
+                    src_uid,
+                    dst_uid,
+                    properties: edge.properties.clone(),
+                },
+            )
+            .is_some()
+        {
+            warn!(
+                edge_type,
+                "fork diff: edge content-UID collision; a row is being shadowed"
+            );
+        }
     }
     Ok(bucket)
 }
@@ -497,7 +537,11 @@ where
                     let Some(Value::Node(node)) = row.value("n") else {
                         continue;
                     };
-                    let uid = VertexDataset::compute_vertex_uid(label, None, &node.properties);
+                    let uid = VertexDataset::compute_vertex_uid(
+                        label,
+                        ext_id_of(&node.properties),
+                        &node.properties,
+                    );
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;
@@ -584,8 +628,16 @@ where
                         Some(l) => l.clone(),
                         None => continue,
                     };
-                    let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
-                    let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+                    let src_uid = VertexDataset::compute_vertex_uid(
+                        &a_label,
+                        ext_id_of(&a.properties),
+                        &a.properties,
+                    );
+                    let dst_uid = VertexDataset::compute_vertex_uid(
+                        &b_label,
+                        ext_id_of(&b.properties),
+                        &b.properties,
+                    );
                     let edge_uid = MainEdgeDataset::compute_edge_uid(
                         &src_uid,
                         &dst_uid,
@@ -672,10 +724,16 @@ where
                             };
                             let ea_label = ea.labels.first().cloned().unwrap_or_default();
                             let eb_label = eb.labels.first().cloned().unwrap_or_default();
-                            let esrc =
-                                VertexDataset::compute_vertex_uid(&ea_label, None, &ea.properties);
-                            let edst =
-                                VertexDataset::compute_vertex_uid(&eb_label, None, &eb.properties);
+                            let esrc = VertexDataset::compute_vertex_uid(
+                                &ea_label,
+                                ext_id_of(&ea.properties),
+                                &ea.properties,
+                            );
+                            let edst = VertexDataset::compute_vertex_uid(
+                                &eb_label,
+                                ext_id_of(&eb.properties),
+                                &eb.properties,
+                            );
                             let euid = MainEdgeDataset::compute_edge_uid(
                                 &esrc,
                                 &edst,

@@ -12,6 +12,7 @@ pub mod bug_rebuild_indexes_path;
 pub mod bug_traversal_filtering;
 pub mod bug_vector_query_l0_scores;
 pub mod bytes_aggregates;
+pub mod bytes_computed_projection;
 pub mod bytes_containers;
 pub mod bytes_list_functions;
 pub mod bytes_maps_projection;

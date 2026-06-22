@@ -3371,6 +3371,36 @@ fn build_list_property_column(
             // Map types are List(Struct(key, value)) — build struct inner elements
             build_list_of_structs_column(vids, props_map, prop_name, fields)
         }
+        DataType::LargeBinary
+            if inner_field
+                .metadata()
+                .get("uni_raw_bytes")
+                .is_some_and(|v| v == "true") =>
+        {
+            // Typed `List(Bytes)`: store each buffer verbatim in a `LargeBinary`
+            // child. The child field (reused from the schema) carries the
+            // `uni_raw_bytes` marker so the read path decodes it as raw `Bytes`.
+            // CV-encoded `LargeBinary` lists lack the marker and keep the string
+            // fallback below — no pattern-comprehension/VLP regression.
+            let mut builder = ListBuilder::new(arrow_array::builder::LargeBinaryBuilder::new())
+                .with_field(inner_field.clone());
+            for vid in vids {
+                match get_property_value(vid, props_map, prop_name) {
+                    Some(Value::List(arr)) => {
+                        for v in arr {
+                            if let Value::Bytes(b) = v {
+                                builder.values().append_value(b);
+                            } else {
+                                builder.values().append_null();
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         // Fallback: serialize inner elements as strings
         _ => {
             let mut builder = ListBuilder::new(StringBuilder::new());
@@ -3485,6 +3515,25 @@ fn build_list_of_structs_column(
                         match obj.get(field_name).and_then(|v| v.as_f64()) {
                             Some(n) => builder.append_value(n),
                             None => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish()) as ArrayRef
+                }
+                // Typed `Map(_, Bytes)` value child: the schema field carries the
+                // `uni_raw_bytes` marker; store each buffer verbatim in a
+                // `LargeBinary` so the read path (`try_reconstruct_map`) decodes it
+                // as raw `Bytes`. CV-encoded values lack the marker → string fallback.
+                DataType::LargeBinary
+                    if field
+                        .metadata()
+                        .get("uni_raw_bytes")
+                        .is_some_and(|v| v == "true") =>
+                {
+                    let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+                    for obj in rows.iter().flatten().flatten() {
+                        match obj.get(field_name) {
+                            Some(Value::Bytes(b)) => builder.append_value(b),
+                            _ => builder.append_null(),
                         }
                     }
                     Arc::new(builder.finish()) as ArrayRef

@@ -43,10 +43,19 @@ async fn blob_db() -> Result<Uni> {
 ///
 /// KNOWN LIMITATION (tracked): `coalesce` compiles to a DataFusion `CASE` whose
 /// `LargeBinary` output field does not carry the `uni_raw_bytes` marker, so the
-/// final read mis-decodes the passthrough raw bytes as tagged CypherValue. The fix
-/// needs planner-level metadata propagation onto computed projection output fields;
-/// deferred as a focused follow-up. The assertion below is the correct expectation.
-#[ignore = "coalesce-of-Bytes: computed CASE output column lacks uni_raw_bytes marker (planner propagation follow-up)"]
+/// final read mis-decodes the passthrough raw bytes as tagged CypherValue.
+///
+/// Investigated for a targeted fix and deferred: replacing the native `CASE` with a
+/// custom UDF would round-trip every coalesce arg through `Value` (lossy for the
+/// Arrow types the type-agnostic `CASE` handles freely, and changes the output
+/// column type), and a metadata-only wrapper can't safely decide when to mark —
+/// `coalesce(b.missing, b.data)` only marks under an "any arg is Bytes" rule, which
+/// mis-marks mixed `Bytes`+`String` coalesce (unified column holds both raw and
+/// CV-encoded blobs row-by-row). This is the same computed-output-field
+/// metadata-propagation class as the list-literal cases ([`head_of_bytes_list_literal`]);
+/// deferred to a single general projection-output propagation follow-up. The
+/// assertion below is the correct expectation.
+#[ignore = "coalesce-of-Bytes: no safe targeted fix; general computed-output metadata-propagation follow-up (with list-literals)"]
 #[tokio::test]
 async fn coalesce_returns_bytes() -> Result<()> {
     let db = blob_db().await?;
@@ -65,11 +74,15 @@ async fn coalesce_returns_bytes() -> Result<()> {
 
 /// `head([b.data, ...])` over a list literal containing a Bytes scalar.
 ///
-/// KNOWN LIMITATION (tracked): a `Bytes` element inside a list LITERAL is read back
-/// through the nested-container path, which can't discriminate raw `Bytes` from
-/// CV-encoded `LargeBinary` by array type alone (same class as typed `List(Bytes)`).
-/// Deferred to the nested-container follow-up. The assertion below is correct.
-#[ignore = "Bytes in list-literal: nested-container read needs field-level Bytes-vs-CV discrimination (follow-up)"]
+/// KNOWN LIMITATION (tracked): a list LITERAL `[b.data]` is built by DataFusion's
+/// `make_array`, producing a `List(LargeBinary)` whose child field carries NO
+/// `uni_raw_bytes` marker — the marker can't flow from `b.data`'s column field
+/// through a logical-plan transform. This is the same computed-output-field
+/// metadata-propagation class as `coalesce` (see [`coalesce_returns_bytes`]):
+/// deferred to the general projection-propagation follow-up. Unlike typed
+/// `List(Bytes)` (schema-driven, now fixed), there is no schema or targetable UDF
+/// here. The assertion below is correct.
+#[ignore = "Bytes in list-literal: make_array output field lacks uni_raw_bytes; general computed-output propagation follow-up (with coalesce)"]
 #[tokio::test]
 async fn head_of_bytes_list_literal() -> Result<()> {
     let db = blob_db().await?;
@@ -88,11 +101,11 @@ async fn head_of_bytes_list_literal() -> Result<()> {
 
 /// List indexing `[b.data][0]` over a Bytes element.
 ///
-/// KNOWN LIMITATION (tracked): same nested-container class as
-/// [`head_of_bytes_list_literal`] — a `Bytes` element in a list literal can't be
-/// discriminated from CV-encoded `LargeBinary` on read by array type alone.
-/// Deferred to the nested-container follow-up. The assertion below is correct.
-#[ignore = "Bytes in list-literal: nested-container read needs field-level Bytes-vs-CV discrimination (follow-up)"]
+/// KNOWN LIMITATION (tracked): same class as [`head_of_bytes_list_literal`] — the
+/// list literal `[b.data]` is built by `make_array` with no `uni_raw_bytes` marker
+/// on its child field. Deferred to the general computed-output metadata-propagation
+/// follow-up (with `coalesce`). The assertion below is correct.
+#[ignore = "Bytes in list-literal: make_array output field lacks uni_raw_bytes; general computed-output propagation follow-up (with coalesce)"]
 #[tokio::test]
 async fn index_into_bytes_list_literal() -> Result<()> {
     let db = blob_db().await?;

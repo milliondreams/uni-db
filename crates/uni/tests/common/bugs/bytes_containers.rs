@@ -27,13 +27,10 @@ fn b2() -> Vec<u8> {
 
 /// A typed `List(Bytes)` property round-trips every element.
 ///
-/// KNOWN LIMITATION (tracked): reading a typed `List(Bytes)` back is ambiguous from
-/// the Arrow array alone — a `LargeBinary` list child can be either raw `Bytes` or
-/// CV-encoded values, and discriminating by array type alone corrupts CV-encoded
-/// containers (regresses pattern-comprehension/VLP edge property maps). A correct fix
-/// needs field-level `uni_raw_bytes` discrimination threaded through nested-container
-/// decode; deferred. The assertion below is the correct expectation.
-#[ignore = "typed List(Bytes) read-back needs field-level Bytes-vs-CV discrimination (nested-container follow-up)"]
+/// The container's Arrow child field is marked `uni_raw_bytes` (in `to_arrow` and on
+/// the built array), so the read path decodes each `LargeBinary` element verbatim.
+/// CV-encoded list/map children carry no marker and keep the codec path, so
+/// pattern-comprehension/VLP edge property maps are unaffected.
 #[tokio::test]
 async fn list_of_bytes_property_round_trips() -> Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -69,12 +66,9 @@ async fn list_of_bytes_property_round_trips() -> Result<()> {
 
 /// A typed `Map(String, Bytes)` property round-trips every value.
 ///
-/// KNOWN LIMITATION (tracked): same as the list case — reading a typed
-/// `Map(String, Bytes)` back can't be discriminated from a CV-encoded map by array
-/// type alone without corrupting CV-encoded maps. Needs field-level `uni_raw_bytes`
-/// discrimination through nested-container decode; deferred. The assertion below is
-/// the correct expectation.
-#[ignore = "typed Map(String,Bytes) read-back needs field-level Bytes-vs-CV discrimination (nested-container follow-up)"]
+/// The map value child field is marked `uni_raw_bytes`, so `try_reconstruct_map`
+/// decodes each `LargeBinary` value verbatim. CV-encoded maps carry no marker and
+/// keep the codec path.
 #[tokio::test]
 async fn map_of_bytes_property_round_trips() -> Result<()> {
     let db = Uni::in_memory().build().await?;

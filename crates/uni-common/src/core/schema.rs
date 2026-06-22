@@ -76,6 +76,17 @@ pub fn is_time_struct(arrow_dt: &ArrowDataType) -> bool {
     matches!(arrow_dt, ArrowDataType::Struct(fields) if *fields == time_struct_fields())
 }
 
+/// Field metadata marking an Arrow `LargeBinary` field as a raw `DataType::Bytes`
+/// value rather than a tagged CypherValue/Duration blob.
+///
+/// Stamped on the child field of `List(Bytes)` / `Map(_, Bytes)` container types so
+/// the read path decodes each element verbatim instead of through the tagged codec
+/// (which would read `byte[0]` as a type tag). CV-encoded containers carry no such
+/// marker and keep the codec path. See the read-side honoring in `arrow_convert`.
+pub fn raw_bytes_field_metadata() -> HashMap<String, String> {
+    HashMap::from([("uni_raw_bytes".to_string(), "true".to_string())])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub enum CrdtType {
@@ -196,16 +207,33 @@ impl DataType {
             DataType::Btic => ArrowDataType::FixedSizeBinary(24),
             DataType::Crdt(_) => ArrowDataType::Binary, // Store CRDT as binary MessagePack
             DataType::List(inner) => {
-                ArrowDataType::List(Arc::new(Field::new("item", inner.to_arrow(), true)))
+                // A raw `Bytes` element maps to Arrow `LargeBinary`, indistinguishable
+                // from a CV-encoded element by type alone; mark the child field so the
+                // read path decodes it verbatim rather than through the tagged codec.
+                let item = Field::new("item", inner.to_arrow(), true);
+                let item = if matches!(**inner, DataType::Bytes) {
+                    item.with_metadata(raw_bytes_field_metadata())
+                } else {
+                    item
+                };
+                ArrowDataType::List(Arc::new(item))
             }
-            DataType::Map(key, value) => ArrowDataType::List(Arc::new(Field::new(
-                "item",
-                ArrowDataType::Struct(Fields::from(vec![
-                    Field::new("key", key.to_arrow(), false),
-                    Field::new("value", value.to_arrow(), true),
-                ])),
-                true,
-            ))),
+            DataType::Map(key, value) => {
+                let value_field = Field::new("value", value.to_arrow(), true);
+                let value_field = if matches!(**value, DataType::Bytes) {
+                    value_field.with_metadata(raw_bytes_field_metadata())
+                } else {
+                    value_field
+                };
+                ArrowDataType::List(Arc::new(Field::new(
+                    "item",
+                    ArrowDataType::Struct(Fields::from(vec![
+                        Field::new("key", key.to_arrow(), false),
+                        value_field,
+                    ])),
+                    true,
+                )))
+            }
         }
     }
 

@@ -1245,31 +1245,23 @@ impl Uni {
     /// Wait (bounded) for a fork's `holder_count` to drain to zero,
     /// returning the final count.
     ///
-    /// Under async-flush a fork's `FlushCoordinator` finalizer is an
-    /// orphan tokio task that transitively pins the fork's
-    /// `ForkHolderGuard`, so `holder_count_for` can sit briefly above
-    /// zero after the last session drops. This polls up to 100 times,
-    /// yielding to the runtime for the first 20 iterations (to let
-    /// pending destructors run) then sleeping 10 ms thereafter. Shared
-    /// by `drop_fork` (ignores the count) and `drop_fork_cascade` (uses
-    /// it to build the blocker message).
+    /// Wait for a fork's holder count to drain to zero, returning the final
+    /// count. (L1)
+    ///
+    /// Under async-flush a fork's `FlushCoordinator` finalizer is an orphan
+    /// tokio task that transitively pins the fork's `ForkHolderGuard`, so
+    /// `holder_count_for` can sit briefly above zero after the last session
+    /// drops. This awaits the registry's deterministic drain `Notify` —
+    /// fired the instant the last guard drops — bounded by
+    /// `drop_fork_drain_timeout`, rather than a fixed-budget poll that could
+    /// expire before the finalizer is scheduled under CPU starvation (the
+    /// #99 `ForkInUse` flake). Shared by `drop_fork` (ignores the count) and
+    /// `drop_fork_cascade` (uses it to build the blocker message).
     async fn wait_for_holders_drained(&self, fork_id: ForkId) -> usize {
-        let mut holders = self.inner.fork_registry.holder_count_for(fork_id).await;
-        if holders == 0 {
-            return 0;
-        }
-        for i in 0..100 {
-            if i < 20 {
-                tokio::task::yield_now().await;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            holders = self.inner.fork_registry.holder_count_for(fork_id).await;
-            if holders == 0 {
-                break;
-            }
-        }
-        holders
+        self.inner
+            .fork_registry
+            .wait_holders_drained(fork_id, self.inner.config.drop_fork_drain_timeout)
+            .await
     }
 
     /// Drop a fork by name (Phase 1: read-only forks only).

@@ -2125,7 +2125,14 @@ fn get_value_from_array(
         DataType::Float32 => Ok(Value::Float(
             downcast_arr!(arr, Float32Array).value(row) as f64
         )),
-        // Fallback: use existing ScalarValue path for Struct, List, FixedSizeList,
+        // Lists: decode via `arrow_to_value` directly so a `uni_raw_bytes`-marked child
+        // (e.g. a raw-`Bytes` list literal) is honored from the array's own type. The
+        // `ScalarValue::try_from_array` fallback strips child-field metadata, which
+        // would mis-decode raw-`Bytes` elements through the tagged codec.
+        DataType::List(_) | DataType::LargeList(_) => Ok(
+            uni_store::storage::arrow_convert::arrow_to_value(arr.as_ref(), row, None),
+        ),
+        // Fallback: use existing ScalarValue path for Struct, FixedSizeList,
         // Timestamp, Date32, and other complex types
         _ => {
             let scalar = ScalarValue::try_from_array(arr, row).map_err(|e| {

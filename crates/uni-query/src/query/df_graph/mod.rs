@@ -77,6 +77,7 @@ pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
 pub mod quantifier;
+pub mod raw_bytes_marker;
 mod read_set_exec;
 pub mod recursive_cte;
 pub mod reduce;

@@ -12,6 +12,7 @@ use crate::query::df_graph::pattern_exists::{
     PatternExistsExecExpr, extract_pattern_from_exists_query, extract_target_property_predicates,
 };
 use crate::query::df_graph::quantifier::{QuantifierExecExpr, QuantifierType};
+use crate::query::df_graph::raw_bytes_marker;
 use crate::query::df_graph::reduce::ReduceExecExpr;
 use crate::query::df_graph::similar_to_expr::SimilarToExecExpr;
 use crate::query::planner::QueryPlanner;
@@ -399,6 +400,18 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 }
             }
 
+            // A raw-`Bytes` list literal (e.g. `[b.data]`): compile the `make_array`
+            // then mark its child field so element-extraction (`head`/`index`/…) and
+            // the final read decode each element as raw `Bytes` rather than via the
+            // tagged codec. CV-routed / mixed lists carry no marker (analyzer is
+            // conservative), so this never disturbs pattern-comprehension/VLP.
+            Expr::List(_) if raw_bytes_marker::is_markable_list(expr, input_schema) => {
+                let inner = self.compile_standard(expr, input_schema)?;
+                Ok(Arc::new(raw_bytes_marker::RawBytesMarkerExpr::list_child(
+                    inner,
+                )))
+            }
+
             // Recursively check other composite types if necessary.
             Expr::List(items) if items.iter().any(Self::contains_custom_expr) => Err(anyhow!(
                 "List literals containing comprehensions not yet supported in compiler"
@@ -452,6 +465,35 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
 
             // FunctionCall wrapping a custom expression (e.g. size(comprehension))
+            // A coalesce that mixes a raw-`Bytes` arg with a non-raw, non-null one:
+            // rewrite to an explicit CASE whose THEN/ELSE values are CypherValue-
+            // encoded (while WHEN tests the original args for null), so the output
+            // column is uniformly codec-decodable and raw bytes round-trip to
+            // `Value::Bytes`. A uniformly raw-or-null coalesce is left alone and marked
+            // at the projection (see `raw_bytes_marker::is_raw_scalar`).
+            Expr::FunctionCall { name, args, .. }
+                if name.eq_ignore_ascii_case("coalesce")
+                    && args.len() > 1
+                    && raw_bytes_marker::coalesce_needs_cv_unify(args, input_schema) =>
+            {
+                let cv_wrap = |a: &Expr| Expr::FunctionCall {
+                    name: "_cypher_scalar_to_cv".to_string(),
+                    args: vec![a.clone()],
+                    distinct: false,
+                    window_spec: None,
+                };
+                let (last, init) = args.split_last().unwrap();
+                let when_then = init
+                    .iter()
+                    .map(|a| (Expr::IsNotNull(Box::new(a.clone())), cv_wrap(a)))
+                    .collect();
+                let case = Expr::Case {
+                    expr: None,
+                    when_then,
+                    else_expr: Some(Box::new(cv_wrap(last))),
+                };
+                self.compile_standard(&case, input_schema)
+            }
             Expr::FunctionCall {
                 name,
                 args,
@@ -461,7 +503,14 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 if name.eq_ignore_ascii_case("similar_to") {
                     return self.compile_similar_to(args, input_schema);
                 }
-                if args.iter().any(Self::contains_custom_expr) {
+                // Route through the recursive custom-args path when an argument is a
+                // raw-`Bytes` list literal, so its `make_array` child gets marked (the
+                // list-consumer UDFs `head`/`last`/`tail`/… then decode raw bytes).
+                if args.iter().any(Self::contains_custom_expr)
+                    || args
+                        .iter()
+                        .any(|a| raw_bytes_marker::is_markable_list(a, input_schema))
+                {
                     self.compile_function_with_custom_args(name, args, *distinct, input_schema)
                 } else {
                     self.compile_standard(expr, input_schema)
@@ -677,6 +726,17 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             && let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)
         {
             return Ok(expr);
+        }
+        // Indexing into a raw-`Bytes` list literal (e.g. `[b.data][0]`): route through
+        // the recursive custom-args path (UDF `index`) so the inner `make_array` child
+        // is marked and the extracted element decodes as raw `Bytes`.
+        if raw_bytes_marker::is_markable_list(array, input_schema) {
+            return self.compile_function_with_custom_args(
+                "index",
+                &[array.clone(), index.clone()],
+                false,
+                input_schema,
+            );
         }
         self.compile_standard(
             &Expr::ArrayIndex {
@@ -1397,7 +1457,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             "TOFLOAT" | "TOFLOATORNULL" => "tofloat".to_string(),
             "HEAD" => "head".to_string(),
             "LAST" => "last".to_string(),
-            "TAIL" => "tail".to_string(),
+            "TAIL" => "_cypher_tail".to_string(),
             "KEYS" => "keys".to_string(),
             "TYPE" => "type".to_string(),
             "PROPERTIES" => "properties".to_string(),

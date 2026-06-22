@@ -98,13 +98,11 @@ async fn map_projection_named_preserves_bytes() -> Result<()> {
 
 /// `RETURN b{.*}` — all-properties map projection of a Bytes property.
 ///
-/// KNOWN LIMITATION (tracked): unlike `b{.data}` (named, fixed) and `RETURN b`
-/// (whole node, fixed), the `b{.*}` wildcard passes the entity to `_map_project`
-/// via a path where the raw `Bytes` property's `uni_raw_bytes` marker is lost
-/// before materialization, so it mis-decodes as tagged CypherValue. The fix needs
-/// planner-level marker propagation onto the wildcard projection; deferred as a
-/// focused follow-up. The assertion below is the correct expectation.
-#[ignore = "b{.*} wildcard projection over Bytes loses uni_raw_bytes marker (planner propagation follow-up)"]
+/// The `b{.*}` wildcard expands to `_map_project("__all__", b)`. The entity struct
+/// carries a CypherValue-encoded `_all_props` map (lossless for raw `Bytes`)
+/// alongside individually-decoded property columns (where a raw `Bytes` child
+/// decodes to Null because `named_struct` drops the `uni_raw_bytes` marker).
+/// `_map_project` now prefers `_all_props`, matching `properties()`.
 #[tokio::test]
 async fn map_projection_all_preserves_bytes() -> Result<()> {
     let db = blob_db().await?;

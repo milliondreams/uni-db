@@ -5366,7 +5366,17 @@ impl ScalarUDFImpl for MapProjectUdf {
                         // AllProperties: expand entity map, skip _-prefixed keys
                         match value {
                             Value::Map(map) => {
-                                for (mk, mv) in map {
+                                // Prefer `_all_props` (the CypherValue-encoded
+                                // property map, which round-trips raw `Bytes`
+                                // losslessly) over the top-level struct columns,
+                                // where a raw `Bytes` property decodes to Null
+                                // because `named_struct` drops the `uni_raw_bytes`
+                                // marker. Mirrors `properties()` for consistency.
+                                let source = match map.get("_all_props") {
+                                    Some(Value::Map(all)) => all,
+                                    _ => map,
+                                };
+                                for (mk, mv) in source {
                                     if !mk.starts_with('_') {
                                         result_map.insert(mk.clone(), mv.clone());
                                     }

@@ -71,13 +71,11 @@ async fn unwind_collected_bytes() -> Result<()> {
 
 /// List comprehension over a collected Bytes list.
 ///
-/// KNOWN LIMITATION (tracked): the comprehension list-materialization path
-/// (`cv_array_to_large_list` / `large_list_of_cv_to_cv_array`) round-trips elements
-/// through `serde_json`, which base64-stringifies raw `Bytes`. A `Value`-space
-/// rewrite fixes it but regressed general pattern-comprehension/VLP projection, so
-/// it is deferred to a focused follow-up. The assertion below is the correct
-/// expectation.
-#[ignore = "list-comprehension over Bytes: serde_json detour base64s Bytes; Value-space rewrite regressed VLP/PC projection (follow-up)"]
+/// The comprehension list-materialization path (`cv_array_to_large_list` /
+/// `large_list_of_cv_to_cv_array`) stays in `Value`-space rather than detouring
+/// through `serde_json` (which base64-stringifies raw `Bytes`). Only the
+/// `LargeBinary`-element branches were converted; the typed primitive and Struct
+/// branches keep their builders, so VLP/pattern-comprehension projection is intact.
 #[tokio::test]
 async fn list_comprehension_over_bytes() -> Result<()> {
     let db = blob_db().await?;

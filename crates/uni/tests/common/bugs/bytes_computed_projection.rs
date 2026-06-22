@@ -64,23 +64,45 @@ async fn coalesce_missing_then_bytes() -> Result<()> {
         "v",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "coalesce(missing,data): {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "coalesce(missing,data): {got:?}"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn coalesce_null_then_bytes() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN coalesce(NULL, b.data) AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "coalesce(NULL,data): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN coalesce(NULL, b.data) AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "coalesce(NULL,data): {got:?}"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn coalesce_bytes_then_bytes() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN coalesce(b.data, b.data2) AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "coalesce(data,data2): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN coalesce(b.data, b.data2) AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "coalesce(data,data2): {got:?}"
+    );
     Ok(())
 }
 
@@ -93,7 +115,11 @@ async fn coalesce_two_missing_then_bytes() -> Result<()> {
         "v",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "coalesce(missing,missing2,data): {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "coalesce(missing,missing2,data): {got:?}"
+    );
     Ok(())
 }
 
@@ -106,7 +132,11 @@ async fn case_then_bytes() -> Result<()> {
         "v",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "CASE then-branch: {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "CASE then-branch: {got:?}"
+    );
     Ok(())
 }
 
@@ -119,7 +149,11 @@ async fn case_else_bytes() -> Result<()> {
         "v",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload2())), "CASE else-branch: {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload2())),
+        "CASE else-branch: {got:?}"
+    );
     Ok(())
 }
 
@@ -131,7 +165,11 @@ async fn case_else_bytes() -> Result<()> {
 async fn head_of_list_literal() -> Result<()> {
     let db = blob_db().await?;
     let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN head([b.data]) AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "head([b.data]): {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "head([b.data]): {got:?}"
+    );
     Ok(())
 }
 
@@ -139,7 +177,11 @@ async fn head_of_list_literal() -> Result<()> {
 async fn last_of_list_literal() -> Result<()> {
     let db = blob_db().await?;
     let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN last([b.data]) AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "last([b.data]): {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "last([b.data]): {got:?}"
+    );
     Ok(())
 }
 
@@ -155,15 +197,28 @@ async fn index_into_list_literal() -> Result<()> {
 async fn index_into_two_element_list_literal() -> Result<()> {
     let db = blob_db().await?;
     let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN [b.data, b.data2][1] AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload2())), "[b.data,b.data2][1]: {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload2())),
+        "[b.data,b.data2][1]: {got:?}"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn head_of_two_element_list_literal() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN head([b.data, b.data2]) AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "head([b.data,b.data2]): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN head([b.data, b.data2]) AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "head([b.data,b.data2]): {got:?}"
+    );
     Ok(())
 }
 
@@ -185,7 +240,10 @@ async fn direct_two_element_list_literal_return() -> Result<()> {
     let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN [b.data, b.data2] AS v", "v").await;
     assert_eq!(
         got,
-        Some(Value::List(vec![Value::Bytes(payload()), Value::Bytes(payload2())])),
+        Some(Value::List(vec![
+            Value::Bytes(payload()),
+            Value::Bytes(payload2())
+        ])),
         "RETURN [b.data,b.data2]: {got:?}"
     );
     Ok(())
@@ -204,7 +262,11 @@ async fn with_chain_coalesce_then_passthrough() -> Result<()> {
         "v",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "WITH coalesce..AS v RETURN v: {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "WITH coalesce..AS v RETURN v: {got:?}"
+    );
     Ok(())
 }
 
@@ -219,7 +281,11 @@ async fn with_chain_passthrough_then_coalesce() -> Result<()> {
         "w",
     )
     .await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "WITH b.data AS v RETURN coalesce(NULL,v): {got:?}");
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "WITH b.data AS v RETURN coalesce(NULL,v): {got:?}"
+    );
     Ok(())
 }
 
@@ -232,8 +298,17 @@ async fn with_chain_passthrough_then_coalesce() -> Result<()> {
 #[tokio::test]
 async fn coalesce_bytes_then_string_consistent() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN coalesce(b.data, 'fallback') AS v", "v").await;
-    assert_eq!(got, Some(Value::Bytes(payload())), "coalesce(data,'str'): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN coalesce(b.data, 'fallback') AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::Bytes(payload())),
+        "coalesce(data,'str'): {got:?}"
+    );
     Ok(())
 }
 
@@ -242,8 +317,17 @@ async fn coalesce_bytes_then_string_consistent() -> Result<()> {
 #[tokio::test]
 async fn coalesce_string_then_bytes_returns_string() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN coalesce(b.name, b.data) AS v", "v").await;
-    assert_eq!(got, Some(Value::String("n1".to_string())), "coalesce(name,data): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN coalesce(b.name, b.data) AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::String("n1".to_string())),
+        "coalesce(name,data): {got:?}"
+    );
     Ok(())
 }
 
@@ -251,8 +335,17 @@ async fn coalesce_string_then_bytes_returns_string() -> Result<()> {
 #[tokio::test]
 async fn coalesce_pure_string() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN coalesce(b.missing, b.name) AS v", "v").await;
-    assert_eq!(got, Some(Value::String("n1".to_string())), "coalesce(missing,name): {got:?}");
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN coalesce(b.missing, b.name) AS v",
+        "v",
+    )
+    .await;
+    assert_eq!(
+        got,
+        Some(Value::String("n1".to_string())),
+        "coalesce(missing,name): {got:?}"
+    );
     Ok(())
 }
 
@@ -269,7 +362,12 @@ async fn plain_passthrough_sanity() -> Result<()> {
 #[tokio::test]
 async fn size_of_list_literal() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN size([b.data, b.data2]) AS n", "n").await;
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN size([b.data, b.data2]) AS n",
+        "n",
+    )
+    .await;
     assert_eq!(got, Some(Value::Int(2)), "size([b.data,b.data2]): {got:?}");
     Ok(())
 }
@@ -281,10 +379,18 @@ async fn size_of_list_literal() -> Result<()> {
 #[tokio::test]
 async fn reverse_of_list_literal() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN reverse([b.data, b.data2]) AS v", "v").await;
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN reverse([b.data, b.data2]) AS v",
+        "v",
+    )
+    .await;
     assert_eq!(
         got,
-        Some(Value::List(vec![Value::Bytes(payload2()), Value::Bytes(payload())])),
+        Some(Value::List(vec![
+            Value::Bytes(payload2()),
+            Value::Bytes(payload())
+        ])),
         "reverse([b.data,b.data2]): {got:?}"
     );
     Ok(())
@@ -293,7 +399,12 @@ async fn reverse_of_list_literal() -> Result<()> {
 #[tokio::test]
 async fn tail_of_list_literal() -> Result<()> {
     let db = blob_db().await?;
-    let got = scalar_bytes(&db, "MATCH (b:Blob) RETURN tail([b.data, b.data2]) AS v", "v").await;
+    let got = scalar_bytes(
+        &db,
+        "MATCH (b:Blob) RETURN tail([b.data, b.data2]) AS v",
+        "v",
+    )
+    .await;
     assert_eq!(
         got,
         Some(Value::List(vec![Value::Bytes(payload2())])),

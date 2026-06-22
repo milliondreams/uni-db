@@ -389,7 +389,7 @@ pub struct PromoteOptions {
     /// fork point but removed on the fork are deleted from primary
     /// (ext_id-keyed; rows without an `ext_id` are reported, never deleted).
     /// Requires a fork-point baseline; the host builds it and passes it to
-    /// [`run_promote`]. Off by default because it removes primary rows.
+    /// [`crate::run_promote`]. Off by default because it removes primary rows.
     pub delete_promotion: bool,
 
     /// How to resolve a vertex that diverged on BOTH primary and the fork

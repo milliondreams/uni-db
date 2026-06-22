@@ -259,6 +259,23 @@ async fn run_knn(dataset: &Dataset, query: &[f32]) -> u64 {
     scanner
         .nearest("embedding", &Float32Array::from(query.to_vec()), 1)
         .unwrap()
+        // This probe builds an *approximate* IVF-HNSW-SQ index (2 IVF
+        // partitions, scalar-quantized vectors). Lance's default search probes
+        // a single partition (`nprobes = 1`) and ranks by *quantized* distance.
+        // After `optimize_indices(append())` spreads the data across multiple
+        // index segments, the exact-match query for row 7 can land on a segment
+        // whose single probed partition no longer holds row 7's (relocated)
+        // entry, returning a far-off row — a recall miss that surfaces only
+        // under concurrent index-build scheduling, making the test flaky.
+        //
+        // Outcome #3 asserts index *integrity* (row 7's untouched embedding
+        // survives the merge and is retrievable), NOT approximate-search recall.
+        // So search every partition and exact-re-rank the candidates: this still
+        // exercises the HnswSq index but makes retrieval of a vector that is
+        // provably present (distance 0) deterministic.
+        .nprobes(2) // == IvfBuildParams partition count: probe every partition
+        .ef(N_ROWS) // wide HNSW beam so the exact match is in the candidate pool
+        .refine(10) // re-rank candidates by true (un-quantized) L2 distance
         .project(&["_vid"])
         .unwrap();
     let batch = scanner.try_into_batch().await.unwrap();

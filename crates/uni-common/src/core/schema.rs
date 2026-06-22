@@ -1251,7 +1251,7 @@ impl SchemaManager {
     ///
     /// # Errors
     /// Returns an error if `name` is empty/all-whitespace, exceeds
-    /// [`MAX_SCHEMA_NAME_LEN`] bytes, or contains a control, whitespace,
+    /// `MAX_SCHEMA_NAME_LEN` bytes, or contains a control, whitespace,
     /// `/`, or `\` character.
     pub fn validate_schema_element_name(kind: &str, name: &str) -> Result<()> {
         if name.is_empty() || name.chars().all(char::is_whitespace) {

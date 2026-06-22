@@ -14,11 +14,11 @@
 //! `CaseExpr`, a `make_array` list literal, …) returns a fresh field with no marker,
 //! so a raw `Bytes` value flowing through it is mis-decoded by the tagged codec.
 //!
-//! [`RawBytesMarkerExpr`] is a thin identity wrapper that delegates evaluation to its
+//! `RawBytesMarkerExpr` is a thin identity wrapper that delegates evaluation to its
 //! inner expression and only overrides the output field so it carries the marker —
 //! either on the field itself (scalar, e.g. a `coalesce` of raw bytes) or on the
 //! child of a `List` field (e.g. a `make_array` of raw bytes, so the element-decode
-//! path reads each element verbatim). [`bytes_shape`] decides, conservatively, when a
+//! path reads each element verbatim). `bytes_shape` decides, conservatively, when a
 //! given Cypher expression's output is uniformly raw bytes and which mode applies.
 
 use std::any::Any;

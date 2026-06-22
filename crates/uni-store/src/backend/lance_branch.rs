@@ -624,7 +624,7 @@ pub async fn delete_from_branch(uri: &str, branch: &str, predicate: &str) -> Res
 ///
 /// Opens the dataset on `branch` and runs Lance's `MergeInsertBuilder`
 /// keyed on `on`, applying `WhenMatched::UpdateAll`. Like the primary
-/// [`crate::backend::lance::LanceDbBackend::merge_insert`], it deliberately
+/// `LanceDbBackend::merge_insert`, it deliberately
 /// does NOT insert unmatched source rows (CREATE goes through the Append
 /// path); the partial/tombstone source only updates existing rows. The
 /// commit lands on the branch tip; primary's main branch is untouched.

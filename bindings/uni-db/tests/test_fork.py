@@ -528,9 +528,9 @@ def test_fork_matches_target_endpoint_label_schemaless():
     assert _rel(fork, "MATCH (a:A)-[r:R]->(b) RETURN count(r) AS c") == 1
     assert _rel(fork, "MATCH (b:B) RETURN count(b) AS c") == 1
     # The #99 bug: target-endpoint label returned 0 on the fork.
-    assert (
-        _rel(fork, "MATCH (a)-[r:R]->(b:B) RETURN count(r) AS c") == 1
-    ), "fork must match the target-endpoint label (GitHub #99)"
+    assert _rel(fork, "MATCH (a)-[r:R]->(b:B) RETURN count(r) AS c") == 1, (
+        "fork must match the target-endpoint label (GitHub #99)"
+    )
 
     del fork
     db.drop_fork("scn")

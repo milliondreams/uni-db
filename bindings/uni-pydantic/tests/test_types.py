@@ -256,7 +256,10 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(int) == ("int64", False)
         assert python_type_to_uni(float) == ("float64", False)
         assert python_type_to_uni(bool) == ("bool", False)
-        assert python_type_to_uni(bytes) == ("bytes", False)  # raw binary → DataType::Bytes
+        assert python_type_to_uni(bytes) == (
+            "bytes",
+            False,
+        )  # raw binary → DataType::Bytes
 
     def test_datetime_types(self):
         """Test datetime type mapping."""

@@ -166,10 +166,18 @@ jobs:
 
       - name: Run fuzz targets (5 min each)
         working-directory: fuzz
+        # `--target x86_64-unknown-linux-gnu` is load-bearing: cargo-binstall
+        # now resolves the *musl*-built `cargo-fuzz` prebuilt, and cargo-fuzz
+        # defaults `--target` to the triple it was itself compiled for. A musl
+        # default makes the build statically link libc, which AddressSanitizer
+        # rejects ("sanitizer is incompatible with statically linked libc") and
+        # which has no sanitizer-ready prebuilt std ("can't find crate for
+        # core"). Pin the runner's native gnu target (dynamic libc + prebuilt
+        # instrumentable std) so the default never leaks in.
         run: |
           for target in cypher_parse locy_parse wal_decode btic_decode; do
             echo "::group::fuzz $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=300 -timeout=10
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=300 -timeout=10
             echo "::endgroup::"
           done
 

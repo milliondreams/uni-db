@@ -2082,7 +2082,11 @@ fn string_to_value(s: &str) -> Value {
 /// This bypasses the `ScalarValue` intermediate allocation for common types,
 /// significantly reducing overhead in UDF execution. Falls back to the
 /// `ScalarValue::try_from_array` -> `scalar_to_value` path for complex types.
-fn get_value_from_array(arr: &ArrayRef, row: usize) -> DFResult<Value> {
+fn get_value_from_array(
+    arr: &ArrayRef,
+    row: usize,
+    field: Option<&arrow::datatypes::Field>,
+) -> DFResult<Value> {
     if arr.is_null(row) {
         return Ok(Value::Null);
     }
@@ -2091,6 +2095,16 @@ fn get_value_from_array(arr: &ArrayRef, row: usize) -> DFResult<Value> {
         DataType::LargeBinary => {
             let typed = downcast_arr!(arr, LargeBinaryArray);
             let bytes = typed.value(row);
+            // A raw `DataType::Bytes` argument column carries the `uni_raw_bytes`
+            // marker; read it verbatim instead of mis-decoding via the tagged
+            // codec (which reads byte[0] as a type tag). (#93/#100 family)
+            if field.is_some_and(|f| {
+                f.metadata()
+                    .get("uni_raw_bytes")
+                    .is_some_and(|v| v == "true")
+            }) {
+                return Ok(Value::Bytes(bytes.to_vec()));
+            }
             if let Ok(val) = uni_common::cypher_value_codec::decode(bytes) {
                 return Ok(val);
             }
@@ -2126,11 +2140,22 @@ fn get_value_from_array(arr: &ArrayRef, row: usize) -> DFResult<Value> {
 }
 
 /// Convert DataFusion `ColumnarValue` arguments to `uni_common::Value` for UDF evaluation.
-fn get_value_args_for_row(args: &[ColumnarValue], row: usize) -> DFResult<Vec<Value>> {
+///
+/// `arg_fields` is positional to `args` (DataFusion `ScalarFunctionArgs::arg_fields`) and
+/// carries per-argument Arrow field metadata — notably the `uni_raw_bytes` marker that
+/// distinguishes a raw `DataType::Bytes` column from a tagged CypherValue `LargeBinary`.
+fn get_value_args_for_row(
+    args: &[ColumnarValue],
+    arg_fields: &[arrow::datatypes::FieldRef],
+    row: usize,
+) -> DFResult<Vec<Value>> {
     args.iter()
-        .map(|arg| match arg {
+        .enumerate()
+        .map(|(idx, arg)| match arg {
             ColumnarValue::Scalar(scalar) => scalar_to_value(scalar),
-            ColumnarValue::Array(arr) => get_value_from_array(arr, row),
+            ColumnarValue::Array(arr) => {
+                get_value_from_array(arr, row, arg_fields.get(idx).map(|f| f.as_ref()))
+            }
         })
         .collect()
 }
@@ -2159,7 +2184,7 @@ where
             .iter()
             .all(|a| matches!(a, ColumnarValue::Scalar(_)))
     {
-        let row_args = get_value_args_for_row(&args.args, 0)?;
+        let row_args = get_value_args_for_row(&args.args, &args.arg_fields, 0)?;
         let res = f(&row_args)?;
         if matches!(output_type, DataType::LargeBinary | DataType::List(_)) {
             // Encode through array path to match UDF's declared LargeBinary return type
@@ -2177,7 +2202,7 @@ where
 
     let mut results = Vec::with_capacity(len);
     for i in 0..len {
-        let row_args = get_value_args_for_row(&args.args, i)?;
+        let row_args = get_value_args_for_row(&args.args, &args.arg_fields, i)?;
         results.push(f(&row_args)?);
     }
 
@@ -2838,12 +2863,13 @@ impl ScalarUDFImpl for CypherSortKeyUdf {
                 Ok(ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(key))))
             }
             ColumnarValue::Array(arr) => {
+                let field = args.arg_fields.first().map(|f| f.as_ref());
                 let mut keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(arr.len());
                 for i in 0..arr.len() {
                     let val = if arr.is_null(i) {
                         Value::Null
                     } else {
-                        get_value_from_array(arr, i)?
+                        get_value_from_array(arr, i, field)?
                     };
                     keys.push(Some(encode_cypher_sort_key(&val)));
                 }
@@ -6619,10 +6645,21 @@ impl AggregateUDFImpl for CypherMinMaxUdaf {
         &self,
         acc_args: datafusion::logical_expr::function::AccumulatorArgs,
     ) -> DFResult<Box<dyn DfAccumulator>> {
+        // A raw `DataType::Bytes` input column (`uni_raw_bytes=true`) holds verbatim
+        // bytes, not tagged CypherValue payloads; honor the #93/#100 marker so
+        // `update_batch` reads the input directly instead of mis-decoding via the
+        // codec (which reads byte[0] as a type tag). State/merge stay in tagged
+        // space (see `merge_batch`). (#100 follow-up)
+        let raw_bytes = acc_args
+            .expr_fields
+            .first()
+            .and_then(|field| field.metadata().get("uni_raw_bytes"))
+            .is_some_and(|v| v == "true");
         Ok(Box::new(CypherMinMaxAccumulator {
             current: None,
             is_max: self.is_max,
             return_type: acc_args.return_field.data_type().clone(),
+            raw_bytes,
         }))
     }
     fn state_fields(
@@ -6642,6 +6679,30 @@ struct CypherMinMaxAccumulator {
     current: Option<Value>,
     is_max: bool,
     return_type: DataType,
+    /// Input column is a raw `DataType::Bytes` column (`uni_raw_bytes=true`).
+    raw_bytes: bool,
+}
+
+impl CypherMinMaxAccumulator {
+    /// Folds one decoded value into the running min/max.
+    fn accumulate(&mut self, val: Value) {
+        if val.is_null() {
+            return;
+        }
+        self.current = Some(match self.current.take() {
+            None => val,
+            Some(cur) => {
+                let ord = cypher_cross_type_cmp(&val, &cur);
+                if (self.is_max && ord == std::cmp::Ordering::Greater)
+                    || (!self.is_max && ord == std::cmp::Ordering::Less)
+                {
+                    val
+                } else {
+                    cur
+                }
+            }
+        });
+    }
 }
 
 impl DfAccumulator for CypherMinMaxAccumulator {
@@ -6654,23 +6715,14 @@ impl DfAccumulator for CypherMinMaxAccumulator {
                     if lb.is_null(i) {
                         continue;
                     }
-                    let val = scalar_binary_to_value(lb.value(i));
-                    if val.is_null() {
-                        continue;
-                    }
-                    self.current = Some(match self.current.take() {
-                        None => val,
-                        Some(cur) => {
-                            let ord = cypher_cross_type_cmp(&val, &cur);
-                            if (self.is_max && ord == std::cmp::Ordering::Greater)
-                                || (!self.is_max && ord == std::cmp::Ordering::Less)
-                            {
-                                val
-                            } else {
-                                cur
-                            }
-                        }
-                    });
+                    // Raw `Bytes` columns bypass the tagged codec; all other
+                    // `LargeBinary` inputs are CypherValue-encoded.
+                    let val = if self.raw_bytes {
+                        Value::Bytes(lb.value(i).to_vec())
+                    } else {
+                        scalar_binary_to_value(lb.value(i))
+                    };
+                    self.accumulate(val);
                 }
             }
             _ => {
@@ -6682,23 +6734,7 @@ impl DfAccumulator for CypherMinMaxAccumulator {
                     let sv = ScalarValue::try_from_array(arr, i).map_err(|e| {
                         datafusion::error::DataFusionError::Execution(e.to_string())
                     })?;
-                    let val = scalar_to_value(&sv)?;
-                    if val.is_null() {
-                        continue;
-                    }
-                    self.current = Some(match self.current.take() {
-                        None => val,
-                        Some(cur) => {
-                            let ord = cypher_cross_type_cmp(&val, &cur);
-                            if (self.is_max && ord == std::cmp::Ordering::Greater)
-                                || (!self.is_max && ord == std::cmp::Ordering::Less)
-                            {
-                                val
-                            } else {
-                                cur
-                            }
-                        }
-                    });
+                    self.accumulate(scalar_to_value(&sv)?);
                 }
             }
         }
@@ -6765,7 +6801,19 @@ impl DfAccumulator for CypherMinMaxAccumulator {
         Ok(vec![self.evaluate()?])
     }
     fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
-        self.update_batch(states)
+        // Partial states are always CypherValue-tagged (produced by `evaluate`),
+        // never raw `Bytes` — decode them with the codec regardless of the
+        // `raw_bytes` input flag.
+        let arr = &states[0];
+        if let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+            for i in 0..lb.len() {
+                if lb.is_null(i) {
+                    continue;
+                }
+                self.accumulate(scalar_binary_to_value(lb.value(i)));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7018,9 +7066,21 @@ impl AggregateUDFImpl for CypherCollectUdaf {
         &self,
         acc_args: datafusion::logical_expr::function::AccumulatorArgs,
     ) -> DFResult<Box<dyn DfAccumulator>> {
+        // `Bytes`, `CypherValue`, and `Duration` all map to Arrow `LargeBinary`.
+        // A raw-`Bytes` column carries the `uni_raw_bytes=true` field-metadata
+        // marker (stamped at scan time by `property_field`); honor it here so the
+        // accumulator materializes raw bytes verbatim instead of feeding them to
+        // the tagged CypherValue codec, which would read byte[0] as a type tag and
+        // drop the value. This is the collect() analogue of the #93 scalar fix (#100).
+        let raw_bytes = acc_args
+            .expr_fields
+            .first()
+            .and_then(|field| field.metadata().get("uni_raw_bytes"))
+            .is_some_and(|v| v == "true");
         Ok(Box::new(CypherCollectAccumulator {
             values: Vec::new(),
             distinct: acc_args.is_distinct,
+            raw_bytes,
         }))
     }
     fn state_fields(
@@ -7039,11 +7099,41 @@ impl AggregateUDFImpl for CypherCollectUdaf {
 struct CypherCollectAccumulator {
     values: Vec<Value>,
     distinct: bool,
+    /// Input column is a raw `DataType::Bytes` column (`uni_raw_bytes=true`); its
+    /// `LargeBinary` elements are verbatim bytes, not tagged CypherValue payloads.
+    raw_bytes: bool,
+}
+
+impl CypherCollectAccumulator {
+    /// Pushes `val` into the accumulator, skipping duplicates when `distinct`.
+    fn push_value(&mut self, val: Value) {
+        if self.distinct {
+            // Use string repr for dedup (consistent with CountDistinct).
+            let repr = val.to_string();
+            if self.values.iter().any(|v| v.to_string() == repr) {
+                return;
+            }
+        }
+        self.values.push(val);
+    }
 }
 
 impl DfAccumulator for CypherCollectAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
         let arr = &values[0];
+        // Raw-`Bytes` columns must bypass the tagged CypherValue codec: read each
+        // non-null `LargeBinary` element directly as `Value::Bytes` (#100).
+        if self.raw_bytes
+            && let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>()
+        {
+            for i in 0..lb.len() {
+                if lb.is_null(i) {
+                    continue;
+                }
+                self.push_value(Value::Bytes(lb.value(i).to_vec()));
+            }
+            return Ok(());
+        }
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;
@@ -7063,14 +7153,7 @@ impl DfAccumulator for CypherCollectAccumulator {
             if val.is_null() {
                 continue;
             }
-            if self.distinct {
-                // Use string repr for dedup (consistent with CountDistinct)
-                let repr = val.to_string();
-                if self.values.iter().any(|v| v.to_string() == repr) {
-                    continue;
-                }
-            }
-            self.values.push(val);
+            self.push_value(val);
         }
         Ok(())
     }
@@ -7098,13 +7181,7 @@ impl DfAccumulator for CypherCollectAccumulator {
                 if let Value::List(items) = val {
                     for item in items {
                         if !item.is_null() {
-                            if self.distinct {
-                                let repr = item.to_string();
-                                if self.values.iter().any(|v| v.to_string() == repr) {
-                                    continue;
-                                }
-                            }
-                            self.values.push(item);
+                            self.push_value(item);
                         }
                     }
                 }

@@ -356,6 +356,15 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s));
     }
 
+    // Python `bytes`/`bytearray` map to raw `Value::Bytes` (round-trips with the
+    // `Value::Bytes => PyBytes` direction); without this they fall through to Null.
+    if let Ok(b) = bound.cast::<PyBytes>() {
+        return Ok(Value::Bytes(b.as_bytes().to_vec()));
+    }
+    if let Ok(b) = bound.cast::<pyo3::types::PyByteArray>() {
+        return Ok(Value::Bytes(b.to_vec()));
+    }
+
     if let Ok(l) = bound.cast::<PyList>() {
         let mut vec = Vec::new();
         for item in l {

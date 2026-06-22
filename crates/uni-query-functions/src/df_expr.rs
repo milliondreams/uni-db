@@ -1147,6 +1147,13 @@ fn value_to_scalar(value: &Value) -> Result<ScalarValue> {
                             ScalarValue::Int64(Some(v)),
                             datafusion::arrow::datatypes::DataType::Float64,
                         ) => ScalarValue::Float64(Some(v as f64)),
+                        // Already-binary scalars (e.g. from Value::Bytes) must pass
+                        // through verbatim — stringifying them would base64/Debug-
+                        // mangle the raw bytes (#100 family).
+                        (
+                            s @ ScalarValue::LargeBinary(_),
+                            datafusion::arrow::datatypes::DataType::LargeBinary,
+                        ) => s,
                         (s, datafusion::arrow::datatypes::DataType::LargeBinary) => {
                             // Convert scalar to JSON-like string bytes
                             let s_str = s.to_string();

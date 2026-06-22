@@ -21,6 +21,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege GITHUB_TOKEN: every job here only reads the repo, runs tests,
+# and uploads artifacts (the artifact API does not use the contents scope), so
+# read-only contents is sufficient. Mirrors ci.yml / pr.yml.
+permissions:
+  contents: read
+
 jobs:
   soak:
     name: Soak & Stress (run-ignored)

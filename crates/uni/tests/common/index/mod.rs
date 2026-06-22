@@ -1,6 +1,7 @@
 pub mod adjacency_cache_edge_cases;
 pub mod adjacency_cache_test;
 pub mod adjacency_snapshot_isolation;
+pub mod batch_extid_uniqueness;
 pub mod composite_index_test;
 pub mod edge_type_properties_test;
 pub mod expression_index_test;
@@ -9,6 +10,7 @@ pub mod index_lifecycle_test;
 pub mod indexing_integration;
 pub mod inline_properties_test;
 pub mod inline_properties_unlabeled_test;
+pub mod label_only_mutation_survives_flush;
 pub mod multi_label_crud_test;
 pub mod partial_index_planner_test;
 pub mod schemaless_labels_test;

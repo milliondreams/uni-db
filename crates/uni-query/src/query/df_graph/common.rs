@@ -564,24 +564,24 @@ pub fn large_list_of_cv_to_cv_array(
         let start = list.offsets()[row_idx] as usize;
         let end = list.offsets()[row_idx + 1] as usize;
 
-        let mut json_elements = Vec::with_capacity(end - start);
+        // Stay in Value-space when rebuilding the CypherValue list. The
+        // `Value -> serde_json::Value` bridge base64-stringifies `Value::Bytes`,
+        // silently corrupting raw-`Bytes` list elements; the codec round-trips
+        // `Bytes` and CV-encoded values identically, so this detour is lossless.
+        let mut items = Vec::with_capacity(end - start);
         for elem_idx in start..end {
             if binary_values.is_null(elem_idx) {
-                json_elements.push(serde_json::Value::Null);
+                items.push(uni_common::Value::Null);
             } else {
                 let blob = binary_values.value(elem_idx);
                 match uni_common::cypher_value_codec::decode(blob) {
-                    Ok(uni_val) => {
-                        let json_val: serde_json::Value = uni_val.into();
-                        json_elements.push(json_val);
-                    }
-                    Err(_) => json_elements.push(serde_json::Value::Null),
+                    Ok(uni_val) => items.push(uni_val),
+                    Err(_) => items.push(uni_common::Value::Null),
                 }
             }
         }
 
-        let uni_val: uni_common::Value = serde_json::Value::Array(json_elements).into();
-        let bytes = uni_common::cypher_value_codec::encode(&uni_val);
+        let bytes = uni_common::cypher_value_codec::encode(&uni_common::Value::List(items));
         builder.append_value(&bytes);
     }
 
@@ -739,9 +739,13 @@ pub fn cv_array_to_large_list(
             )
         })?;
 
-    // Collect all JSON elements across all rows
+    // Collect all elements across all rows in Value-space (not serde_json).
+    // The `Value -> serde_json::Value` bridge base64-stringifies `Value::Bytes`,
+    // which corrupts raw-`Bytes` list elements (e.g. `[x IN collect(b.data) | x]`).
+    // The codec round-trips `Bytes` and CV-encoded values identically, so staying
+    // in Value-space is lossless for every element kind.
     let num_rows = binary_arr.len();
-    let mut all_elements: Vec<Vec<serde_json::Value>> = Vec::with_capacity(num_rows);
+    let mut all_elements: Vec<Vec<uni_common::Value>> = Vec::with_capacity(num_rows);
     let mut nulls = Vec::with_capacity(num_rows);
 
     for i in 0..num_rows {
@@ -752,24 +756,18 @@ pub fn cv_array_to_large_list(
         }
 
         let blob = binary_arr.value(i);
-        let uni_val = match uni_common::cypher_value_codec::decode(blob) {
-            Ok(v) => v,
-            Err(_) => {
-                all_elements.push(Vec::new());
-                nulls.push(false);
-                continue;
-            }
-        };
-        let json_val_decoded: serde_json::Value = uni_val.into();
-
-        match json_val_decoded {
-            serde_json::Value::Array(elements) => {
+        match uni_common::cypher_value_codec::decode(blob) {
+            Ok(uni_common::Value::List(elements)) => {
                 all_elements.push(elements);
                 nulls.push(true);
             }
-            _ => {
+            Ok(_) => {
                 all_elements.push(Vec::new());
                 nulls.push(true);
+            }
+            Err(_) => {
+                all_elements.push(Vec::new());
+                nulls.push(false);
             }
         }
     }
@@ -783,16 +781,10 @@ pub fn cv_array_to_large_list(
             let mut builder = datafusion::arrow::array::builder::Int64Builder::new();
             for elems in &all_elements {
                 for elem in elems {
-                    if let serde_json::Value::Number(n) = elem {
-                        if let Some(i) = n.as_i64() {
-                            builder.append_value(i);
-                        } else if let Some(f) = n.as_f64() {
-                            builder.append_value(f as i64);
-                        } else {
-                            builder.append_null();
-                        }
-                    } else {
-                        builder.append_null();
+                    match elem {
+                        uni_common::Value::Int(i) => builder.append_value(*i),
+                        uni_common::Value::Float(f) => builder.append_value(*f as i64),
+                        _ => builder.append_null(),
                     }
                 }
                 offsets.push(offsets.last().unwrap() + elems.len() as i64);
@@ -803,12 +795,10 @@ pub fn cv_array_to_large_list(
             let mut builder = datafusion::arrow::array::builder::Float64Builder::new();
             for elems in &all_elements {
                 for elem in elems {
-                    if let serde_json::Value::Number(n) = elem
-                        && let Some(f) = n.as_f64()
-                    {
-                        builder.append_value(f);
-                    } else {
-                        builder.append_null();
+                    match elem {
+                        uni_common::Value::Float(f) => builder.append_value(*f),
+                        uni_common::Value::Int(i) => builder.append_value(*i as f64),
+                        _ => builder.append_null(),
                     }
                 }
                 offsets.push(offsets.last().unwrap() + elems.len() as i64);
@@ -820,9 +810,14 @@ pub fn cv_array_to_large_list(
             for elems in &all_elements {
                 for elem in elems {
                     match elem {
-                        serde_json::Value::String(s) => builder.append_value(s),
-                        serde_json::Value::Null => builder.append_null(),
-                        other => builder.append_value(other.to_string()),
+                        uni_common::Value::String(s) => builder.append_value(s),
+                        uni_common::Value::Null => builder.append_null(),
+                        // Non-string element in a Utf8-typed list: preserve the
+                        // prior rendering (never reached for raw `Bytes` lists).
+                        other => {
+                            let json: serde_json::Value = other.clone().into();
+                            builder.append_value(json.to_string());
+                        }
                     }
                 }
                 offsets.push(offsets.last().unwrap() + elems.len() as i64);
@@ -833,23 +828,22 @@ pub fn cv_array_to_large_list(
             let mut builder = datafusion::arrow::array::builder::BooleanBuilder::new();
             for elems in &all_elements {
                 for elem in elems {
-                    if let serde_json::Value::Bool(b) = elem {
-                        builder.append_value(*b);
-                    } else {
-                        builder.append_null();
+                    match elem {
+                        uni_common::Value::Bool(b) => builder.append_value(*b),
+                        _ => builder.append_null(),
                     }
                 }
                 offsets.push(offsets.last().unwrap() + elems.len() as i64);
             }
             Arc::new(builder.finish())
         }
-        // Fallback: keep as CypherValue LargeBinary blobs
+        // Fallback: keep as CypherValue LargeBinary blobs. Encoding straight from
+        // the decoded `Value` preserves raw `Bytes` (and CV-encoded values).
         _ => {
             let mut builder = datafusion::arrow::array::builder::LargeBinaryBuilder::new();
             for elems in &all_elements {
                 for elem in elems {
-                    let uni_val: uni_common::Value = elem.clone().into();
-                    let bytes = uni_common::cypher_value_codec::encode(&uni_val);
+                    let bytes = uni_common::cypher_value_codec::encode(elem);
                     builder.append_value(&bytes);
                 }
                 offsets.push(offsets.last().unwrap() + elems.len() as i64);

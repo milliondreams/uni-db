@@ -4432,7 +4432,21 @@ impl HybridPhysicalPlanner {
                 self.params.clone(),
                 self.outer_entity_vars.clone(),
             );
-            let physical_expr = compiler.compile(expr, &schema)?;
+            let mut physical_expr = compiler.compile(expr, &schema)?;
+
+            // Stamp the `uni_raw_bytes` marker on a computed raw-bytes scalar output
+            // (e.g. `coalesce(b.missing, b.data)`, `CASE ... THEN b.data ...`). Plain
+            // column passthroughs already preserve their marker via `Column::return_field`,
+            // and raw-bytes list literals are marked at compile time (in the expr compiler).
+            if crate::query::df_graph::raw_bytes_marker::is_raw_scalar(expr, &schema)
+                && !matches!(expr, Expr::Variable(_) | Expr::Property(_, _))
+            {
+                physical_expr = Arc::new(
+                    crate::query::df_graph::raw_bytes_marker::RawBytesMarkerExpr::scalar(
+                        physical_expr,
+                    ),
+                );
+            }
 
             let name = alias.clone().unwrap_or_else(|| expr.to_string_repr());
             exprs.push((physical_expr, name));

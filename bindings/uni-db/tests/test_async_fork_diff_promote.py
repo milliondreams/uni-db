@@ -148,3 +148,25 @@ async def test_async_promote_edges_lands_both_endpoints_and_edge():
     rows = rs.rows
     assert len(rows) == 1
     assert rows[0].get("since") == 2020
+
+
+async def test_async_promote_with_options_reports_new_fields():
+    """Async promote_from_fork_with_options exposes the new merge counters."""
+    db = await _make_db(disable_fork_sweeper=True)
+    primary = await _seed_person_schema(db)
+
+    fork = await primary.fork("publish").build()
+    tx = await fork.tx()
+    await tx.execute("CREATE (:Person {name: 'NewKid'})")
+    await tx.commit()
+    del fork
+
+    report = await db.promote_from_fork_with_options(
+        "publish",
+        [uni_db.PromotePattern.label("Person")],
+        uni_db.PromoteOptions(upsert=True),
+    )
+    assert report.vertices_inserted >= 1, repr(report)
+    assert report.vertices_updated == 0
+    assert report.vertices_conflicting == 0
+    assert report.vertices_deleted == 0

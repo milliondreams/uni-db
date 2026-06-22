@@ -76,6 +76,17 @@ pub fn is_time_struct(arrow_dt: &ArrowDataType) -> bool {
     matches!(arrow_dt, ArrowDataType::Struct(fields) if *fields == time_struct_fields())
 }
 
+/// Field metadata marking an Arrow `LargeBinary` field as a raw `DataType::Bytes`
+/// value rather than a tagged CypherValue/Duration blob.
+///
+/// Stamped on the child field of `List(Bytes)` / `Map(_, Bytes)` container types so
+/// the read path decodes each element verbatim instead of through the tagged codec
+/// (which would read `byte[0]` as a type tag). CV-encoded containers carry no such
+/// marker and keep the codec path. See the read-side honoring in `arrow_convert`.
+pub fn raw_bytes_field_metadata() -> HashMap<String, String> {
+    HashMap::from([("uni_raw_bytes".to_string(), "true".to_string())])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub enum CrdtType {
@@ -196,16 +207,33 @@ impl DataType {
             DataType::Btic => ArrowDataType::FixedSizeBinary(24),
             DataType::Crdt(_) => ArrowDataType::Binary, // Store CRDT as binary MessagePack
             DataType::List(inner) => {
-                ArrowDataType::List(Arc::new(Field::new("item", inner.to_arrow(), true)))
+                // A raw `Bytes` element maps to Arrow `LargeBinary`, indistinguishable
+                // from a CV-encoded element by type alone; mark the child field so the
+                // read path decodes it verbatim rather than through the tagged codec.
+                let item = Field::new("item", inner.to_arrow(), true);
+                let item = if matches!(**inner, DataType::Bytes) {
+                    item.with_metadata(raw_bytes_field_metadata())
+                } else {
+                    item
+                };
+                ArrowDataType::List(Arc::new(item))
             }
-            DataType::Map(key, value) => ArrowDataType::List(Arc::new(Field::new(
-                "item",
-                ArrowDataType::Struct(Fields::from(vec![
-                    Field::new("key", key.to_arrow(), false),
-                    Field::new("value", value.to_arrow(), true),
-                ])),
-                true,
-            ))),
+            DataType::Map(key, value) => {
+                let value_field = Field::new("value", value.to_arrow(), true);
+                let value_field = if matches!(**value, DataType::Bytes) {
+                    value_field.with_metadata(raw_bytes_field_metadata())
+                } else {
+                    value_field
+                };
+                ArrowDataType::List(Arc::new(Field::new(
+                    "item",
+                    ArrowDataType::Struct(Fields::from(vec![
+                        Field::new("key", key.to_arrow(), false),
+                        value_field,
+                    ])),
+                    true,
+                )))
+            }
         }
     }
 
@@ -454,6 +482,12 @@ impl Default for SchemalessEdgeTypeRegistry {
 pub const VIRTUAL_LABEL_ID_START: u16 = 0xFF00;
 /// Sentinel "no label" marker, kept distinct from any allocatable ID.
 pub const VIRTUAL_LABEL_ID_SENTINEL: u16 = 0xFFFF;
+
+/// Maximum byte length of a label or edge-type name. (L6)
+///
+/// Generous; the cap is hygiene — the name lands in on-disk dataset paths
+/// and Lance branch names — not a storage limit.
+const MAX_SCHEMA_NAME_LEN: usize = 255;
 
 /// Returns `true` if `id` is in the virtual (catalog-resolved) range.
 #[inline]
@@ -1202,11 +1236,49 @@ impl SchemaManager {
         max_schema_id + 1
     }
 
+    /// Validate a label or edge-type name at definition time. (L6)
+    ///
+    /// Names flow into on-disk dataset paths (`vertices_{name}.lance`) and
+    /// Lance branch names (`fork_{id}_{…}`); a name with a path separator,
+    /// whitespace, or a control character corrupts those paths and breaks
+    /// fork creation. Such names were never actually usable, so they are
+    /// rejected up front rather than failing later. `.` is allowed
+    /// (path-safe and common in qualified names).
+    ///
+    /// Public so the fork-create path can apply the same rule as a backstop
+    /// over names that entered the schema through an infallible interning
+    /// path (e.g. schemaless `get_or_assign_edge_type_id`).
+    ///
+    /// # Errors
+    /// Returns an error if `name` is empty/all-whitespace, exceeds
+    /// `MAX_SCHEMA_NAME_LEN` bytes, or contains a control, whitespace,
+    /// `/`, or `\` character.
+    pub fn validate_schema_element_name(kind: &str, name: &str) -> Result<()> {
+        if name.is_empty() || name.chars().all(char::is_whitespace) {
+            return Err(anyhow!(
+                "{kind} name must be non-empty and not all whitespace"
+            ));
+        }
+        if name.len() > MAX_SCHEMA_NAME_LEN {
+            return Err(anyhow!("{kind} name exceeds {MAX_SCHEMA_NAME_LEN} bytes"));
+        }
+        if let Some(c) = name
+            .chars()
+            .find(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\'))
+        {
+            return Err(anyhow!(
+                "{kind} name '{name}' contains an unsafe character ({c:?})"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn add_label(&self, name: &str) -> Result<u16> {
         self.add_label_with_desc(name, None)
     }
 
     pub fn add_label_with_desc(&self, name: &str, description: Option<String>) -> Result<u16> {
+        Self::validate_schema_element_name("Label", name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         if schema.labels.contains_key(name) {
@@ -1250,6 +1322,7 @@ impl SchemaManager {
         dst_labels: Vec<String>,
         description: Option<String>,
     ) -> Result<u32> {
+        Self::validate_schema_element_name("Edge type", name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         if schema.edge_types.contains_key(name) {
@@ -2274,5 +2347,27 @@ mod tests {
             v0.wrapping_add(2),
             "a second new edge type must bump schema_version again"
         );
+    }
+
+    /// L6: label/edge-type names with path separators, whitespace, or
+    /// control chars are rejected at definition; benign names (incl. `.`)
+    /// are accepted.
+    #[test]
+    fn validate_schema_element_name_rejects_unsafe() {
+        for bad in ["", "   ", "a/b", "a b", "a\nb", "a\\b", "x\0y"] {
+            assert!(
+                SchemaManager::validate_schema_element_name("Label", bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["Person", "My.Label", "edge_2", "KNOWS"] {
+            assert!(
+                SchemaManager::validate_schema_element_name("Label", good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+        // Over-length is rejected.
+        let long = "x".repeat(MAX_SCHEMA_NAME_LEN + 1);
+        assert!(SchemaManager::validate_schema_element_name("Label", &long).is_err());
     }
 }

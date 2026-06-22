@@ -150,22 +150,49 @@ fn try_reconstruct_map(arr: &ArrayRef) -> Option<HashMap<String, Value>> {
     if fields.len() != 2 || fields[0].name() != "key" || fields[1].name() != "value" {
         return None;
     }
+    // A typed `Map(_, Bytes)` value child carries the `uni_raw_bytes` marker; decode
+    // each value verbatim. CV-encoded map values carry no marker → codec path.
+    let value_hint = raw_bytes_hint(fields[1].metadata());
     let key_col = structs.column(0);
     let val_col = structs.column(1);
     let mut map = HashMap::new();
     for i in 0..structs.len() {
         if let Value::String(k) = arrow_to_value(key_col.as_ref(), i, None) {
-            map.insert(k, arrow_to_value(val_col.as_ref(), i, None));
+            map.insert(k, arrow_to_value(val_col.as_ref(), i, value_hint));
         }
     }
     Some(map)
 }
 
 /// Convert all elements of an Arrow array into a `Vec<Value>`.
-fn array_to_value_list(arr: &ArrayRef) -> Vec<Value> {
+///
+/// `elem_type` is the schema hint for each element — `Some(DataType::Bytes)` when the
+/// list child field is marked `uni_raw_bytes`, so raw `Bytes` elements decode verbatim.
+fn array_to_value_list(arr: &ArrayRef, elem_type: Option<&DataType>) -> Vec<Value> {
     (0..arr.len())
-        .map(|i| arrow_to_value(arr.as_ref(), i, None))
+        .map(|i| arrow_to_value(arr.as_ref(), i, elem_type))
         .collect()
+}
+
+/// Returns `Some(&DataType::Bytes)` when Arrow field metadata marks the field as a
+/// raw `Bytes` value (`uni_raw_bytes=true`), else `None`. Used to discriminate raw
+/// `Bytes` container children from CV-encoded `LargeBinary` without array sniffing.
+fn raw_bytes_hint(metadata: &HashMap<String, String>) -> Option<&'static DataType> {
+    if metadata.get("uni_raw_bytes").is_some_and(|v| v == "true") {
+        Some(&DataType::Bytes)
+    } else {
+        None
+    }
+}
+
+/// Extracts the raw-`Bytes` element hint from a list-like Arrow type's child field.
+fn list_child_bytes_hint(dt: &ArrowDataType) -> Option<&'static DataType> {
+    match dt {
+        ArrowDataType::List(f)
+        | ArrowDataType::LargeList(f)
+        | ArrowDataType::FixedSizeList(f, _) => raw_bytes_hint(f.metadata()),
+        _ => None,
+    }
 }
 
 /// Convert an Arrow array value at a given row index to a Uni Value.
@@ -322,7 +349,8 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
 
     // Fixed-size list (vectors)
     if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
-        return Value::List(array_to_value_list(&list.value(row)));
+        let elem_hint = list_child_bytes_hint(list.data_type());
+        return Value::List(array_to_value_list(&list.value(row), elem_hint));
     }
 
     // Variable-size list
@@ -334,12 +362,14 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
             return Value::Map(obj);
         }
 
-        return Value::List(array_to_value_list(&arr));
+        let elem_hint = list_child_bytes_hint(list.data_type());
+        return Value::List(array_to_value_list(&arr, elem_hint));
     }
 
     // Large list (variable-size list with i64 offsets)
     if let Some(list) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
-        return Value::List(array_to_value_list(&list.value(row)));
+        let elem_hint = list_child_bytes_hint(list.data_type());
+        return Value::List(array_to_value_list(&list.value(row), elem_hint));
     }
 
     // Struct type — detect temporal structs by field names before generic handler
@@ -1509,6 +1539,35 @@ impl<'a> PropertyExtractor<'a> {
                     }
                 })
             }
+            DataType::Bytes => {
+                // Raw `Bytes` elements: store each buffer verbatim in a `LargeBinary`
+                // child and mark the child field `uni_raw_bytes` so the read path
+                // decodes it verbatim instead of through the tagged codec.
+                let item_field = Arc::new(
+                    Field::new("item", ArrowDataType::LargeBinary, true)
+                        .with_metadata(schema::raw_bytes_field_metadata()),
+                );
+                let mut builder =
+                    ListBuilder::new(LargeBinaryBuilder::new()).with_field(item_field);
+                for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+                    let val_array = get_props(i).and_then(|v| v.as_array());
+                    if val_array.is_none() && is_deleted {
+                        builder.append_null();
+                    } else if let Some(arr) = val_array {
+                        for v in arr {
+                            if let Value::Bytes(b) = v {
+                                builder.values().append_value(b);
+                            } else {
+                                builder.values().append_null();
+                            }
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
             _ => Err(anyhow!("Unsupported inner type for List: {:?}", inner)),
         }
     }
@@ -1566,6 +1625,7 @@ impl<'a> PropertyExtractor<'a> {
                 &get_props,
                 StringBuilder::new(),
                 arrow_schema::DataType::Utf8,
+                None,
                 |v, b: &mut StringBuilder| {
                     if let Some(s) = v.as_str() {
                         b.append_value(s);
@@ -1580,9 +1640,27 @@ impl<'a> PropertyExtractor<'a> {
                 &get_props,
                 Int64Builder::new(),
                 arrow_schema::DataType::Int64,
+                None,
                 |v, b: &mut Int64Builder| {
                     if let Some(n) = v.as_i64() {
                         b.append_value(n);
+                    } else {
+                        b.append_null();
+                    }
+                },
+            ),
+            DataType::Bytes => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                LargeBinaryBuilder::new(),
+                arrow_schema::DataType::LargeBinary,
+                // Mark the value child `uni_raw_bytes` so the read path decodes each
+                // raw `Bytes` value verbatim rather than through the tagged codec.
+                Some(schema::raw_bytes_field_metadata()),
+                |v, b: &mut LargeBinaryBuilder| {
+                    if let Value::Bytes(bytes) = v {
+                        b.append_value(bytes);
                     } else {
                         b.append_null();
                     }
@@ -1593,6 +1671,10 @@ impl<'a> PropertyExtractor<'a> {
     }
 
     /// Generic helper to build a map column with any value builder type.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "builder plumbing: value type + optional child metadata are distinct knobs"
+    )]
     fn build_typed_map<F, B, A>(
         &self,
         len: usize,
@@ -1600,6 +1682,7 @@ impl<'a> PropertyExtractor<'a> {
         get_props: &F,
         value_builder: B,
         value_arrow_type: arrow_schema::DataType,
+        value_metadata: Option<HashMap<String, String>>,
         mut append_value: A,
     ) -> Result<ArrayRef>
     where
@@ -1609,10 +1692,14 @@ impl<'a> PropertyExtractor<'a> {
     {
         let key_builder = Box::new(StringBuilder::new());
         let value_builder = Box::new(value_builder);
+        let value_field = match value_metadata {
+            Some(meta) => Field::new("value", value_arrow_type, true).with_metadata(meta),
+            None => Field::new("value", value_arrow_type, true),
+        };
         let struct_builder = StructBuilder::new(
             vec![
                 Field::new("key", arrow_schema::DataType::Utf8, false),
-                Field::new("value", value_arrow_type, true),
+                value_field,
             ],
             vec![key_builder, value_builder],
         );

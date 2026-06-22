@@ -229,6 +229,12 @@ pub enum UniError {
     #[error("Fork '{name}' already exists")]
     ForkAlreadyExists { name: String },
 
+    /// The fork name is empty, all-whitespace, too long, or contains
+    /// control characters. Names flow into the registry key and on-disk
+    /// catalog, so they are validated before any state is created.
+    #[error("Invalid fork name: {reason}")]
+    ForkNameInvalid { reason: String },
+
     /// Phase-1 gate: writes through `forked_session.tx()` are blocked
     /// until Phase 2 lands. Reads, `locy()`, and admin paths work.
     #[error(

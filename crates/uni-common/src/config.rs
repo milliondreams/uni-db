@@ -475,10 +475,6 @@ pub struct UniConfig {
     /// Configurable OOM guard to prevent memory exhaustion during compaction.
     pub max_compaction_rows: usize,
 
-    /// Enable in-memory VID-to-labels index for O(1) lookups (default: true).
-    /// Memory cost: ~42 bytes per vertex (1M vertices ≈ 42MB).
-    pub enable_vid_labels_index: bool,
-
     /// Maximum iterations for recursive CTE evaluation (default: 1000).
     pub max_recursive_cte_iterations: usize,
 
@@ -561,6 +557,13 @@ pub struct UniConfig {
     /// with `UniError::ForkBudgetExceeded` once the cap is reached.
     /// Tombstoned forks count because they still hold branch state on
     /// disk until recovery completes; counting them prevents churn-thrash.
+    ///
+    /// **Production guidance (L11):** the default is `None` (unbounded) to
+    /// avoid surprising existing embedders, but each fork's branches scale
+    /// with schema size and persist until dropped, so unbounded fork churn
+    /// is an on-disk growth risk. Production deployments that create forks
+    /// from untrusted/automated callers SHOULD set an explicit `max_forks`
+    /// (and ideally `fork_default_ttl`).
     pub max_forks: Option<usize>,
 
     /// Phase 4a: default TTL applied to forks when the user does not
@@ -646,7 +649,6 @@ impl Default for UniConfig {
             max_query_memory: 1024 * 1024 * 1024,       // 1GB
             max_transaction_memory: 1024 * 1024 * 1024, // 1GB
             max_compaction_rows: 5_000_000,             // 5M rows
-            enable_vid_labels_index: true,              // Enable by default
             max_recursive_cte_iterations: 1000,
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),

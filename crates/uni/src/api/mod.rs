@@ -957,6 +957,10 @@ impl UniInner {
             forked_storage.clone(),
             merged_schema.clone(),
             &scope.fork_id(),
+            // Bootstrap the fork's MVCC version floor to the parent's
+            // fork-point HWM so in-tx fork reads see inherited rows. WAL
+            // replay below advances the counter for the fork's own writes.
+            scope.fork_info().fork_point_version_hwm,
             self.config.clone(),
         )
         .await
@@ -965,11 +969,25 @@ impl UniInner {
         // Phase 2 Day 6: replay any persisted WAL entries for this
         // fork into the freshly-built L0. Without this, a process
         // restart would silently drop committed-but-not-yet-flushed
-        // fork mutations. `replay_wal(0)` replays from the beginning;
-        // the WAL's own LSN tracking (initialized inside the writer
-        // factory) advances correctly past durable segments.
+        // fork mutations.
+        //
+        // Gate replay on the fork's own persisted `wal_high_water_mark`
+        // (review M2). The fork-scoped SnapshotManager (review C1) records
+        // it at each fork flush under `catalog/forks/{fork_id}/latest`; a
+        // crash between the durable branch write and complete WAL truncation
+        // would otherwise replay already-flushed segments from 0 and
+        // double-apply them. A fork that has never flushed (or a pre-fix
+        // on-disk fork) has no per-fork snapshot, so we fall back to 0 —
+        // correct, since nothing has been moved out of the WAL yet.
+        let fork_wal_hwm = forked_storage
+            .snapshot_manager()
+            .load_latest_snapshot()
+            .await
+            .map_err(UniError::Internal)?
+            .map(|s| s.wal_high_water_mark)
+            .unwrap_or(0);
         let replayed = forked_writer
-            .replay_wal(0)
+            .replay_wal(fork_wal_hwm)
             .await
             .map_err(UniError::Internal)?;
         if replayed > 0 {
@@ -1227,31 +1245,23 @@ impl Uni {
     /// Wait (bounded) for a fork's `holder_count` to drain to zero,
     /// returning the final count.
     ///
-    /// Under async-flush a fork's `FlushCoordinator` finalizer is an
-    /// orphan tokio task that transitively pins the fork's
-    /// `ForkHolderGuard`, so `holder_count_for` can sit briefly above
-    /// zero after the last session drops. This polls up to 100 times,
-    /// yielding to the runtime for the first 20 iterations (to let
-    /// pending destructors run) then sleeping 10 ms thereafter. Shared
-    /// by `drop_fork` (ignores the count) and `drop_fork_cascade` (uses
-    /// it to build the blocker message).
+    /// Wait for a fork's holder count to drain to zero, returning the final
+    /// count. (L1)
+    ///
+    /// Under async-flush a fork's `FlushCoordinator` finalizer is an orphan
+    /// tokio task that transitively pins the fork's `ForkHolderGuard`, so
+    /// `holder_count_for` can sit briefly above zero after the last session
+    /// drops. This awaits the registry's deterministic drain `Notify` —
+    /// fired the instant the last guard drops — bounded by
+    /// `drop_fork_drain_timeout`, rather than a fixed-budget poll that could
+    /// expire before the finalizer is scheduled under CPU starvation (the
+    /// #99 `ForkInUse` flake). Shared by `drop_fork` (ignores the count) and
+    /// `drop_fork_cascade` (uses it to build the blocker message).
     async fn wait_for_holders_drained(&self, fork_id: ForkId) -> usize {
-        let mut holders = self.inner.fork_registry.holder_count_for(fork_id).await;
-        if holders == 0 {
-            return 0;
-        }
-        for i in 0..100 {
-            if i < 20 {
-                tokio::task::yield_now().await;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            holders = self.inner.fork_registry.holder_count_for(fork_id).await;
-            if holders == 0 {
-                break;
-            }
-        }
-        holders
+        self.inner
+            .fork_registry
+            .wait_holders_drained(fork_id, self.inner.config.drop_fork_drain_timeout)
+            .await
     }
 
     /// Drop a fork by name (Phase 1: read-only forks only).
@@ -1280,6 +1290,16 @@ impl Uni {
     /// # }
     /// ```
     pub async fn drop_fork(&self, name: &str) -> Result<()> {
+        // Hold the per-name lock for the whole drop sequence. `fork(name).build()`
+        // holds the same lock for its entire open-or-create flow (api/fork.rs),
+        // so create/open and drop are mutually exclusive per name: a concurrent
+        // builder can never observe `Active` + register a holder while we are
+        // tombstoning and force-deleting the Lance branches (review H2/M9). The
+        // cascade path (`drop_fork_cascade`) drops each node through here, so it
+        // inherits the same per-node serialization.
+        let name_lock = self.inner.fork_registry.name_lock(name).await;
+        let _name_guard = name_lock.lock().await;
+
         // Phase 2 Day 11: surface in-flight transactions before the
         // registry transitions to Tombstoned. The `ForkInUse` check in
         // `begin_drop` catches *session* holders; this catches the
@@ -1369,8 +1389,13 @@ impl Uni {
         // this eviction is purely cleanup so the map doesn't accumulate
         // dead Weak entries across the lifetime of the database.
         self.inner.fork_inners.remove(&info.id);
-        // Step 3: walk branches and force-delete each.
+        // Step 3: walk branches and force-delete each. Track failures: if any
+        // branch delete fails we must NOT finish_drop, because finish_drop
+        // deletes the recovery tombstone — the only anchor that lets boot-time
+        // recovery retry the deletion. Dropping it would orphan the surviving
+        // branches permanently (review M3). Leave the fork Tombstoned instead.
         let storage_uri = self.inner.storage.base_uri().to_string();
+        let mut delete_failure: Option<String> = None;
         for (dataset, branch) in &info.datasets {
             let dataset_uri = dataset_uri(&storage_uri, dataset);
             if let Err(e) =
@@ -1381,11 +1406,28 @@ impl Uni {
                     branch = %branch,
                     "delete_branch during drop_fork failed: {e}"
                 );
+                delete_failure = Some(format!("{dataset}/{branch}: {e}"));
             }
         }
-        // Step 4 + 5: clear the registry entry, delete tombstone +
-        // schema overlay files.
+        if let Some(detail) = delete_failure {
+            // Tombstone + registry entry remain; `recover_forks` will retry
+            // delete_all_branches + finish_drop on the next open.
+            return Err(UniError::ForkLifecycle {
+                name: name.to_string(),
+                stage: "delete_branch",
+                source: format!(
+                    "branch delete failed; fork left Tombstoned for recovery ({detail})"
+                )
+                .into(),
+            });
+        }
+        // Step 4 + 5: clear the registry entry, delete tombstone + schema
+        // overlay files.
         self.inner.fork_registry.finish_drop(&info).await?;
+        // Step 6: remove the fork's storage-side artifacts (WAL, id allocator,
+        // fork-scoped snapshot manifests) so a dropped fork leaves no disk
+        // residue (review H3). On the storage object store, not the registry's.
+        uni_store::fork::delete_fork_artifacts(&self.inner.storage.store(), &info.id).await;
         Ok(())
     }
 
@@ -1610,6 +1652,34 @@ impl Uni {
         fork_name: &str,
         patterns: &[fork_diff::PromotePattern],
     ) -> Result<fork_diff::PromoteReport> {
+        self.promote_from_fork_with_options(
+            fork_name,
+            patterns,
+            &fork_diff::PromoteOptions::default(),
+        )
+        .await
+    }
+
+    /// Promote fork changes to primary with explicit merge [`options`].
+    ///
+    /// Same as [`Self::promote_from_fork`] but lets the caller enable
+    /// ext_id-keyed upsert (`PromoteOptions::with_upsert`): a fork edit to
+    /// a vertex that already exists on primary is applied in place instead
+    /// of inserting a twin. The default options reproduce the insert-only
+    /// behavior of `promote_from_fork`, so existing callers are unaffected.
+    ///
+    /// # Errors
+    /// Returns [`UniError::LabelNotFound`] / [`UniError::EdgeTypeNotFound`]
+    /// when a pattern targets a label or edge type absent on primary, or
+    /// any error from the underlying fork flush, transaction, or commit.
+    ///
+    /// [`options`]: fork_diff::PromoteOptions
+    pub async fn promote_from_fork_with_options(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+        options: &fork_diff::PromoteOptions,
+    ) -> Result<fork_diff::PromoteReport> {
         let primary = self.session();
         let fork = primary.fork(fork_name).await?;
         // Persist any pending tx commits on the fork to Lance so the
@@ -1638,10 +1708,101 @@ impl Uni {
                 }
             }
         }
+        // Delete-promotion and conflict detection need the fork-point
+        // baseline: primary's state as of the fork point, read by pinning a
+        // session at the fork's parent snapshot. Built only for merge mode.
+        let baseline = if options.delete_promotion {
+            Some(self.build_promote_baseline(fork_name, patterns).await?)
+        } else {
+            None
+        };
+
         let primary_tx = primary.tx().await?;
-        let report = fork_diff::run_promote(&fork, &primary, &primary_tx, patterns).await?;
+        let report = fork_diff::run_promote(
+            &fork,
+            &primary,
+            &primary_tx,
+            patterns,
+            options,
+            baseline.as_ref(),
+        )
+        .await?;
         primary_tx.commit().await?;
         Ok(report)
+    }
+
+    /// Read primary as of a fork's creation point into a [`PromoteBaseline`].
+    ///
+    /// Pins a session to the fork's `parent_snapshot_id` and scans each
+    /// vertex-pattern label, keying rows by `ext_id` (and `ext_id`-less rows
+    /// by content UID). Returns an empty baseline when the fork has no
+    /// fork-point snapshot (an in-memory primary that never flushed before
+    /// forking — there is no prior primary state to delete against).
+    ///
+    /// [`PromoteBaseline`]: fork_diff::PromoteBaseline
+    async fn build_promote_baseline(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+    ) -> Result<fork_diff::PromoteBaseline> {
+        use uni_common::Value;
+        use uni_fork::ForkQueryHost;
+        use uni_store::storage::vertex::VertexDataset;
+
+        let mut baseline = fork_diff::PromoteBaseline::default();
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        if info.parent_snapshot_id == "uninitialized" {
+            return Ok(baseline);
+        }
+
+        let mut base_session = self.session();
+        base_session
+            .pin_to_version(&info.parent_snapshot_id)
+            .await?;
+        let ext_ids = base_session
+            .storage()
+            .get_vertex_ext_ids()
+            .await
+            .unwrap_or_default();
+
+        let mut labels: Vec<&str> = patterns
+            .iter()
+            .filter(|p| !p.is_edge())
+            .map(|p| p.label_name())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+
+        for label in labels {
+            let escaped = label.replace('`', "``");
+            let cypher = format!("MATCH (n:`{escaped}`) RETURN n");
+            let rs = base_session.query(&cypher).await?;
+            for row in rs.rows() {
+                if let Some(Value::Node(node)) = row.value("n") {
+                    match ext_ids.get(&node.vid) {
+                        Some(eid) if !eid.is_empty() => {
+                            baseline
+                                .ext
+                                .entry(label.to_string())
+                                .or_default()
+                                .insert(eid.clone(), node.properties.clone());
+                        }
+                        _ => {
+                            baseline
+                                .no_ext
+                                .entry(label.to_string())
+                                .or_default()
+                                .insert(VertexDataset::compute_vertex_uid(
+                                    label,
+                                    None,
+                                    &node.properties,
+                                ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(baseline)
     }
 
     /// Tag a fork with a Lance tag (Phase 4a).
@@ -1664,16 +1825,55 @@ impl Uni {
     pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
         let info = self.inner.fork_registry.get(fork_name).await?;
         let storage_uri = self.inner.storage.base_uri().to_string();
-        for (dataset, branch) in &info.datasets {
+
+        // L9: a fork tag spans one Lance tag per dataset, and `create_tag`
+        // is not atomic across them. Pre-validate that none of the target
+        // tags already exist (fail fast with no partial state on the common
+        // "already tagged" case), then create while tracking what THIS call
+        // created so a mid-loop failure rolls back only those — never a
+        // pre-existing tag on another dataset.
+        for dataset in info.datasets.keys() {
             let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
-            uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch)
+            let existing = uni_store::backend::lance_branch::list_tags(&dataset_uri)
                 .await
                 .map_err(|e| UniError::ForkLifecycle {
                     name: fork_name.to_string(),
                     stage: "tag",
                     source: e.into(),
                 })?;
+            if existing.iter().any(|(n, _)| n == &lance_tag) {
+                return Err(UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: format!("tag '{tag}' already present on dataset '{dataset}'").into(),
+                });
+            }
+        }
+
+        let mut created: Vec<(String, String)> = Vec::new();
+        for (dataset, branch) in &info.datasets {
+            let dataset_uri = dataset_uri(&storage_uri, dataset);
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            if let Err(e) =
+                uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch).await
+            {
+                for (uri, tag_name) in &created {
+                    if let Err(rb) =
+                        uni_store::backend::lance_branch::delete_tag(uri, tag_name).await
+                    {
+                        tracing::warn!(
+                            "tag_fork rollback: delete_tag '{tag_name}' on '{uri}' failed: {rb}"
+                        );
+                    }
+                }
+                return Err(UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: e.into(),
+                });
+            }
+            created.push((dataset_uri, lance_tag));
         }
         Ok(())
     }
@@ -2734,11 +2934,21 @@ impl Uni {
     /// This method flushes any pending data and waits for all background tasks to complete
     /// (with a timeout). After calling this method, the database instance should not be used.
     pub async fn shutdown(self) -> Result<()> {
-        // Flush pending data
-        if let Some(writer) = &self.inner.writer
-            && let Err(e) = writer.flush_to_l1(None).await
-        {
-            tracing::error!("Error flushing during shutdown: {}", e);
+        // Flush pending data.
+        if let Some(writer) = &self.inner.writer {
+            if let Err(e) = writer.flush_to_l1(None).await {
+                tracing::error!("Error flushing during shutdown: {}", e);
+            }
+            // Close the async-flush coordinator's submit channel so its
+            // finalizer task exits now. The finalizer's JoinHandle is
+            // tracked by `shutdown_handle`, but the loop blocks on
+            // `submit_rx.recv()` and never sees the shutdown broadcast — so
+            // without this the `shutdown_async` below would await it for the
+            // full grace period. `shutdown()` drops the sender (the
+            // finalizer then receives `None` and exits) and is idempotent.
+            if let Some(coord) = writer.flush_coordinator() {
+                coord.shutdown().await;
+            }
         }
 
         self.inner
@@ -3469,8 +3679,16 @@ impl UniBuilder {
         // Phase 4a: apply the configured fork budget cap.
         fork_registry.set_max_forks(self.config.max_forks).await;
         let storage_uri_for_recovery = storage_uri.clone();
+        let recovery_store = storage.store();
+        // L3: pass the schema-derived candidate dataset names so recovery can
+        // reconstruct and reclaim zombie `fork_{id}_{dataset}` branches left
+        // by a create that crashed before recording them in the registry.
+        let recovery_candidates =
+            crate::api::fork::fork_candidate_dataset_names(&schema_manager.schema());
         let recovered = uni_store::fork::recovery::recover_forks(
             &fork_registry,
+            &recovery_store,
+            &recovery_candidates,
             uni_store::fork::recovery::join_uri_with(storage_uri_for_recovery),
         )
         .await

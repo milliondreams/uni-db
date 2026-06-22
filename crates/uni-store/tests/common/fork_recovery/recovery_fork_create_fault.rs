@@ -58,10 +58,14 @@ async fn partial_create_branch_rolls_back_on_recovery() {
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let registry = ForkRegistryHandle::load(store.clone()).await.unwrap();
 
-    // Begin a Pending fork that "wants" branches on both datasets.
+    // Begin a Pending fork that "wants" branches on both datasets. Use the
+    // real branch-naming convention `fork_{fork_id}_{dataset}` so recovery's
+    // candidate-name reconstruction can find the zombie.
     let fork_id = ForkId::new();
     let info = ForkInfo::new_pending(fork_id, "partial", "snap-1", 1);
     registry.begin_create(info.clone()).await.unwrap();
+    let branch_a = format!("fork_{fork_id}_vertices_A");
+    let branch_b = format!("fork_{fork_id}_vertices_B");
 
     // Reset the counter and arm the hook to fail after the first call.
     lance_branch::fault_injection::reset();
@@ -71,13 +75,13 @@ async fn partial_create_branch_rolls_back_on_recovery() {
 
     // Create the first branch successfully.
     let parent_v_a = lance_branch::current_version(&uri_a).await.unwrap();
-    lance_branch::create_branch(&uri_a, "fork_partial_A", parent_v_a)
+    lance_branch::create_branch(&uri_a, &branch_a, parent_v_a)
         .await
         .expect("first call succeeds before threshold");
 
     // Second call hits the fault.
     let parent_v_b = lance_branch::current_version(&uri_b).await.unwrap();
-    let err = lance_branch::create_branch(&uri_b, "fork_partial_B", parent_v_b).await;
+    let err = lance_branch::create_branch(&uri_b, &branch_b, parent_v_b).await;
     assert!(
         err.is_err(),
         "second create_branch must fail under fault hook"
@@ -87,41 +91,35 @@ async fn partial_create_branch_rolls_back_on_recovery() {
     unsafe { std::env::remove_var("UNI_FORK_INJECT_FAIL_AFTER") };
     lance_branch::fault_injection::reset();
 
-    // At this point: registry has Pending entry "partial" with no
-    // recorded `datasets`, and dataset A has a zombie branch named
-    // `fork_partial_A`. Reload the registry to simulate restart and
-    // run recovery.
-    let h2 = ForkRegistryHandle::load(store).await.unwrap();
+    // At this point: registry has Pending entry "partial" with no recorded
+    // `datasets`, and dataset A has a zombie branch `fork_{id}_vertices_A`.
+    // Reload the registry to simulate restart and run recovery, passing the
+    // schema-derived candidate dataset names.
+    let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     {
         let snap = h2.snapshot().await;
         assert_eq!(snap.forks["partial"].status, ForkStatus::Pending);
     }
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let candidates = vec!["vertices_A".to_string(), "vertices_B".to_string()];
+    let reconciled = recover_forks(&h2, &store, &candidates, join_uri_with(base))
+        .await
+        .unwrap();
     assert_eq!(reconciled, 1);
 
     // Registry: empty.
     assert!(h2.snapshot().await.forks.is_empty());
 
-    // For dataset A, the orphan branch is fork-recorded *only* if
-    // recovery had its name in `info.datasets`. In this scenario the
-    // ForkInfo was Pending with empty datasets — so recovery walks
-    // an empty branch list and the zombie remains. That's the
-    // documented Phase 1 limitation: Pending entries without recorded
-    // branch names rely on the next create_branch call's `force_delete`
-    // semantics. Verify that the zombie *can* be reclaimed via the
-    // wrapper.
+    // L3: the zombie branch on dataset A is reclaimed by recovery (no manual
+    // cleanup needed) — recovery reconstructed `fork_{id}_vertices_A` from
+    // the candidate names and force-deleted it.
     let live_a = lance_branch::list_branches(&uri_a).await.unwrap();
-    if live_a.iter().any(|b| b == "fork_partial_A") {
-        // Reclaim it so the test cleanup is clean.
-        lance_branch::delete_branch(&uri_a, "fork_partial_A")
-            .await
-            .unwrap();
-        let after = lance_branch::list_branches(&uri_a).await.unwrap();
-        assert!(!after.iter().any(|b| b == "fork_partial_A"));
-    }
+    assert!(
+        !live_a.iter().any(|b| b == &branch_a),
+        "recovery must reclaim the zombie branch; still present: {live_a:?}"
+    );
 
     // Dataset B has no branch (the fault prevented creation).
     let live_b = lance_branch::list_branches(&uri_b).await.unwrap();
-    assert!(!live_b.iter().any(|b| b == "fork_partial_B"));
+    assert!(!live_b.iter().any(|b| b == &branch_b));
 }

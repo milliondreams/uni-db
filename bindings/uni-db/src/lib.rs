@@ -168,6 +168,8 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyForkDiff>()?;
     m.add_class::<types::PyPromotePattern>()?;
     m.add_class::<types::PyPromoteReport>()?;
+    m.add_class::<types::PyPromoteOptions>()?;
+    m.add_class::<types::PyConflictPolicy>()?;
 
     // Snapshot & index types
     m.add_class::<types::SnapshotInfo>()?;

@@ -278,6 +278,15 @@ On disk:
 - **Multiple sessions can hold the same fork.** A holder count is tracked and `drop_fork` refuses with `ForkInUse` while sessions are alive, or with `ForkInflightTx` when an open transaction has yet to commit or roll back.
 - **Lance compaction honors branch references.** Primary GC will not reclaim fragments that a live fork still references.
 
+:::caution Forks isolate **data**, not **code**
+A fork's isolation is over graph data and schema. Custom functions and
+plugins are registered at the `Uni` (database) level and are **shared** by
+primary and every fork — registering one in any session affects all of
+them. A fork is **not** a code or privilege sandbox. (Registering a UDF
+already requires in-process Rust/Python access, so this is a clarification
+of scope, not a vulnerability.)
+:::
+
 ## Fork-local indexes
 
 A fork accumulates its writes on its own Lance branches, so a query on a forked session has to consult both the parent's indexes and the fork-local rows. A **fork-local index** builds a secondary index over just the fork's branch and **fuses** it with the parent index at query time — keeping point lookups, range scans, vector ANN, and full-text search fast on a fork without rebuilding any of primary's indexes.

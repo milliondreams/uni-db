@@ -87,21 +87,41 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
         return Ok(());
     }
 
-    // Snapshot which (label, column) pairs primary has scalar indexes on. The
-    // schema is shared across forks, so we read it once per tick.
-    let scalar_index_columns: Vec<(String, String)> = inner
+    // Snapshot which (label, column, kind) targets primary has indexes on.
+    // The schema is shared across forks, so we read it once per tick. M7
+    // extends this beyond single-column scalar indexes to Vector and
+    // FullText: fork rows written after branch-creation are otherwise
+    // unindexed, and for FTS there is generally no brute-force fallback,
+    // so fork-local matches would be silently omitted.
+    let index_targets: Vec<(String, String, ForkLocalIndexKind)> = inner
         .schema
         .schema()
         .indexes
         .iter()
-        .filter_map(|idx| match idx {
+        .flat_map(|idx| match idx {
             IndexDefinition::Scalar(cfg) if cfg.properties.len() == 1 => {
-                Some((cfg.label.clone(), cfg.properties[0].clone()))
+                vec![(
+                    cfg.label.clone(),
+                    cfg.properties[0].clone(),
+                    ForkLocalIndexKind::ScalarBtree,
+                )]
             }
-            _ => None,
+            IndexDefinition::Vector(cfg) => {
+                vec![(
+                    cfg.label.clone(),
+                    cfg.property.clone(),
+                    ForkLocalIndexKind::Vector,
+                )]
+            }
+            IndexDefinition::FullText(cfg) => cfg
+                .properties
+                .iter()
+                .map(|p| (cfg.label.clone(), p.clone(), ForkLocalIndexKind::FullText))
+                .collect(),
+            _ => Vec::new(),
         })
         .collect();
-    if scalar_index_columns.is_empty() {
+    if index_targets.is_empty() {
         return Ok(());
     }
 
@@ -138,21 +158,20 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
             }
         }
         let base_uri = fork_inner.storage.base_uri().to_string();
-        for (label, column) in &scalar_index_columns {
+        for (label, column, kind) in &index_targets {
             let dataset_name = format!("vertices_{label}");
             let count = scope.fragment_count(&dataset_name);
             if count < threshold {
                 continue;
             }
-            if scope.fork_local_index(label, column).is_some() {
+            // Skip only when a fork-local index of the SAME kind already
+            // exists: a column can carry e.g. both a scalar and a vector
+            // index, and `fork_local_index` is keyed by `(label, column)`.
+            if scope.fork_local_index(label, column) == Some(*kind) {
                 continue;
             }
             match uni_store::fork::index_builder::build_fork_local_index(
-                &scope,
-                &base_uri,
-                label,
-                column,
-                ForkLocalIndexKind::ScalarBtree,
+                &scope, &base_uri, label, column, *kind,
             )
             .await
             {
@@ -161,7 +180,8 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                         fork = %fork_info.name,
                         label = %label,
                         column = %column,
-                        "auto-built fork-local scalar index"
+                        kind = ?kind,
+                        "auto-built fork-local index"
                     );
                 }
                 Err(e) => {
@@ -169,7 +189,8 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                         fork = %fork_info.name,
                         label = %label,
                         column = %column,
-                        "fork-local scalar index build failed (will retry next tick): {e}"
+                        kind = ?kind,
+                        "fork-local index build failed (will retry next tick): {e}"
                     );
                 }
             }

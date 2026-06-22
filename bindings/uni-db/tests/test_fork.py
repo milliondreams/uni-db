@@ -492,3 +492,45 @@ def test_nested_unflushed_chain():
     del b
     del a
     db.drop_fork_cascade("a")
+
+
+# ---------------------------------------------------------------------------
+# #99 — on a fork, a relationship pattern with a TARGET-endpoint label must
+# match. Follow-up to #97: a fork's inherited data lives only in Lance, and the
+# schemaless traverse built the target labels column from L0 only, so
+# `hasLabel(b, "B")` (how `b:B` is compiled) evaluated false on the fork. This
+# is the issue's exact (schemaless) shape — no schema is declared.
+# ---------------------------------------------------------------------------
+
+
+def _ab_edge_no_schema_no_flush(db):
+    s = db.session()
+    tx = s.tx()
+    tx.execute("CREATE (:A {k: 1})-[:R]->(:B {k: 2})")
+    tx.commit()  # no schema, no flush — routes through the schemaless path
+    return s
+
+
+def _rel(scope, cypher):
+    return scope.query(cypher)[0]["c"]
+
+
+def test_fork_matches_target_endpoint_label_schemaless():
+    db = _make_db(disable_fork_sweeper=True)
+    s = _ab_edge_no_schema_no_flush(db)
+
+    # Base session matches the target-endpoint label.
+    assert _rel(s, "MATCH (a)-[r:R]->(b:B) RETURN count(r) AS c") == 1
+
+    fork = s.fork("scn").build()
+    # Sibling forms guard against a broken traversal masking the fix.
+    assert _rel(fork, "MATCH (a)-[r:R]->(b) RETURN count(r) AS c") == 1
+    assert _rel(fork, "MATCH (a:A)-[r:R]->(b) RETURN count(r) AS c") == 1
+    assert _rel(fork, "MATCH (b:B) RETURN count(b) AS c") == 1
+    # The #99 bug: target-endpoint label returned 0 on the fork.
+    assert _rel(fork, "MATCH (a)-[r:R]->(b:B) RETURN count(r) AS c") == 1, (
+        "fork must match the target-endpoint label (GitHub #99)"
+    )
+
+    del fork
+    db.drop_fork("scn")

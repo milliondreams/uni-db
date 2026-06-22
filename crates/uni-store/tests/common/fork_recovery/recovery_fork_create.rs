@@ -39,7 +39,9 @@ async fn pending_entry_with_no_branches_is_rolled_back() {
     // Reload from disk to simulate restart.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    let reconciled = recover_forks(&h2, &store, &[], join_uri_with(base))
+        .await
+        .unwrap();
 
     assert_eq!(reconciled, 1);
     let snap = h2.snapshot().await;
@@ -76,7 +78,9 @@ async fn pending_entry_with_partial_branches_force_deletes_them() {
     // Restart-equivalent recovery.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    recover_forks(&h2, join_uri_with(base)).await.unwrap();
+    recover_forks(&h2, &store, &[], join_uri_with(base))
+        .await
+        .unwrap();
 
     // Registry empty.
     assert!(h2.snapshot().await.forks.is_empty());

@@ -4817,7 +4817,6 @@ graph TB
 | `max_query_memory` | `usize` | 1 GB | Per-query memory limit |
 | `max_transaction_memory` | `usize` | 1 GB | Transaction buffer limit |
 | `max_compaction_rows` | `usize` | 5,000,000 | OOM guard for in-memory compaction |
-| `enable_vid_labels_index` | `bool` | `true` | O(1) VID→labels lookups |
 | `max_recursive_cte_iterations` | `usize` | 1,000 | Maximum iterations for recursive CTE evaluation |
 | `strict_schema` | `bool` | `false` | Reject writes referencing undeclared labels or edge types |
 

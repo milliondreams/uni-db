@@ -129,10 +129,18 @@ pub struct AdjacencyDataset {
 }
 
 impl AdjacencyDataset {
-    pub fn new(base_uri: &str, edge_type: &str, label: &str, direction: &str) -> Self {
+    /// Construct a primary (unbranched) adjacency dataset handle.
+    ///
+    /// The on-disk dataset is per-`(edge_type, direction)` — the `label`
+    /// argument is vestigial (adjacency is not per-label) and kept only for
+    /// call-site stability. The `uri` mirrors the backend's canonical
+    /// `{base}/{table_name}.lance` so the direct-open path (`open`/`open_at`,
+    /// `lance-backend` only) targets the same dataset the live backend reads.
+    pub fn new(base_uri: &str, edge_type: &str, _label: &str, direction: &str) -> Self {
         let uri = format!(
-            "{}/adjacency/{}_{}_{}",
-            base_uri, direction, edge_type, label
+            "{}/{}.lance",
+            base_uri,
+            table_names::adjacency_table_name(edge_type, direction)
         );
         Self {
             uri,

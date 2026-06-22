@@ -157,3 +157,80 @@ async fn fork_local_vector_index_returns_fused_results() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+/// Review M6: a fork vector query over a branch-local index must honor the
+/// `_deleted = false` filter. Before the fix the branch search dropped the
+/// filter, so a vertex soft-deleted on the parent before forking (inherited
+/// via `base_paths`) leaked back into fork ANN results.
+#[tokio::test]
+async fn fork_local_vector_honors_deleted_filter() -> Result<()> {
+    let cfg = UniConfig {
+        disable_fork_sweeper: true,
+        disable_fork_index_builder: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("name", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 3 })
+        .apply()
+        .await?;
+
+    // Primary holds two near-Y vectors; one is the closest to the query.
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Doc {name: 'P-y-keep', embedding: [0.0, 0.9, 0.0]})")
+        .await?;
+    tx.execute("CREATE (:Doc {name: 'P-y-gone', embedding: [0.0, 1.0, 0.0]})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Soft-delete the closest match on PRIMARY before forking, then flush.
+    let tx = primary.tx().await?;
+    tx.execute("MATCH (d:Doc {name: 'P-y-gone'}) DETACH DELETE d")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let forked = primary.fork("m6_vec").await?;
+    let tx = forked.tx().await?;
+    tx.execute("CREATE (:Doc {name: 'F-y', embedding: [0.0, 0.8, 0.0]})")
+        .await?;
+    tx.commit().await?;
+    forked.flush().await?;
+
+    forked
+        .build_fork_local_index("Doc", "embedding", ForkLocalIndexKind::Vector)
+        .await?;
+
+    let res = forked
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [0.0, 1.0, 0.0], 10)
+             YIELD node, score
+             RETURN node.name AS name",
+        )
+        .await?;
+    let names: Vec<String> = res
+        .rows()
+        .iter()
+        .filter_map(|r| r.get::<String>("name").ok())
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n == "P-y-gone"),
+        "soft-deleted (inherited) vector leaked into fork ANN results (M6); got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "P-y-keep"),
+        "live inherited vector should still be returned; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "F-y"),
+        "fork-local vector should be returned; got {names:?}"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

@@ -77,8 +77,9 @@ pub use uni_bulk::{
 // Fork diff/promote value types, re-exported from `uni-fork`.
 pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
 pub use uni_fork::{
-    DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromotePattern, PromoteReport,
-    PropertyChange, VertexDiff, VertexPropertyChange,
+    ConflictPolicy, DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromoteBaseline,
+    PromoteOptions, PromotePattern, PromoteReport, PropertyChange, VertexDiff,
+    VertexPropertyChange,
 };
 
 /// `mimalloc` allocator, re-exported under the `mimalloc` feature.

@@ -86,8 +86,14 @@ impl IdAllocator {
 
         // Check if we've exhausted our current batch
         if state.current_vid >= state.manifest.next_vid_batch {
-            // Reserve a new batch
-            state.manifest.next_vid_batch = state.current_vid + self.batch_size;
+            // Reserve a new batch. `checked_add` guards against u64
+            // exhaustion (defense-in-depth; ~1.8e19 ids — physically
+            // unreachable, but wrapping silently would be a correctness
+            // disaster). L13.
+            state.manifest.next_vid_batch = state
+                .current_vid
+                .checked_add(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
             self.persist_manifest(&mut state).await?;
         }
 
@@ -101,10 +107,16 @@ impl IdAllocator {
         let mut state = self.state.lock().await;
         let needed = count as u64;
 
-        // Check if we need to expand our batch
-        if state.current_vid + needed > state.manifest.next_vid_batch {
+        // Check if we need to expand our batch (L13: checked).
+        let want = state
+            .current_vid
+            .checked_add(needed)
+            .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
+        if want > state.manifest.next_vid_batch {
             // Reserve enough for the request plus a full batch
-            state.manifest.next_vid_batch = state.current_vid + needed + self.batch_size;
+            state.manifest.next_vid_batch = want
+                .checked_add(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
             self.persist_manifest(&mut state).await?;
         }
 
@@ -121,10 +133,13 @@ impl IdAllocator {
     pub async fn allocate_eid(&self) -> Result<Eid> {
         let mut state = self.state.lock().await;
 
-        // Check if we've exhausted our current batch
+        // Check if we've exhausted our current batch (L13: checked).
         if state.current_eid >= state.manifest.next_eid_batch {
             // Reserve a new batch
-            state.manifest.next_eid_batch = state.current_eid + self.batch_size;
+            state.manifest.next_eid_batch = state
+                .current_eid
+                .checked_add(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
             self.persist_manifest(&mut state).await?;
         }
 
@@ -138,10 +153,16 @@ impl IdAllocator {
         let mut state = self.state.lock().await;
         let needed = count as u64;
 
-        // Check if we need to expand our batch
-        if state.current_eid + needed > state.manifest.next_eid_batch {
+        // Check if we need to expand our batch (L13: checked).
+        let want = state
+            .current_eid
+            .checked_add(needed)
+            .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
+        if want > state.manifest.next_eid_batch {
             // Reserve enough for the request plus a full batch
-            state.manifest.next_eid_batch = state.current_eid + needed + self.batch_size;
+            state.manifest.next_eid_batch = want
+                .checked_add(self.batch_size)
+                .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
             self.persist_manifest(&mut state).await?;
         }
 

@@ -405,7 +405,7 @@ TYPE_MAP: dict[type, str] = {
     date: "date",
     time: "time",
     timedelta: "duration",
-    bytes: "string",  # uni-db maps bytes→String
+    bytes: "bytes",  # raw binary, stored as DataType::Bytes (LargeBinary)
     dict: "json",
     Btic: "btic",
 }
@@ -492,6 +492,7 @@ def uni_to_python_type(uni_type: str) -> type:
         "duration": timedelta,
         "json": dict,
         "btic": Btic,
+        "bytes": bytes,
     }
 
     # Handle vector types

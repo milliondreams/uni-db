@@ -1407,6 +1407,11 @@ impl L0Buffer {
             self.remove_vid_from_label_index(*vid);
             self.vertex_labels.insert(*vid, labels.clone());
             self.index_labels_for_vid(*vid, &labels);
+            // Carry the overwrite flag into the persistent (main) buffer so a
+            // pure relabel of a prior-window vid — which is absent from
+            // `vertex_properties` — is still re-derived at flush (M8). The
+            // flag is cleared when this buffer is rotated out by the flush.
+            self.vertex_label_overwrites.insert(*vid);
         }
 
         // Merge Edges - insert all edges from edge_endpoints, using empty props if none exist

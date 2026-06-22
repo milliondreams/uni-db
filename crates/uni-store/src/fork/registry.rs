@@ -18,12 +18,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 use tracing::{debug, instrument, warn};
 use uni_common::api::error::UniError;
 use uni_common::core::fork::{ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta};
@@ -58,14 +60,27 @@ struct ForkRegistryInner {
     /// Per-name mutex serializing concurrent open-or-create on the same
     /// fork name. Different names proceed in parallel.
     name_locks: DashMap<String, Arc<AsyncMutex<()>>>,
-    /// Number of live `ForkScope` handles per fork. Drop refuses while
-    /// any holder is alive (Phase 1; Phase 2 replaces with drain).
-    holders: DashMap<ForkId, Arc<AtomicUsize>>,
+    /// Per-fork holder bookkeeping: a live-`ForkScope` count plus a
+    /// `Notify` fired when the count returns to zero. Drop awaits the drain
+    /// (deterministically, via the notify) rather than polling.
+    holders: DashMap<ForkId, Arc<HolderState>>,
     /// Phase 4a: cap on total fork count enforced at `begin_create`.
     /// `None` ⇒ unbounded. Counts include Active + Pending + Tombstoned
     /// — tombstoned forks still hold branch state on disk until
     /// recovery completes, so counting them prevents churn-thrash.
     max_forks: AsyncMutex<Option<usize>>,
+}
+
+/// Per-fork holder bookkeeping (L1).
+///
+/// `count` is the number of live [`ForkScope`] handles; `drained` is fired
+/// when `count` returns to zero so `drop_fork` can await the drain
+/// deterministically (the last holder may be released by a background flush
+/// finalizer that a fixed-duration poll could miss under CPU starvation).
+#[derive(Debug, Default)]
+pub(crate) struct HolderState {
+    count: AtomicUsize,
+    drained: Notify,
 }
 
 /// RAII guard that decrements a fork's holder count on drop.
@@ -74,19 +89,24 @@ struct ForkRegistryInner {
 /// session keeps it for its lifetime. Stored as `Arc` on `ForkScope`
 /// so all clones of a forked session contribute to the same count.
 pub struct ForkHolderGuard {
-    counter: Arc<AtomicUsize>,
+    state: Arc<HolderState>,
 }
 
 impl ForkHolderGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self { counter }
+    fn new(state: Arc<HolderState>) -> Self {
+        state.count.fetch_add(1, Ordering::AcqRel);
+        Self { state }
     }
 }
 
 impl Drop for ForkHolderGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        // When the last holder releases, wake anyone awaiting the drain.
+        // `fetch_sub` returns the PREVIOUS value, so `== 1` means we just
+        // went 1 → 0.
+        if self.state.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.state.drained.notify_waiters();
+        }
     }
 }
 
@@ -271,13 +291,8 @@ impl ForkRegistryHandle {
 
     /// Register a live session on `fork_id`, returning a guard.
     pub fn register_holder(&self, fork_id: ForkId) -> ForkHolderGuard {
-        let counter = self
-            .inner
-            .holders
-            .entry(fork_id)
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        ForkHolderGuard::new(counter)
+        let state = self.inner.holders.entry(fork_id).or_default().clone();
+        ForkHolderGuard::new(state)
     }
 
     /// Public holder count for `fork_id` (Phase 3 — cascade pre-validation).
@@ -289,8 +304,33 @@ impl ForkRegistryHandle {
         self.inner
             .holders
             .get(&fork_id)
-            .map(|c| c.load(Ordering::Acquire))
+            .map(|s| s.count.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Await the fork's holder count reaching zero, bounded by `timeout`. (L1)
+    ///
+    /// Returns the final holder count (0 on success). Deterministic: it wakes
+    /// as soon as the last [`ForkHolderGuard`] drops — including when that
+    /// drop happens inside a background flush finalizer that a fixed-duration
+    /// poll could starve past — rather than sleeping a fixed budget.
+    pub async fn wait_holders_drained(&self, fork_id: ForkId, timeout: Duration) -> usize {
+        let Some(state) = self.inner.holders.get(&fork_id).map(|s| s.clone()) else {
+            return 0; // no holder ever registered for this fork
+        };
+        if state.count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        // Register interest BEFORE the final count re-check so a
+        // `notify_waiters` between the two cannot be lost.
+        let notified = state.drained.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if state.count.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let _ = tokio::time::timeout(timeout, notified).await;
+        state.count.load(Ordering::Acquire)
     }
 
     // ============================================================
@@ -544,7 +584,12 @@ impl ForkRegistryHandle {
         // Outside the cache lock — IO must not block primary.
         if let Some(id) = removed_id {
             self.delete_schema_overlay(&id).await;
+            // L4: reap the holder counter for the rolled-back fork.
+            self.inner.holders.remove(&id);
         }
+        self.inner
+            .name_locks
+            .remove_if(name, |_, lock| Arc::strong_count(lock) == 1);
         Ok(())
     }
 
@@ -600,6 +645,20 @@ impl ForkRegistryHandle {
         }
         self.delete_tombstone(&info.id, &info.name).await?;
         self.delete_schema_overlay(&info.id).await;
+        // L4: reap per-fork bookkeeping so the maps don't grow with fork
+        // churn. `holders` is keyed by the fork's fresh ULID (so it grows
+        // even under same-name churn); the fork is gone now, so no
+        // concurrent `register_holder` can race it. `name_locks` is shared
+        // by concurrent callers, so only reap it when no one else holds the
+        // Arc (strong_count 1 = just the map entry).
+        self.inner.holders.remove(&info.id);
+        self.inner
+            .name_locks
+            .remove_if(info.name.as_str(), |_, lock| Arc::strong_count(lock) == 1);
+        // Note: the fork's WAL (`wal_forks/{id}/`), id allocator, and fork-scoped
+        // snapshot manifests live on the STORAGE object store, not the registry's
+        // metadata store, so they are cleaned by `delete_fork_artifacts` from the
+        // drop / recovery paths that hold the storage store (review H3).
         Ok(())
     }
 
@@ -883,5 +942,50 @@ mod tests {
 
         // After all holders drop, count is 0 — drop should now succeed.
         h.begin_drop("concurrent").await.unwrap();
+    }
+
+    /// L1: `wait_holders_drained` wakes the instant the last holder is
+    /// released — even when that release races the wait — instead of
+    /// burning the whole timeout. Uses `join!` so the release and the wait
+    /// are driven concurrently on one task (the deterministic analogue of a
+    /// background flush finalizer dropping the guard mid-wait).
+    #[tokio::test]
+    async fn wait_holders_drained_wakes_on_last_release() {
+        let (_dir, h) = fresh_handle().await;
+        let id = ForkId::new();
+        let guard = h.register_holder(id);
+        assert_eq!(h.holder_count_for(id).await, 1);
+
+        let waiter = h.wait_holders_drained(id, Duration::from_secs(30));
+        let releaser = async move {
+            // Yield a few times so the waiter is parked on the notify first.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            drop(guard);
+        };
+        let (remaining, ()) = tokio::join!(waiter, releaser);
+        assert_eq!(remaining, 0, "wait must observe the drain, not time out");
+    }
+
+    /// L1: while a holder is alive, `wait_holders_drained` returns the live
+    /// count after the bounded timeout (it genuinely waits).
+    #[tokio::test]
+    async fn wait_holders_drained_times_out_while_held() {
+        let (_dir, h) = fresh_handle().await;
+        let id = ForkId::new();
+        let _guard = h.register_holder(id);
+        let remaining = h.wait_holders_drained(id, Duration::from_millis(50)).await;
+        assert_eq!(
+            remaining, 1,
+            "a still-held fork must report its live holder"
+        );
+
+        // An unknown fork (no holder ever registered) drains immediately.
+        assert_eq!(
+            h.wait_holders_drained(ForkId::new(), Duration::from_secs(30))
+                .await,
+            0
+        );
     }
 }

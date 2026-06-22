@@ -31,7 +31,6 @@ use uni_cypher::ast::{
     Direction as AstDirection, Expr, NodePattern, Pattern, PatternElement, RelationshipPattern,
 };
 use uni_store::QueryContext;
-use uni_store::runtime::l0_visibility;
 use uni_store::storage::direction::Direction;
 
 use super::GraphExecutionContext;
@@ -567,10 +566,12 @@ impl PatternComprehensionExecExpr {
                             continue;
                         }
 
-                        // Label filtering
+                        // Label filtering. Resolve from the L0 chain then the
+                        // persisted index so Lance-only vertices (e.g. on a
+                        // fork) are matched correctly.
                         if let Some(ref label_name) = step.target_label_name
                             && let Some(vertex_labels) =
-                                l0_visibility::get_vertex_labels_optional(target_vid, &query_ctx)
+                                self.graph_ctx.resolve_vertex_labels(target_vid, &query_ctx)
                             && !vertex_labels.contains(label_name)
                         {
                             continue;

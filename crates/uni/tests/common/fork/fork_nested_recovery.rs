@@ -9,9 +9,9 @@
 //!
 //! 1. A nested fork crashing during creation — recovery rolls back
 //!    the partial child without affecting the still-Active parent.
-//! 2. `drop_fork_cascade` completes despite swallowed `delete_branch`
-//!    errors on individual branches (best-effort, by design — the
-//!    registry transition is what matters).
+//! 2. `drop_fork_cascade` surfaces a `delete_branch` failure (rather than
+//!    swallowing it and clearing the registry, which would orphan branches —
+//!    review M3) and leaves the subtree recoverable for a later retry.
 //! 3. After cascade, the on-disk registry has no entries with stale
 //!    `parent_fork_id` pointers.
 
@@ -124,13 +124,15 @@ async fn nested_fork_create_crash_rolls_back_leaf_only() -> Result<()> {
     Ok(())
 }
 
-/// `drop_fork_cascade` is best-effort on individual `delete_branch`
-/// calls: failures are logged-and-swallowed, the registry transition
-/// is what's load-bearing. This test confirms a cascade succeeds end-
-/// to-end even when some branches error out during deletion.
+/// A `delete_branch` failure during cascade must NOT be silently swallowed and
+/// the registry must NOT be cleared while branches survive — that orphans the
+/// branches and discards the recovery tombstone (production-readiness review
+/// M3). Instead the failure surfaces as an error and the affected node stays
+/// Tombstoned; a later reopen (recovery) plus a clean retry fully removes the
+/// subtree with no leak.
 #[tokio::test]
 #[ignore = "mutates the process-wide UNI_FORK_INJECT_FAIL_DELETE_AFTER counter; run with --test-threads=1 or --run-ignored ignored-only"]
-async fn cascade_completes_despite_swallowed_delete_errors() -> Result<()> {
+async fn cascade_surfaces_delete_failures_and_stays_recoverable() -> Result<()> {
     fault_injection::reset_delete();
     clear_fail_delete_after();
 
@@ -155,31 +157,98 @@ async fn cascade_completes_despite_swallowed_delete_errors() -> Result<()> {
         drop(_b);
         drop(a);
 
-        // Fail every delete_branch attempt; cascade should still finish
-        // and clear the registry because delete errors are swallowed.
+        // Fail every delete_branch attempt: the cascade must surface the error
+        // rather than swallow it and clear the registry (review M3).
         fault_injection::reset_delete();
         set_fail_delete_after(0);
         let cascade = db.drop_fork_cascade("a").await;
         clear_fail_delete_after();
         assert!(
-            cascade.is_ok(),
-            "cascade should swallow delete errors; got {cascade:?}"
-        );
-
-        let active = db.list_forks().await;
-        assert!(
-            active.is_empty(),
-            "registry should be cleared even when deletes failed; got {:?}",
-            active.iter().map(|f| &f.name).collect::<Vec<_>>()
+            cascade.is_err(),
+            "cascade must surface delete failures, not swallow them (review M3); got {cascade:?}"
         );
         db.shutdown().await?;
     }
 
-    // Reopen — recovery has nothing to do; no forks remain.
+    // Reopen with no fault: recovery completes any tombstoned drop, and a clean
+    // retry removes the rest — no orphaned branches, no leaked registry entries.
     fault_injection::reset_delete();
     let db2 = Uni::open(&uri).build().await?;
-    assert!(db2.list_forks().await.is_empty());
+    let _ = db2.drop_fork_cascade("a").await; // Ok, or NotFound if recovery cleared it
+    assert!(
+        db2.list_forks().await.is_empty(),
+        "subtree must be fully removable after recovery + retry; got {:?}",
+        db2.list_forks()
+            .await
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
     db2.shutdown().await?;
 
+    Ok(())
+}
+
+/// L3: a fork creation that fails partway (the fault trips the second
+/// `create_branch`) force-deletes the branches it already created in-process
+/// — no recovery, no restart — so no zombie branch is leaked.
+#[tokio::test]
+#[ignore = "mutates the process-wide UNI_FORK_INJECT_FAIL_AFTER counter; run with --test-threads=1 or --run-ignored ignored-only"]
+async fn fork_create_failure_cleans_up_partial_branches_in_process() -> Result<()> {
+    use uni_store::backend::lance_branch;
+
+    fault_injection::reset();
+    clear_fail_create_after();
+
+    let dir = tempfile::tempdir()?;
+    let uri = dir.path().display().to_string();
+
+    let db = Uni::open(&uri).build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Person {name: 'seed'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Arm the hook so the SECOND `create_branch` inside
+    // `build_datasets_for_fork` fails (after the first succeeded).
+    fault_injection::reset();
+    set_fail_create_after(1);
+
+    let result = primary.fork("partial").await;
+
+    clear_fail_create_after();
+    fault_injection::reset();
+
+    assert!(
+        result.is_err(),
+        "fork() must fail under the create_branch fault"
+    );
+
+    // No zombie fork branch remains on any dataset — the in-process cleanup
+    // reclaimed the branch it had already created before the failure.
+    for dataset in ["vertices", "edges", "vertices_Person"] {
+        let dataset_uri = format!("{uri}/{dataset}.lance");
+        if std::path::Path::new(&dataset_uri).exists() {
+            let branches = lance_branch::list_branches(&dataset_uri).await?;
+            assert!(
+                !branches.iter().any(|b| b.starts_with("fork_")),
+                "dataset '{dataset}' leaked a zombie fork branch: {branches:?}"
+            );
+        }
+    }
+
+    // And the registry has no leftover entry.
+    assert!(
+        db.list_forks().await.is_empty(),
+        "a failed fork-create must leave no registry entry"
+    );
+
+    db.shutdown().await?;
     Ok(())
 }

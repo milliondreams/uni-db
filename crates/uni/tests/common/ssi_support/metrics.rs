@@ -140,3 +140,19 @@ impl CounterProbe {
 pub fn freezes() -> u64 {
     counter_value("uni_l0_snapshot_freezes_total", &[])
 }
+
+/// Whether SSI counter assertions can run reliably in this process.
+///
+/// The `metrics` counters are process-global and monotonic. A test can only
+/// assert an exact delta when it owns its process: otherwise a concurrently
+/// running test increments the same counter (breaking "stayed flat" assertions)
+/// or wins the one-shot global-recorder install before us (so we observe zero,
+/// breaking "incremented" assertions). nextest runs each test in its own process
+/// and sets `NEXTEST=1`; the shared-process `cargo test` runner does neither.
+///
+/// Telemetry tests gate on this and skip outside nextest rather than flake — the
+/// project's canonical runner is nextest, where they run at full strength.
+#[must_use]
+pub fn counters_isolated() -> bool {
+    std::env::var_os("NEXTEST").is_some()
+}

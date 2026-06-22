@@ -2097,7 +2097,6 @@ pub struct UniConfig {
     pub max_query_memory: usize,
     pub max_transaction_memory: usize,
     pub max_compaction_rows: usize,
-    pub enable_vid_labels_index: bool,
     pub max_recursive_cte_iterations: usize,
     pub object_store: ObjectStoreConfig,
     pub index_rebuild: IndexRebuildConfig,

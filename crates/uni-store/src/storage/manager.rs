@@ -92,8 +92,14 @@ pub struct StorageManager {
     fork_scope: Option<Arc<crate::fork::ForkScope>>,
     /// Pluggable storage backend.
     backend: Arc<dyn StorageBackend>,
-    /// In-memory VID-to-labels index for O(1) lookups (optional, configurable)
-    vid_labels_index: Option<Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>>,
+    /// In-memory VID-to-labels index for O(1) label lookups.
+    ///
+    /// Always present: populated at startup via [`Self::rebuild_vid_labels_index`]
+    /// and kept current at flush time. Traversal-time label predicates
+    /// (`MATCH (a)-[r]->(b:B)`) read it to resolve labels for vertices that
+    /// have aged out of L0 into Lance storage — notably on forks, whose data
+    /// is flushed to Lance before branching.
+    vid_labels_index: Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>,
 }
 
 /// RAII counter increment for `StorageManager.flush_in_progress`.
@@ -292,13 +298,15 @@ impl StorageManager {
             pinned_version_hwm: None,
             fork_scope: None,
             backend,
-            vid_labels_index: None,
+            vid_labels_index: Arc::new(parking_lot::RwLock::new(
+                crate::storage::vid_labels::VidLabelsIndex::new(),
+            )),
         };
 
-        // Rebuild VidLabelsIndex if enabled
-        if sm.config.enable_vid_labels_index
-            && let Err(e) = sm.rebuild_vid_labels_index().await
-        {
+        // Rebuild VidLabelsIndex from persisted vertices. A failure leaves the
+        // empty index in place; flush-time updates then repopulate it
+        // incrementally, so reads degrade rather than break.
+        if let Err(e) = sm.rebuild_vid_labels_index().await {
             warn!(
                 "Failed to rebuild VidLabelsIndex on startup: {}. Falling back to storage queries.",
                 e
@@ -457,7 +465,14 @@ impl StorageManager {
             pinned_version_hwm: None,
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
-            vid_labels_index: self.vid_labels_index.clone(),
+            // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
+            // so its flushes/relabels don't mutate the parent's (review H1/L2),
+            // mirroring the fresh `adjacency_manager` above. `VidLabelsIndex`
+            // derives `Clone`; the snapshot is taken after flush-before-branch so
+            // inherited labels (#99) are preserved.
+            vid_labels_index: Arc::new(parking_lot::RwLock::new(
+                self.vid_labels_index.read().clone(),
+            )),
         }
     }
 
@@ -493,7 +508,14 @@ impl StorageManager {
             pinned_version_hwm: Some(hwm),
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
-            vid_labels_index: self.vid_labels_index.clone(),
+            // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
+            // so its flushes/relabels don't mutate the parent's (review H1/L2),
+            // mirroring the fresh `adjacency_manager` above. `VidLabelsIndex`
+            // derives `Clone`; the snapshot is taken after flush-before-branch so
+            // inherited labels (#99) are preserved.
+            vid_labels_index: Arc::new(parking_lot::RwLock::new(
+                self.vid_labels_index.read().clone(),
+            )),
         }
     }
 
@@ -534,11 +556,19 @@ impl StorageManager {
         let branched_backend: Arc<dyn StorageBackend> = Arc::new(
             crate::backend::branched::BranchedBackend::new(self.backend.clone(), scope.clone()),
         );
+        // Fork-scoped snapshot manager: a fork's flush publishes its manifest +
+        // `latest` pointer under `catalog/forks/{fork_id}/`, never the primary's
+        // global `catalog/latest` (review C1). Uses the raw object store, since
+        // catalog metadata is not branched.
+        let snapshot_manager = Arc::new(SnapshotManager::new_for_fork(
+            self.store.clone(),
+            scope.fork_id(),
+        ));
         Self {
             base_uri: self.base_uri.clone(),
             store: self.store.clone(),
             schema_manager: merged_schema,
-            snapshot_manager: self.snapshot_manager.clone(),
+            snapshot_manager,
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
@@ -547,7 +577,14 @@ impl StorageManager {
             pinned_version_hwm: None,
             fork_scope: Some(scope),
             backend: branched_backend,
-            vid_labels_index: self.vid_labels_index.clone(),
+            // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
+            // so its flushes/relabels don't mutate the parent's (review H1/L2),
+            // mirroring the fresh `adjacency_manager` above. `VidLabelsIndex`
+            // derives `Clone`; the snapshot is taken after flush-before-branch so
+            // inherited labels (#99) are preserved.
+            vid_labels_index: Arc::new(parking_lot::RwLock::new(
+                self.vid_labels_index.read().clone(),
+            )),
         }
     }
 
@@ -1075,7 +1112,9 @@ impl StorageManager {
     }
 
     /// Rebuild the VidLabelsIndex from the main vertex table.
-    /// This is called on startup if enable_vid_labels_index is true.
+    ///
+    /// Always called on startup. On a fresh database (no vertex table yet) the
+    /// index is left empty and filled incrementally by flush-time updates.
     async fn rebuild_vid_labels_index(&mut self) -> Result<()> {
         use crate::storage::vid_labels::VidLabelsIndex;
 
@@ -1084,7 +1123,7 @@ impl StorageManager {
 
         // Check if the table exists (fresh database)
         if !backend.table_exists(vtable).await.unwrap_or(false) {
-            self.vid_labels_index = Some(Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new())));
+            self.vid_labels_index = Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new()));
             return Ok(());
         }
 
@@ -1129,35 +1168,29 @@ impl StorageManager {
             }
         }
 
-        self.vid_labels_index = Some(Arc::new(parking_lot::RwLock::new(index)));
+        self.vid_labels_index = Arc::new(parking_lot::RwLock::new(index));
         Ok(())
     }
 
     /// Get labels for a VID from the in-memory index.
-    /// Returns None if the index is disabled or the VID is not found.
+    ///
+    /// Returns `None` only when the VID is absent from the index (e.g. it was
+    /// never persisted, or has been deleted).
     pub fn get_labels_from_index(&self, vid: Vid) -> Option<Vec<String>> {
-        self.vid_labels_index.as_ref().and_then(|idx| {
-            let index = idx.read();
-            index.get_labels(vid).map(|labels| labels.to_vec())
-        })
+        let index = self.vid_labels_index.read();
+        index.get_labels(vid).map(|labels| labels.to_vec())
     }
 
     /// Update the VID-to-labels mapping in the index.
-    /// No-op if the index is disabled.
     pub fn update_vid_labels_index(&self, vid: Vid, labels: Vec<String>) {
-        if let Some(idx) = &self.vid_labels_index {
-            let mut index = idx.write();
-            index.insert(vid, labels);
-        }
+        let mut index = self.vid_labels_index.write();
+        index.insert(vid, labels);
     }
 
     /// Remove a VID from the labels index.
-    /// No-op if the index is disabled.
     pub fn remove_from_vid_labels_index(&self, vid: Vid) {
-        if let Some(idx) = &self.vid_labels_index {
-            let mut index = idx.write();
-            index.remove_vid(vid);
-        }
+        let mut index = self.vid_labels_index.write();
+        index.remove_vid(vid);
     }
 
     pub async fn load_subgraph_cached(
@@ -1478,6 +1511,54 @@ impl StorageManager {
             .await
     }
 
+    /// Map every live vertex that has an external id to its `ext_id`
+    /// (`_vid` → `ext_id`).
+    ///
+    /// `ext_id` is folded into a vertex's content `_uid` but is stripped from
+    /// query results, so the fork diff/promote engine can't recover it by
+    /// re-hashing query rows — two vertices differing only by `ext_id` would
+    /// collapse to one identity (review H4). This exposes the stored `ext_id`
+    /// so the diff can fold it back into its recomputed UID. Reads through the
+    /// (branched) backend, so a forked manager sees its own + inherited rows.
+    /// Covers flushed (Lance) rows; `ext_id` is immutable so no version
+    /// reconciliation is needed.
+    pub async fn get_vertex_ext_ids(&self) -> Result<std::collections::HashMap<Vid, String>> {
+        use arrow_array::StringArray;
+        let backend = self.backend.as_ref();
+        let vtable = table_names::main_vertex_table_name();
+        let mut out = std::collections::HashMap::new();
+        if !backend.table_exists(vtable).await.unwrap_or(false) {
+            return Ok(out);
+        }
+        let request = ScanRequest::all(vtable)
+            .with_filter("_deleted = false")
+            .with_columns(vec!["_vid".to_string(), "ext_id".to_string()]);
+        let batches = backend
+            .scan(request)
+            .await
+            .map_err(|e| anyhow!("get_vertex_ext_ids: {}", e))?;
+        for batch in batches {
+            let vids = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| anyhow!("get_vertex_ext_ids: missing/invalid _vid column"))?;
+            let exts = batch
+                .column_by_name("ext_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow!("get_vertex_ext_ids: missing/invalid ext_id column"))?;
+            for i in 0..batch.num_rows() {
+                if exts.is_null(i) {
+                    continue;
+                }
+                let ext = exts.value(i);
+                if !ext.is_empty() {
+                    out.insert(Vid::from(vids.value(i)), ext.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Find labels for a vertex by VID. Uses pinned snapshot HWM if present.
     pub async fn find_vertex_labels_by_vid(&self, vid: Vid) -> Result<Option<Vec<String>>> {
         MainVertexDataset::find_labels_by_vid(self.backend(), vid, self.version_high_water_mark())
@@ -1595,7 +1676,13 @@ impl StorageManager {
         label: &str,
         direction: &str,
     ) -> Result<AdjacencyDataset> {
-        let key = format!("adjacency_{direction}_{edge_type}_{label}");
+        // The fork registers adjacency branches under the canonical table
+        // name (`adjacency_{edge_type}_{direction}`), so the lookup key must
+        // match it — not the historical `adjacency_{direction}_{edge_type}_
+        // {label}`, which never resolved a branch. Adjacency is per-`(edge_
+        // type, direction)`, not per-label. The canonical form is pinned by
+        // `table_names::tests::adjacency_table_name_is_canonical`. (L8)
+        let key = crate::backend::table_names::adjacency_table_name(edge_type, direction);
         match self.fork_branch_for(&key) {
             Some(branch) => Ok(AdjacencyDataset::new_branched(
                 &self.base_uri,

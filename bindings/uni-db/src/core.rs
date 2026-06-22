@@ -578,7 +578,7 @@ pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
             "duration" => Ok(DataType::Duration),
             "json" => Ok(DataType::CypherValue),
             "btic" => Ok(DataType::Btic),
-            "bytes" => Ok(DataType::String),
+            "bytes" => Ok(DataType::Bytes),
             _ => Err(format!("Unknown data type: {}", data_type)),
         }
     }

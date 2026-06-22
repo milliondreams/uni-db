@@ -310,6 +310,9 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        // L6: reject names unsafe for the dataset path / Lance branch names
+        // (a schemaless bad label/edge-type would otherwise panic Lance).
+        crate::backend::table_names::validate_table_name(name)?;
         if batches.is_empty() {
             return Err(anyhow!(
                 "Cannot create table '{}' with empty data. Use create_empty_table instead.",
@@ -349,6 +352,8 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
+        // L6: reject unsafe names before they reach Lance.
+        crate::backend::table_names::validate_table_name(name)?;
         self.connection
             .create_empty_table(name, schema)
             .execute()

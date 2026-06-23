@@ -9,7 +9,7 @@
 //! candidates by dense distance, then the `reranker: 'maxsim'` mode rescores
 //! them by MaxSim against a query multi-vector — no neural model, no index.
 
-use uni_db::{DataType, QueryResult, Uni};
+use uni_db::{DataType, QueryResult, Uni, Value};
 
 /// Extracts titles from a query result, in result order.
 fn titles(result: &QueryResult) -> Vec<String> {
@@ -98,6 +98,75 @@ async fn test_maxsim_rerank_reorders_results() -> anyhow::Result<()> {
         "DocB rerank_score ({top_score}) should exceed the next ({second_score})"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_schemaless_nested_list_rejected() -> anyhow::Result<()> {
+    // Documents a design boundary (issue #96): a multi-vector is a NESTED list,
+    // and nested lists are rejected as property values for any non-CypherValue
+    // column (`validate_structural_property_value` in write.rs) — standard
+    // OpenCypher semantics, not a multivec-specific gap. So a multi-vector must be
+    // declared as `List(Vector{dim})` (typed) or `CypherValue` (flexible), never
+    // stored schemaless. This is why the maxsim flow always declares `tokens`.
+    let db = Uni::temporary().build().await?;
+    let session = db.session();
+    let multivec = Value::List(vec![
+        Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+        Value::List(vec![Value::Float(0.0), Value::Float(1.0)]),
+    ]);
+    let tx = session.tx().await?;
+    let res = tx
+        .execute_with("CREATE (t:Thing {tokens: $toks})")
+        .param("toks", multivec)
+        .run()
+        .await;
+    assert!(
+        res.is_err(),
+        "schemaless nested-list (multi-vector) write should be rejected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_maxsim_cypher_value_tokens() -> anyhow::Result<()> {
+    // Dim-flexible alternative to `List(Vector{dim})`: declare `tokens` as a
+    // `CypherValue` (json) column, which accepts an arbitrary nested list. maxsim
+    // fetches and scores it the same way (extract_vector_list handles Value::List).
+    let db = Uni::temporary().build().await?;
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 2 })
+        .property("tokens", DataType::CypherValue)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'DocA', embedding: [1.0, 0.0], tokens: [[1.0, 0.0]]})")
+        .await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'DocB', embedding: [0.9, 0.1], tokens: [[1.0, 0.0], [0.0, 1.0]]})",
+    )
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    db.indexes().rebuild("Doc", false).await?;
+
+    let result = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 2, null, null, \
+             {reranker: 'maxsim', reranker_property: 'tokens', maxsim_query: [[1.0, 0.0], [0.0, 1.0]]}) \
+             YIELD node, rerank_score \
+             RETURN node.title AS title, rerank_score",
+        )
+        .await?;
+
+    assert_eq!(
+        titles(&result)[0],
+        "DocB",
+        "maxsim should work over a CypherValue-typed multi-vector property"
+    );
     Ok(())
 }
 
@@ -261,13 +330,42 @@ async fn test_maxsim_empty_tokens_scores_zero() -> anyhow::Result<()> {
     Ok(())
 }
 
-// NOTE: declaring a `List<Vector>` property via Cypher `CREATE LABEL` DDL is NOT
-// possible today, but this is a pre-existing grammar limitation unrelated to
-// multi-vector: `property_definition` (cypher.pest) accepts only a single
-// bare-token type, so NO parameterized type — `VECTOR(N)`, `LIST<STRING>`,
-// `LIST<VECTOR(N)>` — is expressible in `CREATE LABEL`. Multi-vector properties
-// are declared through the schema builder API (see `setup_db` above); Cypher is
-// used for writes (list-of-lists literals) and queries (maxsim rerank).
+#[tokio::test]
+async fn test_maxsim_declared_via_cypher_ddl() -> anyhow::Result<()> {
+    // A `List<Vector>` property declared through Cypher DDL (now that the grammar
+    // accepts parameterized types) stores and reranks identically to the builder
+    // API. This closes the gap the earlier phase documented as unsupported.
+    let db = Uni::temporary().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Doc (title STRING, embedding VECTOR(2), tokens LIST<VECTOR(2)>)")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'DocA', embedding: [1.0, 0.0], tokens: [[1.0, 0.0]]})")
+        .await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'DocB', embedding: [0.9, 0.1], tokens: [[1.0, 0.0], [0.0, 1.0]]})",
+    )
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    db.indexes().rebuild("Doc", false).await?;
+
+    let result = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 2, null, null, \
+             {reranker: 'maxsim', reranker_property: 'tokens', maxsim_query: [[1.0, 0.0], [0.0, 1.0]]}) \
+             YIELD node, rerank_score \
+             RETURN node.title AS title, rerank_score",
+        )
+        .await?;
+
+    assert_eq!(
+        titles(&result)[0],
+        "DocB",
+        "maxsim works over a Cypher-DDL-declared List<Vector> property"
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_maxsim_rerank_missing_query_errors() -> anyhow::Result<()> {

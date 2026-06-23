@@ -1568,6 +1568,43 @@ impl<'a> PropertyExtractor<'a> {
                 }
                 Ok(Arc::new(builder.finish()))
             }
+            DataType::Vector { dimensions } => {
+                // Multi-vector / late-interaction (ColBERT) property: a per-row
+                // variable-count set of fixed-`dimensions` token vectors, stored as
+                // `List<FixedSizeList<Float32, dimensions>>`. Each inner token is
+                // validated through the same `extract_vector_f32_values` path used for
+                // single dense vectors, so dimension/type failure modes match.
+                //
+                // NOTE: only the declared-schema write path (this builder) supports
+                // multi-vector today. The schemaless, Arrow-type-driven `values_to_array`
+                // path does not yet handle `List<FixedSizeList<Float32>>`; schemaless
+                // multi-vector writes are a deferred follow-up (issue #96, Phase 1.5).
+                let dim = *dimensions as i32;
+                let mut builder =
+                    ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dim));
+                for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+                    let val_array = get_props(i).and_then(|v| v.as_array());
+                    if val_array.is_none() && is_deleted {
+                        builder.append_null();
+                    } else if let Some(arr) = val_array {
+                        // Variable token count per row: append one fixed-size inner
+                        // vector per token. `extract_vector_f32_values` always yields
+                        // exactly `dimensions` values, satisfying the FixedSizeList stride.
+                        for tok in arr {
+                            let (vals, valid) =
+                                extract_vector_f32_values(Some(tok), false, *dimensions);
+                            for v in vals {
+                                builder.values().values().append_value(v);
+                            }
+                            builder.values().append(valid);
+                        }
+                        builder.append(true);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
             _ => Err(anyhow!("Unsupported inner type for List: {:?}", inner)),
         }
     }
@@ -2617,6 +2654,136 @@ mod tests {
         assert_eq!(child.value(3), 4.0);
         assert_eq!(child.value(4), 5.0);
         assert_eq!(child.value(5), 6.0);
+    }
+
+    // Tests for multi-vector (ColBERT) `List<Vector>` columns (issue #96)
+
+    #[test]
+    fn test_build_multivector_list_column_roundtrip() {
+        // A multi-vector property is `List<FixedSizeList<Float32, dim>>` with a
+        // VARIABLE token count per row. It round-trips numerically: a single dense
+        // vector already reads back as `Value::List`, so a multi-vector reads back
+        // as a nested `Value::List`.
+        let data_type = DataType::List(Box::new(DataType::Vector { dimensions: 3 }));
+        let extractor = PropertyExtractor::new("tokens", &data_type);
+
+        let props = [
+            // row 0: two tokens
+            Some(Value::List(vec![
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Vector(vec![4.0, 5.0, 6.0]),
+            ])),
+            // row 1: three tokens (different count -> exercises variable length)
+            Some(Value::List(vec![
+                Value::Vector(vec![7.0, 8.0, 9.0]),
+                Value::Vector(vec![10.0, 11.0, 12.0]),
+                Value::Vector(vec![13.0, 14.0, 15.0]),
+            ])),
+            // row 2: empty token set (present but zero tokens)
+            Some(Value::List(vec![])),
+            // row 3: deleted, missing property
+            None,
+        ];
+        let deleted = [false, false, false, true];
+
+        let arr_ref = extractor
+            .build_column(4, &deleted, |i| props[i].as_ref())
+            .unwrap();
+
+        // Outer column is a variable-length list of fixed-size vectors.
+        let outer = arr_ref.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(outer.len(), 4);
+        assert!(outer.is_valid(0));
+        assert!(outer.is_valid(1));
+        assert!(outer.is_valid(2)); // empty-but-present row
+        assert!(!outer.is_valid(3)); // deleted/missing -> null
+
+        // Variable token counts survive.
+        assert_eq!(outer.value(0).len(), 2);
+        assert_eq!(outer.value(1).len(), 3);
+        assert_eq!(outer.value(2).len(), 0);
+
+        // Read back through the generic decoder; compare numerically.
+        let row0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&data_type));
+        assert_eq!(
+            row0,
+            Value::List(vec![
+                Value::List(vec![
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                    Value::Float(3.0)
+                ]),
+                Value::List(vec![
+                    Value::Float(4.0),
+                    Value::Float(5.0),
+                    Value::Float(6.0)
+                ]),
+            ])
+        );
+
+        let row1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&data_type));
+        let Value::List(tokens) = row1 else {
+            panic!("row1 should decode to a list of tokens");
+        };
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(
+            tokens[2],
+            Value::List(vec![
+                Value::Float(13.0),
+                Value::Float(14.0),
+                Value::Float(15.0)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_multivector_invalid_inner_tokens() {
+        // A row whose tokens have wrong dimension or non-numeric content: each
+        // bad token becomes a null inner entry (zeros, invalid) without crashing,
+        // and valid tokens in the same row are preserved.
+        let data_type = DataType::List(Box::new(DataType::Vector { dimensions: 2 }));
+        let extractor = PropertyExtractor::new("tokens", &data_type);
+
+        let props = [Some(Value::List(vec![
+            Value::Vector(vec![1.0, 2.0]),                           // valid
+            Value::Vector(vec![9.0, 9.0, 9.0]),                      // wrong dim -> null
+            Value::String("nope".to_string()),                       // non-vector -> null
+            Value::List(vec![Value::Float(3.0), Value::Float(4.0)]), // valid (list form)
+        ]))];
+        let deleted = [false];
+
+        let arr_ref = extractor
+            .build_column(1, &deleted, |i| props[i].as_ref())
+            .unwrap();
+        let outer = arr_ref.as_any().downcast_ref::<ListArray>().unwrap();
+        let inner_row = outer.value(0);
+        let inner = inner_row
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(inner.len(), 4);
+        assert!(inner.is_valid(0)); // [1,2]
+        assert!(!inner.is_valid(1)); // wrong dim -> null
+        assert!(!inner.is_valid(2)); // non-vector -> null
+        assert!(inner.is_valid(3)); // [3,4] from list form
+    }
+
+    #[test]
+    fn test_values_to_array_multivector_schemaless_deferred() {
+        // Schemaless (Arrow-type-driven) multi-vector writes are intentionally NOT
+        // supported yet (issue #96, Phase 1.5). Declared-schema writes go through
+        // `build_list_column` instead. This test pins the deferral contract so a
+        // future change that enables it updates this expectation deliberately.
+        let values = vec![Value::List(vec![Value::Vector(vec![1.0, 2.0])])];
+        let dt = ArrowDataType::List(Arc::new(Field::new(
+            "item",
+            ArrowDataType::FixedSizeList(
+                Arc::new(Field::new("item", ArrowDataType::Float32, true)),
+                2,
+            ),
+            true,
+        )));
+        assert!(values_to_array(&values, &dt).is_err());
     }
 
     /// H13: out-of-range i64 values must become NULL in i32/date32 columns

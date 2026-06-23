@@ -244,6 +244,38 @@ pub fn score_vectors(a: &[f32], b: &[f32], metric: &DistanceMetric) -> Result<f3
     }
 }
 
+/// Compute the MaxSim (late-interaction / ColBERT) score between a query and a
+/// document, each represented as a set of token vectors.
+///
+/// MaxSim is `Σ_i max_j score_vectors(query_i, doc_j, metric)`: for every query
+/// token take its best match across all document tokens, then sum. Per-token
+/// scoring reuses [`score_vectors`], so the metric's normalisation matches the
+/// rest of the engine. Default metric for late interaction is `Cosine`.
+///
+/// An empty query, or a query token with no document tokens to match against,
+/// contributes `0` rather than erroring.
+///
+/// # Errors
+/// Returns [`SimilarToError::DimensionMismatch`] if a query token and a document
+/// token differ in length.
+pub fn maxsim(
+    query: &[Vec<f32>],
+    doc: &[Vec<f32>],
+    metric: &DistanceMetric,
+) -> Result<f32, SimilarToError> {
+    let mut total = 0.0_f32;
+    for q in query {
+        let mut best: Option<f32> = None;
+        for d in doc {
+            let sim = score_vectors(q, d, metric)?;
+            best = Some(best.map_or(sim, |b| b.max(sim)));
+        }
+        // `None` means the document had no tokens: that query token scores 0.
+        total += best.unwrap_or(0.0);
+    }
+    Ok(total)
+}
+
 /// Convert a raw distance value into a normalised similarity score.
 ///
 /// The conversion depends on the distance metric:
@@ -435,6 +467,47 @@ mod tests {
         assert_eq!(opts.k, 60);
         assert!((opts.fts_k - 1.0).abs() < 1e-6);
         assert!(opts.weights.is_none());
+    }
+
+    #[test]
+    fn test_maxsim_hand_computed() {
+        // query = {e0, e1}; doc = {e0, [0.5,0.5]}. With Dot:
+        //   q0=e0 -> max(e0·e0=1, e0·[.5,.5]=0.5) = 1.0
+        //   q1=e1 -> max(e1·e0=0, e1·[.5,.5]=0.5) = 0.5
+        // MaxSim = 1.5
+        let query = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        let doc = vec![vec![1.0_f32, 0.0], vec![0.5_f32, 0.5]];
+        let score = maxsim(&query, &doc, &DistanceMetric::Dot).unwrap();
+        assert!((score - 1.5).abs() < 1e-6, "got {score}");
+    }
+
+    #[test]
+    fn test_maxsim_edge_cases() {
+        let metric = DistanceMetric::Cosine;
+        // Empty query -> 0.
+        assert_eq!(maxsim(&[], &[vec![1.0_f32, 0.0]], &metric).unwrap(), 0.0);
+        // Empty doc -> every query token scores 0 -> 0.
+        let empty_doc: Vec<Vec<f32>> = vec![];
+        assert_eq!(
+            maxsim(&[vec![1.0_f32, 0.0]], &empty_doc, &metric).unwrap(),
+            0.0
+        );
+        // Dimension mismatch between a query token and a doc token -> error.
+        let err = maxsim(&[vec![1.0_f32, 0.0]], &[vec![1.0_f32, 0.0, 0.0]], &metric);
+        assert!(matches!(err, Err(SimilarToError::DimensionMismatch { .. })));
+    }
+
+    #[test]
+    fn test_maxsim_metric_changes_score() {
+        // Non-unit vectors so Dot and Cosine diverge: q=[2,0], d=[3,0].
+        //   Dot    = 2*3 = 6.0
+        //   Cosine = (2*3) / (|2|*|3|) = 1.0
+        let q = vec![vec![2.0_f32, 0.0]];
+        let d = vec![vec![3.0_f32, 0.0]];
+        let dot = maxsim(&q, &d, &DistanceMetric::Dot).unwrap();
+        let cos = maxsim(&q, &d, &DistanceMetric::Cosine).unwrap();
+        assert!((dot - 6.0).abs() < 1e-6, "dot got {dot}");
+        assert!((cos - 1.0).abs() < 1e-6, "cosine got {cos}");
     }
 
     #[test]

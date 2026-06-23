@@ -77,16 +77,51 @@ pub(crate) fn extract_vector(val: &Value) -> DFResult<Vec<f32>> {
     }
 }
 
+/// Extract a multi-vector (a list of token vectors) from a `Value`, for
+/// late-interaction (ColBERT / MaxSim) queries and document properties.
+///
+/// Accepts a `Value::List` whose elements are each a vector (`Value::Vector`
+/// or a list of numbers, via [`extract_vector`]).
+pub(crate) fn extract_vector_list(val: &Value) -> DFResult<Vec<Vec<f32>>> {
+    match val {
+        Value::List(arr) => arr.iter().map(extract_vector).collect(),
+        _ => Err(datafusion::error::DataFusionError::Execution(
+            "Multi-vector query must be a list of vectors".to_string(),
+        )),
+    }
+}
+
+/// Parse a distance-metric name (case-insensitive); defaults to `Cosine`.
+fn parse_distance_metric(s: &str) -> DistanceMetric {
+    match s.to_ascii_lowercase().as_str() {
+        "dot" => DistanceMetric::Dot,
+        "l2" | "euclidean" => DistanceMetric::L2,
+        _ => DistanceMetric::Cosine,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reranker configuration + per-call reranker context
 // ---------------------------------------------------------------------------
 
-/// Configuration for an optional cross-encoder reranking stage.
+/// Sentinel reranker alias selecting in-process MaxSim (late-interaction /
+/// ColBERT) scoring instead of a neural cross-encoder model.
+pub(super) const MAXSIM_RERANKER: &str = "maxsim";
+
+/// Configuration for an optional reranking stage.
+///
+/// When `alias` equals [`MAXSIM_RERANKER`], scoring is in-process MaxSim over a
+/// stored multi-vector property (`maxsim_query` is the per-token query and
+/// `metric` its similarity metric); otherwise it is a neural cross-encoder.
 pub(super) struct RerankerConfig {
     pub alias: String,
     pub property: String,
     pub k: usize,
     pub query_override: Option<String>,
+    /// MaxSim query multi-vector; `Some` only for the [`MAXSIM_RERANKER`] alias.
+    pub maxsim_query: Option<Vec<Vec<f32>>>,
+    /// Similarity metric for MaxSim scoring (default `Cosine`).
+    pub metric: DistanceMetric,
 }
 
 pub(super) fn parse_reranker_options(
@@ -111,11 +146,29 @@ pub(super) fn parse_reranker_options(
         .get("reranker_query")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // MaxSim mode: parse the per-token query multi-vector and metric. The query
+    // is parsed best-effort here; a missing/malformed query is reported as a
+    // hard error at rerank time so a requested maxsim never silently no-ops.
+    let (maxsim_query, metric) = if alias == MAXSIM_RERANKER {
+        let q = map
+            .get("maxsim_query")
+            .and_then(|v| extract_vector_list(v).ok());
+        let m = map
+            .get("maxsim_metric")
+            .and_then(|v| v.as_str())
+            .map(parse_distance_metric)
+            .unwrap_or(DistanceMetric::Cosine);
+        (q, m)
+    } else {
+        (None, DistanceMetric::Cosine)
+    };
     Some(RerankerConfig {
         alias,
         property,
         k: reranker_k,
         query_override,
+        maxsim_query,
+        metric,
     })
 }
 
@@ -149,6 +202,42 @@ async fn rerank_candidates(
         .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // MaxSim (late-interaction / ColBERT) rerank: no neural model — score each
+    // candidate's stored multi-vector property against the query multi-vector
+    // in-process. Pure CPU; `reranker_k` (clamped <= 1000) bounds the work.
+    if config.alias == MAXSIM_RERANKER {
+        let query = config.maxsim_query.as_ref().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "maxsim reranker requires a valid 'maxsim_query' option (a list of vectors)"
+                    .to_string(),
+            )
+        })?;
+        let mut scored: Vec<(Vid, f32)> = Vec::with_capacity(vids.len());
+        for vid in &vids {
+            // Missing/empty multi-vector property -> no document tokens -> score 0.
+            let doc_tokens = props_map
+                .get(vid)
+                .and_then(|p| p.get(&config.property))
+                .map(extract_vector_list)
+                .transpose()?
+                .unwrap_or_default();
+            let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, &config.metric)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            scored.push((*vid, score));
+        }
+        let rerank_map: HashMap<Vid, f32> = scored.iter().copied().collect();
+        let mut reranked = scored;
+        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.truncate(k);
+        return Ok((
+            reranked,
+            RerankContext {
+                scores: rerank_map,
+                props: props_map,
+            },
+        ));
+    }
 
     let doc_texts: Vec<String> = vids
         .iter()
@@ -591,7 +680,12 @@ pub(crate) async fn run_vector_query(
     let reranker_config = parse_reranker_options(options_map, k, None);
 
     if let Some(ref rcfg) = reranker_config {
-        if query_text_from_arg.is_none() && rcfg.query_override.is_none() {
+        // MaxSim scores against `maxsim_query` (a multi-vector), not the text
+        // query, so it is exempt from the cross-encoder's reranker_query rule.
+        if rcfg.alias != MAXSIM_RERANKER
+            && query_text_from_arg.is_none()
+            && rcfg.query_override.is_none()
+        {
             return Err(datafusion::error::DataFusionError::Execution(
                 "Cannot rerank: query is a pre-computed vector. \
                  Provide reranker_query in options."

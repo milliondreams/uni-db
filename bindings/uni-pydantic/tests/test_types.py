@@ -296,6 +296,11 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(Vector[128]) == ("vector:128", False)
         assert python_type_to_uni(Vector[1536] | None) == ("vector:1536", True)
 
+    def test_list_vector_type(self):
+        """Test list[Vector[N]] (multi-vector / ColBERT) type mapping."""
+        assert python_type_to_uni(list[Vector[128]]) == ("list:vector:128", False)
+        assert python_type_to_uni(list[Vector[256]] | None) == ("list:vector:256", True)
+
     def test_unsupported_type(self):
         """Test unsupported type raises error."""
 
@@ -379,6 +384,18 @@ class TestPythonToDbValue:
         vec = Vector[3]([1.0, 2.0, 3.0])
         result = python_to_db_value(vec, Vector[3])
         assert result == [1.0, 2.0, 3.0]
+
+    def test_list_vector_roundtrip(self):
+        """Test list[Vector[N]] <-> list[list[float]] (multi-vector / ColBERT)."""
+        vecs = [Vector[3]([1.0, 2.0, 3.0]), Vector[3]([4.0, 5.0, 6.0])]
+        encoded = python_to_db_value(vecs, list[Vector[3]])
+        assert encoded == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+        decoded = db_to_python_value(encoded, list[Vector[3]])
+        assert len(decoded) == 2
+        assert all(isinstance(v, Vector) for v in decoded)
+        assert decoded[0].values == [1.0, 2.0, 3.0]
+        assert decoded[1].values == [4.0, 5.0, 6.0]
 
     def test_string_passthrough(self):
         """Test string passes through."""

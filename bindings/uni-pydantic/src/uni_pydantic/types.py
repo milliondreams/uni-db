@@ -335,6 +335,10 @@ def python_to_db_value(value: Any, type_hint: Any) -> Any:
     if value is None:
         return None
 
+    # list[Vector[N]] → list[list[float]] (multi-vector / ColBERT)
+    if isinstance(value, list) and value and isinstance(value[0], Vector):
+        return [v.values if isinstance(v, Vector) else v for v in value]
+
     # Vector → list[float]
     if isinstance(value, Vector):
         return value.values
@@ -385,6 +389,14 @@ def db_to_python_value(value: Any, type_hint: Any) -> Any:
         if nanos is not None:
             return datetime.fromtimestamp(nanos / 1_000_000_000)
         return None
+
+    # list[Vector[N]] fields: list[list[float]] → list[Vector[N]] (multi-vector)
+    is_lst, elem_type = is_list_type(type_hint)
+    if is_lst:
+        elem_dims = get_vector_dimensions(elem_type)
+        if elem_dims is not None and isinstance(value, list):
+            vec_cls = Vector[elem_dims]
+            return [vec_cls(v) if isinstance(v, list) else v for v in value]
 
     # Vector fields: list[float] → Vector
     dims = get_vector_dimensions(type_hint)
@@ -446,6 +458,10 @@ def python_type_to_uni(type_hint: Any, *, nullable: bool = False) -> tuple[str, 
             # Simple list types
             elem_uni = TYPE_MAP.get(elem_type, "string")
             return f"list:{elem_uni}", nullable
+        # list[Vector[N]] (multi-vector / ColBERT) -> list:vector:N
+        elem_dims = get_vector_dimensions(elem_type)
+        if elem_dims is not None:
+            return f"list:vector:{elem_dims}", nullable
         # Complex list types stored as JSON
         return "json", nullable
 

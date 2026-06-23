@@ -135,6 +135,22 @@ class TestSchemaGenerator:
         assert prop.data_type == "vector:128"
         assert prop.index_type == "vector"  # Auto-indexed
 
+    def test_generate_list_vector_field(self):
+        """Test generating schema for a list[Vector[N]] (multi-vector) field."""
+
+        class Document(UniNode):
+            title: str
+            embeddings: list[Vector[128]]
+
+        gen = SchemaGenerator()
+        gen.register(Document)
+        schema = gen.generate()
+
+        prop = schema.labels["Document"].properties["embeddings"]
+        assert prop.data_type == "list:vector:128"
+        # Multi-vector lists are NOT auto-indexed like single dense vectors.
+        assert prop.index_type is None
+
     def test_generate_vector_with_metric(self):
         """Test generating schema for vector with metric."""
 

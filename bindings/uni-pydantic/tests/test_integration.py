@@ -13,6 +13,7 @@ from uni_pydantic import (
     UniEdge,
     UniNode,
     UniSession,
+    Vector,
     before_create,
 )
 
@@ -440,3 +441,32 @@ class TestLifecycleHooks:
 
         # before_create should have set created_at
         assert alice.created_at is not None
+
+
+class TestMultiVectorField:
+    """Tests for list[Vector[N]] (multi-vector / ColBERT) OGM fields."""
+
+    def test_list_vector_roundtrip(self, session):
+        """A list[Vector[N]] field persists and retrieves as list[Vector[N]]."""
+
+        class Article(UniNode):
+            __label__ = "Article"
+            title: str
+            tokens: list[Vector[2]]
+
+        session.register(Article)
+        session.sync_schema()
+
+        article = Article(
+            title="A",
+            tokens=[Vector[2]([1.0, 0.0]), Vector[2]([0.0, 1.0])],
+        )
+        session.add(article)
+        session.commit()
+
+        found = session.get(Article, vid=article.vid)
+        assert found is not None
+        assert len(found.tokens) == 2
+        assert all(isinstance(v, Vector) for v in found.tokens)
+        assert found.tokens[0].values == [1.0, 0.0]
+        assert found.tokens[1].values == [0.0, 1.0]

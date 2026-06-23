@@ -558,10 +558,13 @@ pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
             .parse::<usize>()
             .map_err(|_| "Invalid dimensions for vector type".to_string())?;
         Ok(DataType::Vector { dimensions: dims })
-    } else if data_type.starts_with("list:") {
-        let elem_type = data_type.split(':').nth(1).ok_or_else(|| {
-            "List type must specify element type, e.g., 'list:string'".to_string()
-        })?;
+    } else if let Some(elem_type) = data_type.strip_prefix("list:") {
+        // Keep the FULL remainder (not `split(':').nth(1)`, which drops trailing
+        // segments) so nested element types like `list:vector:128` recurse
+        // correctly into `parse_data_type("vector:128")`.
+        if elem_type.is_empty() {
+            return Err("List type must specify element type, e.g., 'list:string'".to_string());
+        }
         let inner = parse_data_type(elem_type)?;
         Ok(DataType::List(Box::new(inner)))
     } else {
@@ -848,5 +851,43 @@ pub fn create_index_definition_from_config(
         }
 
         _ => Err(format!("Unknown index type in config: {}", idx_type)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_data_type_scalars_and_vector() {
+        assert_eq!(parse_data_type("string").unwrap(), DataType::String);
+        assert_eq!(
+            parse_data_type("vector:128").unwrap(),
+            DataType::Vector { dimensions: 128 }
+        );
+        assert_eq!(
+            parse_data_type("list:string").unwrap(),
+            DataType::List(Box::new(DataType::String))
+        );
+    }
+
+    #[test]
+    fn parse_data_type_nested_list_vector() {
+        // Regression: `split(':').nth(1)` dropped the trailing dim segment, so
+        // `list:vector:128` parsed its element as bare "vector" and failed.
+        assert_eq!(
+            parse_data_type("list:vector:128").unwrap(),
+            DataType::List(Box::new(DataType::Vector { dimensions: 128 }))
+        );
+        // Doubly-nested element types must also recurse fully.
+        assert_eq!(
+            parse_data_type("list:list:string").unwrap(),
+            DataType::List(Box::new(DataType::List(Box::new(DataType::String))))
+        );
+    }
+
+    #[test]
+    fn parse_data_type_empty_list_element_errors() {
+        assert!(parse_data_type("list:").is_err());
     }
 }

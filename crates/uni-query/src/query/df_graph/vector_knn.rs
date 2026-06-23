@@ -627,8 +627,14 @@ async fn execute_vector_search(
     let mut vids = Vec::new();
     let mut scores = Vec::new();
 
-    for (vid, distance) in results {
-        let similarity = calculate_score(distance, &metric);
+    for (vid, value) in results {
+        // Multi-vector (ColBERT) results are already exact MaxSim similarities
+        // (higher is better); dense distances are converted to a similarity here.
+        let similarity = if multivec_query.is_some() {
+            value
+        } else {
+            calculate_score(value, &metric)
+        };
 
         if let Some(thresh) = threshold
             && similarity < thresh
@@ -682,22 +688,41 @@ async fn retrieve_vid_scores(
         VectorSource::Native => {
             let storage = graph_ctx.storage();
             let query_ctx = graph_ctx.query_context();
-            // A multi-vector property routes to MaxSim retrieval; the inline
-            // predicate path uses default ANN tuning (nprobes/refine are set via
-            // the `uni.vector.query` options map, which a predicate cannot express).
+            // A multi-vector property routes to MaxSim retrieval with L0
+            // visibility: Lance generates candidates over flushed data and the
+            // shared re-ranker merges live L0 rows and re-scores by exact MaxSim.
+            // The inline predicate path uses default ANN tuning (nprobes/refine
+            // are set via the `uni.vector.query` options map, which a predicate
+            // cannot express) and the default over-fetch.
             if let Some(mv) = multivec_query {
-                return storage
-                    .multivector_search(
+                let property_manager = graph_ctx.property_manager();
+                let metric = storage
+                    .schema_manager()
+                    .schema()
+                    .vector_index_for_property(label_name, property)
+                    .map(|cfg| cfg.metric.clone())
+                    .unwrap_or(DistanceMetric::Cosine);
+                let retrieval_k = k
+                    .saturating_mul(
+                        crate::query::df_graph::search_procedures::MULTIVECTOR_OVER_FETCH,
+                    )
+                    .max(k);
+                let (ranked, _props) =
+                    crate::query::df_graph::search_procedures::multivector_rerank(
+                        storage,
+                        property_manager,
+                        &query_ctx,
                         label_name,
                         property,
                         mv,
                         k,
+                        retrieval_k,
                         None,
                         uni_store::VectorQueryOpts::default(),
-                        Some(&query_ctx),
+                        &metric,
                     )
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()));
+                    .await?;
+                return Ok(ranked);
             }
             storage
                 .vector_search(

@@ -17,6 +17,7 @@ pub mod fork_hooks;
 pub mod fork_index_auto_build;
 pub mod fork_index_bm25;
 pub mod fork_index_btree;
+pub mod fork_index_multivector;
 pub mod fork_index_recall_bench;
 pub mod fork_index_sorted;
 pub mod fork_index_vector;

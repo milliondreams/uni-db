@@ -303,11 +303,19 @@ impl StorageBackend for BranchedBackend {
         filter: FilterExpr,
         opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
-        // Multi-vector retrieval over a forked/branched dataset is not yet
-        // supported — the raw branch scanner does not expose a multi-vector
-        // nearest. The main-table path is fully supported (issue #96 Phase 2).
+        // Multi-vector retrieval over a forked/branched dataset has no Lance ANN
+        // path — there is no per-branch multi-vector `nearest` (and lancedb
+        // cannot open a `Table` on a non-main branch). It is instead handled one
+        // layer up: `StorageManager::multivector_search` intercepts branched
+        // tables, enumerates the branch's candidate vids via a branch-aware scan,
+        // and the uni-query `multivector_rerank` helper re-scores by exact MaxSim
+        // over disk + fork L0. So this method is never reached for a branched
+        // table; the guard is defense-in-depth for any direct backend caller.
         if self.scope.branch_for(table).is_some() {
-            anyhow::bail!("multi-vector search on branches is not yet supported");
+            anyhow::bail!(
+                "multi-vector search on branches must go through \
+                 StorageManager::multivector_search (branch scan + MaxSim re-rank)"
+            );
         }
         self.inner
             .multivector_search(table, column, query, k, metric, filter, opts)

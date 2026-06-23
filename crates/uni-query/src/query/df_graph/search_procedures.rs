@@ -319,6 +319,117 @@ async fn rerank_candidates(
     ))
 }
 
+/// Default Lance candidate over-fetch multiplier for native multi-vector
+/// (ColBERT / MaxSim) first-stage retrieval. Lance ANN over the flushed set is
+/// only a *candidate generator*; the exact MaxSim re-rank picks the true top-k,
+/// so we pull a few times `k` to preserve recall.
+pub(crate) const MULTIVECTOR_OVER_FETCH: usize = 4;
+/// Hard cap on the number of candidates re-scored in-process, bounding CPU.
+const MULTIVECTOR_MAX_CANDIDATES: usize = 1000;
+
+/// First-stage native multi-vector (ColBERT / MaxSim) retrieval **with L0
+/// visibility**.
+///
+/// Single-vector search merges unflushed L0 rows into Lance's ranking directly,
+/// because the in-process distance is on the identical scale as Lance's
+/// `_distance`. Multi-vector cannot: Lance's `_distance` is an opaque internal
+/// aggregate whose scale cannot be matched against an in-process MaxSim. So this
+/// treats Lance as a pure **candidate generator** over flushed/indexed data,
+/// unions its hits with the live L0 vids for the label (minus tombstones), and
+/// re-scores *every* candidate in-process with exact MaxSim. Flushed and
+/// unflushed rows therefore share one consistent, exact ranking, and a query
+/// sees recent writes without an explicit `flush()`.
+///
+/// Returns the top-`k` `(vid, maxsim_similarity)` (higher = better) plus the
+/// fetched property map, which the caller reuses to materialise node columns
+/// without a second fetch. `retrieval_k` is the Lance over-fetch count.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn multivector_rerank(
+    storage: &uni_store::storage::StorageManager,
+    property_manager: &uni_store::PropertyManager,
+    query_ctx: &uni_store::QueryContext,
+    label: &str,
+    property: &str,
+    query: &[Vec<f32>],
+    k: usize,
+    retrieval_k: usize,
+    filter: Option<&str>,
+    opts: uni_store::VectorQueryOpts,
+    metric: &DistanceMetric,
+) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
+    // 1. Candidate generation over flushed/indexed data. `multivector_search`
+    //    skips the Lance scan automatically when the table does not exist yet
+    //    (nothing flushed), so an L0-only corpus still works.
+    let lance_hits = storage
+        .multivector_search(
+            label,
+            property,
+            query,
+            retrieval_k,
+            filter,
+            opts,
+            Some(query_ctx),
+        )
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 2. Live L0 candidates (and tombstones) for the label.
+    let (l0_live, tombstoned) = uni_store::collect_l0_label_candidates(query_ctx, label);
+
+    // 3. Union(Lance, L0) minus tombstoned, deduped, capped.
+    let mut seen: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+    let mut candidates: Vec<Vid> = Vec::new();
+    for (vid, _) in &lance_hits {
+        if !tombstoned.contains(vid) && seen.insert(*vid) {
+            candidates.push(*vid);
+        }
+    }
+    for vid in l0_live {
+        if !tombstoned.contains(&vid) && seen.insert(vid) {
+            candidates.push(vid);
+        }
+    }
+    // On a fork the candidate set is the full branch scan (incl. inherited
+    // rows) unordered, so truncating would silently drop recall — score them
+    // all (brute-force). On the main path Lance pre-limits to `retrieval_k`, so
+    // the cap is just a safety net.
+    if storage.fork_scope().is_none() {
+        candidates.truncate(MULTIVECTOR_MAX_CANDIDATES);
+    }
+
+    // 4. Fetch token properties for all candidates (L0 + Lance merged, tombstone
+    //    aware).
+    let props_map = property_manager
+        .get_batch_vertex_props_for_label(&candidates, label, Some(query_ctx))
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 5. Exact in-process MaxSim re-score. A vid absent from `props_map` is not
+    //    visible (filtered by tombstone / version) and is dropped; a vid present
+    //    but missing the property has no document tokens and scores 0 (matching
+    //    the cross-encoder MaxSim rerank path). A dimension mismatch propagates
+    //    as a hard error.
+    let mut scored: Vec<(Vid, f32)> = Vec::with_capacity(candidates.len());
+    for vid in &candidates {
+        let Some(props) = props_map.get(vid) else {
+            continue;
+        };
+        let doc_tokens = match props.get(property) {
+            Some(v) => extract_vector_list(v)?,
+            None => Vec::new(),
+        };
+        let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, metric)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        scored.push((*vid, score));
+    }
+
+    // 6. Top-k by similarity (higher = better).
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+
+    Ok((scored, props_map))
+}
+
 // ---------------------------------------------------------------------------
 // Auto-embed
 // ---------------------------------------------------------------------------
@@ -711,6 +822,9 @@ pub(crate) async fn run_vector_query(
     if is_multivector {
         let k = require_int_arg(args, 3, "uni.vector.query: fourth argument (k)")?;
         let filter = extract_optional_filter(args, 4);
+        // The multi-vector `score` is an exact MaxSim *similarity* (higher is
+        // better), so `threshold` here is a minimum similarity (not a maximum
+        // distance, unlike the dense-vector path).
         let threshold = extract_optional_threshold(args, 5);
         let options_map = args
             .get(6)
@@ -719,26 +833,6 @@ pub(crate) async fn run_vector_query(
         let queries = extract_vector_list(query_val)?;
         let query_ctx = host.query_context();
 
-        let mut results = storage
-            .multivector_search(
-                &label,
-                &property,
-                &queries,
-                k,
-                filter.as_deref(),
-                opts,
-                Some(&query_ctx),
-            )
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-
-        if let Some(max_dist) = threshold {
-            results.retain(|(_, dist)| *dist <= max_dist as f32);
-        }
-        if results.is_empty() {
-            return Ok(Some(create_empty_batch(schema.clone())?));
-        }
-
         // Default Cosine for multi-vector (ColBERT) when the property has no index.
         let metric = {
             let sch = storage.schema_manager().schema();
@@ -746,12 +840,57 @@ pub(crate) async fn run_vector_query(
                 .map(|config| config.metric.clone())
                 .unwrap_or(DistanceMetric::Cosine)
         };
+
+        // Lance is a candidate generator; over-fetch (`over_fetch` option, or a
+        // default multiple of `k`) preserves recall before the exact re-rank.
+        let over_fetch = options_map
+            .and_then(|m| m.get("over_fetch"))
+            .and_then(|v| v.as_f64())
+            .filter(|f| *f >= 1.0)
+            .unwrap_or(MULTIVECTOR_OVER_FETCH as f64);
+        let retrieval_k = (((k as f64) * over_fetch).ceil() as usize).max(k);
+
+        let property_manager = host.property_manager().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "Cannot run multi-vector query: property manager not available on host".to_string(),
+            )
+        })?;
+
+        let (mut results, props) = multivector_rerank(
+            storage,
+            property_manager,
+            &query_ctx,
+            &label,
+            &property,
+            &queries,
+            k,
+            retrieval_k,
+            filter.as_deref(),
+            opts,
+            &metric,
+        )
+        .await?;
+
+        if let Some(min_sim) = threshold {
+            results.retain(|(_, sim)| *sim >= min_sim as f32);
+        }
+        if results.is_empty() {
+            return Ok(Some(create_empty_batch(schema.clone())?));
+        }
+
+        // Emit the exact MaxSim similarity as `score` (and reuse the fetched
+        // props for node materialisation) by routing through the rerank context,
+        // which bypasses `calculate_score`.
+        let rerank_ctx = RerankContext {
+            scores: results.iter().copied().collect(),
+            props,
+        };
         let batch_ctx = BatchBuildCtx {
             yield_items,
             target_properties,
             host,
             schema,
-            rerank_ctx: None,
+            rerank_ctx: Some(&rerank_ctx),
         };
         return build_search_result_batch(&results, &label, &metric, &batch_ctx).await;
     }

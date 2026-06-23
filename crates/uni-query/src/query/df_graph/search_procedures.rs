@@ -100,6 +100,39 @@ fn parse_distance_metric(s: &str) -> DistanceMetric {
     }
 }
 
+/// Parse the `nprobes` / `refine_factor` ANN tuning knobs from a procedure's
+/// `options` map (`None` for either = Lance default). Applies to dense and
+/// multi-vector queries alike.
+fn parse_vector_query_opts(
+    options_map: Option<&HashMap<String, Value>>,
+) -> uni_store::VectorQueryOpts {
+    let nprobes = options_map
+        .and_then(|m| m.get("nprobes"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let refine_factor = options_map
+        .and_then(|m| m.get("refine_factor"))
+        .and_then(|v| v.as_u64())
+        .map(|r| r as u32);
+    uni_store::VectorQueryOpts {
+        nprobes,
+        refine_factor,
+    }
+}
+
+/// Detects whether a property is a multi-vector (`List<FixedSizeList<Float32>>`)
+/// column, given the label's property metadata.
+fn is_multivector_property(
+    property: &str,
+    label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
+) -> bool {
+    matches!(
+        resolve_property_type(property, label_props),
+        arrow_schema::DataType::List(ref inner)
+            if matches!(inner.data_type(), arrow_schema::DataType::FixedSizeList(_, _))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Reranker configuration + per-call reranker context
 // ---------------------------------------------------------------------------
@@ -665,6 +698,64 @@ pub(crate) async fn run_vector_query(
     })?;
 
     let storage = host.storage();
+
+    // First-stage multi-vector (ColBERT / MaxSim) retrieval: when the queried
+    // property is a `List<Vector>` column, the query is a list of token vectors
+    // and there is no cross-encoder rerank stage. (The dense + `reranker:'maxsim'`
+    // path below is a different call shape: a dense ANN property reranked by a
+    // separate multi-vector `reranker_property`.)
+    let is_multivector = {
+        let sch = storage.schema_manager().schema();
+        is_multivector_property(&property, sch.properties.get(&label))
+    };
+    if is_multivector {
+        let k = require_int_arg(args, 3, "uni.vector.query: fourth argument (k)")?;
+        let filter = extract_optional_filter(args, 4);
+        let threshold = extract_optional_threshold(args, 5);
+        let options_map = args
+            .get(6)
+            .and_then(|v| if v.is_null() { None } else { v.as_object() });
+        let opts = parse_vector_query_opts(options_map);
+        let queries = extract_vector_list(query_val)?;
+        let query_ctx = host.query_context();
+
+        let mut results = storage
+            .multivector_search(
+                &label,
+                &property,
+                &queries,
+                k,
+                filter.as_deref(),
+                opts,
+                Some(&query_ctx),
+            )
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+        if let Some(max_dist) = threshold {
+            results.retain(|(_, dist)| *dist <= max_dist as f32);
+        }
+        if results.is_empty() {
+            return Ok(Some(create_empty_batch(schema.clone())?));
+        }
+
+        // Default Cosine for multi-vector (ColBERT) when the property has no index.
+        let metric = {
+            let sch = storage.schema_manager().schema();
+            sch.vector_index_for_property(&label, &property)
+                .map(|config| config.metric.clone())
+                .unwrap_or(DistanceMetric::Cosine)
+        };
+        let batch_ctx = BatchBuildCtx {
+            yield_items,
+            target_properties,
+            host,
+            schema,
+            rerank_ctx: None,
+        };
+        return build_search_result_batch(&results, &label, &metric, &batch_ctx).await;
+    }
+
     let query_text_from_arg = query_val.as_str().map(String::from);
     let query_vector: Vec<f32> = if let Some(ref query_text) = query_text_from_arg {
         auto_embed_text(host, &label, &property, query_text).await?
@@ -678,6 +769,7 @@ pub(crate) async fn run_vector_query(
     let options_val = args.get(6);
     let options_map = options_val.and_then(|v| if v.is_null() { None } else { v.as_object() });
     let reranker_config = parse_reranker_options(options_map, k, None);
+    let vec_opts = parse_vector_query_opts(options_map);
 
     if let Some(ref rcfg) = reranker_config {
         // MaxSim scores against `maxsim_query` (a multi-vector), not the text
@@ -709,6 +801,7 @@ pub(crate) async fn run_vector_query(
             &query_vector,
             retrieval_k,
             filter.as_deref(),
+            vec_opts,
             Some(&query_ctx),
         )
         .await
@@ -911,6 +1004,7 @@ pub(crate) async fn run_hybrid_search(
                     &qvec,
                     effective_retrieval_k,
                     filter.as_deref(),
+                    uni_store::VectorQueryOpts::default(),
                     Some(&query_ctx),
                 )
                 .await

@@ -134,6 +134,18 @@ pub struct IndexRebuildTask {
     pub retry_count: u32,
 }
 
+/// Resolves the embedding dimension of a vector or multi-vector property type.
+///
+/// Recurses through `List(Vector{dim})` (multi-vector / ColBERT) to the inner
+/// `Vector{dim}`; returns `None` for non-vector types.
+fn resolve_vector_dim(t: &uni_common::DataType) -> Option<usize> {
+    match t {
+        uni_common::DataType::Vector { dimensions } => Some(*dimensions),
+        uni_common::DataType::List(inner) => resolve_vector_dim(inner),
+        _ => None,
+    }
+}
+
 /// Manages physical and logical indexes across all vertex datasets.
 pub struct IndexManager {
     base_uri: String,
@@ -213,6 +225,42 @@ impl IndexManager {
             .labels
             .get(label)
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+
+        // Fail fast on an invalid PQ configuration before touching Lance (which
+        // would otherwise error opaquely at build time). The embedding dimension
+        // comes from the schema property type, recursing `List(Vector{dim})` for
+        // multi-vector (ColBERT) columns.
+        let prop_dim = schema
+            .properties
+            .get(label)
+            .and_then(|props| props.get(property))
+            .and_then(|meta| resolve_vector_dim(&meta.r#type));
+        let pq_sub = match config.index_type {
+            VectorIndexType::IvfPq {
+                num_sub_vectors, ..
+            }
+            | VectorIndexType::HnswPq {
+                num_sub_vectors, ..
+            } => Some(num_sub_vectors as usize),
+            _ => None,
+        };
+        // Only the realistic misconfiguration (sub-vectors that don't divide a
+        // dimension at least as large) is rejected up front. The degenerate
+        // `sub > dim` case (e.g. the default 16 on a dim-2 column) is left to Lance,
+        // which clamps/defers it — notably so an index can be declared on an empty
+        // table before any rows exist.
+        if let (Some(dim), Some(sub)) = (prop_dim, pq_sub)
+            && sub != 0
+            && dim >= sub
+            && dim % sub != 0
+        {
+            return Err(anyhow!(
+                "Vector index '{}': PQ num_sub_vectors ({}) must divide the embedding dimension ({})",
+                config.name,
+                sub,
+                dim
+            ));
+        }
 
         let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
 

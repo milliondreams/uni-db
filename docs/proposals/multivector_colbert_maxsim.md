@@ -1,12 +1,16 @@
 # Design Proposal: Multi-vector (late-interaction / ColBERT) storage + MaxSim retrieval
 
 - **Issue:** rustic-ai/uni-db#96
-- **Status:** Phase 1 IMPLEMENTED (Rust + Cypher scope), uncommitted. Storage `List<Vector>`
-  column write, in-process `maxsim()`, and a `reranker: "maxsim"` mode are landed with tests
-  green. Phases 2–3, Python OGM, schemaless writes, and Cypher-DDL declaration remain deferred
-  (see §11/§13 and "Deferred" notes). Feasibility was de-risked by the retained probe
-  (`crates/uni-store/examples/multivec_lance_probe.rs`).
-- **Date:** 2026-06-22
+- **Status:** Phases 1 **and 2** IMPLEMENTED (Rust + Cypher scope), uncommitted. **Phase 1**:
+  storage `List<Vector>` column, in-process `maxsim()`, `reranker: "maxsim"` mode. **Phase 2**:
+  native first-stage index over multivector columns — the **full `VectorIndexType` menu**
+  (Flat/IVF_FLAT/PQ/SQ/RQ/HNSW_FLAT/SQ/PQ), `nprobes`/`refine_factor` query options, the
+  `uni.vector.query` procedure path **and** the inline `vector_similarity()` predicate, plus
+  index-creation fixes (metric-from-OPTIONS, numeric-OPTIONS parsing, PQ `dim%sub_vectors`
+  validation). Tests green (6 Phase-2 + Phase-1 regression). **Deferred:** multivector L0-merge
+  (flush-before-query), fork/branch multivector (clear error), multivector auto-embed, Python
+  OGM, Phase 3 MUVERA. Validated by the real-data recall benchmark (§2.4).
+- **Date:** 2026-06-22 (Phase 1), 2026-06-23 (Phase 2)
 - **Producer dependency:** rustic-ai/uni-xervo#41 (per-token vector emission). Dependency arrow is **uni-db → uni-xervo**: this proposal is the *consumer/storage* half and does not require the producer to land first (multivecs can be written directly).
 
 **Validation summary (2026-06-22).** Tier-0 (does Lance do it) and Tier-1 (does it fit our
@@ -87,6 +91,58 @@ Remaining unrun validation is **#5 storage codec round-trip** — but that *is* 
 storage work item (the `build_list_column` arm + read decoder), not a separate risk: the
 `Value`-space MessagePack path already round-trips nested lists; only the Arrow column
 builder/decoder needs the new branch.
+
+### 2.3 Follow-ups landed (2026-06-23)
+
+- **Python OGM** — `list[Vector[N]]` Pydantic fields now map to `List(Vector{dim})`
+  (`bindings/uni-pydantic/.../types.py`). Surfaced + fixed a **latent binding bug**:
+  `bindings/uni-db/src/core.rs::parse_data_type` used `split(':').nth(1)` for `list:`, dropping
+  trailing segments, so `list:vector:N` (and `list:list:string`) failed — fixed to
+  `strip_prefix("list:")`.
+- **Schemaless multivec = design boundary (no code).** Nested-list property values are rejected
+  at write by `validate_structural_property_value` (`write.rs:2931`) for non-`CypherValue`
+  columns (standard OpenCypher), so a multivec must be a declared `List(Vector{dim})` **or** a
+  declared `CypherValue`/json column (the latter a dim-flexible alternative that maxsim handles).
+- **Cypher DDL parameterized types** — `CREATE LABEL Doc (... tokens LIST<VECTOR(2)>)` now parses
+  (new compound-atomic `type_specification` rule in `cypher.pest`), so multivec is declarable via
+  Cypher DDL, not just the builder API. (`MAP<...>` deferred — needs a backend `parse_data_type`
+  arm.)
+
+### 2.4 Phase-2 recall benchmark — GO on real data (2026-06-23)
+
+Two benchmarks were run. The first used **synthetic random** vectors
+(`multivec_recall_bench.rs`) and gave a misleading NO-GO (IVF recall ~0.30–0.40). Random
+vectors are a worst case for ANN — they have no cluster structure for IVF to exploit, and that
+run did not use `refine_factor`. **On real embeddings the conclusion reverses.**
+
+The authoritative benchmark (`multivec_recall_real.rs`) uses **real ColBERT embeddings**: 2000
+scifact passages + 100 real queries encoded by the local **uni-xervo** `answerai-colbert-small`
+model (dim 96, 375k tokens), scored through the pinned Lance stack. `recall@10` is averaged over
+all 100 queries:
+
+| Config | recall@10 | latency |
+|---|---|---|
+| no-index (Flat, exact MaxSim) | **1.000** | 1580 ms/query (baseline) |
+| **IVF_PQ + refine×10, nprobes=8** | **0.966** | **154 ms/query (~10× faster)** |
+| IVF_PQ + refine×10, nprobes 16–256 | 0.964–0.967 | 154–178 ms/query |
+| IVF_HNSW_SQ, nprobes=256 (no refine) | 0.721 | 78 ms/query (below gate) |
+
+**Decision: GO — a native first-stage multivector index is viable.** `IVF_PQ` with
+`refine_factor` (re-rank the index candidates with exact distances) reaches **recall@10 ≈ 0.966
+at nprobes=8** — clearing the 0.95 gate — at a **~10× speedup** over exact brute-force MaxSim.
+Recall is *flat across nprobes*, so the cheapest probing already suffices. This is a conservative
+test: at 2000 docs brute force is only 1.6 s; IVF's advantage grows with corpus size (linear vs
+sublinear), so the speedup is larger at scale. PQ *without* refine (and HNSW_SQ) miss the gate —
+**`refine_factor` is the load-bearing knob.**
+
+Caveats: measured on one corpus (scientific) + one model (96-dim); recall may vary by
+domain/model/dim, and the index stores full vectors (for refine) + PQ codes. Recommend
+re-confirming on the consumer's model/corpus before shipping, but the result is a clear,
+data-backed reversal of the synthetic NO-GO.
+
+> Correction note: the earlier "NO-GO / structural mismatch" claim (synthetic data) was wrong.
+> The indexed path does *not* fundamentally mis-rank MaxSim — PQ discards precision that
+> `refine_factor` recovers. Real-data validation overturned a premature negative.
 
 ## 3. Current state (what blocks us today)
 
@@ -250,16 +306,26 @@ existing `Vector` field; details in implementation.
 
 ## 11. Recommended sequencing
 
-1. **Phase 1** (column + `Value::MultiVector` + codec round-trip + `maxsim` rerank branch) —
-   small, shippable, unblocks the uniko consumer with no new index.
-2. **Benchmark** Lance 0.30.0 multivector HNSW/IVF recall to decide if Phase 2 is worth it.
-3. **Phase 2** native first-stage index, gated on the benchmark.
+1. **Phase 1** — DONE. Storage column + `maxsim` rerank, no index; unblocks the rerank use case.
+2. **Benchmark** — DONE (§2.4). Real-data result: `IVF_PQ + refine_factor` clears the recall gate
+   at ~10× speedup → **Phase 2 is viable.**
+3. **Phase 2** native first-stage index — **DONE.** The full `VectorIndexType` menu builds over a
+   `List<Vector>` column; a multivector query threads through procedure + inline-predicate paths via
+   the `add_query_vector` chain; `nprobes`/`refine_factor` are query options. Storage seams:
+   `multivector_search` in `backend/lance.rs` + `manager.rs`; routing in `search_procedures.rs`
+   (`run_vector_query`) and `vector_knn.rs` (`GraphVectorKnnExec`); index-creation fixes in
+   `planner.rs` (metric + numeric OPTIONS) and `index_manager.rs` (PQ dim guard). **Deferred:**
+   multivector L0-merge (Lance's internal MaxSim distance scale can't be matched against in-process
+   MaxSim without re-reading candidate props — flush before query meanwhile); fork/branch multivector;
+   auto-embed.
 4. **Phase 3 / auto-embed** once uni-xervo#41 lands.
 
 ## 12. Open questions
 
-- Confirm HNSW/IVF (not just Flat) multivector recall/perf in Lance 0.30.0. *(Flat/no-index
-  MaxSim already confirmed — see §2.1; this question is now Phase-2-only.)*
+- ~~Confirm HNSW/IVF (not just Flat) multivector recall in Lance 0.30.0~~ — **resolved (§2.4):
+  GO on real data.** `IVF_PQ + refine_factor` reaches recall@10 ≈ 0.966 at nprobes=8 (~10×
+  faster than brute force) on real ColBERT embeddings. (Synthetic-data NO-GO was a false
+  negative — no cluster structure + no refine.) Native first-stage index is viable.
 - Option A (`List(Vector)`) ambiguity guards vs Option B (`MultiVector` variant) — settle in review.
 - Max per-row vector count / dim caps and host-memory floors for MaxSim brute-force.
 - ~~Distance metric semantics for MaxSim~~ — **resolved (§2.1): default Cosine** (unit-norm

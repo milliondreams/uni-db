@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::backend::types::FilterExpr;
+use crate::backend::types::{FilterExpr, VectorQueryOpts};
 use anyhow::{Context, Result};
 use lance::Dataset;
 
@@ -273,6 +273,7 @@ pub async fn create_scalar_index_on_branch(
 ///
 /// - The dataset or branch cannot be opened.
 /// - Lance rejects the query (column type mismatch, dimension mismatch).
+#[allow(clippy::too_many_arguments)]
 pub async fn vector_search_on_branch(
     uri: &str,
     branch: &str,
@@ -280,6 +281,7 @@ pub async fn vector_search_on_branch(
     query: &[f32],
     k: usize,
     filter: &FilterExpr,
+    opts: VectorQueryOpts,
 ) -> Result<Vec<arrow_array::RecordBatch>> {
     use arrow_array::Float32Array;
     use futures::TryStreamExt;
@@ -290,6 +292,12 @@ pub async fn vector_search_on_branch(
     scanner
         .nearest(column, &key, k)
         .map_err(|e| anyhow::anyhow!("vector_search_on_branch nearest({column}, k={k}): {e}"))?;
+    if let Some(n) = opts.nprobes {
+        scanner.nprobes(n);
+    }
+    if let Some(r) = opts.refine_factor {
+        scanner.refine(r);
+    }
     // M6: honor the caller's filter (user predicate + `_deleted = false`
     // + version HWM pin). Prefilter so excluded rows never consume a
     // top-k slot — otherwise a soft-deleted or out-of-version row could

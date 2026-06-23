@@ -129,7 +129,15 @@ fn bench_vector_search(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 storage
-                    .vector_search("Item", "embedding", &query, 10, None, None)
+                    .vector_search(
+                        "Item",
+                        "embedding",
+                        &query,
+                        10,
+                        None,
+                        uni_store::VectorQueryOpts::default(),
+                        None,
+                    )
                     .await
                     .unwrap();
             })

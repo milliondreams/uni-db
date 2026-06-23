@@ -291,6 +291,46 @@ impl GraphVectorKnnExec {
             )),
         }
     }
+
+    /// Evaluate the query expression to a multi-vector (a list of token vectors).
+    fn evaluate_query_multivector(&self) -> DFResult<Vec<Vec<f32>>> {
+        let value = evaluate_simple_expr(&self.query_expr, &self.params, &HashMap::new())?;
+        let Value::List(tokens) = value else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "Multi-vector query must be a list of vectors".to_string(),
+            ));
+        };
+        tokens
+            .into_iter()
+            .map(|tok| match tok {
+                Value::Vector(v) => Ok(v),
+                Value::List(inner) => inner
+                    .iter()
+                    .map(|x| {
+                        x.as_f64().map(|f| f as f32).ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution(
+                                "Multi-vector query token must contain numbers".to_string(),
+                            )
+                        })
+                    })
+                    .collect(),
+                _ => Err(datafusion::error::DataFusionError::Execution(
+                    "Multi-vector query must be a list of vectors".to_string(),
+                )),
+            })
+            .collect()
+    }
+
+    /// Whether the queried property is a multi-vector (`List<FixedSizeList>`) column.
+    fn is_multivector_property(&self) -> bool {
+        let uni_schema = self.graph_ctx.storage().schema_manager().schema();
+        let label_props = uni_schema.properties.get(self.label_name.as_str());
+        matches!(
+            resolve_property_type(&self.property, label_props),
+            DataType::List(ref inner)
+                if matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        )
+    }
 }
 
 impl DisplayAs for GraphVectorKnnExec {
@@ -343,8 +383,14 @@ impl ExecutionPlan for GraphVectorKnnExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
-        // Evaluate query vector upfront
-        let query_vector = self.evaluate_query_vector()?;
+        // Evaluate the query upfront: a multi-vector (ColBERT) property takes a
+        // list of token vectors and routes to MaxSim retrieval; a dense property
+        // takes a single vector.
+        let (query_vector, multivec_query) = if self.is_multivector_property() {
+            (Vec::new(), Some(self.evaluate_query_multivector()?))
+        } else {
+            (self.evaluate_query_vector()?, None)
+        };
 
         Ok(Box::pin(VectorKnnStream::new(
             self.graph_ctx.clone(),
@@ -352,6 +398,7 @@ impl ExecutionPlan for GraphVectorKnnExec {
             self.variable.clone(),
             self.property.clone(),
             query_vector,
+            multivec_query,
             self.k,
             self.threshold,
             self.target_properties.clone(),
@@ -390,8 +437,12 @@ struct VectorKnnStream {
     /// Property name containing vectors.
     property: String,
 
-    /// Query vector.
+    /// Query vector (dense path).
     query_vector: Vec<f32>,
+
+    /// Query multi-vector (ColBERT / MaxSim path); `Some` when the queried
+    /// property is a `List<Vector>` column.
+    multivec_query: Option<Vec<Vec<f32>>>,
 
     /// Number of results.
     k: usize,
@@ -423,6 +474,7 @@ impl VectorKnnStream {
         variable: String,
         property: String,
         query_vector: Vec<f32>,
+        multivec_query: Option<Vec<Vec<f32>>>,
         k: usize,
         threshold: Option<f32>,
         target_properties: Vec<String>,
@@ -436,6 +488,7 @@ impl VectorKnnStream {
             variable,
             property,
             query_vector,
+            multivec_query,
             k,
             threshold,
             target_properties,
@@ -464,6 +517,7 @@ impl Stream for VectorKnnStream {
                     let variable = self.variable.clone();
                     let property = self.property.clone();
                     let query_vector = self.query_vector.clone();
+                    let multivec_query = self.multivec_query.clone();
                     let k = self.k;
                     let threshold = self.threshold;
                     let target_properties = self.target_properties.clone();
@@ -482,6 +536,7 @@ impl Stream for VectorKnnStream {
                             &variable,
                             &property,
                             &query_vector,
+                            multivec_query.as_deref(),
                             k,
                             threshold,
                             &target_properties,
@@ -532,6 +587,7 @@ async fn execute_vector_search(
     variable: &str,
     property: &str,
     query_vector: &[f32],
+    multivec_query: Option<&[Vec<f32>]>,
     k: usize,
     threshold: Option<f32>,
     target_properties: &[String],
@@ -541,17 +597,31 @@ async fn execute_vector_search(
     let storage = graph_ctx.storage();
 
     // Retrieve `(vid, distance)` pairs via the configured source.
-    let results =
-        retrieve_vid_scores(graph_ctx, label_name, property, query_vector, k, source).await?;
+    let results = retrieve_vid_scores(
+        graph_ctx,
+        label_name,
+        property,
+        query_vector,
+        multivec_query,
+        k,
+        source,
+    )
+    .await?;
 
     // Look up the distance metric for this vector property so we can
     // convert raw distances into normalised similarity scores correctly.
+    // Multi-vector (ColBERT) defaults to Cosine; dense defaults to L2.
+    let default_metric = if multivec_query.is_some() {
+        DistanceMetric::Cosine
+    } else {
+        DistanceMetric::L2
+    };
     let metric = storage
         .schema_manager()
         .schema()
         .vector_index_for_property(label_name, property)
         .map(|cfg| cfg.metric.clone())
-        .unwrap_or(DistanceMetric::L2);
+        .unwrap_or(default_metric);
 
     // Filter by threshold and build result
     let mut vids = Vec::new();
@@ -604,6 +674,7 @@ async fn retrieve_vid_scores(
     label_name: &str,
     property: &str,
     query_vector: &[f32],
+    multivec_query: Option<&[Vec<f32>]>,
     k: usize,
     source: &VectorSource,
 ) -> DFResult<Vec<(Vid, f32)>> {
@@ -611,6 +682,23 @@ async fn retrieve_vid_scores(
         VectorSource::Native => {
             let storage = graph_ctx.storage();
             let query_ctx = graph_ctx.query_context();
+            // A multi-vector property routes to MaxSim retrieval; the inline
+            // predicate path uses default ANN tuning (nprobes/refine are set via
+            // the `uni.vector.query` options map, which a predicate cannot express).
+            if let Some(mv) = multivec_query {
+                return storage
+                    .multivector_search(
+                        label_name,
+                        property,
+                        mv,
+                        k,
+                        None,
+                        uni_store::VectorQueryOpts::default(),
+                        Some(&query_ctx),
+                    )
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()));
+            }
             storage
                 .vector_search(
                     label_name,
@@ -618,6 +706,7 @@ async fn retrieve_vid_scores(
                     query_vector,
                     k,
                     None,
+                    uni_store::VectorQueryOpts::default(),
                     Some(&query_ctx),
                 )
                 .await

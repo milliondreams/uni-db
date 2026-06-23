@@ -8360,18 +8360,22 @@ impl QueryPlanner {
     fn plan_schema_command(&self, cmd: SchemaCommand) -> Result<LogicalPlan> {
         match cmd {
             SchemaCommand::CreateVectorIndex(c) => {
-                // Parse index type from options (default: IvfPq)
-                let opt = |key: &str| {
-                    c.options
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u32>().ok())
+                // Parse index type from options (default: IvfPq). Accept either a
+                // numeric value (`partitions: 256`) or a quoted string
+                // (`partitions: '256'`) — Cypher map literals produce the former.
+                let opt = |key: &str| -> Option<u32> {
+                    c.options.get(key).and_then(|v| {
+                        v.as_u64()
+                            .map(|n| n as u32)
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+                    })
                 };
                 let opt_u8 = |key: &str| -> Option<u8> {
-                    c.options
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u8>().ok())
+                    c.options.get(key).and_then(|v| {
+                        v.as_u64()
+                            .map(|n| n as u8)
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u8>().ok()))
+                    })
                 };
                 let index_type = match c.options.get("type").and_then(|v| v.as_str()) {
                     Some("flat") => VectorIndexType::Flat,
@@ -8415,11 +8419,23 @@ impl QueryPlanner {
                     None
                 };
 
+                // Parse the distance metric from OPTIONS (default Cosine).
+                let metric = match c.options.get("metric").and_then(|v| v.as_str()) {
+                    Some("l2") | Some("euclidean") => DistanceMetric::L2,
+                    Some("dot") => DistanceMetric::Dot,
+                    Some("cosine") | None => DistanceMetric::Cosine,
+                    Some(other) => {
+                        return Err(anyhow::anyhow!(
+                            "Unknown vector index metric '{other}' (expected cosine, l2, or dot)"
+                        ));
+                    }
+                };
+
                 let config = VectorIndexConfig {
                     name: c.name,
                     label: c.label,
                     property: c.property,
-                    metric: DistanceMetric::Cosine,
+                    metric,
                     index_type,
                     embedding_config,
                     metadata: Default::default(),

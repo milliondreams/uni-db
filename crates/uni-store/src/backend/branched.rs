@@ -250,6 +250,7 @@ impl StorageBackend for BranchedBackend {
         self.inner.get_table_schema(name).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn vector_search(
         &self,
         table: &str,
@@ -258,6 +259,7 @@ impl StorageBackend for BranchedBackend {
         k: usize,
         metric: DistanceMetric,
         filter: FilterExpr,
+        opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
         // Phase 5b: when the fork has a branch for this dataset,
         // route through Lance's per-branch nearest-K — its
@@ -281,11 +283,34 @@ impl StorageBackend for BranchedBackend {
                 query,
                 k,
                 &filter,
+                opts,
             )
             .await;
         }
         self.inner
-            .vector_search(table, column, query, k, metric, filter)
+            .vector_search(table, column, query, k, metric, filter, opts)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn multivector_search(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[Vec<f32>],
+        k: usize,
+        metric: DistanceMetric,
+        filter: FilterExpr,
+        opts: VectorQueryOpts,
+    ) -> Result<Vec<RecordBatch>> {
+        // Multi-vector retrieval over a forked/branched dataset is not yet
+        // supported — the raw branch scanner does not expose a multi-vector
+        // nearest. The main-table path is fully supported (issue #96 Phase 2).
+        if self.scope.branch_for(table).is_some() {
+            anyhow::bail!("multi-vector search on branches is not yet supported");
+        }
+        self.inner
+            .multivector_search(table, column, query, k, metric, filter, opts)
             .await
     }
 

@@ -30,6 +30,20 @@ impl FilterExpr {
     }
 }
 
+/// Tunable knobs for a vector / multi-vector ANN query.
+///
+/// `Default` (`{None, None}`) lets Lance pick its built-in defaults, i.e. the
+/// behavior before these knobs existed. `nprobes` controls how many IVF
+/// partitions are probed (higher = better recall, slower); `refine_factor` re-ranks
+/// `refine_factor * k` index candidates with exact distances (recovers PQ error).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VectorQueryOpts {
+    /// Number of IVF partitions to probe. `None` = Lance default.
+    pub nprobes: Option<usize>,
+    /// Exact-distance re-rank factor over the candidate set. `None` = no refine.
+    pub refine_factor: Option<u32>,
+}
+
 /// Column projection for backend queries.
 #[derive(Debug, Clone)]
 pub enum ColumnProjection {

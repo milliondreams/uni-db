@@ -5,7 +5,7 @@ use crate::backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 use crate::backend::lance::LanceDbBackend;
 use crate::backend::table_names;
-use crate::backend::types::ScanRequest;
+use crate::backend::types::{ScanRequest, VectorQueryOpts};
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
@@ -1749,6 +1749,7 @@ impl StorageManager {
         InvertedIndex::new(&self.base_uri, config).await
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn vector_search(
         &self,
         label: &str,
@@ -1756,6 +1757,7 @@ impl StorageManager {
         query: &[f32],
         k: usize,
         filter: Option<&str>,
+        opts: VectorQueryOpts,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
         use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
@@ -1791,7 +1793,15 @@ impl StorageManager {
             let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
             let batches = backend
-                .vector_search(&name, property, query, k, backend_metric, combined_filter)
+                .vector_search(
+                    &name,
+                    property,
+                    query,
+                    k,
+                    backend_metric,
+                    combined_filter,
+                    opts,
+                )
                 .await?;
 
             results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
@@ -1800,6 +1810,76 @@ impl StorageManager {
         // Merge L0 buffer vertices into results for visibility of unflushed data.
         if let Some(qctx) = ctx {
             merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric);
+        }
+
+        Ok(results)
+    }
+
+    /// Late-interaction (ColBERT / MaxSim) first-stage search over a multi-vector
+    /// (`List<Vector>`) column.
+    ///
+    /// Mirrors [`Self::vector_search`] but issues a multi-token query — Lance scores
+    /// each row's token set by MaxSim — and defaults to **Cosine** (the ColBERT
+    /// convention) when the property has no index, vs `L2` for dense vectors.
+    /// `opts` (`nprobes` / `refine_factor`) tune the underlying ANN index.
+    ///
+    /// NOTE: results reflect **flushed/indexed data only** — unflushed L0 vertices
+    /// are not merged. Lance's multi-vector `_distance` is an internal aggregate
+    /// whose scale cannot be matched against an in-process MaxSim without re-reading
+    /// candidate properties, so a correct L0 merge (Lance as candidate generator +
+    /// exact MaxSim re-rank over disk + L0) is a deliberate follow-up. Flush before
+    /// querying for full visibility of recent writes.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn multivector_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[Vec<f32>],
+        k: usize,
+        filter: Option<&str>,
+        opts: VectorQueryOpts,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Vec<(Vid, f32)>> {
+        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+
+        let schema = self.schema_manager.schema();
+        let metric = schema
+            .vector_index_for_property(label, property)
+            .map(|config| config.metric.clone())
+            .unwrap_or(DistanceMetric::Cosine);
+
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
+
+        let mut results = Vec::new();
+        if backend.table_exists(&name).await.unwrap_or(false) {
+            let backend_metric = match &metric {
+                DistanceMetric::L2 => BackendMetric::L2,
+                DistanceMetric::Cosine => BackendMetric::Cosine,
+                DistanceMetric::Dot => BackendMetric::Dot,
+                _ => BackendMetric::Cosine,
+            };
+
+            let mut filter_parts = vec![Self::build_active_filter(filter)];
+            if ctx.is_some()
+                && let Some(hwm) = self.version_high_water_mark()
+            {
+                filter_parts.push(format!("_version <= {}", hwm));
+            }
+            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+
+            let batches = backend
+                .multivector_search(
+                    &name,
+                    property,
+                    query,
+                    k,
+                    backend_metric,
+                    combined_filter,
+                    opts,
+                )
+                .await?;
+            results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
         }
 
         Ok(results)

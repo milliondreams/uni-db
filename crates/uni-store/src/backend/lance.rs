@@ -714,6 +714,9 @@ impl StorageBackend for LanceDbBackend {
     // Optional Capabilities
     // ========================
 
+    // async_trait rewrites the signature, so clippy's arg count doesn't trip the
+    // `too_many_arguments` lint here — use allow (expect would be unfulfilled).
+    #[allow(clippy::too_many_arguments)]
     async fn vector_search(
         &self,
         table: &str,
@@ -722,6 +725,7 @@ impl StorageBackend for LanceDbBackend {
         k: usize,
         metric: DistanceMetric,
         filter: FilterExpr,
+        opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
         let tbl = self.get_or_open_table(table).await?;
 
@@ -738,6 +742,12 @@ impl StorageBackend for LanceDbBackend {
             .distance_type(distance_type)
             .limit(k);
 
+        if let Some(n) = opts.nprobes {
+            query_builder = query_builder.nprobes(n);
+        }
+        if let Some(r) = opts.refine_factor {
+            query_builder = query_builder.refine_factor(r);
+        }
         if let FilterExpr::Sql(sql) = &filter {
             query_builder = query_builder.only_if(sql);
         }
@@ -751,6 +761,68 @@ impl StorageBackend for LanceDbBackend {
             .map_err(|e| {
                 anyhow!(
                     "Failed to collect vector search results from '{}': {}",
+                    table,
+                    e
+                )
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn multivector_search(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[Vec<f32>],
+        k: usize,
+        metric: DistanceMetric,
+        filter: FilterExpr,
+        opts: VectorQueryOpts,
+    ) -> Result<Vec<RecordBatch>> {
+        let tbl = self.get_or_open_table(table).await?;
+
+        let distance_type = match metric {
+            DistanceMetric::L2 => lancedb::DistanceType::L2,
+            DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
+            DistanceMetric::Dot => lancedb::DistanceType::Dot,
+        };
+
+        // Late-interaction query: the first token seeds `vector_search`, the rest
+        // are chained via `add_query_vector`; Lance MaxSim-scores the List column.
+        let (first, rest) = query
+            .split_first()
+            .ok_or_else(|| anyhow!("multivector_search on '{}': empty query", table))?;
+        let mut query_builder = tbl
+            .vector_search(first.clone())
+            .map_err(|e| anyhow!("Failed to create multivector search on '{}': {}", table, e))?;
+        for tok in rest {
+            query_builder = query_builder
+                .add_query_vector(tok.clone())
+                .map_err(|e| anyhow!("Failed to add query token on '{}': {}", table, e))?;
+        }
+        let mut query_builder = query_builder
+            .column(column)
+            .distance_type(distance_type)
+            .limit(k);
+
+        if let Some(n) = opts.nprobes {
+            query_builder = query_builder.nprobes(n);
+        }
+        if let Some(r) = opts.refine_factor {
+            query_builder = query_builder.refine_factor(r);
+        }
+        if let FilterExpr::Sql(sql) = &filter {
+            query_builder = query_builder.only_if(sql);
+        }
+
+        query_builder
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Multivector search execution failed on '{}': {}", table, e))?
+            .try_collect()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to collect multivector search results from '{}': {}",
                     table,
                     e
                 )

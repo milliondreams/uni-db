@@ -17,6 +17,7 @@ pub mod snapshot {
 pub use backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 pub use backend::lance::LanceDbBackend;
+pub use backend::types::VectorQueryOpts;
 pub use compaction::{CompactionStats, CompactionStatus};
 pub use runtime::context::QueryContext;
 pub use runtime::property_manager::PropertyManager;

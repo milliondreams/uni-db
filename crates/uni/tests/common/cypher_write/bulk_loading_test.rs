@@ -853,3 +853,267 @@ async fn bulk_partial_flush_rolled_back_on_reopen() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Vector indexes via the bulk loader (issue #96, creation surface E)
+//
+// The bulk loader rebuilds indexes through `rebuild_indexes_for_label` ->
+// `create_vector_index(...).with_backend(...)` (bulk.rs sync-commit path). That rebuild
+// path-class is where an earlier MUVERA backfill bug hid (a missing `with_backend` left the
+// FDE column registered in schema but not materialised on disk), and NO test exercised it
+// via bulk. These two tests close that gap and assert results against an independent
+// brute-force MaxSim oracle, not just "non-empty".
+// ---------------------------------------------------------------------------
+
+const MV_DIM: usize = 8;
+
+fn mv_basis(i: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; MV_DIM];
+    v[i] = 1.0;
+    v
+}
+
+fn mv_unit(state: &mut u64) -> Vec<f32> {
+    let mut v: Vec<f32> = (0..MV_DIM)
+        .map(|_| {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        })
+        .collect();
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+    for x in &mut v {
+        *x /= n;
+    }
+    v
+}
+
+fn mv_query() -> Vec<Vec<f32>> {
+    vec![mv_basis(0), mv_basis(1)]
+}
+
+/// Planted corpus: doc `n/2` titled `target` has tokens == the query (MaxSim 2.0); the
+/// rest are random unit-vector docs. Returned so the test can compute ground truth.
+fn mv_corpus(n: usize, seed: u64) -> Vec<(String, Vec<Vec<f32>>)> {
+    let mut state = seed;
+    (0..n)
+        .map(|i| {
+            if i == n / 2 {
+                ("target".to_string(), mv_query())
+            } else {
+                (
+                    format!("doc{i}"),
+                    (0..3).map(|_| mv_unit(&mut state)).collect(),
+                )
+            }
+        })
+        .collect()
+}
+
+fn mv_to_value(tokens: &[Vec<f32>]) -> uni_db::Value {
+    uni_db::Value::List(
+        tokens
+            .iter()
+            .map(|t| {
+                uni_db::Value::List(t.iter().map(|&x| uni_db::Value::Float(x as f64)).collect())
+            })
+            .collect(),
+    )
+}
+
+fn mv_lit(tokens: &[Vec<f32>]) -> String {
+    let toks: Vec<String> = tokens
+        .iter()
+        .map(|t| {
+            let nums: Vec<String> = t.iter().map(|x| format!("{x:?}")).collect();
+            format!("[{}]", nums.join(","))
+        })
+        .collect();
+    format!("[{}]", toks.join(","))
+}
+
+/// Cosine MaxSim `Σ_q max_d cos(q,d)` (empty doc token contributes 0) — matches
+/// `uni_query_functions::similar_to::maxsim` under the default Cosine metric.
+fn mv_cosine_maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f64 {
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let na = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    };
+    query
+        .iter()
+        .map(|q| {
+            doc.iter()
+                .map(|d| cos(q, d))
+                .fold(None, |acc: Option<f64>, s| {
+                    Some(acc.map_or(s, |b| b.max(s)))
+                })
+                .unwrap_or(0.0)
+        })
+        .sum()
+}
+
+async fn mv_query_results(db: &Uni, k: usize) -> Result<Vec<(String, f64)>> {
+    let cypher = format!(
+        "CALL uni.vector.query('Doc', 'tokens', {}, {k}, null, null, {{}}) \
+         YIELD node, score RETURN node.title AS title, score",
+        mv_lit(&mv_query())
+    );
+    let res = db.session().query(&cypher).await?;
+    Ok(res
+        .rows()
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
+        .collect())
+}
+
+fn mv_assert_oracle(engine: &[(String, f64)], corpus: &[(String, Vec<Vec<f32>>)], full_set: bool) {
+    const EPS: f64 = 1e-4;
+    let q = mv_query();
+    let oracle: HashMap<&str, f64> = corpus
+        .iter()
+        .map(|(t, toks)| (t.as_str(), mv_cosine_maxsim(&q, toks)))
+        .collect();
+    for (title, score) in engine {
+        let want = oracle
+            .get(title.as_str())
+            .unwrap_or_else(|| panic!("engine returned unknown title {title:?}"));
+        assert!(
+            (score - want).abs() < EPS,
+            "exact-MaxSim score mismatch for {title:?}: engine={score} oracle={want}"
+        );
+    }
+    for w in engine.windows(2) {
+        assert!(
+            w[0].1 >= w[1].1 - EPS,
+            "results not sorted by score desc: {engine:?}"
+        );
+    }
+    if full_set {
+        let got: std::collections::HashSet<&str> = engine.iter().map(|(t, _)| t.as_str()).collect();
+        let want: std::collections::HashSet<&str> = oracle.keys().copied().collect();
+        assert_eq!(
+            got, want,
+            "returned set != full bulk-loaded corpus (recall gap)"
+        );
+        assert_eq!(
+            engine.first().map(|(t, _)| t.as_str()),
+            Some("target"),
+            "exact-match target must rank first: {engine:?}"
+        );
+    }
+}
+
+fn mv_props(corpus: &[(String, Vec<Vec<f32>>)]) -> Vec<HashMap<String, uni_db::Value>> {
+    corpus
+        .iter()
+        .map(|(title, tokens)| {
+            let mut p: HashMap<String, uni_db::Value> = HashMap::new();
+            p.insert("title".to_string(), unival!(title.clone()));
+            p.insert("tokens".to_string(), mv_to_value(tokens));
+            p
+        })
+        .collect()
+}
+
+async fn mv_define_doc_schema(db: &Uni) -> Result<()> {
+    use uni_db::DataType;
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property(
+            "tokens",
+            DataType::List(Box::new(DataType::Vector { dimensions: MV_DIM })),
+        )
+        .apply()
+        .await?;
+    Ok(())
+}
+
+/// Bulk-load the corpus, THEN `CREATE VECTOR INDEX ... muvera`: the index backfill must
+/// read the BULK-written rows correctly (different write path than tx CREATE) and the
+/// flat-inner MUVERA query must reproduce the brute-force ranking over the whole corpus.
+#[tokio::test]
+async fn test_bulk_then_create_muvera_index() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+    mv_define_doc_schema(&db).await?;
+
+    let corpus = mv_corpus(60, 0xB17C_0DE5);
+    let s = db.session();
+    let tx = s.tx().await?;
+    let mut bulk = tx.bulk_writer().batch_size(100).build()?;
+    bulk.insert_vertices("Doc", mv_props(&corpus)).await?;
+    bulk.commit().await?;
+    drop(tx);
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE VECTOR INDEX tok_idx FOR (d:Doc) ON (d.tokens) \
+         OPTIONS {type:'muvera', k_sim:4, reps:8, d_proj:8, inner:'flat'}",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let results = mv_query_results(&db, corpus.len()).await?;
+    mv_assert_oracle(&results, &corpus, true);
+    Ok(())
+}
+
+/// Declare the MUVERA index up front, THEN bulk-load + sync-commit: the bulk commit's index
+/// rebuild (`rebuild_indexes_for_label` -> `create_vector_index(...).with_backend(...)`,
+/// the bulk.rs path) must materialise the FDE column over the bulk-loaded rows. This is the
+/// exact rebuild path-class the earlier missing-`with_backend` MUVERA bug lived in.
+#[tokio::test]
+async fn test_bulk_commit_rebuilds_declared_muvera_index() -> Result<()> {
+    use uni_db::{VectorAlgo, VectorIndexCfg, VectorMetric};
+    let db = Uni::temporary().build().await?;
+    mv_define_doc_schema(&db).await?;
+
+    db.schema()
+        .label("Doc")
+        .index(
+            "tokens",
+            uni_db::IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::Muvera {
+                    k_sim: 4,
+                    reps: 8,
+                    d_proj: 8,
+                    seed: uni_db::api::schema::DEFAULT_FDE_SEED,
+                    inner: Box::new(VectorAlgo::Flat),
+                },
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .apply()
+        .await?;
+
+    let corpus = mv_corpus(60, 0x5EED_1234);
+    let s = db.session();
+    let tx = s.tx().await?;
+    let mut bulk = tx
+        .bulk_writer()
+        .batch_size(100)
+        .async_indexes(false)
+        .build()?;
+    bulk.insert_vertices("Doc", mv_props(&corpus)).await?;
+    bulk.commit().await?;
+    drop(tx);
+
+    let results = mv_query_results(&db, corpus.len()).await?;
+    mv_assert_oracle(&results, &corpus, true);
+    Ok(())
+}

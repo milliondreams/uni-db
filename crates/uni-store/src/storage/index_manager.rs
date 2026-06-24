@@ -236,9 +236,29 @@ impl IndexManager {
     #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_vector_index(&self, config: VectorIndexConfig) -> Result<()> {
+        self.create_vector_index_inner(config, false).await
+    }
+
+    /// Like [`Self::create_vector_index`], but `force_backfill` re-materialises a MUVERA
+    /// index's derived FDE column over ALL current rows even if it was already registered.
+    ///
+    /// Full rebuilds ([`Self::rebuild_indexes_for_label`], hence `db.indexes().rebuild()`
+    /// and the bulk loader's sync index sync) set this. The flush-time FDE materializer
+    /// (`Writer::materialize_fde_columns`) only runs on the tx write path, so after a BULK
+    /// load — or any out-of-band table mutation — the newly written rows have no FDE. A
+    /// plain create would hit the "already registered" guard and skip the backfill, leaving
+    /// those rows invisible to the FDE ANN (silent empty results). A rebuild must therefore
+    /// force a fresh backfill; `splice_fde_batch` recomputes every row's FDE deterministically
+    /// and overwrites any stale column, so this is idempotent.
+    #[cfg(feature = "lance-backend")]
+    async fn create_vector_index_inner(
+        &self,
+        config: VectorIndexConfig,
+        force_backfill: bool,
+    ) -> Result<()> {
         if let VectorIndexType::Muvera { inner, .. } = &config.index_type {
-            // Register + (first-time) backfill the derived FDE column.
-            self.prepare_muvera_fde(&config).await?;
+            // Register + backfill the derived FDE column (forced on a full rebuild).
+            self.prepare_muvera_fde(&config, force_backfill).await?;
             let inner_cfg = VectorIndexConfig {
                 name: config.name.clone(),
                 label: config.label.clone(),
@@ -264,14 +284,20 @@ impl IndexManager {
     /// column into the `get_arrow_schema`-sorted position → `replace_table_atomic`),
     /// mirroring the inverted-index "scan all rows at create time" precedent.
     ///
-    /// The "already registered" guard makes this cheap on rebuilds: subsequent
-    /// `create_vector_index` calls (e.g. when another index on the label is added, or on
-    /// schema re-apply) skip the rewrite — the column is kept current by the flush-time
-    /// materializer (`Writer::materialize_fde_columns`). No-op for a non-MUVERA config, an
-    /// unresolved source dimension, a label with nothing flushed yet, or when no backend
-    /// is attached.
+    /// The "already registered" guard makes this cheap on incremental creates: a plain
+    /// `create_vector_index` (e.g. when another index on the label is added, or on schema
+    /// re-apply) skips the rewrite — on the tx write path the column is kept current by the
+    /// flush-time materializer (`Writer::materialize_fde_columns`). `force_backfill` bypasses
+    /// that guard for full rebuilds, where the materializer assumption does not hold (e.g.
+    /// after a bulk load); see [`Self::create_vector_index_inner`]. No-op for a non-MUVERA
+    /// config, an unresolved source dimension, a label with nothing flushed yet, or when no
+    /// backend is attached.
     #[cfg(feature = "lance-backend")]
-    async fn prepare_muvera_fde(&self, config: &VectorIndexConfig) -> Result<()> {
+    async fn prepare_muvera_fde(
+        &self,
+        config: &VectorIndexConfig,
+        force_backfill: bool,
+    ) -> Result<()> {
         use crate::storage::muvera_index::{fde_spec_for_config, splice_fde_batch};
 
         let schema = self.schema_manager.schema();
@@ -293,8 +319,10 @@ impl IndexManager {
             },
             true,
         )?;
-        // Backfill only on first registration, and only with a backend + flushed table.
-        if already_registered {
+        // Backfill on first registration, or whenever a full rebuild forces it (the
+        // flush-time materializer doesn't cover bulk-loaded / out-of-band rows); and only
+        // with a backend + flushed table.
+        if already_registered && !force_backfill {
             return Ok(());
         }
         let Some(backend) = self.backend.as_ref() else {
@@ -781,7 +809,10 @@ impl IndexManager {
 
         for index in indexes {
             match index {
-                IndexDefinition::Vector(cfg) => self.create_vector_index(cfg).await?,
+                // A full rebuild must force the MUVERA FDE backfill: bulk-loaded / reopened
+                // rows aren't covered by the flush-time materializer (see
+                // `create_vector_index_inner`).
+                IndexDefinition::Vector(cfg) => self.create_vector_index_inner(cfg, true).await?,
                 IndexDefinition::Scalar(cfg) => self.create_scalar_index(cfg).await?,
                 IndexDefinition::FullText(cfg) => self.create_fts_index(cfg).await?,
                 IndexDefinition::Inverted(cfg) => self.create_inverted_index(cfg).await?,

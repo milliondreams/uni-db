@@ -241,12 +241,44 @@ Once the column exists, expose Lance's native multivector retrieval as a first-s
   (`df_graph/vector_knn.rs`) to carry a multivector query and route to Lance's multi-vector
   plan. The Cypher surface (`uni.vector.query`) gains a multivec query argument.
 
-### Phase 3 — MUVERA (arXiv:2405.19504), optional/research
+### Phase 3 — MUVERA (arXiv:2405.19504) — IMPLEMENTED
 
 Fixed-dimension encoding that approximates MaxSim using the **existing single-vector ANN**,
-then MaxSim-rerank. Pure add-on: an encoder that maps a multivec → one dense vector stored in
-a normal `Vector` column, reusing today's ANN unchanged, with Phase-1 MaxSim as the rerank.
-Defer until Phases 1–2 are proven.
+then MaxSim-rerank. An in-tree deterministic encoder (`uni_common::muvera`) maps a multivec →
+one dense FDE vector stored in an internal derived column (`__fde_<index>`), reusing today's
+single-vector ANN (forced **Dot** metric) as the first stage, with the Phase-1 exact MaxSim as
+the re-rank. Created via `OPTIONS {type:'muvera', ...}` (DDL), the `uni.schema.createIndex`
+procedure, the Python/Rust builders, and the bulk loader — all converging on
+`IndexManager::create_vector_index`.
+
+**FDE materialization.** The derived column is materialized two ways: (1) at flush on the tx
+write path (`Writer::materialize_fde_columns`, mirroring auto-embed); (2) by a full-table
+backfill at index build / rebuild (`prepare_muvera_fde` → `splice_fde_batch` →
+`replace_table_atomic`). A *full rebuild* (`rebuild_indexes_for_label`, hence
+`db.indexes().rebuild()` and the bulk loader's sync index step) forces the backfill, because
+the flush-time materializer does **not** run on the bulk write path — without the forced
+backfill, declaring a MUVERA index and then bulk-loading would leave the new rows without an
+FDE (silent empty results). The backfill is idempotent (FDE recomputed deterministically per
+row).
+
+**Parameter caveat.** Defaults `k_sim=4, reps=20, d_proj=16` are starting points, **not**
+recall-validated on a real corpus. FDE recall is corpus-dependent; the recall bench
+(`crates/uni-store/examples/multivec_recall_real.rs`) requires a real ColBERT MVEC corpus and
+has not been run for a Phase-3 GO number. Synthetic self-retrieval@1 is robust at any setting
+and is **not** evidence of real recall. The exact MaxSim re-rank means a weak FDE costs only
+recall, never precision. Tune per corpus.
+
+**Known limitations (not yet fixed; tracked under #96):**
+- *Concurrent `CREATE INDEX` race* — `prepare_muvera_fde` reads the "already registered" flag
+  before mutating the schema, so two concurrent creates of the same MUVERA index could both
+  run the full-table backfill (wasteful duplicate rewrites). Low-frequency; no single-writer
+  lock guards index creation today.
+- *Crash window between backfill and schema save* — on a plain create, the backfill
+  (`replace_table_atomic`) runs before `schema_manager.save()`. A crash in between leaves the
+  derived column on disk without a persisted schema entry; the next create/rebuild re-backfills
+  (full rewrite is self-healing), but the on-disk state is briefly inconsistent.
+- Forks fall back to the brute-force branch scan (the FDE index isn't branched); nested
+  (2-level) forks share the pre-existing single-vector `_vid` limitation.
 
 ## 6. Producer integration (uni-xervo#41)
 

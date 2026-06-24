@@ -3,6 +3,9 @@
 
 //! Index lifecycle management: creation, rebuild, and incremental updates for all index types.
 
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::ScanRequest;
 #[cfg(feature = "lance-backend")]
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::vertex::VertexDataset;
@@ -150,6 +153,10 @@ fn resolve_vector_dim(t: &uni_common::DataType) -> Option<usize> {
 pub struct IndexManager {
     base_uri: String,
     schema_manager: Arc<SchemaManager>,
+    /// Storage backend, when available. Needed only for MUVERA FDE backfill (scan +
+    /// `replace_table_atomic`); `None` callers (e.g. some rebuild paths) still build
+    /// indexes over already-materialised columns.
+    backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl std::fmt::Debug for IndexManager {
@@ -161,12 +168,20 @@ impl std::fmt::Debug for IndexManager {
 }
 
 impl IndexManager {
-    /// Create a new `IndexManager` bound to `base_uri` and the given schema.
+    /// Create a new `IndexManager` bound to `base_uri` and the given schema, without a
+    /// storage backend (MUVERA backfill over pre-existing rows is unavailable).
     pub fn new(base_uri: &str, schema_manager: Arc<SchemaManager>) -> Self {
         Self {
             base_uri: base_uri.to_string(),
             schema_manager,
+            backend: None,
         }
+    }
+
+    /// Attach a storage backend, enabling MUVERA FDE backfill over already-flushed rows.
+    pub fn with_backend(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.backend = Some(backend);
+        self
     }
 
     /// Build and persist an inverted index for set-membership queries.
@@ -209,10 +224,125 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Build and persist a vector (ANN) index on an embedding column.
+    /// Build and persist a vector (ANN) index on an embedding column. This is the SINGLE
+    /// build path every creation surface converges on (Cypher DDL, the
+    /// `uni.schema.createIndex` procedure, and the Rust/Python schema builders via
+    /// `rebuild`), so dense, native-multivector, and MUVERA indexes behave identically.
+    ///
+    /// For a `Muvera` index it first prepares the derived FDE column ([`Self::prepare_muvera_fde`]:
+    /// register + one-time backfill), then builds the physical single-vector ANN over that
+    /// `__fde_*` column with the **Dot** metric (its inner product approximates MaxSim),
+    /// while the persisted config stays the MUVERA one so query routing detects it.
     #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_vector_index(&self, config: VectorIndexConfig) -> Result<()> {
+        if let VectorIndexType::Muvera { inner, .. } = &config.index_type {
+            // Register + (first-time) backfill the derived FDE column.
+            self.prepare_muvera_fde(&config).await?;
+            let inner_cfg = VectorIndexConfig {
+                name: config.name.clone(),
+                label: config.label.clone(),
+                property: crate::storage::muvera_index::fde_derived_column(&config.name),
+                index_type: (**inner).clone(),
+                metric: DistanceMetric::Dot,
+                embedding_config: None,
+                metadata: config.metadata.clone(),
+            };
+            self.build_physical_vector_index(&inner_cfg).await?;
+        } else {
+            self.build_physical_vector_index(&config).await?;
+        }
+        self.schema_manager
+            .add_index(IndexDefinition::Vector(config))?;
+        self.schema_manager.save().await?;
+        Ok(())
+    }
+
+    /// Prepare a MUVERA index's derived `__fde_*` column: register it as an internal
+    /// schema property and, the FIRST time (when it was not already registered), backfill
+    /// it over all already-flushed rows via a full table rewrite (scan → splice the FDE
+    /// column into the `get_arrow_schema`-sorted position → `replace_table_atomic`),
+    /// mirroring the inverted-index "scan all rows at create time" precedent.
+    ///
+    /// The "already registered" guard makes this cheap on rebuilds: subsequent
+    /// `create_vector_index` calls (e.g. when another index on the label is added, or on
+    /// schema re-apply) skip the rewrite — the column is kept current by the flush-time
+    /// materializer (`Writer::materialize_fde_columns`). No-op for a non-MUVERA config, an
+    /// unresolved source dimension, a label with nothing flushed yet, or when no backend
+    /// is attached.
+    #[cfg(feature = "lance-backend")]
+    async fn prepare_muvera_fde(&self, config: &VectorIndexConfig) -> Result<()> {
+        use crate::storage::muvera_index::{fde_spec_for_config, splice_fde_batch};
+
+        let schema = self.schema_manager.schema();
+        let Some(spec) = fde_spec_for_config(&schema, config) else {
+            return Ok(());
+        };
+        spec.params.validate()?;
+
+        // Was the derived column already registered (i.e. a prior create already ran)?
+        let already_registered = schema
+            .properties
+            .get(&spec.label)
+            .is_some_and(|p| p.contains_key(&spec.derived_col));
+        self.schema_manager.add_internal_property(
+            &spec.label,
+            &spec.derived_col,
+            uni_common::DataType::Vector {
+                dimensions: spec.params.fde_dim(),
+            },
+            true,
+        )?;
+        // Backfill only on first registration, and only with a backend + flushed table.
+        if already_registered {
+            return Ok(());
+        }
+        let Some(backend) = self.backend.as_ref() else {
+            return Ok(());
+        };
+        let table = table_names::vertex_table_name(&spec.label);
+        if !backend.table_exists(&table).await.unwrap_or(false) {
+            // Nothing flushed yet (create-before-ingest): the flush path populates it.
+            return Ok(());
+        }
+
+        let label_id = schema
+            .label_id_by_name(&spec.label)
+            .ok_or_else(|| anyhow!("MUVERA: label '{}' not found", spec.label))?;
+        // Re-read schema AFTER add_internal_property so the FDE column is in the arrow schema.
+        let schema2 = self.schema_manager.schema();
+        let target_schema =
+            VertexDataset::new(&self.base_uri, &spec.label, label_id).get_arrow_schema(&schema2)?;
+        let source_dt = schema2
+            .properties
+            .get(&spec.label)
+            .and_then(|p| p.get(&spec.source_prop))
+            .map(|m| m.r#type.clone());
+        let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)?;
+
+        let batches = backend.scan(ScanRequest::all(&table)).await?;
+        let mut new_batches = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            new_batches.push(splice_fde_batch(
+                batch,
+                &target_schema,
+                &spec,
+                &encoder,
+                source_dt.as_ref(),
+            )?);
+        }
+        backend
+            .replace_table_atomic(&table, new_batches, target_schema)
+            .await?;
+        Ok(())
+    }
+
+    /// Build the physical Lance ANN index described by `config` over `config.property`
+    /// with `config.metric`. Does NOT persist the schema index definition — the caller
+    /// does, possibly under a different logical config (see MUVERA in
+    /// [`Self::create_vector_index`]).
+    #[cfg(feature = "lance-backend")]
+    async fn build_physical_vector_index(&self, config: &VectorIndexConfig) -> Result<()> {
         let label = &config.label;
         let property = &config.property;
         info!(
@@ -235,13 +365,13 @@ impl IndexManager {
             .get(label)
             .and_then(|props| props.get(property))
             .and_then(|meta| resolve_vector_dim(&meta.r#type));
-        let pq_sub = match config.index_type {
+        let pq_sub = match &config.index_type {
             VectorIndexType::IvfPq {
                 num_sub_vectors, ..
             }
             | VectorIndexType::HnswPq {
                 num_sub_vectors, ..
-            } => Some(num_sub_vectors as usize),
+            } => Some(*num_sub_vectors as usize),
             _ => None,
         };
         // Only the realistic misconfiguration (sub-vectors that don't divide a
@@ -266,14 +396,14 @@ impl IndexManager {
 
         match ds_wrapper.open_raw().await {
             Ok(mut lance_ds) => {
-                let metric_type = match config.metric {
+                let metric_type = match &config.metric {
                     DistanceMetric::L2 => MetricType::L2,
                     DistanceMetric::Cosine => MetricType::Cosine,
                     DistanceMetric::Dot => MetricType::Dot,
                     _ => return Err(anyhow!("Unsupported metric: {:?}", config.metric)),
                 };
 
-                let params = match config.index_type {
+                let params = match config.index_type.clone() {
                     VectorIndexType::Flat => {
                         let ivf = IvfBuildParams::new(1);
                         VectorIndexParams::with_ivf_flat_params(metric_type, ivf)
@@ -386,10 +516,6 @@ impl IndexManager {
                 );
             }
         }
-
-        self.schema_manager
-            .add_index(IndexDefinition::Vector(config))?;
-        self.schema_manager.save().await?;
 
         Ok(())
     }

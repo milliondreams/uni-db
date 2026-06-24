@@ -27,6 +27,7 @@ use lancedb::DistanceType;
 use lancedb::index::Index;
 use lancedb::index::vector::{IvfHnswSqIndexBuilder, IvfPqIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
+use uni_common::muvera::{DEFAULT_FDE_SEED, FdeEncoder, FdeParams};
 
 /// Top-k for recall.
 const K: usize = 10;
@@ -121,7 +122,182 @@ async fn main() -> Result<()> {
         "\nGate: a native first-stage index is worth building if it reaches recall@{K} >=0.95\n\
          at an nprobes LOW enough to be faster than the no-index (Flat) baseline above."
     );
+
+    // ---------------------------------------------------------------------
+    // Phase-3 MUVERA: encode each multi-vector into ONE fixed-dim FDE vector,
+    // run a single-vector ANN over the FDE column (Dot ≈ MaxSim), then re-rank
+    // the candidates by EXACT MaxSim. Sweep (k_sim, reps, d_proj) and the
+    // retrieval over-fetch to find the recall/dim/latency frontier vs the
+    // native multi-vector index above.
+    // ---------------------------------------------------------------------
+    println!("\n=== MUVERA (FDE first-stage + exact MaxSim re-rank) ===");
+    for &(k_sim, reps, d_proj) in &[(4u32, 20u32, 16u32), (4, 8, 8), (5, 20, 16)] {
+        let params = FdeParams {
+            k_sim,
+            reps,
+            d_proj,
+            input_dim: dim as u32,
+            seed: DEFAULT_FDE_SEED,
+        };
+        if params.validate().is_err() {
+            println!("  (k_sim={k_sim} reps={reps} d_proj={d_proj}) invalid params, skipped");
+            continue;
+        }
+        let fde_dim = params.fde_dim();
+        let encoder = FdeEncoder::new(&params).map_err(|e| anyhow!("FDE encoder: {e}"))?;
+        let name = format!("fde_{k_sim}_{reps}_{d_proj}");
+        let fde_table = build_fde_table(&conn, &name, &docs, &encoder, fde_dim).await?;
+        let nsub = pick_num_sub_vectors(fde_dim);
+        fde_table
+            .create_index(
+                &["fde"],
+                Index::IvfPq(
+                    IvfPqIndexBuilder::default()
+                        .distance_type(DistanceType::Dot)
+                        .num_partitions(N_PARTITIONS)
+                        .num_sub_vectors(nsub),
+                ),
+            )
+            .execute()
+            .await
+            .context("MUVERA IVF_PQ over FDE")?;
+        for &over in &[1usize, 2, 4, 8] {
+            let retrieval_k = (K * over).max(K);
+            let r = muvera_recall(
+                &fde_table,
+                &docs,
+                &queries,
+                &truth,
+                &encoder,
+                retrieval_k,
+                Some(16),
+            )
+            .await?;
+            println!(
+                "  MUVERA k_sim={k_sim} reps={reps} d_proj={d_proj} fde_dim={fde_dim} over={over}x: \
+                 recall@{K} = {:.3}   {:.1} ms/query",
+                r.0, r.1
+            );
+        }
+    }
+    println!(
+        "\nGate: MUVERA is worth building if recall@{K} >=0.95 after re-rank at LOWER total\n\
+         query latency than the native multi-vector IVF_PQ above at equal recall."
+    );
     Ok(())
+}
+
+/// Build a `{id, fde: FixedSizeList<Float32, fde_dim>}` table of document FDEs.
+async fn build_fde_table(
+    conn: &lancedb::Connection,
+    name: &str,
+    docs: &[Item],
+    encoder: &FdeEncoder,
+    fde_dim: usize,
+) -> Result<lancedb::Table> {
+    let ids = UInt64Array::from((0..docs.len() as u64).collect::<Vec<_>>());
+    let mut fde = FixedSizeListBuilder::new(Float32Builder::new(), fde_dim as i32);
+    for doc in docs {
+        let v = encoder
+            .encode_doc(&doc.tokens)
+            .map_err(|e| anyhow!("encode_doc: {e}"))?;
+        fde.values().append_slice(&v);
+        fde.append(true);
+    }
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(ids) as Arc<dyn Array>),
+        ("fde", Arc::new(fde.finish()) as Arc<dyn Array>),
+    ])
+    .context("assemble FDE batch")?;
+    conn.create_table(name, vec![batch])
+        .execute()
+        .await
+        .with_context(|| format!("create FDE table {name}"))
+}
+
+/// Exact MaxSim of one query against one doc's tokens: `Σ_i max_j cos(q_i, d_j)`.
+fn maxsim_one(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f32 {
+    query
+        .iter()
+        .map(|q| {
+            doc.iter()
+                .map(|d| cos(q, d))
+                .fold(f32::NEG_INFINITY, f32::max)
+        })
+        .sum()
+}
+
+/// Mean recall@k and latency for MUVERA: FDE ANN over-fetch then exact MaxSim re-rank.
+async fn muvera_recall(
+    fde_table: &lancedb::Table,
+    docs: &[Item],
+    queries: &[Item],
+    truth: &[Vec<u64>],
+    encoder: &FdeEncoder,
+    retrieval_k: usize,
+    nprobes: Option<usize>,
+) -> Result<(f64, f64)> {
+    let mut sum = 0.0;
+    let start = std::time::Instant::now();
+    for (q, t) in queries.iter().zip(truth) {
+        let fq = encoder
+            .encode_query(&q.tokens)
+            .map_err(|e| anyhow!("encode_query: {e}"))?;
+        let cand = fde_ann_topk(fde_table, &fq, retrieval_k, nprobes).await?;
+        let mut scored: Vec<(u64, f32)> = cand
+            .iter()
+            .map(|&id| (id, maxsim_one(&q.tokens, &docs[id as usize].tokens)))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let got: Vec<u64> = scored.into_iter().take(K).map(|(id, _)| id).collect();
+        let tset: BTreeSet<u64> = t.iter().copied().collect();
+        let hit = got.iter().filter(|id| tset.contains(id)).count();
+        sum += hit as f64 / t.len() as f64;
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0 / queries.len() as f64;
+    Ok((sum / queries.len() as f64, ms))
+}
+
+/// Single-vector ANN over the FDE column (Dot), returning candidate ids best-first.
+async fn fde_ann_topk(
+    table: &lancedb::Table,
+    fde_query: &[f32],
+    retrieval_k: usize,
+    nprobes: Option<usize>,
+) -> Result<Vec<u64>> {
+    let mut vq = table
+        .vector_search(fde_query.to_vec())?
+        .column("fde")
+        .distance_type(DistanceType::Dot)
+        .limit(retrieval_k);
+    if let Some(n) = nprobes {
+        vq = vq.nprobes(n);
+    }
+    let batches = vq
+        .execute()
+        .await?
+        .try_collect::<Vec<RecordBatch>>()
+        .await?;
+    let mut out: Vec<(u64, f32)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("missing id column"))?;
+        let dist = batch
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+            .ok_or_else(|| anyhow!("missing _distance column"))?;
+        for row in 0..batch.num_rows() {
+            out.push((ids.value(row), dist.value(row)));
+        }
+    }
+    out.sort_by(|a, b| a.1.total_cmp(&b.1));
+    Ok(out
+        .into_iter()
+        .take(retrieval_k)
+        .map(|(id, _)| id)
+        .collect())
 }
 
 /// Reads an `MVEC` binary file: `(dim, items)` where each item is ragged tokens.

@@ -684,7 +684,12 @@ async fn test_ddl_procedure_algorithm_hnsw_pq() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_ddl_procedure_default_algorithm_is_hnsw_sq() -> Result<()> {
+async fn test_ddl_procedure_default_algorithm_is_ivf_pq() -> Result<()> {
+    // The `uni.schema.createIndex` procedure and the Cypher DDL now share ONE option
+    // parser (`uni_common::vector_index_opts`), so a vector index created without an
+    // explicit algorithm uses the canonical default IVF_PQ on BOTH paths. (Previously the
+    // procedure defaulted to HNSW_SQ while the DDL defaulted to IVF_PQ — this asserts that
+    // divergence is gone.)
     let db = Uni::temporary().build().await?;
 
     db.schema()
@@ -711,10 +716,10 @@ async fn test_ddl_procedure_default_algorithm_is_hnsw_sq() -> Result<()> {
     if let IndexDefinition::Vector(cfg) = idx {
         assert_eq!(
             cfg.index_type,
-            VectorIndexType::HnswSq {
-                m: 16,
-                ef_construction: 200,
-                num_partitions: None,
+            VectorIndexType::IvfPq {
+                num_partitions: 256,
+                num_sub_vectors: 16,
+                bits_per_subvector: 8,
             }
         );
     } else {

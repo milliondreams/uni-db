@@ -569,7 +569,21 @@ pub enum VectorAlgo {
         sub_vectors: u32,
         partitions: Option<u32>,
     },
+    /// MUVERA (ColBERT/MaxSim) Fixed-Dimensional Encoding: the source multi-vector is
+    /// encoded into a derived single-vector column indexed by `inner`. Use
+    /// [`crate::api::schema::DEFAULT_FDE_SEED`] for `seed` unless reproducing a specific
+    /// transform. See `uni_common::muvera`.
+    Muvera {
+        k_sim: u32,
+        reps: u32,
+        d_proj: u32,
+        seed: u64,
+        inner: Box<VectorAlgo>,
+    },
 }
+
+/// Default MUVERA FDE seed for [`VectorAlgo::Muvera`] (re-exported for ergonomics).
+pub use uni_common::muvera::DEFAULT_FDE_SEED;
 
 impl VectorAlgo {
     fn into_internal(self) -> VectorIndexType {
@@ -629,6 +643,19 @@ impl VectorAlgo {
                 ef_construction,
                 num_sub_vectors: sub_vectors,
                 num_partitions: partitions,
+            },
+            VectorAlgo::Muvera {
+                k_sim,
+                reps,
+                d_proj,
+                seed,
+                inner,
+            } => VectorIndexType::Muvera {
+                k_sim,
+                reps,
+                d_proj,
+                seed,
+                inner: Box::new(inner.into_internal()),
             },
         }
     }

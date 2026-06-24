@@ -357,21 +357,57 @@ pub(crate) async fn multivector_rerank(
     opts: uni_store::VectorQueryOpts,
     metric: &DistanceMetric,
 ) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
-    // 1. Candidate generation over flushed/indexed data. `multivector_search`
-    //    skips the Lance scan automatically when the table does not exist yet
-    //    (nothing flushed), so an L0-only corpus still works.
-    let lance_hits = storage
-        .multivector_search(
-            label,
-            property,
-            query,
-            retrieval_k,
-            filter,
-            opts,
-            Some(query_ctx),
-        )
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    // 1. Candidate generation over flushed/indexed data.
+    //
+    //    MUVERA fast path (main line only): if the property has a MUVERA index, encode
+    //    the query into a Fixed-Dimensional Encoding and run the single-vector ANN over
+    //    the derived `__fde_*` column (Dot metric). This replaces the heavier native
+    //    multi-vector ANN with a fast single-vector ANN; the exact MaxSim re-rank below
+    //    is unchanged. On forks we keep the native brute-force branch scan (the FDE index
+    //    isn't branched), and `multivector_search` also handles L0-only corpora.
+    let lance_hits = {
+        let muvera_hits = if storage.fork_scope().is_none() {
+            let schema = storage.schema_manager().schema();
+            schema
+                .vector_index_for_property(label, property)
+                .and_then(|cfg| uni_store::storage::muvera_index::fde_spec_for_config(&schema, cfg))
+        } else {
+            None
+        };
+        match muvera_hits {
+            Some(spec) => {
+                let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                let fde_q = encoder
+                    .encode_query(query)
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                storage
+                    .muvera_fde_candidates(
+                        label,
+                        &spec.derived_col,
+                        &fde_q,
+                        retrieval_k,
+                        filter,
+                        opts,
+                        Some(query_ctx),
+                    )
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+            }
+            None => storage
+                .multivector_search(
+                    label,
+                    property,
+                    query,
+                    retrieval_k,
+                    filter,
+                    opts,
+                    Some(query_ctx),
+                )
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+        }
+    };
 
     // 2. Live L0 candidates (and tombstones) for the label.
     let (l0_live, tombstoned) = uni_store::collect_l0_label_candidates(query_ctx, label);

@@ -14,7 +14,6 @@ use uni_common::UniError;
 use uni_common::core::schema::{
     DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
     InvertedIndexConfig, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
-    VectorIndexType,
 };
 
 // Re-export types used by the sync and async API modules.
@@ -626,16 +625,17 @@ pub fn create_index_definition(
             where_clause: None,
             metadata: Default::default(),
         })),
+        // No options here, so use the canonical defaults from the shared parser (IVF_PQ /
+        // Cosine) — identical to the DDL, procedure, and config-map paths.
         "vector" => Ok(IndexDefinition::Vector(VectorIndexConfig {
             name: format!("idx_{}_{}_vec", label, property),
             label: label.to_string(),
             property: property.to_string(),
-            index_type: VectorIndexType::HnswSq {
-                m: 16,
-                ef_construction: 200,
-                num_partitions: None,
-            },
-            metric: DistanceMetric::Cosine,
+            index_type: uni_common::vector_index_opts::build_vector_index_type(
+                &uni_common::vector_index_opts::VectorIndexOpts::default(),
+            ),
+            metric: uni_common::vector_index_opts::parse_vector_metric(None)
+                .unwrap_or(DistanceMetric::Cosine),
             embedding_config: None,
             metadata: Default::default(),
         })),
@@ -684,91 +684,30 @@ pub fn create_index_definition_from_config(
         "inverted" => create_index_definition(label, property, "inverted"),
 
         "vector" => {
-            let algorithm = config
-                .get("algorithm")
-                .and_then(|v| v.as_str())
-                .unwrap_or("hnsw");
-            let metric = match config
-                .get("metric")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cosine")
-                .to_lowercase()
-                .as_str()
-            {
-                "l2" => DistanceMetric::L2,
-                "dot" => DistanceMetric::Dot,
-                _ => DistanceMetric::Cosine,
-            };
-
-            let partitions = || {
-                config
-                    .get("partitions")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(256) as u32
-            };
-            let m = || config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
-            let ef_construction = || {
-                config
-                    .get("ef_construction")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as u32
-            };
-
-            let index_type = match algorithm.to_lowercase().as_str() {
-                "flat" => VectorIndexType::Flat,
-                "ivf_flat" | "ivfflat" => VectorIndexType::IvfFlat {
-                    num_partitions: partitions(),
+            // Parsed via the SAME uni-common helpers as the Cypher DDL / procedure paths
+            // so dense / native-multivector / MUVERA behave identically across surfaces
+            // (incl. the canonical default ANN = IVF_PQ and `algorithm: "muvera"`).
+            let cfg_u32 = |k: &str| config.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+            let cfg_u8 = |k: &str| config.get(k).and_then(|v| v.as_u64()).map(|n| n as u8);
+            let metric = uni_common::vector_index_opts::parse_vector_metric(
+                config.get("metric").and_then(|v| v.as_str()),
+            )
+            .map_err(|e| e.to_string())?;
+            let index_type = uni_common::vector_index_opts::build_vector_index_type(
+                &uni_common::vector_index_opts::VectorIndexOpts {
+                    type_name: config.get("algorithm").and_then(|v| v.as_str()),
+                    partitions: cfg_u32("partitions"),
+                    m: cfg_u32("m"),
+                    ef_construction: cfg_u32("ef_construction"),
+                    sub_vectors: cfg_u32("sub_vectors"),
+                    num_bits: cfg_u8("num_bits").or_else(|| cfg_u8("bits_per_subvector")),
+                    k_sim: cfg_u32("k_sim"),
+                    reps: cfg_u32("reps"),
+                    d_proj: cfg_u32("d_proj"),
+                    seed: config.get("seed").and_then(|v| v.as_u64()),
+                    inner: config.get("inner").and_then(|v| v.as_str()),
                 },
-                "ivf_pq" | "ivfpq" => VectorIndexType::IvfPq {
-                    num_partitions: partitions(),
-                    num_sub_vectors: config
-                        .get("sub_vectors")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(16) as u32,
-                    bits_per_subvector: config
-                        .get("bits_per_subvector")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(8) as u8,
-                },
-                "ivf_sq" | "ivfsq" => VectorIndexType::IvfSq {
-                    num_partitions: partitions(),
-                },
-                "ivf_rq" | "ivfrq" => VectorIndexType::IvfRq {
-                    num_partitions: partitions(),
-                    num_bits: config
-                        .get("num_bits")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u8),
-                },
-                "hnsw_flat" | "hnswflat" => VectorIndexType::HnswFlat {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-                "hnsw_pq" | "hnswpq" => VectorIndexType::HnswPq {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_sub_vectors: config
-                        .get("sub_vectors")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(16) as u32,
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-                _ => VectorIndexType::HnswSq {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-            };
+            );
 
             let embedding_config = config.get("embedding").and_then(|v| {
                 let obj = v.as_object()?;

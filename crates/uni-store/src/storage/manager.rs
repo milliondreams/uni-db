@@ -1272,6 +1272,7 @@ impl StorageManager {
 
     pub fn index_manager(&self) -> IndexManager {
         IndexManager::new(&self.base_uri, self.schema_manager.clone())
+            .with_backend(self.backend_arc())
     }
 
     // ========================================================================
@@ -1813,6 +1814,58 @@ impl StorageManager {
         }
 
         Ok(results)
+    }
+
+    /// First-stage candidate generation for a MUVERA index: single-vector ANN over the
+    /// derived FDE column with the **Dot** metric (the FDE inner product approximates
+    /// MaxSim — the physical index was built with Dot, see
+    /// `IndexManager::create_vector_index`).
+    ///
+    /// Flushed/indexed data ONLY — unlike [`Self::vector_search`] this deliberately does
+    /// NOT merge L0, because the live L0 has no FDE column (it is materialised at flush by
+    /// `Writer::materialize_fde_columns`). L0 visibility is provided one layer up by
+    /// `multivector_rerank`, which unions live L0 vids and re-scores everything by exact
+    /// MaxSim. Scores returned here are placeholder distances (the caller re-ranks).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn muvera_fde_candidates(
+        &self,
+        label: &str,
+        fde_column: &str,
+        fde_query: &[f32],
+        k: usize,
+        filter: Option<&str>,
+        opts: VectorQueryOpts,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Vec<(Vid, f32)>> {
+        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
+        if !backend.table_exists(&name).await.unwrap_or(false) {
+            // Nothing flushed yet; L0-only candidates are merged upstream.
+            return Ok(Vec::new());
+        }
+
+        let mut filter_parts = vec![Self::build_active_filter(filter)];
+        if ctx.is_some()
+            && let Some(hwm) = self.version_high_water_mark()
+        {
+            filter_parts.push(format!("_version <= {}", hwm));
+        }
+        let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+
+        let batches = backend
+            .vector_search(
+                &name,
+                fde_column,
+                fde_query,
+                k,
+                BackendMetric::Dot,
+                combined_filter,
+                opts,
+            )
+            .await?;
+        extract_vid_score_pairs(&batches, "_vid", "_distance")
     }
 
     /// Late-interaction (ColBERT / MaxSim) first-stage search over a multi-vector

@@ -526,7 +526,8 @@ impl IndexRebuildManager {
     /// Execute the actual index rebuild for a label.
     #[cfg(feature = "lance-backend")]
     async fn execute_rebuild(&self, label: &str) -> Result<()> {
-        let idx_mgr = IndexManager::new(self.storage.base_path(), self.schema_manager.clone());
+        let idx_mgr = IndexManager::new(self.storage.base_path(), self.schema_manager.clone())
+            .with_backend(self.storage.backend_arc());
         idx_mgr.rebuild_indexes_for_label(label).await
     }
 

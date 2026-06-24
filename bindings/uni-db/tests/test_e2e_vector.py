@@ -305,3 +305,114 @@ def test_vector_search_different_dimensions(empty_db):
 
     assert len(results) == 2
     assert results[0]["distance"] < 0.01
+
+
+# ---------------------------------------------------------------------------
+# MUVERA (ColBERT / MaxSim) multi-vector index via the Python binding (issue #96)
+# ---------------------------------------------------------------------------
+
+_MV_DIM = 8
+
+
+def _basis(i):
+    v = [0.0] * _MV_DIM
+    v[i] = 1.0
+    return v
+
+
+def _vec_lit(vals):
+    return "[" + ",".join(str(float(x)) for x in vals) + "]"
+
+
+def _mv_lit(tokens):
+    return "[" + ",".join(_vec_lit(t) for t in tokens) + "]"
+
+
+def test_muvera_index_create_and_query(empty_db):
+    """MUVERA index via the Python config-map surface: declare a `list:vector` field,
+    create a `{"type":"vector","algorithm":"muvera",...}` index, then `uni.vector.query`
+    ranks the exact-MaxSim maximizer first (FDE first stage + exact MaxSim re-rank).
+
+    Exercises the Python binding's MUVERA option-parsing path (shared `uni-common`
+    parser), which the Rust e2e suite cannot reach. Token convention: query `[e0,e1]`;
+    the `target` doc has identical tokens (MaxSim 2.0); noise docs are orthogonal."""
+    session = empty_db.session()
+    (
+        empty_db.schema()
+        .label("Doc")
+        .property("title", "string")
+        .property("tokens", "list:vector:8")
+        .done()
+        .apply()
+    )
+
+    query_tokens = [_basis(0), _basis(1)]
+    tx = session.tx()
+    tx.execute(f"CREATE (d:Doc {{title: 'target', tokens: {_mv_lit(query_tokens)}}})")
+    for i in range(20):
+        # Orthogonal noise (tokens from e2..e7) → MaxSim well below the target's 2.0.
+        toks = [_basis(2 + (i % 6)), _basis(2 + ((i + 1) % 6))]
+        tx.execute(f"CREATE (d:Doc {{title: 'doc{i}', tokens: {_mv_lit(toks)}}})")
+    tx.commit()
+    empty_db.flush()
+
+    # Create the MUVERA index over the already-flushed rows (backfill path).
+    empty_db.schema().label("Doc").index(
+        "tokens",
+        {
+            "type": "vector",
+            "algorithm": "muvera",
+            "k_sim": 4,
+            "reps": 8,
+            "d_proj": 8,
+            "inner": "flat",
+        },
+    ).apply()
+
+    results = session.query(f"""
+        CALL uni.vector.query('Doc', 'tokens', {_mv_lit(query_tokens)}, 5)
+        YIELD node, score
+        RETURN node.title AS title, score
+    """)
+    titles = [r["title"] for r in results]
+    assert titles, "MUVERA query should return results"
+    assert titles[0] == "target", (
+        f"MUVERA (Python) should rank the MaxSim maximizer first: {titles}"
+    )
+
+
+def test_muvera_index_is_hidden_from_user_columns(empty_db):
+    """The derived `__fde_*` column must not leak into a Python `RETURN n` node map."""
+    session = empty_db.session()
+    (
+        empty_db.schema()
+        .label("Doc")
+        .property("title", "string")
+        .property("tokens", "list:vector:8")
+        .done()
+        .apply()
+    )
+    tx = session.tx()
+    tx.execute(
+        f"CREATE (d:Doc {{title: 'a', tokens: {_mv_lit([_basis(0), _basis(1)])}}})"
+    )
+    tx.commit()
+    empty_db.flush()
+    empty_db.schema().label("Doc").index(
+        "tokens",
+        {
+            "type": "vector",
+            "algorithm": "muvera",
+            "k_sim": 4,
+            "reps": 8,
+            "d_proj": 8,
+            "inner": "flat",
+        },
+    ).apply()
+
+    rows = session.query("MATCH (d:Doc {title:'a'}) RETURN keys(d) AS k")
+    keys = rows[0]["k"]
+    assert not any(str(x).startswith("__") for x in keys), (
+        f"internal FDE column leaked into keys(d): {keys}"
+    )
+    assert "tokens" in keys

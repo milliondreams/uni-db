@@ -22,6 +22,7 @@ pub mod json_index;
 pub mod main_edge;
 pub mod main_vertex;
 pub mod manager;
+pub mod muvera_index;
 pub mod property_builder;
 pub mod resilient_store;
 pub mod shadow_csr;

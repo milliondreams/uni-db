@@ -896,6 +896,24 @@ pub enum VectorIndexType {
         #[serde(default)]
         num_partitions: Option<u32>,
     },
+    /// MUVERA (arXiv:2405.19504) Fixed-Dimensional Encoding for multi-vector
+    /// (ColBERT/MaxSim) columns. The source multi-vector is encoded into a single
+    /// derived `Vector<fde_dim>` column, and `inner` is the single-vector ANN index
+    /// type built over that derived column (always with the `Dot` metric — the FDE
+    /// inner product approximates MaxSim). The exact MaxSim re-rank still uses the
+    /// `VectorIndexConfig.metric`. See `uni_query_functions::muvera`.
+    Muvera {
+        /// SimHash hyperplanes per repetition (`2^k_sim` buckets).
+        k_sim: u32,
+        /// Independent repetitions concatenated into the FDE.
+        reps: u32,
+        /// Inner-projection target dim (`0` = no projection, use the source dim).
+        d_proj: u32,
+        /// Master seed; persisted so query-time encoding matches doc-time encoding.
+        seed: u64,
+        /// The single-vector ANN index built over the derived FDE column.
+        inner: Box<VectorIndexType>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1433,6 +1451,53 @@ impl SchemaManager {
             },
         );
         // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
+        Ok(())
+    }
+
+    /// Register an INTERNAL property (underscore-prefixed name allowed) that is
+    /// materialised by the storage layer, not written by the user — e.g. the MUVERA
+    /// `__fde_*` derived column. Bypasses the user-facing underscore-prefix rule but
+    /// still rejects storage-layer name collisions. Idempotent: a no-op if the property
+    /// already exists with the same type (so re-creating an index is safe).
+    pub fn add_internal_property(
+        &self,
+        label_or_type: &str,
+        prop_name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<()> {
+        validate_reserved_property_name(prop_name)?;
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let version = schema.schema_version;
+        let props = schema
+            .properties
+            .entry(label_or_type.to_string())
+            .or_default();
+
+        if let Some(existing) = props.get(prop_name) {
+            if existing.r#type == data_type {
+                return Ok(()); // idempotent re-registration
+            }
+            return Err(anyhow!(
+                "Internal property '{}' already exists for '{}' with a different type",
+                prop_name,
+                label_or_type
+            ));
+        }
+
+        props.insert(
+            prop_name.to_string(),
+            PropertyMeta {
+                r#type: data_type,
+                nullable,
+                added_in: version,
+                state: SchemaElementState::Active,
+                generation_expression: None,
+                description: None,
+            },
+        );
         schema.bump_version();
         Ok(())
     }

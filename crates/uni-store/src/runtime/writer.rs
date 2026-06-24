@@ -3303,6 +3303,60 @@ impl Writer {
         Ok(())
     }
 
+    /// Materialise MUVERA FDE columns for the about-to-flush L0. Mirrors
+    /// [`Self::drain_pending_embeddings`]: for each MUVERA index, compute the derived
+    /// Fixed-Dimensional Encoding from each row's source multi-vector and inject it into
+    /// that row's `vertex_properties` (so the normal column builder writes the
+    /// `__fde_*` column with no hot-path change). For partial-write rows that touched the
+    /// source column, the derived column is added to `vertex_partial_keys` so the partial
+    /// MergeInsert batch carries the recomputed FDE (avoids staleness on `SET`).
+    ///
+    /// No-op when the schema has no MUVERA index. Unlike auto-embed, the FDE is a pure,
+    /// deterministic, in-process transform — no runtime/embedding service needed.
+    fn materialize_fde_columns(&self, old_l0_arc: &Arc<RwLock<L0Buffer>>) -> Result<()> {
+        let schema = self.schema_manager.schema();
+        let specs = crate::storage::muvera_index::fde_specs(&schema);
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let mut guard = old_l0_arc.write();
+        for spec in &specs {
+            let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)
+                .map_err(|e| anyhow!("MUVERA index '{}': {e}", spec.index_name))?;
+            // VIDs of this label currently in L0 (collect first to avoid a borrow
+            // conflict with the per-row mutation below).
+            let vids: Vec<Vid> = guard
+                .vertex_labels
+                .iter()
+                .filter(|(_, labels)| labels.contains(&spec.label))
+                .map(|(vid, _)| *vid)
+                .collect();
+            for vid in vids {
+                // Decode the source multi-vector tokens (borrow ends before the mutation).
+                let tokens = match guard
+                    .vertex_properties
+                    .get(&vid)
+                    .and_then(|p| p.get(&spec.source_prop))
+                {
+                    Some(v) => crate::storage::muvera_index::value_to_multivec(v),
+                    None => continue, // source absent → leave the FDE column NULL
+                };
+                let fde = encoder.encode_doc(&tokens).map_err(|e| {
+                    anyhow!("MUVERA index '{}' vid {:?}: {e}", spec.index_name, vid)
+                })?;
+                if let Some(props) = guard.vertex_properties.get_mut(&vid) {
+                    props.insert(spec.derived_col.clone(), Value::Vector(fde));
+                }
+                if let Some(touched) = guard.vertex_partial_keys.get_mut(&vid)
+                    && touched.contains(&spec.source_prop)
+                {
+                    touched.insert(spec.derived_col.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Process embeddings for a batch of vertices efficiently.
     ///
     /// Groups vertices by embedding config and makes batched API calls to the
@@ -3717,6 +3771,11 @@ impl Writer {
         // be empty). On-demand reads of the embedding column are a TODO
         // for a future revision (see UniConfig::defer_embeddings docs).
         self.drain_pending_embeddings(&old_l0_arc).await?;
+
+        // Materialise MUVERA FDE columns from each row's source multi-vector (pure/sync;
+        // no-op without a MUVERA index). Runs after embeddings so a row can be both
+        // auto-embedded and FDE-encoded.
+        self.materialize_fde_columns(&old_l0_arc)?;
 
         let schema = self.schema_manager.schema();
         // 2. Acquire Read lock on Old L0 for flushing

@@ -469,9 +469,21 @@ def python_type_to_uni(type_hint: Any, *, nullable: bool = False) -> tuple[str, 
     if type_hint in TYPE_MAP:
         return TYPE_MAP[type_hint], nullable
 
-    # Handle generic dict types
+    # Handle generic dict types -> typed MAP<STRING, V> when the key is `str` and the
+    # value type maps to a concrete Uni type; otherwise schemaless JSON. Keys must be
+    # `str` because the storage value model (Value::Map) is string-keyed.
     origin = get_origin(type_hint)
     if origin is dict:
+        args = get_args(type_hint)
+        if len(args) == 2 and args[0] is str:
+            try:
+                val_uni, _ = python_type_to_uni(args[1])
+            except TypeMappingError:
+                val_uni = "json"
+            # Recurse handles nested values: dict[str, list[int]] -> map:string:list:int64,
+            # dict[str, Vector[N]] -> map:string:vector:N, dict[str, dict[str,int]] -> nested.
+            if val_uni != "json":
+                return f"map:string:{val_uni}", nullable
         return "json", nullable
 
     # Handle forward references (strings)

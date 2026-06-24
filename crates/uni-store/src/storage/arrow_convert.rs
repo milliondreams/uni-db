@@ -144,7 +144,7 @@ fn parse_datetime_to_nanos(s: &str) -> Option<i64> {
 /// Arrow represents Map columns as `List(Struct { key, value })`. This helper
 /// checks whether the given array matches that layout and, if so, converts the
 /// key/value pairs back into a `HashMap<String, Value>`.
-fn try_reconstruct_map(arr: &ArrayRef) -> Option<HashMap<String, Value>> {
+pub(crate) fn try_reconstruct_map(arr: &ArrayRef) -> Option<HashMap<String, Value>> {
     let structs = arr.as_any().downcast_ref::<StructArray>()?;
     let fields = structs.fields();
     if fields.len() != 2 || fields[0].name() != "key" || fields[1].name() != "value" {
@@ -1686,6 +1686,54 @@ impl<'a> PropertyExtractor<'a> {
                     }
                 },
             ),
+            DataType::Int32 => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                Int32Builder::new(),
+                arrow_schema::DataType::Int32,
+                None,
+                |v, b: &mut Int32Builder| match v.as_i64().and_then(|n| i32::try_from(n).ok()) {
+                    Some(n) => b.append_value(n),
+                    None => b.append_null(),
+                },
+            ),
+            DataType::Float64 => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                Float64Builder::new(),
+                arrow_schema::DataType::Float64,
+                None,
+                |v, b: &mut Float64Builder| match v.as_f64() {
+                    Some(f) => b.append_value(f),
+                    None => b.append_null(),
+                },
+            ),
+            DataType::Float32 => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                Float32Builder::new(),
+                arrow_schema::DataType::Float32,
+                None,
+                |v, b: &mut Float32Builder| match v.as_f64() {
+                    Some(f) => b.append_value(f as f32),
+                    None => b.append_null(),
+                },
+            ),
+            DataType::Bool => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                BooleanBuilder::new(),
+                arrow_schema::DataType::Boolean,
+                None,
+                |v, b: &mut BooleanBuilder| match v.as_bool() {
+                    Some(x) => b.append_value(x),
+                    None => b.append_null(),
+                },
+            ),
             DataType::Bytes => self.build_typed_map(
                 len,
                 deleted,
@@ -1703,7 +1751,26 @@ impl<'a> PropertyExtractor<'a> {
                     }
                 },
             ),
-            _ => Err(anyhow!("Unsupported value type for Map: {:?}", value)),
+            // Nested / non-scalar value types (Vector, List, Map, temporal, …): no typed
+            // Arrow builder — CypherValue-encode each value into an UNMARKED LargeBinary
+            // child (no `uni_raw_bytes`), so the read path (`try_reconstruct_map` →
+            // `arrow_to_value` LargeBinary arm) decodes it through the tagged codec. This
+            // mirrors how schemaless/overflow maps are stored and handles arbitrary nesting.
+            _ => self.build_typed_map(
+                len,
+                deleted,
+                &get_props,
+                LargeBinaryBuilder::new(),
+                arrow_schema::DataType::LargeBinary,
+                None,
+                |v, b: &mut LargeBinaryBuilder| {
+                    if v.is_null() {
+                        b.append_null();
+                    } else {
+                        b.append_value(uni_common::cypher_value_codec::encode(v));
+                    }
+                },
+            ),
         }
     }
 

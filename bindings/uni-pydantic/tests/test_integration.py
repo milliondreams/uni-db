@@ -470,3 +470,34 @@ class TestMultiVectorField:
         assert all(isinstance(v, Vector) for v in found.tokens)
         assert found.tokens[0].values == [1.0, 0.0]
         assert found.tokens[1].values == [0.0, 1.0]
+
+
+class MapNode(UniNode):
+    """Model exercising typed MAP<STRING, V> properties (issue #105)."""
+
+    __label__ = "MapNode"
+
+    name: str = Field(unique=True, index="btree")
+    scores: dict[str, float] = {}
+    nested: dict[str, list[int]] = {}
+
+
+class TestTypedMapProperty:
+    """OGM round-trip for `dict[str, V]` -> typed MAP<STRING, V>."""
+
+    def test_typed_map_roundtrip(self, session):
+        session.register(MapNode)
+        session.sync_schema()
+
+        n = MapNode(
+            name="a",
+            scores={"x": 1.5, "y": 2.25},
+            nested={"k": [1, 2, 3], "m": [4]},
+        )
+        session.add(n)
+        session.commit()
+
+        found = session.get(MapNode, vid=n.vid)
+        assert found is not None
+        assert found.scores == {"x": 1.5, "y": 2.25}
+        assert found.nested == {"k": [1, 2, 3], "m": [4]}

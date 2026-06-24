@@ -752,9 +752,13 @@ property_definition = {
 // whitespace-free string the walker forwards to the backend `parse_data_type`.
 // Ordered choice tries the parameterized forms before the bare-token fallback,
 // so scalars (STRING, INT, bare VECTOR) still parse unchanged (backward compatible).
-type_specification = ${ type_vector | type_list | identifier_or_keyword }
+type_specification = ${ type_vector | type_list | type_map | identifier_or_keyword }
 type_vector = ${ VECTOR ~ "(" ~ ASCII_DIGIT+ ~ ")" }
 type_list = ${ ^"list" ~ !ident_char ~ "<" ~ type_specification ~ ">" }
+// `MAP<K, V>` — recursive (V may itself be LIST/VECTOR/MAP); a space after the comma is
+// allowed (the common form). The whole span is forwarded to the backend `parse_data_type`,
+// which does the depth-aware K/V split and enforces a STRING key.
+type_map = ${ ^"map" ~ !ident_char ~ "<" ~ type_specification ~ "," ~ " "* ~ type_specification ~ ">" }
 nullable_constraint = { NOT ~ NULL | NULL }
 default_value = { DEFAULT ~ expression }
 description_clause = { DESCRIPTION_KW ~ string }

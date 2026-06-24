@@ -53,6 +53,54 @@ fn test_property_list_and_nested_types() {
 }
 
 #[test]
+fn test_property_map_types() {
+    // Scalar + nested map value types; whitespace after the comma is optional and the
+    // captured span is forwarded verbatim to the backend parse_data_type.
+    let cmd = parse_schema(
+        "CREATE LABEL Doc (a MAP<STRING, FLOAT>, b MAP<STRING,INT>, \
+         c MAP<STRING, LIST<INT>>, d MAP<STRING, MAP<STRING, INT>>)",
+    );
+    let SchemaCommand::CreateLabel(c) = cmd else {
+        panic!("Expected CreateLabel");
+    };
+    assert_eq!(c.properties[0].data_type, "MAP<STRING, FLOAT>");
+    assert_eq!(c.properties[1].data_type, "MAP<STRING,INT>");
+    assert_eq!(c.properties[2].data_type, "MAP<STRING, LIST<INT>>");
+    assert_eq!(c.properties[3].data_type, "MAP<STRING, MAP<STRING, INT>>");
+}
+
+#[test]
+fn test_map_type_does_not_swallow_constraints() {
+    let cmd = parse_schema(
+        "CREATE LABEL Doc (m MAP<STRING, INT> NOT NULL, e MAP<STRING, FLOAT> DESCRIPTION 'scores', k INT)",
+    );
+    let SchemaCommand::CreateLabel(c) = cmd else {
+        panic!("Expected CreateLabel");
+    };
+    assert_eq!(c.properties[0].data_type, "MAP<STRING, INT>");
+    assert!(!c.properties[0].nullable, "NOT NULL must not be swallowed");
+    assert_eq!(c.properties[1].data_type, "MAP<STRING, FLOAT>");
+    // The map type didn't consume the following property.
+    assert_eq!(c.properties[2].name, "k");
+    assert_eq!(c.properties[2].data_type, "INT");
+}
+
+#[test]
+fn test_map_keyword_usable_as_identifier() {
+    // `map`/`MAP` must remain usable as a label name and a property name — the `!ident_char`
+    // guard keeps the `type_map` rule from shadowing ordinary identifiers.
+    let cmd = parse_schema("CREATE LABEL Map (map STRING, mapping INT)");
+    let SchemaCommand::CreateLabel(c) = cmd else {
+        panic!("Expected CreateLabel");
+    };
+    assert_eq!(c.name, "Map");
+    assert_eq!(c.properties[0].name, "map");
+    assert_eq!(c.properties[0].data_type, "STRING");
+    assert_eq!(c.properties[1].name, "mapping");
+    assert_eq!(c.properties[1].data_type, "INT");
+}
+
+#[test]
 fn test_parameterized_type_does_not_swallow_constraints() {
     // The parameterized type must not greedily consume a following constraint.
     let cmd = parse_schema(

@@ -566,6 +566,24 @@ pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
         }
         let inner = parse_data_type(elem_type)?;
         Ok(DataType::List(Box::new(inner)))
+    } else if let Some(rest) = data_type.strip_prefix("map:") {
+        // `map:KEY:VALUE` — KEY is always a scalar STRING (no `:`), so split on the FIRST
+        // `:` and recurse on the FULL VALUE remainder so nested values parse, e.g.
+        // `map:string:list:int64`, `map:string:vector:8`, `map:string:map:string:int64`.
+        let (key_str, value_str) = rest.split_once(':').ok_or_else(|| {
+            "Map type must be 'map:KEY:VALUE', e.g., 'map:string:float64'".to_string()
+        })?;
+        if key_str.is_empty() || value_str.is_empty() {
+            return Err(
+                "Map type must specify both key and value, e.g., 'map:string:int64'".to_string(),
+            );
+        }
+        let key_type = parse_data_type(key_str)?;
+        if !matches!(key_type, DataType::String) {
+            return Err(format!("MAP key type must be STRING, got: {key_str}"));
+        }
+        let value_type = parse_data_type(value_str)?;
+        Ok(DataType::Map(Box::new(key_type), Box::new(value_type)))
     } else {
         match data_type.to_lowercase().as_str() {
             "string" => Ok(DataType::String),
@@ -835,5 +853,45 @@ mod tests {
     #[test]
     fn parse_data_type_empty_list_element_errors() {
         assert!(parse_data_type("list:").is_err());
+    }
+
+    #[test]
+    fn parse_data_type_map_scalar_and_nested() {
+        assert_eq!(
+            parse_data_type("map:string:float64").unwrap(),
+            DataType::Map(Box::new(DataType::String), Box::new(DataType::Float64))
+        );
+        // Nested value types recurse on the full remainder after the first ':'.
+        assert_eq!(
+            parse_data_type("map:string:list:int64").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::List(Box::new(DataType::Int64)))
+            )
+        );
+        assert_eq!(
+            parse_data_type("map:string:vector:8").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::Vector { dimensions: 8 })
+            )
+        );
+        assert_eq!(
+            parse_data_type("map:string:map:string:int64").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::Map(
+                    Box::new(DataType::String),
+                    Box::new(DataType::Int64)
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn parse_data_type_map_rejects_bad_forms() {
+        assert!(parse_data_type("map:int64:string").is_err()); // non-STRING key
+        assert!(parse_data_type("map:string").is_err()); // missing value
+        assert!(parse_data_type("map:string:").is_err()); // empty value
     }
 }

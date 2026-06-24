@@ -473,6 +473,19 @@ fn parse_data_type(s: &str) -> Result<DataType> {
         let inner_type = parse_data_type(inner)?;
         return Ok(DataType::List(Box::new(inner_type)));
     }
+    if s.to_uppercase().starts_with("MAP<") && s.ends_with('>') {
+        let (k_str, v_str) = split_map_kv(&s[4..s.len() - 1])?;
+        let key_type = parse_data_type(&k_str)?;
+        if !matches!(key_type, DataType::String) {
+            return Err(UniError::InvalidArgument {
+                arg: "type".into(),
+                message: format!("MAP key type must be STRING, got: {k_str}"),
+            }
+            .into());
+        }
+        let value_type = parse_data_type(&v_str)?;
+        return Ok(DataType::Map(Box::new(key_type), Box::new(value_type)));
+    }
 
     match s.to_uppercase().as_str() {
         "STRING" | "UTF8" => Ok(DataType::String),
@@ -491,4 +504,34 @@ fn parse_data_type(s: &str) -> Result<DataType> {
         }
         .into()),
     }
+}
+
+/// Split a `MAP<K, V>` inner string on the top-level comma, respecting `<>`/`()` depth so
+/// nested value types split at the right comma. Returns trimmed `(key, value)` strings.
+fn split_map_kv(inner: &str) -> Result<(String, String)> {
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let k = inner[..i].trim();
+                let v = inner[i + 1..].trim();
+                if k.is_empty() || v.is_empty() {
+                    return Err(UniError::InvalidArgument {
+                        arg: "type".into(),
+                        message: "MAP<K,V> requires both a key and a value type".into(),
+                    }
+                    .into());
+                }
+                return Ok((k.to_string(), v.to_string()));
+            }
+            _ => {}
+        }
+    }
+    Err(UniError::InvalidArgument {
+        arg: "type".into(),
+        message: "MAP<K,V> requires a comma separating key and value types".into(),
+    }
+    .into())
 }

@@ -219,11 +219,21 @@ impl DataType {
                 ArrowDataType::List(Arc::new(item))
             }
             DataType::Map(key, value) => {
-                let value_field = Field::new("value", value.to_arrow(), true);
-                let value_field = if matches!(**value, DataType::Bytes) {
-                    value_field.with_metadata(raw_bytes_field_metadata())
+                // The value child's Arrow storage MUST agree with `build_map_column` in
+                // uni-store: typed scalars use their own Arrow type; `Bytes` is a
+                // raw-bytes-marked `LargeBinary`; every other (nested/non-scalar) value type
+                // is CypherValue-encoded into an UNMARKED `LargeBinary` (decoded back through
+                // the tagged codec on read). Gated by `map_value_is_typed` so the two sites
+                // can't drift.
+                let value_field = if value.map_value_is_typed() {
+                    let f = Field::new("value", value.to_arrow(), true);
+                    if matches!(**value, DataType::Bytes) {
+                        f.with_metadata(raw_bytes_field_metadata())
+                    } else {
+                        f
+                    }
                 } else {
-                    value_field
+                    Field::new("value", ArrowDataType::LargeBinary, true)
                 };
                 ArrowDataType::List(Arc::new(Field::new(
                     "item",
@@ -235,6 +245,23 @@ impl DataType {
                 )))
             }
         }
+    }
+
+    /// Whether a `Map(_, self)` VALUE is stored as a typed Arrow child (this set) versus a
+    /// CypherValue-encoded `LargeBinary` fallback child (everything else, e.g. `Vector`,
+    /// `List`, `Map`, temporal). This MUST stay in lockstep with the explicit value-type
+    /// arms of `build_map_column` in uni-store (the `_` arm there is the CV fallback).
+    pub fn map_value_is_typed(&self) -> bool {
+        matches!(
+            self,
+            DataType::String
+                | DataType::Int64
+                | DataType::Int32
+                | DataType::Float64
+                | DataType::Float32
+                | DataType::Bool
+                | DataType::Bytes
+        )
     }
 
     /// Returns `true` if `value` is directly storable in this column type without loss.

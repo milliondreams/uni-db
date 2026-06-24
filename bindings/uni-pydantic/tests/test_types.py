@@ -287,9 +287,29 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(list[int]) == ("list:int64", False)
 
     def test_dict_type(self):
-        """Test dict type mapping."""
+        """Test dict type mapping.
+
+        String-keyed parameterized dicts map to a typed MAP<STRING, V> (#105); the value
+        type recurses (so nested values map too). Bare dicts and non-string-key or
+        unmappable-value dicts fall back to schemaless JSON.
+        """
+        # Bare dict and non-string keys -> schemaless JSON.
         assert python_type_to_uni(dict) == ("json", False)
-        assert python_type_to_uni(dict[str, int]) == ("json", False)
+        assert python_type_to_uni(dict[int, str]) == ("json", False)
+        # Typed string-keyed maps (scalars).
+        assert python_type_to_uni(dict[str, int]) == ("map:string:int64", False)
+        assert python_type_to_uni(dict[str, float]) == ("map:string:float64", False)
+        assert python_type_to_uni(dict[str, str]) == ("map:string:string", False)
+        assert python_type_to_uni(dict[str, bool]) == ("map:string:bool", False)
+        # Nested value types recurse.
+        assert python_type_to_uni(dict[str, list[int]]) == ("map:string:list:int64", False)
+        assert python_type_to_uni(dict[str, Vector[8]]) == ("map:string:vector:8", False)
+        assert python_type_to_uni(dict[str, dict[str, int]]) == (
+            "map:string:map:string:int64",
+            False,
+        )
+        # Optional unwraps to nullable.
+        assert python_type_to_uni(dict[str, float] | None) == ("map:string:float64", True)
 
     def test_vector_type(self):
         """Test vector type mapping."""

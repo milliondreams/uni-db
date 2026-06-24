@@ -1312,7 +1312,7 @@ typing-extensions = ">=4.12.0"
 
 [[package]]
 name = "uni-db"
-version = "2.2.5"
+version = "2.3.0"
 description = "Python bindings for Uni Graph Database (default — all 11 providers, CPU)"
 optional = false
 python-versions = ">=3.10"
@@ -1331,7 +1331,7 @@ url = "../bindings/uni-db"
 
 [[package]]
 name = "uni-pydantic"
-version = "2.2.5"
+version = "2.3.0"
 description = "Pydantic-based OGM (Object-Graph Mapping) for Uni Graph Database"
 optional = false
 python-versions = ">=3.10"

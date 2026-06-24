@@ -298,7 +298,7 @@ impl IndexManager {
         config: &VectorIndexConfig,
         force_backfill: bool,
     ) -> Result<()> {
-        use crate::storage::muvera_index::{fde_spec_for_config, splice_fde_batch};
+        use crate::storage::muvera_index::fde_spec_for_config;
 
         let schema = self.schema_manager.schema();
         let Some(spec) = fde_spec_for_config(&schema, config) else {
@@ -306,12 +306,10 @@ impl IndexManager {
         };
         spec.params.validate()?;
 
-        // Was the derived column already registered (i.e. a prior create already ran)?
-        let already_registered = schema
-            .properties
-            .get(&spec.label)
-            .is_some_and(|p| p.contains_key(&spec.derived_col));
-        self.schema_manager.add_internal_property(
+        // Register the derived column. `add_internal_property` is write-lock-guarded and
+        // reports whether THIS call inserted it, so two concurrent creates of the same MUVERA
+        // index can't both run the (expensive) full-table backfill — only the inserter does.
+        let newly_added = self.schema_manager.add_internal_property(
             &spec.label,
             &spec.derived_col,
             uni_common::DataType::Vector {
@@ -319,29 +317,66 @@ impl IndexManager {
             },
             true,
         )?;
-        // Backfill on first registration, or whenever a full rebuild forces it (the
-        // flush-time materializer doesn't cover bulk-loaded / out-of-band rows); and only
-        // with a backend + flushed table.
-        if already_registered && !force_backfill {
+
+        // Backfill when we just registered the column, or when a full rebuild forces it (the
+        // flush-time materializer doesn't cover bulk-loaded / out-of-band rows). A plain
+        // re-create that finds the column already present relies on that materializer.
+        if !newly_added && !force_backfill {
             return Ok(());
         }
+
+        // Run the backfill; if it FAILS after we just added the column, roll the registration
+        // back so the in-memory schema stays consistent with disk and a retry re-adds +
+        // re-backfills. Otherwise the retry would see the column registered, skip the
+        // backfill, and build the index over an unpopulated FDE column.
+        //
+        // Crash-window note: the on-disk order is backfill (`replace_table_atomic`) THEN
+        // schema save (in `create_vector_index_inner`). A crash in between leaves an orphan
+        // `__fde_*` column with no persisted schema entry, which the next create's idempotent
+        // rewrite overwrites — self-healing. Persisting the schema first would be worse (a
+        // registered column with no data errors reads), and a `Building` marker is not
+        // auto-recovered (`labels_needing_rebuild` skips `Building`/`Failed`).
+        if let Err(e) = self.backfill_fde_column(&spec).await {
+            if newly_added {
+                let _ = self
+                    .schema_manager
+                    .drop_property(&spec.label, &spec.derived_col);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Materialize the MUVERA derived FDE column over all currently-flushed rows via a full
+    /// table rewrite (scan → recompute each row's FDE → splice into the
+    /// `get_arrow_schema`-sorted position → `replace_table_atomic`). No-op (kept registration)
+    /// when no backend is attached or the label has nothing flushed yet — create-before-ingest,
+    /// where the flush path materializes the column. The caller must have already registered
+    /// the derived column in the schema.
+    #[cfg(feature = "lance-backend")]
+    async fn backfill_fde_column(
+        &self,
+        spec: &crate::storage::muvera_index::FdeSpec,
+    ) -> Result<()> {
+        use crate::storage::muvera_index::splice_fde_batch;
+
         let Some(backend) = self.backend.as_ref() else {
             return Ok(());
         };
         let table = table_names::vertex_table_name(&spec.label);
         if !backend.table_exists(&table).await.unwrap_or(false) {
-            // Nothing flushed yet (create-before-ingest): the flush path populates it.
             return Ok(());
         }
 
+        let schema = self.schema_manager.schema();
         let label_id = schema
             .label_id_by_name(&spec.label)
             .ok_or_else(|| anyhow!("MUVERA: label '{}' not found", spec.label))?;
-        // Re-read schema AFTER add_internal_property so the FDE column is in the arrow schema.
-        let schema2 = self.schema_manager.schema();
+        // Schema already carries the FDE column (registered by the caller) so it's in the
+        // arrow schema at the position future flush appends will use.
         let target_schema =
-            VertexDataset::new(&self.base_uri, &spec.label, label_id).get_arrow_schema(&schema2)?;
-        let source_dt = schema2
+            VertexDataset::new(&self.base_uri, &spec.label, label_id).get_arrow_schema(&schema)?;
+        let source_dt = schema
             .properties
             .get(&spec.label)
             .and_then(|p| p.get(&spec.source_prop))
@@ -354,7 +389,7 @@ impl IndexManager {
             new_batches.push(splice_fde_batch(
                 batch,
                 &target_schema,
-                &spec,
+                spec,
                 &encoder,
                 source_dt.as_ref(),
             )?);

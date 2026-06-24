@@ -1460,13 +1460,18 @@ impl SchemaManager {
     /// `__fde_*` derived column. Bypasses the user-facing underscore-prefix rule but
     /// still rejects storage-layer name collisions. Idempotent: a no-op if the property
     /// already exists with the same type (so re-creating an index is safe).
+    ///
+    /// Returns `true` if this call newly inserted the property, `false` if it already
+    /// existed (idempotent). The check-and-insert is atomic under the schema write lock,
+    /// so for concurrent callers exactly one observes `true` — letting callers gate
+    /// expensive one-time work (e.g. the MUVERA backfill) on the winner.
     pub fn add_internal_property(
         &self,
         label_or_type: &str,
         prop_name: &str,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         validate_reserved_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
@@ -1478,7 +1483,7 @@ impl SchemaManager {
 
         if let Some(existing) = props.get(prop_name) {
             if existing.r#type == data_type {
-                return Ok(()); // idempotent re-registration
+                return Ok(false); // already present (idempotent re-registration)
             }
             return Err(anyhow!(
                 "Internal property '{}' already exists for '{}' with a different type",
@@ -1499,7 +1504,7 @@ impl SchemaManager {
             },
         );
         schema.bump_version();
-        Ok(())
+        Ok(true)
     }
 
     pub fn add_generated_property(
@@ -2118,6 +2123,32 @@ mod tests {
         // Non-existent index should error
         assert!(manager.update_index_metadata("nope", |_| {}).is_err());
 
+        Ok(())
+    }
+
+    /// `add_internal_property` reports whether THIS call inserted the property: `true` on
+    /// first insert, `false` on idempotent re-registration, `Err` on a type conflict. The
+    /// MUVERA backfill gates on this (only the inserter backfills), so two concurrent
+    /// creates of the same index can't both run the full-table rewrite (issue #107).
+    #[tokio::test]
+    async fn add_internal_property_reports_newly_added() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+        manager.add_label("Doc")?;
+
+        let dt = DataType::Vector { dimensions: 16 };
+        // First registration: newly added.
+        assert!(manager.add_internal_property("Doc", "__fde_x", dt.clone(), true)?);
+        // Idempotent re-registration with the same type: NOT newly added.
+        assert!(!manager.add_internal_property("Doc", "__fde_x", dt.clone(), true)?);
+        // Same name, conflicting type: hard error (no silent divergence).
+        assert!(
+            manager
+                .add_internal_property("Doc", "__fde_x", DataType::Vector { dimensions: 8 }, true)
+                .is_err()
+        );
         Ok(())
     }
 

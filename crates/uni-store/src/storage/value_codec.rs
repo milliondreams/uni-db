@@ -196,7 +196,7 @@ fn value_from_column_inner(
             }
             Ok(Value::Array(vec))
         }
-        DataType::Map(key_type, value_type) => {
+        DataType::Map(_, _) => {
             let list_arr = col
                 .as_any()
                 .downcast_ref::<ListArray>()
@@ -204,31 +204,21 @@ fn value_from_column_inner(
             if list_arr.is_null(row) {
                 return Ok(Value::Null);
             }
+            // Decode through the unified map reconstructor (single source of truth with
+            // `arrow_to_value`): it handles typed scalar value children, raw-`Bytes`
+            // (`uni_raw_bytes`-marked) children, and CV-encoded nested-value fallback
+            // children uniformly by runtime Arrow type — so this is correct regardless of
+            // the declared value type (a nested value is stored as a CV LargeBinary, which
+            // a declared-type recursion would otherwise fail to downcast).
             let struct_arr = list_arr.value(row);
-            let struct_arr_ref = struct_arr
-                .as_any()
-                .downcast_ref::<StructArray>()
+            let uni_map = super::arrow_convert::try_reconstruct_map(&struct_arr)
                 .ok_or_else(|| anyhow!("Invalid struct array inner for map"))?;
-
-            let keys = struct_arr_ref.column(0);
-            let values = struct_arr_ref.column(1);
-
-            let mut map = serde_json::Map::with_capacity(struct_arr_ref.len());
-
-            for i in 0..struct_arr_ref.len() {
-                let k_val =
-                    value_from_column_inner(keys.as_ref(), key_type, i, crdt_mode, depth + 1)?;
-                let v_val =
-                    value_from_column_inner(values.as_ref(), value_type, i, crdt_mode, depth + 1)?;
-
-                // Convert key to string for JSON object
-                if let Some(k_str) = k_val.as_str() {
-                    map.insert(k_str.to_string(), v_val);
-                } else if let Some(k_int) = k_val.as_i64() {
-                    map.insert(k_int.to_string(), v_val);
-                } else {
-                    map.insert(k_val.to_string(), v_val);
-                }
+            let mut map = serde_json::Map::with_capacity(uni_map.len());
+            for (k, v) in uni_map {
+                map.insert(
+                    k,
+                    serde_json::to_value(&v).unwrap_or(serde_json::Value::Null),
+                );
             }
             Ok(Value::Object(map))
         }
@@ -390,7 +380,12 @@ pub fn decode_column_value(
         | DataType::Date
         | DataType::Time
         | DataType::Btic
-        | DataType::Bytes => Ok(super::arrow_convert::arrow_to_value(
+        | DataType::Bytes
+        // Maps decode natively (full fidelity, CV-aware) via the unified
+        // `try_reconstruct_map` path inside `arrow_to_value`, which handles typed scalar
+        // value children, raw-`Bytes` (uni_raw_bytes-marked) children, and CV-encoded
+        // nested-value fallback children uniformly by runtime Arrow type.
+        | DataType::Map(_, _) => Ok(super::arrow_convert::arrow_to_value(
             col,
             row,
             Some(data_type),

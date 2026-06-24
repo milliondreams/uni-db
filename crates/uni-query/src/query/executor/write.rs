@@ -1203,10 +1203,44 @@ impl Executor {
                 let inner_type = Self::parse_data_type(inner_type_str)?;
                 Ok(DataType::List(Box::new(inner_type)))
             }
+            s if s.starts_with("map<") && s.ends_with('>') => {
+                let (k_str, v_str) = Self::split_map_kv(&s[4..s.len() - 1])?;
+                let key_type = Self::parse_data_type(&k_str)?;
+                if !matches!(key_type, DataType::String) {
+                    return Err(anyhow!("MAP key type must be STRING, got: {k_str}"));
+                }
+                let value_type = Self::parse_data_type(&v_str)?;
+                Ok(DataType::Map(Box::new(key_type), Box::new(value_type)))
+            }
             "gcounter" => Ok(DataType::Crdt(CrdtType::GCounter)),
             "lwwregister" => Ok(DataType::Crdt(CrdtType::LWWRegister)),
             _ => Err(anyhow!("Unknown data type: {}", type_str)),
         }
+    }
+
+    /// Split a `MAP<K, V>` inner string on the top-level comma, respecting `<>`/`()` depth
+    /// so nested value types (`STRING, LIST<INT>`, `STRING, MAP<STRING,INT>`) split at the
+    /// right comma. Returns trimmed `(key, value)` type strings.
+    fn split_map_kv(inner: &str) -> Result<(String, String)> {
+        let mut depth = 0i32;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '<' | '(' => depth += 1,
+                '>' | ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    let k = inner[..i].trim();
+                    let v = inner[i + 1..].trim();
+                    if k.is_empty() || v.is_empty() {
+                        return Err(anyhow!("MAP<K,V> requires both a key and a value type"));
+                    }
+                    return Ok((k.to_string(), v.to_string()));
+                }
+                _ => {}
+            }
+        }
+        Err(anyhow!(
+            "MAP<K,V> requires a comma separating key and value types"
+        ))
     }
 
     pub(crate) async fn execute_create_label(&self, clause: CreateLabel) -> Result<()> {

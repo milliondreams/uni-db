@@ -14,7 +14,6 @@ use uni_common::UniError;
 use uni_common::core::schema::{
     DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
     InvertedIndexConfig, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
-    VectorIndexType,
 };
 
 // Re-export types used by the sync and async API modules.
@@ -558,12 +557,33 @@ pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
             .parse::<usize>()
             .map_err(|_| "Invalid dimensions for vector type".to_string())?;
         Ok(DataType::Vector { dimensions: dims })
-    } else if data_type.starts_with("list:") {
-        let elem_type = data_type.split(':').nth(1).ok_or_else(|| {
-            "List type must specify element type, e.g., 'list:string'".to_string()
-        })?;
+    } else if let Some(elem_type) = data_type.strip_prefix("list:") {
+        // Keep the FULL remainder (not `split(':').nth(1)`, which drops trailing
+        // segments) so nested element types like `list:vector:128` recurse
+        // correctly into `parse_data_type("vector:128")`.
+        if elem_type.is_empty() {
+            return Err("List type must specify element type, e.g., 'list:string'".to_string());
+        }
         let inner = parse_data_type(elem_type)?;
         Ok(DataType::List(Box::new(inner)))
+    } else if let Some(rest) = data_type.strip_prefix("map:") {
+        // `map:KEY:VALUE` — KEY is always a scalar STRING (no `:`), so split on the FIRST
+        // `:` and recurse on the FULL VALUE remainder so nested values parse, e.g.
+        // `map:string:list:int64`, `map:string:vector:8`, `map:string:map:string:int64`.
+        let (key_str, value_str) = rest.split_once(':').ok_or_else(|| {
+            "Map type must be 'map:KEY:VALUE', e.g., 'map:string:float64'".to_string()
+        })?;
+        if key_str.is_empty() || value_str.is_empty() {
+            return Err(
+                "Map type must specify both key and value, e.g., 'map:string:int64'".to_string(),
+            );
+        }
+        let key_type = parse_data_type(key_str)?;
+        if !matches!(key_type, DataType::String) {
+            return Err(format!("MAP key type must be STRING, got: {key_str}"));
+        }
+        let value_type = parse_data_type(value_str)?;
+        Ok(DataType::Map(Box::new(key_type), Box::new(value_type)))
     } else {
         match data_type.to_lowercase().as_str() {
             "string" => Ok(DataType::String),
@@ -623,16 +643,17 @@ pub fn create_index_definition(
             where_clause: None,
             metadata: Default::default(),
         })),
+        // No options here, so use the canonical defaults from the shared parser (IVF_PQ /
+        // Cosine) — identical to the DDL, procedure, and config-map paths.
         "vector" => Ok(IndexDefinition::Vector(VectorIndexConfig {
             name: format!("idx_{}_{}_vec", label, property),
             label: label.to_string(),
             property: property.to_string(),
-            index_type: VectorIndexType::HnswSq {
-                m: 16,
-                ef_construction: 200,
-                num_partitions: None,
-            },
-            metric: DistanceMetric::Cosine,
+            index_type: uni_common::vector_index_opts::build_vector_index_type(
+                &uni_common::vector_index_opts::VectorIndexOpts::default(),
+            ),
+            metric: uni_common::vector_index_opts::parse_vector_metric(None)
+                .unwrap_or(DistanceMetric::Cosine),
             embedding_config: None,
             metadata: Default::default(),
         })),
@@ -659,7 +680,14 @@ pub fn create_index_definition(
 /// Create an index definition from a rich configuration dict.
 ///
 /// The config dict must have a `"type"` key. Supported types:
-/// - `"vector"`: optional `algorithm`, `metric`, `m`, `ef_construction`, `embedding`
+/// - `"vector"`: optional `algorithm` (`flat`, `ivf_flat`, `ivf_pq` (default),
+///   `ivf_sq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq`, `hnsw_pq`, `muvera`), `metric`
+///   (`cosine` (default), `l2`, `dot`), `partitions`, `m`, `ef_construction`,
+///   `sub_vectors`, `embedding`. For `algorithm: "muvera"` (ColBERT/MaxSim FDE over a
+///   multi-vector column): also `k_sim`, `reps`, `d_proj`, `seed`, `inner`. The MUVERA
+///   defaults (`k_sim=4, reps=20, d_proj=16`) are starting points, not corpus-validated;
+///   recall is corpus-dependent, so tune per corpus (the exact MaxSim re-rank keeps results
+///   precise — a weak FDE only costs recall).
 /// - `"fulltext"`: optional `tokenizer`, `ngram_min`, `ngram_max`
 /// - `"inverted"`: no extra options
 /// - `"btree"`, `"hash"`, `"scalar"`: no extra options
@@ -681,91 +709,30 @@ pub fn create_index_definition_from_config(
         "inverted" => create_index_definition(label, property, "inverted"),
 
         "vector" => {
-            let algorithm = config
-                .get("algorithm")
-                .and_then(|v| v.as_str())
-                .unwrap_or("hnsw");
-            let metric = match config
-                .get("metric")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cosine")
-                .to_lowercase()
-                .as_str()
-            {
-                "l2" => DistanceMetric::L2,
-                "dot" => DistanceMetric::Dot,
-                _ => DistanceMetric::Cosine,
-            };
-
-            let partitions = || {
-                config
-                    .get("partitions")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(256) as u32
-            };
-            let m = || config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
-            let ef_construction = || {
-                config
-                    .get("ef_construction")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as u32
-            };
-
-            let index_type = match algorithm.to_lowercase().as_str() {
-                "flat" => VectorIndexType::Flat,
-                "ivf_flat" | "ivfflat" => VectorIndexType::IvfFlat {
-                    num_partitions: partitions(),
+            // Parsed via the SAME uni-common helpers as the Cypher DDL / procedure paths
+            // so dense / native-multivector / MUVERA behave identically across surfaces
+            // (incl. the canonical default ANN = IVF_PQ and `algorithm: "muvera"`).
+            let cfg_u32 = |k: &str| config.get(k).and_then(|v| v.as_u64()).map(|n| n as u32);
+            let cfg_u8 = |k: &str| config.get(k).and_then(|v| v.as_u64()).map(|n| n as u8);
+            let metric = uni_common::vector_index_opts::parse_vector_metric(
+                config.get("metric").and_then(|v| v.as_str()),
+            )
+            .map_err(|e| e.to_string())?;
+            let index_type = uni_common::vector_index_opts::build_vector_index_type(
+                &uni_common::vector_index_opts::VectorIndexOpts {
+                    type_name: config.get("algorithm").and_then(|v| v.as_str()),
+                    partitions: cfg_u32("partitions"),
+                    m: cfg_u32("m"),
+                    ef_construction: cfg_u32("ef_construction"),
+                    sub_vectors: cfg_u32("sub_vectors"),
+                    num_bits: cfg_u8("num_bits").or_else(|| cfg_u8("bits_per_subvector")),
+                    k_sim: cfg_u32("k_sim"),
+                    reps: cfg_u32("reps"),
+                    d_proj: cfg_u32("d_proj"),
+                    seed: config.get("seed").and_then(|v| v.as_u64()),
+                    inner: config.get("inner").and_then(|v| v.as_str()),
                 },
-                "ivf_pq" | "ivfpq" => VectorIndexType::IvfPq {
-                    num_partitions: partitions(),
-                    num_sub_vectors: config
-                        .get("sub_vectors")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(16) as u32,
-                    bits_per_subvector: config
-                        .get("bits_per_subvector")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(8) as u8,
-                },
-                "ivf_sq" | "ivfsq" => VectorIndexType::IvfSq {
-                    num_partitions: partitions(),
-                },
-                "ivf_rq" | "ivfrq" => VectorIndexType::IvfRq {
-                    num_partitions: partitions(),
-                    num_bits: config
-                        .get("num_bits")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u8),
-                },
-                "hnsw_flat" | "hnswflat" => VectorIndexType::HnswFlat {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-                "hnsw_pq" | "hnswpq" => VectorIndexType::HnswPq {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_sub_vectors: config
-                        .get("sub_vectors")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(16) as u32,
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-                _ => VectorIndexType::HnswSq {
-                    m: m(),
-                    ef_construction: ef_construction(),
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                },
-            };
+            );
 
             let embedding_config = config.get("embedding").and_then(|v| {
                 let obj = v.as_object()?;
@@ -848,5 +815,83 @@ pub fn create_index_definition_from_config(
         }
 
         _ => Err(format!("Unknown index type in config: {}", idx_type)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_data_type_scalars_and_vector() {
+        assert_eq!(parse_data_type("string").unwrap(), DataType::String);
+        assert_eq!(
+            parse_data_type("vector:128").unwrap(),
+            DataType::Vector { dimensions: 128 }
+        );
+        assert_eq!(
+            parse_data_type("list:string").unwrap(),
+            DataType::List(Box::new(DataType::String))
+        );
+    }
+
+    #[test]
+    fn parse_data_type_nested_list_vector() {
+        // Regression: `split(':').nth(1)` dropped the trailing dim segment, so
+        // `list:vector:128` parsed its element as bare "vector" and failed.
+        assert_eq!(
+            parse_data_type("list:vector:128").unwrap(),
+            DataType::List(Box::new(DataType::Vector { dimensions: 128 }))
+        );
+        // Doubly-nested element types must also recurse fully.
+        assert_eq!(
+            parse_data_type("list:list:string").unwrap(),
+            DataType::List(Box::new(DataType::List(Box::new(DataType::String))))
+        );
+    }
+
+    #[test]
+    fn parse_data_type_empty_list_element_errors() {
+        assert!(parse_data_type("list:").is_err());
+    }
+
+    #[test]
+    fn parse_data_type_map_scalar_and_nested() {
+        assert_eq!(
+            parse_data_type("map:string:float64").unwrap(),
+            DataType::Map(Box::new(DataType::String), Box::new(DataType::Float64))
+        );
+        // Nested value types recurse on the full remainder after the first ':'.
+        assert_eq!(
+            parse_data_type("map:string:list:int64").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::List(Box::new(DataType::Int64)))
+            )
+        );
+        assert_eq!(
+            parse_data_type("map:string:vector:8").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::Vector { dimensions: 8 })
+            )
+        );
+        assert_eq!(
+            parse_data_type("map:string:map:string:int64").unwrap(),
+            DataType::Map(
+                Box::new(DataType::String),
+                Box::new(DataType::Map(
+                    Box::new(DataType::String),
+                    Box::new(DataType::Int64)
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn parse_data_type_map_rejects_bad_forms() {
+        assert!(parse_data_type("map:int64:string").is_err()); // non-STRING key
+        assert!(parse_data_type("map:string").is_err()); // missing value
+        assert!(parse_data_type("map:string:").is_err()); // empty value
     }
 }

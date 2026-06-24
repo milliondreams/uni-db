@@ -219,11 +219,21 @@ impl DataType {
                 ArrowDataType::List(Arc::new(item))
             }
             DataType::Map(key, value) => {
-                let value_field = Field::new("value", value.to_arrow(), true);
-                let value_field = if matches!(**value, DataType::Bytes) {
-                    value_field.with_metadata(raw_bytes_field_metadata())
+                // The value child's Arrow storage MUST agree with `build_map_column` in
+                // uni-store: typed scalars use their own Arrow type; `Bytes` is a
+                // raw-bytes-marked `LargeBinary`; every other (nested/non-scalar) value type
+                // is CypherValue-encoded into an UNMARKED `LargeBinary` (decoded back through
+                // the tagged codec on read). Gated by `map_value_is_typed` so the two sites
+                // can't drift.
+                let value_field = if value.map_value_is_typed() {
+                    let f = Field::new("value", value.to_arrow(), true);
+                    if matches!(**value, DataType::Bytes) {
+                        f.with_metadata(raw_bytes_field_metadata())
+                    } else {
+                        f
+                    }
                 } else {
-                    value_field
+                    Field::new("value", ArrowDataType::LargeBinary, true)
                 };
                 ArrowDataType::List(Arc::new(Field::new(
                     "item",
@@ -235,6 +245,23 @@ impl DataType {
                 )))
             }
         }
+    }
+
+    /// Whether a `Map(_, self)` VALUE is stored as a typed Arrow child (this set) versus a
+    /// CypherValue-encoded `LargeBinary` fallback child (everything else, e.g. `Vector`,
+    /// `List`, `Map`, temporal). This MUST stay in lockstep with the explicit value-type
+    /// arms of `build_map_column` in uni-store (the `_` arm there is the CV fallback).
+    pub fn map_value_is_typed(&self) -> bool {
+        matches!(
+            self,
+            DataType::String
+                | DataType::Int64
+                | DataType::Int32
+                | DataType::Float64
+                | DataType::Float32
+                | DataType::Bool
+                | DataType::Bytes
+        )
     }
 
     /// Returns `true` if `value` is directly storable in this column type without loss.
@@ -896,6 +923,24 @@ pub enum VectorIndexType {
         #[serde(default)]
         num_partitions: Option<u32>,
     },
+    /// MUVERA (arXiv:2405.19504) Fixed-Dimensional Encoding for multi-vector
+    /// (ColBERT/MaxSim) columns. The source multi-vector is encoded into a single
+    /// derived `Vector<fde_dim>` column, and `inner` is the single-vector ANN index
+    /// type built over that derived column (always with the `Dot` metric — the FDE
+    /// inner product approximates MaxSim). The exact MaxSim re-rank still uses the
+    /// `VectorIndexConfig.metric`. See `uni_query_functions::muvera`.
+    Muvera {
+        /// SimHash hyperplanes per repetition (`2^k_sim` buckets).
+        k_sim: u32,
+        /// Independent repetitions concatenated into the FDE.
+        reps: u32,
+        /// Inner-projection target dim (`0` = no projection, use the source dim).
+        d_proj: u32,
+        /// Master seed; persisted so query-time encoding matches doc-time encoding.
+        seed: u64,
+        /// The single-vector ANN index built over the derived FDE column.
+        inner: Box<VectorIndexType>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1435,6 +1480,58 @@ impl SchemaManager {
         // Bump after stamping `added_in` with the pre-bump `version`.
         schema.bump_version();
         Ok(())
+    }
+
+    /// Register an INTERNAL property (underscore-prefixed name allowed) that is
+    /// materialised by the storage layer, not written by the user — e.g. the MUVERA
+    /// `__fde_*` derived column. Bypasses the user-facing underscore-prefix rule but
+    /// still rejects storage-layer name collisions. Idempotent: a no-op if the property
+    /// already exists with the same type (so re-creating an index is safe).
+    ///
+    /// Returns `true` if this call newly inserted the property, `false` if it already
+    /// existed (idempotent). The check-and-insert is atomic under the schema write lock,
+    /// so for concurrent callers exactly one observes `true` — letting callers gate
+    /// expensive one-time work (e.g. the MUVERA backfill) on the winner.
+    pub fn add_internal_property(
+        &self,
+        label_or_type: &str,
+        prop_name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<bool> {
+        validate_reserved_property_name(prop_name)?;
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let version = schema.schema_version;
+        let props = schema
+            .properties
+            .entry(label_or_type.to_string())
+            .or_default();
+
+        if let Some(existing) = props.get(prop_name) {
+            if existing.r#type == data_type {
+                return Ok(false); // already present (idempotent re-registration)
+            }
+            return Err(anyhow!(
+                "Internal property '{}' already exists for '{}' with a different type",
+                prop_name,
+                label_or_type
+            ));
+        }
+
+        props.insert(
+            prop_name.to_string(),
+            PropertyMeta {
+                r#type: data_type,
+                nullable,
+                added_in: version,
+                state: SchemaElementState::Active,
+                generation_expression: None,
+                description: None,
+            },
+        );
+        schema.bump_version();
+        Ok(true)
     }
 
     pub fn add_generated_property(
@@ -2053,6 +2150,32 @@ mod tests {
         // Non-existent index should error
         assert!(manager.update_index_metadata("nope", |_| {}).is_err());
 
+        Ok(())
+    }
+
+    /// `add_internal_property` reports whether THIS call inserted the property: `true` on
+    /// first insert, `false` on idempotent re-registration, `Err` on a type conflict. The
+    /// MUVERA backfill gates on this (only the inserter backfills), so two concurrent
+    /// creates of the same index can't both run the full-table rewrite (issue #107).
+    #[tokio::test]
+    async fn add_internal_property_reports_newly_added() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+        manager.add_label("Doc")?;
+
+        let dt = DataType::Vector { dimensions: 16 };
+        // First registration: newly added.
+        assert!(manager.add_internal_property("Doc", "__fde_x", dt.clone(), true)?);
+        // Idempotent re-registration with the same type: NOT newly added.
+        assert!(!manager.add_internal_property("Doc", "__fde_x", dt.clone(), true)?);
+        // Same name, conflicting type: hard error (no silent divergence).
+        assert!(
+            manager
+                .add_internal_property("Doc", "__fde_x", DataType::Vector { dimensions: 8 }, true)
+                .is_err()
+        );
         Ok(())
     }
 

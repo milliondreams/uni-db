@@ -8,9 +8,8 @@ use uni_common::Value;
 use uni_common::{
     UniError,
     core::schema::{
-        Constraint, ConstraintTarget, ConstraintType, DataType, DistanceMetric, EmbeddingConfig,
-        IndexDefinition, ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, VectorIndexType,
-        validate_identifier,
+        Constraint, ConstraintTarget, ConstraintType, DataType, EmbeddingConfig, IndexDefinition,
+        ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, validate_identifier,
     },
 };
 use uni_store::storage::StorageManager;
@@ -56,6 +55,12 @@ struct IndexConfig {
     ef_construction: Option<u32>,
     sub_vectors: Option<u32>,
     num_bits: Option<u8>,
+    // MUVERA-specific (algorithm == "muvera"): FDE encoder params + inner ANN type.
+    k_sim: Option<u32>,
+    reps: Option<u32>,
+    d_proj: Option<u32>,
+    seed: Option<u64>,
+    inner: Option<String>,
     embedding: Option<EmbeddingOptions>,
     // Generic
     name: Option<String>,
@@ -278,18 +283,15 @@ async fn create_index_internal(
 
     let def = match config.index_type.to_uppercase().as_str() {
         "VECTOR" => {
-            let metric = match config.metric.as_deref().unwrap_or("cosine") {
-                "cosine" => DistanceMetric::Cosine,
-                "l2" | "euclidean" => DistanceMetric::L2,
-                "dot" => DistanceMetric::Dot,
-                _ => {
-                    return Err(UniError::InvalidArgument {
+            // Distance metric + index type are parsed via the SAME helpers as the DDL
+            // `CREATE VECTOR INDEX` path so dense / native-multivector / MUVERA behave
+            // identically across both entry points (incl. the default ANN = IVF_PQ).
+            let metric =
+                uni_common::vector_index_opts::parse_vector_metric(config.metric.as_deref())
+                    .map_err(|e| UniError::InvalidArgument {
                         arg: "metric".into(),
-                        message: "Invalid metric".into(),
-                    }
-                    .into());
-                }
-            };
+                        message: e.to_string(),
+                    })?;
 
             // Parse embedding config from procedure options
             let embedding_config = config.embedding.as_ref().map(|emb| EmbeddingConfig {
@@ -300,41 +302,21 @@ async fn create_index_internal(
                 query_prefix: emb.query_prefix.clone(),
             });
 
-            let algorithm = config.algorithm.as_deref().unwrap_or("hnsw");
-            let index_type = match algorithm.to_lowercase().as_str() {
-                "flat" => VectorIndexType::Flat,
-                "ivf_flat" => VectorIndexType::IvfFlat {
-                    num_partitions: config.partitions.unwrap_or(256),
-                },
-                "ivf_pq" => VectorIndexType::IvfPq {
-                    num_partitions: config.partitions.unwrap_or(256),
-                    num_sub_vectors: config.sub_vectors.unwrap_or(16),
-                    bits_per_subvector: config.num_bits.unwrap_or(8),
-                },
-                "ivf_sq" => VectorIndexType::IvfSq {
-                    num_partitions: config.partitions.unwrap_or(256),
-                },
-                "ivf_rq" => VectorIndexType::IvfRq {
-                    num_partitions: config.partitions.unwrap_or(256),
+            let index_type = uni_common::vector_index_opts::build_vector_index_type(
+                &uni_common::vector_index_opts::VectorIndexOpts {
+                    type_name: config.algorithm.as_deref(),
+                    partitions: config.partitions,
+                    m: config.m,
+                    ef_construction: config.ef_construction,
+                    sub_vectors: config.sub_vectors,
                     num_bits: config.num_bits,
+                    k_sim: config.k_sim,
+                    reps: config.reps,
+                    d_proj: config.d_proj,
+                    seed: config.seed,
+                    inner: config.inner.as_deref(),
                 },
-                "hnsw_flat" => VectorIndexType::HnswFlat {
-                    m: config.m.unwrap_or(16),
-                    ef_construction: config.ef_construction.unwrap_or(200),
-                    num_partitions: config.partitions,
-                },
-                "hnsw_pq" => VectorIndexType::HnswPq {
-                    m: config.m.unwrap_or(16),
-                    ef_construction: config.ef_construction.unwrap_or(200),
-                    num_sub_vectors: config.sub_vectors.unwrap_or(16),
-                    num_partitions: config.partitions,
-                },
-                _ => VectorIndexType::HnswSq {
-                    m: config.m.unwrap_or(16),
-                    ef_construction: config.ef_construction.unwrap_or(200),
-                    num_partitions: config.partitions,
-                },
-            };
+            );
 
             IndexDefinition::Vector(VectorIndexConfig {
                 name: index_name,
@@ -389,38 +371,38 @@ async fn create_index_internal(
 
     storage.schema_manager().add_index(def.clone())?;
 
-    // Trigger build if data exists
-    let count = if let Ok(ds) = storage.vertex_dataset(label) {
-        if let Ok(raw) = ds.open_raw().await {
-            raw.count_rows(None).await.unwrap_or(0)
-        } else {
-            0
+    let idx_mgr = storage.index_manager();
+    match def {
+        // Vector indexes ALWAYS build, matching the DDL `CREATE VECTOR INDEX` path:
+        // `create_vector_index` handles an empty/not-yet-created dataset gracefully, and
+        // MUVERA must register (+ backfill when data exists) its derived FDE column even
+        // before any rows exist (create-before-ingest). `prepare_muvera_index` is a no-op
+        // for non-MUVERA vector indexes.
+        IndexDefinition::Vector(cfg) => {
+            idx_mgr.create_vector_index(cfg).await?;
         }
-    } else {
-        0
-    };
-
-    tracing::debug!("create_index_internal count for {}: {}", label, count);
-
-    if count > 0 {
-        let idx_mgr = storage.index_manager();
-        match def {
-            IndexDefinition::Vector(cfg) => {
-                idx_mgr.create_vector_index(cfg).await?;
+        // Non-vector indexes keep the build-if-data-exists optimization.
+        other => {
+            let count = if let Ok(ds) = storage.vertex_dataset(label) {
+                if let Ok(raw) = ds.open_raw().await {
+                    raw.count_rows(None).await.unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if count > 0 {
+                match other {
+                    IndexDefinition::Scalar(cfg) => idx_mgr.create_scalar_index(cfg).await?,
+                    IndexDefinition::Inverted(cfg) => idx_mgr.create_inverted_index(cfg).await?,
+                    IndexDefinition::FullText(cfg) => idx_mgr.create_fts_index(cfg).await?,
+                    IndexDefinition::JsonFullText(cfg) => {
+                        idx_mgr.create_json_fts_index(cfg).await?
+                    }
+                    _ => {}
+                }
             }
-            IndexDefinition::Scalar(cfg) => {
-                idx_mgr.create_scalar_index(cfg).await?;
-            }
-            IndexDefinition::Inverted(cfg) => {
-                idx_mgr.create_inverted_index(cfg).await?;
-            }
-            IndexDefinition::FullText(cfg) => {
-                idx_mgr.create_fts_index(cfg).await?;
-            }
-            IndexDefinition::JsonFullText(cfg) => {
-                idx_mgr.create_json_fts_index(cfg).await?;
-            }
-            _ => {}
         }
     }
 
@@ -491,6 +473,19 @@ fn parse_data_type(s: &str) -> Result<DataType> {
         let inner_type = parse_data_type(inner)?;
         return Ok(DataType::List(Box::new(inner_type)));
     }
+    if s.to_uppercase().starts_with("MAP<") && s.ends_with('>') {
+        let (k_str, v_str) = split_map_kv(&s[4..s.len() - 1])?;
+        let key_type = parse_data_type(&k_str)?;
+        if !matches!(key_type, DataType::String) {
+            return Err(UniError::InvalidArgument {
+                arg: "type".into(),
+                message: format!("MAP key type must be STRING, got: {k_str}"),
+            }
+            .into());
+        }
+        let value_type = parse_data_type(&v_str)?;
+        return Ok(DataType::Map(Box::new(key_type), Box::new(value_type)));
+    }
 
     match s.to_uppercase().as_str() {
         "STRING" | "UTF8" => Ok(DataType::String),
@@ -509,4 +504,34 @@ fn parse_data_type(s: &str) -> Result<DataType> {
         }
         .into()),
     }
+}
+
+/// Split a `MAP<K, V>` inner string on the top-level comma, respecting `<>`/`()` depth so
+/// nested value types split at the right comma. Returns trimmed `(key, value)` strings.
+fn split_map_kv(inner: &str) -> Result<(String, String)> {
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let k = inner[..i].trim();
+                let v = inner[i + 1..].trim();
+                if k.is_empty() || v.is_empty() {
+                    return Err(UniError::InvalidArgument {
+                        arg: "type".into(),
+                        message: "MAP<K,V> requires both a key and a value type".into(),
+                    }
+                    .into());
+                }
+                return Ok((k.to_string(), v.to_string()));
+            }
+            _ => {}
+        }
+    }
+    Err(UniError::InvalidArgument {
+        arg: "type".into(),
+        message: "MAP<K,V> requires a comma separating key and value types".into(),
+    }
+    .into())
 }

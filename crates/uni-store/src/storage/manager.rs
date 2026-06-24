@@ -5,7 +5,7 @@ use crate::backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 use crate::backend::lance::LanceDbBackend;
 use crate::backend::table_names;
-use crate::backend::types::ScanRequest;
+use crate::backend::types::{ScanRequest, VectorQueryOpts};
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
@@ -1272,6 +1272,7 @@ impl StorageManager {
 
     pub fn index_manager(&self) -> IndexManager {
         IndexManager::new(&self.base_uri, self.schema_manager.clone())
+            .with_backend(self.backend_arc())
     }
 
     // ========================================================================
@@ -1749,6 +1750,7 @@ impl StorageManager {
         InvertedIndex::new(&self.base_uri, config).await
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub async fn vector_search(
         &self,
         label: &str,
@@ -1756,6 +1758,7 @@ impl StorageManager {
         query: &[f32],
         k: usize,
         filter: Option<&str>,
+        opts: VectorQueryOpts,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
         use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
@@ -1791,7 +1794,15 @@ impl StorageManager {
             let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
             let batches = backend
-                .vector_search(&name, property, query, k, backend_metric, combined_filter)
+                .vector_search(
+                    &name,
+                    property,
+                    query,
+                    k,
+                    backend_metric,
+                    combined_filter,
+                    opts,
+                )
                 .await?;
 
             results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
@@ -1800,6 +1811,178 @@ impl StorageManager {
         // Merge L0 buffer vertices into results for visibility of unflushed data.
         if let Some(qctx) = ctx {
             merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric);
+        }
+
+        Ok(results)
+    }
+
+    /// First-stage candidate generation for a MUVERA index: single-vector ANN over the
+    /// derived FDE column with the **Dot** metric (the FDE inner product approximates
+    /// MaxSim — the physical index was built with Dot, see
+    /// `IndexManager::create_vector_index`).
+    ///
+    /// Flushed/indexed data ONLY — unlike [`Self::vector_search`] this deliberately does
+    /// NOT merge L0, because the live L0 has no FDE column (it is materialised at flush by
+    /// `Writer::materialize_fde_columns`). L0 visibility is provided one layer up by
+    /// `multivector_rerank`, which unions live L0 vids and re-scores everything by exact
+    /// MaxSim. Scores returned here are placeholder distances (the caller re-ranks).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn muvera_fde_candidates(
+        &self,
+        label: &str,
+        fde_column: &str,
+        fde_query: &[f32],
+        k: usize,
+        filter: Option<&str>,
+        opts: VectorQueryOpts,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Vec<(Vid, f32)>> {
+        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
+        if !backend.table_exists(&name).await.unwrap_or(false) {
+            // Nothing flushed yet; L0-only candidates are merged upstream.
+            return Ok(Vec::new());
+        }
+
+        let mut filter_parts = vec![Self::build_active_filter(filter)];
+        if ctx.is_some()
+            && let Some(hwm) = self.version_high_water_mark()
+        {
+            filter_parts.push(format!("_version <= {}", hwm));
+        }
+        let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+
+        let batches = backend
+            .vector_search(
+                &name,
+                fde_column,
+                fde_query,
+                k,
+                BackendMetric::Dot,
+                combined_filter,
+                opts,
+            )
+            .await?;
+        extract_vid_score_pairs(&batches, "_vid", "_distance")
+    }
+
+    /// Late-interaction (ColBERT / MaxSim) first-stage search over a multi-vector
+    /// (`List<Vector>`) column.
+    ///
+    /// Issues a multi-token query — Lance scores each row's token set by MaxSim —
+    /// and defaults to **Cosine** (the ColBERT convention) when the property has
+    /// no index, vs `L2` for dense vectors. `opts` (`nprobes` / `refine_factor`)
+    /// tune the underlying ANN index.
+    ///
+    /// This is a **candidate generator over flushed/indexed data only** — it does
+    /// not merge unflushed L0 rows (unlike [`Self::vector_search`], which can,
+    /// because the single-vector in-process distance is on the identical scale as
+    /// Lance's `_distance`). Lance's multi-vector `_distance` is an opaque internal
+    /// aggregate whose scale cannot be matched against an in-process MaxSim, so L0
+    /// visibility is provided one layer up: the uni-query `multivector_rerank`
+    /// helper unions these flushed candidates with live L0 vids and re-scores
+    /// *every* candidate by exact MaxSim. Callers wanting recent-write visibility
+    /// must go through that path (the `uni.vector.query` procedure and the inline
+    /// `vector_similarity` predicate both do); calling this directly sees flushed
+    /// data only. Multi-vector search on forks/branches remains unsupported
+    /// (`backend::branched` bails).
+    #[expect(clippy::too_many_arguments)]
+    pub async fn multivector_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[Vec<f32>],
+        k: usize,
+        filter: Option<&str>,
+        opts: VectorQueryOpts,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Vec<(Vid, f32)>> {
+        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+
+        let schema = self.schema_manager.schema();
+        let metric = schema
+            .vector_index_for_property(label, property)
+            .map(|config| config.metric.clone())
+            .unwrap_or(DistanceMetric::Cosine);
+
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
+
+        // On a branched table, Lance has no per-branch multi-vector nearest
+        // (and lancedb cannot open a `Table` on a non-main branch), so the
+        // backend's `multivector_search` bails. Instead, enumerate the branch's
+        // candidate vids via a branch-aware scan (`BranchedBackend::scan`
+        // applies the branch, surfacing fork-local + parent-inherited rows via
+        // `base_paths`) and let the uni-query layer re-score by exact MaxSim —
+        // it fetches candidate properties branch-aware and merges fork L0. The
+        // returned score is a placeholder (the only caller re-ranks). This is a
+        // brute-force scan, O(branch rows incl. inherited): the inherent cost of
+        // having no multi-vector index on branches.
+        let branched = self
+            .fork_scope
+            .as_ref()
+            .is_some_and(|s| s.branch_for(&name).is_some());
+        if branched {
+            if !backend.table_exists(&name).await.unwrap_or(false) {
+                // Nothing flushed on the branch; fork L0 rows are merged upstream.
+                return Ok(Vec::new());
+            }
+            let mut filter_parts = vec![Self::build_active_filter(filter)];
+            if ctx.is_some()
+                && let Some(hwm) = self.version_high_water_mark()
+            {
+                filter_parts.push(format!("_version <= {}", hwm));
+            }
+            let request = ScanRequest::all(&name)
+                .with_filter(filter_parts.join(" AND "))
+                .with_columns(vec!["_vid".to_string()]);
+            let batches = backend.scan(request).await?;
+            let mut results = Vec::new();
+            for batch in batches {
+                let vid_col = batch
+                    .column_by_name("_vid")
+                    .ok_or(anyhow!("Missing _vid"))?
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or(anyhow!("Invalid _vid"))?;
+                for i in 0..batch.num_rows() {
+                    results.push((Vid::from(vid_col.value(i)), 0.0_f32));
+                }
+            }
+            return Ok(results);
+        }
+
+        let mut results = Vec::new();
+        if backend.table_exists(&name).await.unwrap_or(false) {
+            let backend_metric = match &metric {
+                DistanceMetric::L2 => BackendMetric::L2,
+                DistanceMetric::Cosine => BackendMetric::Cosine,
+                DistanceMetric::Dot => BackendMetric::Dot,
+                _ => BackendMetric::Cosine,
+            };
+
+            let mut filter_parts = vec![Self::build_active_filter(filter)];
+            if ctx.is_some()
+                && let Some(hwm) = self.version_high_water_mark()
+            {
+                filter_parts.push(format!("_version <= {}", hwm));
+            }
+            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+
+            let batches = backend
+                .multivector_search(
+                    &name,
+                    property,
+                    query,
+                    k,
+                    backend_metric,
+                    combined_filter,
+                    opts,
+                )
+                .await?;
+            results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
         }
 
         Ok(results)
@@ -2223,6 +2406,56 @@ fn merge_l0_into_vector_results(
     // Re-sort by distance ascending.
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
+}
+
+/// Collects the live L0 vids carrying `label`, plus the set of vids tombstoned,
+/// across the 3-tier L0 chain (pending flush → main → transaction).
+///
+/// Walks the buffers in precedence order (last writer wins): a vid created in a
+/// later buffer clears an earlier tombstone, and a vid tombstoned in a later
+/// buffer is removed from the live set. The returned `live` set therefore
+/// excludes anything currently tombstoned.
+///
+/// This mirrors the L0 traversal in `merge_l0_into_vector_results` but returns
+/// membership only — it does not score — so callers that re-score candidates
+/// themselves (e.g. multi-vector MaxSim re-ranking, where Lance's `_distance`
+/// scale is opaque) can build a candidate set without duplicating the
+/// tombstone/precedence semantics.
+pub fn collect_l0_label_candidates(ctx: &QueryContext, label: &str) -> (Vec<Vid>, HashSet<Vid>) {
+    // Buffers in precedence order: pending flush → main → transaction.
+    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
+        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
+    buffers.push(Arc::clone(&ctx.l0));
+    if let Some(ref txn) = ctx.transaction_l0 {
+        buffers.push(Arc::clone(txn));
+    }
+
+    let mut live: HashSet<Vid> = HashSet::new();
+    let mut tombstoned: HashSet<Vid> = HashSet::new();
+
+    for buf_arc in &buffers {
+        let buf = buf_arc.read();
+
+        // A delete in this buffer wins over earlier creations.
+        for &vid in &buf.vertex_tombstones {
+            tombstoned.insert(vid);
+            live.remove(&vid);
+        }
+
+        // A (re-)creation with the target label in this buffer wins over an
+        // earlier tombstone.
+        for (&vid, labels) in &buf.vertex_labels {
+            if !labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if buf.vertex_properties.contains_key(&vid) {
+                live.insert(vid);
+                tombstoned.remove(&vid);
+            }
+        }
+    }
+
+    (live.into_iter().collect(), tombstoned)
 }
 
 /// Computes a simple token-overlap relevance score between a query and text.

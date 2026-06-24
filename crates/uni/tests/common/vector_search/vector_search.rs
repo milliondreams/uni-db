@@ -111,7 +111,15 @@ async fn test_vector_search() -> anyhow::Result<()> {
     // Query: [0.1, 0.1]. Should match Item 1 best.
     let query = vec![0.1f32, 0.1f32];
     let results = storage
-        .vector_search("Item", "embedding", &query, 2, None, None)
+        .vector_search(
+            "Item",
+            "embedding",
+            &query,
+            2,
+            None,
+            uni_store::VectorQueryOpts::default(),
+            None,
+        )
         .await?;
 
     // Expect 2 results
@@ -238,7 +246,15 @@ async fn test_l0_vertex_appears_in_vector_search() -> anyhow::Result<()> {
     // Search near origin — L0 vertex should be closest.
     let query = vec![0.1f32, 0.1f32];
     let results = storage
-        .vector_search("Item", "embedding", &query, 5, None, Some(&ctx))
+        .vector_search(
+            "Item",
+            "embedding",
+            &query,
+            5,
+            None,
+            uni_store::VectorQueryOpts::default(),
+            Some(&ctx),
+        )
         .await?;
 
     assert!(
@@ -281,7 +297,15 @@ async fn test_l0_tombstone_hides_flushed_vertex() -> anyhow::Result<()> {
 
     let query = vec![0.0f32, 0.0f32];
     let results = storage
-        .vector_search("Item", "embedding", &query, 5, None, Some(&ctx))
+        .vector_search(
+            "Item",
+            "embedding",
+            &query,
+            5,
+            None,
+            uni_store::VectorQueryOpts::default(),
+            Some(&ctx),
+        )
         .await?;
 
     // VID 1 should be filtered out by the tombstone.
@@ -327,7 +351,15 @@ async fn test_l0_updated_embedding_wins() -> anyhow::Result<()> {
 
     let query = vec![0.1f32, 0.1f32];
     let results = storage
-        .vector_search("Item", "embedding", &query, 5, None, Some(&ctx))
+        .vector_search(
+            "Item",
+            "embedding",
+            &query,
+            5,
+            None,
+            uni_store::VectorQueryOpts::default(),
+            Some(&ctx),
+        )
         .await?;
 
     assert!(!results.is_empty(), "should have at least one result");

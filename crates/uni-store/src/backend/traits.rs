@@ -192,6 +192,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     // ========================
 
     /// Perform a vector similarity search.
+    #[expect(clippy::too_many_arguments)]
     async fn vector_search(
         &self,
         _table: &str,
@@ -200,8 +201,27 @@ pub trait StorageBackend: Send + Sync + 'static {
         _k: usize,
         _metric: DistanceMetric,
         _filter: FilterExpr,
+        _opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
         anyhow::bail!("Vector search not supported by this backend")
+    }
+
+    /// Late-interaction (ColBERT / MaxSim) search over a multi-vector column.
+    ///
+    /// `query` is a set of per-token vectors; each row's `List<FixedSizeList>`
+    /// column is scored by MaxSim. Defaults to unsupported.
+    #[expect(clippy::too_many_arguments)]
+    async fn multivector_search(
+        &self,
+        _table: &str,
+        _column: &str,
+        _query: &[Vec<f32>],
+        _k: usize,
+        _metric: DistanceMetric,
+        _filter: FilterExpr,
+        _opts: VectorQueryOpts,
+    ) -> Result<Vec<RecordBatch>> {
+        anyhow::bail!("Multi-vector search not supported by this backend")
     }
 
     /// Perform a full-text search.

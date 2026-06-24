@@ -82,6 +82,13 @@ async fn fork_sets_property_on_inherited_vertex() -> Result<()> {
         .rows()[0]
         .get("age")?;
     assert_eq!(fork_age, 31, "fork should reflect the SET on inherited A");
+    // The untouched property must survive the partial SET (vertex sibling of #102).
+    let fork_name: String = fork
+        .query("MATCH (n:Person {age: 31}) RETURN n.name AS name")
+        .await?
+        .rows()[0]
+        .get("name")?;
+    assert_eq!(fork_name, "A", "untouched vertex prop must survive the SET");
     let parent_age: i64 = session
         .query("MATCH (n:Person {name: 'A'}) RETURN n.age AS age")
         .await?

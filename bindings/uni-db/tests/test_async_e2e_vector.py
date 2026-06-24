@@ -5,6 +5,81 @@
 
 import pytest
 
+# MUVERA multi-vector helpers (mirror the sync `test_e2e_vector.py` helpers).
+_MV_DIM = 8
+
+
+def _basis(i):
+    v = [0.0] * _MV_DIM
+    v[i] = 1.0
+    return v
+
+
+def _vec_lit(vals):
+    return "[" + ",".join(str(float(x)) for x in vals) + "]"
+
+
+def _mv_lit(tokens):
+    return "[" + ",".join(_vec_lit(t) for t in tokens) + "]"
+
+
+@pytest.mark.asyncio
+async def test_async_muvera_index_create_and_query(async_empty_db):
+    """Async mirror of the sync `test_muvera_index_create_and_query`: declare a
+    `list:vector` field, create a `{"type":"vector","algorithm":"muvera",...}` index over
+    flushed rows (backfill path), then `uni.vector.query` ranks the exact-MaxSim maximizer
+    first. Confirms the async binding reaches the same shared MUVERA option-parsing +
+    create/backfill path as the sync surface."""
+    await (
+        async_empty_db.schema()
+        .label("Doc")
+        .property("title", "string")
+        .property("tokens", "list:vector:8")
+        .done()
+        .apply()
+    )
+
+    session = async_empty_db.session()
+    query_tokens = [_basis(0), _basis(1)]
+    tx = await session.tx()
+    await tx.execute(
+        f"CREATE (d:Doc {{title: 'target', tokens: {_mv_lit(query_tokens)}}})"
+    )
+    for i in range(20):
+        # Orthogonal noise (tokens from e2..e7) → MaxSim well below the target's 2.0.
+        toks = [_basis(2 + (i % 6)), _basis(2 + ((i + 1) % 6))]
+        await tx.execute(f"CREATE (d:Doc {{title: 'doc{i}', tokens: {_mv_lit(toks)}}})")
+    await tx.commit()
+    await async_empty_db.flush()
+
+    await (
+        async_empty_db.schema()
+        .label("Doc")
+        .index(
+            "tokens",
+            {
+                "type": "vector",
+                "algorithm": "muvera",
+                "k_sim": 4,
+                "reps": 8,
+                "d_proj": 8,
+                "inner": "flat",
+            },
+        )
+        .apply()
+    )
+
+    results = await session.query(f"""
+        CALL uni.vector.query('Doc', 'tokens', {_mv_lit(query_tokens)}, 5)
+        YIELD node, score
+        RETURN node.title AS title, score
+    """)
+    titles = [r["title"] for r in results]
+    assert titles, "async MUVERA query should return results"
+    assert titles[0] == "target", (
+        f"async MUVERA should rank the MaxSim maximizer first: {titles}"
+    )
+
 
 @pytest.mark.asyncio
 async def test_basic_vector_search_knn(async_ecommerce_db_populated):

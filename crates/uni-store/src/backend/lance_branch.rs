@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use crate::backend::types::FilterExpr;
+use crate::backend::types::{FilterExpr, VectorQueryOpts};
 use anyhow::{Context, Result};
 use lance::Dataset;
 
@@ -273,6 +273,7 @@ pub async fn create_scalar_index_on_branch(
 ///
 /// - The dataset or branch cannot be opened.
 /// - Lance rejects the query (column type mismatch, dimension mismatch).
+#[allow(clippy::too_many_arguments)]
 pub async fn vector_search_on_branch(
     uri: &str,
     branch: &str,
@@ -280,6 +281,7 @@ pub async fn vector_search_on_branch(
     query: &[f32],
     k: usize,
     filter: &FilterExpr,
+    opts: VectorQueryOpts,
 ) -> Result<Vec<arrow_array::RecordBatch>> {
     use arrow_array::Float32Array;
     use futures::TryStreamExt;
@@ -287,9 +289,20 @@ pub async fn vector_search_on_branch(
     let on_branch = open_branch(uri, branch).await?;
     let key = Float32Array::from(query.to_vec());
     let mut scanner = on_branch.scan();
+    // Disable scalar-index pushdown: the ANN prefilter would otherwise engage scalar-index
+    // discovery, whose `_indices/<id>/page_lookup.lance` is unresolvable across a >1-level
+    // fork `base_paths` chain (#106). Result-set neutral — the prefilter still excludes the
+    // same rows via a sequential scan.
+    scanner.use_scalar_index(false);
     scanner
         .nearest(column, &key, k)
         .map_err(|e| anyhow::anyhow!("vector_search_on_branch nearest({column}, k={k}): {e}"))?;
+    if let Some(n) = opts.nprobes {
+        scanner.nprobes(n);
+    }
+    if let Some(r) = opts.refine_factor {
+        scanner.refine(r);
+    }
     // M6: honor the caller's filter (user predicate + `_deleted = false`
     // + version HWM pin). Prefilter so excluded rows never consume a
     // top-k slot — otherwise a soft-deleted or out-of-version row could
@@ -338,6 +351,10 @@ pub async fn full_text_search_on_branch(
         wand_factor: None,
     };
     let mut scanner = on_branch.scan();
+    // Disable scalar-index pushdown (the prefilter would otherwise need the scalar index,
+    // unresolvable across a >1-level fork `base_paths` chain — #106). Only scalar indices are
+    // disabled; the FTS inverted index used by `full_text_search` is unaffected.
+    scanner.use_scalar_index(false);
     scanner
         .full_text_search(fts_query)
         .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;

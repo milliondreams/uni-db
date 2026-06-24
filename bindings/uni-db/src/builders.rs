@@ -667,16 +667,30 @@ impl LabelBuilder {
     /// Add an index on a property.
     ///
     /// `index_type` can be a string (e.g., `"btree"`, `"vector"`, `"fulltext"`, `"inverted"`)
-    /// or a dict with a `"type"` key and additional configuration:
+    /// or a dict with a `"type"` key and additional configuration.
+    ///
+    /// For `"type": "vector"`, the optional `"algorithm"` selects the ANN —
+    /// `"flat"`, `"ivf_flat"`, `"ivf_pq"` (the default), `"ivf_sq"`, `"ivf_rq"`,
+    /// `"hnsw_flat"`, `"hnsw_sq"`, `"hnsw_pq"`, or `"muvera"` — and `"metric"` is
+    /// `"cosine"` (default), `"l2"`, or `"dot"`. `"muvera"` (ColBERT / MaxSim
+    /// Fixed-Dimensional Encoding over a multi-vector `list[Vector[N]]` column) also
+    /// accepts `"k_sim"`, `"reps"`, `"d_proj"`, `"seed"`, and `"inner"` (the ANN built
+    /// over the derived FDE column, default `"ivf_pq"`).
     ///
     /// ```python
-    /// # Simple (string):
+    /// # Simple (string) — a "vector" index defaults to the IVF_PQ algorithm:
     /// builder.index("name", "btree")
+    /// builder.index("embedding", "vector")
     ///
     /// # Rich (dict):
     /// builder.index("embedding", {
-    ///     "type": "vector", "algorithm": "hnsw",
+    ///     "type": "vector", "algorithm": "hnsw_sq",
     ///     "m": 32, "ef_construction": 400, "metric": "l2"
+    /// })
+    /// # MUVERA over a multi-vector column:
+    /// builder.index("tokens", {
+    ///     "type": "vector", "algorithm": "muvera",
+    ///     "k_sim": 4, "reps": 20, "d_proj": 16, "inner": "ivf_pq"
     /// })
     /// builder.index("content", {
     ///     "type": "fulltext", "tokenizer": "ngram",

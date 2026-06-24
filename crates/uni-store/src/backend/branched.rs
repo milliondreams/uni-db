@@ -250,6 +250,7 @@ impl StorageBackend for BranchedBackend {
         self.inner.get_table_schema(name).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn vector_search(
         &self,
         table: &str,
@@ -258,6 +259,7 @@ impl StorageBackend for BranchedBackend {
         k: usize,
         metric: DistanceMetric,
         filter: FilterExpr,
+        opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
         // Phase 5b: when the fork has a branch for this dataset,
         // route through Lance's per-branch nearest-K — its
@@ -281,11 +283,42 @@ impl StorageBackend for BranchedBackend {
                 query,
                 k,
                 &filter,
+                opts,
             )
             .await;
         }
         self.inner
-            .vector_search(table, column, query, k, metric, filter)
+            .vector_search(table, column, query, k, metric, filter, opts)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn multivector_search(
+        &self,
+        table: &str,
+        column: &str,
+        query: &[Vec<f32>],
+        k: usize,
+        metric: DistanceMetric,
+        filter: FilterExpr,
+        opts: VectorQueryOpts,
+    ) -> Result<Vec<RecordBatch>> {
+        // Multi-vector retrieval over a forked/branched dataset has no Lance ANN
+        // path — there is no per-branch multi-vector `nearest` (and lancedb
+        // cannot open a `Table` on a non-main branch). It is instead handled one
+        // layer up: `StorageManager::multivector_search` intercepts branched
+        // tables, enumerates the branch's candidate vids via a branch-aware scan,
+        // and the uni-query `multivector_rerank` helper re-scores by exact MaxSim
+        // over disk + fork L0. So this method is never reached for a branched
+        // table; the guard is defense-in-depth for any direct backend caller.
+        if self.scope.branch_for(table).is_some() {
+            anyhow::bail!(
+                "multi-vector search on branches must go through \
+                 StorageManager::multivector_search (branch scan + MaxSim re-rank)"
+            );
+        }
+        self.inner
+            .multivector_search(table, column, query, k, metric, filter, opts)
             .await
     }
 

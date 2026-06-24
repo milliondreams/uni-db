@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use uni_db::{DataType, ModelAliasSpec, ModelTask, QueryResult, Uni, WarmupPolicy};
 use uni_xervo::runtime::ModelRuntime;
 use uni_xervo::traits::{
-    LoadedModelHandle, ModelProvider, ProviderCapabilities, ProviderHealth, RerankerModel,
-    ScoredDoc,
+    LoadedModelHandle, ModelInfo, ModelProvider, ProviderCapabilities, ProviderHealth,
+    RerankerModel, ScoredDoc,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,12 @@ use uni_xervo::traits::{
 /// (which orders by embedding proximity) and BM25 (which orders by term
 /// frequency).
 struct LengthReranker;
+
+impl ModelInfo for LengthReranker {
+    fn model_id(&self) -> &str {
+        "length-reranker"
+    }
+}
 
 #[async_trait]
 impl RerankerModel for LengthReranker {

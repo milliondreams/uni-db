@@ -234,3 +234,86 @@ async fn fork_local_vector_honors_deleted_filter() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+/// Nested (2-level) fork single-vector `vector.query` fuses results across the whole
+/// ancestry (grandchild → child → parent → main). This is the single-vector counterpart to
+/// `fork_index_multivector::nested_fork_multivector_resolves_through_ancestors`: it
+/// previously failed identically because a filtered branch scan engaged scalar-index
+/// pushdown whose `_vid` BTree `page_lookup.lance` is unresolvable across a >1-level fork
+/// chain. Fixed by disabling scalar-index pushdown on branch scans (#106).
+#[tokio::test]
+async fn nested_fork_vector_resolves_through_ancestors() -> Result<()> {
+    let cfg = UniConfig {
+        disable_fork_sweeper: true,
+        disable_fork_index_builder: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("name", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 3 })
+        .apply()
+        .await?;
+
+    // Root (main): a doc on the X axis.
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Doc {name: 'P-x', embedding: [1.0, 0.0, 0.0]})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Level-1 fork: a doc on the Y axis (the query target).
+    let a = primary.fork("vec_parent_fork").await?;
+    let tx = a.tx().await?;
+    tx.execute("CREATE (:Doc {name: 'A-y', embedding: [0.0, 1.0, 0.0]})")
+        .await?;
+    tx.commit().await?;
+    a.flush().await?;
+
+    // Level-2 fork (fork of a fork): a doc on the Z axis.
+    let b = a.fork("vec_child_fork").await?;
+    let tx = b.tx().await?;
+    tx.execute("CREATE (:Doc {name: 'B-z', embedding: [0.0, 0.0, 1.0]})")
+        .await?;
+    tx.commit().await?;
+    b.flush().await?;
+
+    // Query the grandchild near the Y axis: must fuse all three ancestry levels (this
+    // errored on the `_vid` scalar index before #106) with A-y (closest) on top.
+    let res = b
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [0.0, 1.0, 0.0], 5)
+             YIELD node, score
+             RETURN node.name AS name, score
+             ORDER BY score DESC",
+        )
+        .await?;
+    let names: Vec<String> = res
+        .rows()
+        .iter()
+        .filter_map(|r| r.get::<String>("name").ok())
+        .collect();
+
+    assert_eq!(
+        res.rows()[0].get::<String>("name")?,
+        "A-y",
+        "grandchild query: closest (parent-level) vector ranks first; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "P-x"),
+        "root-inherited vector must be visible across 2 fork levels; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "B-z"),
+        "child-local vector must be present; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "A-y"),
+        "parent-level vector must be present; got {names:?}"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

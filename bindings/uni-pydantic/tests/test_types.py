@@ -287,14 +287,48 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(list[int]) == ("list:int64", False)
 
     def test_dict_type(self):
-        """Test dict type mapping."""
+        """Test dict type mapping.
+
+        String-keyed parameterized dicts map to a typed MAP<STRING, V> (#105); the value
+        type recurses (so nested values map too). Bare dicts and non-string-key or
+        unmappable-value dicts fall back to schemaless JSON.
+        """
+        # Bare dict and non-string keys -> schemaless JSON.
         assert python_type_to_uni(dict) == ("json", False)
-        assert python_type_to_uni(dict[str, int]) == ("json", False)
+        assert python_type_to_uni(dict[int, str]) == ("json", False)
+        # Typed string-keyed maps (scalars).
+        assert python_type_to_uni(dict[str, int]) == ("map:string:int64", False)
+        assert python_type_to_uni(dict[str, float]) == ("map:string:float64", False)
+        assert python_type_to_uni(dict[str, str]) == ("map:string:string", False)
+        assert python_type_to_uni(dict[str, bool]) == ("map:string:bool", False)
+        # Nested value types recurse.
+        assert python_type_to_uni(dict[str, list[int]]) == (
+            "map:string:list:int64",
+            False,
+        )
+        assert python_type_to_uni(dict[str, Vector[8]]) == (
+            "map:string:vector:8",
+            False,
+        )
+        assert python_type_to_uni(dict[str, dict[str, int]]) == (
+            "map:string:map:string:int64",
+            False,
+        )
+        # Optional unwraps to nullable.
+        assert python_type_to_uni(dict[str, float] | None) == (
+            "map:string:float64",
+            True,
+        )
 
     def test_vector_type(self):
         """Test vector type mapping."""
         assert python_type_to_uni(Vector[128]) == ("vector:128", False)
         assert python_type_to_uni(Vector[1536] | None) == ("vector:1536", True)
+
+    def test_list_vector_type(self):
+        """Test list[Vector[N]] (multi-vector / ColBERT) type mapping."""
+        assert python_type_to_uni(list[Vector[128]]) == ("list:vector:128", False)
+        assert python_type_to_uni(list[Vector[256]] | None) == ("list:vector:256", True)
 
     def test_unsupported_type(self):
         """Test unsupported type raises error."""
@@ -379,6 +413,18 @@ class TestPythonToDbValue:
         vec = Vector[3]([1.0, 2.0, 3.0])
         result = python_to_db_value(vec, Vector[3])
         assert result == [1.0, 2.0, 3.0]
+
+    def test_list_vector_roundtrip(self):
+        """Test list[Vector[N]] <-> list[list[float]] (multi-vector / ColBERT)."""
+        vecs = [Vector[3]([1.0, 2.0, 3.0]), Vector[3]([4.0, 5.0, 6.0])]
+        encoded = python_to_db_value(vecs, list[Vector[3]])
+        assert encoded == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+        decoded = db_to_python_value(encoded, list[Vector[3]])
+        assert len(decoded) == 2
+        assert all(isinstance(v, Vector) for v in decoded)
+        assert decoded[0].values == [1.0, 2.0, 3.0]
+        assert decoded[1].values == [4.0, 5.0, 6.0]
 
     def test_string_passthrough(self):
         """Test string passes through."""

@@ -1087,9 +1087,18 @@ class LabelBuilder:
         self, name: str, data_type: str | DataType, *, description: str | None = None
     ) -> LabelBuilder: ...
     def vector(self, name: str, dimensions: int) -> LabelBuilder: ...
-    def index(
-        self, property: str, index_type: str | dict[str, Any]
-    ) -> LabelBuilder: ...
+    def index(self, property: str, index_type: str | dict[str, Any]) -> LabelBuilder:
+        """Add an index. ``index_type`` is a name (``"btree"``, ``"vector"``,
+        ``"fulltext"``, ``"inverted"``) or a config dict with a ``"type"`` key.
+
+        For ``"type": "vector"`` the optional ``"algorithm"`` is one of ``flat``,
+        ``ivf_flat``, ``ivf_pq`` (default), ``ivf_sq``, ``ivf_rq``, ``hnsw_flat``,
+        ``hnsw_sq``, ``hnsw_pq``, or ``muvera``; ``"metric"`` is ``cosine`` (default),
+        ``l2``, or ``dot``. ``"muvera"`` (ColBERT/MaxSim Fixed-Dimensional Encoding over a
+        ``list[Vector[N]]`` column) also accepts ``k_sim``, ``reps``, ``d_proj``,
+        ``seed``, and ``inner`` (the ANN over the derived FDE column, default ``ivf_pq``).
+        """
+        ...
     def done(self) -> SchemaBuilder: ...
     def apply(self) -> None: ...
 
@@ -2313,7 +2322,18 @@ class AsyncLabelBuilder:
     def vector(self, name: str, dimensions: int) -> AsyncLabelBuilder: ...
     def index(
         self, property: str, index_type: str | dict[str, Any]
-    ) -> AsyncLabelBuilder: ...
+    ) -> AsyncLabelBuilder:
+        """Add an index. ``index_type`` is a name (``"btree"``, ``"vector"``,
+        ``"fulltext"``, ``"inverted"``) or a config dict with a ``"type"`` key.
+
+        For ``"type": "vector"`` the optional ``"algorithm"`` is one of ``flat``,
+        ``ivf_flat``, ``ivf_pq`` (default), ``ivf_sq``, ``ivf_rq``, ``hnsw_flat``,
+        ``hnsw_sq``, ``hnsw_pq``, or ``muvera``; ``"metric"`` is ``cosine`` (default),
+        ``l2``, or ``dot``. ``"muvera"`` (ColBERT/MaxSim Fixed-Dimensional Encoding over a
+        ``list[Vector[N]]`` column) also accepts ``k_sim``, ``reps``, ``d_proj``,
+        ``seed``, and ``inner`` (the ANN over the derived FDE column, default ``ivf_pq``).
+        """
+        ...
     def done(self) -> AsyncSchemaBuilder: ...
     async def apply(self) -> None: ...
 

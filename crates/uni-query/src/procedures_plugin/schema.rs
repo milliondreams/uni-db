@@ -448,6 +448,11 @@ impl ProcedurePlugin for SchemaLabelInfoProc {
         let mut rows: Vec<HashMap<String, Value>> = Vec::new();
         if let Some(props) = uni_schema.properties.get(&label_name) {
             for (prop_name, prop_meta) in props {
+                // Hide internal storage-layer columns (e.g. MUVERA `__fde_*` derived
+                // vectors) from schema introspection.
+                if prop_name.starts_with("__") {
+                    continue;
+                }
                 let is_indexed = uni_schema.indexes.iter().any(|idx| match idx {
                     IndexDefinition::Vector(v) => v.label == label_name && v.property == *prop_name,
                     IndexDefinition::Scalar(s) => {

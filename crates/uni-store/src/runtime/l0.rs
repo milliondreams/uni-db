@@ -1473,6 +1473,15 @@ impl L0Buffer {
             self.merge_guard_index.insert(key.clone(), *vid);
         }
 
+        // Carry deferred-embedding markers from the tx L0 into the main L0 so the
+        // flush-time `drain_pending_embeddings` sees them (the marked vids' properties were
+        // just merged above). Without this, `defer_embeddings` auto-embed silently no-ops for
+        // any transactional write — a pre-existing gap that also affects single-vector
+        // deferral, surfaced while wiring multi-vector auto-embed (issue #104).
+        for (vid, label) in &other.pending_embeddings {
+            self.pending_embeddings.insert(*vid, label.clone());
+        }
+
         Ok(())
     }
 

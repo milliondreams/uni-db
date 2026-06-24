@@ -3696,11 +3696,15 @@ async fn pre_embed_semantic_match_queries(
             ))
         })?;
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let embeddings = embedder.embed(text_refs).await.map_err(|e| {
-            datafusion::error::DataFusionError::Execution(format!(
-                "semantic_match: embedder '{alias}' call failed: {e}"
-            ))
-        })?;
+        let embeddings = embedder
+            .embed(&text_refs)
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "semantic_match: embedder '{alias}' call failed: {e}"
+                ))
+            })?
+            .vectors;
         if embeddings.len() != texts.len() {
             return Err(datafusion::error::DataFusionError::Execution(format!(
                 "semantic_match: embedder '{alias}' returned {} vectors for {} queries",

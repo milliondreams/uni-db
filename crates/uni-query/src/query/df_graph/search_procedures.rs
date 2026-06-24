@@ -77,16 +77,84 @@ pub(crate) fn extract_vector(val: &Value) -> DFResult<Vec<f32>> {
     }
 }
 
+/// Extract a multi-vector (a list of token vectors) from a `Value`, for
+/// late-interaction (ColBERT / MaxSim) queries and document properties.
+///
+/// Accepts a `Value::List` whose elements are each a vector (`Value::Vector`
+/// or a list of numbers, via [`extract_vector`]).
+pub(crate) fn extract_vector_list(val: &Value) -> DFResult<Vec<Vec<f32>>> {
+    match val {
+        Value::List(arr) => arr.iter().map(extract_vector).collect(),
+        _ => Err(datafusion::error::DataFusionError::Execution(
+            "Multi-vector query must be a list of vectors".to_string(),
+        )),
+    }
+}
+
+/// Parse a distance-metric name (case-insensitive); defaults to `Cosine`.
+fn parse_distance_metric(s: &str) -> DistanceMetric {
+    match s.to_ascii_lowercase().as_str() {
+        "dot" => DistanceMetric::Dot,
+        "l2" | "euclidean" => DistanceMetric::L2,
+        _ => DistanceMetric::Cosine,
+    }
+}
+
+/// Parse the `nprobes` / `refine_factor` ANN tuning knobs from a procedure's
+/// `options` map (`None` for either = Lance default). Applies to dense and
+/// multi-vector queries alike.
+fn parse_vector_query_opts(
+    options_map: Option<&HashMap<String, Value>>,
+) -> uni_store::VectorQueryOpts {
+    let nprobes = options_map
+        .and_then(|m| m.get("nprobes"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let refine_factor = options_map
+        .and_then(|m| m.get("refine_factor"))
+        .and_then(|v| v.as_u64())
+        .map(|r| r as u32);
+    uni_store::VectorQueryOpts {
+        nprobes,
+        refine_factor,
+    }
+}
+
+/// Detects whether a property is a multi-vector (`List<FixedSizeList<Float32>>`)
+/// column, given the label's property metadata.
+fn is_multivector_property(
+    property: &str,
+    label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
+) -> bool {
+    matches!(
+        resolve_property_type(property, label_props),
+        arrow_schema::DataType::List(ref inner)
+            if matches!(inner.data_type(), arrow_schema::DataType::FixedSizeList(_, _))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Reranker configuration + per-call reranker context
 // ---------------------------------------------------------------------------
 
-/// Configuration for an optional cross-encoder reranking stage.
+/// Sentinel reranker alias selecting in-process MaxSim (late-interaction /
+/// ColBERT) scoring instead of a neural cross-encoder model.
+pub(super) const MAXSIM_RERANKER: &str = "maxsim";
+
+/// Configuration for an optional reranking stage.
+///
+/// When `alias` equals [`MAXSIM_RERANKER`], scoring is in-process MaxSim over a
+/// stored multi-vector property (`maxsim_query` is the per-token query and
+/// `metric` its similarity metric); otherwise it is a neural cross-encoder.
 pub(super) struct RerankerConfig {
     pub alias: String,
     pub property: String,
     pub k: usize,
     pub query_override: Option<String>,
+    /// MaxSim query multi-vector; `Some` only for the [`MAXSIM_RERANKER`] alias.
+    pub maxsim_query: Option<Vec<Vec<f32>>>,
+    /// Similarity metric for MaxSim scoring (default `Cosine`).
+    pub metric: DistanceMetric,
 }
 
 pub(super) fn parse_reranker_options(
@@ -111,11 +179,29 @@ pub(super) fn parse_reranker_options(
         .get("reranker_query")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // MaxSim mode: parse the per-token query multi-vector and metric. The query
+    // is parsed best-effort here; a missing/malformed query is reported as a
+    // hard error at rerank time so a requested maxsim never silently no-ops.
+    let (maxsim_query, metric) = if alias == MAXSIM_RERANKER {
+        let q = map
+            .get("maxsim_query")
+            .and_then(|v| extract_vector_list(v).ok());
+        let m = map
+            .get("maxsim_metric")
+            .and_then(|v| v.as_str())
+            .map(parse_distance_metric)
+            .unwrap_or(DistanceMetric::Cosine);
+        (q, m)
+    } else {
+        (None, DistanceMetric::Cosine)
+    };
     Some(RerankerConfig {
         alias,
         property,
         k: reranker_k,
         query_override,
+        maxsim_query,
+        metric,
     })
 }
 
@@ -149,6 +235,42 @@ async fn rerank_candidates(
         .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // MaxSim (late-interaction / ColBERT) rerank: no neural model — score each
+    // candidate's stored multi-vector property against the query multi-vector
+    // in-process. Pure CPU; `reranker_k` (clamped <= 1000) bounds the work.
+    if config.alias == MAXSIM_RERANKER {
+        let query = config.maxsim_query.as_ref().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "maxsim reranker requires a valid 'maxsim_query' option (a list of vectors)"
+                    .to_string(),
+            )
+        })?;
+        let mut scored: Vec<(Vid, f32)> = Vec::with_capacity(vids.len());
+        for vid in &vids {
+            // Missing/empty multi-vector property -> no document tokens -> score 0.
+            let doc_tokens = props_map
+                .get(vid)
+                .and_then(|p| p.get(&config.property))
+                .map(extract_vector_list)
+                .transpose()?
+                .unwrap_or_default();
+            let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, &config.metric)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            scored.push((*vid, score));
+        }
+        let rerank_map: HashMap<Vid, f32> = scored.iter().copied().collect();
+        let mut reranked = scored;
+        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.truncate(k);
+        return Ok((
+            reranked,
+            RerankContext {
+                scores: rerank_map,
+                props: props_map,
+            },
+        ));
+    }
 
     let doc_texts: Vec<String> = vids
         .iter()
@@ -197,6 +319,153 @@ async fn rerank_candidates(
     ))
 }
 
+/// Default Lance candidate over-fetch multiplier for native multi-vector
+/// (ColBERT / MaxSim) first-stage retrieval. Lance ANN over the flushed set is
+/// only a *candidate generator*; the exact MaxSim re-rank picks the true top-k,
+/// so we pull a few times `k` to preserve recall.
+pub(crate) const MULTIVECTOR_OVER_FETCH: usize = 4;
+/// Hard cap on the number of candidates re-scored in-process, bounding CPU.
+const MULTIVECTOR_MAX_CANDIDATES: usize = 1000;
+
+/// First-stage native multi-vector (ColBERT / MaxSim) retrieval **with L0
+/// visibility**.
+///
+/// Single-vector search merges unflushed L0 rows into Lance's ranking directly,
+/// because the in-process distance is on the identical scale as Lance's
+/// `_distance`. Multi-vector cannot: Lance's `_distance` is an opaque internal
+/// aggregate whose scale cannot be matched against an in-process MaxSim. So this
+/// treats Lance as a pure **candidate generator** over flushed/indexed data,
+/// unions its hits with the live L0 vids for the label (minus tombstones), and
+/// re-scores *every* candidate in-process with exact MaxSim. Flushed and
+/// unflushed rows therefore share one consistent, exact ranking, and a query
+/// sees recent writes without an explicit `flush()`.
+///
+/// Returns the top-`k` `(vid, maxsim_similarity)` (higher = better) plus the
+/// fetched property map, which the caller reuses to materialise node columns
+/// without a second fetch. `retrieval_k` is the Lance over-fetch count.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn multivector_rerank(
+    storage: &uni_store::storage::StorageManager,
+    property_manager: &uni_store::PropertyManager,
+    query_ctx: &uni_store::QueryContext,
+    label: &str,
+    property: &str,
+    query: &[Vec<f32>],
+    k: usize,
+    retrieval_k: usize,
+    filter: Option<&str>,
+    opts: uni_store::VectorQueryOpts,
+    metric: &DistanceMetric,
+) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
+    // 1. Candidate generation over flushed/indexed data.
+    //
+    //    MUVERA fast path (main line only): if the property has a MUVERA index, encode
+    //    the query into a Fixed-Dimensional Encoding and run the single-vector ANN over
+    //    the derived `__fde_*` column (Dot metric). This replaces the heavier native
+    //    multi-vector ANN with a fast single-vector ANN; the exact MaxSim re-rank below
+    //    is unchanged. On forks we keep the native brute-force branch scan (the FDE index
+    //    isn't branched), and `multivector_search` also handles L0-only corpora.
+    let lance_hits = {
+        let muvera_hits = if storage.fork_scope().is_none() {
+            let schema = storage.schema_manager().schema();
+            schema
+                .vector_index_for_property(label, property)
+                .and_then(|cfg| uni_store::storage::muvera_index::fde_spec_for_config(&schema, cfg))
+        } else {
+            None
+        };
+        match muvera_hits {
+            Some(spec) => {
+                let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                let fde_q = encoder
+                    .encode_query(query)
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                storage
+                    .muvera_fde_candidates(
+                        label,
+                        &spec.derived_col,
+                        &fde_q,
+                        retrieval_k,
+                        filter,
+                        opts,
+                        Some(query_ctx),
+                    )
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+            }
+            None => storage
+                .multivector_search(
+                    label,
+                    property,
+                    query,
+                    retrieval_k,
+                    filter,
+                    opts,
+                    Some(query_ctx),
+                )
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+        }
+    };
+
+    // 2. Live L0 candidates (and tombstones) for the label.
+    let (l0_live, tombstoned) = uni_store::collect_l0_label_candidates(query_ctx, label);
+
+    // 3. Union(Lance, L0) minus tombstoned, deduped, capped.
+    let mut seen: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+    let mut candidates: Vec<Vid> = Vec::new();
+    for (vid, _) in &lance_hits {
+        if !tombstoned.contains(vid) && seen.insert(*vid) {
+            candidates.push(*vid);
+        }
+    }
+    for vid in l0_live {
+        if !tombstoned.contains(&vid) && seen.insert(vid) {
+            candidates.push(vid);
+        }
+    }
+    // On a fork the candidate set is the full branch scan (incl. inherited
+    // rows) unordered, so truncating would silently drop recall — score them
+    // all (brute-force). On the main path Lance pre-limits to `retrieval_k`, so
+    // the cap is just a safety net.
+    if storage.fork_scope().is_none() {
+        candidates.truncate(MULTIVECTOR_MAX_CANDIDATES);
+    }
+
+    // 4. Fetch token properties for all candidates (L0 + Lance merged, tombstone
+    //    aware).
+    let props_map = property_manager
+        .get_batch_vertex_props_for_label(&candidates, label, Some(query_ctx))
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 5. Exact in-process MaxSim re-score. A vid absent from `props_map` is not
+    //    visible (filtered by tombstone / version) and is dropped; a vid present
+    //    but missing the property has no document tokens and scores 0 (matching
+    //    the cross-encoder MaxSim rerank path). A dimension mismatch propagates
+    //    as a hard error.
+    let mut scored: Vec<(Vid, f32)> = Vec::with_capacity(candidates.len());
+    for vid in &candidates {
+        let Some(props) = props_map.get(vid) else {
+            continue;
+        };
+        let doc_tokens = match props.get(property) {
+            Some(v) => extract_vector_list(v)?,
+            None => Vec::new(),
+        };
+        let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, metric)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        scored.push((*vid, score));
+    }
+
+    // 6. Top-k by similarity (higher = better).
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+
+    Ok((scored, props_map))
+}
+
 // ---------------------------------------------------------------------------
 // Auto-embed
 // ---------------------------------------------------------------------------
@@ -237,9 +506,10 @@ async fn auto_embed_text(
     };
 
     let embeddings = embedder
-        .embed(vec![prefixed_query.as_str()])
+        .embed(&[prefixed_query.as_str()])
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .vectors;
     embeddings.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
             "Embedding service returned no results".to_string(),
@@ -576,6 +846,92 @@ pub(crate) async fn run_vector_query(
     })?;
 
     let storage = host.storage();
+
+    // First-stage multi-vector (ColBERT / MaxSim) retrieval: when the queried
+    // property is a `List<Vector>` column, the query is a list of token vectors
+    // and there is no cross-encoder rerank stage. (The dense + `reranker:'maxsim'`
+    // path below is a different call shape: a dense ANN property reranked by a
+    // separate multi-vector `reranker_property`.)
+    let is_multivector = {
+        let sch = storage.schema_manager().schema();
+        is_multivector_property(&property, sch.properties.get(&label))
+    };
+    if is_multivector {
+        let k = require_int_arg(args, 3, "uni.vector.query: fourth argument (k)")?;
+        let filter = extract_optional_filter(args, 4);
+        // The multi-vector `score` is an exact MaxSim *similarity* (higher is
+        // better), so `threshold` here is a minimum similarity (not a maximum
+        // distance, unlike the dense-vector path).
+        let threshold = extract_optional_threshold(args, 5);
+        let options_map = args
+            .get(6)
+            .and_then(|v| if v.is_null() { None } else { v.as_object() });
+        let opts = parse_vector_query_opts(options_map);
+        let queries = extract_vector_list(query_val)?;
+        let query_ctx = host.query_context();
+
+        // Default Cosine for multi-vector (ColBERT) when the property has no index.
+        let metric = {
+            let sch = storage.schema_manager().schema();
+            sch.vector_index_for_property(&label, &property)
+                .map(|config| config.metric.clone())
+                .unwrap_or(DistanceMetric::Cosine)
+        };
+
+        // Lance is a candidate generator; over-fetch (`over_fetch` option, or a
+        // default multiple of `k`) preserves recall before the exact re-rank.
+        let over_fetch = options_map
+            .and_then(|m| m.get("over_fetch"))
+            .and_then(|v| v.as_f64())
+            .filter(|f| *f >= 1.0)
+            .unwrap_or(MULTIVECTOR_OVER_FETCH as f64);
+        let retrieval_k = (((k as f64) * over_fetch).ceil() as usize).max(k);
+
+        let property_manager = host.property_manager().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "Cannot run multi-vector query: property manager not available on host".to_string(),
+            )
+        })?;
+
+        let (mut results, props) = multivector_rerank(
+            storage,
+            property_manager,
+            &query_ctx,
+            &label,
+            &property,
+            &queries,
+            k,
+            retrieval_k,
+            filter.as_deref(),
+            opts,
+            &metric,
+        )
+        .await?;
+
+        if let Some(min_sim) = threshold {
+            results.retain(|(_, sim)| *sim >= min_sim as f32);
+        }
+        if results.is_empty() {
+            return Ok(Some(create_empty_batch(schema.clone())?));
+        }
+
+        // Emit the exact MaxSim similarity as `score` (and reuse the fetched
+        // props for node materialisation) by routing through the rerank context,
+        // which bypasses `calculate_score`.
+        let rerank_ctx = RerankContext {
+            scores: results.iter().copied().collect(),
+            props,
+        };
+        let batch_ctx = BatchBuildCtx {
+            yield_items,
+            target_properties,
+            host,
+            schema,
+            rerank_ctx: Some(&rerank_ctx),
+        };
+        return build_search_result_batch(&results, &label, &metric, &batch_ctx).await;
+    }
+
     let query_text_from_arg = query_val.as_str().map(String::from);
     let query_vector: Vec<f32> = if let Some(ref query_text) = query_text_from_arg {
         auto_embed_text(host, &label, &property, query_text).await?
@@ -589,9 +945,15 @@ pub(crate) async fn run_vector_query(
     let options_val = args.get(6);
     let options_map = options_val.and_then(|v| if v.is_null() { None } else { v.as_object() });
     let reranker_config = parse_reranker_options(options_map, k, None);
+    let vec_opts = parse_vector_query_opts(options_map);
 
     if let Some(ref rcfg) = reranker_config {
-        if query_text_from_arg.is_none() && rcfg.query_override.is_none() {
+        // MaxSim scores against `maxsim_query` (a multi-vector), not the text
+        // query, so it is exempt from the cross-encoder's reranker_query rule.
+        if rcfg.alias != MAXSIM_RERANKER
+            && query_text_from_arg.is_none()
+            && rcfg.query_override.is_none()
+        {
             return Err(datafusion::error::DataFusionError::Execution(
                 "Cannot rerank: query is a pre-computed vector. \
                  Provide reranker_query in options."
@@ -615,6 +977,7 @@ pub(crate) async fn run_vector_query(
             &query_vector,
             retrieval_k,
             filter.as_deref(),
+            vec_opts,
             Some(&query_ctx),
         )
         .await
@@ -817,6 +1180,7 @@ pub(crate) async fn run_hybrid_search(
                     &qvec,
                     effective_retrieval_k,
                     filter.as_deref(),
+                    uni_store::VectorQueryOpts::default(),
                     Some(&query_ctx),
                 )
                 .await

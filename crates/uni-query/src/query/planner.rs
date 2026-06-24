@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{
-    DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig,
-    ScalarIndexConfig, ScalarIndexType, Schema, TokenizerConfig, VectorIndexConfig,
-    VectorIndexType,
+    EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig,
+    ScalarIndexType, Schema, TokenizerConfig, VectorIndexConfig,
 };
 use uni_cypher::ast::{
     AlterEdgeType, AlterLabel, BinaryOp, CallKind, Clause, CreateConstraint, CreateEdgeType,
@@ -8360,53 +8359,46 @@ impl QueryPlanner {
     fn plan_schema_command(&self, cmd: SchemaCommand) -> Result<LogicalPlan> {
         match cmd {
             SchemaCommand::CreateVectorIndex(c) => {
-                // Parse index type from options (default: IvfPq)
-                let opt = |key: &str| {
-                    c.options
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u32>().ok())
+                use uni_common::vector_index_opts::{
+                    VectorIndexOpts, build_vector_index_type, parse_vector_metric,
+                };
+                // Accept either a numeric value (`partitions: 256`) or a quoted string
+                // (`partitions: '256'`) — Cypher map literals produce the former.
+                let opt = |key: &str| -> Option<u32> {
+                    c.options.get(key).and_then(|v| {
+                        v.as_u64()
+                            .map(|n| n as u32)
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+                    })
                 };
                 let opt_u8 = |key: &str| -> Option<u8> {
-                    c.options
-                        .get(key)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u8>().ok())
+                    c.options.get(key).and_then(|v| {
+                        v.as_u64()
+                            .map(|n| n as u8)
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u8>().ok()))
+                    })
                 };
-                let index_type = match c.options.get("type").and_then(|v| v.as_str()) {
-                    Some("flat") => VectorIndexType::Flat,
-                    Some("ivf_flat") => VectorIndexType::IvfFlat {
-                        num_partitions: opt("partitions").unwrap_or(256),
-                    },
-                    Some("ivf_sq") => VectorIndexType::IvfSq {
-                        num_partitions: opt("partitions").unwrap_or(256),
-                    },
-                    Some("ivf_rq") => VectorIndexType::IvfRq {
-                        num_partitions: opt("partitions").unwrap_or(256),
-                        num_bits: opt_u8("num_bits"),
-                    },
-                    Some("hnsw_flat") => VectorIndexType::HnswFlat {
-                        m: opt("m").unwrap_or(16),
-                        ef_construction: opt("ef_construction").unwrap_or(200),
-                        num_partitions: opt("partitions"),
-                    },
-                    Some("hnsw") | Some("hnsw_sq") => VectorIndexType::HnswSq {
-                        m: opt("m").unwrap_or(16),
-                        ef_construction: opt("ef_construction").unwrap_or(200),
-                        num_partitions: opt("partitions"),
-                    },
-                    Some("hnsw_pq") => VectorIndexType::HnswPq {
-                        m: opt("m").unwrap_or(16),
-                        ef_construction: opt("ef_construction").unwrap_or(200),
-                        num_sub_vectors: opt("sub_vectors").unwrap_or(16),
-                        num_partitions: opt("partitions"),
-                    },
-                    _ => VectorIndexType::IvfPq {
-                        num_partitions: opt("partitions").unwrap_or(256),
-                        num_sub_vectors: opt("sub_vectors").unwrap_or(16),
-                        bits_per_subvector: opt_u8("num_bits").unwrap_or(8),
-                    },
+                let opt_u64 = |key: &str| -> Option<u64> {
+                    c.options.get(key).and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
                 };
+                // Single source of truth (shared with the `uni.create_vector_index`
+                // procedure) so dense / native-multivector / MUVERA behave identically.
+                let index_type = build_vector_index_type(&VectorIndexOpts {
+                    type_name: c.options.get("type").and_then(|v| v.as_str()),
+                    partitions: opt("partitions"),
+                    m: opt("m"),
+                    ef_construction: opt("ef_construction"),
+                    sub_vectors: opt("sub_vectors"),
+                    num_bits: opt_u8("num_bits"),
+                    k_sim: opt("k_sim"),
+                    reps: opt("reps"),
+                    d_proj: opt("d_proj"),
+                    seed: opt_u64("seed"),
+                    inner: c.options.get("inner").and_then(|v| v.as_str()),
+                });
 
                 // Parse embedding config from options
                 let embedding_config = if let Some(emb_val) = c.options.get("embedding") {
@@ -8415,11 +8407,14 @@ impl QueryPlanner {
                     None
                 };
 
+                // Parse the distance metric from OPTIONS (default Cosine).
+                let metric = parse_vector_metric(c.options.get("metric").and_then(|v| v.as_str()))?;
+
                 let config = VectorIndexConfig {
                     name: c.name,
                     label: c.label,
                     property: c.property,
-                    metric: DistanceMetric::Cosine,
+                    metric,
                     index_type,
                     embedding_config,
                     metadata: Default::default(),

@@ -662,7 +662,11 @@ pub fn create_index_definition(
 /// Create an index definition from a rich configuration dict.
 ///
 /// The config dict must have a `"type"` key. Supported types:
-/// - `"vector"`: optional `algorithm`, `metric`, `m`, `ef_construction`, `embedding`
+/// - `"vector"`: optional `algorithm` (`flat`, `ivf_flat`, `ivf_pq` (default),
+///   `ivf_sq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq`, `hnsw_pq`, `muvera`), `metric`
+///   (`cosine` (default), `l2`, `dot`), `partitions`, `m`, `ef_construction`,
+///   `sub_vectors`, `embedding`. For `algorithm: "muvera"` (ColBERT/MaxSim FDE over a
+///   multi-vector column): also `k_sim`, `reps`, `d_proj`, `seed`, `inner`.
 /// - `"fulltext"`: optional `tokenizer`, `ngram_min`, `ngram_max`
 /// - `"inverted"`: no extra options
 /// - `"btree"`, `"hash"`, `"scalar"`: no extra options

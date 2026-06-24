@@ -666,7 +666,10 @@ pub fn create_index_definition(
 ///   `ivf_sq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq`, `hnsw_pq`, `muvera`), `metric`
 ///   (`cosine` (default), `l2`, `dot`), `partitions`, `m`, `ef_construction`,
 ///   `sub_vectors`, `embedding`. For `algorithm: "muvera"` (ColBERT/MaxSim FDE over a
-///   multi-vector column): also `k_sim`, `reps`, `d_proj`, `seed`, `inner`.
+///   multi-vector column): also `k_sim`, `reps`, `d_proj`, `seed`, `inner`. The MUVERA
+///   defaults (`k_sim=4, reps=20, d_proj=16`) are starting points, not corpus-validated;
+///   recall is corpus-dependent, so tune per corpus (the exact MaxSim re-rank keeps results
+///   precise — a weak FDE only costs recall).
 /// - `"fulltext"`: optional `tokenizer`, `ngram_min`, `ngram_max`
 /// - `"inverted"`: no extra options
 /// - `"btree"`, `"hash"`, `"scalar"`: no extra options

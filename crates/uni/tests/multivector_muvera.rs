@@ -85,25 +85,41 @@ async fn define_schema(db: &Uni) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Insert `n` docs (the middle one titled `target` with tokens == query) in one tx.
-async fn insert_corpus(db: &Uni, n: usize, seed: u64) -> anyhow::Result<()> {
+/// Deterministic corpus: doc `n/2` titled `target` has tokens == the query (the unique
+/// MaxSim maximizer, score 2.0); the rest are random unit-vector docs. Returned (not just
+/// inserted) so a test can compute an independent brute-force MaxSim ground truth over the
+/// exact same data.
+fn build_corpus(n: usize, seed: u64) -> Vec<(String, Vec<Vec<f32>>)> {
     let q = query_tokens();
     let mut rng = Rng(seed);
+    (0..n)
+        .map(|i| {
+            if i == n / 2 {
+                ("target".to_string(), q.clone())
+            } else {
+                (format!("doc{i}"), (0..3).map(|_| rng.unit()).collect())
+            }
+        })
+        .collect()
+}
+
+/// Insert an explicit corpus in one tx.
+async fn insert_docs(db: &Uni, docs: &[(String, Vec<Vec<f32>>)]) -> anyhow::Result<()> {
     let tx = db.session().tx().await?;
-    for i in 0..n {
-        let (title, tokens) = if i == n / 2 {
-            ("target".to_string(), q.clone())
-        } else {
-            (format!("doc{i}"), (0..3).map(|_| rng.unit()).collect())
-        };
+    for (title, tokens) in docs {
         tx.execute_with("CREATE (:Doc {title: $title, tokens: $toks})")
-            .param("title", Value::String(title))
-            .param("toks", to_value(&tokens))
+            .param("title", Value::String(title.clone()))
+            .param("toks", to_value(tokens))
             .run()
             .await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Insert `n` docs (the middle one titled `target` with tokens == query) in one tx.
+async fn insert_corpus(db: &Uni, n: usize, seed: u64) -> anyhow::Result<()> {
+    insert_docs(db, &build_corpus(n, seed)).await
 }
 
 async fn create_muvera_index(db: &Uni, opts: &str) -> anyhow::Result<()> {
@@ -128,6 +144,107 @@ async fn query_titles(db: &Uni, k: usize) -> anyhow::Result<Vec<String>> {
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect())
+}
+
+/// The `uni.vector.query` Cypher for the standard query tokens, yielding title + score.
+fn vector_query_cypher(k: usize) -> String {
+    let lit = cypher_lit(&query_tokens());
+    format!(
+        "CALL uni.vector.query('Doc', 'tokens', {lit}, {k}, null, null, {{}}) \
+         YIELD node, score RETURN node.title AS title, score"
+    )
+}
+
+/// Run the query and return `(title, score)` in engine rank order.
+async fn query_results(db: &Uni, k: usize) -> anyhow::Result<Vec<(String, f64)>> {
+    let res = db.session().query(&vector_query_cypher(k)).await?;
+    Ok(res
+        .rows()
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
+        .collect())
+}
+
+/// Brute-force ground truth: cosine MaxSim `Σ_q max_d cos(q,d)` (a query token with no doc
+/// tokens contributes 0), computed in f64. This mirrors
+/// `uni_query_functions::similar_to::maxsim` under the `Cosine` metric — raw cosine summed
+/// over query tokens — which is the EXACT score the engine returns for a MUVERA / native
+/// multi-vector query (the FDE first stage only selects candidates; the reported score is
+/// the exact re-rank). The MUVERA indexes in this file use the default Cosine metric.
+fn cosine_maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f64 {
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let na = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    };
+    query
+        .iter()
+        .map(|q| {
+            doc.iter()
+                .map(|d| cos(q, d))
+                .fold(None, |acc: Option<f64>, s| {
+                    Some(acc.map_or(s, |b| b.max(s)))
+                })
+                .unwrap_or(0.0)
+        })
+        .sum()
+}
+
+/// Assert engine results match the brute-force oracle over `corpus`:
+/// (a) every returned doc carries its EXACT MaxSim score, (b) results are ordered by
+/// descending score, (c) the top score equals the oracle maximum, and — when
+/// `expect_full_set` (retrieval covered the whole corpus, e.g. an exact `flat` inner with
+/// `k == corpus.len()`) — (d) the returned title set equals the full corpus. `EPS` absorbs
+/// f32-vs-f64 rounding.
+fn assert_matches_oracle(
+    engine: &[(String, f64)],
+    corpus: &[(String, Vec<Vec<f32>>)],
+    query: &[Vec<f32>],
+    expect_full_set: bool,
+) {
+    const EPS: f64 = 1e-4;
+    let oracle: std::collections::HashMap<&str, f64> = corpus
+        .iter()
+        .map(|(t, toks)| (t.as_str(), cosine_maxsim(query, toks)))
+        .collect();
+
+    for (title, score) in engine {
+        let want = oracle
+            .get(title.as_str())
+            .unwrap_or_else(|| panic!("engine returned a title not in the corpus: {title:?}"));
+        assert!(
+            (score - want).abs() < EPS,
+            "exact-MaxSim score mismatch for {title:?}: engine={score} oracle={want}"
+        );
+    }
+    for w in engine.windows(2) {
+        assert!(
+            w[0].1 >= w[1].1 - EPS,
+            "results are not ordered by descending score: {engine:?}"
+        );
+    }
+    let oracle_max = oracle.values().copied().fold(f64::NEG_INFINITY, f64::max);
+    if let Some((_, top)) = engine.first() {
+        assert!(
+            (top - oracle_max).abs() < EPS,
+            "top score {top} != oracle max {oracle_max}: {engine:?}"
+        );
+    }
+    if expect_full_set {
+        let got: std::collections::HashSet<&str> = engine.iter().map(|(t, _)| t.as_str()).collect();
+        let want: std::collections::HashSet<&str> = oracle.keys().copied().collect();
+        assert_eq!(got, want, "returned set != full corpus (recall gap)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +299,8 @@ async fn muvera_create_before_ingest() -> anyhow::Result<()> {
 async fn muvera_ivf_pq_inner() -> anyhow::Result<()> {
     let db = Uni::temporary().build().await?;
     define_schema(&db).await?;
-    insert_corpus(&db, 120, 0x1234_5678).await?;
+    let corpus = build_corpus(120, 0x1234_5678);
+    insert_docs(&db, &corpus).await?;
     db.flush().await?;
 
     // fde_dim = reps*2^k_sim*d_proj = 8*16*8 = 1024; sub_vectors=8 divides it.
@@ -192,10 +310,18 @@ async fn muvera_ivf_pq_inner() -> anyhow::Result<()> {
     )
     .await?;
 
-    let titles = query_titles(&db, 10).await?;
-    assert!(
-        titles.iter().any(|t| t == "target"),
-        "IVF_PQ-backed MUVERA should retrieve the target in top-10: {titles:?}"
+    // IVF_PQ is a LOSSY first stage (it may skip partitions), so we do NOT require
+    // full-corpus recall. But the contract that must hold regardless of the lossy ANN:
+    // (1) every retrieved doc carries its exact MaxSim score (re-rank is exact),
+    // (2) results are ordered by descending score, and
+    // (3) the exact-match `target` — reliably surfaced by the FDE self-retrieval property —
+    //     is the global maximizer, so it must rank first after re-rank.
+    let results = query_results(&db, 10).await?;
+    assert_matches_oracle(&results, &corpus, &query_tokens(), false);
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "exact-match target must rank first after re-rank: {results:?}"
     );
     Ok(())
 }
@@ -207,7 +333,8 @@ async fn muvera_ivf_pq_inner() -> anyhow::Result<()> {
 async fn muvera_l0_and_flushed_mix() -> anyhow::Result<()> {
     let db = Uni::temporary().build().await?;
     define_schema(&db).await?;
-    insert_corpus(&db, 40, 0xAAAA_5555).await?;
+    let mut corpus = build_corpus(40, 0xAAAA_5555);
+    insert_docs(&db, &corpus).await?;
     db.flush().await?;
     create_muvera_index(&db, MUVERA_OPTS).await?;
 
@@ -219,11 +346,24 @@ async fn muvera_l0_and_flushed_mix() -> anyhow::Result<()> {
         .run()
         .await?;
     tx.commit().await?;
+    corpus.push(("l0-target".to_string(), query_tokens()));
 
-    let titles = query_titles(&db, 5).await?;
+    // Query the full corpus (flat inner ⇒ retrieval covers everything), so the unioned
+    // Lance+L0 result must equal the brute-force ranking — not merely contain the L0 doc.
+    let results = query_results(&db, corpus.len()).await?;
+    assert_matches_oracle(&results, &corpus, &query_tokens(), true);
+    // Both exact matches (flushed `target` + unflushed `l0-target`) occupy the top-2 at
+    // the maximal score 2.0 — the L0 row is not just visible, it is ranked correctly.
+    let top2: std::collections::HashSet<&str> =
+        results.iter().take(2).map(|(t, _)| t.as_str()).collect();
+    let want_top2: std::collections::HashSet<&str> = ["target", "l0-target"].into_iter().collect();
+    assert_eq!(
+        top2, want_top2,
+        "both exact matches must occupy the top-2: {results:?}"
+    );
     assert!(
-        titles.iter().any(|t| t == "l0-target"),
-        "unflushed L0 exact match must be visible: {titles:?}"
+        results.iter().take(2).all(|(_, s)| (s - 2.0).abs() < 1e-4),
+        "top-2 exact matches must score 2.0: {results:?}"
     );
     Ok(())
 }
@@ -275,7 +415,8 @@ async fn muvera_fork_fallback() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    insert_corpus(&db, 40, 0x0F0F_0F0F).await?;
+    let parent_corpus = build_corpus(40, 0x0F0F_0F0F);
+    insert_docs(&db, &parent_corpus).await?;
     db.flush().await?;
     create_muvera_index(&db, MUVERA_OPTS).await?;
 
@@ -288,36 +429,52 @@ async fn muvera_fork_fallback() -> anyhow::Result<()> {
         .await?;
     tx.commit().await?;
 
-    let lit = cypher_lit(&query_tokens());
-    let cypher = format!(
-        "CALL uni.vector.query('Doc', 'tokens', {lit}, 5, null, null, {{}}) \
-         YIELD node, score RETURN node.title AS title"
-    );
-    let fork_titles: Vec<String> = forked
-        .query(&cypher)
+    // Query the full fork corpus on the brute-force fork path (it scores ALL candidates,
+    // including inherited rows), so the fork ranking must equal the brute-force oracle.
+    let mut fork_corpus = parent_corpus.clone();
+    fork_corpus.push(("fork-target".to_string(), query_tokens()));
+    let fork_results: Vec<(String, f64)> = forked
+        .query(&vector_query_cypher(fork_corpus.len()))
         .await?
         .rows()
         .iter()
-        .map(|r| r.get::<String>("title").unwrap())
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
         .collect();
+    assert_matches_oracle(&fork_results, &fork_corpus, &query_tokens(), true);
+    // The fork inherits the parent's planted `target` (also tokens == query), so there are
+    // two exact maximizers: the fork must surface its OWN `fork-target` alongside the
+    // inherited `target` in the top-2, both at the maximal score 2.0.
+    let fork_top2: std::collections::HashSet<&str> = fork_results
+        .iter()
+        .take(2)
+        .map(|(t, _)| t.as_str())
+        .collect();
+    let want_fork_top2: std::collections::HashSet<&str> =
+        ["target", "fork-target"].into_iter().collect();
+    assert_eq!(
+        fork_top2, want_fork_top2,
+        "fork must surface its own exact match (brute-force fallback) in the top-2: {fork_results:?}"
+    );
     assert!(
-        fork_titles.iter().any(|t| t == "fork-target"),
-        "fork must see its own exact match via brute-force fallback: {fork_titles:?}"
+        fork_results
+            .iter()
+            .take(2)
+            .all(|(_, s)| (s - 2.0).abs() < 1e-4),
+        "both fork maximizers must score 2.0: {fork_results:?}"
     );
 
-    // Parent is isolated from the fork's write.
-    let parent_titles: Vec<String> = db
-        .session()
-        .query(&cypher)
-        .await?
-        .rows()
-        .iter()
-        .map(|r| r.get::<String>("title").unwrap())
-        .collect();
+    // Parent is isolated from the fork's write and still matches its own ground truth.
+    let parent_results = query_results(&db, parent_corpus.len()).await?;
     assert!(
-        !parent_titles.iter().any(|t| t == "fork-target"),
-        "parent must not see fork-local docs: {parent_titles:?}"
+        !parent_results.iter().any(|(t, _)| t == "fork-target"),
+        "parent must not see fork-local docs: {parent_results:?}"
     );
+    assert_matches_oracle(&parent_results, &parent_corpus, &query_tokens(), true);
     Ok(())
 }
 
@@ -331,37 +488,57 @@ async fn muvera_fork_fallback() -> anyhow::Result<()> {
 async fn muvera_update_and_tombstone() -> anyhow::Result<()> {
     let db = Uni::temporary().build().await?;
     define_schema(&db).await?;
-    insert_corpus(&db, 40, 0xC0FF_EE00).await?;
+    let mut corpus = build_corpus(40, 0xC0FF_EE00);
+    insert_docs(&db, &corpus).await?;
     db.flush().await?;
     create_muvera_index(&db, MUVERA_OPTS).await?;
 
     // Demote the target: overwrite its tokens with orthogonal vectors (MaxSim 0).
-    let orthogonal = to_value(&[basis(4), basis(5)]);
+    let orthogonal = vec![basis(4), basis(5)];
     let tx = db.session().tx().await?;
     tx.execute_with("MATCH (d:Doc {title:'target'}) SET d.tokens = $toks")
-        .param("toks", orthogonal)
+        .param("toks", to_value(&orthogonal))
         .run()
         .await?;
     tx.commit().await?;
     db.flush().await?;
-    let titles = query_titles(&db, 5).await?;
+
+    // Mirror the update in the oracle and re-verify the WHOLE ranking, not just rank-1.
+    for (title, toks) in corpus.iter_mut() {
+        if title == "target" {
+            *toks = orthogonal.clone();
+        }
+    }
+    let results = query_results(&db, corpus.len()).await?;
+    assert_matches_oracle(&results, &corpus, &query_tokens(), true);
+    let target_score = results
+        .iter()
+        .find(|(t, _)| t == "target")
+        .map(|(_, s)| *s)
+        .expect("demoted target is still present, just re-ranked");
+    assert!(
+        target_score.abs() < 1e-4,
+        "demoted target (orthogonal tokens) must score 0: {target_score}"
+    );
     assert_ne!(
-        titles.first().map(String::as_str),
+        results.first().map(|(t, _)| t.as_str()),
         Some("target"),
-        "after demotion the target must NOT rank first: {titles:?}"
+        "after demotion the target must NOT rank first: {results:?}"
     );
 
-    // Now restore + delete it; it must vanish from results.
+    // Now delete it; it must vanish, and the remaining ranking must still match the oracle.
     let tx = db.session().tx().await?;
     tx.execute("MATCH (d:Doc {title:'target'}) DETACH DELETE d")
         .await?;
     tx.commit().await?;
     db.flush().await?;
-    let titles = query_titles(&db, 40).await?;
+    corpus.retain(|(t, _)| t != "target");
+    let results = query_results(&db, corpus.len()).await?;
     assert!(
-        !titles.iter().any(|t| t == "target"),
-        "deleted doc must not appear: {titles:?}"
+        !results.iter().any(|(t, _)| t == "target"),
+        "deleted doc must not appear: {results:?}"
     );
+    assert_matches_oracle(&results, &corpus, &query_tokens(), true);
     Ok(())
 }
 
@@ -555,6 +732,92 @@ async fn muvera_via_schema_builder_path() -> anyhow::Result<()> {
         titles.first().map(String::as_str),
         Some("target"),
         "builder-path MUVERA should rank the maximizer first: {titles:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SHOW INDEXES must not leak the internal FDE artifacts
+// ---------------------------------------------------------------------------
+
+/// `SHOW INDEXES` is a user-facing surface, so the derived `__fde_*` column and any index
+/// built over it must stay hidden: no listed row may be named for or reference `__fde`.
+/// The user's own MUVERA index IS listed (they created it).
+#[tokio::test]
+async fn muvera_show_indexes_hides_internal() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    insert_corpus(&db, 20, 0xABCD_1234).await?;
+    db.flush().await?;
+    create_muvera_index(&db, MUVERA_OPTS).await?;
+
+    let res = db.session().query("SHOW INDEXES").await?;
+    let mut names = Vec::new();
+    let mut leaked = Vec::new();
+    for row in res.rows() {
+        let name = row.get::<String>("name").unwrap_or_default();
+        let details = row.get::<String>("details").unwrap_or_default();
+        if name.starts_with("__") || name.contains("__fde") || details.contains("__fde") {
+            leaked.push(format!("{name} :: {details}"));
+        }
+        names.push(name);
+    }
+    assert!(
+        leaked.is_empty(),
+        "internal FDE index/column leaked into SHOW INDEXES: {leaked:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "tok_idx"),
+        "the user MUVERA index should be listed by SHOW INDEXES: {names:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cross-surface parity: dense (non-MUVERA) native multi-vector index via the
+// Rust schema-builder path (the Python `.index()` surface)
+// ---------------------------------------------------------------------------
+
+/// The schema-builder path (`db.schema().label().index().apply()` →
+/// `rebuild_indexes_for_label` → `create_vector_index`) must also build a working DENSE
+/// native multi-vector IVF_PQ index — not just MUVERA. This complements
+/// `muvera_via_schema_builder_path` and guards the same rebuild path for the non-MUVERA
+/// algorithm. IVF_PQ requires `sub_vectors | DIM` and enough training vectors (>=256), so
+/// the corpus is sized accordingly (~3 tokens/doc).
+#[tokio::test]
+async fn dense_ivfpq_via_schema_builder_path() -> anyhow::Result<()> {
+    use uni_db::{VectorAlgo, VectorIndexCfg, VectorMetric};
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(120, 0x2468_ACE0);
+    insert_docs(&db, &corpus).await?;
+    db.flush().await?;
+
+    db.schema()
+        .label("Doc")
+        .index(
+            "tokens",
+            uni_db::IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::IvfPq {
+                    partitions: 4,
+                    sub_vectors: 4,
+                },
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .apply()
+        .await?;
+
+    // Native IVF_PQ is a lossy first stage (don't require full-set recall), but the exact
+    // MaxSim re-rank must score every retrieved doc correctly and surface the exact-match
+    // target (the global maximizer) at rank 1.
+    let results = query_results(&db, 10).await?;
+    assert_matches_oracle(&results, &corpus, &query_tokens(), false);
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "builder-path native IVF_PQ should rank the exact match first: {results:?}"
     );
     Ok(())
 }

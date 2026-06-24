@@ -40,6 +40,15 @@
 //! — essential because the document FDEs are materialised at write time and the query
 //! FDE is computed later (possibly after a restart/upgrade); both must use the *same*
 //! transform or the inner-product approximation breaks.
+//!
+//! ## Parameter tuning (important)
+//! FDE recall is corpus-dependent. The shipped defaults (`k_sim=4, reps=20, d_proj=16`,
+//! see `uni_common::vector_index_opts`) are reasonable starting points but are **not**
+//! validated for recall on any particular corpus. Higher `reps`/`k_sim` raise recall at the
+//! cost of a larger `fde_dim`. Synthetic self-retrieval (an exact-match doc ranking first)
+//! is robust at any setting and is NOT evidence of real recall; measure recall@k on a real
+//! ColBERT corpus with `crates/uni-store/examples/multivec_recall_real.rs` and tune from
+//! there. The exact MaxSim re-rank means a poor FDE only costs recall, never precision.
 
 use serde::{Deserialize, Serialize};
 

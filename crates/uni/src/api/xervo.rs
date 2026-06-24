@@ -42,7 +42,23 @@ impl UniXervo {
     pub async fn embed(&self, alias: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
         let embedder = runtime.embedding(alias).await.map_err(into_uni_error)?;
-        embedder.embed(texts.to_vec()).await.map_err(into_uni_error)
+        Ok(embedder.embed(texts).await.map_err(into_uni_error)?.vectors)
+    }
+
+    /// Embed text inputs into per-token (multi-vector / ColBERT late-interaction) vectors
+    /// using a configured model alias. Returns, per input, a ragged list of token vectors —
+    /// the shape stored in a `List<Vector>` property and consumed by MaxSim retrieval.
+    pub async fn embed_multivector(
+        &self,
+        alias: &str,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        let embedder = runtime
+            .multi_vector_embedder(alias)
+            .await
+            .map_err(into_uni_error)?;
+        Ok(embedder.embed(texts).await.map_err(into_uni_error)?.vectors)
     }
 
     /// Generate using a configured model alias with structured messages.

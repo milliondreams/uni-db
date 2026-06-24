@@ -169,7 +169,7 @@ url = "2.5"
 proptest = "1.11"
 datafusion = "53.1.0"
 lancedb = { version = "=0.30.0", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = ">=0.14.0, <1.0.0", default-features = false }
+uni-xervo = { version = ">=0.17.0, <1.0.0", default-features = false }
 biodivine-lib-bdd = "0.6"
 candle-core = "0.10"
 candle-nn = "0.10"

@@ -693,14 +693,15 @@ async fn auto_embed_query(
     };
 
     let embeddings = embedder
-        .embed(vec![prefixed_query.as_str()])
+        .embed(&[prefixed_query.as_str()])
         .await
         .map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(
                 "similar_to: embedding failed: {}",
                 e
             ))
-        })?;
+        })?
+        .vectors;
 
     embeddings.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(

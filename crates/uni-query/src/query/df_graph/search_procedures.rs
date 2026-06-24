@@ -506,9 +506,10 @@ async fn auto_embed_text(
     };
 
     let embeddings = embedder
-        .embed(vec![prefixed_query.as_str()])
+        .embed(&[prefixed_query.as_str()])
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .vectors;
     embeddings.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
             "Embedding service returned no results".to_string(),

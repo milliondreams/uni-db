@@ -33,6 +33,35 @@ use uni_common::core::snapshot::{EdgeSnapshot, LabelSnapshot, SnapshotManifest};
 use uni_xervo::runtime::ModelRuntime;
 use uuid::Uuid;
 
+/// Whether `property` on `label` is a multi-vector (`List<Vector>`) column — the
+/// late-interaction (ColBERT) shape that auto-embeds per-token via the multi-vector model
+/// (issue #104). A plain `Vector` column uses the dense single-vector model.
+fn is_multivector_property(
+    schema: &uni_common::core::schema::Schema,
+    label: &str,
+    property: &str,
+) -> bool {
+    schema
+        .properties
+        .get(label)
+        .and_then(|p| p.get(property))
+        .is_some_and(|m| {
+            matches!(&m.r#type, uni_common::DataType::List(inner)
+                if matches!(**inner, uni_common::DataType::Vector { .. }))
+        })
+}
+
+/// Convert per-token embedding vectors into the stored `List<Vector>` representation:
+/// a `Value::List` whose elements are each a `Value::List<Float>` (one token vector).
+fn multivec_to_value(tokens: &[Vec<f32>]) -> Value {
+    Value::List(
+        tokens
+            .iter()
+            .map(|tok| Value::List(tok.iter().map(|f| Value::Float(*f as f64)).collect()))
+            .collect(),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
     pub max_mutations: usize,
@@ -3429,18 +3458,32 @@ impl Writer {
                 let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
-                let embedder = runtime.embedding(&emb_config.alias).await?;
-
-                // Batch generate embeddings (single API call)
                 let input_refs: Vec<&str> = input_texts.iter().map(|s| s.as_str()).collect();
-                let embeddings = embedder.embed(input_refs).await?;
 
-                // Distribute results back to properties
-                for (embedding_idx, &prop_idx) in needs_embedding.iter().enumerate() {
-                    if let Some(vec) = embeddings.get(embedding_idx) {
-                        let vals: Vec<Value> =
-                            vec.iter().map(|f| Value::Float(*f as f64)).collect();
-                        properties_batch[prop_idx].insert(target_prop.clone(), Value::List(vals));
+                // A `List<Vector>` target is a late-interaction (ColBERT) multi-vector
+                // property: embed per-token via the multi-vector model and store a list of
+                // token vectors. A plain `Vector` target uses the dense single-vector model.
+                if is_multivector_property(&schema, label, &target_prop) {
+                    let embedder = runtime.multi_vector_embedder(&emb_config.alias).await?;
+                    let embeddings = embedder.embed(&input_refs).await?.vectors;
+                    for (embedding_idx, &prop_idx) in needs_embedding.iter().enumerate() {
+                        if let Some(tokens) = embeddings.get(embedding_idx) {
+                            properties_batch[prop_idx]
+                                .insert(target_prop.clone(), multivec_to_value(tokens));
+                        }
+                    }
+                } else {
+                    let embedder = runtime.embedding(&emb_config.alias).await?;
+                    // Batch generate embeddings (single API call)
+                    let embeddings = embedder.embed(&input_refs).await?.vectors;
+                    // Distribute results back to properties
+                    for (embedding_idx, &prop_idx) in needs_embedding.iter().enumerate() {
+                        if let Some(vec) = embeddings.get(embedding_idx) {
+                            let vals: Vec<Value> =
+                                vec.iter().map(|f| Value::Float(*f as f64)).collect();
+                            properties_batch[prop_idx]
+                                .insert(target_prop.clone(), Value::List(vals));
+                        }
                     }
                 }
             }
@@ -3501,14 +3544,24 @@ impl Writer {
                 let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
-                let embedder = runtime.embedding(&emb_config.alias).await?;
 
-                // Generate
-                let embeddings = embedder.embed(vec![input_text.as_str()]).await?;
-                if let Some(vec) = embeddings.first() {
-                    // Store as array of floats
-                    let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
-                    properties.insert(target_prop.clone(), Value::List(vals));
+                // Multi-vector (ColBERT) target -> per-token vectors; dense target -> one vector.
+                if is_multivector_property(&schema, label, &target_prop) {
+                    let embedder = runtime.multi_vector_embedder(&emb_config.alias).await?;
+                    let embeddings = embedder.embed(&[input_text.as_str()]).await?.vectors;
+                    if let Some(tokens) = embeddings.first() {
+                        properties.insert(target_prop.clone(), multivec_to_value(tokens));
+                    }
+                } else {
+                    let embedder = runtime.embedding(&emb_config.alias).await?;
+                    // Generate
+                    let embeddings = embedder.embed(&[input_text.as_str()]).await?.vectors;
+                    if let Some(vec) = embeddings.first() {
+                        // Store as array of floats
+                        let vals: Vec<Value> =
+                            vec.iter().map(|f| Value::Float(*f as f64)).collect();
+                        properties.insert(target_prop.clone(), Value::List(vals));
+                    }
                 }
             }
         }

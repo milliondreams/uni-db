@@ -51,8 +51,9 @@ pub use api::prepared::{PreparedLocy, PreparedLocyBinder, PreparedQuery, Prepare
 pub use api::retry::RetryOptions;
 pub use api::rule_registry::{RuleInfo, RuleRegistry};
 pub use api::schema::{
-    ConstraintInfo, EdgeTypeBuilder, EdgeTypeInfo, IndexInfo, IndexType, LabelBuilder, LabelInfo,
-    PropertyInfo, ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg, VectorMetric,
+    ConstraintInfo, EdgeTypeBuilder, EdgeTypeInfo, EmbeddingCfg, IndexInfo, IndexType,
+    LabelBuilder, LabelInfo, PropertyInfo, ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg,
+    VectorMetric,
 };
 pub use api::session::{
     Session, SessionCapabilities, SessionMetrics, TransactionBuilder, WriteLeaseSummary,

@@ -363,3 +363,43 @@ async fn nested_fork_strict_schema_composition() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+// Issue #103: a fork of a fork (nested fork) over schemaless data must read the
+// inherited graph instead of erroring with `LanceError(IO): Object not found`.
+//
+// Root cause (shared with #106): a fork is a Lance branch whose reads traverse a
+// `base_paths` chain (child -> parent -> main). Lance resolves data fragments across
+// that chain but NOT a scalar (BTree) index's `page_lookup.lance` across >1 level, so
+// the `:A` label predicate engaging scalar-index pushdown failed on a nested fork.
+// Fixed in 9b787fcd8 by disabling scalar-index pushdown on every branch scan
+// (`execute_branch_scan`), which covers this plain-MATCH path as well as vector/FTS.
+#[tokio::test]
+async fn issue_103_nested_fork_schemaless_edge_reads_inherited() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (:A {k: 1})-[:R {key: 11}]->(:B {k: 2})")
+        .await?;
+    tx.commit().await?;
+
+    // First-level fork already worked before the fix.
+    let fork = s.fork("x").await?;
+    let c1: i64 = fork
+        .query("MATCH (a:A) RETURN count(a) AS c")
+        .await?
+        .rows()[0]
+        .get("c")?;
+    assert_eq!(c1, 1, "first-level fork should see 1 A node");
+
+    // Nested fork (fork of a fork) used to raise LanceError(IO): Object not found.
+    let nested = fork.fork("y").await?;
+    let c2: i64 = nested
+        .query("MATCH (a:A) RETURN count(a) AS c")
+        .await?
+        .rows()[0]
+        .get("c")?;
+    assert_eq!(c2, 1, "nested fork should read 1 inherited A node (issue #103)");
+
+    db.shutdown().await?;
+    Ok(())
+}

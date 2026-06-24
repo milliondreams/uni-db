@@ -1258,6 +1258,35 @@ impl PropertyManager {
             }
         }
 
+        // Schemaless / overflow edge props live in the main edges table's
+        // `props_json`, NOT in the per-type delta columns — so the delta replay
+        // above recovers only typed columns and leaves a schemaless edge (or any
+        // prop absent from the type schema) empty here. Mirror the single-EID
+        // `fetch_all_edge_props_from_storage` fallback: for any requested EID
+        // still unresolved (no entry, or an empty one) fall back to the main
+        // edges table. Without this, a fork SET/REMOVE on an inherited schemaless
+        // relationship read an empty prefetch and wiped the edge's untouched
+        // properties (#102). Only misses pay the per-EID lookup, so the batch
+        // fast-path is preserved for fully-typed edges.
+        use crate::storage::main_edge::MainEdgeDataset;
+        for &eid in eids {
+            if l0_visibility::is_edge_deleted(eid, ctx) {
+                continue;
+            }
+            let needs_fallback = result.get(&eid).is_none_or(|p| p.is_empty());
+            if !needs_fallback {
+                continue;
+            }
+            if let Some(props) =
+                MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+            {
+                let entry = result.entry(eid).or_default();
+                for (k, v) in props {
+                    entry.entry(k).or_insert(v);
+                }
+            }
+        }
+
         Ok(result)
     }
 

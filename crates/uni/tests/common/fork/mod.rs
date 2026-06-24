@@ -30,6 +30,7 @@ pub mod fork_nested_recovery;
 pub mod fork_new_label;
 pub mod fork_no_primary_blocking;
 pub mod fork_params;
+pub mod fork_partial_mutation_inherited;
 pub mod fork_pin;
 pub mod fork_promote;
 pub mod fork_promote_edges;

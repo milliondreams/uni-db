@@ -221,6 +221,13 @@ impl LanceDbBackend {
         let dataset = lance_branch::open_branch(&uri, branch).await?;
 
         let mut scanner = dataset.scan();
+        // Disable scalar-index pushdown on branch scans: a fork's `base_paths` chain
+        // (child -> parent -> main) resolves data fragments but NOT a scalar (BTree) index's
+        // `_indices/<id>/page_lookup.lance` across >1 level, so a filtered branch scan would
+        // error on a nested fork (#106). This is result-set neutral — the filter still matches
+        // the same rows via a sequential scan — and fork datasets are small, so the lost
+        // acceleration is negligible. The primary (non-branch) scan path keeps the index.
+        scanner.use_scalar_index(false);
 
         if let ColumnProjection::Columns(cols) = &request.columns {
             scanner.project(cols).map_err(|e| {

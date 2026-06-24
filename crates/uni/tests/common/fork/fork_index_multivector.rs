@@ -273,16 +273,13 @@ async fn fork_multivector_tombstone_isolated() -> Result<()> {
 
 /// A nested (grandchild) fork sees a multivector doc written in the parent fork.
 ///
-/// IGNORED: nested (multi-level) forks hit a **pre-existing** limitation that is
-/// NOT specific to multi-vector — `uni.vector.query` (single-vector too) over a
-/// 2-level branch fails because the `_vid` BTree scalar index's `page_lookup.lance`
-/// file is not resolved across the `child → parent → main` branch chain (Lance
-/// nested-branch index-file resolution). Single-level fork multi-vector (the rest
-/// of this file) works fully — at parity with single-vector fork support, which is
-/// also single-level only. Un-ignore once nested-branch scalar-index resolution is
-/// fixed in the fork/branch layer.
+/// Nested (2-level) fork multi-vector query fuses results across the whole ancestry
+/// (grandchild → child → parent → main). This previously failed because a filtered branch
+/// scan engaged scalar-index pushdown, and the `_vid` BTree's `page_lookup.lance` is not
+/// resolvable across a >1-level fork `base_paths` chain. Fixed by disabling scalar-index
+/// pushdown on branch scans (`use_scalar_index(false)` in the branch read-paths, #106) —
+/// the same fix unblocks single-vector nested-fork `vector.query`.
 #[tokio::test]
-#[ignore = "pre-existing nested-branch _vid scalar-index resolution bug; affects single-vector vector.query too"]
 async fn nested_fork_multivector_resolves_through_ancestors() -> Result<()> {
     let db = mk_db().await?;
     let primary = db.session();

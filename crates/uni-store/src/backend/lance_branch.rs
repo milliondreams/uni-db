@@ -289,6 +289,11 @@ pub async fn vector_search_on_branch(
     let on_branch = open_branch(uri, branch).await?;
     let key = Float32Array::from(query.to_vec());
     let mut scanner = on_branch.scan();
+    // Disable scalar-index pushdown: the ANN prefilter would otherwise engage scalar-index
+    // discovery, whose `_indices/<id>/page_lookup.lance` is unresolvable across a >1-level
+    // fork `base_paths` chain (#106). Result-set neutral — the prefilter still excludes the
+    // same rows via a sequential scan.
+    scanner.use_scalar_index(false);
     scanner
         .nearest(column, &key, k)
         .map_err(|e| anyhow::anyhow!("vector_search_on_branch nearest({column}, k={k}): {e}"))?;
@@ -346,6 +351,10 @@ pub async fn full_text_search_on_branch(
         wand_factor: None,
     };
     let mut scanner = on_branch.scan();
+    // Disable scalar-index pushdown (the prefilter would otherwise need the scalar index,
+    // unresolvable across a >1-level fork `base_paths` chain — #106). Only scalar indices are
+    // disabled; the FTS inverted index used by `full_text_search` is unaffected.
+    scanner.use_scalar_index(false);
     scanner
         .full_text_search(fts_query)
         .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;

@@ -82,7 +82,8 @@ fn ann_type(o: &VectorIndexOpts, t: Option<&str>) -> VectorIndexType {
 }
 
 /// Build a [`VectorIndexType`] from raw options. `type:'muvera'` produces a MUVERA index
-/// whose `inner` ANN (over the derived FDE column) is itself parsed via [`ann_type`].
+/// whose `inner` ANN (over the derived FDE column) is itself parsed via the private
+/// `ann_type` helper.
 ///
 /// NOTE: the MUVERA defaults below (`k_sim=4, reps=20, d_proj=16`) are reasonable starting
 /// points, NOT values validated for recall on a specific corpus. FDE recall is

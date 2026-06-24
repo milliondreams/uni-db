@@ -2416,7 +2416,7 @@ fn merge_l0_into_vector_results(
 /// buffer is removed from the live set. The returned `live` set therefore
 /// excludes anything currently tombstoned.
 ///
-/// This mirrors the L0 traversal in [`merge_l0_into_vector_results`] but returns
+/// This mirrors the L0 traversal in `merge_l0_into_vector_results` but returns
 /// membership only — it does not score — so callers that re-score candidates
 /// themselves (e.g. multi-vector MaxSim re-ranking, where Lance's `_distance`
 /// scale is opaque) can build a candidate set without duplicating the

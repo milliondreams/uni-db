@@ -302,14 +302,23 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(dict[str, str]) == ("map:string:string", False)
         assert python_type_to_uni(dict[str, bool]) == ("map:string:bool", False)
         # Nested value types recurse.
-        assert python_type_to_uni(dict[str, list[int]]) == ("map:string:list:int64", False)
-        assert python_type_to_uni(dict[str, Vector[8]]) == ("map:string:vector:8", False)
+        assert python_type_to_uni(dict[str, list[int]]) == (
+            "map:string:list:int64",
+            False,
+        )
+        assert python_type_to_uni(dict[str, Vector[8]]) == (
+            "map:string:vector:8",
+            False,
+        )
         assert python_type_to_uni(dict[str, dict[str, int]]) == (
             "map:string:map:string:int64",
             False,
         )
         # Optional unwraps to nullable.
-        assert python_type_to_uni(dict[str, float] | None) == ("map:string:float64", True)
+        assert python_type_to_uni(dict[str, float] | None) == (
+            "map:string:float64",
+            True,
+        )
 
     def test_vector_type(self):
         """Test vector type mapping."""

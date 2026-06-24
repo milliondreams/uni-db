@@ -229,7 +229,7 @@ impl IndexManager {
     /// `uni.schema.createIndex` procedure, and the Rust/Python schema builders via
     /// `rebuild`), so dense, native-multivector, and MUVERA indexes behave identically.
     ///
-    /// For a `Muvera` index it first prepares the derived FDE column ([`Self::prepare_muvera_fde`]:
+    /// For a `Muvera` index it first prepares the derived FDE column (`prepare_muvera_fde`:
     /// register + one-time backfill), then builds the physical single-vector ANN over that
     /// `__fde_*` column with the **Dot** metric (its inner product approximates MaxSim),
     /// while the persisted config stays the MUVERA one so query routing detects it.

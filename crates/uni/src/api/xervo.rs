@@ -61,6 +61,30 @@ impl UniXervo {
         Ok(embedder.embed(texts).await.map_err(into_uni_error)?.vectors)
     }
 
+    /// Embed text inputs through a multi-functional model (e.g. BGE-M3) in a SINGLE forward
+    /// pass, returning the dense and per-token (ColBERT) heads together: `(dense, multivector)`
+    /// where each is `Some` iff the model produced that head. The alias must resolve to an
+    /// `EmbedHybrid` model. This is what powers single-pass hybrid auto-embed (one inference
+    /// feeding both a `Vector` and a `List<Vector>` column).
+    #[allow(clippy::type_complexity)]
+    pub async fn embed_hybrid(
+        &self,
+        alias: &str,
+        texts: &[&str],
+    ) -> Result<(Option<Vec<Vec<f32>>>, Option<Vec<Vec<Vec<f32>>>>)> {
+        use uni_xervo::traits::hybrid::HeadSet;
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        let embedder = runtime
+            .hybrid_embedder(alias)
+            .await
+            .map_err(into_uni_error)?;
+        let res = embedder
+            .embed(texts, HeadSet::DENSE | HeadSet::MULTI_VECTOR)
+            .await
+            .map_err(into_uni_error)?;
+        Ok((res.dense, res.multi_vector))
+    }
+
     /// Generate using a configured model alias with structured messages.
     pub async fn generate(
         &self,

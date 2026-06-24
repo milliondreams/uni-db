@@ -62,6 +62,85 @@ fn multivec_to_value(tokens: &[Vec<f32>]) -> Value {
     )
 }
 
+/// One coalesced auto-embed group: all targets that share an `alias` + `source_properties`,
+/// split into dense (`Vector`) vs multi-vector (`List<Vector>`) target columns. When a group
+/// has BOTH kinds, a single hybrid inference fills both (single forward pass).
+struct EmbedGroupSpec {
+    source_properties: Vec<String>,
+    document_prefix: Option<String>,
+    dense: Vec<String>,
+    multi: Vec<String>,
+}
+
+/// Run ONE embedding inference for a coalesced group of auto-embed targets sharing an alias +
+/// source text, returning `(dense_per_text, multi_vector_per_text)` (each `Some` iff that head
+/// was requested). When both heads are needed this uses the hybrid model
+/// (`hybrid_embedder`), so a multi-functional model (e.g. BGE-M3) produces the dense + ColBERT
+/// heads from a SINGLE forward pass; otherwise it uses the single-head dense / multi-vector
+/// embedder (today's behavior for non-mixed groups).
+async fn embed_group(
+    runtime: &ModelRuntime,
+    alias: &str,
+    texts: &[&str],
+    want_dense: bool,
+    want_multi: bool,
+) -> Result<(Option<Vec<Vec<f32>>>, Option<Vec<Vec<Vec<f32>>>>)> {
+    use uni_xervo::traits::hybrid::HeadSet;
+    if want_dense && want_multi {
+        // Single-pass hybrid: one model, one inference, both heads.
+        let embedder = runtime.hybrid_embedder(alias).await?;
+        let res = embedder
+            .embed(texts, HeadSet::DENSE | HeadSet::MULTI_VECTOR)
+            .await?;
+        let dense = res.dense.ok_or_else(|| {
+            anyhow!("hybrid model '{alias}' returned no dense head for a Vector target")
+        })?;
+        let multi = res.multi_vector.ok_or_else(|| {
+            anyhow!(
+                "hybrid model '{alias}' returned no multi-vector head for a List<Vector> target"
+            )
+        })?;
+        Ok((Some(dense), Some(multi)))
+    } else if want_multi {
+        let embedder = runtime.multi_vector_embedder(alias).await?;
+        Ok((None, Some(embedder.embed(texts).await?.vectors)))
+    } else {
+        let embedder = runtime.embedding(alias).await?;
+        Ok((Some(embedder.embed(texts).await?.vectors), None))
+    }
+}
+
+/// Group a label's auto-embed configs by `(alias, source_properties)`, classifying each target
+/// column as dense vs multi-vector. A group with both kinds is a single-pass hybrid source.
+fn collect_embed_groups(
+    schema: &uni_common::core::schema::Schema,
+    label: &str,
+) -> std::collections::BTreeMap<(String, Vec<String>), EmbedGroupSpec> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(String, Vec<String>), EmbedGroupSpec> = BTreeMap::new();
+    for idx in &schema.indexes {
+        if let IndexDefinition::Vector(v_config) = idx
+            && v_config.label == label
+            && let Some(emb) = &v_config.embedding_config
+        {
+            let g = groups
+                .entry((emb.alias.clone(), emb.source_properties.clone()))
+                .or_insert_with(|| EmbedGroupSpec {
+                    source_properties: emb.source_properties.clone(),
+                    document_prefix: emb.document_prefix.clone(),
+                    dense: Vec::new(),
+                    multi: Vec::new(),
+                });
+            if is_multivector_property(schema, label, &v_config.property) {
+                g.multi.push(v_config.property.clone());
+            } else {
+                g.dense.push(v_config.property.clone());
+            }
+        }
+    }
+    groups
+}
+
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
     pub max_mutations: usize,
@@ -3400,89 +3479,82 @@ impl Writer {
         labels: &[String],
         properties_batch: &mut [Properties],
     ) -> Result<()> {
-        let label_name = labels.first().map(|s| s.as_str());
+        let Some(label) = labels.first().map(|s| s.as_str()) else {
+            return Ok(());
+        };
         let schema = self.schema_manager.schema();
 
-        if let Some(label) = label_name {
-            // Find vector indexes with embedding config for this label
-            let mut configs = Vec::new();
-            for idx in &schema.indexes {
-                if let IndexDefinition::Vector(v_config) = idx
-                    && v_config.label == label
-                    && let Some(emb_config) = &v_config.embedding_config
-                {
-                    configs.push((v_config.property.clone(), emb_config.clone()));
-                }
-            }
+        // Group auto-embed targets by (alias, source). A group with both a dense Vector and a
+        // multi-vector List<Vector> column is a single-pass hybrid source: one inference fills
+        // both. Non-mixed groups use the dense / multi-vector embedder as before.
+        let groups = collect_embed_groups(&schema, label);
+        if groups.is_empty() {
+            return Ok(());
+        }
 
-            if configs.is_empty() {
-                return Ok(());
-            }
+        for (key, group) in groups {
+            let alias = &key.0;
+            let want_dense = !group.dense.is_empty();
+            let want_multi = !group.multi.is_empty();
 
-            for (target_prop, emb_config) in configs {
-                // Collect input texts from all vertices that need embeddings
-                let mut input_texts: Vec<String> = Vec::new();
-                let mut needs_embedding: Vec<usize> = Vec::new();
-
-                for (idx, properties) in properties_batch.iter().enumerate() {
-                    // Skip if target property already exists
-                    if properties.contains_key(&target_prop) {
-                        continue;
-                    }
-
-                    // Check if source properties exist
-                    let mut inputs = Vec::new();
-                    for src_prop in &emb_config.source_properties {
-                        if let Some(val) = properties.get(src_prop)
-                            && let Some(s) = val.as_str()
-                        {
-                            inputs.push(s.to_string());
-                        }
-                    }
-
-                    if !inputs.is_empty() {
-                        let input_text = inputs.join(" ");
-                        let input_text = match &emb_config.document_prefix {
-                            Some(prefix) => format!("{prefix}{input_text}"),
-                            None => input_text,
-                        };
-                        input_texts.push(input_text);
-                        needs_embedding.push(idx);
-                    }
-                }
-
-                if input_texts.is_empty() {
+            // A row needs this group's inference if it has the source text and is still missing
+            // at least one of the group's target columns (user-supplied values are preserved).
+            let mut input_texts: Vec<String> = Vec::new();
+            let mut needs: Vec<usize> = Vec::new();
+            for (idx, properties) in properties_batch.iter().enumerate() {
+                let all_present = group
+                    .dense
+                    .iter()
+                    .chain(group.multi.iter())
+                    .all(|t| properties.contains_key(t));
+                if all_present {
                     continue;
                 }
+                let mut inputs = Vec::new();
+                for src in &group.source_properties {
+                    if let Some(val) = properties.get(src)
+                        && let Some(s) = val.as_str()
+                    {
+                        inputs.push(s.to_string());
+                    }
+                }
+                if inputs.is_empty() {
+                    continue;
+                }
+                let text = inputs.join(" ");
+                let text = match &group.document_prefix {
+                    Some(prefix) => format!("{prefix}{text}"),
+                    None => text,
+                };
+                input_texts.push(text);
+                needs.push(idx);
+            }
+            if input_texts.is_empty() {
+                continue;
+            }
 
-                let runtime = self.xervo_runtime.get().ok_or_else(|| {
-                    anyhow!("Uni-Xervo runtime not configured for auto-embedding")
-                })?;
-                let input_refs: Vec<&str> = input_texts.iter().map(|s| s.as_str()).collect();
+            let runtime = self
+                .xervo_runtime
+                .get()
+                .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
+            let input_refs: Vec<&str> = input_texts.iter().map(|s| s.as_str()).collect();
+            let (dense, multi) =
+                embed_group(runtime, alias, &input_refs, want_dense, want_multi).await?;
 
-                // A `List<Vector>` target is a late-interaction (ColBERT) multi-vector
-                // property: embed per-token via the multi-vector model and store a list of
-                // token vectors. A plain `Vector` target uses the dense single-vector model.
-                if is_multivector_property(&schema, label, &target_prop) {
-                    let embedder = runtime.multi_vector_embedder(&emb_config.alias).await?;
-                    let embeddings = embedder.embed(&input_refs).await?.vectors;
-                    for (embedding_idx, &prop_idx) in needs_embedding.iter().enumerate() {
-                        if let Some(tokens) = embeddings.get(embedding_idx) {
-                            properties_batch[prop_idx]
-                                .insert(target_prop.clone(), multivec_to_value(tokens));
+            for (i, &row) in needs.iter().enumerate() {
+                if let Some(vec) = dense.as_ref().and_then(|d| d.get(i)) {
+                    let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
+                    for t in &group.dense {
+                        if !properties_batch[row].contains_key(t) {
+                            properties_batch[row].insert(t.clone(), Value::List(vals.clone()));
                         }
                     }
-                } else {
-                    let embedder = runtime.embedding(&emb_config.alias).await?;
-                    // Batch generate embeddings (single API call)
-                    let embeddings = embedder.embed(&input_refs).await?.vectors;
-                    // Distribute results back to properties
-                    for (embedding_idx, &prop_idx) in needs_embedding.iter().enumerate() {
-                        if let Some(vec) = embeddings.get(embedding_idx) {
-                            let vals: Vec<Value> =
-                                vec.iter().map(|f| Value::Float(*f as f64)).collect();
-                            properties_batch[prop_idx]
-                                .insert(target_prop.clone(), Value::List(vals));
+                }
+                if let Some(tokens) = multi.as_ref().and_then(|m| m.get(i)) {
+                    let mv = multivec_to_value(tokens);
+                    for t in &group.multi {
+                        if !properties_batch[row].contains_key(t) {
+                            properties_batch[row].insert(t.clone(), mv.clone());
                         }
                     }
                 }
@@ -3499,68 +3571,69 @@ impl Writer {
     ) -> Result<()> {
         let schema = self.schema_manager.schema();
 
-        if let Some(label) = label_name {
-            // Find vector indexes with embedding config for this label
-            let mut configs = Vec::new();
-            for idx in &schema.indexes {
-                if let IndexDefinition::Vector(v_config) = idx
-                    && v_config.label == label
-                    && let Some(emb_config) = &v_config.embedding_config
+        let Some(label) = label_name else {
+            return Ok(());
+        };
+
+        // Same (alias, source) grouping as the deferred path: a mixed dense + multi-vector
+        // group is a single-pass hybrid source (one inference fills both columns).
+        let groups = collect_embed_groups(&schema, label);
+        if groups.is_empty() {
+            log::info!("No embedding config found for label {}", label);
+            return Ok(());
+        }
+
+        for (key, group) in groups {
+            let alias = &key.0;
+            // Skip if every target already present (user-supplied values win).
+            if group
+                .dense
+                .iter()
+                .chain(group.multi.iter())
+                .all(|t| properties.contains_key(t))
+            {
+                continue;
+            }
+
+            let mut inputs = Vec::new();
+            for src in &group.source_properties {
+                if let Some(val) = properties.get(src)
+                    && let Some(s) = val.as_str()
                 {
-                    configs.push((v_config.property.clone(), emb_config.clone()));
+                    inputs.push(s.to_string());
                 }
             }
-
-            if configs.is_empty() {
-                log::info!("No embedding config found for label {}", label);
+            if inputs.is_empty() {
+                continue;
             }
+            let text = inputs.join(" ");
+            let text = match &group.document_prefix {
+                Some(prefix) => format!("{prefix}{text}"),
+                None => text,
+            };
 
-            for (target_prop, emb_config) in configs {
-                // If target property already exists, skip (assume user provided it)
-                if properties.contains_key(&target_prop) {
-                    continue;
-                }
+            let runtime = self
+                .xervo_runtime
+                .get()
+                .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
+            let want_dense = !group.dense.is_empty();
+            let want_multi = !group.multi.is_empty();
+            let (dense, multi) =
+                embed_group(runtime, alias, &[text.as_str()], want_dense, want_multi).await?;
 
-                // Check if source properties exist
-                let mut inputs = Vec::new();
-                for src_prop in &emb_config.source_properties {
-                    if let Some(val) = properties.get(src_prop)
-                        && let Some(s) = val.as_str()
-                    {
-                        inputs.push(s.to_string());
+            if let Some(vec) = dense.as_ref().and_then(|d| d.first()) {
+                let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
+                for t in &group.dense {
+                    if !properties.contains_key(t) {
+                        properties.insert(t.clone(), Value::List(vals.clone()));
                     }
                 }
-
-                if inputs.is_empty() {
-                    continue;
-                }
-
-                let input_text = inputs.join(" ");
-                let input_text = match &emb_config.document_prefix {
-                    Some(prefix) => format!("{prefix}{input_text}"),
-                    None => input_text,
-                };
-
-                let runtime = self.xervo_runtime.get().ok_or_else(|| {
-                    anyhow!("Uni-Xervo runtime not configured for auto-embedding")
-                })?;
-
-                // Multi-vector (ColBERT) target -> per-token vectors; dense target -> one vector.
-                if is_multivector_property(&schema, label, &target_prop) {
-                    let embedder = runtime.multi_vector_embedder(&emb_config.alias).await?;
-                    let embeddings = embedder.embed(&[input_text.as_str()]).await?.vectors;
-                    if let Some(tokens) = embeddings.first() {
-                        properties.insert(target_prop.clone(), multivec_to_value(tokens));
-                    }
-                } else {
-                    let embedder = runtime.embedding(&emb_config.alias).await?;
-                    // Generate
-                    let embeddings = embedder.embed(&[input_text.as_str()]).await?.vectors;
-                    if let Some(vec) = embeddings.first() {
-                        // Store as array of floats
-                        let vals: Vec<Value> =
-                            vec.iter().map(|f| Value::Float(*f as f64)).collect();
-                        properties.insert(target_prop.clone(), Value::List(vals));
+            }
+            if let Some(tokens) = multi.as_ref().and_then(|m| m.first()) {
+                let mv = multivec_to_value(tokens);
+                for t in &group.multi {
+                    if !properties.contains_key(t) {
+                        properties.insert(t.clone(), mv.clone());
                     }
                 }
             }

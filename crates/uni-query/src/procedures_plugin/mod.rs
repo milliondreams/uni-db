@@ -29,6 +29,7 @@ pub mod graph;
 mod host_args;
 pub mod schema;
 pub mod search;
+pub mod sparse;
 pub mod vector;
 
 // Rust guideline compliant
@@ -75,6 +76,7 @@ pub fn register_into(
     schema::register_into(r)?;
     vector::register_into(r)?;
     fts::register_into(r)?;
+    sparse::register_into(r)?;
     search::register_into(r)?;
     graph::register_into(r)?;
     create::register_into(r)?;

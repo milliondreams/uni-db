@@ -1191,6 +1191,13 @@ impl Executor {
             "point" => Ok(DataType::Point(PointType::Cartesian2D)),
             "point3d" => Ok(DataType::Point(PointType::Cartesian3D)),
             "geopoint" | "geographic" => Ok(DataType::Point(PointType::Geographic)),
+            s if s.starts_with("sparse_vector(") && s.ends_with(')') => {
+                let dims_str = &s["sparse_vector(".len()..s.len() - 1];
+                let dimensions = dims_str
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("Invalid sparse_vector dimensions: {}", dims_str))?;
+                Ok(DataType::SparseVector { dimensions })
+            }
             s if s.starts_with("vector(") && s.ends_with(')') => {
                 let dims_str = &s[7..s.len() - 1];
                 let dimensions = dims_str

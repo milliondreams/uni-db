@@ -1988,6 +1988,49 @@ impl StorageManager {
         Ok(results)
     }
 
+    /// Flushed-data candidate generation for scored sparse-vector retrieval.
+    ///
+    /// Loads the registered sparse index and returns its top-`k`
+    /// `(vid, prelim_score)` by dot product over the flushed postings. Like
+    /// [`Self::multivector_search`], this is **flushed-only** and the prelim
+    /// score is advisory: the uni-query `sparse_rerank` helper unions live L0
+    /// rows and re-scores *every* candidate exactly and MVCC-aware via
+    /// `sparse_dot`, so callers wanting recent-write visibility must go through
+    /// that path. Returns empty if no sparse index is registered for the
+    /// property, or on a fork/branch (fork-local sparse index is a later task).
+    pub async fn sparse_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[(u32, f32)],
+        k: usize,
+    ) -> Result<Vec<(Vid, f32)>> {
+        #[cfg(feature = "lance-backend")]
+        {
+            let name = table_names::vertex_table_name(label);
+            let branched = self
+                .fork_scope
+                .as_ref()
+                .is_some_and(|s| s.branch_for(&name).is_some());
+            if branched {
+                return Ok(Vec::new());
+            }
+            match self
+                .index_manager()
+                .sparse_vector_index(label, property)
+                .await
+            {
+                Ok(idx) => idx.query_topk(query, k).await,
+                Err(_) => Ok(Vec::new()),
+            }
+        }
+        #[cfg(not(feature = "lance-backend"))]
+        {
+            let _ = (label, property, query, k);
+            Ok(Vec::new())
+        }
+    }
+
     /// Perform a full-text search with BM25 scoring.
     ///
     /// Returns vertices matching the search query along with their BM25 scores.

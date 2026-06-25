@@ -13,13 +13,13 @@ use arrow_array::builder::{
     FixedSizeBinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
     Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
     StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt64Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
     IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -314,6 +314,39 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                     }
                 };
             }
+            DataType::SparseVector { .. } => {
+                let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() else {
+                    log::warn!("SparseVector column is not StructArray");
+                    return Value::Null;
+                };
+                if struct_arr.is_null(row) {
+                    return Value::Null;
+                }
+                let (Some(indices_list), Some(values_list)) = (
+                    struct_arr
+                        .column_by_name("indices")
+                        .and_then(|c| c.as_any().downcast_ref::<ListArray>()),
+                    struct_arr
+                        .column_by_name("values")
+                        .and_then(|c| c.as_any().downcast_ref::<ListArray>()),
+                ) else {
+                    log::warn!("SparseVector struct missing indices/values list columns");
+                    return Value::Null;
+                };
+                let idx_vals = indices_list.value(row);
+                let Some(idx_arr) = idx_vals.as_any().downcast_ref::<UInt32Array>() else {
+                    log::warn!("SparseVector 'indices' inner not UInt32");
+                    return Value::Null;
+                };
+                let w_vals = values_list.value(row);
+                let Some(w_arr) = w_vals.as_any().downcast_ref::<Float32Array>() else {
+                    log::warn!("SparseVector 'values' inner not Float32");
+                    return Value::Null;
+                };
+                let indices: Vec<u32> = (0..idx_arr.len()).map(|i| idx_arr.value(i)).collect();
+                let values: Vec<f32> = (0..w_arr.len()).map(|i| w_arr.value(i)).collect();
+                return Value::SparseVector { indices, values };
+            }
             _ => {}
         }
     }
@@ -374,6 +407,32 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
 
     // Struct type — detect temporal structs by field names before generic handler
     if let Some(s) = col.as_any().downcast_ref::<StructArray>() {
+        // Sparse-vector struct: the result-row path calls with `data_type = None`,
+        // so detect it by Arrow shape here (otherwise the generic struct→Map
+        // handler below reads the `List<UInt32>` indices child as null).
+        if schema::is_sparse_vector_struct(col.data_type()) {
+            if s.is_null(row) {
+                return Value::Null;
+            }
+            if let (Some(idx_list), Some(val_list)) = (
+                s.column_by_name("indices")
+                    .and_then(|c| c.as_any().downcast_ref::<ListArray>()),
+                s.column_by_name("values")
+                    .and_then(|c| c.as_any().downcast_ref::<ListArray>()),
+            ) {
+                let idx_vals = idx_list.value(row);
+                let val_vals = val_list.value(row);
+                if let (Some(ia), Some(va)) = (
+                    idx_vals.as_any().downcast_ref::<UInt32Array>(),
+                    val_vals.as_any().downcast_ref::<Float32Array>(),
+                ) {
+                    let indices = (0..ia.len()).map(|i| ia.value(i)).collect();
+                    let values = (0..va.len()).map(|i| va.value(i)).collect();
+                    return Value::SparseVector { indices, values };
+                }
+            }
+        }
+
         let field_names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
 
         // DateTime struct: {nanos_since_epoch, offset_seconds, timezone_name}
@@ -1097,6 +1156,83 @@ pub struct PropertyExtractor<'a> {
     data_type: &'a DataType,
 }
 
+/// Extract sparse `(indices, values)` from a property value.
+///
+/// Accepts the native [`Value::SparseVector`] **and** the degraded
+/// `Value::Map { "indices": [..], "values": [..] }` form that a `SparseVector`
+/// collapses into when round-tripped through `#[serde(untagged)]` persistence —
+/// notably the WAL, which serializes mutations via `serde_json`. This mirrors
+/// how the dense `Vector` column tolerates a `Value::List` from the same hazard.
+/// Returns `None` for any other value (→ a null struct row).
+fn sparse_pair_from_value(v: &Value) -> Option<(Vec<u32>, Vec<f32>)> {
+    match v {
+        Value::SparseVector { indices, values } => Some((indices.clone(), values.clone())),
+        Value::Map(m) => {
+            let idx = match m.get("indices") {
+                Some(Value::List(l)) => l,
+                _ => return None,
+            };
+            let vals = match m.get("values") {
+                Some(Value::List(l)) => l,
+                _ => return None,
+            };
+            let indices: Vec<u32> = idx
+                .iter()
+                .map(|x| x.as_u64().map(|n| n as u32))
+                .collect::<Option<_>>()?;
+            let values: Vec<f32> = vals
+                .iter()
+                .map(|x| x.as_f64().map(|n| n as f32))
+                .collect::<Option<_>>()?;
+            if indices.len() != values.len() {
+                return None;
+            }
+            Some((indices, values))
+        }
+        _ => None,
+    }
+}
+
+/// Build a sparse-vector `Struct { indices: List<UInt32>, values: List<Float32> }`
+/// Arrow column from a sequence of property values. Used by the query result
+/// projection path (`RETURN d.sparse_col`). A `None` / non-sparse / map-degraded
+/// value that can't be extracted becomes a null struct row. Mirrors
+/// `PropertyExtractor::build_sparse_vector_column` but operates on owned values.
+pub fn build_sparse_vector_array(values: &[Option<Value>]) -> ArrayRef {
+    let mut indices_builder = ListBuilder::new(UInt32Builder::new());
+    let mut values_builder = ListBuilder::new(Float32Builder::new());
+    let mut null_buffer = BooleanBufferBuilder::new(values.len());
+    for v in values {
+        match v.as_ref().and_then(sparse_pair_from_value) {
+            Some((indices, vals)) => {
+                for ix in indices {
+                    indices_builder.values().append_value(ix);
+                }
+                indices_builder.append(true);
+                for w in vals {
+                    values_builder.values().append_value(w);
+                }
+                values_builder.append(true);
+                null_buffer.append(true);
+            }
+            None => {
+                indices_builder.append(true);
+                values_builder.append(true);
+                null_buffer.append(false);
+            }
+        }
+    }
+    let struct_arr = StructArray::new(
+        schema::sparse_vector_struct_fields(),
+        vec![
+            Arc::new(indices_builder.finish()) as ArrayRef,
+            Arc::new(values_builder.finish()) as ArrayRef,
+        ],
+        Some(null_buffer.finish().into()),
+    );
+    Arc::new(struct_arr)
+}
+
 impl<'a> PropertyExtractor<'a> {
     pub fn new(_name: &'a str, data_type: &'a DataType) -> Self {
         Self { data_type }
@@ -1117,6 +1253,9 @@ impl<'a> PropertyExtractor<'a> {
             DataType::Bool => self.build_bool_column(len, deleted, get_props),
             DataType::Vector { dimensions } => {
                 self.build_vector_column(len, deleted, get_props, *dimensions)
+            }
+            DataType::SparseVector { .. } => {
+                self.build_sparse_vector_column(len, deleted, get_props)
             }
             DataType::CypherValue => self.build_json_column(len, deleted, get_props),
             DataType::Bytes => self.build_bytes_column(len, deleted, get_props),
@@ -1461,6 +1600,61 @@ impl<'a> PropertyExtractor<'a> {
             builder.append(valid);
         }
         Ok(Arc::new(builder.finish()))
+    }
+
+    /// Build a sparse-vector column as `Struct { indices: List<UInt32>,
+    /// values: List<Float32> }` (see `schema::sparse_vector_struct_fields`).
+    /// Deleted, missing, or non-sparse rows become null struct rows carrying
+    /// empty child lists — mirroring how `build_vector_column` nulls deleted
+    /// rows. An empty sparse vector is stored as two empty (non-null) lists.
+    fn build_sparse_vector_column<F>(
+        &self,
+        len: usize,
+        deleted: &[bool],
+        get_props: F,
+    ) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let mut indices_builder = ListBuilder::new(UInt32Builder::new());
+        let mut values_builder = ListBuilder::new(Float32Builder::new());
+        let mut null_buffer = BooleanBufferBuilder::new(len);
+
+        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+            let pair = if is_deleted {
+                None
+            } else {
+                get_props(i).and_then(sparse_pair_from_value)
+            };
+            match pair {
+                Some((indices, values)) => {
+                    for ix in indices {
+                        indices_builder.values().append_value(ix);
+                    }
+                    indices_builder.append(true);
+                    for w in values {
+                        values_builder.values().append_value(w);
+                    }
+                    values_builder.append(true);
+                    null_buffer.append(true);
+                }
+                None => {
+                    indices_builder.append(true);
+                    values_builder.append(true);
+                    null_buffer.append(false);
+                }
+            }
+        }
+
+        let struct_arr = StructArray::new(
+            schema::sparse_vector_struct_fields(),
+            vec![
+                Arc::new(indices_builder.finish()) as ArrayRef,
+                Arc::new(values_builder.finish()) as ArrayRef,
+            ],
+            Some(null_buffer.finish().into()),
+        );
+        Ok(Arc::new(struct_arr))
     }
 
     fn build_json_column<F>(&self, len: usize, deleted: &[bool], get_props: F) -> Result<ArrayRef>
@@ -1908,6 +2102,57 @@ mod tests {
     use std::collections::HashMap;
     use uni_common::TemporalValue;
     use uni_crdt::{Crdt, GCounter};
+
+    #[test]
+    fn test_sparse_vector_columnar_roundtrip_and_no_silent_null() {
+        use crate::storage::value_codec::{CrdtDecodeMode, decode_column_value, value_from_column};
+
+        let dt = DataType::SparseVector { dimensions: 100 };
+        let v0 = Value::SparseVector {
+            indices: vec![1, 5, 9],
+            values: vec![0.5, -1.0, 2.0],
+        };
+        // An empty sparse vector must round-trip as empty lists, not null.
+        let v1 = Value::SparseVector {
+            indices: vec![],
+            values: vec![],
+        };
+        // row 2 is a tombstone → decodes back to Null.
+        let props = [Some(v0.clone()), Some(v1.clone()), None];
+        let deleted = [false, false, true];
+
+        let extractor = PropertyExtractor::new("emb", &dt);
+        let col = extractor
+            .build_column(3, &deleted, |i| props[i].as_ref())
+            .unwrap();
+
+        // Full-fidelity decode → uni_common::Value::SparseVector.
+        assert_eq!(
+            decode_column_value(&col, &dt, 0, CrdtDecodeMode::Strict).unwrap(),
+            v0
+        );
+        assert_eq!(
+            decode_column_value(&col, &dt, 1, CrdtDecodeMode::Strict).unwrap(),
+            v1
+        );
+        assert_eq!(
+            decode_column_value(&col, &dt, 2, CrdtDecodeMode::Strict).unwrap(),
+            Value::Null
+        );
+
+        // Regression for the `_ => Ok(Value::Null)` fallback: the serde_json
+        // read path must surface the data, not silently null it.
+        let json0 = value_from_column(&col, &dt, 0, CrdtDecodeMode::Strict).unwrap();
+        assert!(
+            json0.is_object(),
+            "sparse column was silently nulled by value_from_column: {json0:?}"
+        );
+        assert_eq!(json0["indices"], serde_json::json!([1u32, 5u32, 9u32]));
+        assert_eq!(
+            json0["values"],
+            serde_json::json!([0.5f32, -1.0f32, 2.0f32])
+        );
+    }
 
     #[test]
     fn test_arrow_to_value_string() {

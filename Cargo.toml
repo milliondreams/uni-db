@@ -2,6 +2,7 @@
 members = [
     "crates/uni-common",
     "crates/uni-btic",
+    "crates/uni-sparse-vector",
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
@@ -47,6 +48,7 @@ members = [
 default-members = [
     "crates/uni-common",
     "crates/uni-btic",
+    "crates/uni-sparse-vector",
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
@@ -97,6 +99,7 @@ uni-crdt = { path = "crates/uni-crdt", version = "2.0.0" }
 uni-cypher = { path = "crates/uni-cypher", version = "2.0.0" }
 uni-locy = { path = "crates/uni-locy", version = "2.0.0" }
 uni-btic = { path = "crates/uni-btic", version = "2.0.0" }
+uni-sparse-vector = { path = "crates/uni-sparse-vector", version = "2.0.0" }
 uni-plugin = { path = "crates/uni-plugin", version = "2.0.0" }
 uni-plugin-builtin = { path = "crates/uni-plugin-builtin", version = "2.0.0" }
 uni-plugin-apoc-core = { path = "crates/uni-plugin-apoc-core", version = "2.0.0" }

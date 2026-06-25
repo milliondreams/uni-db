@@ -1,0 +1,15 @@
+[package]
+name = "uni-sparse-vector"
+description = "Learned-sparse (SPLADE/BGE-M3) vector type, codec, and dot-product kernel for Uni graph database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

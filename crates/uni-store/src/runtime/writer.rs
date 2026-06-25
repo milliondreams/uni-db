@@ -4522,6 +4522,45 @@ impl Writer {
                 }
             }
 
+            // Collect sparse-vector index updates before consuming vertices.
+            // Maps: cfg.property -> (added [(term_id, weight)] per vid, removed).
+            type SparseUpdateMap = HashMap<String, (HashMap<Vid, Vec<(u32, f32)>>, HashSet<Vid>)>;
+            let mut sparse_updates: SparseUpdateMap = HashMap::new();
+
+            for idx in &schema.indexes {
+                if let IndexDefinition::Sparse(cfg) = idx
+                    && cfg.label == label_name
+                {
+                    let mut added: HashMap<Vid, Vec<(u32, f32)>> = HashMap::new();
+                    let mut removed: HashSet<Vid> = HashSet::new();
+
+                    for (vid, _labels, props, deleted, _version) in &vertices {
+                        if *deleted {
+                            removed.insert(*vid);
+                        } else if let Some(uni_common::Value::SparseVector { indices, values }) =
+                            props.get(&cfg.property)
+                        {
+                            let pairs: Vec<(u32, f32)> = indices
+                                .iter()
+                                .copied()
+                                .zip(values.iter().copied())
+                                .collect();
+                            added.insert(*vid, pairs);
+                        }
+                    }
+                    // Tombstones are not in `vertices`; pull from tombstones_by_label.
+                    if let Some(tomb_rows) = tombstones_by_label.get(&label_id) {
+                        for (vid, _) in tomb_rows {
+                            removed.insert(*vid);
+                        }
+                    }
+
+                    if !added.is_empty() || !removed.is_empty() {
+                        sparse_updates.insert(cfg.property.clone(), (added, removed));
+                    }
+                }
+            }
+
             let mut v_data = Vec::new();
             let mut d_data = Vec::new();
             let mut ver_data = Vec::new();
@@ -4622,6 +4661,20 @@ impl Writer {
                     self.storage
                         .index_manager()
                         .update_inverted_index_incremental(cfg, added, removed)
+                        .await?;
+                }
+            }
+
+            // Apply sparse-vector index updates incrementally
+            #[cfg(feature = "lance-backend")]
+            for idx in &schema.indexes {
+                if let IndexDefinition::Sparse(cfg) = idx
+                    && cfg.label == label_name
+                    && let Some((added, removed)) = sparse_updates.get(&cfg.property)
+                {
+                    self.storage
+                        .index_manager()
+                        .update_sparse_vector_index_incremental(cfg, added, removed)
                         .await?;
                 }
             }

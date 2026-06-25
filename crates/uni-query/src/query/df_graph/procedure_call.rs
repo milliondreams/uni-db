@@ -73,6 +73,7 @@ pub(crate) fn map_yield_to_canonical(yield_name: &str) -> &'static str {
 pub(crate) const NODE_YIELD_PROCEDURE_NAMES: &[&str] = &[
     "uni.vector.query",
     "uni.fts.query",
+    "uni.sparse.query",
     "uni.search",
     // M5g — `uni.create.vNode` yields a typed Node column via the
     // same `_yield_kind = node_vid_source` mechanism, expanded by

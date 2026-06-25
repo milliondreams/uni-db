@@ -8,6 +8,8 @@ use crate::backend::table_names;
 use crate::backend::types::ScanRequest;
 #[cfg(feature = "lance-backend")]
 use crate::storage::inverted_index::InvertedIndex;
+#[cfg(feature = "lance-backend")]
+use crate::storage::sparse_index::SparseVectorIndex;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -47,7 +49,8 @@ use uni_common::core::schema::SchemaManager;
 #[cfg(feature = "lance-backend")]
 use uni_common::core::schema::{
     DistanceMetric, FullTextIndexConfig, InvertedIndexConfig, JsonFtsIndexConfig,
-    ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, VectorIndexType,
+    ScalarIndexConfig, ScalarIndexType, SparseVectorIndexConfig, VectorIndexConfig,
+    VectorIndexType,
 };
 
 /// Tracing-based progress reporter for Lance index builds.
@@ -852,6 +855,7 @@ impl IndexManager {
                 IndexDefinition::FullText(cfg) => self.create_fts_index(cfg).await?,
                 IndexDefinition::Inverted(cfg) => self.create_inverted_index(cfg).await?,
                 IndexDefinition::JsonFullText(cfg) => self.create_json_fts_index(cfg).await?,
+                IndexDefinition::Sparse(cfg) => self.create_sparse_vector_index(cfg).await?,
                 _ => warn!("Unknown index type encountered during rebuild, skipping"),
             }
         }
@@ -943,5 +947,101 @@ impl IndexManager {
 
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
         index.apply_incremental_updates(added, removed).await
+    }
+
+    /// Create (and backfill) a scored sparse-vector index. Mirrors
+    /// `create_inverted_index`: build from the flushed vertex dataset if it
+    /// exists, then register + persist the config.
+    #[cfg(feature = "lance-backend")]
+    #[instrument(skip(self), level = "info")]
+    pub async fn create_sparse_vector_index(&self, config: SparseVectorIndexConfig) -> Result<()> {
+        let label = &config.label;
+        let property = &config.property;
+        info!(
+            "Creating Sparse Vector Index '{}' on {}.{}",
+            config.name, label, property
+        );
+
+        let schema = self.schema_manager.schema();
+        let label_meta = schema
+            .labels
+            .get(label)
+            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+
+        let _ = label_meta;
+        let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
+
+        // Backfill from the flushed vertex table via the storage backend (the
+        // LanceDB-managed table is not at the raw `{base}/vertices_<label>`
+        // path a `VertexDataset::open` expects). Mirrors the MUVERA backfill.
+        let table = table_names::vertex_table_name(label);
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await.unwrap_or(false) {
+                let batches = backend.scan(ScanRequest::all(&table)).await?;
+                index
+                    .build_from_batches(&batches, |n| debug!("Indexed {} sparse docs", n))
+                    .await?;
+            } else {
+                debug!(
+                    "Table '{}' not flushed yet; creating empty sparse index (populated on flush)",
+                    table
+                );
+            }
+        } else {
+            warn!(
+                "No storage backend available; sparse index '{}' left empty (populated on flush)",
+                config.name
+            );
+        }
+
+        self.schema_manager
+            .add_index(IndexDefinition::Sparse(config))?;
+        self.schema_manager.save().await?;
+
+        Ok(())
+    }
+
+    /// Applies incremental updates to a sparse-vector index (load-modify-write,
+    /// same semantics as the set-membership inverted index).
+    #[cfg(feature = "lance-backend")]
+    #[instrument(skip(self, added, removed), level = "info", fields(
+        label = %config.label,
+        property = %config.property
+    ))]
+    pub async fn update_sparse_vector_index_incremental(
+        &self,
+        config: &SparseVectorIndexConfig,
+        added: &HashMap<Vid, Vec<(u32, f32)>>,
+        removed: &HashSet<Vid>,
+    ) -> Result<()> {
+        info!(
+            added = added.len(),
+            removed = removed.len(),
+            "Incrementally updating sparse vector index"
+        );
+        let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
+        index.apply_incremental_updates(added, removed).await
+    }
+
+    /// Open a sparse-vector index for querying, given its label + property.
+    /// Errors if no `IndexDefinition::Sparse` is registered for that pair.
+    #[cfg(feature = "lance-backend")]
+    pub async fn sparse_vector_index(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<SparseVectorIndex> {
+        let schema = self.schema_manager.schema();
+        let config = schema
+            .indexes
+            .iter()
+            .find_map(|idx| match idx {
+                IndexDefinition::Sparse(cfg) if cfg.label == label && cfg.property == property => {
+                    Some(cfg.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("No sparse vector index found for {}.{}", label, property))?;
+        SparseVectorIndex::new(&self.base_uri, config).await
     }
 }

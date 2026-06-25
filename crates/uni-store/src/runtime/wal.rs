@@ -106,6 +106,67 @@ pub(crate) fn sync_file_and_parent(path: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
+/// Lossless WAL serialization for a property map.
+///
+/// `uni_common::Value` is `#[serde(untagged)]`, so serializing a `Properties`
+/// map straight to serde_json is **lossy**: a `Value::SparseVector` collapses to
+/// a `Map`, a `Value::Vector` to a `List`, nested temporals to strings, etc. —
+/// the variant cannot be recovered on replay. The WAL is a persistence path, so
+/// it must not rely on untagged serde (the exact hazard called out on the
+/// `Value` type).
+///
+/// This module encodes each property value through the explicit, tagged
+/// CypherValue codec (`cypher_value_codec`), stored as a base64 string with a
+/// sentinel prefix. On read, a value carrying the prefix is CV-decoded (lossless,
+/// new format); any other value is a pre-existing legacy segment and is decoded
+/// through the old untagged path unchanged (backward compatible — no WAL version
+/// bump, and old segments behave exactly as before).
+mod cv_props {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+    use uni_common::{Properties, Value};
+
+    /// Sentinel marking a CV-encoded value. The leading control byte cannot
+    /// begin a legacy untagged-JSON string a user could realistically store.
+    const CV_PREFIX: &str = "\u{1}uni_cv:";
+
+    pub fn serialize<S: Serializer>(props: &Properties, s: S) -> Result<S::Ok, S::Error> {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let encoded: HashMap<&String, String> = props
+            .iter()
+            .map(|(k, v)| {
+                let bytes = uni_common::cypher_value_codec::encode(v);
+                (k, format!("{CV_PREFIX}{}", engine.encode(bytes)))
+            })
+            .collect();
+        encoded.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Properties, D::Error> {
+        let raw: HashMap<String, serde_json::Value> = HashMap::deserialize(d)?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut out = Properties::with_capacity(raw.len());
+        for (k, jv) in raw {
+            let value = match &jv {
+                serde_json::Value::String(s) if s.starts_with(CV_PREFIX) => {
+                    let bytes = engine
+                        .decode(&s[CV_PREFIX.len()..])
+                        .map_err(serde::de::Error::custom)?;
+                    uni_common::cypher_value_codec::decode(&bytes)
+                        .map_err(serde::de::Error::custom)?
+                }
+                // Legacy (pre-CV) segment: an untagged `Value` written directly.
+                // Decode through the old path (lossy for SparseVector/Vector, but
+                // that is exactly the pre-existing behavior for old segments).
+                _ => serde_json::from_value::<Value>(jv).map_err(serde::de::Error::custom)?,
+            };
+            out.insert(k, value);
+        }
+        Ok(out)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Mutation {
     InsertEdge {
@@ -114,6 +175,7 @@ pub enum Mutation {
         edge_type: u32,
         eid: Eid,
         version: u64,
+        #[serde(with = "cv_props")]
         properties: Properties,
         /// Edge type name for metadata recovery. Optional for backward compatibility.
         #[serde(default)]
@@ -128,6 +190,7 @@ pub enum Mutation {
     },
     InsertVertex {
         vid: Vid,
+        #[serde(with = "cv_props")]
         properties: Properties,
         #[serde(default)]
         labels: Vec<String>,

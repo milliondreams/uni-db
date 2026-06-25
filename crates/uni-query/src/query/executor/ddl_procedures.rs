@@ -360,6 +360,34 @@ async fn create_index_internal(
             max_terms_per_doc: 10_000,
             metadata: Default::default(),
         }),
+        "SPARSE" => {
+            // The term-space cardinality comes from the declared
+            // `DataType::SparseVector { dimensions }` of the column.
+            let dimensions = storage
+                .schema_manager()
+                .schema()
+                .properties
+                .get(label)
+                .and_then(|props| props.get(prop_name))
+                .and_then(|meta| match &meta.r#type {
+                    uni_common::DataType::SparseVector { dimensions } => Some(*dimensions),
+                    _ => None,
+                })
+                .ok_or_else(|| UniError::InvalidArgument {
+                    arg: "property".into(),
+                    message: format!(
+                        "Property '{prop_name}' is not a SparseVector column; cannot create a sparse index"
+                    ),
+                })?;
+            IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
+                name: index_name,
+                label: label.to_string(),
+                property: prop_name.clone(),
+                dimensions,
+                quantize: true,
+                metadata: Default::default(),
+            })
+        }
         _ => {
             return Err(UniError::InvalidArgument {
                 arg: "type".into(),
@@ -396,6 +424,7 @@ async fn create_index_internal(
                 match other {
                     IndexDefinition::Scalar(cfg) => idx_mgr.create_scalar_index(cfg).await?,
                     IndexDefinition::Inverted(cfg) => idx_mgr.create_inverted_index(cfg).await?,
+                    IndexDefinition::Sparse(cfg) => idx_mgr.create_sparse_vector_index(cfg).await?,
                     IndexDefinition::FullText(cfg) => idx_mgr.create_fts_index(cfg).await?,
                     IndexDefinition::JsonFullText(cfg) => {
                         idx_mgr.create_json_fts_index(cfg).await?

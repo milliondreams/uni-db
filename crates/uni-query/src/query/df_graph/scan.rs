@@ -3221,6 +3221,16 @@ pub(crate) fn build_property_column_static(
         DataType::List(inner_field) => {
             build_list_property_column(vids, props_map, prop_name, inner_field)
         }
+        // Sparse-vector struct must be matched BEFORE the generic struct arm
+        // below (whose `build_struct_property_column` only knows scalar fields
+        // and would emit Utf8 for the `List` children).
+        DataType::Struct(_) if uni_common::core::schema::is_sparse_vector_struct(data_type) => {
+            let values: Vec<Option<Value>> = vids
+                .iter()
+                .map(|vid| get_property_value(vid, props_map, prop_name))
+                .collect();
+            Ok(uni_store::storage::arrow_convert::build_sparse_vector_array(&values))
+        }
         DataType::Struct(fields) => {
             build_struct_property_column(vids, props_map, prop_name, fields)
         }

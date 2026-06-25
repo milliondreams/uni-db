@@ -325,6 +325,16 @@ impl<'a> LabelBuilder<'a> {
                 metadata: Default::default(),
             }),
             IndexType::Inverted(config) => IndexDefinition::Inverted(config),
+            IndexType::Sparse { dimensions } => {
+                IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
+                    name: format!("idx_{}_{}", self.name, property),
+                    label: self.name.clone(),
+                    property: property.to_string(),
+                    dimensions,
+                    quantize: true,
+                    metadata: Default::default(),
+                })
+            }
         };
         self.builder.pending.push(SchemaChange::AddIndex(idx));
         self
@@ -497,6 +507,11 @@ pub enum IndexType {
     FullText,
     Scalar(ScalarType),
     Inverted(uni_common::core::schema::InvertedIndexConfig),
+    /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
+    /// term-space cardinality of the column.
+    Sparse {
+        dimensions: usize,
+    },
 }
 
 pub struct VectorIndexCfg {

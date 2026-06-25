@@ -70,6 +70,7 @@ pub const TAG_VECTOR: u8 = 16;
 pub const TAG_LOCALTIME: u8 = 17;
 pub const TAG_LOCALDATETIME: u8 = 18;
 pub const TAG_BTIC: u8 = 19;
+pub const TAG_SPARSE_VECTOR: u8 = 20;
 
 // ---------------------------------------------------------------------------
 // rmp_serde + UniError::Storage wrappers
@@ -238,6 +239,16 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
                 hi: btic.hi(),
                 meta: btic.meta(),
             }))
+        }
+        TAG_SPARSE_VECTOR => {
+            let sv = uni_sparse_vector::encode::decode_slice(payload).map_err(|e| {
+                UniError::Storage {
+                    message: format!("failed to decode SparseVector: {e}"),
+                    source: None,
+                }
+            })?;
+            let (indices, values) = sv.into_parts();
+            Ok(Value::SparseVector { indices, values })
         }
         _ => Err(UniError::Storage {
             message: format!("unknown CypherValue tag: {tag}"),
@@ -422,6 +433,12 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
             encode_msgpack(buf, TAG_PATH, &payload, "path");
         }
         Value::Vector(v) => encode_msgpack(buf, TAG_VECTOR, v, "vector"),
+        Value::SparseVector { indices, values } => {
+            buf.push(TAG_SPARSE_VECTOR);
+            let sv = uni_sparse_vector::SparseVector::new(indices.clone(), values.clone())
+                .expect("invalid SparseVector value");
+            buf.extend_from_slice(&uni_sparse_vector::encode::encode(&sv));
+        }
         Value::Temporal(t) => match t {
             crate::value::TemporalValue::Date { days_since_epoch } => {
                 encode_msgpack(buf, TAG_DATE, days_since_epoch, "date");
@@ -693,6 +710,47 @@ mod tests {
         let v = Value::Vector(vec![0.1, 0.2, 0.3]);
         let bytes = encode(&v);
         assert_eq!(bytes[0], TAG_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector() {
+        let v = Value::SparseVector {
+            indices: vec![1, 7, 42],
+            values: vec![0.25, -1.5, 3.0],
+        };
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_SPARSE_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector_empty() {
+        let v = Value::SparseVector {
+            indices: vec![],
+            values: vec![],
+        };
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_SPARSE_VECTOR);
+        assert_eq!(decode(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector_nested_in_map() {
+        // Nested-in-Map exercises the CV path used for non-declared/nested
+        // sparse values (the tag framing must survive map recursion).
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "emb".to_string(),
+            Value::SparseVector {
+                indices: vec![3, 9],
+                values: vec![1.0, 2.0],
+            },
+        );
+        let v = Value::Map(m);
+        let bytes = encode(&v);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, v);
     }

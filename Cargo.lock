@@ -12733,6 +12733,7 @@ dependencies = [
  "tracing",
  "ulid",
  "uni-btic",
+ "uni-sparse-vector",
 ]
 
 [[package]]
@@ -13355,6 +13356,7 @@ dependencies = [
  "uni-plugin",
  "uni-plugin-builtin",
  "uni-query-functions",
+ "uni-sparse-vector",
  "uni-store",
  "uni-xervo",
 ]
@@ -13400,6 +13402,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uni-sparse-vector"
+version = "2.3.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "uni-store"
 version = "2.3.0"
 dependencies = [
@@ -13409,6 +13420,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "chrono",

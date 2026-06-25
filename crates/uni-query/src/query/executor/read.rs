@@ -1167,6 +1167,7 @@ impl Executor {
                 | "uni.schema.labelInfo"
                 | "uni.vector.query"
                 | "uni.fts.query"
+                | "uni.sparse.query"
                 | "uni.search"
                 // M5g — `uni.create.vNode` produces a typed Node yield
                 // via the planner-level node-shape expansion in

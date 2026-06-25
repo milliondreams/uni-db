@@ -550,6 +550,19 @@ pub enum Value {
     /// Dense float vector for similarity search.
     Vector(Vec<f32>),
 
+    /// Learned-sparse vector (SPLADE / BGE-M3): two parallel arrays with
+    /// strictly-ascending `indices` (term ids) and parallel `values` (weights).
+    /// Holds plain fields; reconstruct the [`uni_sparse_vector::SparseVector`]
+    /// type only at boundaries (the BTIC split). Real persistence goes through
+    /// the explicit codecs, never untagged serde (which would shadow this as a
+    /// `Map`).
+    SparseVector {
+        /// Term ids, strictly ascending (sorted + unique).
+        indices: Vec<u32>,
+        /// Weights, parallel to `indices`.
+        values: Vec<f32>,
+    },
+
     // Temporal
     /// Typed temporal value (date, time, datetime, duration).
     Temporal(TemporalValue),
@@ -727,6 +740,9 @@ impl fmt::Display for Value {
                 p.edges.len()
             ),
             Value::Vector(v) => write!(f, "<vector: {} dims>", v.len()),
+            Value::SparseVector { indices, .. } => {
+                write!(f, "<sparse vector: {} nnz>", indices.len())
+            }
             Value::Temporal(t) => write!(f, "{t}"),
         }
     }
@@ -771,6 +787,16 @@ impl PartialEq for Value {
             (Value::Edge(a), Value::Edge(b)) => a == b,
             (Value::Path(a), Value::Path(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
+            (
+                Value::SparseVector {
+                    indices: i1,
+                    values: v1,
+                },
+                Value::SparseVector {
+                    indices: i2,
+                    values: v2,
+                },
+            ) => i1 == i2 && v1 == v2,
             (Value::Temporal(a), Value::Temporal(b)) => a == b,
             // Distinct variants are never equal.
             _ => false,
@@ -819,6 +845,23 @@ impl Hash for Value {
                 // with the same signed-zero/NaN normalization to stay consistent.
                 v.len().hash(state);
                 for f in v {
+                    let bits = if *f == 0.0f32 {
+                        0.0f32.to_bits()
+                    } else if f.is_nan() {
+                        f32::NAN.to_bits()
+                    } else {
+                        f.to_bits()
+                    };
+                    bits.hash(state);
+                }
+            }
+            Value::SparseVector { indices, values } => {
+                // Parallel to the `Vector` arm: `Vec<f32>` weights compare via
+                // IEEE-754 `==`, so hash with the same signed-zero/NaN
+                // normalization to uphold the `Hash`/`Eq` contract.
+                indices.hash(state);
+                values.len().hash(state);
+                for f in values {
                     let bits = if *f == 0.0f32 {
                         0.0f32.to_bits()
                     } else if f.is_nan() {
@@ -1546,6 +1589,28 @@ impl From<Value> for serde_json::Value {
                     })
                     .collect(),
             ),
+            Value::SparseVector { indices, values } => {
+                let idx = serde_json::Value::Array(
+                    indices
+                        .into_iter()
+                        .map(|i| serde_json::Value::Number(serde_json::Number::from(i)))
+                        .collect(),
+                );
+                let vals = serde_json::Value::Array(
+                    values
+                        .into_iter()
+                        .map(|f| {
+                            serde_json::Number::from_f64(f as f64)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect(),
+                );
+                let mut map = serde_json::Map::new();
+                map.insert("indices".to_string(), idx);
+                map.insert("values".to_string(), vals);
+                serde_json::Value::Object(map)
+            }
             Value::Temporal(t) => serde_json::Value::String(t.to_string()),
         }
     }

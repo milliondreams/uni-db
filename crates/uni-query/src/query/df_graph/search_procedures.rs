@@ -466,6 +466,226 @@ pub(crate) async fn multivector_rerank(
     Ok((scored, props_map))
 }
 
+/// Scored sparse-vector retrieval with exact dot-product re-scoring and L0
+/// union — the sparse analogue of [`multivector_rerank`]. The sparse index is a
+/// flushed-only candidate generator; this helper unions live L0 rows, fetches
+/// properties MVCC/tombstone-aware, and re-scores *every* candidate exactly via
+/// `sparse_dot`, so a query sees recent writes (and never a tombstoned/stale
+/// row) without an explicit `flush()`.
+///
+/// Returns the top-`k` `(vid, dot_score)` (higher = better) plus the fetched
+/// property map for node materialisation. `retrieval_k` is the index over-fetch.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn sparse_rerank(
+    storage: &uni_store::storage::StorageManager,
+    property_manager: &uni_store::PropertyManager,
+    query_ctx: &uni_store::QueryContext,
+    label: &str,
+    property: &str,
+    query: &uni_sparse_vector::SparseVector,
+    k: usize,
+    retrieval_k: usize,
+) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
+    // 1. Flushed candidate generation via the sparse index (term-matching vids).
+    let query_pairs: Vec<(u32, f32)> = query.iter().collect();
+    let flushed = storage
+        .sparse_search(label, property, &query_pairs, retrieval_k)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 2. Live L0 candidates (and tombstones) for the label.
+    let (l0_live, tombstoned) = uni_store::collect_l0_label_candidates(query_ctx, label);
+
+    // 3. Union(flushed, L0) minus tombstoned, deduped.
+    let mut seen: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+    let mut candidates: Vec<Vid> = Vec::new();
+    for (vid, _) in &flushed {
+        if !tombstoned.contains(vid) && seen.insert(*vid) {
+            candidates.push(*vid);
+        }
+    }
+    for vid in l0_live {
+        if !tombstoned.contains(&vid) && seen.insert(vid) {
+            candidates.push(vid);
+        }
+    }
+
+    // 4. Fetch properties for all candidates (MVCC/tombstone aware: a vid that
+    //    is not visible under this snapshot is absent from `props_map`).
+    let props_map = property_manager
+        .get_batch_vertex_props_for_label(&candidates, label, Some(query_ctx))
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 5. Exact dot re-score. Absent vid → not visible → dropped. Present but
+    //    missing the property → no document terms → score 0. The fetched
+    //    property is the latest (L0-merged) value, so an L0 update re-scores
+    //    against the new weights even though the stale flushed posting matched.
+    let mut scored: Vec<(Vid, f32)> = Vec::with_capacity(candidates.len());
+    for vid in &candidates {
+        let Some(props) = props_map.get(vid) else {
+            continue;
+        };
+        let score = match props.get(property) {
+            Some(uni_common::Value::SparseVector { indices, values }) => {
+                match uni_sparse_vector::SparseVector::new(indices.clone(), values.clone()) {
+                    Ok(doc) => uni_sparse_vector::ops::sparse_dot(query, &doc),
+                    Err(_) => 0.0,
+                }
+            }
+            _ => 0.0,
+        };
+        // A zero score means no query-term overlap — not a sparse match. Dropping
+        // it keeps the L0 brute-force path and the flushed-index path (which only
+        // surfaces term-overlapping docs via its `term_id IN (...)` filter)
+        // returning the same set, instead of the L0 path padding top-k with
+        // irrelevant zero-overlap docs.
+        if score > 0.0 {
+            scored.push((*vid, score));
+        }
+    }
+
+    // 6. Top-k by similarity (higher = better).
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    Ok((scored, props_map))
+}
+
+/// Parse the `query` argument of `uni.sparse.query` into a [`SparseVector`].
+/// Accepts a `Value::SparseVector` (the typical query-parameter form) or a map
+/// `{indices: [...], values: [...]}`.
+fn extract_sparse_query(val: &Value) -> DFResult<uni_sparse_vector::SparseVector> {
+    use datafusion::error::DataFusionError;
+    match val {
+        Value::SparseVector { indices, values } => {
+            uni_sparse_vector::SparseVector::new(indices.clone(), values.clone()).map_err(|e| {
+                DataFusionError::Execution(format!("uni.sparse.query: invalid query vector: {e}"))
+            })
+        }
+        Value::Map(m) => {
+            let list = |key: &str| -> DFResult<&Vec<Value>> {
+                match m.get(key) {
+                    Some(Value::List(l)) => Ok(l),
+                    _ => Err(DataFusionError::Execution(format!(
+                        "uni.sparse.query: query map missing '{key}' list"
+                    ))),
+                }
+            };
+            let idx_list = list("indices")?;
+            let val_list = list("values")?;
+            let indices: Vec<u32> = idx_list
+                .iter()
+                .map(|v| v.as_i64().map(|i| i as u32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "uni.sparse.query: 'indices' must be integers".to_string(),
+                    )
+                })?;
+            let values: Vec<f32> = val_list
+                .iter()
+                .map(|v| v.as_f64().map(|f| f as f32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "uni.sparse.query: 'values' must be numbers".to_string(),
+                    )
+                })?;
+            if indices.len() != values.len() {
+                return Err(DataFusionError::Execution(
+                    "uni.sparse.query: 'indices' and 'values' length mismatch".to_string(),
+                ));
+            }
+            uni_sparse_vector::SparseVector::from_pairs(
+                indices.into_iter().zip(values).collect(),
+            )
+            .map_err(|e| {
+                DataFusionError::Execution(format!("uni.sparse.query: invalid query vector: {e}"))
+            })
+        }
+        _ => Err(DataFusionError::Execution(
+            "uni.sparse.query: third argument (query) must be a sparse vector or {indices,values} map"
+                .to_string(),
+        )),
+    }
+}
+
+/// `uni.sparse.query(label, property, query, k, filter?, threshold?, options?)`.
+pub(crate) async fn run_sparse_query(
+    host: &QueryProcedureHost,
+    args: &[Value],
+    yield_items: &[(String, Option<String>)],
+    target_properties: &HashMap<String, Vec<String>>,
+    schema: &SchemaRef,
+) -> DFResult<Option<RecordBatch>> {
+    let label = require_string_arg(args, 0, "uni.sparse.query: first argument (label)")?;
+    let property = require_string_arg(args, 1, "uni.sparse.query: second argument (property)")?;
+    let query_val = args.get(2).ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "uni.sparse.query: third argument (query) is required".to_string(),
+        )
+    })?;
+    let query = extract_sparse_query(query_val)?;
+    let k = require_int_arg(args, 3, "uni.sparse.query: fourth argument (k)")?;
+    // `filter` is accepted for API symmetry; MVCC/tombstone visibility is
+    // already enforced by the property fetch in `sparse_rerank`.
+    let _filter = extract_optional_filter(args, 4);
+    let threshold = extract_optional_threshold(args, 5);
+    let options_map = args
+        .get(6)
+        .and_then(|v| if v.is_null() { None } else { v.as_object() });
+    let over_fetch = options_map
+        .and_then(|m| m.get("over_fetch"))
+        .and_then(|v| v.as_f64())
+        .filter(|f| *f >= 1.0)
+        .unwrap_or(MULTIVECTOR_OVER_FETCH as f64);
+    let retrieval_k = (((k as f64) * over_fetch).ceil() as usize).max(k);
+
+    let storage = host.storage();
+    let query_ctx = host.query_context();
+    let property_manager = host.property_manager().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Cannot run sparse query: property manager not available on host".to_string(),
+        )
+    })?;
+
+    let (mut results, props) = sparse_rerank(
+        storage,
+        property_manager,
+        &query_ctx,
+        &label,
+        &property,
+        &query,
+        k,
+        retrieval_k,
+    )
+    .await?;
+
+    if let Some(min_score) = threshold {
+        results.retain(|(_, s)| *s >= min_score as f32);
+    }
+    if results.is_empty() {
+        return Ok(Some(create_empty_batch(schema.clone())?));
+    }
+
+    // Emit the exact dot score as `score` and reuse the fetched props for node
+    // materialisation by routing through the rerank context (bypasses
+    // `calculate_score`). The metric is cosmetic on this path.
+    let metric = DistanceMetric::Cosine;
+    let rerank_ctx = RerankContext {
+        scores: results.iter().copied().collect(),
+        props,
+    };
+    let batch_ctx = BatchBuildCtx {
+        yield_items,
+        target_properties,
+        host,
+        schema,
+        rerank_ctx: Some(&rerank_ctx),
+    };
+    build_search_result_batch(&results, &label, &metric, &batch_ctx).await
+}
+
 // ---------------------------------------------------------------------------
 // Auto-embed
 // ---------------------------------------------------------------------------

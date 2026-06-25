@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt32Array,
 };
 use serde_json::Value;
 use uni_common::{DataType, TemporalValue};
@@ -124,6 +124,48 @@ fn value_from_column_inner(
                 .map(|i| float_values.value(i))
                 .collect();
             Ok(serde_json::json!(vec))
+        }
+        DataType::SparseVector { .. } => {
+            // Explicit arm so a sparse column is never silently nulled by the
+            // `_ => Ok(Value::Null)` fallback below. This serde_json shape
+            // (`{indices, values}`) is the lossy JSON view; full-fidelity
+            // `uni_common::Value::SparseVector` is produced by `arrow_to_value`
+            // via `decode_column_value`.
+            let struct_arr = col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| anyhow!("Invalid struct col for sparse vector"))?;
+            if struct_arr.is_null(row) {
+                return Ok(Value::Null);
+            }
+            let indices_list = struct_arr
+                .column_by_name("indices")
+                .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+                .ok_or_else(|| anyhow!("sparse vector missing list column 'indices'"))?;
+            let values_list = struct_arr
+                .column_by_name("values")
+                .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+                .ok_or_else(|| anyhow!("sparse vector missing list column 'values'"))?;
+            let idx_vals = indices_list.value(row);
+            let idx_arr = idx_vals
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("sparse 'indices' inner not UInt32"))?;
+            let w_vals = values_list.value(row);
+            let w_arr = w_vals
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("sparse 'values' inner not Float32"))?;
+            let indices: Vec<Value> = (0..idx_arr.len())
+                .map(|i| serde_json::json!(idx_arr.value(i)))
+                .collect();
+            let values: Vec<Value> = (0..w_arr.len())
+                .map(|i| serde_json::json!(w_arr.value(i)))
+                .collect();
+            let mut map = serde_json::Map::new();
+            map.insert("indices".to_string(), Value::Array(indices));
+            map.insert("values".to_string(), Value::Array(values));
+            Ok(Value::Object(map))
         }
         DataType::CypherValue => {
             let bytes = col
@@ -381,6 +423,10 @@ pub fn decode_column_value(
         | DataType::Time
         | DataType::Btic
         | DataType::Bytes
+        // Sparse vectors decode to a full-fidelity `Value::SparseVector` via
+        // `arrow_to_value`; the `value_from_column` serde_json path would lose
+        // the type (an object would round-trip back as a `Map`).
+        | DataType::SparseVector { .. }
         // Maps decode natively (full fidelity, CV-aware) via the unified
         // `try_reconstruct_map` path inside `arrow_to_value`, which handles typed scalar
         // value children, raw-`Bytes` (uni_raw_bytes-marked) children, and CV-encoded

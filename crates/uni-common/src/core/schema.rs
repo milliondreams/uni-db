@@ -76,6 +76,32 @@ pub fn is_time_struct(arrow_dt: &ArrowDataType) -> bool {
     matches!(arrow_dt, ArrowDataType::Struct(fields) if *fields == time_struct_fields())
 }
 
+/// The canonical Arrow struct fields for a `DataType::SparseVector` column:
+/// `Struct { indices: List<UInt32>, values: List<Float32> }`. Two parallel
+/// variable-length lists in one struct. Both lists are non-null — an empty
+/// sparse vector stores as two empty lists, never null. The write and read
+/// sides both route through this one definition so they cannot drift (the same
+/// lockstep discipline as the temporal structs above).
+pub fn sparse_vector_struct_fields() -> Fields {
+    Fields::from(vec![
+        Field::new(
+            "indices",
+            ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::UInt32, true))),
+            false,
+        ),
+        Field::new(
+            "values",
+            ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Float32, true))),
+            false,
+        ),
+    ])
+}
+
+/// Detects if an Arrow DataType is the canonical SparseVector struct.
+pub fn is_sparse_vector_struct(arrow_dt: &ArrowDataType) -> bool {
+    matches!(arrow_dt, ArrowDataType::Struct(fields) if *fields == sparse_vector_struct_fields())
+}
+
 /// Field metadata marking an Arrow `LargeBinary` field as a raw `DataType::Bytes`
 /// value rather than a tagged CypherValue/Duration blob.
 ///
@@ -151,7 +177,14 @@ pub enum DataType {
     CypherValue,
     Bytes,
     Point(PointType),
-    Vector { dimensions: usize },
+    Vector {
+        dimensions: usize,
+    },
+    /// Learned-sparse vector (SPLADE / BGE-M3). `dimensions` is the term-space
+    /// cardinality (max term id + 1) used for validation and index config.
+    SparseVector {
+        dimensions: usize,
+    },
     Btic,
     Crdt(CrdtType),
     List(Box<DataType>),
@@ -204,6 +237,7 @@ impl DataType {
                 Arc::new(Field::new("item", ArrowDataType::Float32, true)),
                 *dimensions as i32,
             ),
+            DataType::SparseVector { .. } => ArrowDataType::Struct(sparse_vector_struct_fields()),
             DataType::Btic => ArrowDataType::FixedSizeBinary(24),
             DataType::Crdt(_) => ArrowDataType::Binary, // Store CRDT as binary MessagePack
             DataType::List(inner) => {
@@ -346,6 +380,13 @@ impl DataType {
                 Value::String(_) | Value::List(_) | Value::Temporal(TemporalValue::Btic { .. })
             ),
             DataType::Vector { .. } => matches!(value, Value::Vector(_) | Value::List(_)),
+            // `Value::Map` is the degraded form a `SparseVector` collapses into
+            // when round-tripped through `#[serde(untagged)]` persistence (e.g.
+            // the WAL's serde_json mutation log); accept it like `Vector` accepts
+            // `List`. The column builder re-extracts `{indices, values}`.
+            DataType::SparseVector { .. } => {
+                matches!(value, Value::SparseVector { .. } | Value::Map(_))
+            }
             DataType::List(_) => matches!(value, Value::List(_)),
             DataType::Map(_, _) => matches!(value, Value::Map(_)),
         }
@@ -787,6 +828,8 @@ pub enum IndexDefinition {
     Scalar(ScalarIndexConfig),
     Inverted(InvertedIndexConfig),
     JsonFullText(JsonFtsIndexConfig),
+    /// Scored sparse-vector (SPLADE / learned-sparse) inverted index.
+    Sparse(SparseVectorIndexConfig),
 }
 
 impl IndexDefinition {
@@ -798,6 +841,7 @@ impl IndexDefinition {
             IndexDefinition::Scalar(c) => &c.name,
             IndexDefinition::Inverted(c) => &c.name,
             IndexDefinition::JsonFullText(c) => &c.name,
+            IndexDefinition::Sparse(c) => &c.name,
         }
     }
 
@@ -809,6 +853,7 @@ impl IndexDefinition {
             IndexDefinition::Scalar(c) => &c.label,
             IndexDefinition::Inverted(c) => &c.label,
             IndexDefinition::JsonFullText(c) => &c.label,
+            IndexDefinition::Sparse(c) => &c.label,
         }
     }
 
@@ -820,6 +865,7 @@ impl IndexDefinition {
             IndexDefinition::Scalar(c) => &c.metadata,
             IndexDefinition::Inverted(c) => &c.metadata,
             IndexDefinition::JsonFullText(c) => &c.metadata,
+            IndexDefinition::Sparse(c) => &c.metadata,
         }
     }
 
@@ -831,6 +877,7 @@ impl IndexDefinition {
             IndexDefinition::Scalar(c) => &mut c.metadata,
             IndexDefinition::Inverted(c) => &mut c.metadata,
             IndexDefinition::JsonFullText(c) => &mut c.metadata,
+            IndexDefinition::Sparse(c) => &mut c.metadata,
         }
     }
 }
@@ -854,6 +901,30 @@ fn default_normalize() -> bool {
 
 fn default_max_terms_per_doc() -> usize {
     10_000
+}
+
+/// Configuration for a scored sparse-vector (SPLADE / learned-sparse) index.
+///
+/// The index stores per-term postings `(term_id, vids, weights, max_impact)`
+/// and scores by dot product. `quantize` controls 8-bit weight quantization at
+/// the postings boundary (≈ lossless, ~4× smaller; default on). P2 block-max
+/// pruning knobs are added in a later milestone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SparseVectorIndexConfig {
+    pub name: String,
+    pub label: String,
+    pub property: String,
+    /// Term-space cardinality (max term id + 1), for validation/config.
+    pub dimensions: usize,
+    /// Quantize stored weights to 8-bit (per-term scale). Default on.
+    #[serde(default = "default_sparse_quantize")]
+    pub quantize: bool,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
+}
+
+fn default_sparse_quantize() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

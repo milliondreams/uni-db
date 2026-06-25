@@ -358,6 +358,29 @@ similar_docs = session.cypher(
 )
 ```
 
+### Multi-vector (ColBERT) and typed maps
+
+Use `list[Vector[N]]` for late-interaction (ColBERT) token embeddings, and `dict[str, V]` for typed maps:
+
+```python
+from uni_pydantic import Vector
+
+class Document(UniNode):
+    title: str
+    tokens: list[Vector[96]]          # multi-vector -> list:vector:96
+    section_scores: dict[str, float] = {}   # typed map -> map:string:float64
+
+doc = Document(
+    title="My Document",
+    tokens=[Vector[96]([0.1] * 96), Vector[96]([0.2] * 96)],
+    section_scores={"intro": 0.9, "body": 0.7},
+)
+session.add(doc)
+session.commit()
+```
+
+A MUVERA / MaxSim index on the `tokens` field is created via Cypher DDL or the imperative schema API (not via `Field()`); see [Vector Search — Multi-Vector](../features/vector-search.md#multi-vector-search-colbert-late-interaction).
+
 ## Best Practices
 
 ### 1. Define Models in Separate Module

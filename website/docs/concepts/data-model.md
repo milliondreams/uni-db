@@ -241,7 +241,8 @@ Uni supports a rich set of data types for properties:
 | `Json` | Structured JSON document | `{"nested": {"key": [1, 2, 3]}}` |
 | `Vector` | Fixed-dimension float32 array | `[0.1, -0.2, 0.3, ...]` |
 | `List<T>` | Variable-length array | `["a", "b", "c"]` |
-| `Map(K, V)` | Key-value map | `{key1: "value1", key2: "value2"}` |
+| `List<Vector>` | Multi-vector (ColBERT / late-interaction) | `[[0.1, -0.2], [0.3, -0.4]]` |
+| `Map<K, V>` | Typed key-value map (string keys) | `{key1: "value1", key2: "value2"}` |
 | `CypherValue` | Dynamic Cypher value | Any Cypher-compatible value |
 | `Bytes` | Raw byte buffer (images, audio, blobs) | `b"\xde\xad\xbe\xef"` |
 | `Point(PointType)` | Spatial point | `point({x: 1.0, y: 2.0})` |
@@ -264,8 +265,25 @@ Vectors are first-class citizens for embedding-based search:
 **Vector Characteristics:**
 - Fixed dimension (immutable after schema creation)
 - Float32 elements (for storage efficiency)
-- Indexable with HNSW, IVF_PQ algorithms
+- Indexable with IVF_PQ (default), HNSW, and other ANN algorithms
 - Searchable via Cypher procedures
+
+A `List<Vector>` property holds **many vectors per row** (per-token / ColBERT) for late-interaction MaxSim retrieval; it indexes with MUVERA. See [Vector Search — Multi-Vector](../features/vector-search.md#multi-vector-search-colbert-late-interaction).
+
+### Collection Types in DDL
+
+`List<T>` and `Map<K, V>` are declarable directly in Cypher DDL, including parameterized and nested forms. `Map` keys must be strings:
+
+```cypher
+CREATE LABEL Document (
+  tags     LIST<STRING>,
+  tokens   LIST<VECTOR(96)>,       -- multi-vector (ColBERT)
+  scores   MAP<STRING, FLOAT>,
+  sections MAP<STRING, LIST<INT>>  -- nested
+)
+```
+
+A typed scalar `Map` value (`String`, `Int64`, `Float64`, `Bool`, `Bytes`) is stored as a native column; complex value types (`Vector`, `List`, `Map`, temporal) are encoded as a `CypherValue`. See the [Cypher DDL guide](../guides/cypher-querying.md#parameterized-container-types).
 
 ### JSON Type
 

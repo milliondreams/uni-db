@@ -1,6 +1,6 @@
 # Vector Search
 
-Uni provides native vector search over embedding properties with 9 ANN index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW, HNSW-Flat/SQ/PQ) featuring scalar, product, and RaBitQ quantization. Use it for semantic search, RAG, and similarity-based retrieval.
+Uni provides native vector search over embedding properties with 8 single-vector ANN index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) featuring scalar, product, and RaBitQ quantization — plus MUVERA for multi-vector (ColBERT / late-interaction) columns. The default algorithm is IVF-PQ with cosine distance. Use it for semantic search, RAG, and similarity-based retrieval.
 
 ## What It Provides
 
@@ -9,6 +9,7 @@ Uni provides native vector search over embedding properties with 9 ANN index alg
 - `CALL uni.vector.query(...)` for KNN retrieval.
 - `similar_to()` expression function for point-scoring bound nodes in `WHERE`, `RETURN`, and Locy rules.
 - **Auto-embedding**: Pass text directly and let Uni embed it using the index's configured embedding model.
+- **Multi-vector (ColBERT / late-interaction)**: store many vectors per row and rank by exact MaxSim, optionally accelerated by a MUVERA first-stage index.
 
 ## Example
 
@@ -185,7 +186,101 @@ YIELD node, score, rerank_score
 RETURN node.title, score
 ```
 
-Supports local ONNX models (`local/onnx`) and remote APIs (Cohere, Voyage AI). See [Hybrid Search — Reranking](hybrid-search.md#cross-encoder-reranking) for full details.
+Supports local ONNX models (`local/onnx`) and remote APIs (Cohere, Voyage AI). See [Hybrid Search — Reranking](hybrid-search.md#reranking-cross-encoder-maxsim) for full details.
+
+## Multi-Vector Search (ColBERT / Late-Interaction)
+
+Late-interaction models (ColBERT, ColQwen2) represent each document and query as a **set of per-token vectors** rather than a single dense vector, then score with **MaxSim** — for each query token, take its best match across the document's tokens, and sum:
+
+```
+MaxSim = Σ_i max_j  similarity(query_token_i, doc_token_j)
+```
+
+This gives token-level matching precision, the strongest known approach for visual/layout-rich and long-document retrieval.
+
+### Declaring a multi-vector property
+
+A multi-vector property is a `LIST<VECTOR(dim)>` — a variable-length list of fixed-size token vectors. It must be schema-declared (multi-vectors cannot be stored on a schemaless property; a `CypherValue`/JSON column is the flexible-dimension alternative).
+
+=== "Cypher DDL"
+    ```cypher
+    CREATE LABEL Document (
+        title  STRING,
+        embedding VECTOR(384),     -- dense vector for first-stage ANN
+        tokens LIST<VECTOR(96)>    -- per-token (ColBERT) vectors
+    )
+    ```
+
+=== "Rust"
+    ```rust
+    use uni_db::DataType;
+
+    db.schema()
+        .label("Document")
+            .property("title", DataType::String)
+            .property("embedding", DataType::Vector { dimensions: 384 })
+            .property("tokens", DataType::List(Box::new(DataType::Vector { dimensions: 96 })))
+        .apply()
+        .await?;
+    ```
+
+=== "Python"
+    ```python
+    # Imperative builder: declare the multi-vector via its type string
+    db.schema() \
+        .label("Document") \
+            .property("title", "string") \
+            .vector("embedding", 384) \
+            .property("tokens", "list:vector:96") \
+            .done() \
+        .apply()
+    ```
+
+The Pydantic OGM maps a `list[Vector[96]]` field to the same `list:vector:96` type — see [Pydantic OGM reference](../reference/pydantic-ogm.md#multi-vector-colbert-fields).
+
+### Querying with MaxSim
+
+Retrieve candidates with a fast first stage (dense ANN, or a MUVERA index over the tokens), then re-rank them by exact MaxSim. Pass the per-token query via `maxsim_query`:
+
+```cypher
+CALL uni.vector.query(
+    'Document',
+    'embedding',                                -- dense property for first-stage ANN
+    $dense_query_vector,
+    50,                                         -- over-fetch candidates to re-rank
+    null,
+    null,
+    {
+        reranker: 'maxsim',
+        reranker_property: 'tokens',            -- the LIST<VECTOR> property
+        maxsim_query: [[0.1, 0.2], [0.3, 0.4]], -- per-token query embeddings
+        maxsim_metric: 'cosine'                 -- optional; default 'cosine'
+    }
+)
+YIELD node, score, rerank_score
+RETURN node.title, rerank_score
+ORDER BY rerank_score DESC
+```
+
+You can also query a multi-vector property **directly** (no separate dense stage) by passing a list of vectors as the query — `score` is then the exact MaxSim similarity:
+
+```cypher
+CALL uni.vector.query('Document', 'tokens', [[0.1, 0.2], [0.3, 0.4]], 10)
+YIELD node, score
+RETURN node.title, score
+ORDER BY score DESC
+```
+
+### MUVERA first-stage index
+
+For large corpora, add a MUVERA index on the multi-vector column. It encodes each row's token set into a single fixed-dimensional vector (FDE), indexes that with a normal single-vector ANN for fast candidate generation, then re-ranks with exact MaxSim:
+
+```cypher
+CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
+OPTIONS { type: 'muvera', k_sim: 4, reps: 20, d_proj: 16 }
+```
+
+Because the final stage is always an exact MaxSim re-rank, a weak FDE only costs recall, never precision. See [Indexing — MUVERA Multi-Vector Indexes](../concepts/indexing.md#muvera-multi-vector-indexes) for parameters and tuning, and [Hybrid Search — Reranking](hybrid-search.md#reranking-cross-encoder-maxsim) for using MaxSim inside `uni.fts.query` / `uni.search`.
 
 ## When To Use
 

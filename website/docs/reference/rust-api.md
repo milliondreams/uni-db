@@ -627,13 +627,16 @@ pub struct VectorIndexCfg {
 pub enum VectorAlgo {
     Flat,
     IvfFlat { partitions: u32 },
-    IvfPq { partitions: u32, sub_vectors: u32 },
+    IvfPq { partitions: u32, sub_vectors: u32 },     // default algorithm
     IvfSq { partitions: u32 },
     IvfRq { partitions: u32, num_bits: Option<u8> },
     Hnsw { m: u32, ef_construction: u32, partitions: Option<u32> },      // alias for HnswSq
     HnswFlat { m: u32, ef_construction: u32, partitions: Option<u32> },
     HnswSq { m: u32, ef_construction: u32, partitions: Option<u32> },
     HnswPq { m: u32, ef_construction: u32, sub_vectors: u32, partitions: Option<u32> },
+    // Multi-vector (ColBERT / MaxSim): encodes a List<Vector> column into a derived
+    // FDE column indexed by `inner`. Use on a `DataType::List(Vector { .. })` property.
+    Muvera { k_sim: u32, reps: u32, d_proj: u32, seed: u64, inner: Box<VectorAlgo> },
 }
 
 pub enum VectorMetric {

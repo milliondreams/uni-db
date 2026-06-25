@@ -555,13 +555,32 @@ The `index_type` parameter can be a string (`"btree"`, `"vector"`, `"fulltext"`,
 # Simple index
 builder.index("name", "btree")
 
-# Vector index with HNSW configuration
+# Vector index (default algorithm is ivf_pq when "algorithm" is omitted)
+builder.index("embedding", {
+    "type": "vector",
+    "algorithm": "ivf_pq",
+    "partitions": 256,
+    "sub_vectors": 16,
+    "metric": "cosine"
+})
+
+# HNSW configuration
 builder.index("embedding", {
     "type": "vector",
     "algorithm": "hnsw",
     "m": 32,
     "ef_construction": 400,
     "metric": "cosine"
+})
+
+# MUVERA index on a multi-vector ("list:vector:N") property (ColBERT / MaxSim)
+builder.index("tokens", {
+    "type": "vector",
+    "algorithm": "muvera",
+    "k_sim": 4,
+    "reps": 20,
+    "d_proj": 16,
+    "inner": "ivf_pq"
 })
 
 # Full-text index with n-gram tokenizer

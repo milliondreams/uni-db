@@ -99,10 +99,12 @@ YIELD vid, score, node [, vector_score] [, fts_score]
 | `method` | `'rrf'` (default), `'weighted'` | Fusion algorithm |
 | `alpha` | 0.0 - 1.0 | Vector weight for weighted fusion |
 | `over_fetch` | Float | Over-fetch factor (default: 2.0) |
-| `reranker` | String | Xervo alias for cross-encoder model (see [Reranking](#cross-encoder-reranking)) |
-| `reranker_property` | String | Node text property for cross-encoder input |
+| `reranker` | String | `'maxsim'` for in-process late-interaction, or a Xervo alias for a cross-encoder model (see [Reranking](#reranking-cross-encoder-maxsim)) |
+| `reranker_property` | String | Node property: text for a cross-encoder, or the multi-vector property for MaxSim |
 | `reranker_k` | Integer | Candidates for reranking (default: k×3, max: 1000) |
-| `reranker_query` | String | Override query text for cross-encoder |
+| `reranker_query` | String | Override query text for a cross-encoder (ignored for MaxSim) |
+| `maxsim_query` | List of vectors | **MaxSim only**: per-token query embeddings, e.g. `[[...], [...]]` (required when `reranker: 'maxsim'`) |
+| `maxsim_metric` | String | **MaxSim only**: `'cosine'` (default), `'dot'`, or `'l2'` |
 
 ## Fusion Methods
 
@@ -219,11 +221,18 @@ Adding two separate `similar_to` calls produces raw score addition without norma
 
 See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
 
-## Cross-Encoder Reranking
+## Reranking (Cross-Encoder & MaxSim)
 
-All three search procedures (`uni.search`, `uni.vector.query`, `uni.fts.query`) support an optional cross-encoder reranking stage. A cross-encoder jointly attends to a (query, document) pair to produce a more accurate relevance score, but is too expensive to run on the full corpus. By running it on a small over-fetched candidate set, you get fast retrieval with high-precision final ranking.
+All three search procedures (`uni.search`, `uni.vector.query`, `uni.fts.query`) support an optional reranking stage that re-scores a small over-fetched candidate set for higher-precision final ranking. Two modes are available:
 
-### How It Works
+- **Cross-encoder** — a neural model that jointly attends to a (query, document) text pair.
+- **MaxSim** — in-process, model-free late-interaction (ColBERT) scoring over a stored multi-vector property.
+
+Both share the same over-fetch path: retrieval fetches `reranker_k` candidates (default `k×3`, capped at 1000), the reranker re-scores them, and the top `k` are returned. When reranking is active, `score` reflects the reranker score; original retrieval scores remain available via `vector_score` and `fts_score`, and `rerank_score` is `null` when no reranker is configured.
+
+### Cross-Encoder
+
+A cross-encoder is too expensive to run on the full corpus, so it runs only on the over-fetched candidate set.
 
 ```
 Retrieval (vector/FTS/hybrid) → Over-fetch reranker_k candidates → Cross-encoder re-scores → Top k returned
@@ -256,8 +265,40 @@ When reranking is active, `score` reflects the reranker score. Original retrieva
 | Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
 | Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
 
+### MaxSim (Late-Interaction / ColBERT)
+
+MaxSim is an in-process, model-free reranker. Instead of a neural model it scores each candidate by the exact **MaxSim** of its stored per-token vectors against the query's per-token vectors:
+
+```
+MaxSim = Σ_i max_j  similarity(query_token_i, doc_token_j)
+```
+
+It is fast (pure CPU over pre-stored embeddings) and requires no model runtime — just a multi-vector (`LIST<VECTOR(dim)>`) property and a per-token query. Set `reranker: 'maxsim'` and pass the query tokens via `maxsim_query`:
+
+```cypher
+CALL uni.vector.query(
+    'Document',
+    'embedding',                                   -- dense property for first-stage ANN
+    $dense_query_vector,
+    50,                                            -- over-fetch candidates to re-rank
+    null,
+    null,
+    {
+        reranker: 'maxsim',
+        reranker_property: 'tokens',               -- the LIST<VECTOR> property to score
+        maxsim_query: [[0.1, 0.2], [0.3, 0.4]],    -- per-token query embeddings
+        maxsim_metric: 'cosine'                    -- optional; default 'cosine'
+    }
+)
+YIELD node, score, rerank_score
+RETURN node.title, rerank_score
+ORDER BY rerank_score DESC
+```
+
+MaxSim works identically inside `uni.fts.query` and `uni.search` (re-rank FTS or hybrid candidates by late interaction). The query property storing the tokens must be declared as a multi-vector type — see [Multi-Vector Search](vector-search.md#multi-vector-search-colbert-late-interaction).
+
 !!! note "Reranking does not apply to `similar_to()`"
-    `similar_to()` is a per-row expression with no bounded candidate set. Cross-encoders are only effective on small candidate sets, so reranking is limited to the three search procedures.
+    `similar_to()` is a per-row expression with no bounded candidate set. Reranking (cross-encoder or MaxSim) is only effective on small candidate sets, so it is limited to the three search procedures.
 
 ## Use Cases
 

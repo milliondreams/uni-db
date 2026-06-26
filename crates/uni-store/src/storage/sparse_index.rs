@@ -14,18 +14,21 @@
 //! 3. [`SparseVectorIndex::query_topk`] returns scored, ranked results via a
 //!    dot-product accumulator + bounded min-heap, not an unordered VID set.
 //!
-//! Weights are stored losslessly as `f32` in this milestone; 8-bit quantization
-//! (config `quantize`, paired with P2 block-max pruning) is a later milestone.
-//! MVCC / tombstone correctness is applied by the *query orchestration* layer
-//! (uni-query), exactly as the dense `vector_search` path does — this module is
-//! the storage kernel.
+//! Weights are stored as 8-bit per-term-quantized codes by default (config
+//! `quantize`, ≈ lossless and ~4× smaller); `quantize = false` stores lossless
+//! `f32` instead. Both encodings are read transparently by the same reader (the
+//! `weights` list element type is the discriminator), which also makes legacy
+//! `f32`-only segments forward-compatible without a rebuild. MVCC / tombstone
+//! correctness is applied by the *query orchestration* layer (uni-query),
+//! exactly as the dense `vector_search` path does — this module is the storage
+//! kernel.
 
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
-use arrow_array::types::{Float32Type, UInt64Type};
+use arrow_array::types::{Float32Type, UInt8Type, UInt64Type};
 use arrow_array::{
-    Array, Float32Array, ListArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array,
-    UInt64Array,
+    Array, Float32Array, ListArray, RecordBatch, RecordBatchIterator, StructArray, UInt8Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -87,13 +90,116 @@ fn read_sparse_row(struct_arr: &StructArray, row: usize) -> Option<(Vec<u32>, Ve
     Some((indices, values))
 }
 
+/// Number of 8-bit quantization levels above zero.
+///
+/// Learned-sparse / SPLADE weights are non-negative (ReLU), so the full
+/// unsigned `0..=255` range is used: the per-term scale is `max_weight / 255`,
+/// giving twice the resolution of a signed `i8` scheme for the same width.
+const QUANT_LEVELS: f32 = 255.0;
+
+/// Quantize one term's weights to 8-bit codes with a shared per-term scale.
+///
+/// Returns `(codes, scale, max_impact)` where `code as f32 * scale` reconstructs
+/// the weight and `max_impact` is computed from the *dequantized* weights, so it
+/// stays a valid upper bound on the values scoring actually multiplies — the
+/// invariant any future block-max pruning depends on.
+///
+/// Weights are clamped to `[0, max_weight]`; learned-sparse weights are
+/// non-negative, and a stray negative has no 8-bit code (it maps to zero).
+fn quantize_term(weights: &[f32]) -> (Vec<u8>, f32, f32) {
+    let max_weight = weights.iter().copied().fold(0.0f32, f32::max);
+    // All-zero (or all-negative) term: scale 0, every code 0. Guards the
+    // `w / scale` division against `0 / 0 = NaN`.
+    if max_weight <= 0.0 {
+        return (vec![0u8; weights.len()], 0.0, 0.0);
+    }
+    let scale = max_weight / QUANT_LEVELS;
+    let codes: Vec<u8> = weights
+        .iter()
+        .map(|&w| {
+            // Round to nearest (never truncate: truncation biases every weight
+            // down and would let a dequantized value exceed `max_impact`). The
+            // `as u8` cast saturates, so fp drift at the top of the range is safe.
+            (w.clamp(0.0, max_weight) / scale).round() as u8
+        })
+        .collect();
+    let max_code = codes.iter().copied().max().unwrap_or(0);
+    (codes, scale, dequantize(max_code, scale))
+}
+
+/// Reconstruct an approximate weight from an 8-bit code and its term scale.
+fn dequantize(code: u8, scale: f32) -> f32 {
+    f32::from(code) * scale
+}
+
+/// A borrowed view over one term's posting weights that yields `f32` regardless
+/// of on-disk encoding: quantized (`UInt8` codes + a per-term scale) or lossless
+/// (`Float32` — legacy segments and `quantize = false`).
+enum TermWeights<'a> {
+    Quantized { codes: &'a UInt8Array, scale: f32 },
+    Lossless(&'a Float32Array),
+}
+
+impl TermWeights<'_> {
+    /// Weight at posting position `j` (`0.0` for a null element).
+    fn get(&self, j: usize) -> f32 {
+        match self {
+            Self::Quantized { codes, scale } => {
+                if codes.is_null(j) {
+                    0.0
+                } else {
+                    dequantize(codes.value(j), *scale)
+                }
+            }
+            Self::Lossless(arr) => {
+                if arr.is_null(j) {
+                    0.0
+                } else {
+                    arr.value(j)
+                }
+            }
+        }
+    }
+}
+
+/// Build a [`TermWeights`] view over one posting row's `weights` element array.
+///
+/// `row_scale` is the row's `weight_scale` value, required when the elements are
+/// quantized `UInt8` codes and absent for lossless `Float32` segments.
+///
+/// # Errors
+/// Returns an error if the element type is neither `UInt8` nor `Float32`, or if
+/// quantized codes arrive without a `weight_scale`.
+fn term_weights(weights_arr: &dyn Array, row_scale: Option<f32>) -> Result<TermWeights<'_>> {
+    if let Some(codes) = weights_arr.as_any().downcast_ref::<UInt8Array>() {
+        let scale = row_scale
+            .ok_or_else(|| anyhow!("Quantized sparse weights missing weight_scale column"))?;
+        Ok(TermWeights::Quantized { codes, scale })
+    } else if let Some(arr) = weights_arr.as_any().downcast_ref::<Float32Array>() {
+        Ok(TermWeights::Lossless(arr))
+    } else {
+        Err(anyhow!(
+            "Invalid inner weights type: {:?}",
+            weights_arr.data_type()
+        ))
+    }
+}
+
+/// Read the optional per-term `weight_scale` column from a postings batch.
+///
+/// Present only for quantized segments; absent for lossless / legacy ones.
+fn weight_scale_column(batch: &RecordBatch) -> Option<&Float32Array> {
+    batch
+        .column_by_name("weight_scale")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+}
+
 /// Scored sparse-vector inverted index over a `DataType::SparseVector` column.
 pub struct SparseVectorIndex {
     dataset: Option<Dataset>,
     base_uri: String,
     label: String,
     property: String,
-    #[allow(dead_code)]
     config: SparseVectorIndexConfig,
 }
 
@@ -238,65 +344,100 @@ impl SparseVectorIndex {
 
     /// Overwrite the on-disk postings with the provided map.
     ///
-    /// Schema: `(term_id: UInt32, vids: List<UInt64>, weights: List<Float32>,
-    /// max_impact: Float32)`. `max_impact` is the per-term maximum weight — the
-    /// upper bound P2 block-max pruning consumes.
+    /// Schema (quantized, default): `(term_id: UInt32, vids: List<UInt64>,
+    /// weights: List<UInt8>, max_impact: Float32, weight_scale: Float32)`.
+    /// Lossless (`quantize = false`): `weights` is `List<Float32>` and the
+    /// `weight_scale` column is omitted. `max_impact` is the per-term maximum
+    /// (dequantized) weight — the upper bound P2 block-max pruning consumes.
     async fn write_postings(&mut self, postings: Postings) -> Result<()> {
-        let mut term_ids = Vec::with_capacity(postings.len());
-        let mut vid_lists: Vec<Option<Vec<Option<u64>>>> = Vec::with_capacity(postings.len());
-        let mut weight_lists: Vec<Option<Vec<Option<f32>>>> = Vec::with_capacity(postings.len());
-        let mut max_impacts = Vec::with_capacity(postings.len());
+        let quantize = self.config.quantize;
+        let n = postings.len();
+        let mut term_ids = Vec::with_capacity(n);
+        let mut vid_lists: Vec<Option<Vec<Option<u64>>>> = Vec::with_capacity(n);
+        let mut max_impacts = Vec::with_capacity(n);
+        // Exactly one weights representation is populated, per `quantize`.
+        let mut q_weight_lists: Vec<Option<Vec<Option<u8>>>> = Vec::new();
+        let mut q_scales: Vec<f32> = Vec::new();
+        let mut f_weight_lists: Vec<Option<Vec<Option<f32>>>> = Vec::new();
 
         for (term, entries) in postings {
-            // True maximum weight (the P2 block-max upper bound). Start at
-            // NEG_INFINITY so an all-negative-weight term records its real max
-            // rather than a spurious 0.0; empty terms (unreachable here) fall
-            // back to 0.0.
-            let mut max_impact = f32::NEG_INFINITY;
             let mut vids = Vec::with_capacity(entries.len());
             let mut weights = Vec::with_capacity(entries.len());
             for (vid, weight) in entries {
                 vids.push(Some(vid));
-                weights.push(Some(weight));
-                if weight > max_impact {
-                    max_impact = weight;
-                }
-            }
-            if !max_impact.is_finite() {
-                max_impact = 0.0;
+                weights.push(weight);
             }
             term_ids.push(term);
             vid_lists.push(Some(vids));
-            weight_lists.push(Some(weights));
-            max_impacts.push(max_impact);
+
+            if quantize {
+                let (codes, scale, max_impact) = quantize_term(&weights);
+                q_weight_lists.push(Some(codes.into_iter().map(Some).collect()));
+                q_scales.push(scale);
+                max_impacts.push(max_impact);
+            } else {
+                // True maximum weight (the P2 block-max upper bound). Start at
+                // NEG_INFINITY so an all-negative-weight term records its real
+                // max rather than a spurious 0.0; empty terms fall back to 0.0.
+                let mut max_impact = f32::NEG_INFINITY;
+                for &w in &weights {
+                    if w > max_impact {
+                        max_impact = w;
+                    }
+                }
+                if !max_impact.is_finite() {
+                    max_impact = 0.0;
+                }
+                max_impacts.push(max_impact);
+                f_weight_lists.push(Some(weights.into_iter().map(Some).collect()));
+            }
         }
 
         let term_array = UInt32Array::from(term_ids);
         let vid_list_array = ListArray::from_iter_primitive::<UInt64Type, _, _>(vid_lists);
-        let weight_list_array = ListArray::from_iter_primitive::<Float32Type, _, _>(weight_lists);
         let max_impact_array = Float32Array::from(max_impacts);
 
-        let batch = arrow_array::RecordBatch::try_from_iter(vec![
+        let mut columns: Vec<(&str, Arc<dyn Array>)> = vec![
             ("term_id", Arc::new(term_array) as Arc<dyn Array>),
             ("vids", Arc::new(vid_list_array) as Arc<dyn Array>),
-            ("weights", Arc::new(weight_list_array) as Arc<dyn Array>),
-            ("max_impact", Arc::new(max_impact_array) as Arc<dyn Array>),
-        ])?;
+        ];
+        if quantize {
+            let weight_list_array =
+                ListArray::from_iter_primitive::<UInt8Type, _, _>(q_weight_lists);
+            columns.push(("weights", Arc::new(weight_list_array) as Arc<dyn Array>));
+            columns.push(("max_impact", Arc::new(max_impact_array) as Arc<dyn Array>));
+            columns.push((
+                "weight_scale",
+                Arc::new(Float32Array::from(q_scales)) as Arc<dyn Array>,
+            ));
+        } else {
+            let weight_list_array =
+                ListArray::from_iter_primitive::<Float32Type, _, _>(f_weight_lists);
+            columns.push(("weights", Arc::new(weight_list_array) as Arc<dyn Array>));
+            columns.push(("max_impact", Arc::new(max_impact_array) as Arc<dyn Array>));
+        }
+
+        let batch = arrow_array::RecordBatch::try_from_iter(columns)?;
 
         let path = Self::postings_path(&self.base_uri, &self.label, &self.property);
         let write_params = lance::dataset::WriteParams {
             mode: lance::dataset::WriteMode::Overwrite,
             ..Default::default()
         };
-        let iterator = RecordBatchIterator::new(vec![Ok(batch)], Self::postings_schema());
+        let iterator = RecordBatchIterator::new(vec![Ok(batch)], Self::postings_schema(quantize));
         let ds = Dataset::write(iterator, &path, Some(write_params)).await?;
         self.dataset = Some(ds);
         Ok(())
     }
 
-    /// Arrow schema of the postings dataset.
-    fn postings_schema() -> Arc<ArrowSchema> {
-        Arc::new(ArrowSchema::new(vec![
+    /// Arrow schema of the postings dataset for the given `quantize` mode.
+    fn postings_schema(quantize: bool) -> Arc<ArrowSchema> {
+        let weights_item = if quantize {
+            DataType::UInt8
+        } else {
+            DataType::Float32
+        };
+        let mut fields = vec![
             Field::new("term_id", DataType::UInt32, false),
             Field::new(
                 "vids",
@@ -305,11 +446,15 @@ impl SparseVectorIndex {
             ),
             Field::new(
                 "weights",
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                DataType::List(Arc::new(Field::new("item", weights_item, true))),
                 false,
             ),
             Field::new("max_impact", DataType::Float32, false),
-        ]))
+        ];
+        if quantize {
+            fields.push(Field::new("weight_scale", DataType::Float32, false));
+        }
+        Arc::new(ArrowSchema::new(fields))
     }
 
     /// Score the corpus against `query` (`[(term_id, weight)]`) by dot product
@@ -360,6 +505,7 @@ impl SparseVectorIndex {
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| anyhow!("Invalid weights column"))?;
+            let weight_scale_col = weight_scale_column(&batch);
 
             for i in 0..batch.num_rows() {
                 let term = term_col.value(i);
@@ -375,16 +521,14 @@ impl SparseVectorIndex {
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| anyhow!("Invalid inner vids type"))?;
                 let weights_arr = weights_col.value(i);
-                let weights = weights_arr
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| anyhow!("Invalid inner weights type"))?;
+                let weights =
+                    term_weights(weights_arr.as_ref(), weight_scale_col.map(|c| c.value(i)))?;
 
                 for j in 0..vids.len() {
-                    if vids.is_null(j) || weights.is_null(j) {
+                    if vids.is_null(j) {
                         continue;
                     }
-                    *scores.entry(vids.value(j)).or_insert(0.0) += qw * weights.value(j);
+                    *scores.entry(vids.value(j)).or_insert(0.0) += qw * weights.get(j);
                 }
             }
         }
@@ -443,6 +587,7 @@ impl SparseVectorIndex {
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| anyhow!("Invalid weights column"))?;
+            let weight_scale_col = weight_scale_column(&batch);
 
             for i in 0..batch.num_rows() {
                 if vids_col.is_null(i) || weights_col.is_null(i) {
@@ -455,14 +600,14 @@ impl SparseVectorIndex {
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| anyhow!("Invalid inner vids type"))?;
                 let weights_arr = weights_col.value(i);
-                let weights = weights_arr
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| anyhow!("Invalid inner weights type"))?;
+                // Dequantizes into f32 so the load-modify-write update path stays
+                // in f32 space and re-quantizes on the next `write_postings`.
+                let weights =
+                    term_weights(weights_arr.as_ref(), weight_scale_col.map(|c| c.value(i)))?;
                 let entry = postings.entry(term).or_default();
                 for j in 0..vids.len() {
-                    if !vids.is_null(j) && !weights.is_null(j) {
-                        entry.push((vids.value(j), weights.value(j)));
+                    if !vids.is_null(j) {
+                        entry.push((vids.value(j), weights.get(j)));
                     }
                 }
             }
@@ -585,5 +730,54 @@ mod tests {
     #[test]
     fn test_top_k_empty() {
         assert!(SparseVectorIndex::top_k_from_scores(HashMap::new(), 5).is_empty());
+    }
+
+    #[test]
+    fn test_quantize_all_zero_term_no_nan() {
+        let (codes, scale, max_impact) = quantize_term(&[0.0, 0.0, 0.0]);
+        assert_eq!(codes, vec![0, 0, 0]);
+        assert_eq!(scale, 0.0);
+        assert_eq!(max_impact, 0.0);
+        assert!(!scale.is_nan() && !max_impact.is_nan());
+    }
+
+    #[test]
+    fn test_quantize_negative_weights_clamp_to_zero() {
+        // Learned-sparse weights are non-negative; a stray negative has no code.
+        let (codes, _scale, max_impact) = quantize_term(&[-1.0, -0.5]);
+        assert_eq!(codes, vec![0, 0]);
+        assert_eq!(max_impact, 0.0);
+    }
+
+    #[test]
+    fn test_quantize_max_weight_maps_to_top_code() {
+        let (codes, scale, max_impact) = quantize_term(&[0.1, 2.0, 1.0]);
+        // The maximum weight quantizes to the top code (255).
+        assert_eq!(codes[1], 255);
+        // max_impact is the dequantized top code and bounds every dequantized
+        // weight (the rank-safety invariant for future block-max pruning).
+        for (j, &w) in [0.1f32, 2.0, 1.0].iter().enumerate() {
+            assert!(dequantize(codes[j], scale) <= max_impact + f32::EPSILON);
+            // Round-trip error is bounded by half a quantization step.
+            assert!((dequantize(codes[j], scale) - w).abs() <= scale / 2.0 + 1e-6);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_quantize_roundtrip_and_bound(
+            weights in proptest::collection::vec(0.0f32..1000.0, 1..64)
+        ) {
+            let (codes, scale, max_impact) = quantize_term(&weights);
+            proptest::prop_assert_eq!(codes.len(), weights.len());
+            for (j, &w) in weights.iter().enumerate() {
+                let dq = dequantize(codes[j], scale);
+                // max_impact upper-bounds every dequantized weight.
+                proptest::prop_assert!(dq <= max_impact + 1e-4);
+                // Reconstruction is within half a step of the original.
+                proptest::prop_assert!((dq - w).abs() <= scale / 2.0 + 1e-3);
+                proptest::prop_assert!(dq.is_finite());
+            }
+        }
     }
 }

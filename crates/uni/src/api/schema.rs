@@ -325,16 +325,17 @@ impl<'a> LabelBuilder<'a> {
                 metadata: Default::default(),
             }),
             IndexType::Inverted(config) => IndexDefinition::Inverted(config),
-            IndexType::Sparse { dimensions } => {
-                IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
-                    name: format!("idx_{}_{}", self.name, property),
-                    label: self.name.clone(),
-                    property: property.to_string(),
-                    dimensions,
-                    quantize: true,
-                    metadata: Default::default(),
-                })
-            }
+            IndexType::Sparse {
+                dimensions,
+                quantize,
+            } => IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
+                name: format!("idx_{}_{}", self.name, property),
+                label: self.name.clone(),
+                property: property.to_string(),
+                dimensions,
+                quantize,
+                metadata: Default::default(),
+            }),
         };
         self.builder.pending.push(SchemaChange::AddIndex(idx));
         self
@@ -508,10 +509,25 @@ pub enum IndexType {
     Scalar(ScalarType),
     Inverted(uni_common::core::schema::InvertedIndexConfig),
     /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
-    /// term-space cardinality of the column.
+    /// term-space cardinality of the column; `quantize` stores 8-bit per-term
+    /// quantized weights (≈ lossless, ~4× smaller; default on).
     Sparse {
         dimensions: usize,
+        quantize: bool,
     },
+}
+
+impl IndexType {
+    /// A sparse-vector index over a `dimensions`-wide term space with 8-bit
+    /// weight quantization enabled (the default; use the [`IndexType::Sparse`]
+    /// struct variant directly to disable it).
+    #[must_use]
+    pub fn sparse(dimensions: usize) -> Self {
+        Self::Sparse {
+            dimensions,
+            quantize: true,
+        }
+    }
 }
 
 pub struct VectorIndexCfg {

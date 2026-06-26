@@ -90,7 +90,7 @@ async fn define_schema(db: &Uni) -> anyhow::Result<()> {
         .label("Doc")
         .property("title", DataType::String)
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
     Ok(())
@@ -111,7 +111,27 @@ async fn define_schema_no_index(db: &Uni) -> anyhow::Result<()> {
 async fn add_index(db: &Uni) -> anyhow::Result<()> {
     db.schema()
         .label("Doc")
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
+        .apply()
+        .await?;
+    Ok(())
+}
+
+/// Schema + sparse index with an explicit `quantize` setting. The default-on
+/// (quantized) path is exercised by [`define_schema`]; `quantize = false` stores
+/// lossless f32 postings (the legacy / back-compat layout).
+async fn define_schema_quantize(db: &Uni, quantize: bool) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("emb", DataType::SparseVector { dimensions: VOCAB })
+        .index(
+            "emb",
+            IndexType::Sparse {
+                dimensions: VOCAB,
+                quantize,
+            },
+        )
         .apply()
         .await?;
     Ok(())
@@ -225,6 +245,85 @@ async fn sparse_create_before_ingest_matches_oracle() -> anyhow::Result<()> {
         results.first().map(|(t, _)| t.as_str()),
         Some("target"),
         "flush-maintained index should retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_quantize_false_is_lossless() -> anyhow::Result<()> {
+    // `quantize:false` stores f32 postings (the legacy / back-compat read path).
+    let db = Uni::temporary().build().await?;
+    define_schema_quantize(&db, false).await?;
+    let corpus = build_corpus(60, 0x10C5_1E55);
+    insert_docs(&db, &corpus, true).await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "lossless sparse index must retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_quantized_and_lossless_agree() -> anyhow::Result<()> {
+    // 8-bit quantization is ≈ lossless: the quantized (default) index and the
+    // lossless index return the same ranked candidates on the same corpus, and
+    // both carry the exact `sparse_dot` score (the orchestration layer always
+    // re-scores from the lossless stored vector, so quantization can only ever
+    // perturb the candidate set within the over-fetch margin).
+    let corpus = build_corpus(80, 0x5EED_0095);
+
+    let build_and_query = |quantize: bool| {
+        let corpus = corpus.clone();
+        async move {
+            let db = Uni::temporary().build().await?;
+            define_schema_quantize(&db, quantize).await?;
+            insert_docs(&db, &corpus, true).await?;
+            query_results(&db, 10).await
+        }
+    };
+
+    let quant = build_and_query(true).await?;
+    let lossless = build_and_query(false).await?;
+
+    let quant_titles: Vec<&str> = quant.iter().map(|(t, _)| t.as_str()).collect();
+    let lossless_titles: Vec<&str> = lossless.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        quant_titles, lossless_titles,
+        "quantized vs lossless ranking diverged: {quant:?} vs {lossless:?}"
+    );
+    assert_matches_oracle(&quant, &corpus);
+    assert_matches_oracle(&lossless, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_index_via_create_index_proc_quantize_false() -> anyhow::Result<()> {
+    // Exercises the procedure index-creation path — `uni.schema.createIndex` with
+    // `{type:'sparse', quantize:false}` — distinct from the schema-builder route,
+    // confirming the `quantize` option is threaded through `ddl_procedures`. (The
+    // Cypher `CREATE VECTOR INDEX ... OPTIONS{type:'sparse'}` statement is the
+    // DENSE-vector path and does NOT create a sparse index — see notes in #95.)
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CALL uni.schema.createIndex('Doc', 'emb', {type: 'sparse', quantize: false})")
+        .await?;
+    tx.commit().await?;
+
+    let corpus = build_corpus(50, 0xDD15_0095);
+    insert_docs(&db, &corpus, true).await?; // flush populates the index incrementally
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "procedure-created sparse index must retrieve the target: {results:?}"
     );
     assert_matches_oracle(&results, &corpus);
     Ok(())

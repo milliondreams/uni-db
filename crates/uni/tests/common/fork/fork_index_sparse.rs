@@ -61,7 +61,7 @@ async fn mk_db() -> Result<Uni> {
         .label("Doc")
         .property("title", DataType::String)
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
     Ok(db)
@@ -311,7 +311,7 @@ async fn sparse_fork_auto_built_for_new_rows() -> Result<()> {
         .label("Doc")
         .property("title", DataType::String)
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
 

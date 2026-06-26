@@ -62,6 +62,8 @@ struct IndexConfig {
     seed: Option<u64>,
     inner: Option<String>,
     embedding: Option<EmbeddingOptions>,
+    // Sparse-specific: 8-bit weight quantization (default on).
+    quantize: Option<bool>,
     // Generic
     name: Option<String>,
 }
@@ -384,7 +386,8 @@ async fn create_index_internal(
                 label: label.to_string(),
                 property: prop_name.clone(),
                 dimensions,
-                quantize: true,
+                // `OPTIONS{type:'sparse', quantize:false}` stores lossless f32.
+                quantize: config.quantize.unwrap_or(true),
                 metadata: Default::default(),
             })
         }

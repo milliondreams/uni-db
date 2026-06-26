@@ -304,12 +304,7 @@ async fn sparse_matrix_db() -> Result<Uni> {
                 dimensions: SPARSE_VOCAB,
             },
         )
-        .index(
-            "emb",
-            IndexType::Sparse {
-                dimensions: SPARSE_VOCAB,
-            },
-        )
+        .index("emb", IndexType::sparse(SPARSE_VOCAB))
         .done()
         .label("Other")
         .property("id", DataType::String)

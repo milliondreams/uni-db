@@ -44,7 +44,7 @@ async fn define_sparse_schema(db: &Uni) -> Result<()> {
         .label("Doc")
         .property("title", DataType::String)
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
     Ok(())

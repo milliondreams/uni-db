@@ -104,7 +104,7 @@ async fn setup_hybrid(db: &Uni) -> anyhow::Result<()> {
         .property("content", DataType::String)
         .property("embedding", DataType::Vector { dimensions: 2 })
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
 

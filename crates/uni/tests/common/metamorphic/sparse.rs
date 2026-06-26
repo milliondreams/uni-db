@@ -104,7 +104,7 @@ async fn build_sparse_seed() -> anyhow::Result<SparseSeed> {
         .label("Doc")
         .property("title", DataType::String)
         .property("emb", DataType::SparseVector { dimensions: VOCAB })
-        .index("emb", IndexType::Sparse { dimensions: VOCAB })
+        .index("emb", IndexType::sparse(VOCAB))
         .apply()
         .await?;
     let corpus = deterministic_corpus(CORPUS);

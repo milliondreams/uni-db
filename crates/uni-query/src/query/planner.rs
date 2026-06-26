@@ -1790,6 +1790,16 @@ pub enum FusionKind {
     /// primary's and fork-local FTS indexes combined via standard
     /// RRF (`score = sum 1 / (k_rrf + rank_i)`, k_rrf = 60).
     Bm25Rrf,
+    /// M4 — hybrid RRF that includes a learned-sparse (SPLADE) source:
+    /// emitted for `uni.search` whose properties map carries a `sparse`
+    /// key, fused via N-ary RRF in `run_hybrid_search`. Independent of
+    /// fork-local indexes.
+    SparseRrf,
+    /// M4 — sparse dot-product rerank: the `uni.sparse.query` analogue of
+    /// [`FusionKind::AnnRerank`], fusing primary's and fork-local sparse
+    /// indexes. Reserved: emitted once fork-local sparse indexes land
+    /// (issue #95 Task #4 introduces `ForkLocalIndexKind::Sparse`).
+    SparseDot,
 }
 
 /// Logical query plan produced by [`QueryPlanner`].
@@ -9865,6 +9875,21 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
     if arguments.len() < 2 {
         return None;
     }
+
+    // `uni.search` hybrid: a `sparse` key in the inline properties map means the
+    // call fuses a learned-sparse source via RRF (`run_hybrid_search`). This is
+    // independent of fork-local indexes, so it is not gated on `lookup`.
+    // Limitation: a properties map passed as a `$param` (not an inline
+    // `Expr::Map`) is opaque here and stays unlabeled.
+    if procedure_name == "uni.search" {
+        if let Expr::Map(entries) = &arguments[1]
+            && entries.iter().any(|(key, _)| key.as_str() == "sparse")
+        {
+            return Some(FusionKind::SparseRrf);
+        }
+        return None;
+    }
+
     let label = match &arguments[0] {
         Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
         _ => return None,
@@ -9876,6 +9901,10 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
     let expected = match procedure_name {
         "uni.vector.query" => uni_store::fork::ForkLocalIndexKind::Vector,
         "uni.fts.query" => uni_store::fork::ForkLocalIndexKind::FullText,
+        // `uni.sparse.query` fork-fusion observability (the `SparseDot` analogue
+        // of `AnnRerank`/`Bm25Rrf`) lands with issue #95 Task #4, which
+        // introduces `ForkLocalIndexKind::Sparse`. Until a fork-local sparse
+        // index can exist, there is nothing to fuse against here.
         _ => return None,
     };
     let registered = lookup.fork_index_for(label, column)?;

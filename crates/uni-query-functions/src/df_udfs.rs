@@ -217,6 +217,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     // Similarity scoring UDF
     ctx.register_udf(create_similar_to_udf());
     ctx.register_udf(create_vector_similarity_udf());
+    ctx.register_udf(create_sparse_similar_to_udf());
 
     // Cypher-aware aggregate UDAFs
     ctx.register_udaf(create_cypher_min_udaf());
@@ -7763,6 +7764,65 @@ impl ScalarUDFImpl for VectorSimilarityUdf {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         invoke_similarity_udf("vector_similarity", 2, args)
+    }
+}
+
+/// Shared invocation logic for the `sparse_similar_to` UDF.
+///
+/// Computes the pure sparse-vector dot product between two `Value::SparseVector`
+/// operands. Storage-backed retrieval lives in the `uni.sparse.query` procedure.
+fn invoke_sparse_similarity_udf(args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    let output_type = DataType::Float64;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "sparse_similar_to takes 2 arguments".to_string(),
+            ));
+        }
+        crate::similar_to::eval_sparse_similar_to_pure(&val_args[0], &val_args[1])
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+    })
+}
+
+/// Create the `sparse_similar_to` UDF for learned-sparse dot-product scoring.
+pub fn create_sparse_similar_to_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(SparseSimilarToUdf::new())
+}
+
+#[derive(Debug)]
+struct SparseSimilarToUdf {
+    signature: Signature,
+}
+
+impl SparseSimilarToUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(SparseSimilarToUdf);
+
+impl ScalarUDFImpl for SparseSimilarToUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "sparse_similar_to"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        invoke_sparse_similarity_udf(args)
     }
 }
 

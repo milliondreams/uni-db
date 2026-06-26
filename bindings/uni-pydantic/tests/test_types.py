@@ -10,8 +10,10 @@ import pytest
 
 from uni_pydantic import (
     Btic,
+    SparseVector,
     Vector,
     db_to_python_value,
+    get_sparse_vector_dimensions,
     get_vector_dimensions,
     is_list_type,
     is_optional,
@@ -21,6 +23,34 @@ from uni_pydantic import (
     unwrap_annotated,
 )
 from uni_pydantic.exceptions import TypeMappingError
+
+
+class TestSparseVector:
+    """Tests for the learned-sparse SparseVector[N] OGM type."""
+
+    def test_subscript_and_caching(self):
+        assert SparseVector[30522] is SparseVector[30522]
+        assert get_sparse_vector_dimensions(SparseVector[30522]) == 30522
+
+    def test_not_confused_with_dense_vector(self):
+        # A sparse type must NOT report dense dimensions, and vice versa.
+        assert get_vector_dimensions(SparseVector[100]) is None
+        assert get_sparse_vector_dimensions(Vector[100]) is None
+
+    def test_emits_sparse_vector_type_string(self):
+        uni_type, nullable = python_type_to_uni(SparseVector[30522])
+        assert uni_type == "sparse_vector:30522"
+        assert nullable is False
+
+    def test_optional_sparse_vector(self):
+        uni_type, nullable = python_type_to_uni(SparseVector[256] | None)
+        assert uni_type == "sparse_vector:256"
+        assert nullable is True
+
+    def test_from_dict_canonicalizes(self):
+        sv = SparseVector[1000].from_dict({9: 3.0, 2: 1.0})
+        assert sv.indices == [2, 9]
+        assert sv.values == [1.0, 3.0]
 
 
 class TestVector:

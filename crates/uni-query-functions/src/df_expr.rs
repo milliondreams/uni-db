@@ -2235,7 +2235,7 @@ fn translate_function_call(
 
     // Similarity functions → registered UDFs
     match name_upper.as_str() {
-        "SIMILAR_TO" | "VECTOR_SIMILARITY" => {
+        "SIMILAR_TO" | "VECTOR_SIMILARITY" | "SPARSE_SIMILAR_TO" => {
             return Ok(dummy_udf_expr(&name_upper.to_lowercase(), df_args));
         }
         _ => {}

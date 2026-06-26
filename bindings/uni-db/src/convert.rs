@@ -184,6 +184,18 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                 }
             }
         }
+        // Learned-sparse vector → `SparseVector` (without this arm it would fall
+        // through to `py.None()`, silently dropping any returned sparse property).
+        Value::SparseVector { indices, values } => {
+            let inner =
+                uni_common::uni_sparse_vector::SparseVector::new(indices.clone(), values.clone())
+                    .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid stored sparse vector: {e}"
+                    ))
+                })?;
+            Ok(Py::new(py, crate::sparse::PySparseVector { inner })?.into_any())
+        }
         _ => Ok(py.None()),
     }
 }
@@ -340,6 +352,17 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
             hi: btic.inner.hi(),
             meta: btic.inner.meta(),
         }));
+    }
+
+    // Check for a learned-sparse vector (PySparseVector instance). This MUST come
+    // before the `PyDict` branch below: a sparse vector is conceptually a
+    // `{term_id: weight}` mapping, so without an explicit class extraction first a
+    // user-built `SparseVector` would be mis-ingested as a `Value::Map`.
+    if let Ok(sv) = bound.extract::<crate::sparse::PySparseVector>() {
+        return Ok(Value::SparseVector {
+            indices: sv.inner.indices().to_vec(),
+            values: sv.inner.values().to_vec(),
+        });
     }
 
     // Check primitive types in order of specificity
@@ -1550,6 +1573,15 @@ pub fn index_definition_to_py(
                 index_type: "json_fulltext".to_string(),
                 label: cfg.label,
                 properties: vec![cfg.column],
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        uni_common::core::schema::IndexDefinition::Sparse(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: "sparse".to_string(),
+                label: cfg.label,
+                properties: vec![cfg.property],
                 state: format!("{:?}", cfg.metadata.status).to_lowercase(),
             })
         }

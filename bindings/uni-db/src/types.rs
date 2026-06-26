@@ -2610,6 +2610,13 @@ impl PyDataType {
     }
 
     #[staticmethod]
+    fn sparse_vector(dimensions: usize) -> Self {
+        Self {
+            inner: uni_common::DataType::SparseVector { dimensions },
+        }
+    }
+
+    #[staticmethod]
     fn list(element_type: &PyDataType) -> Self {
         Self {
             inner: uni_common::DataType::List(Box::new(element_type.inner.clone())),
@@ -2648,6 +2655,9 @@ impl PyDataType {
             uni_common::DataType::Duration => "DURATION".to_string(),
             uni_common::DataType::CypherValue => "JSON".to_string(),
             uni_common::DataType::Vector { dimensions } => format!("vector({})", dimensions),
+            uni_common::DataType::SparseVector { dimensions } => {
+                format!("sparse_vector({})", dimensions)
+            }
             uni_common::DataType::List(inner) => {
                 let py_inner = PyDataType {
                     inner: *inner.clone(),

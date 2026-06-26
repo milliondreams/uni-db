@@ -33,6 +33,7 @@ pub use core::id::{Eid, UniId, Vid};
 pub use core::schema::{CrdtType, DataType, Schema};
 pub use graph::simple_graph::SimpleGraph;
 pub use uni_btic;
+pub use uni_sparse_vector;
 #[doc(inline)]
 pub use value::{Edge, FromValue, Node, Path, TemporalType, TemporalValue, Value};
 

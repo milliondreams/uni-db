@@ -55,6 +55,7 @@ pub(crate) fn map_yield_to_canonical(yield_name: &str) -> &'static str {
         "score" | "_score" => "score",
         "vector_score" => "vector_score",
         "fts_score" => "fts_score",
+        "sparse_score" => "sparse_score",
         "raw_score" => "raw_score",
         "rerank_score" | "_rerank_score" => "rerank_score",
         _ => "node",
@@ -96,7 +97,9 @@ pub(crate) fn is_node_yield_procedure_static(name: &str) -> bool {
 pub(crate) fn canonical_search_type(canonical: &str) -> DataType {
     match canonical {
         "distance" => DataType::Float64,
-        "score" | "vector_score" | "fts_score" | "raw_score" | "rerank_score" => DataType::Float32,
+        "score" | "vector_score" | "fts_score" | "sparse_score" | "raw_score" | "rerank_score" => {
+            DataType::Float32
+        }
         "vid" => DataType::Int64,
         _ => DataType::Utf8,
     }

@@ -13388,6 +13388,7 @@ dependencies = [
  "uni-btic",
  "uni-common",
  "uni-cypher",
+ "uni-sparse-vector",
  "uni-store",
 ]
 

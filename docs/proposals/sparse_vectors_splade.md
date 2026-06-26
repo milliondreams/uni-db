@@ -1,8 +1,39 @@
 # Sparse Vectors (SPLADE / learned-sparse) — Storage, Indexing & Hybrid Retrieval
 
 - **Issue:** #95 (consumer/storage side). Producer side `rustic-ai/uni-xervo#40` (`EmbedSparse` / `SparseEmbeddingModel`) is **CLOSED/shipped** — dependency unblocked.
-- **Status:** PROPOSED. Not implemented. No code written.
-- **Date:** 2026-06-25
+- **Status:** PARTIALLY IMPLEMENTED — committed `c5d8d6225` on branch `feat/sparse-vectors-issue-95` (not merged/pushed). See [§0 Implementation status](#0-implementation-status).
+- **Date:** 2026-06-25 (proposal); implementation 2026-06-25
+- **v1 decision (locked at impl time):** P1 brute-force DAAT **and** P2 block-max (rank-safe α=0 default), delivered via milestone gates **M1–M5**.
+
+## 0. Implementation status
+
+**Landed & green** (committed `c5d8d6225`; full `default-members` build + clippy + fmt clean):
+
+| Area | What shipped | Tests |
+|---|---|---|
+| **M1** crate + type/codecs | `uni-sparse-vector` leaf crate (`SparseVector` + validating ctor, lossless LE binary codec, `sparse_dot`/`l2_norm`/`prune_top_k`); `Value::SparseVector` + `DataType::SparseVector`; Arrow `Struct{indices:List<UInt32>,values:List<Float32>}`; CV `TAG_SPARSE_VECTOR=20`; columnar + `arrow_to_value` read | crate unit + proptests; CV round-trip; columnar round-trip + silent-null regression |
+| **M2** index + query | `SparseVectorIndex` (fork of `inverted_index.rs`): postings `(term_id, vids, weights, max_impact)`, `query_topk` (dot accumulator + min-heap), segment-merge build (backend-scan backfill + L0-incremental flush); `IndexDefinition::Sparse`; MVCC-correct `sparse_rerank` (L0 union + version/`_deleted` gating + exact rescore, drops zero-overlap); `uni.sparse.query` procedure; index DDL `OPTIONS{type:'sparse'}` + Rust builder `IndexType::Sparse` | `sparse_index.rs` (10) |
+| **Durability** A/B/C/D/G | brute-force-oracle E2E (both build paths), L0 matrix (flush-equivalence, last-writer-wins, tombstone), snapshot isolation, restart/reopen | included in `sparse_index.rs` |
+| **WAL durability fix** | mutation `Value`s now persist through the explicit CV codec, not untagged serde_json (fixes lossy crash-recovery for SparseVector + latently dense Vector); backward-compatible with legacy segments | WAL replay test + 97 uni-store WAL/recovery + 119 uni-db recovery/CRDT/temporal/btic regression |
+| **Read/write surface** | `RETURN d.sparse_col` projection round-trip; `SPARSE_VECTOR(N)` Cypher type DDL | `sparse_ddl_type.rs` (2) + projection test |
+
+**8 integration/correctness bugs found-and-fixed by the test surface:** DataFusion `is_df_eligible_procedure` routing allowlist; zero-overlap result semantics; backend-scan backfill (raw `Dataset::open` can't see the LanceDB table); `max_impact` init for negative weights; **WAL untagged-serde durability**; projection Utf8 fallback; generic-`Struct`-arm shadowing in `build_property_column_static`; `UInt32`-list result-row materialization.
+
+**M4 landed (UNCOMMITTED on the same branch; gates green — clippy 0, fmt, Rust + Python tests pass):**
+- **Scalar `sparse_similar_to(a, b)`** — `eval_sparse_similar_to_pure` (`similar_to.rs`) registered at all 3 sites; accepts both `Value::SparseVector` and the `{indices,values}` Map form (a sparse param reaches a scalar UDF as an Arrow `Struct` decoded without schema context → arrives as a Map).
+- **N-ary fusion** — `fuse_rrf_multi` (+ 2-arg `fuse_rrf` shim) and source-aware `fuse_weighted_sources` (`NormKind::{DistanceToSim,ScoreByMax}`) in `fusion.rs`; empty source = no-op, so 2-way is byte-identical.
+- **3-way hybrid** — `run_hybrid_search` parses an optional `sparse` property + `options.sparse_query`, reuses `sparse_rerank`, fuses under RRF *and* weighted, emits a `sparse_score` column; `FusionKind::SparseRrf` in EXPLAIN.
+- **Python** — fixed a real latent bug (`value_to_py` returned `None` for sparse props); `PySparseVector` + ingestion collision fix; `DataType.sparse_vector(N)`; `sparse_vector:N` parser; OGM `SparseVector[N]` + `sparse_search()` builder + schema auto-indexing.
+- Tests: `sparse_scoring.rs` (7), `test_async_e2e_sparse.py` (5), OGM (8).
+
+**Not yet implemented (follow-up, tracked in §15):**
+- **M3 / P2** — block-max pruning (config knobs α/β present in plan; the `max_impact` column is already stored as the prerequisite) + rank-safety equivalence test.
+- **Task #4 — fork-local sparse index** (`ForkLocalIndexKind::Sparse`, fork-aware path, planner fusion-kind arm `FusionKind::SparseDot`, set-E tests). The kernel is intentionally NOT fork-aware yet; `sparse_search` returns empty on a fork.
+- **Test sets F** (crash/WAL failpoints), **H** (OCC/loom), and **I** (metamorphic).
+- **M5** — real-corpus benchmark; OGM `hybrid_search()` builder (deferred — GitHub issue #114).
+- **Auto-embed wiring to xervo `EmbedSparse`** — upstream-blocked: the current `uni-xervo` dependency exposes no `EmbedSparse`/`HeadSet::SPARSE` (only `DENSE | MULTI_VECTOR`), and `SparseVectorIndexConfig` has no `embedding_config`.
+
+**Known residual gaps (documented):** dense `Vector` likely shares the (now-fixed-for-sparse) WAL gap and a `RETURN` projection gap — only the sparse arms were added; secondary indexes (all kinds) are not maintained during WAL recovery and need a rebuild after an unflushed-then-recovered write (universal engine property, not sparse-specific).
 - **Dependency arrow:** uni-db → uni-xervo (uni-db calls xervo to embed text → stores + indexes + scores the sparse result).
 - **Scope:** new first-class `SparseVector` value type (its own crate, BTIC-style), a scored sparse inverted index, dot-product scoring fusible into the existing dense-ANN + BM25 hybrid machinery, auto-embed wiring, and full production-readiness (MVCC / fork / crash-recovery / restart / WAL-replay) coverage.
 
@@ -186,14 +217,20 @@ Gates: `cargo nextest run` (workspace), TCK, Locy, pytest, clippy/fmt — per re
 **Out (deferred):** schemaless sparse columns; P2 block-max pruning and P3 clustering (separate, benchmark-gated); IDF query-weight modifier (Qdrant-style); sparse on edges (v1 = vertices); GPU scoring.
 
 ## 15. Recommended sequencing
-1. **Crate** `uni-sparse-vector` (struct + validating ctor + binary codec + `sparse_dot` + proptests) — isolated, no `uni-*` deps. **(test A)**
-2. **Type + codecs** in uni-common (variants, Arrow struct, CV tag) + uni-store column builders. **(test A)**
-3. **`SparseVectorIndex`** (build/flush/`query_topk`/incremental, scored, quantized) with MVCC + tombstone gating + segment-merge updates. **(tests B, C, D, F, G)**
-4. **Fork-local sparse index** (`ForkLocalIndexKind::Sparse`, branch path, fusion). **(test E)**
-5. **Scoring + N-ary fusion + hybrid wiring + `similar_to`.** **(tests B, I)**
-6. **Cypher surface** (type DDL, `OPTIONS{type:'sparse'}`, `uni.sparse.query`, `sparse_similar_to`).
-7. **Python** (pyo3 factory + dict fix, OGM type + hybrid method) + auto-embed wiring. **(test J)**
-8. **Benchmark P1** on a real SPLADE corpus → GO/NO-GO for P2.
+
+Status legend: ✅ done (committed `c5d8d6225`) · ◐ partial · ⬜ remaining.
+
+1. ✅ **Crate** `uni-sparse-vector` (struct + validating ctor + binary codec + `sparse_dot` + proptests) — isolated, no `uni-*` deps. **(test A)**
+2. ✅ **Type + codecs** in uni-common (variants, Arrow struct, CV tag) + uni-store column builders. **(test A)**
+3. ✅ **`SparseVectorIndex`** (build/flush/`query_topk`/incremental, scored) with MVCC + tombstone gating + segment-merge build. **(tests B, C, D, G)** — *weight quantization deferred to step 9 (P2); crash failpoints (F) ⬜.*
+4. ⬜ **Fork-local sparse index** (`ForkLocalIndexKind::Sparse`, branch path, fusion). **(test E)**
+5. ◐ **Scoring + N-ary fusion + hybrid wiring + `similar_to`.** — `sparse_rerank` orchestration ✅; scalar `sparse_similar_to` / N-ary fusion / 3-way hybrid ⬜. **(tests B, I)**
+6. ◐ **Cypher surface** — `SPARSE_VECTOR(N)` type DDL ✅, `OPTIONS{type:'sparse'}` ✅, `uni.sparse.query` ✅; `sparse_similar_to` scalar ⬜.
+7. ⬜ **Python** (pyo3 factory + dict fix, OGM type + hybrid method) + auto-embed wiring. **(test J)**
+8. ⬜ **Benchmark P1** on a real SPLADE corpus.
+9. ⬜ **P2 block-max** (rank-safe α=0 default) + 8-bit weight quantization + rank-safety equivalence test (`max_impact` column already stored).
+
+**Also landed beyond the original plan** (surfaced during implementation): WAL CV-codec durability fix (mutation `Value`s no longer lost on crash recovery); `RETURN`-projection round-trip for sparse columns.
 
 ## 16. Open questions
 - ~~Own crate or in uni-common?~~ **Own crate `uni-sparse-vector`, BTIC-style** (decided per maintainer direction).

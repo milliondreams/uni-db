@@ -329,6 +329,71 @@ pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
     Ok(Value::Float(sim as f64))
 }
 
+/// Compute the sparse dot product between two sparse vectors (no storage access).
+///
+/// Each operand may be a `Value::SparseVector` or the structural
+/// `{indices: [...], values: [...]}` `Value::Map` — the latter is how a sparse
+/// param arrives at a scalar UDF, where the Arrow `Struct` is decoded without
+/// schema context. A `NULL` operand propagates to `NULL` (3VL semantics,
+/// matching [`eval_similar_to_pure`]). Non-overlapping term sets yield
+/// `Value::Float(0.0)`.
+///
+/// This is the SPLADE/learned-sparse analogue of [`eval_similar_to_pure`]:
+/// dot product is the canonical sparse similarity, so no normalization is
+/// applied (higher means more similar, unbounded above).
+///
+/// # Errors
+/// Returns an error if either non-null operand is neither a sparse vector nor a
+/// well-formed `{indices, values}` map, or if its weights are non-finite.
+pub fn eval_sparse_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
+    if matches!(v1, Value::Null) || matches!(v2, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let a = value_to_sparse(v1)?;
+    let b = value_to_sparse(v2)?;
+    Ok(Value::Float(f64::from(uni_sparse_vector::ops::sparse_dot(
+        &a, &b,
+    ))))
+}
+
+/// Reconstruct a kernel [`uni_sparse_vector::SparseVector`] from either a
+/// `Value::SparseVector` or a `{indices, values}` `Value::Map`.
+fn value_to_sparse(v: &Value) -> Result<uni_sparse_vector::SparseVector> {
+    match v {
+        Value::SparseVector { indices, values } => {
+            uni_sparse_vector::SparseVector::new(indices.clone(), values.clone())
+                .map_err(|e| anyhow::anyhow!("sparse_similar_to: invalid sparse vector: {e}"))
+        }
+        Value::Map(m) => {
+            let as_list = |key: &str| -> Result<&Vec<Value>> {
+                match m.get(key) {
+                    Some(Value::List(l)) => Ok(l),
+                    _ => Err(anyhow::anyhow!(
+                        "sparse_similar_to: map operand missing '{key}' list"
+                    )),
+                }
+            };
+            let indices: Vec<u32> = as_list("indices")?
+                .iter()
+                .map(|x| x.as_i64().map(|i| i as u32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| anyhow::anyhow!("sparse_similar_to: 'indices' must be integers"))?;
+            let values: Vec<f32> = as_list("values")?
+                .iter()
+                .map(|x| x.as_f64().map(|f| f as f32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| anyhow::anyhow!("sparse_similar_to: 'values' must be numbers"))?;
+            // `from_pairs` canonicalizes (sort + sum) since a map carries no
+            // ascending-order guarantee.
+            uni_sparse_vector::SparseVector::from_pairs(indices.into_iter().zip(values).collect())
+                .map_err(|e| anyhow::anyhow!("sparse_similar_to: invalid sparse map: {e}"))
+        }
+        _ => Err(anyhow::anyhow!(
+            "sparse_similar_to arguments must be sparse vectors or {{indices, values}} maps"
+        )),
+    }
+}
+
 /// Compute the raw cosine similarity (in f64) between two equal-length vectors,
 /// clamped to [-1, 1]. Returns 0 when either vector has zero magnitude.
 ///

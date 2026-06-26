@@ -744,6 +744,9 @@ async fn auto_embed_text(
 pub(super) struct HybridScoreContext<'a> {
     pub vec_score_map: &'a HashMap<Vid, f32>,
     pub fts_score_map: &'a HashMap<Vid, f32>,
+    /// Raw sparse dot scores by vid (empty when `uni.search` has no `sparse`
+    /// property). Reported unnormalized, mirroring `uni.sparse.query`'s `score`.
+    pub sparse_score_map: &'a HashMap<Vid, f32>,
     pub fts_max: f32,
     pub metric: &'a DistanceMetric,
 }
@@ -1013,6 +1016,18 @@ async fn build_hybrid_search_batch(
                             0.0
                         };
                         builder.append_value(norm);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "sparse_score" => {
+                let mut builder = Float32Builder::with_capacity(num_rows);
+                for vid in &vids {
+                    // Raw dot product, unnormalized — matches `uni.sparse.query`.
+                    if let Some(&dot) = scores.sparse_score_map.get(vid) {
+                        builder.append_value(dot);
                     } else {
                         builder.append_null();
                     }
@@ -1302,6 +1317,26 @@ pub(crate) async fn run_fts_query(
     build_search_result_batch(&results, &label, &DistanceMetric::L2, &batch_ctx).await
 }
 
+/// Parse three-way fusion weights `[vector, fts, sparse]` from `options.weights`.
+///
+/// Falls back to equal thirds when the option is absent or not a 3-element
+/// numeric array. Used only on the weighted three-way (dense + text + sparse)
+/// path; the two-way path keeps its single `alpha` knob.
+fn parse_three_weights(options_map: Option<&HashMap<String, Value>>) -> [f32; 3] {
+    const EQUAL_THIRD: f32 = 1.0 / 3.0;
+    options_map
+        .and_then(|m| m.get("weights"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            let w: Vec<f32> = arr
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            (w.len() == 3).then_some([w[0], w[1], w[2]])
+        })
+        .unwrap_or([EQUAL_THIRD, EQUAL_THIRD, EQUAL_THIRD])
+}
+
 /// `uni.search(label, properties, query_text, query_vector?, k, filter?, options?)`.
 pub(crate) async fn run_hybrid_search(
     host: &QueryProcedureHost,
@@ -1318,7 +1353,7 @@ pub(crate) async fn run_hybrid_search(
         )
     })?;
 
-    let (vector_prop, fts_prop) = if let Some(obj) = properties_val.as_object() {
+    let (vector_prop, fts_prop, sparse_prop) = if let Some(obj) = properties_val.as_object() {
         let vec_prop = obj
             .get("vector")
             .and_then(|v| v.as_str())
@@ -1327,12 +1362,19 @@ pub(crate) async fn run_hybrid_search(
             .get("fts")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        (vec_prop, fts_prop)
+        let sparse_prop = obj
+            .get("sparse")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        (vec_prop, fts_prop, sparse_prop)
     } else if let Some(prop) = properties_val.as_str() {
-        (Some(prop.to_string()), Some(prop.to_string()))
+        // A bare string names a single property used for both dense + FTS; sparse
+        // is opt-in only (it needs a paired query vector), so it stays absent here.
+        (Some(prop.to_string()), Some(prop.to_string()), None)
     } else {
         return Err(datafusion::error::DataFusionError::Execution(
-            "Properties must be an object {vector: '...', fts: '...'} or a string".to_string(),
+            "Properties must be an object {vector: '...', fts: '...', sparse: '...'} or a string"
+                .to_string(),
         ));
     };
 
@@ -1423,9 +1465,58 @@ pub(crate) async fn run_hybrid_search(
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
     }
 
+    // Sparse arm: opt-in via a `sparse` property plus an `options.sparse_query`
+    // (a `SparseVector` or `{indices, values}` map). Reuse `sparse_rerank` so the
+    // arm inherits the same flushed∪L0 / MVCC / tombstone correctness as
+    // `uni.sparse.query`. Absent ⇒ `sparse_results` stays empty ⇒ fusion below is
+    // a no-op for the sparse source and the two-way result is byte-identical.
+    let mut sparse_results: Vec<(Vid, f32)> = Vec::new();
+    if let Some(ref sparse_prop) = sparse_prop {
+        let sparse_query_val = options_map.and_then(|m| m.get("sparse_query"));
+        if let Some(sq_val) = sparse_query_val.filter(|v| !v.is_null()) {
+            let sparse_query = extract_sparse_query(sq_val)?;
+            let property_manager = host.property_manager().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "uni.search: sparse arm requires a property manager on the host".to_string(),
+                )
+            })?;
+            let (scored, _props) = sparse_rerank(
+                storage,
+                property_manager,
+                &query_ctx,
+                &label,
+                sparse_prop,
+                &sparse_query,
+                effective_retrieval_k,
+                effective_retrieval_k,
+            )
+            .await?;
+            sparse_results = scored;
+        }
+    }
+
     let fused_results = match fusion_method.as_str() {
-        "weighted" => crate::query::fusion::fuse_weighted(&vector_results, &fts_results, alpha),
-        _ => crate::query::fusion::fuse_rrf(&vector_results, &fts_results, rrf_k),
+        "weighted" => {
+            if sparse_results.is_empty() {
+                // Two-way weighted path is unchanged.
+                crate::query::fusion::fuse_weighted(&vector_results, &fts_results, alpha)
+            } else {
+                // Three-way weighted with per-source normalization. Weights come
+                // from `options.weights = [vector, fts, sparse]`, defaulting to
+                // equal thirds; `alpha` is the two-way-only knob.
+                let weights = parse_three_weights(options_map);
+                use crate::query::fusion::NormKind;
+                crate::query::fusion::fuse_weighted_sources(&[
+                    (&vector_results, weights[0], NormKind::DistanceToSim),
+                    (&fts_results, weights[1], NormKind::ScoreByMax),
+                    (&sparse_results, weights[2], NormKind::ScoreByMax),
+                ])
+            }
+        }
+        _ => crate::query::fusion::fuse_rrf_multi(
+            &[&vector_results, &fts_results, &sparse_results],
+            rrf_k,
+        ),
     };
 
     let (final_results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
@@ -1448,6 +1539,7 @@ pub(crate) async fn run_hybrid_search(
 
     let vec_score_map: HashMap<Vid, f32> = vector_results.iter().cloned().collect();
     let fts_score_map: HashMap<Vid, f32> = fts_results.iter().cloned().collect();
+    let sparse_score_map: HashMap<Vid, f32> = sparse_results.iter().cloned().collect();
     let fts_max = fts_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
 
     let uni_schema = storage.schema_manager().schema();
@@ -1463,6 +1555,7 @@ pub(crate) async fn run_hybrid_search(
     let score_ctx = HybridScoreContext {
         vec_score_map: &vec_score_map,
         fts_score_map: &fts_score_map,
+        sparse_score_map: &sparse_score_map,
         fts_max,
         metric: &metric,
     };

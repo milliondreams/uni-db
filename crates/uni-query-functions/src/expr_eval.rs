@@ -1925,6 +1925,13 @@ pub fn eval_scalar_function(
             eval_vector_similarity(&args[0], &args[1])
         }
 
+        "SPARSE_SIMILAR_TO" => {
+            if args.len() != 2 {
+                return Err(anyhow!("sparse_similar_to takes 2 arguments"));
+            }
+            crate::similar_to::eval_sparse_similar_to_pure(&args[0], &args[1])
+        }
+
         // BTIC functions — dispatch via is_btic_function check
         _ if is_btic_function(&name_upper) => eval_btic_function(&name_upper, args),
 
@@ -2187,6 +2194,7 @@ pub fn is_scalar_function(name: &str) -> bool {
             | "VALIDAT"
             | "SIMILAR_TO"
             | "VECTOR_SIMILARITY"
+            | "SPARSE_SIMILAR_TO"
             | "VECTOR_DISTANCE"
             | "DATE"
             | "TIME"

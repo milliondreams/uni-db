@@ -2013,12 +2013,33 @@ fn eval_valid_at(args: &[Value]) -> Result<Value> {
     Ok(Value::Bool(is_valid))
 }
 
+/// Coerce a vector-valued argument into `Vec<f64>` for elementwise vector math.
+///
+/// Accepts both a `Value::Vector` (a stored dense-vector property now decodes to
+/// this with type fidelity) and a `Value::List` of numbers (a Cypher array
+/// literal / parameter), so callers work uniformly across both surfaces.
+///
+/// # Errors
+/// Returns an error if `v` is neither a vector nor a numeric list, or if any
+/// list element is non-numeric.
+fn vector_arg_to_f64(v: &Value) -> Result<Vec<f64>> {
+    match v {
+        Value::Vector(a) => Ok(a.iter().map(|&f| f as f64).collect()),
+        Value::List(a) => a
+            .iter()
+            .map(|e| {
+                e.as_f64()
+                    .ok_or_else(|| anyhow!("Vector element not a number"))
+            })
+            .collect(),
+        _ => Err(anyhow!("vector argument must be an array")),
+    }
+}
+
 /// Evaluate vector similarity between two vectors (cosine similarity).
 pub fn eval_vector_similarity(v1: &Value, v2: &Value) -> Result<Value> {
-    let (arr1, arr2) = match (v1, v2) {
-        (Value::List(a1), Value::List(a2)) => (a1, a2),
-        _ => return Err(anyhow!("vector_similarity arguments must be arrays")),
-    };
+    let arr1 = vector_arg_to_f64(v1)?;
+    let arr2 = vector_arg_to_f64(v2)?;
 
     if arr1.len() != arr2.len() {
         return Err(anyhow!(
@@ -2032,13 +2053,7 @@ pub fn eval_vector_similarity(v1: &Value, v2: &Value) -> Result<Value> {
     let mut norm1_sq = 0.0;
     let mut norm2_sq = 0.0;
 
-    for (v1_elem, v2_elem) in arr1.iter().zip(arr2.iter()) {
-        let f1 = v1_elem
-            .as_f64()
-            .ok_or_else(|| anyhow!("Vector element not a number"))?;
-        let f2 = v2_elem
-            .as_f64()
-            .ok_or_else(|| anyhow!("Vector element not a number"))?;
+    for (&f1, &f2) in arr1.iter().zip(arr2.iter()) {
         dot += f1 * f2;
         norm1_sq += f1 * f1;
         norm2_sq += f2 * f2;
@@ -2058,10 +2073,8 @@ pub fn eval_vector_similarity(v1: &Value, v2: &Value) -> Result<Value> {
 
 /// Evaluate vector distance between two vectors.
 pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Value> {
-    let (arr1, arr2) = match (v1, v2) {
-        (Value::List(a1), Value::List(a2)) => (a1, a2),
-        _ => return Err(anyhow!("vector_distance arguments must be arrays")),
-    };
+    let arr1 = vector_arg_to_f64(v1)?;
+    let arr2 = vector_arg_to_f64(v2)?;
 
     if arr1.len() != arr2.len() {
         return Err(anyhow!(
@@ -2071,13 +2084,7 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
         ));
     }
 
-    // Helper to get f64 iterator
-    let iter1 = arr1
-        .iter()
-        .map(|v| v.as_f64().ok_or(anyhow!("Vector element not a number")));
-    let iter2 = arr2
-        .iter()
-        .map(|v| v.as_f64().ok_or(anyhow!("Vector element not a number")));
+    let pairs = || arr1.iter().copied().zip(arr2.iter().copied());
 
     match metric.to_lowercase().as_str() {
         "cosine" => {
@@ -2086,9 +2093,7 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
             let mut norm1_sq = 0.0;
             let mut norm2_sq = 0.0;
 
-            for (r1, r2) in iter1.zip(iter2) {
-                let f1 = r1?;
-                let f2 = r2?;
+            for (f1, f2) in pairs() {
                 dot += f1 * f2;
                 norm1_sq += f1 * f1;
                 norm2_sq += f2 * f2;
@@ -2108,9 +2113,7 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
         }
         "euclidean" | "l2" => {
             let mut sum_sq_diff = 0.0;
-            for (r1, r2) in iter1.zip(iter2) {
-                let f1 = r1?;
-                let f2 = r2?;
+            for (f1, f2) in pairs() {
                 let diff = f1 - f2;
                 sum_sq_diff += diff * diff;
             }
@@ -2118,9 +2121,7 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
         }
         "dot" | "inner_product" => {
             let mut dot = 0.0;
-            for (r1, r2) in iter1.zip(iter2) {
-                let f1 = r1?;
-                let f2 = r2?;
+            for (f1, f2) in pairs() {
                 dot += f1 * f2;
             }
             Ok(Value::Float(1.0 - dot))

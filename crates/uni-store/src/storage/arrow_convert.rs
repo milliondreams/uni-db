@@ -380,10 +380,19 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         return Value::Bool(b.value(row));
     }
 
-    // Fixed-size list (vectors)
+    // Fixed-size list: a `Float32` child is a dense vector and round-trips as
+    // `Value::Vector`, preserving type identity (parity with `SparseVector` /
+    // `Btic`); any other element type decodes as a generic list. The recursive
+    // inner-element decode for multivector tokens (via `array_to_value_list`)
+    // reaches this same arm, so a `List<FixedSizeList<Float32>>` multivector
+    // decodes as a `Value::List` of `Value::Vector` tokens.
     if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let inner = list.value(row);
+        if let Some(floats) = inner.as_any().downcast_ref::<Float32Array>() {
+            return Value::Vector((0..floats.len()).map(|i| floats.value(i)).collect());
+        }
         let elem_hint = list_child_bytes_hint(list.data_type());
-        return Value::List(array_to_value_list(&list.value(row), elem_hint));
+        return Value::List(array_to_value_list(&inner, elem_hint));
     }
 
     // Variable-size list
@@ -1231,6 +1240,43 @@ pub fn build_sparse_vector_array(values: &[Option<Value>]) -> ArrayRef {
         Some(null_buffer.finish().into()),
     );
     Arc::new(struct_arr)
+}
+
+/// Build a multi-vector `List<FixedSizeList<Float32, dimensions>>` Arrow column.
+///
+/// Used by the query result projection path (`RETURN d.multivector_col`) on the
+/// L0 (unflushed) read path. Mirrors the `DataType::Vector { dimensions }` arm of
+/// `PropertyExtractor::build_list_column` but operates on owned values: a `None`
+/// or non-list value becomes a null row, and each token is validated through
+/// `extract_vector_f32_values` (a wrong-dimension or non-numeric token becomes a
+/// null inner vector), so failure modes match the write path.
+///
+/// # Examples
+/// ```ignore
+/// let col = build_multivector_array(&[Some(Value::List(vec![Value::Vector(vec![1.0, 2.0])]))], 2);
+/// ```
+pub fn build_multivector_array(values: &[Option<Value>], dimensions: usize) -> ArrayRef {
+    let dim = dimensions as i32;
+    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dim));
+    for v in values {
+        match v.as_ref().and_then(|v| v.as_array()) {
+            Some(arr) => {
+                // Variable token count per row: one fixed-size inner vector per
+                // token. `extract_vector_f32_values` always yields exactly
+                // `dimensions` values, satisfying the FixedSizeList stride.
+                for tok in arr {
+                    let (vals, valid) = extract_vector_f32_values(Some(tok), false, dimensions);
+                    for f in vals {
+                        builder.values().values().append_value(f);
+                    }
+                    builder.values().append(valid);
+                }
+                builder.append(true);
+            }
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
 }
 
 impl<'a> PropertyExtractor<'a> {
@@ -2973,9 +3019,10 @@ mod tests {
     #[test]
     fn test_build_multivector_list_column_roundtrip() {
         // A multi-vector property is `List<FixedSizeList<Float32, dim>>` with a
-        // VARIABLE token count per row. It round-trips numerically: a single dense
-        // vector already reads back as `Value::List`, so a multi-vector reads back
-        // as a nested `Value::List`.
+        // VARIABLE token count per row. Each token is a dense vector, so it reads
+        // back with type fidelity as a `Value::List` of `Value::Vector` tokens
+        // (parity with `SparseVector`/`Btic` — `FixedSizeList<Float32>` decodes to
+        // `Value::Vector`, not a generic float list).
         let data_type = DataType::List(Box::new(DataType::Vector { dimensions: 3 }));
         let extractor = PropertyExtractor::new("tokens", &data_type);
 
@@ -3015,21 +3062,14 @@ mod tests {
         assert_eq!(outer.value(1).len(), 3);
         assert_eq!(outer.value(2).len(), 0);
 
-        // Read back through the generic decoder; compare numerically.
+        // Read back through the generic decoder; each token round-trips with type
+        // fidelity as a `Value::Vector`.
         let row0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&data_type));
         assert_eq!(
             row0,
             Value::List(vec![
-                Value::List(vec![
-                    Value::Float(1.0),
-                    Value::Float(2.0),
-                    Value::Float(3.0)
-                ]),
-                Value::List(vec![
-                    Value::Float(4.0),
-                    Value::Float(5.0),
-                    Value::Float(6.0)
-                ]),
+                Value::Vector(vec![1.0, 2.0, 3.0]),
+                Value::Vector(vec![4.0, 5.0, 6.0]),
             ])
         );
 
@@ -3038,14 +3078,7 @@ mod tests {
             panic!("row1 should decode to a list of tokens");
         };
         assert_eq!(tokens.len(), 3);
-        assert_eq!(
-            tokens[2],
-            Value::List(vec![
-                Value::Float(13.0),
-                Value::Float(14.0),
-                Value::Float(15.0)
-            ])
-        );
+        assert_eq!(tokens[2], Value::Vector(vec![13.0, 14.0, 15.0]));
     }
 
     #[test]

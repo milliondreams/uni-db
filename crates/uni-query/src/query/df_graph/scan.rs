@@ -3411,6 +3411,21 @@ fn build_list_property_column(
             }
             Ok(Arc::new(builder.finish()))
         }
+        // Multi-vector (`List<FixedSizeList<Float32>>`): build the typed
+        // multi-vector column from the owned L0 values, mirroring the write path.
+        // Without this arm the value falls to the string fallback below and yields
+        // `List<Utf8>`, which mismatches the declared schema type when the result
+        // batch is assembled (`RETURN d.tokens` on unflushed/L0 rows).
+        DataType::FixedSizeList(child, dim) if matches!(child.data_type(), DataType::Float32) => {
+            let values: Vec<Option<Value>> = vids
+                .iter()
+                .map(|vid| get_property_value(vid, props_map, prop_name))
+                .collect();
+            Ok(uni_store::storage::arrow_convert::build_multivector_array(
+                &values,
+                *dim as usize,
+            ))
+        }
         // Fallback: serialize inner elements as strings
         _ => {
             let mut builder = ListBuilder::new(StringBuilder::new());

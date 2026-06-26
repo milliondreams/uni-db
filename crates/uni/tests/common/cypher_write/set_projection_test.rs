@@ -183,29 +183,17 @@ async fn f1c_set_preserves_embedding_under_partial_update() -> Result<()> {
     assert_eq!(row.get::<i64>("f").unwrap(), 99);
     assert!((row.get::<f64>("c").unwrap() - 0.95).abs() < 1e-9);
 
-    // Verify embedding survived. Accept either Vector or List representation.
+    // Verify embedding survived. A `VECTOR` column round-trips with type fidelity
+    // as `Value::Vector` (not a generic `Value::List` of floats).
     let emb = row.value("emb").expect("emb missing");
-    let len = match emb {
-        Value::List(v) => v.len(),
-        Value::Vector(v) => v.len(),
-        other => panic!("unexpected embedding shape: {other:?}"),
+    let Value::Vector(raw) = emb else {
+        panic!("RETURN of a VECTOR column must yield Value::Vector, got {emb:?}");
     };
-    assert_eq!(len, EMBED_DIM, "embedding clobbered by partial SET");
+    assert_eq!(raw.len(), EMBED_DIM, "embedding clobbered by partial SET");
 
     // Verify element-wise that the embedding values weren't replaced
     // with defaults (e.g., all-zeros from a null-coalesce path).
-    let preserved: Vec<f64> = match emb {
-        Value::List(v) => v
-            .iter()
-            .filter_map(|x| match x {
-                Value::Float(f) => Some(*f),
-                Value::Int(i) => Some(*i as f64),
-                _ => None,
-            })
-            .collect(),
-        Value::Vector(v) => v.iter().map(|f| *f as f64).collect(),
-        _ => unreachable!(),
-    };
+    let preserved: Vec<f64> = raw.iter().map(|f| *f as f64).collect();
     assert_eq!(preserved.len(), EMBED_DIM);
     for (i, got) in preserved.iter().enumerate() {
         let want = (i as f64) * 0.1 + 0.05;
@@ -1120,17 +1108,12 @@ async fn h3b_set_vector_property_directly_round_trips() -> Result<()> {
         .await?;
     assert_eq!(r.rows()[0].get::<String>("name").unwrap(), "A");
     let emb = r.rows()[0].value("emb").expect("embedding missing");
-    let v: Vec<f64> = match emb {
-        Value::List(l) => l
-            .iter()
-            .filter_map(|x| match x {
-                Value::Float(f) => Some(*f),
-                _ => None,
-            })
-            .collect(),
-        Value::Vector(v) => v.iter().map(|f| *f as f64).collect(),
-        other => panic!("unexpected vector shape: {other:?}"),
+    // A `VECTOR` column must round-trip with type fidelity as `Value::Vector`,
+    // not a generic `Value::List` of floats (parity with SparseVector/Btic).
+    let Value::Vector(raw) = emb else {
+        panic!("RETURN of a VECTOR column must yield Value::Vector, got {emb:?}");
     };
+    let v: Vec<f64> = raw.iter().map(|f| *f as f64).collect();
     assert_eq!(v.len(), 3);
     let expected = [0.7, 0.8, 0.9];
     for (i, (got, want)) in v.iter().zip(expected.iter()).enumerate() {

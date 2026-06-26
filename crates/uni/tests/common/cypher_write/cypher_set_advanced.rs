@@ -35,12 +35,12 @@ async fn test_cypher_set_advanced() -> Result<()> {
         .await?;
     assert_eq!(result.len(), 1);
 
+    // A declared `VECTOR` column round-trips with type fidelity as `Value::Vector`.
     let emb = result.rows()[0].value("emb").unwrap();
-    match emb {
-        Value::List(arr) => assert_eq!(arr.len(), 3),
-        Value::Vector(arr) => assert_eq!(arr.len(), 3),
-        _ => {} // Vector may come back in other formats
-    }
+    let Value::Vector(arr) = emb else {
+        panic!("RETURN of a VECTOR column must yield Value::Vector, got {emb:?}");
+    };
+    assert_eq!(arr.len(), 3);
 
     // 3. Update properties via SET
     let session = db.session();

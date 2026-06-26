@@ -303,11 +303,9 @@ async fn sparse_quantized_and_lossless_agree() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn sparse_index_via_create_index_proc_quantize_false() -> anyhow::Result<()> {
-    // Exercises the procedure index-creation path — `uni.schema.createIndex` with
-    // `{type:'sparse', quantize:false}` — distinct from the schema-builder route,
-    // confirming the `quantize` option is threaded through `ddl_procedures`. (The
-    // Cypher `CREATE VECTOR INDEX ... OPTIONS{type:'sparse'}` statement is the
-    // DENSE-vector path and does NOT create a sparse index — see notes in #95.)
+    // Procedure index-creation path — `uni.schema.createIndex` with
+    // `{type:'sparse', quantize:false}` (create-before-ingest) — confirming the
+    // `quantize` option is threaded through `ddl_procedures`.
     let db = Uni::temporary().build().await?;
     define_schema_no_index(&db).await?;
 
@@ -324,6 +322,105 @@ async fn sparse_index_via_create_index_proc_quantize_false() -> anyhow::Result<(
         results.first().map(|(t, _)| t.as_str()),
         Some("target"),
         "procedure-created sparse index must retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_index_via_create_index_proc_after_flush() -> anyhow::Result<()> {
+    // Regression for the create-after-flush count-guard fix: creating the sparse
+    // index via the procedure AFTER rows are flushed must backfill them (the raw
+    // dataset count reads 0 for the flushed LanceDB table, so the build must not
+    // be gated by it).
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    let corpus = build_corpus(50, 0xAF7E_0095);
+    insert_docs(&db, &corpus, true).await?; // flush BEFORE the index exists
+
+    let tx = db.session().tx().await?;
+    tx.execute("CALL uni.schema.createIndex('Doc', 'emb', {type: 'sparse'})")
+        .await?;
+    tx.commit().await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "procedure index built after flush must backfill + retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+/// Create a sparse index via the Cypher `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}`
+/// statement (the routing fixed for #95).
+async fn create_sparse_index_cypher(db: &Uni, opts: &str) -> anyhow::Result<()> {
+    let tx = db.session().tx().await?;
+    tx.execute(&format!(
+        "CREATE VECTOR INDEX emb_idx FOR (d:Doc) ON (d.emb) OPTIONS {opts}"
+    ))
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_index_via_cypher_create_vector_index() -> anyhow::Result<()> {
+    // `CREATE VECTOR INDEX ... OPTIONS{type:'sparse'}` must build a SPARSE index
+    // (not a dense one), create-before-ingest.
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    create_sparse_index_cypher(&db, "{type: 'sparse'}").await?;
+
+    let corpus = build_corpus(50, 0xC17E_0095);
+    insert_docs(&db, &corpus, true).await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "Cypher-created sparse index must retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_index_via_cypher_create_after_flush() -> anyhow::Result<()> {
+    // Same Cypher statement, but created AFTER the rows are flushed: the executor
+    // routes to `create_sparse_vector_index`, which backfills via the backend.
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    let corpus = build_corpus(50, 0xC17F_0095);
+    insert_docs(&db, &corpus, true).await?; // flush BEFORE the index exists
+    create_sparse_index_cypher(&db, "{type: 'sparse'}").await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "Cypher index built after flush must backfill + retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_index_via_cypher_quantize_false() -> anyhow::Result<()> {
+    // The `quantize` option is threaded through the Cypher routing too.
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    create_sparse_index_cypher(&db, "{type: 'sparse', quantize: false}").await?;
+
+    let corpus = build_corpus(50, 0xC180_0095);
+    insert_docs(&db, &corpus, true).await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "Cypher quantize:false sparse index must retrieve the target: {results:?}"
     );
     assert_matches_oracle(&results, &corpus);
     Ok(())

@@ -412,7 +412,16 @@ async fn create_index_internal(
         IndexDefinition::Vector(cfg) => {
             idx_mgr.create_vector_index(cfg).await?;
         }
-        // Non-vector indexes keep the build-if-data-exists optimization.
+        // Sparse ALSO always builds, like Vector: `create_sparse_vector_index`
+        // handles an empty table (create-before-ingest → populated on flush) and
+        // backfills already-flushed rows via the storage *backend*. It must NOT be
+        // gated by the raw-dataset `count` below, which reads 0 for a flushed
+        // LanceDB-managed table (the table is not at the raw `{base}/vertices_<L>`
+        // path); that gate would silently leave the index empty after a flush.
+        IndexDefinition::Sparse(cfg) => {
+            idx_mgr.create_sparse_vector_index(cfg).await?;
+        }
+        // Remaining non-vector indexes keep the build-if-data-exists optimization.
         other => {
             let count = if let Ok(ds) = storage.vertex_dataset(label) {
                 if let Ok(raw) = ds.open_raw().await {
@@ -427,7 +436,6 @@ async fn create_index_internal(
                 match other {
                     IndexDefinition::Scalar(cfg) => idx_mgr.create_scalar_index(cfg).await?,
                     IndexDefinition::Inverted(cfg) => idx_mgr.create_inverted_index(cfg).await?,
-                    IndexDefinition::Sparse(cfg) => idx_mgr.create_sparse_vector_index(cfg).await?,
                     IndexDefinition::FullText(cfg) => idx_mgr.create_fts_index(cfg).await?,
                     IndexDefinition::JsonFullText(cfg) => {
                         idx_mgr.create_json_fts_index(cfg).await?

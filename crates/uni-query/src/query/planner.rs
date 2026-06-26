@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{
     EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig,
-    ScalarIndexType, Schema, TokenizerConfig, VectorIndexConfig,
+    ScalarIndexType, Schema, SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
 };
 use uni_cypher::ast::{
     AlterEdgeType, AlterLabel, BinaryOp, CallKind, Clause, CreateConstraint, CreateEdgeType,
@@ -2104,6 +2104,13 @@ pub enum LogicalPlan {
     // DDL Plans
     CreateVectorIndex {
         config: VectorIndexConfig,
+        if_not_exists: bool,
+    },
+    /// Scored sparse-vector (SPLADE / learned-sparse) index. Reached via
+    /// `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}`, which shares the vector
+    /// DDL surface but is a distinct index kind.
+    CreateSparseIndex {
+        config: SparseVectorIndexConfig,
         if_not_exists: bool,
     },
     CreateFullTextIndex {
@@ -8372,6 +8379,45 @@ impl QueryPlanner {
                 use uni_common::vector_index_opts::{
                     VectorIndexOpts, build_vector_index_type, parse_vector_metric,
                 };
+                // `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}` shares the vector DDL
+                // surface but is a scored inverted index, not a dense ANN — route it to
+                // the sparse path (mirrors the `uni.schema.createIndex` SPARSE arm in
+                // `ddl_procedures.rs`). `build_vector_index_type` has no "sparse" case
+                // and would otherwise fall through to the dense IVF_PQ default.
+                if c.options.get("type").and_then(|v| v.as_str()) == Some("sparse") {
+                    let dimensions = self
+                        .schema
+                        .properties
+                        .get(&c.label)
+                        .and_then(|props| props.get(&c.property))
+                        .and_then(|meta| match &meta.r#type {
+                            uni_common::DataType::SparseVector { dimensions } => Some(*dimensions),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Property '{}' is not a SparseVector column; cannot create a sparse index",
+                                c.property
+                            )
+                        })?;
+                    let quantize = c
+                        .options
+                        .get("quantize")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let config = SparseVectorIndexConfig {
+                        name: c.name,
+                        label: c.label,
+                        property: c.property,
+                        dimensions,
+                        quantize,
+                        metadata: Default::default(),
+                    };
+                    return Ok(LogicalPlan::CreateSparseIndex {
+                        config,
+                        if_not_exists: c.if_not_exists,
+                    });
+                }
                 // Accept either a numeric value (`partitions: 256`) or a quoted string
                 // (`partitions: '256'`) — Cypher map literals produce the former.
                 let opt = |key: &str| -> Option<u32> {

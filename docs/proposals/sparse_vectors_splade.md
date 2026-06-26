@@ -1,7 +1,7 @@
 # Sparse Vectors (SPLADE / learned-sparse) — Storage, Indexing & Hybrid Retrieval
 
 - **Issue:** #95 (consumer/storage side). Producer side `rustic-ai/uni-xervo#40` (`EmbedSparse` / `SparseEmbeddingModel`) is **CLOSED/shipped** — dependency unblocked.
-- **Status:** PARTIALLY IMPLEMENTED — M1–M2 core + M4 surface committed (`c5d8d6225` + `83e0ba686`) on branch `feat/sparse-vectors-issue-95` (not merged/pushed). Fork-local index (task #4) landed via Approach A. Remaining: P2 block-max (M3), benchmark (M5), test sets B′/F/H/I. See [§0 Implementation status](#0-implementation-status).
+- **Status:** PARTIALLY IMPLEMENTED — M1–M2 core + M4 surface committed (`c5d8d6225` + `83e0ba686`) on branch `feat/sparse-vectors-issue-95` (not merged/pushed). Fork-local index (task #4) landed via Approach A. Test sets F (crash/WAL failpoints), H (OCC matrix; loom N/A), and I (metamorphic) now landed. Remaining: P2 block-max (M3), benchmark (M5), test set B′ (rank-safety, needs M3). See [§0 Implementation status](#0-implementation-status).
 - **Date:** 2026-06-25 (proposal); implementation 2026-06-25
 - **v1 decision (locked at impl time):** P1 brute-force DAAT **and** P2 block-max (rank-safe α=0 default), delivered via milestone gates **M1–M5**.
 
@@ -39,16 +39,18 @@
 | **C** L0/flush visibility matrix | ✅ | `sparse_index.rs`: l0-only, last-writer-wins, tombstone-hides-flushed, flush-equivalence |
 | **D** MVCC/snapshot isolation | ◐ | `sparse_snapshot_isolates_reader_from_concurrent_insert`; not yet a full read-path matrix entry |
 | **E** fork isolation + fusion | ✅ | `fork/fork_index_sparse.rs` (5): fused results, isolation both ways, honors-deleted, nested-fork, auto-built + EXPLAIN `SparseDot` |
-| **F** crash/WAL failpoints | ◐ | WAL-replay test present (`sparse_wal_replay_after_reopen_unflushed_delta`); no `--features failpoints` crash injection |
+| **F** crash/WAL failpoints | ✅ | `sparse_resilience.rs` (4): crash after-wal-flush (CV-codec decode fidelity), crash after-validate (atomicity), crash at `flush::after-rotate-before-lance` (no double-apply of flushed data), WAL-tail corruption skip. `--features failpoints` |
 | **G** restart/reopen durability | ✅ | `sparse_persists_across_reopen` |
-| **H** concurrency (OCC/loom) | ◐ | one concurrent-reader test; no OCC-matrix/loom case |
-| **I** metamorphic/soak | ⬜ | not added to `metamorphic/` |
+| **H** concurrency (OCC/loom) | ✅ | `ssi_read_path_matrix.rs` (2): `sparse_query_records_matches` (RW antidependency aborts), `sparse_query_disjoint_label_no_false_abort` (label-level precision). **Loom N/A** — `SparseVectorIndex` is stateless per-query (no `Arc`/`Mutex`/`RwLock`), so there is no shared mutable state to model-check. Read-set is recorded via `sparse_rerank`'s property fetch (`record_vertex_read`), not a procedure-exec wrap |
+| **I** metamorphic/soak | ✅ | `metamorphic/sparse.rs`: `uni.sparse.query` index path ≡ brute-force `sparse_dot` oracle; score-vector comparison (tie-stable); smoke (per-PR) + `#[ignore]` soak (nightly `test(/soak/)` filter). First vector-modality metamorphic case |
 | **J** Python E2E | ✅ | `test_async_e2e_sparse.py` (5) + OGM (5) |
 
 **Not yet implemented (follow-up, tracked in §15):**
 - **M3 / P2** — block-max pruning + rank-safety equivalence test (set B′). The `max_impact` column is stored from M2 as the prerequisite but is **never read** in `query_topk` today; weights are still **f32** (8-bit quantization ships with P2, `SparseVectorIndexConfig.quantize` flag present, default true, but unimplemented).
-- **Test sets B′** (P2 rank-safety — needs M3), **F** (crash/WAL failpoints), **H** (OCC/loom), and **I** (metamorphic).
+- **Test set B′** (P2 rank-safety) — needs M3. (Sets **F**, **H**, **I** are now ✅; see the table above.)
 - **M5** — real-corpus benchmark; OGM `hybrid_search()` builder (deferred — GitHub issue #114).
+
+**Set F durability observation (general, not sparse-specific, unconfirmed):** the crash-during-flush test surfaced that a panic at `flush::after-rotate-before-lance` followed by a graceful `drop(db)` + reopen recovers only the *flushed* rows — a committed-but-unflushed delta sitting in the rotated buffer is gone (reopen replays the WAL from the last manifest's `wal_high_water_mark`, `uni/src/api/mod.rs:3381`/`:3592`). The rotation (`writer.rs:3845-3860`) is payload-agnostic, so this is engine-wide, not a sparse concern; it may also be a graceful-`Drop` artifact that wouldn't reproduce under a real (no-`Drop`) crash. Set F therefore asserts only the **no-double-apply / flushed-data-intact** invariant the proposal's §12.F intended; the unflushed-delta atomicity question is flagged for a separate durability investigation.
 - **Auto-embed wiring to xervo `EmbedSparse`** — upstream-blocked: the current `uni-xervo` dependency exposes no `EmbedSparse`/`HeadSet::SPARSE` (only `DENSE | MULTI_VECTOR`), and `SparseVectorIndexConfig` has no `embedding_config`.
 
 **Known residual gaps (documented):** dense `Vector` likely shares the (now-fixed-for-sparse) WAL gap and a `RETURN` projection gap — only the sparse arms were added; secondary indexes (all kinds) are not maintained during WAL recovery and need a rebuild after an unflushed-then-recovered write (universal engine property, not sparse-specific).

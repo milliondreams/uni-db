@@ -30,6 +30,7 @@
 
 pub mod norec;
 pub mod seed;
+pub mod sparse;
 pub mod structural;
 pub mod tlp;
 

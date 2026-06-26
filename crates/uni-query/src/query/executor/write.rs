@@ -3212,9 +3212,11 @@ impl Executor {
                                 .get_mut(var_name)
                                 .expect("inserted above when absent");
                             pv.props.insert(prop_name.clone(), val.clone());
-                            if pv.partial {
-                                pv.touched.insert(prop_name.clone());
-                            }
+                            // Record every SET-assigned key. For the partial path this
+                            // drives the MergeInsert source; for the full path it is the
+                            // signal `refresh_embed_targets` uses to re-embed when a
+                            // source column changed (the full writer ignores it otherwise).
+                            pv.touched.insert(prop_name.clone());
 
                             // Update the row binding so subsequent RHS sees the new value.
                             if let Some(Value::Map(node_map)) = row.get_mut(var_name) {
@@ -3473,6 +3475,11 @@ impl Executor {
         // `insert_vertex_with_labels` (Append) path with
         // generated-column enrichment.
         for (_var_name, mut pv) in pending_v {
+            // A SET that touches an auto-embed source column must refresh the target
+            // embedding; both the partial MergeInsert and the full Append paths
+            // otherwise re-write the stale vector. Applied before the branch so both
+            // writer entry points get the refreshed props + touched keys.
+            writer.refresh_embed_targets(&mut pv.props, &mut pv.touched, &pv.labels);
             if pv.partial {
                 // Round 12 §C: run the generator enrichment over the
                 // merged-in-L0 full row, then add the produced generator

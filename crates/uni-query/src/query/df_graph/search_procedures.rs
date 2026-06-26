@@ -625,7 +625,12 @@ pub(crate) async fn run_sparse_query(
             "uni.sparse.query: third argument (query) is required".to_string(),
         )
     })?;
-    let query = extract_sparse_query(query_val)?;
+    // A string query is auto-embedded via the sparse index's configured model;
+    // otherwise it's an explicit sparse vector / {indices,values} map.
+    let query = match query_val {
+        Value::String(text) => auto_embed_sparse_text(host, &label, &property, text).await?,
+        other => extract_sparse_query(other)?,
+    };
     let k = require_int_arg(args, 3, "uni.sparse.query: fourth argument (k)")?;
     // `filter` is accepted for API symmetry; MVCC/tombstone visibility is
     // already enforced by the property fetch in `sparse_rerank`.
@@ -734,6 +739,56 @@ async fn auto_embed_text(
         datafusion::error::DataFusionError::Execution(
             "Embedding service returned no results".to_string(),
         )
+    })
+}
+
+/// Embed a text query into a `SparseVector` via the sparse index's configured
+/// xervo model. The sparse encoder is symmetric (no `query_prefix`), unlike the
+/// dense path.
+async fn auto_embed_sparse_text(
+    host: &QueryProcedureHost,
+    label: &str,
+    property: &str,
+    query_text: &str,
+) -> DFResult<uni_sparse_vector::SparseVector> {
+    let storage = host.storage();
+    let uni_schema = storage.schema_manager().schema();
+    let embedding_config = uni_schema
+        .sparse_index_for_property(label, property)
+        .and_then(|cfg| cfg.embedding_config.clone())
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "Cannot auto-embed: sparse index for {label}.{property} has no embedding_config. \
+                 Either pass a sparse vector or create the index with embedding options."
+            ))
+        })?;
+
+    let runtime = host.xervo_runtime().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Cannot auto-embed: Uni-Xervo runtime not configured".to_string(),
+        )
+    })?;
+
+    let embedder = runtime
+        .sparse_embedder(&embedding_config.alias)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    let pairs = embedder
+        .embed(&[query_text])
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "Sparse embedding service returned no results".to_string(),
+            )
+        })?;
+    uni_sparse_vector::SparseVector::from_pairs(pairs).map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "Sparse embedding produced an invalid vector: {e}"
+        ))
     })
 }
 

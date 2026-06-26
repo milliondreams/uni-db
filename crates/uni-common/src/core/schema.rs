@@ -658,6 +658,24 @@ impl Schema {
         })
     }
 
+    /// Returns the scored sparse-vector index configuration for a label/property.
+    pub fn sparse_index_for_property(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<&SparseVectorIndexConfig> {
+        self.indexes.iter().find_map(|idx| {
+            if let IndexDefinition::Sparse(config) = idx
+                && config.label == label
+                && config.property == property
+                && config.metadata.status == IndexStatus::Online
+            {
+                return Some(config);
+            }
+            None
+        })
+    }
+
     /// Returns the full-text index configuration for a given label and property.
     ///
     /// A full-text index covers one or more properties. This returns the config
@@ -919,6 +937,11 @@ pub struct SparseVectorIndexConfig {
     /// Quantize stored weights to 8-bit (per-term scale). Default on.
     #[serde(default = "default_sparse_quantize")]
     pub quantize: bool,
+    /// Auto-embedding source. When set, a declared text column is embedded into
+    /// this sparse column via the xervo sparse model at write time (and a text
+    /// query is embedded at query time) — mirrors `VectorIndexConfig`.
+    #[serde(default)]
+    pub embedding_config: Option<EmbeddingConfig>,
     #[serde(default)]
     pub metadata: IndexMetadata,
 }

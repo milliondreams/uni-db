@@ -8405,12 +8405,19 @@ impl QueryPlanner {
                         .get("quantize")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
+                    // `OPTIONS{type:'sparse', embedding:{alias, source}}` auto-embeds
+                    // a text column into the sparse column (same parser as dense).
+                    let embedding_config = match c.options.get("embedding") {
+                        Some(emb_val) => Self::parse_embedding_config(emb_val)?,
+                        None => None,
+                    };
                     let config = SparseVectorIndexConfig {
                         name: c.name,
                         label: c.label,
                         property: c.property,
                         dimensions,
                         quantize,
+                        embedding_config,
                         metadata: Default::default(),
                     };
                     return Ok(LogicalPlan::CreateSparseIndex {

@@ -128,6 +128,7 @@ async fn setup_db(n: usize, quantize: bool) -> anyhow::Result<(Uni, Vec<Sparse>)
             IndexType::Sparse {
                 dimensions: VOCAB,
                 quantize,
+                embedding: None,
             },
         )
         .apply()

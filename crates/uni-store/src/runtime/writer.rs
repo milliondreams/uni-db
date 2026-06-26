@@ -70,6 +70,24 @@ struct EmbedGroupSpec {
     document_prefix: Option<String>,
     dense: Vec<String>,
     multi: Vec<String>,
+    sparse: Vec<String>,
+}
+
+/// Convert one xervo sparse embedding (`(term_id, weight)` pairs, possibly
+/// unsorted / with duplicate terms) into a `Value::SparseVector`. Sorting (via
+/// `BTreeMap`) and summing duplicates yields the sorted-unique invariant the
+/// index and codec require; non-finite weights are dropped (never poison a row).
+fn sparse_pairs_to_value(pairs: &[(u32, f32)]) -> Value {
+    let mut by_term: std::collections::BTreeMap<u32, f32> = std::collections::BTreeMap::new();
+    for &(term, weight) in pairs {
+        if weight.is_finite() {
+            *by_term.entry(term).or_insert(0.0) += weight;
+        }
+    }
+    Value::SparseVector {
+        indices: by_term.keys().copied().collect(),
+        values: by_term.values().copied().collect(),
+    }
 }
 
 /// Run ONE embedding inference for a coalesced group of auto-embed targets sharing an alias +
@@ -78,35 +96,69 @@ struct EmbedGroupSpec {
 /// (`hybrid_embedder`), so a multi-functional model (e.g. BGE-M3) produces the dense + ColBERT
 /// heads from a SINGLE forward pass; otherwise it uses the single-head dense / multi-vector
 /// embedder (today's behavior for non-mixed groups).
+#[allow(clippy::type_complexity)]
 async fn embed_group(
     runtime: &ModelRuntime,
     alias: &str,
     texts: &[&str],
     want_dense: bool,
     want_multi: bool,
-) -> Result<(Option<Vec<Vec<f32>>>, Option<Vec<Vec<Vec<f32>>>>)> {
+    want_sparse: bool,
+) -> Result<(
+    Option<Vec<Vec<f32>>>,
+    Option<Vec<Vec<Vec<f32>>>>,
+    Option<Vec<Vec<(u32, f32)>>>,
+)> {
     use uni_xervo::traits::hybrid::HeadSet;
-    if want_dense && want_multi {
-        // Single-pass hybrid: one model, one inference, both heads.
+    let heads_wanted = u8::from(want_dense) + u8::from(want_multi) + u8::from(want_sparse);
+    if heads_wanted > 1 {
+        // Single-pass hybrid: one model, one inference, all requested heads
+        // (e.g. BGE-M3 fills dense + sparse from one forward pass).
+        let mut heads = HeadSet::empty();
+        if want_dense {
+            heads |= HeadSet::DENSE;
+        }
+        if want_multi {
+            heads |= HeadSet::MULTI_VECTOR;
+        }
+        if want_sparse {
+            heads |= HeadSet::SPARSE;
+        }
         let embedder = runtime.hybrid_embedder(alias).await?;
-        let res = embedder
-            .embed(texts, HeadSet::DENSE | HeadSet::MULTI_VECTOR)
-            .await?;
-        let dense = res.dense.ok_or_else(|| {
-            anyhow!("hybrid model '{alias}' returned no dense head for a Vector target")
-        })?;
-        let multi = res.multi_vector.ok_or_else(|| {
-            anyhow!(
-                "hybrid model '{alias}' returned no multi-vector head for a List<Vector> target"
-            )
-        })?;
-        Ok((Some(dense), Some(multi)))
+        let res = embedder.embed(texts, heads).await?;
+        let dense = if want_dense {
+            Some(res.dense.ok_or_else(|| {
+                anyhow!("hybrid model '{alias}' returned no dense head for a Vector target")
+            })?)
+        } else {
+            None
+        };
+        let multi = if want_multi {
+            Some(res.multi_vector.ok_or_else(|| {
+                anyhow!(
+                    "hybrid model '{alias}' returned no multi-vector head for a List<Vector> target"
+                )
+            })?)
+        } else {
+            None
+        };
+        let sparse = if want_sparse {
+            Some(res.sparse.ok_or_else(|| {
+                anyhow!("hybrid model '{alias}' returned no sparse head for a SparseVector target")
+            })?)
+        } else {
+            None
+        };
+        Ok((dense, multi, sparse))
     } else if want_multi {
         let embedder = runtime.multi_vector_embedder(alias).await?;
-        Ok((None, Some(embedder.embed(texts).await?.vectors)))
+        Ok((None, Some(embedder.embed(texts).await?.vectors), None))
+    } else if want_sparse {
+        let embedder = runtime.sparse_embedder(alias).await?;
+        Ok((None, None, Some(embedder.embed(texts).await?.vectors)))
     } else {
         let embedder = runtime.embedding(alias).await?;
-        Ok((Some(embedder.embed(texts).await?.vectors), None))
+        Ok((Some(embedder.embed(texts).await?.vectors), None, None))
     }
 }
 
@@ -118,27 +170,81 @@ fn collect_embed_groups(
 ) -> std::collections::BTreeMap<(String, Vec<String>), EmbedGroupSpec> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(String, Vec<String>), EmbedGroupSpec> = BTreeMap::new();
+    fn spec_for<'a>(
+        groups: &'a mut std::collections::BTreeMap<(String, Vec<String>), EmbedGroupSpec>,
+        emb: &uni_common::core::schema::EmbeddingConfig,
+    ) -> &'a mut EmbedGroupSpec {
+        groups
+            .entry((emb.alias.clone(), emb.source_properties.clone()))
+            .or_insert_with(|| EmbedGroupSpec {
+                source_properties: emb.source_properties.clone(),
+                document_prefix: emb.document_prefix.clone(),
+                dense: Vec::new(),
+                multi: Vec::new(),
+                sparse: Vec::new(),
+            })
+    }
     for idx in &schema.indexes {
         if let IndexDefinition::Vector(v_config) = idx
             && v_config.label == label
             && let Some(emb) = &v_config.embedding_config
         {
-            let g = groups
-                .entry((emb.alias.clone(), emb.source_properties.clone()))
-                .or_insert_with(|| EmbedGroupSpec {
-                    source_properties: emb.source_properties.clone(),
-                    document_prefix: emb.document_prefix.clone(),
-                    dense: Vec::new(),
-                    multi: Vec::new(),
-                });
+            let g = spec_for(&mut groups, emb);
             if is_multivector_property(schema, label, &v_config.property) {
                 g.multi.push(v_config.property.clone());
             } else {
                 g.dense.push(v_config.property.clone());
             }
+        } else if let IndexDefinition::Sparse(s_config) = idx
+            && s_config.label == label
+            && let Some(emb) = &s_config.embedding_config
+        {
+            spec_for(&mut groups, emb)
+                .sparse
+                .push(s_config.property.clone());
         }
     }
     groups
+}
+
+/// On a partial / `SET` write, when the write touches a *source* property of an
+/// auto-embed group, drop that group's target columns from `props` so the
+/// `!contains_key` guard in `process_embeddings_*` re-embeds them (otherwise the
+/// re-read old embedding is preserved → stale), and add the targets to
+/// `touched_keys` so the partial Lance write persists the refresh. Mirrors the
+/// MUVERA derived-column touched-keys handling. A target the caller set
+/// explicitly in the SAME write (already in `touched_keys`) is left intact.
+fn refresh_touched_embed_targets(
+    schema: &uni_common::core::schema::Schema,
+    props: &mut Properties,
+    touched_keys: &mut HashSet<String>,
+    labels: &[String],
+) {
+    let Some(label) = labels.first() else {
+        return;
+    };
+    let user_touched = touched_keys.clone();
+    for (_key, group) in collect_embed_groups(schema, label) {
+        if !group
+            .source_properties
+            .iter()
+            .any(|s| touched_keys.contains(s))
+        {
+            continue;
+        }
+        for target in group
+            .dense
+            .iter()
+            .chain(group.multi.iter())
+            .chain(group.sparse.iter())
+        {
+            if user_touched.contains(target) {
+                continue;
+            }
+            props.remove(target);
+            touched_keys.insert(target.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2652,6 +2758,20 @@ impl Writer {
     /// When `UniConfig::partial_lance_writes == false`, falls through
     /// to `insert_vertex_with_labels` (Append) — preserving bit-for-bit
     /// equivalence with prior releases.
+    /// Refresh auto-embed targets for a partial / `SET` write whose `touched_keys`
+    /// include an embed *source* column: drop stale target embeddings from `props`
+    /// (so they re-embed) and add them to `touched_keys`. Public so the query
+    /// executor can apply it on the coalesced write **before** the partial-vs-full
+    /// branch — both branches need it. No-op for non-SET writes / non-embed labels.
+    pub fn refresh_embed_targets(
+        &self,
+        props: &mut Properties,
+        touched_keys: &mut HashSet<String>,
+        labels: &[String],
+    ) {
+        refresh_touched_embed_targets(&self.schema_manager.schema(), props, touched_keys, labels);
+    }
+
     #[instrument(skip(self, props, touched_keys, labels), level = "trace")]
     pub async fn insert_vertex_partial_full(
         &self,
@@ -3337,11 +3457,20 @@ impl Writer {
         let schema = self.schema_manager.schema();
         let mut has_unsatisfied_cfg = false;
         for idx in &schema.indexes {
-            if let IndexDefinition::Vector(v_cfg) = idx
-                && v_cfg.label == *label
-                && v_cfg.embedding_config.is_some()
-                && !properties.contains_key(&v_cfg.property)
-            {
+            let unsatisfied = match idx {
+                IndexDefinition::Vector(v_cfg) => {
+                    v_cfg.label == *label
+                        && v_cfg.embedding_config.is_some()
+                        && !properties.contains_key(&v_cfg.property)
+                }
+                IndexDefinition::Sparse(s_cfg) => {
+                    s_cfg.label == *label
+                        && s_cfg.embedding_config.is_some()
+                        && !properties.contains_key(&s_cfg.property)
+                }
+                _ => false,
+            };
+            if unsatisfied {
                 has_unsatisfied_cfg = true;
                 break;
             }
@@ -3496,6 +3625,7 @@ impl Writer {
             let alias = &key.0;
             let want_dense = !group.dense.is_empty();
             let want_multi = !group.multi.is_empty();
+            let want_sparse = !group.sparse.is_empty();
 
             // A row needs this group's inference if it has the source text and is still missing
             // at least one of the group's target columns (user-supplied values are preserved).
@@ -3506,6 +3636,7 @@ impl Writer {
                     .dense
                     .iter()
                     .chain(group.multi.iter())
+                    .chain(group.sparse.iter())
                     .all(|t| properties.contains_key(t));
                 if all_present {
                     continue;
@@ -3538,8 +3669,15 @@ impl Writer {
                 .get()
                 .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
             let input_refs: Vec<&str> = input_texts.iter().map(|s| s.as_str()).collect();
-            let (dense, multi) =
-                embed_group(runtime, alias, &input_refs, want_dense, want_multi).await?;
+            let (dense, multi, sparse) = embed_group(
+                runtime,
+                alias,
+                &input_refs,
+                want_dense,
+                want_multi,
+                want_sparse,
+            )
+            .await?;
 
             for (i, &row) in needs.iter().enumerate() {
                 if let Some(vec) = dense.as_ref().and_then(|d| d.get(i)) {
@@ -3555,6 +3693,14 @@ impl Writer {
                     for t in &group.multi {
                         if !properties_batch[row].contains_key(t) {
                             properties_batch[row].insert(t.clone(), mv.clone());
+                        }
+                    }
+                }
+                if let Some(pairs) = sparse.as_ref().and_then(|s| s.get(i)) {
+                    let sv = sparse_pairs_to_value(pairs);
+                    for t in &group.sparse {
+                        if !properties_batch[row].contains_key(t) {
+                            properties_batch[row].insert(t.clone(), sv.clone());
                         }
                     }
                 }
@@ -3590,6 +3736,7 @@ impl Writer {
                 .dense
                 .iter()
                 .chain(group.multi.iter())
+                .chain(group.sparse.iter())
                 .all(|t| properties.contains_key(t))
             {
                 continue;
@@ -3618,8 +3765,16 @@ impl Writer {
                 .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
             let want_dense = !group.dense.is_empty();
             let want_multi = !group.multi.is_empty();
-            let (dense, multi) =
-                embed_group(runtime, alias, &[text.as_str()], want_dense, want_multi).await?;
+            let want_sparse = !group.sparse.is_empty();
+            let (dense, multi, sparse) = embed_group(
+                runtime,
+                alias,
+                &[text.as_str()],
+                want_dense,
+                want_multi,
+                want_sparse,
+            )
+            .await?;
 
             if let Some(vec) = dense.as_ref().and_then(|d| d.first()) {
                 let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
@@ -3634,6 +3789,14 @@ impl Writer {
                 for t in &group.multi {
                     if !properties.contains_key(t) {
                         properties.insert(t.clone(), mv.clone());
+                    }
+                }
+            }
+            if let Some(pairs) = sparse.as_ref().and_then(|s| s.first()) {
+                let sv = sparse_pairs_to_value(pairs);
+                for t in &group.sparse {
+                    if !properties.contains_key(t) {
+                        properties.insert(t.clone(), sv.clone());
                     }
                 }
             }

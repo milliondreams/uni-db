@@ -381,6 +381,14 @@ async fn create_index_internal(
                         "Property '{prop_name}' is not a SparseVector column; cannot create a sparse index"
                     ),
                 })?;
+            // Auto-embed config, same shape as the VECTOR arm.
+            let embedding_config = config.embedding.as_ref().map(|emb| EmbeddingConfig {
+                alias: emb.alias.clone(),
+                source_properties: emb.source.clone(),
+                batch_size: emb.batch_size,
+                document_prefix: emb.document_prefix.clone(),
+                query_prefix: emb.query_prefix.clone(),
+            });
             IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
                 name: index_name,
                 label: label.to_string(),
@@ -388,6 +396,7 @@ async fn create_index_internal(
                 dimensions,
                 // `OPTIONS{type:'sparse', quantize:false}` stores lossless f32.
                 quantize: config.quantize.unwrap_or(true),
+                embedding_config,
                 metadata: Default::default(),
             })
         }

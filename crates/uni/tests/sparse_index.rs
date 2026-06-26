@@ -130,6 +130,7 @@ async fn define_schema_quantize(db: &Uni, quantize: bool) -> anyhow::Result<()> 
             IndexType::Sparse {
                 dimensions: VOCAB,
                 quantize,
+                embedding: None,
             },
         )
         .apply()

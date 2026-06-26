@@ -328,12 +328,14 @@ impl<'a> LabelBuilder<'a> {
             IndexType::Sparse {
                 dimensions,
                 quantize,
+                embedding,
             } => IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
                 name: format!("idx_{}_{}", self.name, property),
                 label: self.name.clone(),
                 property: property.to_string(),
                 dimensions,
                 quantize,
+                embedding_config: embedding.map(EmbeddingCfg::into_internal),
                 metadata: Default::default(),
             }),
         };
@@ -510,22 +512,36 @@ pub enum IndexType {
     Inverted(uni_common::core::schema::InvertedIndexConfig),
     /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
     /// term-space cardinality of the column; `quantize` stores 8-bit per-term
-    /// quantized weights (≈ lossless, ~4× smaller; default on).
+    /// quantized weights (≈ lossless, ~4× smaller; default on); `embedding`
+    /// auto-embeds a text column into the sparse column via a xervo sparse model.
     Sparse {
         dimensions: usize,
         quantize: bool,
+        embedding: Option<EmbeddingCfg>,
     },
 }
 
 impl IndexType {
     /// A sparse-vector index over a `dimensions`-wide term space with 8-bit
     /// weight quantization enabled (the default; use the [`IndexType::Sparse`]
-    /// struct variant directly to disable it).
+    /// struct variant directly to disable it or to set auto-embedding).
     #[must_use]
     pub fn sparse(dimensions: usize) -> Self {
         Self::Sparse {
             dimensions,
             quantize: true,
+            embedding: None,
+        }
+    }
+
+    /// A sparse-vector index that auto-embeds a text column into the sparse
+    /// column via the given xervo sparse model (quantization on).
+    #[must_use]
+    pub fn sparse_with_embedding(dimensions: usize, embedding: EmbeddingCfg) -> Self {
+        Self::Sparse {
+            dimensions,
+            quantize: true,
+            embedding: Some(embedding),
         }
     }
 }

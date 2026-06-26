@@ -836,6 +836,8 @@ pub fn create_index_definition_from_config(
                     property: property.to_string(),
                     dimensions,
                     quantize: true,
+                    // OGM auto-embed is out of scope (no modality exposes it via OGM yet).
+                    embedding_config: None,
                     metadata: Default::default(),
                 },
             ))

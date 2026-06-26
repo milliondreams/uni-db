@@ -169,6 +169,16 @@ pub struct L0Buffer {
     /// WAL LSN at the time this L0 was rotated for flush.
     /// Used to ensure WAL truncation doesn't remove entries needed by pending flushes.
     pub wal_lsn_at_flush: u64,
+    /// WAL LSN at the time this L0 became active (the previous rotation point).
+    ///
+    /// Everything at or below this LSN is durable in L1 before this buffer's own
+    /// data begins; while the buffer is pending flush its committed WAL entries
+    /// live strictly ABOVE it. It is therefore the floor below which WAL
+    /// truncation and a published `wal_high_water_mark` may safely advance —
+    /// using `wal_lsn_at_flush` (the high watermark) there would discard a
+    /// pending buffer's own not-yet-flushed entries (lost-commit on a graceful
+    /// close after a failed flush).
+    pub wal_lsn_at_start: u64,
     /// Vertex creation timestamps (nanoseconds since epoch)
     pub vertex_created_at: HashMap<Vid, i64>,
     /// Vertex update timestamps (nanoseconds since epoch)
@@ -270,6 +280,7 @@ impl Clone for L0Buffer {
             mutation_stats: self.mutation_stats.clone(),
             wal: None, // Forked L0s don't share the WAL
             wal_lsn_at_flush: self.wal_lsn_at_flush,
+            wal_lsn_at_start: self.wal_lsn_at_start,
             vertex_created_at: self.vertex_created_at.clone(),
             vertex_updated_at: self.vertex_updated_at.clone(),
             edge_created_at: self.edge_created_at.clone(),
@@ -502,6 +513,7 @@ impl L0Buffer {
             mutation_stats: MutationStats::default(),
             wal,
             wal_lsn_at_flush: 0,
+            wal_lsn_at_start: 0,
             vertex_created_at: HashMap::new(),
             vertex_updated_at: HashMap::new(),
             edge_created_at: HashMap::new(),

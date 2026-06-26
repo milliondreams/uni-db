@@ -205,42 +205,37 @@ async fn sparse_crash_before_wal_recovers_nothing() -> Result<()> {
     Ok(())
 }
 
-/// A crash mid-flush (panic after the L0 rotation, before the Lance write) must
-/// not corrupt or double-apply the *already-flushed* sparse data: the prior
-/// flushed match survives intact and exactly once, and the sparse index rebuilds
-/// cleanly over the recovered rows. Targets the `flush::after-rotate-before-lance`
-/// seam — the no-double-apply / consistency half of proposal §12.F.
+/// A crash mid-flush (panic after the L0 rotation, before the Lance write) loses
+/// no committed data: both the flushed `base` and the committed-but-unflushed
+/// `delta` (which sat in the rotated buffer the crash abandoned) survive reopen,
+/// each exactly once, and the index rebuilds cleanly. Targets the
+/// `flush::after-rotate-before-lance` seam.
 ///
-/// Scope note: a committed-but-unflushed delta sitting in the rotated buffer is
-/// NOT asserted to survive here. Empirically, after this graceful-drop-following-
-/// a-panicked-flush, only the flushed rows recover (the rotated delta is gone).
-/// Whether that reproduces under a real (non-graceful) crash — where no `Drop`
-/// runs and recovery replays the WAL from the last manifest's
-/// `wal_high_water_mark` — is a separate, engine-wide durability question
-/// outside the sparse scope; see the set F notes in the proposal.
+/// Regression for the lost-commit durability bug: a graceful close after a
+/// failed flush truncated the delta's WAL segment and published a
+/// `wal_high_water_mark` past it (WAL truncation + checkpoint keyed off the
+/// pending buffer's HIGH watermark instead of its START watermark), so an
+/// acknowledged commit vanished on reopen. See `l0_manager::min_pending_wal_lsn_start`.
 #[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sparse_crash_during_flush_preserves_flushed_data() -> Result<()> {
+async fn sparse_crash_during_flush_loses_no_committed_data() -> Result<()> {
     let h = DiskHarness::new()?;
+    let delta_emb = Value::SparseVector {
+        indices: vec![1, 5],
+        values: vec![0.4, 0.4],
+    };
     {
         let db = Arc::new(h.open().await?);
         define_sparse_schema(&db).await?;
         // `base` is an exact match for the query, flushed durably before the crash.
         insert_doc(&db, "base", target_emb()).await?;
         db.flush().await?;
-        // An unflushed delta the crashing flush will be mid-rotating.
-        insert_doc(
-            &db,
-            "delta",
-            Value::SparseVector {
-                indices: vec![1, 5],
-                values: vec![0.4, 0.4],
-            },
-        )
-        .await?;
+        // `delta` is committed (acknowledged) but unflushed — it is the doc the
+        // crashing flush is mid-rotating when it panics.
+        insert_doc(&db, "delta", delta_emb.clone()).await?;
         // Flush panics at the seam: L0 is rotated to pending but never written to
-        // Lance, and the WAL is left intact (truncation only follows a clean
-        // Lance write).
+        // Lance. The rotated buffer's WAL data must NOT be truncated nor
+        // checkpointed past on the subsequent graceful close.
         fail::cfg("flush::after-rotate-before-lance", "panic").unwrap();
         let dbf = db.clone();
         let res = tokio::spawn(async move { dbf.flush().await }).await;
@@ -249,29 +244,38 @@ async fn sparse_crash_during_flush_preserves_flushed_data() -> Result<()> {
         drop(db);
     }
     let db = h.open().await?;
-    // The flushed `base` survives intact (decodes losslessly) ...
+    // Both the flushed base and the committed-but-unflushed delta survive.
     assert_eq!(
         read_emb(&db, "base").await?,
         Some(target_emb()),
-        "flushed sparse doc corrupted by crash-during-flush"
+        "flushed sparse doc lost across crash-during-flush"
     );
-    // ... and exactly once (no double-apply from the partial flush + reopen).
-    let base_count = db
-        .session()
-        .query("MATCH (d:Doc {title: 'base'}) RETURN d.title AS title")
-        .await?
-        .rows()
-        .len();
     assert_eq!(
-        base_count, 1,
-        "flushed sparse doc double-applied across crash-during-flush"
+        read_emb(&db, "delta").await?,
+        Some(delta_emb),
+        "committed-but-unflushed sparse doc lost across crash-during-flush (lost-commit regression)"
     );
-    // The sparse index rebuilds cleanly and the flushed match is retrievable.
+    // Neither is double-applied by the partial-flush + WAL-replay interplay.
+    for title in ["base", "delta"] {
+        let n = db
+            .session()
+            .query_with("MATCH (d:Doc {title: $t}) RETURN d.title AS title")
+            .param("t", Value::String(title.to_string()))
+            .fetch_all()
+            .await?
+            .rows()
+            .len();
+        assert_eq!(
+            n, 1,
+            "{title} double-applied across crash-during-flush recovery"
+        );
+    }
+    // The sparse index rebuilds cleanly over the recovered rows.
     db.indexes().rebuild("Doc", false).await?;
     assert_eq!(
         top_sparse_title(&db).await?.as_deref(),
         Some("base"),
-        "flushed sparse doc not retrievable through a rebuilt index after crash-during-flush"
+        "recovered top sparse match wrong after crash-during-flush"
     );
     Ok(())
 }

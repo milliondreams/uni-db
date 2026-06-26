@@ -3857,6 +3857,12 @@ impl Writer {
             let mut new_l0_guard = new_l0_arc.write();
             new_l0_guard.wal = wal;
             new_l0_guard.current_version = current_version;
+            // The new active buffer starts accumulating strictly above the
+            // rotation point: everything <= `wal_lsn` is now owned by the old
+            // (being-flushed) buffer or earlier. This start watermark is the
+            // floor that keeps WAL truncation / checkpoint publication from
+            // discarding this buffer's data if its eventual flush fails.
+            new_l0_guard.wal_lsn_at_start = wal_lsn;
         }
 
         Ok(RotateOutput {
@@ -4130,7 +4136,16 @@ impl Writer {
         manifest.name = name;
         manifest.created_at = Utc::now();
         manifest.version_high_water_mark = current_version;
-        manifest.wal_high_water_mark = wal_lsn;
+        // Cap the published WAL checkpoint at the floor of any OTHER pending
+        // flush. A still-pending flush (notably one that FAILED and left its
+        // buffer in `pending_flush`) holds committed WAL entries above its start
+        // that are NOT in this snapshot; recovery replays from this mark, so
+        // claiming durability past that floor would skip them (lost commit). A
+        // normal flush with no other pending buffer keeps `wal_lsn` unchanged.
+        manifest.wal_high_water_mark = self
+            .l0_manager
+            .min_pending_wal_lsn_start(&old_l0_arc)
+            .map_or(wal_lsn, |floor| floor.min(wal_lsn));
         let snapshot_id = manifest.snapshot_id.clone();
 
         tracing::Span::current().record("snapshot_id", &snapshot_id);
@@ -4923,14 +4938,18 @@ impl Writer {
         // read after flush finalize).
         fail::fail_point!("flush::after-complete-before-cache-clear");
 
-        // K. Truncate WAL up to the safe LSN.
+        // K. Truncate WAL up to the safe LSN. The floor is the START watermark
+        // of any OTHER pending flush (this flush's own buffer was removed from
+        // pending by `complete_flush` in J, so it is excluded): a pending — e.g.
+        // failed — flush's committed entries live above its start and are not yet
+        // in L1, so truncating to its high watermark would delete its own data
+        // (the lost-commit-on-graceful-close bug).
         let wal_handle = shared.l0_manager.get_current().read().wal.clone();
         if let Some(w) = wal_handle {
             let safe_lsn = shared
                 .l0_manager
-                .min_pending_wal_lsn()
-                .map(|min_pending| min_pending.min(wal_lsn))
-                .unwrap_or(wal_lsn);
+                .min_pending_wal_lsn_start(&old_l0_arc)
+                .map_or(wal_lsn, |floor| floor.min(wal_lsn));
             w.truncate_before(safe_lsn).await?;
         }
 

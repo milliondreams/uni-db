@@ -3488,7 +3488,12 @@ impl UniBuilder {
             })
             .collect();
 
-        if !required_embed_aliases.is_empty() && self.xervo_catalog.is_none() {
+        // A prebuilt runtime (`.xervo_runtime(...)`) already carries its catalog, so it
+        // satisfies the embedding-alias requirement just as a `.xervo_catalog(...)` does.
+        if !required_embed_aliases.is_empty()
+            && self.xervo_catalog.is_none()
+            && self.prebuilt_xervo_runtime.is_none()
+        {
             return Err(UniError::Internal(anyhow::anyhow!(
                 "Uni-Xervo catalog is required because schema has vector indexes with embedding aliases"
             )));

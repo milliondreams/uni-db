@@ -2402,16 +2402,24 @@ fn extract_vid_score_pairs(
     Ok(results)
 }
 
-/// Extracts a `Vec<f32>` from a JSON property value.
+/// Extracts a dense `Vec<f32>` embedding from an L0 property value.
 ///
-/// Returns `None` if the property is missing, not an array, or contains
-/// non-numeric elements.
+/// Accepts both representations of a dense vector: the typed
+/// [`Value::Vector`] (what the Cypher write path stores) and a
+/// [`Value::List`] of numbers (the JSON-ingest representation), via the
+/// canonical `TryFrom<&Value>` converter. Returns `None` if the property is
+/// missing or not coercible to a numeric vector.
+///
+/// # Why both variants
+///
+/// Real Cypher writes land dense embeddings in L0 as `Value::Vector`; scoring
+/// L0 candidates off only `Value::List` silently dropped every such candidate,
+/// so committed-but-unflushed inserts/updates were invisible to dense search.
 fn extract_embedding_from_props(
     props: &uni_common::Properties,
     property: &str,
 ) -> Option<Vec<f32>> {
-    let arr = props.get(property)?.as_array()?;
-    arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect()
+    Vec::<f32>::try_from(props.get(property)?).ok()
 }
 
 /// Merges L0 buffer vertices into LanceDB vector search results.

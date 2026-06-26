@@ -1,0 +1,554 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Dragonscale Team
+
+//! E2E correctness tests for the dense-vector (KNN) index — parity with the
+//! gold-standard sparse suite (`sparse_index.rs`).
+//!
+//! A `Vector` column + a `Flat` (exact, brute-force) Cosine index, queried via
+//! `uni.vector.query`. The doc titled `"target"` has `emb == query`, so it is the
+//! unique cosine maximizer; the engine's reported `score` is the EXACT
+//! `(2 - cosine_distance) / 2 == (1 + cosine_similarity) / 2`, validated against
+//! an independent brute-force oracle over the same corpus. Covers the backfill and
+//! create-before-ingest build paths, the L0 (no-flush) union path, L0 update /
+//! tombstone (MVCC) visibility, snapshot isolation, restart durability, the Cypher
+//! DDL build path, and dense-property projection.
+//!
+//! `Flat` is chosen deliberately: it is an exact KNN, so the score is oracle-exact
+//! on every path (no ANN approximation), matching the sparse suite's bar.
+
+use uni_db::{DataType, IndexType, Uni, Value, VectorAlgo, VectorIndexCfg, VectorMetric};
+
+/// Vector dimensionality — small enough for fast tests, large enough that random
+/// `[-1, 1]` vectors are near-orthogonal so the `target` self-match (cos = 1) is a
+/// clear, unique maximizer.
+const DIM: usize = 16;
+
+struct Rng(u64);
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// A component in `[-1, 1)`, so cosine similarity spans the full range and
+    /// random docs cluster near orthogonal (score ≈ 0.5).
+    fn component(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+    }
+}
+
+/// A dense vector.
+type Dense = Vec<f32>;
+
+fn random_dense(rng: &mut Rng) -> Dense {
+    (0..DIM).map(|_| rng.component()).collect()
+}
+
+/// The fixed query vector (distinct non-trivial components).
+fn query_vec() -> Dense {
+    (0..DIM).map(|i| ((i as f32) - 7.5) / 8.0).collect()
+}
+
+fn vec_value(v: &Dense) -> Value {
+    Value::Vector(v.clone())
+}
+
+/// Brute-force cosine-derived score ground truth in f64: `(1 + cos(q, d)) / 2`,
+/// the exact value [`uni_query_functions::similar_to::calculate_score`] produces
+/// for a `Cosine` metric (Lance returns `1 - cos` as the distance). Higher is
+/// better; range `[0, 1]`; a self-match scores `1.0`.
+fn dense_score_oracle(q: &Dense, d: &Dense) -> f64 {
+    let dot: f64 = q.iter().zip(d).map(|(&x, &y)| x as f64 * y as f64).sum();
+    let nq = q.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    let nd = d.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    let cos = if nq == 0.0 || nd == 0.0 {
+        0.0
+    } else {
+        dot / (nq * nd)
+    };
+    (1.0 + cos) / 2.0
+}
+
+/// Deterministic corpus: doc `n/2` titled `target` has `emb == query` (the unique
+/// cosine maximizer); the rest are random vectors. Returned so a test can compute
+/// the oracle over the exact same data.
+fn build_corpus(n: usize, seed: u64) -> Vec<(String, Dense)> {
+    let q = query_vec();
+    let mut rng = Rng(seed);
+    (0..n)
+        .map(|i| {
+            if i == n / 2 {
+                ("target".to_string(), q.clone())
+            } else {
+                (format!("doc{i}"), random_dense(&mut rng))
+            }
+        })
+        .collect()
+}
+
+async fn define_schema(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("emb", DataType::Vector { dimensions: DIM })
+        .index("emb", flat_cosine())
+        .apply()
+        .await?;
+    Ok(())
+}
+
+/// Schema with the vector column but NO index (for create-before-ingest / backfill,
+/// where the index is added separately).
+async fn define_schema_no_index(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("emb", DataType::Vector { dimensions: DIM })
+        .apply()
+        .await?;
+    Ok(())
+}
+
+async fn add_index(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .index("emb", flat_cosine())
+        .apply()
+        .await?;
+    Ok(())
+}
+
+/// The exact, brute-force KNN index used throughout (oracle-exact scores).
+fn flat_cosine() -> IndexType {
+    IndexType::Vector(VectorIndexCfg {
+        algorithm: VectorAlgo::Flat,
+        metric: VectorMetric::Cosine,
+        embedding: None,
+    })
+}
+
+async fn insert_docs(db: &Uni, docs: &[(String, Dense)], flush: bool) -> anyhow::Result<()> {
+    let tx = db.session().tx().await?;
+    for (title, dense) in docs {
+        tx.execute_with("CREATE (:Doc {title: $title, emb: $emb})")
+            .param("title", Value::String(title.clone()))
+            .param("emb", vec_value(dense))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    if flush {
+        db.flush().await?;
+    }
+    Ok(())
+}
+
+/// Run `uni.vector.query` for the standard query and return `(title, score)` in
+/// engine rank order.
+async fn query_results(db: &Uni, k: usize) -> anyhow::Result<Vec<(String, f64)>> {
+    let rows = db
+        .session()
+        .query_with(
+            "CALL uni.vector.query('Doc', 'emb', $q, $k, null, null, {}) \
+             YIELD node, score RETURN node.title AS title, score",
+        )
+        .param("q", vec_value(&query_vec()))
+        .param("k", Value::Int(k as i64))
+        .fetch_all()
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
+        .collect())
+}
+
+/// Assert engine results match the brute-force oracle: every returned doc carries
+/// its EXACT cosine score, results are descending, and the top score equals the
+/// oracle maximum (the `target` self-match at `1.0`).
+fn assert_matches_oracle(engine: &[(String, f64)], corpus: &[(String, Dense)]) {
+    const EPS: f64 = 1e-3;
+    let q = query_vec();
+    let oracle: std::collections::HashMap<&str, f64> = corpus
+        .iter()
+        .map(|(t, d)| (t.as_str(), dense_score_oracle(&q, d)))
+        .collect();
+
+    for (title, score) in engine {
+        let want = oracle
+            .get(title.as_str())
+            .unwrap_or_else(|| panic!("engine returned a title not in the corpus: {title:?}"));
+        assert!(
+            (score - want).abs() < EPS,
+            "exact cosine-score mismatch for {title:?}: engine={score} oracle={want}"
+        );
+    }
+    for w in engine.windows(2) {
+        assert!(
+            w[0].1 >= w[1].1 - EPS,
+            "results not in descending score order: {engine:?}"
+        );
+    }
+    let oracle_max = oracle.values().cloned().fold(f64::MIN, f64::max);
+    if let Some((_, top)) = engine.first() {
+        assert!(
+            (top - oracle_max).abs() < EPS,
+            "top score {top} != oracle max {oracle_max}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_backfill_then_query_matches_oracle() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    let corpus = build_corpus(60, 0xD1CE_5EED);
+    insert_docs(&db, &corpus, true).await?; // flush so the backfill scan sees rows
+    add_index(&db).await?; // backfill build path
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "target (emb == query) must rank first: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_create_before_ingest_matches_oracle() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?; // index created on empty label
+    let corpus = build_corpus(60, 0xBEEF_F00D);
+    insert_docs(&db, &corpus, true).await?; // flush populates the index incrementally
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "flush-maintained index should retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_index_via_cypher_create_vector_index() -> anyhow::Result<()> {
+    // `CREATE VECTOR INDEX ... OPTIONS{type:'flat', metric:'cosine'}` builds a dense
+    // KNN index (the default modality), create-before-ingest.
+    let db = Uni::temporary().build().await?;
+    define_schema_no_index(&db).await?;
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE VECTOR INDEX emb_idx FOR (d:Doc) ON (d.emb) \
+         OPTIONS {type: 'flat', metric: 'cosine'}",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let corpus = build_corpus(50, 0xC17E_0095);
+    insert_docs(&db, &corpus, true).await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "Cypher-created dense index must retrieve the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// L0 union / flush equivalence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_l0_only_no_flush_matches_oracle() -> anyhow::Result<()> {
+    // No flush: all rows live in L0. The query path must union L0 candidates and
+    // re-score them, so results are correct without an index dataset on disk.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(40, 0x0A0A_0A0A);
+    insert_docs(&db, &corpus, false).await?;
+
+    let results = query_results(&db, 10).await?;
+    assert_eq!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "L0-only query must find the target: {results:?}"
+    );
+    assert_matches_oracle(&results, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_flush_equivalence() -> anyhow::Result<()> {
+    // The ranking must be identical before and after a flush (consistency across
+    // the L0 and flushed-index paths).
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(50, 0xF1F1_F1F1);
+    insert_docs(&db, &corpus, false).await?;
+    let before = query_results(&db, 10).await?;
+    db.flush().await?;
+    let after = query_results(&db, 10).await?;
+
+    let names_before: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
+    let names_after: Vec<&str> = after.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        names_before, names_after,
+        "ranking changed across flush: {names_before:?} vs {names_after:?}"
+    );
+    assert_matches_oracle(&after, &corpus);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// L0 MVCC visibility — update / tombstone
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_l0_update_last_writer_wins() -> anyhow::Result<()> {
+    // Flush a corpus, then in L0 overwrite `target`'s emb with `-query` (cosine
+    // -1 → score 0). The stale flushed vector would still rank it first, but the
+    // re-score must use the fresh L0 value → it drops out of the top.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(30, 0xABCD_1234);
+    insert_docs(&db, &corpus, true).await?;
+
+    let anti: Dense = query_vec().iter().map(|&x| -x).collect();
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (d:Doc {title: 'target'}) SET d.emb = $emb")
+        .param("emb", vec_value(&anti))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let results = query_results(&db, 10).await?;
+    let target_score = results.iter().find(|(t, _)| t == "target").map(|(_, s)| *s);
+    // target is now anti-parallel to the query → score ≈ 0; with random docs near
+    // 0.5 it falls out of the top-k entirely.
+    assert!(
+        target_score.map(|s| s < 0.1).unwrap_or(true),
+        "after L0 update target should no longer rank near the query: {target_score:?}"
+    );
+    assert_ne!(
+        results.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "anti-parallel target must not rank first: {results:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_l0_tombstone_hides_flushed_doc() -> anyhow::Result<()> {
+    // Flush a corpus, then delete `target` in L0. A tombstone must hide it from
+    // results even though its flushed vector still maximizes the query.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(30, 0x5555_AAAA);
+    insert_docs(&db, &corpus, true).await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (d:Doc {title: 'target'}) DELETE d")
+        .await?;
+    tx.commit().await?;
+
+    let results = query_results(&db, 10).await?;
+    assert!(
+        !results.iter().any(|(t, _)| t == "target"),
+        "tombstoned target must not appear in results: {results:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Restart / reopen durability
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_persists_across_reopen() -> anyhow::Result<()> {
+    // Build + flush the index, drop the db, reopen the same on-disk path, and
+    // assert the query returns an identical, oracle-exact ranking.
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().to_str().unwrap();
+    let corpus = build_corpus(60, 0xD00D_FEED);
+
+    let before = {
+        let db = Uni::open(path).build().await?;
+        define_schema(&db).await?;
+        insert_docs(&db, &corpus, true).await?;
+        let r = query_results(&db, 10).await?;
+        assert_eq!(r.first().map(|(t, _)| t.as_str()), Some("target"));
+        assert_matches_oracle(&r, &corpus);
+        drop(db);
+        r
+    };
+
+    let db = Uni::open(path).build().await?;
+    let after = query_results(&db, 10).await?;
+    let names_before: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
+    let names_after: Vec<&str> = after.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        names_before, names_after,
+        "ranking changed across reopen: {names_before:?} vs {names_after:?}"
+    );
+    assert_matches_oracle(&after, &corpus);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dense_wal_replay_after_reopen_unflushed_delta() -> anyhow::Result<()> {
+    // Durability of UNFLUSHED dense writes through the WAL. Flush a base batch
+    // first (creates the manifest), then commit a delta — including `target` —
+    // WITHOUT flushing, then drop + reopen. The recovered rows land in L0 and the
+    // vector read path unions them, so the query returns `target` first with EXACT
+    // oracle scores (no index rebuild).
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().to_str().unwrap();
+
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+    let base: Vec<(String, Dense)> = (0..20)
+        .map(|i| (format!("base{i}"), random_dense(&mut rng)))
+        .collect();
+    let mut delta: Vec<(String, Dense)> = vec![("target".to_string(), query_vec())];
+    for i in 0..5 {
+        delta.push((format!("delta{i}"), random_dense(&mut rng)));
+    }
+
+    {
+        let db = Uni::open(path).build().await?;
+        define_schema(&db).await?;
+        insert_docs(&db, &base, true).await?; // flush → manifest
+        insert_docs(&db, &delta, false).await?; // commit only, in WAL
+        let r = query_results(&db, 10).await?;
+        assert_eq!(r.first().map(|(t, _)| t.as_str()), Some("target"));
+        drop(db);
+    }
+
+    let db = Uni::open(path).build().await?;
+    let after = query_results(&db, 10).await?;
+    assert_eq!(
+        after.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "after WAL recovery, recovered dense data must be queryable with no rebuild: {after:?}"
+    );
+    let full: Vec<(String, Dense)> = base.into_iter().chain(delta).collect();
+    assert_matches_oracle(&after, &full);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MVCC snapshot isolation
+// ---------------------------------------------------------------------------
+
+/// Run `uni.vector.query` inside a transaction's pinned snapshot.
+async fn query_results_tx(tx: &uni_db::Transaction, k: usize) -> anyhow::Result<Vec<String>> {
+    let rows = tx
+        .query_with(
+            "CALL uni.vector.query('Doc', 'emb', $q, $k, null, null, {}) \
+             YIELD node, score RETURN node.title AS title",
+        )
+        .param("q", vec_value(&query_vec()))
+        .param("k", Value::Int(k as i64))
+        .fetch_all()
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<String>("title").unwrap())
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dense_snapshot_isolates_reader_from_concurrent_insert() -> anyhow::Result<()> {
+    // A reader transaction pins its snapshot at begin. A concurrent writer inserts
+    // a new doc that maximizes the query and commits. The reader, querying within
+    // its pinned snapshot, must NOT see the new doc.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let corpus = build_corpus(20, 0x5A4B_3C2D_1E0F_9876);
+    insert_docs(&db, &corpus, true).await?;
+
+    let s_r = db.session();
+    let tx_r = s_r.tx().await?;
+    let before = query_results_tx(&tx_r, 50).await?;
+    assert!(
+        before.contains(&"target".to_string()),
+        "snapshot sees the seed corpus"
+    );
+
+    {
+        let s_w = db.session();
+        let tx_w = s_w.tx().await?;
+        tx_w.execute_with("CREATE (:Doc {title: $title, emb: $emb})")
+            .param("title", Value::String("late_arrival".to_string()))
+            .param("emb", vec_value(&query_vec()))
+            .run()
+            .await?;
+        tx_w.commit().await?;
+    }
+
+    let after = query_results_tx(&tx_r, 50).await?;
+    assert!(
+        !after.contains(&"late_arrival".to_string()),
+        "reader snapshot must be isolated from the concurrent insert: {after:?}"
+    );
+
+    let live = query_results(&db, 50).await?;
+    assert!(
+        live.iter().any(|(t, _)| t == "late_arrival"),
+        "live view should see the committed insert: {live:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Result-surface — projecting a dense vector in RETURN
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dense_property_projection_in_return() -> anyhow::Result<()> {
+    // `RETURN d.emb` must materialise the dense `Value::Vector` result column (not
+    // fall back to a Utf8 string column). Covers both the L0 and flushed paths.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    let q = query_vec();
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Doc {title: 'p', emb: $emb})")
+        .param("emb", vec_value(&q))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    for flush in [false, true] {
+        if flush {
+            db.flush().await?;
+        }
+        let rows = db
+            .session()
+            .query("MATCH (d:Doc {title: 'p'}) RETURN d.emb AS emb")
+            .await?;
+        assert_eq!(rows.rows().len(), 1);
+        match rows.rows()[0].value("emb") {
+            Some(Value::Vector(v)) => {
+                assert_eq!(v, &q, "projected dense vector (flush={flush})");
+            }
+            other => panic!("expected projected Vector (flush={flush}), got {other:?}"),
+        }
+    }
+    Ok(())
+}

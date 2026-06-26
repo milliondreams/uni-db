@@ -371,14 +371,16 @@ async fn sparse_wal_replay_after_reopen_unflushed_delta() -> anyhow::Result<()> 
     // reopen, so we flush a base batch first (creates the manifest), then commit
     // a second batch — including `target` — WITHOUT flushing, then drop + reopen.
     //
-    // Two guarantees are asserted:
-    //   1. The sparse VALUE survives WAL recovery — a plain MATCH finds `target`
-    //      with its sparse vector intact (this is the sparse-specific concern:
-    //      the CV codec round-trips through the WAL).
-    //   2. Secondary indexes are NOT maintained during WAL recovery (a universal
-    //      engine property shared by dense/inverted/FTS indexes — recovered-but-
-    //      unflushed rows are flushed to L1 without index maintenance). An
-    //      explicit index rebuild restores sparse-query consistency.
+    // This is the sparse-specific concern: the sparse VALUE must survive WAL
+    // recovery — the CV codec round-trips the `SparseVector` weights through the
+    // WAL (not a degraded untagged-serde `Map`), so the recovered query returns
+    // `target` first with EXACT oracle scores.
+    //
+    // NOTE: no index rebuild is needed here. WAL recovery does not repopulate the
+    // postings index, but it does not have to: the recovered rows land in L0 and
+    // the `sparse_rerank` read path unions live L0 candidates. The companion test
+    // `sparse_recovered_delta_queryable_without_rebuild` pins both that L0-union
+    // path AND the flush-time re-index (L1-only) path explicitly.
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().to_str().unwrap();
 
@@ -405,19 +407,17 @@ async fn sparse_wal_replay_after_reopen_unflushed_delta() -> anyhow::Result<()> 
 
     let db = Uni::open(path).build().await?;
 
-    // The WAL now serializes mutation values through the explicit CV codec, so
-    // the unflushed delta — including `target`'s sparse vector — recovers as a
-    // genuine `Value::SparseVector` (not a degraded untagged-serde `Map`).
-    // Secondary indexes are not maintained during WAL recovery (a universal
-    // engine property), so rebuild the index, then verify the sparse query
-    // returns `target` first with EXACT oracle scores — which is only possible
-    // if the recovered weights survived intact through the WAL.
-    db.indexes().rebuild("Doc", false).await?;
+    // The WAL serializes mutation values through the explicit CV codec, so the
+    // unflushed delta — including `target`'s sparse vector — recovers as a
+    // genuine `Value::SparseVector` (not a degraded untagged-serde `Map`). No
+    // index rebuild: the recovered rows are in L0 and the sparse read path unions
+    // them, so the query returns `target` first with EXACT oracle scores — which
+    // is only possible if the recovered weights survived intact through the WAL.
     let after = query_results(&db, 10).await?;
     assert_eq!(
         after.first().map(|(t, _)| t.as_str()),
         Some("target"),
-        "after WAL recovery + rebuild, recovered sparse data must be queryable: {after:?}"
+        "after WAL recovery, recovered sparse data must be queryable with no rebuild: {after:?}"
     );
     let full: Vec<(String, Sparse)> = base.into_iter().chain(delta).collect();
     assert_matches_oracle(&after, &full);
@@ -529,5 +529,170 @@ async fn sparse_property_projection_in_return() -> anyhow::Result<()> {
             other => panic!("expected projected SparseVector (flush={flush}), got {other:?}"),
         }
     }
+    Ok(())
+}
+
+/// Regression: a sparse query reflects a recovered-but-unflushed delta WITHOUT
+/// any explicit index rebuild — disproving the long-standing "secondary indexes
+/// must be rebuilt after WAL recovery" belief that was previously asserted (only
+/// as a comment) by `sparse_wal_replay_after_reopen_unflushed_delta`.
+///
+/// Two mechanisms make a rebuild unnecessary, and this test pins BOTH:
+///   [A] L0-union read path — after reopen, the recovered rows live in L0 and the
+///       `sparse_rerank` orchestration unions them (`collect_l0_label_candidates`),
+///       so the query is correct with the postings index still cold.
+///   [B] flush re-indexes — the next flush recomputes the sparse-index delta from a
+///       FULL L0 scan (`writer.rs` `flush_stream_l1`), so the recovered rows are
+///       written into the L1 postings index. After a SECOND reopen (WAL truncated,
+///       L0 empty) the query is served purely from the L1 index — the only way it
+///       can still find `target` is if that flush actually maintained the index.
+#[tokio::test]
+async fn sparse_recovered_delta_queryable_without_rebuild() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().to_str().unwrap();
+
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+    let base: Vec<(String, Sparse)> = (0..20)
+        .map(|i| (format!("base{i}"), random_sparse(&mut rng, 8)))
+        .collect();
+    let mut delta: Vec<(String, Sparse)> = vec![("target".to_string(), query_vec())];
+    for i in 0..5 {
+        delta.push((format!("delta{i}"), random_sparse(&mut rng, 8)));
+    }
+    let full: Vec<(String, Sparse)> = base.iter().cloned().chain(delta.iter().cloned()).collect();
+
+    {
+        let db = Uni::open(path).build().await?;
+        define_schema(&db).await?;
+        insert_docs(&db, &base, true).await?; // flush -> manifest
+        insert_docs(&db, &delta, false).await?; // commit only, in WAL
+        drop(db);
+    }
+
+    // [A] Reopen and query with the postings index still cold (NO rebuild, NO
+    // flush). The recovered delta is served via the L0-union path.
+    let db = Uni::open(path).build().await?;
+    let after_reopen = query_results(&db, 10).await?;
+    assert_eq!(
+        after_reopen.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "recovered delta must be queryable via the L0-union path with no rebuild: {after_reopen:?}"
+    );
+    assert_matches_oracle(&after_reopen, &full);
+
+    // [B] Flush (re-indexes the recovered rows into L1) then reopen again. The
+    // WAL is now truncated and L0 is empty, so the query is served purely from
+    // the L1 postings index — still with NO explicit rebuild.
+    db.flush().await?;
+    drop(db);
+
+    let db = Uni::open(path).build().await?;
+    let from_l1_index = query_results(&db, 10).await?;
+    assert_eq!(
+        from_l1_index.first().map(|(t, _)| t.as_str()),
+        Some("target"),
+        "flush after recovery must maintain the L1 sparse index (no rebuild): {from_l1_index:?}"
+    );
+    assert_matches_oracle(&from_l1_index, &full);
+    Ok(())
+}
+
+/// Regression: a recovered-but-unflushed UPDATE to an indexed sparse column is
+/// honored without a rebuild — the stale flushed posting must NOT win.
+///
+/// `target` is flushed as the exact query match (the high-scoring L1 posting),
+/// then overwritten in an unflushed commit with a disjoint vector. After a crash
+/// (drop) + reopen the recovered L0 value must override the stale L1 posting, so
+/// `target` drops out of the results. Pins both the L0-union path [A] and the
+/// post-flush L1-only path [B] (the flush must rewrite the posting, not append).
+#[tokio::test]
+async fn sparse_recovered_update_overrides_stale_posting_without_rebuild() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().to_str().unwrap();
+    let corpus = build_corpus(20, 0x1357_9BDF);
+
+    {
+        let db = Uni::open(path).build().await?;
+        define_schema(&db).await?;
+        insert_docs(&db, &corpus, true).await?; // flush -> target indexed as the exact match
+
+        // Overwrite target with a disjoint vector (no query terms), unflushed.
+        let tx = db.session().tx().await?;
+        tx.execute_with("MATCH (d:Doc {title: 'target'}) SET d.emb = $emb")
+            .param(
+                "emb",
+                Value::SparseVector {
+                    indices: vec![500, 600, 700],
+                    values: vec![1.0, 1.0, 1.0],
+                },
+            )
+            .run()
+            .await?;
+        tx.commit().await?; // committed, NOT flushed
+        drop(db);
+    }
+
+    // [A] L0-union path: the recovered update overrides the stale L1 posting.
+    let assert_target_dropped = |results: &[(String, f64)], stage: &str| {
+        let score = results.iter().find(|(t, _)| t == "target").map(|(_, s)| *s);
+        assert!(
+            score.map(|s| s.abs() < 1e-6).unwrap_or(true),
+            "[{stage}] recovered update ignored — stale high-scoring posting won: {score:?}"
+        );
+    };
+
+    let db = Uni::open(path).build().await?;
+    assert_target_dropped(&query_results(&db, 10).await?, "L0-union");
+
+    // [B] L1-only path: the flush must rewrite target's posting to the new value.
+    db.flush().await?;
+    drop(db);
+    let db = Uni::open(path).build().await?;
+    assert_target_dropped(&query_results(&db, 10).await?, "L1-index");
+    Ok(())
+}
+
+/// Regression: a recovered-but-unflushed DELETE of an indexed sparse doc is
+/// honored without a rebuild — the flushed posting must not resurrect it.
+///
+/// `target` is flushed as the exact query match, then deleted in an unflushed
+/// commit. After a crash (drop) + reopen the recovered tombstone must hide it
+/// (L0-union path [A]); after flushing the tombstone and reopening again the doc
+/// must be gone from the L1 index too (post-flush L1-only path [B]).
+#[tokio::test]
+async fn sparse_recovered_delete_hides_doc_without_rebuild() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().to_str().unwrap();
+    let corpus = build_corpus(20, 0x2468_ACE0);
+
+    {
+        let db = Uni::open(path).build().await?;
+        define_schema(&db).await?;
+        insert_docs(&db, &corpus, true).await?; // flush -> target indexed
+
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (d:Doc {title: 'target'}) DELETE d")
+            .await?;
+        tx.commit().await?; // committed, NOT flushed
+        drop(db);
+    }
+
+    // [A] L0-union path: the recovered tombstone hides the flushed posting.
+    let db = Uni::open(path).build().await?;
+    let after_reopen = query_results(&db, 10).await?;
+    assert!(
+        !after_reopen.iter().any(|(t, _)| t == "target"),
+        "recovered tombstone must hide the flushed posting (no rebuild): {after_reopen:?}"
+    );
+
+    // [B] L1-only path: the flush must remove target's posting from the L1 index.
+    db.flush().await?;
+    drop(db);
+    let db = Uni::open(path).build().await?;
+    let from_l1_index = query_results(&db, 10).await?;
+    assert!(
+        !from_l1_index.iter().any(|(t, _)| t == "target"),
+        "flush after recovery must drop the deleted doc from the L1 index (no rebuild): {from_l1_index:?}"
+    );
     Ok(())
 }

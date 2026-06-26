@@ -12,9 +12,10 @@
 //! tests (gated behind the `failpoints` feature) drive a commit / flush to panic
 //! at a precise seam, then reopen and assert atomicity and decode fidelity.
 //!
-//! Like the rest of the secondary indexes, the sparse postings index is not
-//! maintained while the WAL replays an unflushed delta (a universal engine
-//! property), so tests that query through the index `rebuild` it after reopen.
+//! WAL replay does not repopulate the sparse postings index, but no rebuild is
+//! needed: the recovered rows land in L0 and the `sparse_rerank` read path
+//! unions live L0 candidates, so the index query is correct with the postings
+//! still cold (see `recovery_index_no_rebuild.rs` for the cross-index regression).
 //! Run with `--features failpoints`. Each test owns its failpoint and runs in
 //! its own process under nextest, so the global registry does not bleed.
 
@@ -151,13 +152,13 @@ async fn sparse_committed_value_survives_crash_recovery() -> Result<()> {
         Some(target_emb()),
         "committed sparse value corrupted or lost across crash recovery"
     );
-    // Usable post-recovery: rebuild the index and confirm the recovered doc is
-    // retrievable as the top sparse match.
-    db.indexes().rebuild("Doc", false).await?;
+    // Usable post-recovery WITHOUT a rebuild: the recovered doc is in L0 and the
+    // sparse read path unions it, so it is the top sparse match with the index
+    // still cold.
     assert_eq!(
         top_sparse_title(&db).await?.as_deref(),
         Some("target"),
-        "recovered sparse doc not retrievable through a rebuilt index"
+        "recovered sparse doc not retrievable via the L0-union path (no rebuild)"
     );
     Ok(())
 }
@@ -270,12 +271,13 @@ async fn sparse_crash_during_flush_loses_no_committed_data() -> Result<()> {
             "{title} double-applied across crash-during-flush recovery"
         );
     }
-    // The sparse index rebuilds cleanly over the recovered rows.
-    db.indexes().rebuild("Doc", false).await?;
+    // The sparse query is correct over the recovered rows with NO rebuild: both
+    // base (flushed, indexed in L1) and delta (recovered into L0) are unioned by
+    // the read path.
     assert_eq!(
         top_sparse_title(&db).await?.as_deref(),
         Some("base"),
-        "recovered top sparse match wrong after crash-during-flush"
+        "recovered top sparse match wrong after crash-during-flush (no rebuild)"
     );
     Ok(())
 }

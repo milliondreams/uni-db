@@ -57,6 +57,8 @@ mod session_tx;
 // Shared infra for the SSI release-readiness suite (metrics capture, reopen
 // harness, conflict assertions, invariant oracles). Must precede the modules
 // that use it.
+#[path = "common/sparse_resilience.rs"]
+mod sparse_resilience;
 #[path = "common/ssi_for_update.rs"]
 mod ssi_for_update;
 #[path = "common/ssi_hermitage.rs"]
@@ -65,8 +67,6 @@ mod ssi_hermitage;
 mod ssi_invariants;
 #[path = "common/ssi_l1_pinning.rs"]
 mod ssi_l1_pinning;
-#[path = "common/sparse_resilience.rs"]
-mod sparse_resilience;
 #[path = "common/ssi_occ_e2e.rs"]
 mod ssi_occ_e2e;
 #[path = "common/ssi_read_path_matrix.rs"]

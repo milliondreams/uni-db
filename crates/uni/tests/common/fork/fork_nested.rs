@@ -384,11 +384,7 @@ async fn issue_103_nested_fork_schemaless_edge_reads_inherited() -> Result<()> {
 
     // First-level fork already worked before the fix.
     let fork = s.fork("x").await?;
-    let c1: i64 = fork
-        .query("MATCH (a:A) RETURN count(a) AS c")
-        .await?
-        .rows()[0]
-        .get("c")?;
+    let c1: i64 = fork.query("MATCH (a:A) RETURN count(a) AS c").await?.rows()[0].get("c")?;
     assert_eq!(c1, 1, "first-level fork should see 1 A node");
 
     // Nested fork (fork of a fork) used to raise LanceError(IO): Object not found.
@@ -398,7 +394,10 @@ async fn issue_103_nested_fork_schemaless_edge_reads_inherited() -> Result<()> {
         .await?
         .rows()[0]
         .get("c")?;
-    assert_eq!(c2, 1, "nested fork should read 1 inherited A node (issue #103)");
+    assert_eq!(
+        c2, 1,
+        "nested fork should read 1 inherited A node (issue #103)"
+    );
 
     db.shutdown().await?;
     Ok(())

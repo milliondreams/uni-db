@@ -118,6 +118,17 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                 .iter()
                 .map(|p| (cfg.label.clone(), p.clone(), ForkLocalIndexKind::FullText))
                 .collect(),
+            // Sparse registers a fork-local marker (issue #95 Task #4) so fork
+            // `uni.sparse.query` reports the `SparseDot` fused plan; retrieval is
+            // a brute-force branch scan, so the marker is observability, not a
+            // built index file.
+            IndexDefinition::Sparse(cfg) => {
+                vec![(
+                    cfg.label.clone(),
+                    cfg.property.clone(),
+                    ForkLocalIndexKind::Sparse,
+                )]
+            }
             _ => Vec::new(),
         })
         .collect();

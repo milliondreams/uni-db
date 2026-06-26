@@ -1,7 +1,7 @@
 # Sparse Vectors (SPLADE / learned-sparse) — Storage, Indexing & Hybrid Retrieval
 
 - **Issue:** #95 (consumer/storage side). Producer side `rustic-ai/uni-xervo#40` (`EmbedSparse` / `SparseEmbeddingModel`) is **CLOSED/shipped** — dependency unblocked.
-- **Status:** PARTIALLY IMPLEMENTED — committed `c5d8d6225` on branch `feat/sparse-vectors-issue-95` (not merged/pushed). See [§0 Implementation status](#0-implementation-status).
+- **Status:** PARTIALLY IMPLEMENTED — M1–M2 core + M4 surface committed (`c5d8d6225` + `83e0ba686`) on branch `feat/sparse-vectors-issue-95` (not merged/pushed). Fork-local index (task #4) landed via Approach A. Remaining: P2 block-max (M3), benchmark (M5), test sets B′/F/H/I. See [§0 Implementation status](#0-implementation-status).
 - **Date:** 2026-06-25 (proposal); implementation 2026-06-25
 - **v1 decision (locked at impl time):** P1 brute-force DAAT **and** P2 block-max (rank-safe α=0 default), delivered via milestone gates **M1–M5**.
 
@@ -19,17 +19,35 @@
 
 **8 integration/correctness bugs found-and-fixed by the test surface:** DataFusion `is_df_eligible_procedure` routing allowlist; zero-overlap result semantics; backend-scan backfill (raw `Dataset::open` can't see the LanceDB table); `max_impact` init for negative weights; **WAL untagged-serde durability**; projection Utf8 fallback; generic-`Struct`-arm shadowing in `build_property_column_static`; `UInt32`-list result-row materialization.
 
-**M4 landed (UNCOMMITTED on the same branch; gates green — clippy 0, fmt, Rust + Python tests pass):**
-- **Scalar `sparse_similar_to(a, b)`** — `eval_sparse_similar_to_pure` (`similar_to.rs`) registered at all 3 sites; accepts both `Value::SparseVector` and the `{indices,values}` Map form (a sparse param reaches a scalar UDF as an Arrow `Struct` decoded without schema context → arrives as a Map).
+**M4 landed & green (committed `83e0ba686` on the same branch; clippy 0, fmt, Rust + Python tests pass):**
+- **Scalar `sparse_similar_to(a, b)`** — `eval_sparse_similar_to_pure` (`similar_to.rs:348`) registered at **2** sites (`df_udfs.rs:220`, `expr_eval.rs:1928`) — *not* the 3 the design predicted; `df_expr.rs` took only a 1-line change and there is **no `ScoringMode::Sparse` arm** (the sparse scalar routes through the UDF/`expr_eval` path, not the `similar_to_expr` ScoringMode). Accepts both `Value::SparseVector` and the `{indices,values}` Map form (a sparse param reaches a scalar UDF as an Arrow `Struct` decoded without schema context → arrives as a Map).
 - **N-ary fusion** — `fuse_rrf_multi` (+ 2-arg `fuse_rrf` shim) and source-aware `fuse_weighted_sources` (`NormKind::{DistanceToSim,ScoreByMax}`) in `fusion.rs`; empty source = no-op, so 2-way is byte-identical.
-- **3-way hybrid** — `run_hybrid_search` parses an optional `sparse` property + `options.sparse_query`, reuses `sparse_rerank`, fuses under RRF *and* weighted, emits a `sparse_score` column; `FusionKind::SparseRrf` in EXPLAIN.
+- **3-way hybrid** — `run_hybrid_search` (`search_procedures.rs:1341`) parses an optional `sparse` property + `options.sparse_query`, reuses `sparse_rerank`, fuses under RRF *and* weighted, emits a `sparse_score` column (`HybridScoreContext.sparse_score_map`); `FusionKind::SparseRrf` + `FusionKind::SparseDot` in EXPLAIN (`planner.rs:1797,1802`).
+- **Index DDL** — `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}` is routed through `ddl_procedures.rs` (+`planner.rs`), *not* `build_vector_index_type` (`vector_index_opts.rs` still lists only dense algorithms); the design's predicted `Some("sparse")` hook there was unused.
 - **Python** — fixed a real latent bug (`value_to_py` returned `None` for sparse props); `PySparseVector` + ingestion collision fix; `DataType.sparse_vector(N)`; `sparse_vector:N` parser; OGM `SparseVector[N]` + `sparse_search()` builder + schema auto-indexing.
-- Tests: `sparse_scoring.rs` (7), `test_async_e2e_sparse.py` (5), OGM (8).
+- Tests: `sparse_scoring.rs` (7), `test_async_e2e_sparse.py` (5), OGM `test_types.py`+`test_queries.py` (5).
+
+**Task #4 — fork-local sparse index landed (UNCOMMITTED on the same branch; gates green — clippy 0 on touched crates, fmt-clean for new files, set E + sparse + all fork-index tests pass).** Approach A: on a fork, `StorageManager::sparse_search` brute-force scans the branch vertices table (Lance `base_paths` supplies inherited+fork rows; `_deleted=false` prefilter handles tombstones) and returns candidates; the already-correct `sparse_rerank` re-scores by exact `sparse_dot` — mirroring `multivector_search`'s branched path. `ForkLocalIndexKind::Sparse` is a planner/EXPLAIN marker (no index file, like `VidUid`) wired to `FusionKind::SparseDot`; the auto-build scheduler registers it. Approach B (a dedicated fork-local postings dataset) is documented in-code as a benchmark-gated future path (M5). New: `crates/uni/tests/common/fork/fork_index_sparse.rs` (5 tests).
+
+**Test-set coverage (proposal §12 sets A–J), verified against `83e0ba686` + task-#4 work:** all sparse Rust tests are consolidated into 3 files (`sparse_index.rs` ~18 fns, `sparse_scoring.rs` 7, `sparse_ddl_type.rs` 2) + `uni-sparse-vector/tests/proptest.rs` (8) rather than the separate per-set files the plan sketched.
+
+| Set | Status | Where |
+|---|---|---|
+| **A** type/codec + silent-null | ✅ | crate proptests; `sparse_ddl_type.rs`; columnar/`value_codec.rs` arm |
+| **B** index vs brute-force oracle | ✅ | `sparse_index.rs` (`*_matches_oracle`); `sparse_scoring.rs` dot tests |
+| **B′** P2 rank-safety (α=0 ≡ oracle) | ⬜ | blocked on M3 (P2 not built) |
+| **C** L0/flush visibility matrix | ✅ | `sparse_index.rs`: l0-only, last-writer-wins, tombstone-hides-flushed, flush-equivalence |
+| **D** MVCC/snapshot isolation | ◐ | `sparse_snapshot_isolates_reader_from_concurrent_insert`; not yet a full read-path matrix entry |
+| **E** fork isolation + fusion | ✅ | `fork/fork_index_sparse.rs` (5): fused results, isolation both ways, honors-deleted, nested-fork, auto-built + EXPLAIN `SparseDot` |
+| **F** crash/WAL failpoints | ◐ | WAL-replay test present (`sparse_wal_replay_after_reopen_unflushed_delta`); no `--features failpoints` crash injection |
+| **G** restart/reopen durability | ✅ | `sparse_persists_across_reopen` |
+| **H** concurrency (OCC/loom) | ◐ | one concurrent-reader test; no OCC-matrix/loom case |
+| **I** metamorphic/soak | ⬜ | not added to `metamorphic/` |
+| **J** Python E2E | ✅ | `test_async_e2e_sparse.py` (5) + OGM (5) |
 
 **Not yet implemented (follow-up, tracked in §15):**
-- **M3 / P2** — block-max pruning (config knobs α/β present in plan; the `max_impact` column is already stored as the prerequisite) + rank-safety equivalence test.
-- **Task #4 — fork-local sparse index** (`ForkLocalIndexKind::Sparse`, fork-aware path, planner fusion-kind arm `FusionKind::SparseDot`, set-E tests). The kernel is intentionally NOT fork-aware yet; `sparse_search` returns empty on a fork.
-- **Test sets F** (crash/WAL failpoints), **H** (OCC/loom), and **I** (metamorphic).
+- **M3 / P2** — block-max pruning + rank-safety equivalence test (set B′). The `max_impact` column is stored from M2 as the prerequisite but is **never read** in `query_topk` today; weights are still **f32** (8-bit quantization ships with P2, `SparseVectorIndexConfig.quantize` flag present, default true, but unimplemented).
+- **Test sets B′** (P2 rank-safety — needs M3), **F** (crash/WAL failpoints), **H** (OCC/loom), and **I** (metamorphic).
 - **M5** — real-corpus benchmark; OGM `hybrid_search()` builder (deferred — GitHub issue #114).
 - **Auto-embed wiring to xervo `EmbedSparse`** — upstream-blocked: the current `uni-xervo` dependency exposes no `EmbedSparse`/`HeadSet::SPARSE` (only `DENSE | MULTI_VECTOR`), and `SparseVectorIndexConfig` has no `embedding_config`.
 
@@ -218,15 +236,15 @@ Gates: `cargo nextest run` (workspace), TCK, Locy, pytest, clippy/fmt — per re
 
 ## 15. Recommended sequencing
 
-Status legend: ✅ done (committed `c5d8d6225`) · ◐ partial · ⬜ remaining.
+Status legend: ✅ done · ◐ partial · ⬜ remaining. Committed across `c5d8d6225` (M1–M2 core + index) and `83e0ba686` (M4 scoring/fusion/hybrid/Cypher/Python).
 
 1. ✅ **Crate** `uni-sparse-vector` (struct + validating ctor + binary codec + `sparse_dot` + proptests) — isolated, no `uni-*` deps. **(test A)**
 2. ✅ **Type + codecs** in uni-common (variants, Arrow struct, CV tag) + uni-store column builders. **(test A)**
 3. ✅ **`SparseVectorIndex`** (build/flush/`query_topk`/incremental, scored) with MVCC + tombstone gating + segment-merge build. **(tests B, C, D, G)** — *weight quantization deferred to step 9 (P2); crash failpoints (F) ⬜.*
-4. ⬜ **Fork-local sparse index** (`ForkLocalIndexKind::Sparse`, branch path, fusion). **(test E)**
-5. ◐ **Scoring + N-ary fusion + hybrid wiring + `similar_to`.** — `sparse_rerank` orchestration ✅; scalar `sparse_similar_to` / N-ary fusion / 3-way hybrid ⬜. **(tests B, I)**
-6. ◐ **Cypher surface** — `SPARSE_VECTOR(N)` type DDL ✅, `OPTIONS{type:'sparse'}` ✅, `uni.sparse.query` ✅; `sparse_similar_to` scalar ⬜.
-7. ⬜ **Python** (pyo3 factory + dict fix, OGM type + hybrid method) + auto-embed wiring. **(test J)**
+4. ✅ **Fork-local sparse index** — Approach A (brute-force branch scan re-scored by `sparse_dot`, mirroring `multivector_search`): `ForkLocalIndexKind::Sparse` marker, fork-aware `sparse_search` branch scan, planner `SparseDot` fusion arm, auto-build scheduler arm. Approach B (dedicated fork-local postings dataset) documented in-code, deferred behind M5. **(test E ✅)**
+5. ✅ **Scoring + N-ary fusion + hybrid wiring + `similar_to`.** — `sparse_rerank` orchestration, scalar `sparse_similar_to` (both `SparseVector` + Map forms), `fuse_rrf_multi`/`fuse_weighted_sources` (+`NormKind`), 3-way hybrid + `sparse_score` + `FusionKind::SparseRrf`/`SparseDot`. Delta from design: routed via the UDF/`expr_eval` path, **no** new `ScoringMode::Sparse` arm. **(test B ✅; metamorphic I ⬜)**
+6. ✅ **Cypher surface** — `SPARSE_VECTOR(N)` type DDL, `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}` (routed through `ddl_procedures.rs`, not `build_vector_index_type`), `uni.sparse.query`, `sparse_similar_to` scalar (registered in `df_udfs.rs` + `expr_eval.rs`).
+7. ◐ **Python** — pyo3 `DataType.sparse_vector(N)` + `PySparseVector` + dict-collision fix + `value_to_py` arm ✅; OGM `SparseVector[N]` + `sparse_search()` builder + schema auto-indexing ✅ **(test J ✅)**. Remaining: ⬜ OGM `hybrid_search()` (deferred #114); ⬜ auto-embed wiring to xervo `EmbedSparse` (upstream-blocked).
 8. ⬜ **Benchmark P1** on a real SPLADE corpus.
 9. ⬜ **P2 block-max** (rank-safe α=0 default) + 8-bit weight quantization + rank-safety equivalence test (`max_impact` column already stored).
 

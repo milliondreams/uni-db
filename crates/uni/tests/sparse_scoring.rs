@@ -148,7 +148,10 @@ async fn run_hybrid(db: &Uni, options: &str) -> anyhow::Result<Vec<(String, f64,
     let rows = db
         .session()
         .query_with(&cypher)
-        .param("qvec", Value::List(vec![Value::Float(0.9), Value::Float(0.1)]))
+        .param(
+            "qvec",
+            Value::List(vec![Value::Float(0.9), Value::Float(0.1)]),
+        )
         .param("sq", sv(q.0, q.1))
         .fetch_all()
         .await?;
@@ -183,7 +186,10 @@ async fn hybrid_three_way_rrf_populates_sparse_score() -> anyhow::Result<()> {
         "target sparse_score = {ss}, want 14.0"
     );
     // target is the unique sparse maximizer → it should be ranked first.
-    assert_eq!(results[0].0, "target", "target should rank first: {results:?}");
+    assert_eq!(
+        results[0].0, "target",
+        "target should rank first: {results:?}"
+    );
     Ok(())
 }
 
@@ -207,7 +213,10 @@ async fn hybrid_three_way_weighted_populates_sparse_score() -> anyhow::Result<()
         target.2.expect("sparse_score populated") > 0.0,
         "target sparse_score should be positive"
     );
-    assert_eq!(results[0].0, "target", "sparse-dominant weighted → target first");
+    assert_eq!(
+        results[0].0, "target",
+        "sparse-dominant weighted → target first"
+    );
     Ok(())
 }
 
@@ -225,7 +234,10 @@ async fn hybrid_two_way_unchanged_without_sparse() -> anyhow::Result<()> {
              YIELD node, score, sparse_score \
              RETURN node.title AS title, sparse_score",
         )
-        .param("qvec", Value::List(vec![Value::Float(0.9), Value::Float(0.1)]))
+        .param(
+            "qvec",
+            Value::List(vec![Value::Float(0.9), Value::Float(0.1)]),
+        )
         .fetch_all()
         .await?;
     assert!(!rows.is_empty(), "two-way hybrid returned no rows");
@@ -254,7 +266,10 @@ async fn explain_hybrid_with_sparse_shows_sparse_rrf() -> anyhow::Result<()> {
              'zebra', $qvec, 5, null, {sparse_query: $sq}) \
              YIELD node, score RETURN node.title AS title",
         )
-        .param("qvec", Value::List(vec![Value::Float(0.9), Value::Float(0.1)]))
+        .param(
+            "qvec",
+            Value::List(vec![Value::Float(0.9), Value::Float(0.1)]),
+        )
         .param("sq", sv(vec![1, 5, 9], vec![1.0, 2.0, 3.0]))
         .explain()
         .await?;
@@ -271,7 +286,10 @@ async fn explain_hybrid_with_sparse_shows_sparse_rrf() -> anyhow::Result<()> {
             "CALL uni.search('Doc', {vector: 'embedding', fts: 'content'}, 'zebra', $qvec, 5) \
              YIELD node, score RETURN node.title AS title",
         )
-        .param("qvec", Value::List(vec![Value::Float(0.9), Value::Float(0.1)]))
+        .param(
+            "qvec",
+            Value::List(vec![Value::Float(0.9), Value::Float(0.1)]),
+        )
         .explain()
         .await?;
     assert!(

@@ -9864,6 +9864,8 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
 ///   when a `Vector` fork-local index exists.
 /// - `uni.fts.query(label, column, query, k)` → `Bm25Rrf` when a
 ///   `FullText` fork-local index exists.
+/// - `uni.sparse.query(label, column, query_vec, k)` → `SparseDot`
+///   when a `Sparse` fork-local index marker exists.
 ///
 /// Returns `None` for any other procedure (no rewrite) or when the
 /// registry has no matching entry.
@@ -9901,10 +9903,12 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
     let expected = match procedure_name {
         "uni.vector.query" => uni_store::fork::ForkLocalIndexKind::Vector,
         "uni.fts.query" => uni_store::fork::ForkLocalIndexKind::FullText,
-        // `uni.sparse.query` fork-fusion observability (the `SparseDot` analogue
-        // of `AnnRerank`/`Bm25Rrf`) lands with issue #95 Task #4, which
-        // introduces `ForkLocalIndexKind::Sparse`. Until a fork-local sparse
-        // index can exist, there is nothing to fuse against here.
+        // `uni.sparse.query` fork-fusion observability: a registered fork-local
+        // `Sparse` marker (issue #95 Task #4) switches the call to the `SparseDot`
+        // fused operator. Retrieval itself is a brute-force branch scan re-scored
+        // by `sparse_dot` (`StorageManager::sparse_search`); the marker drives the
+        // planner/EXPLAIN view, the `AnnRerank`/`Bm25Rrf` analogue.
+        "uni.sparse.query" => uni_store::fork::ForkLocalIndexKind::Sparse,
         _ => return None,
     };
     let registered = lookup.fork_index_for(label, column)?;
@@ -9925,6 +9929,7 @@ fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> Option<FusionK
         K::Sorted => Some(FusionKind::SortedKWayMerge),
         K::Vector => Some(FusionKind::AnnRerank),
         K::FullText => Some(FusionKind::Bm25Rrf),
+        K::Sparse => Some(FusionKind::SparseDot),
         // `ForkLocalIndexKind` is `#[non_exhaustive]`; future kinds
         // we don't yet handle are silently passed through as a
         // regular Scan so a forward-incompatible binary doesn't

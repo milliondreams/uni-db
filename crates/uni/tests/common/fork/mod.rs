@@ -20,6 +20,7 @@ pub mod fork_index_btree;
 pub mod fork_index_multivector;
 pub mod fork_index_recall_bench;
 pub mod fork_index_sorted;
+pub mod fork_index_sparse;
 pub mod fork_index_vector;
 pub mod fork_index_vid_uid;
 pub mod fork_locy_rules;

@@ -31,6 +31,7 @@ permissions:
 jobs:
   # Format and lint checks
   lint:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -71,6 +72,7 @@ jobs:
 
   # Rust tests — the workspace suite (the core signal contributors gate on).
   rust-tests:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Rust Tests
     runs-on: ubuntu-xlarge
     steps:
@@ -123,6 +125,7 @@ jobs:
   # (crates/uni-store/src/runtime/occ.rs) on the PR that introduces them. The
   # exhaustive 3-committer model + shuttle run nightly (nightly.yml model-check).
   loom-smoke:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Concurrency Model Check (loom smoke)
     runs-on: ubuntu-xlarge
     steps:
@@ -159,6 +162,7 @@ jobs:
   # the PR that introduces them. The high-volume soak runs nightly
   # (nightly.yml metamorphic). Only the non-ignored smoke tests run here.
   metamorphic-smoke:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Metamorphic Query Oracles (smoke)
     runs-on: ubuntu-xlarge
     steps:
@@ -195,6 +199,7 @@ jobs:
   # main-push CI (ci.yml). Without this, a PR breaking Cypher conformance lands
   # green and only fails post-merge.
   tck:
+    if: github.repository == 'rustic-ai/uni-db'
     name: openCypher TCK (schemaless)
     runs-on: ubuntu-xlarge
     steps:
@@ -225,6 +230,7 @@ jobs:
   # shifted left onto the PR). The 6 flagship-notebook executions are heavier
   # and run on the main-push CI (ci.yml), not here.
   python-tests:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Python Tests
     runs-on: ubuntu-xlarge
     steps:

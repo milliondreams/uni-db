@@ -39,6 +39,7 @@ permissions:
 
 jobs:
   publish-pydantic:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build & publish uni-pydantic ${{ inputs.version }} to ${{ inputs.target }}
     runs-on: ubuntu-latest
     # Gates secret access (and any required reviewer approval) behind the chosen

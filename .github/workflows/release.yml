@@ -44,6 +44,7 @@ env:
 
 jobs:
   validate:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Validate
     runs-on: ubuntu-latest
     permissions:
@@ -126,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: github.event_name == 'workflow_dispatch' && inputs.create_tag == true && inputs.dry_run != true
+    if: github.repository == 'rustic-ai/uni-db' && github.event_name == 'workflow_dispatch' && inputs.create_tag == true && inputs.dry_run != true
     steps:
       - uses: actions/checkout@v4
 
@@ -145,7 +146,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: always() && inputs.dry_run != true && needs.validate.result == 'success' && (needs.create-tag.result == 'success' || needs.create-tag.result == 'skipped')
+    if: github.repository == 'rustic-ai/uni-db' && always() && inputs.dry_run != true && needs.validate.result == 'success' && (needs.create-tag.result == 'success' || needs.create-tag.result == 'skipped')
     steps:
       - uses: actions/checkout@v4
 
@@ -159,6 +160,7 @@ jobs:
           prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
 
   publish-rust:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Publish to crates.io
     needs: [validate]
     runs-on: linux-xlarge-32

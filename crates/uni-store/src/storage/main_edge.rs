@@ -246,7 +246,7 @@ impl MainEdgeDataset {
             }
             log::info!("Creating {} index on main_edges", column);
             if let Err(e) = backend
-                .create_scalar_index(table_name, column, idx_type)
+                .create_scalar_index(table_name, &[column], idx_type, None)
                 .await
             {
                 log::warn!("Failed to create {} index on main_edges: {}", column, e);

@@ -62,6 +62,8 @@ struct IndexConfig {
     seed: Option<u64>,
     inner: Option<String>,
     embedding: Option<EmbeddingOptions>,
+    // Sparse-specific: 8-bit weight quantization (default on).
+    quantize: Option<bool>,
     // Generic
     name: Option<String>,
 }
@@ -360,6 +362,44 @@ async fn create_index_internal(
             max_terms_per_doc: 10_000,
             metadata: Default::default(),
         }),
+        "SPARSE" => {
+            // The term-space cardinality comes from the declared
+            // `DataType::SparseVector { dimensions }` of the column.
+            let dimensions = storage
+                .schema_manager()
+                .schema()
+                .properties
+                .get(label)
+                .and_then(|props| props.get(prop_name))
+                .and_then(|meta| match &meta.r#type {
+                    uni_common::DataType::SparseVector { dimensions } => Some(*dimensions),
+                    _ => None,
+                })
+                .ok_or_else(|| UniError::InvalidArgument {
+                    arg: "property".into(),
+                    message: format!(
+                        "Property '{prop_name}' is not a SparseVector column; cannot create a sparse index"
+                    ),
+                })?;
+            // Auto-embed config, same shape as the VECTOR arm.
+            let embedding_config = config.embedding.as_ref().map(|emb| EmbeddingConfig {
+                alias: emb.alias.clone(),
+                source_properties: emb.source.clone(),
+                batch_size: emb.batch_size,
+                document_prefix: emb.document_prefix.clone(),
+                query_prefix: emb.query_prefix.clone(),
+            });
+            IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
+                name: index_name,
+                label: label.to_string(),
+                property: prop_name.clone(),
+                dimensions,
+                // `OPTIONS{type:'sparse', quantize:false}` stores lossless f32.
+                quantize: config.quantize.unwrap_or(true),
+                embedding_config,
+                metadata: Default::default(),
+            })
+        }
         _ => {
             return Err(UniError::InvalidArgument {
                 arg: "type".into(),
@@ -381,14 +421,26 @@ async fn create_index_internal(
         IndexDefinition::Vector(cfg) => {
             idx_mgr.create_vector_index(cfg).await?;
         }
-        // Non-vector indexes keep the build-if-data-exists optimization.
+        // Sparse ALSO always builds, like Vector: `create_sparse_vector_index`
+        // handles an empty table (create-before-ingest → populated on flush) and
+        // backfills already-flushed rows via the storage *backend*. It must NOT be
+        // gated by the raw-dataset `count` below, which reads 0 for a flushed
+        // LanceDB-managed table (the table is not at the raw `{base}/vertices_<L>`
+        // path); that gate would silently leave the index empty after a flush.
+        IndexDefinition::Sparse(cfg) => {
+            idx_mgr.create_sparse_vector_index(cfg).await?;
+        }
+        // Remaining non-vector indexes keep the build-if-data-exists optimization.
         other => {
-            let count = if let Ok(ds) = storage.vertex_dataset(label) {
-                if let Ok(raw) = ds.open_raw().await {
-                    raw.count_rows(None).await.unwrap_or(0)
-                } else {
-                    0
-                }
+            // Build-if-data-exists gate, read through the `StorageBackend`
+            // (correct `.lance` path). With the prior raw-dataset read this
+            // counted 0 for any flushed table, so the physical index was
+            // silently skipped after a flush (#115). A not-yet-flushed table
+            // legitimately has no rows here and is populated on the next flush.
+            let backend = storage.backend();
+            let table = uni_store::backend::table_names::vertex_table_name(label);
+            let count = if backend.table_exists(&table).await? {
+                backend.count_rows(&table, None).await?
             } else {
                 0
             };

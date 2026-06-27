@@ -6,7 +6,8 @@ Uni combines a property graph with vectors and JSON documents. You can model ent
 
 - Labeled vertices and typed, directed edges.
 - Typed properties plus flexible JSON overflow for ad-hoc fields.
-- Vector properties for similarity search.
+- Vector properties for similarity search — including multi-vector (`List<Vector>`) for ColBERT / late-interaction MaxSim retrieval.
+- Rich complex types: typed `List<T>`, string-keyed `Map<K, V>`, `Bytes`, `Point`, and CRDTs.
 
 ## Example
 

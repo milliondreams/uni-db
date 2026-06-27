@@ -1191,6 +1191,13 @@ impl Executor {
             "point" => Ok(DataType::Point(PointType::Cartesian2D)),
             "point3d" => Ok(DataType::Point(PointType::Cartesian3D)),
             "geopoint" | "geographic" => Ok(DataType::Point(PointType::Geographic)),
+            s if s.starts_with("sparse_vector(") && s.ends_with(')') => {
+                let dims_str = &s["sparse_vector(".len()..s.len() - 1];
+                let dimensions = dims_str
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("Invalid sparse_vector dimensions: {}", dims_str))?;
+                Ok(DataType::SparseVector { dimensions })
+            }
             s if s.starts_with("vector(") && s.ends_with(')') => {
                 let dims_str = &s[7..s.len() - 1];
                 let dimensions = dims_str
@@ -3041,6 +3048,17 @@ impl Executor {
             return Ok(val);
         };
 
+        // Sparse vectors carry invariants the type system cannot express (strictly
+        // ascending unique term ids, finite weights, equal-length arrays, term ids
+        // within the declared term space). Canonicalize and validate the native value
+        // at ingest so a malformed sparse vector is a clean `TypeError` here, rather
+        // than a panic deep in the durable WAL value codec — which reconstructs via
+        // `SparseVector::new` and previously `.expect()`ed (issue #95). The degraded
+        // `Value::Map` / `Null` forms fall through to `accepts` unchanged.
+        if let (DataType::SparseVector { dimensions }, Value::SparseVector { .. }) = (dt, &val) {
+            return Self::canonicalize_sparse_vector(prop_name, val, *dimensions);
+        }
+
         // Directly storable: scalars, the intentional `Int`→`Float`/`Int32` and
         // `Temporal`→`Timestamp` widenings, declared composite columns (`Map`/`List`/
         // `Vector`) receiving their matching value, and `Null` (always accepted).
@@ -3086,6 +3104,60 @@ impl Executor {
             dt,
             value_type_name(&val)
         );
+    }
+
+    /// Canonicalizes and validates a value destined for a `SparseVector` column.
+    ///
+    /// Sorts term ids ascending and sums the weights of duplicate term ids (via
+    /// [`uni_sparse_vector::SparseVector::from_pairs`]), then rejects mismatched array
+    /// lengths, non-finite weights, and term ids outside the declared `dimensions` term
+    /// space. Running this at the write boundary keeps the durable WAL codec's
+    /// `SparseVector::new(..)` reconstruction infallible and mirrors the auto-embed
+    /// path, which canonicalizes through the same kernel constructor (issue #95).
+    ///
+    /// # Errors
+    /// Returns a `TypeError` if the value violates a sparse-vector invariant or carries
+    /// a term id at or beyond `dimensions`.
+    fn canonicalize_sparse_vector(prop_name: &str, val: Value, dimensions: usize) -> Result<Value> {
+        let Value::SparseVector { indices, values } = val else {
+            // The caller only routes native `Value::SparseVector` values here.
+            anyhow::bail!(
+                "TypeError: property '{}' is declared SparseVector but got {}",
+                prop_name,
+                value_type_name(&val)
+            );
+        };
+        if indices.len() != values.len() {
+            anyhow::bail!(
+                "TypeError: property '{}' sparse vector has {} term ids but {} weights",
+                prop_name,
+                indices.len(),
+                values.len()
+            );
+        }
+        let pairs: Vec<(u32, f32)> = indices.into_iter().zip(values).collect();
+        let sv = uni_sparse_vector::SparseVector::from_pairs(pairs).map_err(|e| {
+            anyhow!(
+                "TypeError: property '{}' has an invalid sparse vector: {}",
+                prop_name,
+                e
+            )
+        })?;
+        // `dimensions` is the term-space cardinality (max term id + 1); the largest
+        // term id of a canonical (ascending) vector is its last index.
+        if let Some(&max_term) = sv.indices().last()
+            && max_term as usize >= dimensions
+        {
+            anyhow::bail!(
+                "TypeError: property '{}' sparse vector term id {} is outside the declared \
+                 term space (dimensions = {})",
+                prop_name,
+                max_term,
+                dimensions
+            );
+        }
+        let (indices, values) = sv.into_parts();
+        Ok(Value::SparseVector { indices, values })
     }
 
     /// Coerces and validates every property in `props` against the declared types for `labels`.
@@ -3205,9 +3277,11 @@ impl Executor {
                                 .get_mut(var_name)
                                 .expect("inserted above when absent");
                             pv.props.insert(prop_name.clone(), val.clone());
-                            if pv.partial {
-                                pv.touched.insert(prop_name.clone());
-                            }
+                            // Record every SET-assigned key. For the partial path this
+                            // drives the MergeInsert source; for the full path it is the
+                            // signal `refresh_embed_targets` uses to re-embed when a
+                            // source column changed (the full writer ignores it otherwise).
+                            pv.touched.insert(prop_name.clone());
 
                             // Update the row binding so subsequent RHS sees the new value.
                             if let Some(Value::Map(node_map)) = row.get_mut(var_name) {
@@ -3466,6 +3540,11 @@ impl Executor {
         // `insert_vertex_with_labels` (Append) path with
         // generated-column enrichment.
         for (_var_name, mut pv) in pending_v {
+            // A SET that touches an auto-embed source column must refresh the target
+            // embedding; both the partial MergeInsert and the full Append paths
+            // otherwise re-write the stale vector. Applied before the branch so both
+            // writer entry points get the refreshed props + touched keys.
+            writer.refresh_embed_targets(&mut pv.props, &mut pv.touched, &pv.labels);
             if pv.partial {
                 // Round 12 §C: run the generator enrichment over the
                 // merged-in-L0 full row, then add the produced generator

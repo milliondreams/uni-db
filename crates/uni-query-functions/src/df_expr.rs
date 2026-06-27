@@ -1354,16 +1354,14 @@ fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfE
         BinaryOp::Div => Ok(left / right),
         BinaryOp::Mod => Ok(left % right),
         BinaryOp::Pow => {
-            // Cast operands to Float64 to prevent integer overflow panics
-            // and ensure Float return type per Cypher semantics.
-            let left_f = datafusion::logical_expr::cast(
-                left,
-                datafusion::arrow::datatypes::DataType::Float64,
-            );
-            let right_f = datafusion::logical_expr::cast(
-                right,
-                datafusion::arrow::datatypes::DataType::Float64,
-            );
+            // Coerce operands to Float64 to prevent integer overflow panics and
+            // ensure Float return type per Cypher semantics. Use the Cypher-aware
+            // coercion rather than a raw cast so a cv-encoded numeric carried as
+            // LargeBinary (schemaless property arithmetic) decodes instead of
+            // hitting the unsupported `LargeBinary -> Float64` cast (issue #111
+            // family).
+            let left_f = crate::df_udfs::cypher_to_float64_expr(left);
+            let right_f = crate::df_udfs::cypher_to_float64_expr(right);
             Ok(datafusion::functions::math::expr_fn::power(left_f, right_f))
         }
 
@@ -1497,10 +1495,16 @@ where
     F: FnOnce(DfExpr) -> DfExpr,
 {
     require_arg(df_args, func_name)?;
-    Ok(math_fn(cast_expr(
-        first_arg(df_args),
-        datafusion::arrow::datatypes::DataType::Float64,
-    )))
+    // Use the Cypher-aware Float64 coercion rather than a raw `CAST(_, Float64)`.
+    // A typed value carried as `LargeBinary` (cv_encoded Duration/Btic/etc.) has
+    // no DataFusion `LargeBinary -> Float64` kernel, so a blind cast fails at
+    // PLAN time and — because Locy plans all rules together — poisons every
+    // co-registered rule (issue #111). `cypher_to_float64_expr` decodes a
+    // numeric CypherValue and yields a clean per-row NULL for non-numeric values
+    // (e.g. `exp(duration)`), matching SIGN/ABS/AVG which already use it.
+    Ok(math_fn(crate::df_udfs::cypher_to_float64_expr(first_arg(
+        df_args,
+    ))))
 }
 
 /// Apply DISTINCT modifier to an aggregate expression if needed.
@@ -1719,18 +1723,28 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
         }
         "CEIL" | "CEILING" => {
             check_args!(1, df_args, "ceil");
-            Some(Ok(expr_fn::ceil(first_arg(df_args))))
+            // Cypher-aware Float64 coercion: a cv-encoded numeric carried as
+            // LargeBinary would otherwise fail `ceil`'s signature coercion
+            // (issue #111 family). Same for FLOOR/ROUND below.
+            Some(Ok(expr_fn::ceil(crate::df_udfs::cypher_to_float64_expr(
+                first_arg(df_args),
+            ))))
         }
         "FLOOR" => {
             check_args!(1, df_args, "floor");
-            Some(Ok(expr_fn::floor(first_arg(df_args))))
+            Some(Ok(expr_fn::floor(crate::df_udfs::cypher_to_float64_expr(
+                first_arg(df_args),
+            ))))
         }
         "ROUND" => {
             check_args!(1, df_args, "round");
             let args = if df_args.len() == 1 {
-                vec![first_arg(df_args)]
+                vec![crate::df_udfs::cypher_to_float64_expr(first_arg(df_args))]
             } else {
-                vec![df_args[0].clone(), df_args[1].clone()]
+                vec![
+                    crate::df_udfs::cypher_to_float64_expr(df_args[0].clone()),
+                    df_args[1].clone(),
+                ]
             };
             Some(Ok(expr_fn::round(args)))
         }
@@ -1751,11 +1765,11 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
         "ATAN" => unary_f64("atan", expr_fn::atan),
         "ATAN2" => {
             check_args!(2, df_args, "atan2");
-            let cast_f64 =
-                |e: DfExpr| cast_expr(e, datafusion::arrow::datatypes::DataType::Float64);
+            // Cypher-aware Float64 coercion (see `apply_unary_math_f64`): avoids
+            // the unsupported `LargeBinary -> Float64` cast on cv_encoded args.
             Some(Ok(expr_fn::atan2(
-                cast_f64(df_args[0].clone()),
-                cast_f64(df_args[1].clone()),
+                crate::df_udfs::cypher_to_float64_expr(df_args[0].clone()),
+                crate::df_udfs::cypher_to_float64_expr(df_args[1].clone()),
             )))
         }
         "RAND" | "RANDOM" => Some(Ok(expr_fn::random())),
@@ -1947,8 +1961,23 @@ fn translate_btic_function(
     name: &str,
     df_args: &[DfExpr],
 ) -> Option<Result<DfExpr>> {
-    if crate::expr_eval::is_btic_function(name_upper) {
-        Some(Ok(dummy_udf_expr(name, df_args.to_vec())))
+    // Accept the dot-namespaced spelling `btic.<fn>` as an alias for the
+    // underscore-registered UDF `btic_<fn>` — mirroring `duration.<fn>` /
+    // `datetime()`. Without this, `btic.contains(...)` (as written in #113) is
+    // unrecognized, falls through translation, and the planner produces a
+    // Null-typed predicate ("Filter predicate must return BOOLEAN, got Null").
+    let canonical_upper = name_upper
+        .strip_prefix("BTIC.")
+        .map(|rest| format!("BTIC_{rest}"));
+    let lookup_upper = canonical_upper.as_deref().unwrap_or(name_upper);
+    if crate::expr_eval::is_btic_function(lookup_upper) {
+        // The registered UDF names are lowercase underscore (`btic_contains`).
+        let canonical_name = name
+            .strip_prefix("btic.")
+            .or_else(|| name.strip_prefix("BTIC."))
+            .map(|rest| format!("btic_{}", rest.to_lowercase()));
+        let udf_name = canonical_name.as_deref().unwrap_or(name);
+        Some(Ok(dummy_udf_expr(udf_name, df_args.to_vec())))
     } else {
         None
     }
@@ -2235,7 +2264,7 @@ fn translate_function_call(
 
     // Similarity functions → registered UDFs
     match name_upper.as_str() {
-        "SIMILAR_TO" | "VECTOR_SIMILARITY" => {
+        "SIMILAR_TO" | "VECTOR_SIMILARITY" | "SPARSE_SIMILAR_TO" => {
             return Ok(dummy_udf_expr(&name_upper.to_lowercase(), df_args));
         }
         _ => {}

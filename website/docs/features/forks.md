@@ -138,7 +138,7 @@ tx.commit().await?;
 // primary sees only its own rows.
 ```
 
-**Read resolution.** A leaf-fork read chains through Lance `base_paths` from the leaf's branch up through every ancestor branch to main. Lance handles this transparently — the depth cost is one extra commit lookup per level. The Phase 3 perf-sanity test asserts depth-5 latency within 5× depth-1 latency on the same query.
+**Read resolution.** A leaf-fork read chains through Lance `base_paths` from the leaf's branch up through every ancestor branch to main. Lance handles this transparently — the depth cost is one extra commit lookup per level. The Phase 3 perf-sanity test asserts depth-5 latency within 5× depth-1 latency on the same query. All query types resolve through a nested fork — plain `MATCH`, filtered scans, vector ANN, and full-text search alike. (Branch scans use sequential predicate filtering rather than scalar-index pushdown, which is negligible for fork-sized datasets; an earlier limitation that errored on vector/FTS and filtered reads over a fork-of-a-fork was fixed in 2.3.0.)
 
 **Snapshot isolation at every level.** Writes on an ancestor *after* a descendant was created stay invisible to the descendant. Writes on a descendant never leak up. Sibling forks under the same parent are mutually isolated.
 

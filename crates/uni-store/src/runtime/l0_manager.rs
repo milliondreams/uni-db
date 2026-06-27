@@ -271,20 +271,31 @@ impl L0Manager {
         *self.current_pin.write() = Arc::new(PinToken(()));
     }
 
-    /// Get the minimum WAL LSN across all pending flush L0s.
-    /// WAL truncation should not go past this LSN to preserve data for pending flushes.
-    /// Returns None if no pending flushes exist.
-    pub fn min_pending_wal_lsn(&self) -> Option<u64> {
-        let pending = self.pending_flush.read();
-        if pending.is_empty() {
-            return None;
-        }
-        pending
+    /// Minimum `wal_lsn_at_start` among pending-flush L0s other than `except`.
+    ///
+    /// This is the floor below which every WAL entry is durable in L1: a pending
+    /// flush — one still streaming, or one whose flush FAILED and left the buffer
+    /// in `pending_flush` — holds committed WAL entries strictly above its start
+    /// that are not yet in L1. WAL truncation and the published
+    /// `wal_high_water_mark` must not advance past this floor, or that buffer's
+    /// committed-but-unflushed data is silently dropped by the next (e.g.
+    /// shutdown) flush. Using the high watermark (`wal_lsn_at_flush`) here was the
+    /// lost-commit bug: it truncated / checkpointed past the pending buffer's own
+    /// entries.
+    ///
+    /// `except` is the buffer the caller is itself flushing — its data IS entering
+    /// the new snapshot, so it must not constrain the floor. At truncation time it
+    /// has already been removed via `complete_flush`, so passing it is a harmless
+    /// no-op; during the stream phase it is still pending and the exclusion is
+    /// load-bearing.
+    ///
+    /// Returns `None` when no other pending flush exists.
+    pub fn min_pending_wal_lsn_start(&self, except: &Arc<RwLock<L0Buffer>>) -> Option<u64> {
+        self.pending_flush
+            .read()
             .iter()
-            .map(|l0_arc| {
-                let l0 = l0_arc.read();
-                l0.wal_lsn_at_flush
-            })
+            .filter(|l0_arc| !Arc::ptr_eq(l0_arc, except))
+            .map(|l0_arc| l0_arc.read().wal_lsn_at_start)
             .min()
     }
 }

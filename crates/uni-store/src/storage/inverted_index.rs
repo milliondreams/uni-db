@@ -8,10 +8,9 @@
 //! maintaining a term-to-VID mapping. Supports both full rebuilds and
 //! incremental updates for optimal performance during mutations.
 
-use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ListArray, RecordBatchIterator, StringArray, UInt64Array};
+use arrow_array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::Dataset;
@@ -86,127 +85,126 @@ impl InvertedIndex {
         })
     }
 
-    /// Rebuild the index from scratch by scanning `vertex_dataset`.
+    /// Accumulate one record batch's terms into `postings`.
     ///
-    /// Calls `progress` every 10 000 vertices with the running document count.
-    /// Uses segmented accumulation to stay within the 256 MB memory limit.
-    pub async fn build_from_dataset(
-        &mut self,
-        vertex_dataset: &VertexDataset,
-        progress: impl Fn(usize),
-    ) -> Result<()> {
-        let mut postings: HashMap<String, Vec<u64>> = HashMap::new();
-        let mut temp_segments: Vec<HashMap<String, Vec<u64>>> = Vec::new();
+    /// Returns the number of documents (rows) processed. Shared by the two
+    /// build entry points so the term-extraction and `_vid` decoding logic
+    /// lives in exactly one place.
+    ///
+    /// # Errors
+    /// Returns an error if the batch lacks the `_vid` column or the indexed
+    /// property is not a `List<String>` column.
+    fn accumulate_batch(
+        &self,
+        batch: &RecordBatch,
+        postings: &mut HashMap<String, Vec<u64>>,
+    ) -> Result<usize> {
+        let vid_col = batch
+            .column_by_name("_vid")
+            .ok_or_else(|| anyhow!("Missing _vid"))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("Invalid _vid type"))?;
+
+        let term_col = batch
+            .column_by_name(&self.property)
+            .ok_or_else(|| anyhow!("Missing property {}", self.property))?;
+
+        let list_array = term_col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Property {} must be List<String>, got {:?}",
+                    self.property,
+                    term_col.data_type()
+                )
+            })?;
+
+        let values = list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("Property {} must be List<String>", self.property))?;
+
         let mut count = 0;
-        let max_memory = DEFAULT_MAX_POSTINGS_MEMORY;
+        for i in 0..batch.num_rows() {
+            let vid = vid_col.value(i);
 
-        debug!(property = %self.property, "Building inverted index from dataset");
+            if list_array.is_null(i) {
+                continue;
+            }
 
-        if let Ok(ds) = vertex_dataset.open().await {
-            let scanner = ds.scan();
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                debug!(rows = batch.num_rows(), "Processing batch");
-                let vid_col = batch
-                    .column_by_name("_vid")
-                    .ok_or_else(|| anyhow!("Missing _vid"))?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| anyhow!("Invalid _vid type"))?;
+            let start = list_array.value_offsets()[i] as usize;
+            let end = list_array.value_offsets()[i + 1] as usize;
 
-                let term_col = batch
-                    .column_by_name(&self.property)
-                    .ok_or_else(|| anyhow!("Missing property {}", self.property))?;
-
-                let list_array =
-                    term_col
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "Property {} must be List<String>, got {:?}",
-                                self.property,
-                                term_col.data_type()
-                            )
-                        })?;
-
-                let values = list_array
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| anyhow!("Property {} must be List<String>", self.property))?;
-
-                for i in 0..batch.num_rows() {
-                    let vid = vid_col.value(i);
-
-                    if list_array.is_null(i) {
-                        continue;
-                    }
-
-                    let start = list_array.value_offsets()[i] as usize;
-                    let end = list_array.value_offsets()[i + 1] as usize;
-
-                    let mut terms = HashSet::new();
-                    for j in start..end {
-                        if !values.is_null(j) {
-                            let term = values.value(j);
-                            let term = if self.config.normalize {
-                                term.to_lowercase().trim().to_string()
-                            } else {
-                                term.to_string()
-                            };
-                            terms.insert(term);
-                        }
-                    }
-
-                    if terms.len() > self.config.max_terms_per_doc {
-                        // Truncate logic if needed
-                    }
-
-                    for term in terms {
-                        postings.entry(term).or_default().push(vid);
-                    }
-
-                    count += 1;
-                    if count % 10_000 == 0 {
-                        progress(count);
-                    }
-                }
-
-                // Check if we've exceeded memory limit - flush to temp segment
-                if max_memory > 0 && estimated_postings_memory(&postings) > max_memory {
-                    debug!(
-                        segment = temp_segments.len(),
-                        terms = postings.len(),
-                        "Flushing postings segment due to memory limit"
-                    );
-                    temp_segments.push(std::mem::take(&mut postings));
+            let mut terms = HashSet::new();
+            for j in start..end {
+                if !values.is_null(j) {
+                    let term = values.value(j);
+                    let term = if self.config.normalize {
+                        term.to_lowercase().trim().to_string()
+                    } else {
+                        term.to_string()
+                    };
+                    terms.insert(term);
                 }
             }
-        } else {
-            debug!("Vertex dataset not found, creating empty index");
+
+            for term in terms {
+                postings.entry(term).or_default().push(vid);
+            }
+
+            count += 1;
         }
+        Ok(count)
+    }
 
-        debug!(
-            terms = postings.len(),
-            segments = temp_segments.len(),
-            "Built inverted index"
-        );
-
-        // Merge and write
+    /// Merge the accumulated segments and overwrite the on-disk postings.
+    async fn finish_build(
+        &mut self,
+        postings: HashMap<String, Vec<u64>>,
+        mut temp_segments: Vec<HashMap<String, Vec<u64>>>,
+    ) -> Result<()> {
         if temp_segments.is_empty() {
-            // Small dataset: write directly
             self.write_postings(postings).await?;
         } else {
-            // Large dataset: merge all segments
-            temp_segments.push(postings); // add remaining
+            temp_segments.push(postings);
             info!(segments = temp_segments.len(), "Merging postings segments");
             let merged = merge_postings_segments(temp_segments);
             debug!(final_terms = merged.len(), "Merged postings");
             self.write_postings(merged).await?;
         }
-
         Ok(())
+    }
+
+    /// Rebuild the index from already-scanned record batches.
+    ///
+    /// This is the canonical backfill path: the LanceDB-managed vertex table
+    /// is read by the storage backend (`backend.scan`), not by a raw
+    /// `lance::Dataset::open` whose physical path differs. Calls `progress`
+    /// per batch with the running document count and uses segmented
+    /// accumulation to stay within the 256 MB memory limit.
+    ///
+    /// # Errors
+    /// Returns an error if a batch is missing `_vid` or the indexed property
+    /// is not `List<String>`, or if persisting the postings fails.
+    pub async fn build_from_batches(
+        &mut self,
+        batches: &[RecordBatch],
+        progress: impl Fn(usize),
+    ) -> Result<()> {
+        let mut postings: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut temp_segments: Vec<HashMap<String, Vec<u64>>> = Vec::new();
+        let mut count = 0;
+        for batch in batches {
+            count += self.accumulate_batch(batch, &mut postings)?;
+            progress(count);
+            if estimated_postings_memory(&postings) > DEFAULT_MAX_POSTINGS_MEMORY {
+                temp_segments.push(std::mem::take(&mut postings));
+            }
+        }
+        self.finish_build(postings, temp_segments).await
     }
 
     /// Overwrite the on-disk postings with the provided map.

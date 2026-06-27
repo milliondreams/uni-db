@@ -549,7 +549,14 @@ pub async fn build_database_core(
 
 /// Parse a data type string into a DataType enum.
 pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
-    if data_type.starts_with("vector:") {
+    // Checked before `vector:` — `sparse_vector:N` does not start with `vector:`,
+    // but ordering it first keeps the learned-sparse case unambiguous.
+    if let Some(dims_str) = data_type.strip_prefix("sparse_vector:") {
+        let dims = dims_str.parse::<usize>().map_err(|_| {
+            "Invalid dimensions for sparse_vector type, e.g., 'sparse_vector:30522'".to_string()
+        })?;
+        Ok(DataType::SparseVector { dimensions: dims })
+    } else if data_type.starts_with("vector:") {
         let dims = data_type
             .split(':')
             .nth(1)
@@ -812,6 +819,28 @@ pub fn create_index_definition_from_config(
                     .unwrap_or(true),
                 metadata: Default::default(),
             }))
+        }
+
+        "sparse" => {
+            // Vocabulary size is metadata (the engine reads term ids from the
+            // data, not this bound); callers that know it — e.g. the OGM, which
+            // has the declared `sparse_vector:N` column — pass it through.
+            let dimensions = config
+                .get("dimensions")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            Ok(IndexDefinition::Sparse(
+                uni_common::core::schema::SparseVectorIndexConfig {
+                    name: format!("idx_{}_{}_sparse", label, property),
+                    label: label.to_string(),
+                    property: property.to_string(),
+                    dimensions,
+                    quantize: true,
+                    // OGM auto-embed is out of scope (no modality exposes it via OGM yet).
+                    embedding_config: None,
+                    metadata: Default::default(),
+                },
+            ))
         }
 
         _ => Err(format!("Unknown index type in config: {}", idx_type)),

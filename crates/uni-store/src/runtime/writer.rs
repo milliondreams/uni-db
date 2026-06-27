@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+#[cfg(feature = "lance-backend")]
+use crate::backend::table_names;
 use crate::runtime::context::QueryContext;
 use crate::runtime::flush_coordinator::{
     FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
@@ -70,6 +72,24 @@ struct EmbedGroupSpec {
     document_prefix: Option<String>,
     dense: Vec<String>,
     multi: Vec<String>,
+    sparse: Vec<String>,
+}
+
+/// Convert one xervo sparse embedding (`(term_id, weight)` pairs, possibly
+/// unsorted / with duplicate terms) into a `Value::SparseVector`. Sorting (via
+/// `BTreeMap`) and summing duplicates yields the sorted-unique invariant the
+/// index and codec require; non-finite weights are dropped (never poison a row).
+fn sparse_pairs_to_value(pairs: &[(u32, f32)]) -> Value {
+    let mut by_term: std::collections::BTreeMap<u32, f32> = std::collections::BTreeMap::new();
+    for &(term, weight) in pairs {
+        if weight.is_finite() {
+            *by_term.entry(term).or_insert(0.0) += weight;
+        }
+    }
+    Value::SparseVector {
+        indices: by_term.keys().copied().collect(),
+        values: by_term.values().copied().collect(),
+    }
 }
 
 /// Run ONE embedding inference for a coalesced group of auto-embed targets sharing an alias +
@@ -78,35 +98,69 @@ struct EmbedGroupSpec {
 /// (`hybrid_embedder`), so a multi-functional model (e.g. BGE-M3) produces the dense + ColBERT
 /// heads from a SINGLE forward pass; otherwise it uses the single-head dense / multi-vector
 /// embedder (today's behavior for non-mixed groups).
+#[allow(clippy::type_complexity)]
 async fn embed_group(
     runtime: &ModelRuntime,
     alias: &str,
     texts: &[&str],
     want_dense: bool,
     want_multi: bool,
-) -> Result<(Option<Vec<Vec<f32>>>, Option<Vec<Vec<Vec<f32>>>>)> {
+    want_sparse: bool,
+) -> Result<(
+    Option<Vec<Vec<f32>>>,
+    Option<Vec<Vec<Vec<f32>>>>,
+    Option<Vec<Vec<(u32, f32)>>>,
+)> {
     use uni_xervo::traits::hybrid::HeadSet;
-    if want_dense && want_multi {
-        // Single-pass hybrid: one model, one inference, both heads.
+    let heads_wanted = u8::from(want_dense) + u8::from(want_multi) + u8::from(want_sparse);
+    if heads_wanted > 1 {
+        // Single-pass hybrid: one model, one inference, all requested heads
+        // (e.g. BGE-M3 fills dense + sparse from one forward pass).
+        let mut heads = HeadSet::empty();
+        if want_dense {
+            heads |= HeadSet::DENSE;
+        }
+        if want_multi {
+            heads |= HeadSet::MULTI_VECTOR;
+        }
+        if want_sparse {
+            heads |= HeadSet::SPARSE;
+        }
         let embedder = runtime.hybrid_embedder(alias).await?;
-        let res = embedder
-            .embed(texts, HeadSet::DENSE | HeadSet::MULTI_VECTOR)
-            .await?;
-        let dense = res.dense.ok_or_else(|| {
-            anyhow!("hybrid model '{alias}' returned no dense head for a Vector target")
-        })?;
-        let multi = res.multi_vector.ok_or_else(|| {
-            anyhow!(
-                "hybrid model '{alias}' returned no multi-vector head for a List<Vector> target"
-            )
-        })?;
-        Ok((Some(dense), Some(multi)))
+        let res = embedder.embed(texts, heads).await?;
+        let dense = if want_dense {
+            Some(res.dense.ok_or_else(|| {
+                anyhow!("hybrid model '{alias}' returned no dense head for a Vector target")
+            })?)
+        } else {
+            None
+        };
+        let multi = if want_multi {
+            Some(res.multi_vector.ok_or_else(|| {
+                anyhow!(
+                    "hybrid model '{alias}' returned no multi-vector head for a List<Vector> target"
+                )
+            })?)
+        } else {
+            None
+        };
+        let sparse = if want_sparse {
+            Some(res.sparse.ok_or_else(|| {
+                anyhow!("hybrid model '{alias}' returned no sparse head for a SparseVector target")
+            })?)
+        } else {
+            None
+        };
+        Ok((dense, multi, sparse))
     } else if want_multi {
         let embedder = runtime.multi_vector_embedder(alias).await?;
-        Ok((None, Some(embedder.embed(texts).await?.vectors)))
+        Ok((None, Some(embedder.embed(texts).await?.vectors), None))
+    } else if want_sparse {
+        let embedder = runtime.sparse_embedder(alias).await?;
+        Ok((None, None, Some(embedder.embed(texts).await?.vectors)))
     } else {
         let embedder = runtime.embedding(alias).await?;
-        Ok((Some(embedder.embed(texts).await?.vectors), None))
+        Ok((Some(embedder.embed(texts).await?.vectors), None, None))
     }
 }
 
@@ -118,27 +172,81 @@ fn collect_embed_groups(
 ) -> std::collections::BTreeMap<(String, Vec<String>), EmbedGroupSpec> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(String, Vec<String>), EmbedGroupSpec> = BTreeMap::new();
+    fn spec_for<'a>(
+        groups: &'a mut std::collections::BTreeMap<(String, Vec<String>), EmbedGroupSpec>,
+        emb: &uni_common::core::schema::EmbeddingConfig,
+    ) -> &'a mut EmbedGroupSpec {
+        groups
+            .entry((emb.alias.clone(), emb.source_properties.clone()))
+            .or_insert_with(|| EmbedGroupSpec {
+                source_properties: emb.source_properties.clone(),
+                document_prefix: emb.document_prefix.clone(),
+                dense: Vec::new(),
+                multi: Vec::new(),
+                sparse: Vec::new(),
+            })
+    }
     for idx in &schema.indexes {
         if let IndexDefinition::Vector(v_config) = idx
             && v_config.label == label
             && let Some(emb) = &v_config.embedding_config
         {
-            let g = groups
-                .entry((emb.alias.clone(), emb.source_properties.clone()))
-                .or_insert_with(|| EmbedGroupSpec {
-                    source_properties: emb.source_properties.clone(),
-                    document_prefix: emb.document_prefix.clone(),
-                    dense: Vec::new(),
-                    multi: Vec::new(),
-                });
+            let g = spec_for(&mut groups, emb);
             if is_multivector_property(schema, label, &v_config.property) {
                 g.multi.push(v_config.property.clone());
             } else {
                 g.dense.push(v_config.property.clone());
             }
+        } else if let IndexDefinition::Sparse(s_config) = idx
+            && s_config.label == label
+            && let Some(emb) = &s_config.embedding_config
+        {
+            spec_for(&mut groups, emb)
+                .sparse
+                .push(s_config.property.clone());
         }
     }
     groups
+}
+
+/// On a partial / `SET` write, when the write touches a *source* property of an
+/// auto-embed group, drop that group's target columns from `props` so the
+/// `!contains_key` guard in `process_embeddings_*` re-embeds them (otherwise the
+/// re-read old embedding is preserved → stale), and add the targets to
+/// `touched_keys` so the partial Lance write persists the refresh. Mirrors the
+/// MUVERA derived-column touched-keys handling. A target the caller set
+/// explicitly in the SAME write (already in `touched_keys`) is left intact.
+fn refresh_touched_embed_targets(
+    schema: &uni_common::core::schema::Schema,
+    props: &mut Properties,
+    touched_keys: &mut HashSet<String>,
+    labels: &[String],
+) {
+    let Some(label) = labels.first() else {
+        return;
+    };
+    let user_touched = touched_keys.clone();
+    for (_key, group) in collect_embed_groups(schema, label) {
+        if !group
+            .source_properties
+            .iter()
+            .any(|s| touched_keys.contains(s))
+        {
+            continue;
+        }
+        for target in group
+            .dense
+            .iter()
+            .chain(group.multi.iter())
+            .chain(group.sparse.iter())
+        {
+            if user_touched.contains(target) {
+                continue;
+            }
+            props.remove(target);
+            touched_keys.insert(target.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1867,10 +1975,16 @@ impl Writer {
                         vid_list.join(", ")
                     );
 
-                    if let Ok(ds) = self.storage.vertex_dataset(label)
-                        && let Ok(lance_ds) = ds.open_raw().await
-                    {
-                        let count = lance_ds.count_rows(Some(filter.clone())).await?;
+                    // Count flushed duplicates through the `StorageBackend`
+                    // (branch-aware, correct `.lance` path). A missing table
+                    // means nothing is flushed yet — the L0/pending/tx checks
+                    // above already covered in-memory rows — so skip cleanly;
+                    // any other backend error must abort the write rather than
+                    // silently fail open (the prior `open_raw()` foot-gun).
+                    let backend = self.storage.backend();
+                    let table = table_names::vertex_table_name(label);
+                    if backend.table_exists(&table).await? {
+                        let count = backend.count_rows(&table, Some(filter.as_str())).await?;
                         if count > 0 {
                             return Err(anyhow!(
                                 "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
@@ -2200,17 +2314,22 @@ impl Writer {
             current_vid.as_u64()
         ));
 
+        // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
+        // correct `.lance` path). Skip cleanly when the table is not yet
+        // flushed; propagate any real backend error instead of failing open.
         #[cfg(feature = "lance-backend")]
-        if let Ok(ds) = self.storage.vertex_dataset(label)
-            && let Ok(lance_ds) = ds.open_raw().await
         {
-            let count = lance_ds.count_rows(Some(filter.clone())).await?;
-            if count > 0 {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
-                    label,
-                    filter
-                ));
+            let backend = self.storage.backend();
+            let table = table_names::vertex_table_name(label);
+            if backend.table_exists(&table).await? {
+                let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                if count > 0 {
+                    return Err(anyhow!(
+                        "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
+                        label,
+                        filter
+                    ));
+                }
             }
         }
 
@@ -2652,6 +2771,20 @@ impl Writer {
     /// When `UniConfig::partial_lance_writes == false`, falls through
     /// to `insert_vertex_with_labels` (Append) — preserving bit-for-bit
     /// equivalence with prior releases.
+    /// Refresh auto-embed targets for a partial / `SET` write whose `touched_keys`
+    /// include an embed *source* column: drop stale target embeddings from `props`
+    /// (so they re-embed) and add them to `touched_keys`. Public so the query
+    /// executor can apply it on the coalesced write **before** the partial-vs-full
+    /// branch — both branches need it. No-op for non-SET writes / non-embed labels.
+    pub fn refresh_embed_targets(
+        &self,
+        props: &mut Properties,
+        touched_keys: &mut HashSet<String>,
+        labels: &[String],
+    ) {
+        refresh_touched_embed_targets(&self.schema_manager.schema(), props, touched_keys, labels);
+    }
+
     #[instrument(skip(self, props, touched_keys, labels), level = "trace")]
     pub async fn insert_vertex_partial_full(
         &self,
@@ -3337,11 +3470,20 @@ impl Writer {
         let schema = self.schema_manager.schema();
         let mut has_unsatisfied_cfg = false;
         for idx in &schema.indexes {
-            if let IndexDefinition::Vector(v_cfg) = idx
-                && v_cfg.label == *label
-                && v_cfg.embedding_config.is_some()
-                && !properties.contains_key(&v_cfg.property)
-            {
+            let unsatisfied = match idx {
+                IndexDefinition::Vector(v_cfg) => {
+                    v_cfg.label == *label
+                        && v_cfg.embedding_config.is_some()
+                        && !properties.contains_key(&v_cfg.property)
+                }
+                IndexDefinition::Sparse(s_cfg) => {
+                    s_cfg.label == *label
+                        && s_cfg.embedding_config.is_some()
+                        && !properties.contains_key(&s_cfg.property)
+                }
+                _ => false,
+            };
+            if unsatisfied {
                 has_unsatisfied_cfg = true;
                 break;
             }
@@ -3449,9 +3591,25 @@ impl Writer {
                     Some(v) => crate::storage::muvera_index::value_to_multivec(v),
                     None => continue, // source absent → leave the FDE column NULL
                 };
-                let fde = encoder.encode_doc(&tokens).map_err(|e| {
-                    anyhow!("MUVERA index '{}' vid {:?}: {e}", spec.index_name, vid)
-                })?;
+                // A source token with the wrong dimension makes `encode_doc` error.
+                // Skipping the row (leaving the FDE column NULL → ranks last under the
+                // mandatory Dot metric; harmless) keeps one malformed document from
+                // wedging *every* flush of this label, matching the normal multi-vector
+                // column path, which null-fills a dimension mismatch rather than failing
+                // the flush (issue #96).
+                let fde = match encoder.encode_doc(&tokens) {
+                    Ok(fde) => fde,
+                    Err(e) => {
+                        tracing::warn!(
+                            index = %spec.index_name,
+                            vid = ?vid,
+                            error = %e,
+                            "muvera.fde.skip_malformed: leaving FDE NULL for a source \
+                             multi-vector that failed encoding"
+                        );
+                        continue;
+                    }
+                };
                 if let Some(props) = guard.vertex_properties.get_mut(&vid) {
                     props.insert(spec.derived_col.clone(), Value::Vector(fde));
                 }
@@ -3496,6 +3654,7 @@ impl Writer {
             let alias = &key.0;
             let want_dense = !group.dense.is_empty();
             let want_multi = !group.multi.is_empty();
+            let want_sparse = !group.sparse.is_empty();
 
             // A row needs this group's inference if it has the source text and is still missing
             // at least one of the group's target columns (user-supplied values are preserved).
@@ -3506,6 +3665,7 @@ impl Writer {
                     .dense
                     .iter()
                     .chain(group.multi.iter())
+                    .chain(group.sparse.iter())
                     .all(|t| properties.contains_key(t));
                 if all_present {
                     continue;
@@ -3538,8 +3698,15 @@ impl Writer {
                 .get()
                 .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
             let input_refs: Vec<&str> = input_texts.iter().map(|s| s.as_str()).collect();
-            let (dense, multi) =
-                embed_group(runtime, alias, &input_refs, want_dense, want_multi).await?;
+            let (dense, multi, sparse) = embed_group(
+                runtime,
+                alias,
+                &input_refs,
+                want_dense,
+                want_multi,
+                want_sparse,
+            )
+            .await?;
 
             for (i, &row) in needs.iter().enumerate() {
                 if let Some(vec) = dense.as_ref().and_then(|d| d.get(i)) {
@@ -3555,6 +3722,14 @@ impl Writer {
                     for t in &group.multi {
                         if !properties_batch[row].contains_key(t) {
                             properties_batch[row].insert(t.clone(), mv.clone());
+                        }
+                    }
+                }
+                if let Some(pairs) = sparse.as_ref().and_then(|s| s.get(i)) {
+                    let sv = sparse_pairs_to_value(pairs);
+                    for t in &group.sparse {
+                        if !properties_batch[row].contains_key(t) {
+                            properties_batch[row].insert(t.clone(), sv.clone());
                         }
                     }
                 }
@@ -3590,6 +3765,7 @@ impl Writer {
                 .dense
                 .iter()
                 .chain(group.multi.iter())
+                .chain(group.sparse.iter())
                 .all(|t| properties.contains_key(t))
             {
                 continue;
@@ -3618,8 +3794,16 @@ impl Writer {
                 .ok_or_else(|| anyhow!("Uni-Xervo runtime not configured for auto-embedding"))?;
             let want_dense = !group.dense.is_empty();
             let want_multi = !group.multi.is_empty();
-            let (dense, multi) =
-                embed_group(runtime, alias, &[text.as_str()], want_dense, want_multi).await?;
+            let want_sparse = !group.sparse.is_empty();
+            let (dense, multi, sparse) = embed_group(
+                runtime,
+                alias,
+                &[text.as_str()],
+                want_dense,
+                want_multi,
+                want_sparse,
+            )
+            .await?;
 
             if let Some(vec) = dense.as_ref().and_then(|d| d.first()) {
                 let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
@@ -3634,6 +3818,14 @@ impl Writer {
                 for t in &group.multi {
                     if !properties.contains_key(t) {
                         properties.insert(t.clone(), mv.clone());
+                    }
+                }
+            }
+            if let Some(pairs) = sparse.as_ref().and_then(|s| s.first()) {
+                let sv = sparse_pairs_to_value(pairs);
+                for t in &group.sparse {
+                    if !properties.contains_key(t) {
+                        properties.insert(t.clone(), sv.clone());
                     }
                 }
             }
@@ -3857,6 +4049,12 @@ impl Writer {
             let mut new_l0_guard = new_l0_arc.write();
             new_l0_guard.wal = wal;
             new_l0_guard.current_version = current_version;
+            // The new active buffer starts accumulating strictly above the
+            // rotation point: everything <= `wal_lsn` is now owned by the old
+            // (being-flushed) buffer or earlier. This start watermark is the
+            // floor that keeps WAL truncation / checkpoint publication from
+            // discarding this buffer's data if its eventual flush fails.
+            new_l0_guard.wal_lsn_at_start = wal_lsn;
         }
 
         Ok(RotateOutput {
@@ -4130,7 +4328,16 @@ impl Writer {
         manifest.name = name;
         manifest.created_at = Utc::now();
         manifest.version_high_water_mark = current_version;
-        manifest.wal_high_water_mark = wal_lsn;
+        // Cap the published WAL checkpoint at the floor of any OTHER pending
+        // flush. A still-pending flush (notably one that FAILED and left its
+        // buffer in `pending_flush`) holds committed WAL entries above its start
+        // that are NOT in this snapshot; recovery replays from this mark, so
+        // claiming durability past that floor would skip them (lost commit). A
+        // normal flush with no other pending buffer keeps `wal_lsn` unchanged.
+        manifest.wal_high_water_mark = self
+            .l0_manager
+            .min_pending_wal_lsn_start(&old_l0_arc)
+            .map_or(wal_lsn, |floor| floor.min(wal_lsn));
         let snapshot_id = manifest.snapshot_id.clone();
 
         tracing::Span::current().record("snapshot_id", &snapshot_id);
@@ -4522,6 +4729,54 @@ impl Writer {
                 }
             }
 
+            // Collect sparse-vector index updates before consuming vertices.
+            // Maps: cfg.property -> (added [(term_id, weight)] per vid, removed).
+            type SparseUpdateMap = HashMap<String, (HashMap<Vid, Vec<(u32, f32)>>, HashSet<Vid>)>;
+            let mut sparse_updates: SparseUpdateMap = HashMap::new();
+
+            for idx in &schema.indexes {
+                if let IndexDefinition::Sparse(cfg) = idx
+                    && cfg.label == label_name
+                {
+                    let mut added: HashMap<Vid, Vec<(u32, f32)>> = HashMap::new();
+                    let mut removed: HashSet<Vid> = HashSet::new();
+
+                    for (vid, _labels, props, deleted, _version) in &vertices {
+                        if *deleted {
+                            removed.insert(*vid);
+                        } else if let Some(uni_common::Value::SparseVector { indices, values }) =
+                            props.get(&cfg.property)
+                        {
+                            let pairs: Vec<(u32, f32)> = indices
+                                .iter()
+                                .copied()
+                                .zip(values.iter().copied())
+                                .collect();
+                            added.insert(*vid, pairs);
+                            // An in-place SET re-flushes an already-indexed vid. The
+                            // sparse postings are a `Vec` with no per-vid dedup, so unless
+                            // the vid is also marked removed, `apply_incremental_updates`
+                            // appends the new postings *alongside* the stale ones — leaking
+                            // duplicates that grow unboundedly on hot-updated docs and
+                            // double-count the advisory `query_topk` score (issue #95).
+                            // Mark every updated vid removed so its prior postings are
+                            // purged before the new ones are appended (remove-then-add).
+                            removed.insert(*vid);
+                        }
+                    }
+                    // Tombstones are not in `vertices`; pull from tombstones_by_label.
+                    if let Some(tomb_rows) = tombstones_by_label.get(&label_id) {
+                        for (vid, _) in tomb_rows {
+                            removed.insert(*vid);
+                        }
+                    }
+
+                    if !added.is_empty() || !removed.is_empty() {
+                        sparse_updates.insert(cfg.property.clone(), (added, removed));
+                    }
+                }
+            }
+
             let mut v_data = Vec::new();
             let mut d_data = Vec::new();
             let mut ver_data = Vec::new();
@@ -4622,6 +4877,20 @@ impl Writer {
                     self.storage
                         .index_manager()
                         .update_inverted_index_incremental(cfg, added, removed)
+                        .await?;
+                }
+            }
+
+            // Apply sparse-vector index updates incrementally
+            #[cfg(feature = "lance-backend")]
+            for idx in &schema.indexes {
+                if let IndexDefinition::Sparse(cfg) = idx
+                    && cfg.label == label_name
+                    && let Some((added, removed)) = sparse_updates.get(&cfg.property)
+                {
+                    self.storage
+                        .index_manager()
+                        .update_sparse_vector_index_incremental(cfg, added, removed)
                         .await?;
                 }
             }
@@ -4870,14 +5139,18 @@ impl Writer {
         // read after flush finalize).
         fail::fail_point!("flush::after-complete-before-cache-clear");
 
-        // K. Truncate WAL up to the safe LSN.
+        // K. Truncate WAL up to the safe LSN. The floor is the START watermark
+        // of any OTHER pending flush (this flush's own buffer was removed from
+        // pending by `complete_flush` in J, so it is excluded): a pending — e.g.
+        // failed — flush's committed entries live above its start and are not yet
+        // in L1, so truncating to its high watermark would delete its own data
+        // (the lost-commit-on-graceful-close bug).
         let wal_handle = shared.l0_manager.get_current().read().wal.clone();
         if let Some(w) = wal_handle {
             let safe_lsn = shared
                 .l0_manager
-                .min_pending_wal_lsn()
-                .map(|min_pending| min_pending.min(wal_lsn))
-                .unwrap_or(wal_lsn);
+                .min_pending_wal_lsn_start(&old_l0_arc)
+                .map_or(wal_lsn, |floor| floor.min(wal_lsn));
             w.truncate_before(safe_lsn).await?;
         }
 

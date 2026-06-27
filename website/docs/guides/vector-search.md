@@ -87,18 +87,7 @@ Add a `Vector` type property to your schema:
 
 Create an index for efficient similarity search:
 
-**HNSW (Recommended for most cases):**
-
-```cypher
-CREATE VECTOR INDEX paper_embeddings
-FOR (p:Paper)
-ON p.embedding
-OPTIONS {
-  type: "hnsw"
-}
-```
-
-**IVF_PQ (For memory-constrained environments):**
+**IVF_PQ (Default — recommended for most cases):**
 
 ```cypher
 CREATE VECTOR INDEX paper_embeddings
@@ -106,6 +95,19 @@ FOR (p:Paper)
 ON p.embedding
 OPTIONS {
   type: "ivf_pq"
+}
+```
+
+If you omit `type`, the index defaults to IVF_PQ with cosine distance.
+
+**HNSW (Lower latency for mid-size datasets):**
+
+```cypher
+CREATE VECTOR INDEX paper_embeddings
+FOR (p:Paper)
+ON p.embedding
+OPTIONS {
+  type: "hnsw"
 }
 ```
 
@@ -658,7 +660,11 @@ For Cosine and L2, you can compare scores across queries without worrying about 
 DDL supports selecting the index type and tuning parameters directly:
 
 ```cypher
--- HNSW-SQ with custom parameters (default algorithm)
+-- IVF-PQ with custom parameters (default algorithm)
+CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'ivf_pq', partitions: '256', sub_vectors: '16' }
+
+-- HNSW-SQ with custom parameters
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_sq', m: '32', ef_construction: '200' }
 
@@ -692,7 +698,49 @@ db.schema()
     .await?;
 ```
 
-All 8 algorithms are available: `Flat`, `IvfFlat`, `IvfSq`, `IvfPq`, `IvfRq`, `HnswFlat`, `HnswSq` (default), `HnswPq`. See [Indexing Concepts](../concepts/indexing.md) for the full parameter reference.
+All 8 single-vector algorithms are available: `Flat`, `IvfFlat`, `IvfSq`, `IvfPq` (default), `IvfRq`, `HnswFlat`, `HnswSq`, `HnswPq` — plus `Muvera` for multi-vector (ColBERT) columns. See [Indexing Concepts](../concepts/indexing.md) for the full parameter reference, query-time tuning (`nprobes`/`refine_factor`), and MUVERA.
+
+---
+
+## Multi-Vector (ColBERT) Search
+
+Late-interaction retrieval stores **many vectors per row** (one per token) and scores by MaxSim. The full model is covered in [Vector Search — Multi-Vector](../features/vector-search.md#multi-vector-search-colbert-late-interaction); here is the end-to-end how-to.
+
+**1. Declare a multi-vector property** — a `LIST<VECTOR(dim)>`. It must be schema-declared:
+
+```cypher
+CREATE LABEL Document (
+    title  STRING,
+    tokens LIST<VECTOR(96)>
+)
+```
+
+**2. (Optional) Add a MUVERA index** for fast first-stage retrieval over the tokens:
+
+```cypher
+CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
+OPTIONS { type: 'muvera', k_sim: 4, reps: 20, d_proj: 16 }
+```
+
+**3. Query** — either re-rank a dense candidate set, or query the tokens directly:
+
+```cypher
+-- Direct multi-vector query: score is the exact MaxSim similarity
+CALL uni.vector.query('Document', 'tokens', [[0.1, 0.2], [0.3, 0.4]], 10)
+YIELD node, score
+RETURN node.title, score
+ORDER BY score DESC
+
+-- Or: dense first stage, then MaxSim re-rank
+CALL uni.vector.query('Document', 'embedding', $dense_q, 50, null, null,
+  { reranker: 'maxsim', reranker_property: 'tokens',
+    maxsim_query: [[0.1, 0.2], [0.3, 0.4]] })
+YIELD node, rerank_score
+RETURN node.title, rerank_score
+ORDER BY rerank_score DESC
+```
+
+The MUVERA defaults (`k_sim=4, reps=20, d_proj=16`) are unvalidated for any specific corpus; measure recall on your own data and tune `reps`/`k_sim`. Because the final stage is always an exact MaxSim re-rank, a weak FDE only costs recall, never precision.
 
 ---
 

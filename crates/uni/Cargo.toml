@@ -181,6 +181,10 @@ harness = false
 name = "schemaless_traversal"
 harness = false
 
+[[bench]]
+name = "sparse_retrieval"
+harness = false
+
 [features]
 default = [
     "lance-backend",

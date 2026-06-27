@@ -203,17 +203,26 @@ fn infer_yield_type_rec(
                         return dt;
                     }
                 }
-                // An integer-typed property in a KEY position keeps its Int64
-                // type; the default Property→Float64 rule would otherwise widen
-                // it to a float (issue #94). The `LargeBinary → Int64` decoder
-                // in `coerce_physical_expr` preserves the integer value.
-                if is_key
-                    && let Expr::Property(object, prop) = &item.expr
+                // A bare property-access column carries its schema-declared
+                // type. The default `Property → Float64` rule (`infer_expr_type`)
+                // is only correct for numeric properties; a non-numeric property
+                // (DateTime/Duration/Btic/String/Bytes/Bool) would be widened to
+                // Float64 and forced through an unsupported projection cast
+                // ("Casting Struct to Float64") or cast-collapsed to Null, and an
+                // integer property would lose its Int64 type. Look the real type
+                // up from the schema for both KEY and value columns; for a
+                // schemaless property the type is unknown, so default to
+                // LargeBinary (the cv-encoded storage type) and let it pass
+                // through unchanged to be decoded at read time. Generalizes the
+                // Int64-only KEY fix from issue #94 to every property (issue
+                // #112: a schemaless/typed property KEY projected Null).
+                if let Expr::Property(object, prop) = &item.expr
                     && let Expr::Variable(var) = object.as_ref()
-                    && property_arrow_type(schema, var_labels, var, prop) == Some(DataType::Int64)
+                    && let Some(dt) = property_arrow_type(schema, var_labels, var, prop)
                 {
-                    return DataType::Int64;
+                    return dt;
                 }
+                let _ = is_key;
                 return infer_expr_type(&item.expr, node_vars);
             }
         }

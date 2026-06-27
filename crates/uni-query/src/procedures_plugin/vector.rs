@@ -114,6 +114,7 @@ pub(super) fn hybrid_search_yields() -> Vec<Field> {
         Field::new("rerank_score", DataType::Float32, true),
         Field::new("vector_score", DataType::Float32, true),
         Field::new("fts_score", DataType::Float32, true),
+        Field::new("sparse_score", DataType::Float32, true),
         Field::new("distance", DataType::Float64, true),
     ]
 }

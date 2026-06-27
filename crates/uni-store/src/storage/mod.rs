@@ -26,6 +26,8 @@ pub mod muvera_index;
 pub mod property_builder;
 pub mod resilient_store;
 pub mod shadow_csr;
+#[cfg(feature = "lance-backend")]
+pub mod sparse_index;
 pub mod value_codec;
 pub mod vertex;
 pub mod vid_labels;

@@ -30,6 +30,7 @@ pub mod classifier;
 pub mod convert;
 pub mod core;
 pub mod exceptions;
+pub mod sparse;
 pub mod sync_api;
 pub mod types;
 
@@ -234,6 +235,9 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // BTIC temporal interval
     m.add_class::<btic::PyBtic>()?;
+
+    // Learned-sparse (SPLADE) vector
+    m.add_class::<sparse::PySparseVector>()?;
 
     // Value and Row types
     m.add_class::<types::PyValue>()?;

@@ -579,7 +579,7 @@ impl DeltaDataset {
                 self.edge_type
             );
             if let Err(e) = backend
-                .create_scalar_index(&table_name, "eid", ScalarIndexType::BTree)
+                .create_scalar_index(&table_name, &["eid"], ScalarIndexType::BTree, None)
                 .await
             {
                 log::warn!("Failed to create eid index for '{}': {}", self.edge_type, e);

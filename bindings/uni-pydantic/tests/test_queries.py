@@ -274,6 +274,27 @@ class TestQueryBuilderCypherGeneration:
         cypher, _ = q._build_cypher()
         assert "distance <= 0.5" in cypher
 
+    def test_sparse_search_cypher_from_dict(self):
+        q = self._make_builder().sparse_search("emb", {5: 2.0, 1: 1.0}, k=5)
+        cypher, params = q._build_cypher()
+        assert "uni.sparse.query" in cypher
+        assert "YIELD node, score" in cypher
+        assert "RETURN node AS n, score ORDER BY score DESC" in cypher
+        # dict canonicalized to sorted parallel arrays.
+        assert params["sparse_q"] == {"indices": [1, 5], "values": [1.0, 2.0]}
+
+    def test_sparse_search_cypher_from_pair(self):
+        q = self._make_builder().sparse_search("emb", ([1, 5], [1.0, 2.0]), k=3)
+        cypher, params = q._build_cypher()
+        assert "uni.sparse.query('Person', 'emb', $sparse_q, 3)" in cypher
+        assert params["sparse_q"] == {"indices": [1, 5], "values": [1.0, 2.0]}
+
+    def test_sparse_search_with_threshold(self):
+        q = self._make_builder().sparse_search("emb", {1: 1.0}, k=5, threshold=0.5)
+        cypher, _ = q._build_cypher()
+        # Sparse score is a dot product → threshold is a lower bound.
+        assert "score >= 0.5" in cypher
+
 
 class TestPropertyValidation:
     """Tests for property name validation."""

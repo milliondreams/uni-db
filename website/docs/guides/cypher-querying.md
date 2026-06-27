@@ -1540,6 +1540,23 @@ CREATE LABEL Author (
 )
 ```
 
+#### Parameterized container types
+
+Property types can be parameterized, including nested forms:
+
+```cypher
+CREATE LABEL Document (
+  title    STRING,
+  embedding VECTOR(384),            -- fixed-dimension dense vector
+  tags     LIST<STRING>,            -- typed list
+  tokens   LIST<VECTOR(96)>,        -- multi-vector (ColBERT / late-interaction)
+  scores   MAP<STRING, FLOAT>,      -- typed map (string keys)
+  sections MAP<STRING, LIST<INT>>   -- nested: map of lists
+)
+```
+
+`LIST<T>` accepts any element type (scalars, `VECTOR(N)`, nested `LIST`/`MAP`). `MAP<K, V>` requires string keys; `V` may be any scalar or nested container. A `LIST<VECTOR(N)>` property is the storage type for multi-vector search — see [Vector Search — Multi-Vector](../features/vector-search.md#multi-vector-search-colbert-late-interaction).
+
 ### Create Edge Type
 
 ```cypher

@@ -54,6 +54,15 @@ pub enum ForkLocalIndexKind {
     Vector,
     /// Lance native FTS / inverted index — RRF fusion (Phase 5b).
     FullText,
+    /// Learned-sparse (SPLADE) dot-product index — `SparseDot` rerank fusion
+    /// (issue #95 Task #4).
+    ///
+    /// v1 retrieval on a fork is a brute-force branch scan re-scored by
+    /// `sparse_dot` (see [`crate::storage::StorageManager::sparse_search`]); this
+    /// variant is a planner/EXPLAIN marker that switches `uni.sparse.query` to the
+    /// fused operator. A dedicated fork-local sparse postings dataset (Approach B)
+    /// is deferred behind the M5 benchmark.
+    Sparse,
 }
 
 /// Read-only scope identifying a forked session.

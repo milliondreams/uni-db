@@ -28,7 +28,7 @@ NodeT = TypeVar("NodeT", bound="UniNode")
 EdgeT = TypeVar("EdgeT", bound="UniEdge")
 
 # Valid index types
-IndexType = Literal["btree", "hash", "fulltext", "vector"]
+IndexType = Literal["btree", "hash", "fulltext", "vector", "sparse"]
 
 # Valid relationship directions
 Direction = Literal["outgoing", "incoming", "both"]

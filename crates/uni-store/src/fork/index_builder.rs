@@ -84,6 +84,18 @@ pub async fn build_fork_local_index(
                 "VidUid fork-local 'index' is a planner marker; no Lance build needed"
             );
         }
+        ForkLocalIndexKind::Sparse => {
+            // No index file to build — Approach A serves fork sparse queries by a
+            // brute-force branch scan re-scored via `sparse_dot`
+            // (`StorageManager::sparse_search`). The registry entry below is a
+            // planner/EXPLAIN marker that switches `uni.sparse.query` to the
+            // `SparseDot` fused operator. A dedicated fork-local postings dataset
+            // (Approach B) is deferred behind the M5 benchmark (issue #95).
+            debug!(
+                fork_id = %scope.fork_id(),
+                "Sparse fork-local 'index' is a planner marker; retrieval is a brute-force branch scan"
+            );
+        }
         ForkLocalIndexKind::ScalarBtree | ForkLocalIndexKind::Sorted => {
             let branch = lookup_branch()?;
             let uri = dataset_uri();

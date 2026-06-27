@@ -2838,14 +2838,19 @@ impl Uni {
     ) -> Result<Option<crate::api::schema::LabelInfo>> {
         let schema = self.inner.schema.schema();
         if let Some(label_meta) = schema.labels.get(name) {
-            let count = if let Ok(ds) = self.inner.storage.vertex_dataset(name) {
-                if let Ok(raw) = ds.open_raw().await {
-                    raw.count_rows(None)
-                        .await
-                        .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?
-                } else {
-                    0
-                }
+            // Row count via the `StorageBackend` (correct `.lance` path); the
+            // prior raw-dataset read reported 0 for flushed tables (#115).
+            let backend = self.inner.storage.backend();
+            let table = uni_store::backend::table_names::vertex_table_name(name);
+            let count = if backend
+                .table_exists(&table)
+                .await
+                .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?
+            {
+                backend
+                    .count_rows(&table, None)
+                    .await
+                    .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?
             } else {
                 0
             };
@@ -3488,7 +3493,12 @@ impl UniBuilder {
             })
             .collect();
 
-        if !required_embed_aliases.is_empty() && self.xervo_catalog.is_none() {
+        // A prebuilt runtime (`.xervo_runtime(...)`) already carries its catalog, so it
+        // satisfies the embedding-alias requirement just as a `.xervo_catalog(...)` does.
+        if !required_embed_aliases.is_empty()
+            && self.xervo_catalog.is_none()
+            && self.prebuilt_xervo_runtime.is_none()
+        {
             return Err(UniError::Internal(anyhow::anyhow!(
                 "Uni-Xervo catalog is required because schema has vector indexes with embedding aliases"
             )));

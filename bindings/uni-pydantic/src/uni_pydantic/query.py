@@ -258,6 +258,38 @@ class VectorSearchConfig:
     pre_filter: str | None = None
 
 
+@dataclass
+class SparseSearchConfig:
+    """Configuration for learned-sparse (SPLADE) similarity search."""
+
+    property_name: str
+    query_indices: list[int]
+    query_values: list[float]
+    k: int
+    threshold: float | None = None
+    pre_filter: str | None = None
+
+
+def _coerce_sparse_query(query: Any) -> tuple[list[int], list[float]]:
+    """Normalize a sparse query into parallel ``(indices, values)`` lists.
+
+    Accepts a ``SparseVector`` (OGM or Rust binding), a ``dict[int, float]``
+    of term id -> weight, or an ``(indices, values)`` pair.
+    """
+    indices = getattr(query, "indices", None)
+    values = getattr(query, "values", None)
+    if indices is not None and values is not None:
+        return [int(i) for i in indices], [float(v) for v in values]
+    if isinstance(query, dict):
+        items = sorted(query.items())
+        return [int(k) for k, _ in items], [float(v) for _, v in items]
+    if isinstance(query, (tuple, list)) and len(query) == 2:
+        return [int(i) for i in query[0]], [float(v) for v in query[1]]
+    raise TypeError(
+        "sparse query must be a SparseVector, dict[int, float], or (indices, values)"
+    )
+
+
 SelfT = TypeVar("SelfT", bound="_QueryBuilderBase[Any]")
 
 
@@ -278,6 +310,7 @@ class _QueryBuilderBase(Generic[NodeT]):
     _traversals: list[TraversalStep]
     _eager_load: list[str]
     _vector_search: VectorSearchConfig | None
+    _sparse_search: SparseSearchConfig | None
     _timeout: float | None
     _max_memory: int | None
     _param_counter: int
@@ -294,6 +327,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         self._traversals = []
         self._eager_load = []
         self._vector_search = None
+        self._sparse_search = None
         self._timeout = None
         self._max_memory = None
         self._param_counter = 0
@@ -311,6 +345,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         new._traversals = list(self._traversals)
         new._eager_load = list(self._eager_load)
         new._vector_search = copy.copy(self._vector_search)
+        new._sparse_search = copy.copy(self._sparse_search)
         new._timeout = self._timeout
         new._max_memory = self._max_memory
         new._param_counter = self._param_counter
@@ -415,6 +450,33 @@ class _QueryBuilderBase(Generic[NodeT]):
         )
         return new
 
+    def sparse_search(
+        self: SelfT,
+        prop: PropertyProxy[Any] | str,
+        query: Any,
+        k: int = 10,
+        threshold: float | None = None,
+        pre_filter: str | None = None,
+    ) -> SelfT:
+        """Perform learned-sparse (SPLADE) similarity search.
+
+        ``query`` may be a ``SparseVector``, a ``dict[int, float]`` of
+        term id -> weight, or an ``(indices, values)`` pair. Returns a new
+        builder. ``threshold`` filters on the dot-product score (``score >= t``).
+        """
+        new = self._clone()
+        name = prop._property_name if isinstance(prop, PropertyProxy) else prop
+        indices, values = _coerce_sparse_query(query)
+        new._sparse_search = SparseSearchConfig(
+            property_name=name,
+            query_indices=indices,
+            query_values=values,
+            k=k,
+            threshold=threshold,
+            pre_filter=pre_filter,
+        )
+        return new
+
     def timeout(self: SelfT, seconds: float) -> SelfT:
         """Set a query timeout. Returns a new builder."""
         new = self._clone()
@@ -456,6 +518,8 @@ class _QueryBuilderBase(Generic[NodeT]):
         """Build the Cypher query string and parameters."""
         if self._vector_search:
             return self._build_vector_search_cypher()
+        if self._sparse_search:
+            return self._build_sparse_search_cypher()
 
         cypher, params = self._build_match_where()
 
@@ -536,6 +600,46 @@ class _QueryBuilderBase(Generic[NodeT]):
             cypher += " WHERE " + " AND ".join(where_parts)
 
         cypher += " RETURN node AS n, distance, score ORDER BY distance"
+
+        if self._limit:
+            cypher += f" LIMIT {self._limit}"
+
+        return cypher, params
+
+    def _build_sparse_search_cypher(self) -> tuple[str, dict[str, Any]]:
+        """Build Cypher for sparse search using uni.sparse.query."""
+        label = self._model.__label__
+        ss = self._sparse_search
+        assert ss is not None
+
+        # The query is passed as an `{indices, values}` map; the procedure
+        # accepts that shape directly (no SparseVector binding needed here).
+        params: dict[str, Any] = {
+            "sparse_q": {"indices": ss.query_indices, "values": ss.query_values}
+        }
+
+        cypher = (
+            f"CALL uni.sparse.query('{label}', '{ss.property_name}', $sparse_q, {ss.k})"
+        )
+        cypher += " YIELD node, score"
+
+        where_parts: list[str] = []
+        if ss.threshold is not None:
+            # Sparse score is a dot product — higher is better, so the
+            # threshold is a lower bound (unlike vector distance).
+            where_parts.append(f"score >= {ss.threshold}")
+
+        if self._filters:
+            for f in self._filters:
+                param_name = self._next_param()
+                clause, clause_params = f.to_cypher("node", param_name)
+                where_parts.append(clause)
+                params.update(clause_params)
+
+        if where_parts:
+            cypher += " WHERE " + " AND ".join(where_parts)
+
+        cypher += " RETURN node AS n, score ORDER BY score DESC"
 
         if self._limit:
             cypher += f" LIMIT {self._limit}"

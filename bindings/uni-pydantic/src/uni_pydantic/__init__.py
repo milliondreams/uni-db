@@ -93,6 +93,7 @@ from .query import (
     OrderByClause,
     PropertyProxy,
     QueryBuilder,
+    SparseSearchConfig,
     TraversalStep,
     VectorSearchConfig,
 )
@@ -114,8 +115,10 @@ from .session import UniSession, UniTransaction
 from .types import (
     DATETIME_TYPES,
     Btic,
+    SparseVector,
     Vector,
     db_to_python_value,
+    get_sparse_vector_dimensions,
     get_vector_dimensions,
     is_list_type,
     is_optional,
@@ -150,9 +153,11 @@ __all__ = [
     # Types
     "Btic",
     "Vector",
+    "SparseVector",
     "python_type_to_uni",
     "uni_to_python_type",
     "get_vector_dimensions",
+    "get_sparse_vector_dimensions",
     "is_optional",
     "is_list_type",
     "unwrap_annotated",
@@ -169,6 +174,7 @@ __all__ = [
     "OrderByClause",
     "TraversalStep",
     "VectorSearchConfig",
+    "SparseSearchConfig",
     # Schema
     "SchemaGenerator",
     "DatabaseSchema",

@@ -1396,6 +1396,7 @@ impl HybridPhysicalPlanner {
 
             // DDL operations should be handled separately
             LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
             | LogicalPlan::CreateFullTextIndex { .. }
             | LogicalPlan::CreateScalarIndex { .. }
             | LogicalPlan::CreateJsonFtsIndex { .. }
@@ -6629,6 +6630,7 @@ fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, Variab
         // Leaf nodes with no variables or not applicable
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
+        | LogicalPlan::CreateSparseIndex { .. }
         | LogicalPlan::CreateFullTextIndex { .. }
         | LogicalPlan::CreateScalarIndex { .. }
         | LogicalPlan::CreateJsonFtsIndex { .. }

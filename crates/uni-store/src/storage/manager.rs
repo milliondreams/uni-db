@@ -1615,22 +1615,18 @@ impl StorageManager {
         Ok(vids)
     }
 
+    /// Construct a [`VertexDataset`] batch-builder for `label`.
+    ///
+    /// `VertexDataset` no longer opens on-disk data, so there is nothing to
+    /// branch here — fork-scoped reads of vertex data go through the
+    /// (branch-aware) `StorageBackend`.
     pub fn vertex_dataset(&self, label: &str) -> Result<VertexDataset> {
         let schema = self.schema_manager.schema();
         let label_meta = schema
             .labels
             .get(label)
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
-        let key = format!("vertices_{label}");
-        match self.fork_branch_for(&key) {
-            Some(branch) => Ok(VertexDataset::new_branched(
-                &self.base_uri,
-                label,
-                label_meta.id,
-                branch,
-            )),
-            None => Ok(VertexDataset::new(&self.base_uri, label, label_meta.id)),
-        }
+        Ok(VertexDataset::new(&self.base_uri, label, label_meta.id))
     }
 
     #[cfg(feature = "lance-backend")]
@@ -1841,8 +1837,10 @@ impl StorageManager {
 
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
-        if !backend.table_exists(&name).await.unwrap_or(false) {
-            // Nothing flushed yet; L0-only candidates are merged upstream.
+        // Distinguish "table genuinely absent" (Ok(false) → nothing flushed yet, L0-only
+        // candidates merged upstream) from a transient backend fault (Err): the latter
+        // must surface, not silently degrade to incomplete results (issue #96).
+        if !backend.table_exists(&name).await? {
             return Ok(Vec::new());
         }
 
@@ -1925,8 +1923,9 @@ impl StorageManager {
             .as_ref()
             .is_some_and(|s| s.branch_for(&name).is_some());
         if branched {
-            if !backend.table_exists(&name).await.unwrap_or(false) {
-                // Nothing flushed on the branch; fork L0 rows are merged upstream.
+            // Ok(false) = nothing flushed on the branch (fork L0 rows merged upstream);
+            // Err = a backend fault that must surface rather than degrade silently (#96).
+            if !backend.table_exists(&name).await? {
                 return Ok(Vec::new());
             }
             let mut filter_parts = vec![Self::build_active_filter(filter)];
@@ -1955,7 +1954,8 @@ impl StorageManager {
         }
 
         let mut results = Vec::new();
-        if backend.table_exists(&name).await.unwrap_or(false) {
+        // Ok(false) = no flushed table yet (L0-only); Err must propagate, not fail open (#96).
+        if backend.table_exists(&name).await? {
             let backend_metric = match &metric {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
@@ -1986,6 +1986,94 @@ impl StorageManager {
         }
 
         Ok(results)
+    }
+
+    /// Flushed-data candidate generation for scored sparse-vector retrieval.
+    ///
+    /// Loads the registered sparse index and returns its top-`k`
+    /// `(vid, prelim_score)` by dot product over the flushed postings. Like
+    /// [`Self::multivector_search`], this is **flushed-only** and the prelim
+    /// score is advisory: the uni-query `sparse_rerank` helper unions live L0
+    /// rows and re-scores *every* candidate exactly and MVCC-aware via
+    /// `sparse_dot`, so callers wanting recent-write visibility must go through
+    /// that path. Returns empty if no sparse index is registered for the
+    /// property. On a fork/branch there is no per-branch sparse index, so this
+    /// brute-force enumerates the branch's candidate vids (Approach A — see the
+    /// branched arm) for the re-score path.
+    pub async fn sparse_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[(u32, f32)],
+        k: usize,
+    ) -> Result<Vec<(Vid, f32)>> {
+        #[cfg(feature = "lance-backend")]
+        {
+            let name = table_names::vertex_table_name(label);
+            let branched = self
+                .fork_scope
+                .as_ref()
+                .is_some_and(|s| s.branch_for(&name).is_some());
+            if branched {
+                // Approach A (v1): the sparse index is a separate hand-rolled
+                // Lance dataset, not a vertices-table index, so it cannot ride
+                // Lance's `base_paths` branch fusion the way the dense/FTS
+                // Lance-native indexes do — there is no per-branch sparse index to
+                // query. Enumerate the branch's candidate vids via a branch-aware
+                // scan (`base_paths` surfaces fork-local + parent-inherited rows;
+                // the `_deleted = false` prefilter drops tombstoned inherited rows)
+                // and let the uni-query `sparse_rerank` helper re-score every
+                // candidate exactly via `sparse_dot` and union fork L0. The
+                // returned score is a placeholder (the only caller re-ranks). This
+                // is a brute-force scan, O(branch rows incl. inherited): the
+                // proposal's brute-force-DAAT-first choice, mirroring
+                // [`Self::multivector_search`]'s branched path.
+                //
+                // Approach B (deferred, benchmark-gated — issue #95 M5): build a
+                // fork-local sparse postings dataset on a fork-scoped path
+                // (`SparseVectorIndex::postings_path` made fork-aware), then query
+                // parent ∪ fork-local postings minus the fork tombstone set,
+                // resolving nested forks through ancestor postings datasets. Faster
+                // on large fork corpora, but it re-implements by hand the fusion /
+                // tombstone / nested-fork correctness this scan gets from Lance.
+                let backend = self.backend.as_ref();
+                // Ok(false) = nothing flushed on the branch (fork L0 rows merge upstream);
+                // Err = a backend fault that must surface, not fail open silently (#95).
+                if !backend.table_exists(&name).await? {
+                    return Ok(Vec::new());
+                }
+                let request = ScanRequest::all(&name)
+                    .with_filter(Self::build_active_filter(None))
+                    .with_columns(vec!["_vid".to_string()]);
+                let batches = backend.scan(request).await?;
+                let mut results = Vec::new();
+                for batch in batches {
+                    let vid_col = batch
+                        .column_by_name("_vid")
+                        .ok_or_else(|| anyhow!("Missing _vid"))?
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| anyhow!("Invalid _vid"))?;
+                    for i in 0..batch.num_rows() {
+                        results.push((Vid::from(vid_col.value(i)), 0.0_f32));
+                    }
+                }
+                return Ok(results);
+            }
+            match self
+                .index_manager()
+                .sparse_vector_index(label, property)
+                .await
+            {
+                Ok(idx) => idx.query_topk(query, k).await,
+                Err(_) => Ok(Vec::new()),
+            }
+        }
+        #[cfg(not(feature = "lance-backend"))]
+        {
+            let _ = (label, property, query, k);
+            Ok(Vec::new())
+        }
     }
 
     /// Perform a full-text search with BM25 scoring.
@@ -2315,16 +2403,24 @@ fn extract_vid_score_pairs(
     Ok(results)
 }
 
-/// Extracts a `Vec<f32>` from a JSON property value.
+/// Extracts a dense `Vec<f32>` embedding from an L0 property value.
 ///
-/// Returns `None` if the property is missing, not an array, or contains
-/// non-numeric elements.
+/// Accepts both representations of a dense vector: the typed
+/// [`Value::Vector`] (what the Cypher write path stores) and a
+/// [`Value::List`] of numbers (the JSON-ingest representation), via the
+/// canonical `TryFrom<&Value>` converter. Returns `None` if the property is
+/// missing or not coercible to a numeric vector.
+///
+/// # Why both variants
+///
+/// Real Cypher writes land dense embeddings in L0 as `Value::Vector`; scoring
+/// L0 candidates off only `Value::List` silently dropped every such candidate,
+/// so committed-but-unflushed inserts/updates were invisible to dense search.
 fn extract_embedding_from_props(
     props: &uni_common::Properties,
     property: &str,
 ) -> Option<Vec<f32>> {
-    let arr = props.get(property)?.as_array()?;
-    arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect()
+    Vec::<f32>::try_from(props.get(property)?).ok()
 }
 
 /// Merges L0 buffer vertices into LanceDB vector search results.

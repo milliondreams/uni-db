@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, get_type_hints
 from .base import UniEdge, UniNode
 from .exceptions import SchemaError
 from .fields import get_field_config
-from .types import get_vector_dimensions, is_optional, python_type_to_uni
+from .types import (
+    get_sparse_vector_dimensions,
+    get_vector_dimensions,
+    is_optional,
+    python_type_to_uni,
+)
 
 if TYPE_CHECKING:
     import uni_db
@@ -118,6 +123,13 @@ class SchemaGenerator:
         if vec_dims:
             data_type = f"vector:{vec_dims}"
 
+        # Check for sparse-vector dimensions (vocabulary size)
+        sparse_dims = get_sparse_vector_dimensions(
+            inner_type if is_nullable else type_hint
+        )
+        if sparse_dims:
+            data_type = f"sparse_vector:{sparse_dims}"
+
         # Get field config for index settings
         config = get_field_config(field_info)
         index_type = config.index if config else None
@@ -128,6 +140,10 @@ class SchemaGenerator:
         # Auto-create vector index for Vector fields (regardless of Field config)
         if vec_dims and not index_type:
             index_type = "vector"
+
+        # Auto-create sparse index for SparseVector fields
+        if sparse_dims and not index_type:
+            index_type = "sparse"
 
         return PropertySchema(
             name=field_name,
@@ -269,6 +285,14 @@ class SchemaGenerator:
                         ).apply()
                     except Exception:
                         pass  # Index may already exist
+                elif prop.index_type == "sparse":
+                    try:
+                        cfg = {"type": "sparse"}
+                        if prop.data_type.startswith("sparse_vector:"):
+                            cfg["dimensions"] = int(prop.data_type.split(":")[1])
+                        db.schema().label(label).index(prop.name, cfg).apply()
+                    except Exception:
+                        pass  # Index may already exist
                 elif prop.index_type == "fulltext":
                     try:
                         db.schema().label(label).index(prop.name, "fulltext").apply()
@@ -333,6 +357,14 @@ class SchemaGenerator:
                             .index(prop.name, {"type": "vector", "metric": metric})
                             .apply()
                         )
+                    except Exception:
+                        pass  # Index may already exist
+                elif prop.index_type == "sparse":
+                    try:
+                        cfg = {"type": "sparse"}
+                        if prop.data_type.startswith("sparse_vector:"):
+                            cfg["dimensions"] = int(prop.data_type.split(":")[1])
+                        await db.schema().label(label).index(prop.name, cfg).apply()
                     except Exception:
                         pass  # Index may already exist
                 elif prop.index_type == "fulltext":

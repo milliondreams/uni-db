@@ -35,11 +35,12 @@ Vector indexes enable fast approximate nearest neighbor (ANN) search on embeddin
 | **Flat** | None | Perfect recall, O(n) speed. Best for < 10k vectors. |
 | **IVF-Flat** | None | Partition-based, exact within partitions |
 | **IVF-SQ** | Scalar (int8) | Large datasets, good recall/memory tradeoff |
-| **IVF-PQ** | Product | Very large datasets, minimum memory |
+| **IVF-PQ** | Product | **Default.** Best latency/compression tradeoff; very large datasets |
 | **IVF-RQ** | RaBitQ (1-bit) | Better accuracy than PQ at similar compression |
 | **HNSW-Flat** | None | Graph search, no compression loss |
-| **HNSW-SQ** | Scalar (int8) | **Default.** Best recall-latency tradeoff |
+| **HNSW-SQ** | Scalar (int8) | Graph search, low latency for mid-size datasets |
 | **HNSW-PQ** | Product | Large datasets needing graph speed + compression |
+| **MUVERA** | FDE projection | Multi-vector (ColBERT / late-interaction) — see [MUVERA Multi-Vector Indexes](#muvera-multi-vector-indexes) |
 
 ### Distance Metrics
 
@@ -62,7 +63,7 @@ OPTIONS {
 }
 ```
 
-DDL supports all algorithm types via the `type` option: `flat`, `ivf_flat`, `ivf_sq`, `ivf_pq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq` (or `hnsw`), `hnsw_pq`. Parameters like `m`, `ef_construction`, `partitions`, `sub_vectors`, and `num_bits` can also be passed in OPTIONS. Default is HNSW-SQ with cosine distance.
+DDL supports all algorithm types via the `type` option: `flat`, `ivf_flat`, `ivf_sq`, `ivf_pq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq` (or `hnsw`), `hnsw_pq`, and `muvera` (for multi-vector columns). Parameters like `m`, `ef_construction`, `partitions`, `sub_vectors`, and `num_bits` can also be passed in OPTIONS. **The default is IVF-PQ with cosine distance**, applied uniformly across every surface (Cypher DDL, the `uni.schema.createIndex` procedure, the Python config map, and the Rust `VectorAlgo` builder).
 
 ### HNSW Configuration
 
@@ -125,6 +126,54 @@ db.schema()
     .apply()
     .await?;
 ```
+
+### MUVERA Multi-Vector Indexes
+
+MUVERA indexes accelerate **multi-vector** (ColBERT / late-interaction) columns — a `List<Vector(dim)>` property storing one vector per token. MUVERA encodes each row's variable set of token vectors into a single fixed-dimensional **FDE** (Fixed-Dimensional Encoding) vector, stored in a derived internal column (`__fde_<index_name>`), and indexes that with a standard single-vector ANN. At query time the FDE drives fast first-stage retrieval, then candidates are re-scored with **exact MaxSim**.
+
+```cypher
+-- Defaults: k_sim=4, reps=20, d_proj=16, inner=ivf_pq
+CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
+OPTIONS { type: 'muvera' }
+
+-- Tuned FDE parameters + explicit inner ANN
+CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
+OPTIONS { type: 'muvera', k_sim: 4, reps: 20, d_proj: 16, inner: 'ivf_pq' }
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `k_sim` | 4 | SimHash hyperplanes per repetition (`2^k_sim` buckets) |
+| `reps` | 20 | Independent repetitions concatenated into the FDE |
+| `d_proj` | 16 | Inner projection dimension (`0` = no projection) |
+| `inner` | `ivf_pq` | Single-vector ANN over the derived FDE column |
+
+The derived `__fde_*` column is internal — it never appears in `RETURN`, `SHOW INDEXES`, or `uni.schema.labelInfo`. Because the pipeline always finishes with an **exact MaxSim re-rank**, a poorly-tuned FDE only costs recall, never precision.
+
+!!! note "Tune FDE parameters per corpus"
+    The defaults are reasonable starting points, not validated for any specific corpus. FDE recall is corpus-dependent — measure recall on your own data and adjust `reps`/`k_sim` to trade recall against FDE size. MUVERA is opt-in; the default vector index remains IVF-PQ.
+
+See [Vector Search](../features/vector-search.md#multi-vector-search-colbert-late-interaction) for the full multi-vector storage + MaxSim query model.
+
+### Query-Time Tuning
+
+Vector ANN queries accept tuning options in the procedure OPTIONS map to trade recall against latency:
+
+| Option | Type | Applies to | Description |
+|--------|------|-----------|-------------|
+| `nprobes` | Integer | IVF indexes | Number of IVF partitions to probe (higher = better recall, slower) |
+| `refine_factor` | Integer | IVF-PQ/SQ | Re-rank `refine_factor × k` candidates with exact distances (recovers quantization error) |
+| `over_fetch` | Float | multi-vector | Candidate over-fetch multiplier before MaxSim re-rank (default `4.0`) |
+
+```cypher
+CALL uni.vector.query('Paper', 'embedding', $query_vector, 10, NULL, NULL,
+  { nprobes: 8, refine_factor: 10 })
+YIELD node, score
+RETURN node.title, score
+ORDER BY score DESC
+```
+
+`refine_factor` is the load-bearing recall knob for quantized (PQ/SQ) indexes — even a small value (e.g. `10`) typically recovers most of the recall lost to quantization.
 
 ### Querying Vector Indexes
 

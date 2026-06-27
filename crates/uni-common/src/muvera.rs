@@ -74,6 +74,17 @@ pub const DEFAULT_FDE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 const MAX_K_SIM: u32 = 16;
 const MAX_FDE_DIM: usize = 200_000;
 
+/// Per-axis caps on the user-supplied `reps` and `d_proj`, applied before the
+/// `fde_dim = reps · 2^k_sim · proj_dim` product is formed (M-DOCUMENTED-MAGIC).
+///
+/// With `k_sim ≤ 16`, `reps ≤ 1024`, and `proj_dim ≤ 4096`, the product is at most
+/// `2^16 · 1024 · 4096 ≈ 2.7e14`, far below `usize::MAX`, so `fde_dim` cannot overflow
+/// `usize` and wrap *under* the `MAX_FDE_DIM` guard (which previously let an absurd
+/// config bypass validation or panic an overflow-checked build — issue #96). The real
+/// ceiling is still enforced by `MAX_FDE_DIM`; these only bound the multiplication.
+const MAX_REPS: u32 = 1024;
+const MAX_PROJ_DIM: u32 = 4096;
+
 /// Parameters of an FDE transform. Persisted (via the raw fields on
 /// `VectorIndexType::Muvera`) so query-time encoding reproduces document-time encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,13 +115,23 @@ impl FdeParams {
     /// Number of buckets per repetition (`2^k_sim`).
     #[inline]
     pub fn buckets(&self) -> usize {
-        1usize << self.k_sim
+        // `checked_shl` guards an out-of-range `k_sim` (≥ `usize::BITS`) that a raw
+        // `1usize << k_sim` would panic on; `validate` rejects `k_sim > MAX_K_SIM`
+        // regardless, so this only hardens unvalidated callers.
+        1usize.checked_shl(self.k_sim).unwrap_or(0)
     }
 
     /// Final FDE dimension: `reps * 2^k_sim * proj_dim`.
+    ///
+    /// Saturates to `usize::MAX` on overflow rather than panicking (M-PANIC-IS-STOP):
+    /// an unvalidated caller with absurd `reps`/`d_proj` must not crash, and a saturated
+    /// value cleanly trips the `dim > MAX_FDE_DIM` check in [`FdeParams::validate`].
     #[inline]
     pub fn fde_dim(&self) -> usize {
-        self.reps as usize * self.buckets() * self.proj_dim()
+        self.buckets()
+            .checked_mul(self.proj_dim())
+            .and_then(|x| x.checked_mul(self.reps as usize))
+            .unwrap_or(usize::MAX)
     }
 
     /// Validate the parameters, returning a descriptive error if unsupported.
@@ -121,13 +142,25 @@ impl FdeParams {
                 self.k_sim
             )));
         }
-        if self.reps == 0 {
-            return Err(FdeError::InvalidParams("reps must be >= 1".to_string()));
+        if self.reps == 0 || self.reps > MAX_REPS {
+            return Err(FdeError::InvalidParams(format!(
+                "reps must be in 1..={MAX_REPS}, got {}",
+                self.reps
+            )));
         }
         if self.input_dim == 0 {
             return Err(FdeError::InvalidParams(
                 "input_dim must be >= 1".to_string(),
             ));
+        }
+        // Bound `d_proj` before forming the `fde_dim` product so the multiplication
+        // cannot overflow `usize` (issue #96). `d_proj == 0` legitimately means
+        // "no projection" (use `input_dim`), so only the upper bound is checked here.
+        if self.d_proj > MAX_PROJ_DIM {
+            return Err(FdeError::InvalidParams(format!(
+                "d_proj must be <= {MAX_PROJ_DIM}, got {}",
+                self.d_proj
+            )));
         }
         let dim = self.fde_dim();
         if dim == 0 || dim > MAX_FDE_DIM {
@@ -508,6 +541,31 @@ mod tests {
         // absurd fde_dim
         assert!(params(16, 1000, 64, 96).validate().is_err());
         assert!(params(4, 20, 16, 96).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_overflowing_reps_and_d_proj_without_panicking() {
+        // Regression for issue #96: an unbounded `reps`/`d_proj` made
+        // `fde_dim = reps · 2^k_sim · proj_dim` overflow `usize`, which panicked an
+        // overflow-checked build inside `validate` itself, or wrapped *under* the
+        // `MAX_FDE_DIM` guard in release. The per-axis bounds + `checked_mul` must
+        // reject these cleanly (an `Err`, never a panic and never an `Ok`).
+        assert!(params(16, u32::MAX, u32::MAX, 96).validate().is_err());
+        assert!(params(16, MAX_REPS + 1, 16, 96).validate().is_err());
+        assert!(params(16, 20, MAX_PROJ_DIM + 1, 96).validate().is_err());
+        // The historical wrap-bypass witness (k_sim=1) must also be rejected, not pass.
+        assert!(
+            params(1, 2_147_516_416, 4_294_901_761, 96)
+                .validate()
+                .is_err()
+        );
+        // `fde_dim` itself saturates instead of panicking for an unvalidated caller.
+        assert_eq!(params(16, u32::MAX, u32::MAX, 96).fde_dim(), usize::MAX);
+        // A `k_sim` at/above `usize::BITS` cannot panic the shift in `buckets`.
+        assert_eq!(params(64, 1, 0, 8).buckets(), 0);
+        // Parameters at the new ceilings still validate.
+        assert!(params(16, MAX_REPS, MAX_PROJ_DIM, 96).validate().is_err()); // exceeds MAX_FDE_DIM
+        assert!(params(4, MAX_REPS, 16, 96).validate().is_err()); // exceeds MAX_FDE_DIM but no overflow/panic
     }
 
     #[test]

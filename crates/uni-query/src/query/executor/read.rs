@@ -1120,6 +1120,7 @@ impl Executor {
 
             // Index operations
             LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
             | LogicalPlan::CreateFullTextIndex { .. }
             | LogicalPlan::CreateScalarIndex { .. }
             | LogicalPlan::CreateJsonFtsIndex { .. }
@@ -1167,6 +1168,7 @@ impl Executor {
                 | "uni.schema.labelInfo"
                 | "uni.vector.query"
                 | "uni.fts.query"
+                | "uni.sparse.query"
                 | "uni.search"
                 // M5g — `uni.create.vNode` produces a typed Node yield
                 // via the planner-level node-shape expansion in
@@ -2487,6 +2489,20 @@ impl Executor {
                     }
                     let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_vector_index(config).await?;
+                    Ok(vec![])
+                }
+                LogicalPlan::CreateSparseIndex {
+                    config,
+                    if_not_exists,
+                } => {
+                    if if_not_exists && self.index_exists_by_name(&config.name) {
+                        return Ok(vec![]);
+                    }
+                    // `create_sparse_vector_index` registers the index, backfills any
+                    // already-flushed rows via the backend, handles the empty
+                    // (create-before-ingest) case, and persists the schema.
+                    let idx_mgr = self.storage.index_manager();
+                    idx_mgr.create_sparse_vector_index(config).await?;
                     Ok(vec![])
                 }
                 LogicalPlan::CreateFullTextIndex {

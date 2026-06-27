@@ -237,6 +237,40 @@ class Document(UniNode):
 
 At runtime, vectors are stored as `list[float]`. The dimension is validated on assignment.
 
+### Multi-vector (ColBERT) fields
+
+A `list[Vector[N]]` field stores many vectors per row (per-token / ColBERT) and maps to the `list:vector:N` schema type — the storage type for [MaxSim / multi-vector search](../features/vector-search.md#multi-vector-search-colbert-late-interaction):
+
+```python
+class Document(UniNode):
+    title: str
+    tokens: list[Vector[96]]   # -> list:vector:96 (multi-vector)
+```
+
+!!! note "Multi-vector indexes are configured outside `Field()`"
+    A vector index on a `list[Vector[N]]` field (e.g. MUVERA) is **not** auto-created from `Field()`. Declare the model, then create the index via the imperative schema API or Cypher DDL, e.g. `CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens OPTIONS { type: 'muvera' }`.
+
+### Typed map fields
+
+A `dict[str, V]` field maps to a typed `map:string:V` schema type (string keys), recursing for nested values. A bare `dict` falls back to schemaless JSON.
+
+```python
+class Article(UniNode):
+    title: str
+    scores: dict[str, float] = {}        # -> map:string:float64
+    sections: dict[str, list[int]] = {}  # -> map:string:list:int64
+```
+
+### Type mapping reference
+
+| Python type | Uni type |
+|-------------|----------|
+| `Vector[N]` | `vector:N` |
+| `list[Vector[N]]` | `list:vector:N` (multi-vector / ColBERT) |
+| `list[T]` | `list:T` (e.g. `list:int64`) |
+| `dict[str, V]` | `map:string:V` (e.g. `map:string:float64`) |
+| `dict` (untyped) | `json` |
+
 ---
 
 ## UniSession

@@ -22,7 +22,7 @@
 //! the bottom.
 
 use anyhow::Result;
-use uni_db::{DataType, IndexType, Uni, VectorAlgo, VectorIndexCfg, VectorMetric};
+use uni_db::{DataType, IndexType, Uni, Value, VectorAlgo, VectorIndexCfg, VectorMetric};
 
 use crate::ssi_support::schedule::{assert_committed, assert_serialization_conflict};
 
@@ -273,5 +273,133 @@ async fn vector_knn_records_matches() -> Result<()> {
     ta.execute("CREATE (:Doc {id: 'sentinel', val: 0, embedding: [0.5, 0.5]})")
         .await?;
     assert_serialization_conflict(ta.commit().await);
+    Ok(())
+}
+
+// ── G1-class: the sparse-query procedure records its matches ──────────────────
+
+const SPARSE_VOCAB: usize = 1000;
+
+/// The query sparse vector. `d1` is seeded with this exact vector (the unique
+/// dot-product maximizer); `d2` shares no terms, so it never enters a top-k.
+fn sparse_query() -> Value {
+    Value::SparseVector {
+        indices: vec![1, 5, 9],
+        values: vec![1.0, 2.0, 3.0],
+    }
+}
+
+/// Schema `Doc(id, val, emb: SparseVector)` + sparse index and a disjoint label
+/// `Other(id, val)` that the sparse query never scans. Seeded with a strong
+/// match `d1` (`emb == query`), a term-disjoint `d2`, and an `Other` node `o1`.
+async fn sparse_matrix_db() -> Result<Uni> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Doc")
+        .property("id", DataType::String)
+        .property("val", DataType::Int)
+        .property(
+            "emb",
+            DataType::SparseVector {
+                dimensions: SPARSE_VOCAB,
+            },
+        )
+        .index("emb", IndexType::sparse(SPARSE_VOCAB))
+        .done()
+        .label("Other")
+        .property("id", DataType::String)
+        .property("val", DataType::Int)
+        .done()
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Doc {id: 'd1', val: 0, emb: $emb})")
+        .param("emb", sparse_query())
+        .run()
+        .await?;
+    tx.execute_with("CREATE (:Doc {id: 'd2', val: 0, emb: $emb})")
+        .param(
+            "emb",
+            Value::SparseVector {
+                indices: vec![100, 200],
+                values: vec![1.0, 1.0],
+            },
+        )
+        .run()
+        .await?;
+    tx.execute("CREATE (:Other {id: 'o1', val: 0})").await?;
+    tx.commit().await?;
+    Ok(db)
+}
+
+/// A `uni.sparse.query` read records the matched vids, so a concurrent write to
+/// a matched vertex makes the reader abort. The procedure reaches matches
+/// through `sparse_rerank`, whose MVCC-aware property fetch records every
+/// candidate it reads via `record_vertex_read` (`l0_visibility.rs`) — the
+/// storage-layer read-set path, not a DataFusion `ReadSetRecordingExec` wrap.
+/// This locks that antidependency invariant in for the procedure read path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sparse_query_records_matches() -> Result<()> {
+    let db = sparse_matrix_db().await?;
+    let sa = db.session();
+    let ta = sa.tx().await?;
+    // Top-1 sparse match to the query is `d1` (emb == query) — its vid must
+    // enter tx_a's read-set via the procedure-call read-set wrap.
+    ta.query_with(
+        "CALL uni.sparse.query('Doc', 'emb', $q, 1, null, null, {}) \
+         YIELD node, score RETURN node.id AS id",
+    )
+    .param("q", sparse_query())
+    .fetch_all()
+    .await?;
+
+    {
+        let tb = db.session().tx().await?;
+        tb.execute("MATCH (n:Doc {id: 'd1'}) SET n.val = 1").await?;
+        assert_committed(tb.commit().await);
+    }
+
+    ta.execute_with("CREATE (:Doc {id: 'sentinel', val: 0, emb: $emb})")
+        .param("emb", sparse_query())
+        .run()
+        .await?;
+    assert_serialization_conflict(ta.commit().await);
+    Ok(())
+}
+
+/// Precision (label-level): a concurrent write to a vertex of a *disjoint
+/// label* the sparse query never scanned (`Other`) must NOT abort the reader.
+/// The query's candidate scan is scoped to the `Doc` label, so an `Other` write
+/// is no antidependency — mirrors `full_label_scan`'s disjoint-`S` case.
+///
+/// (A write to the term-disjoint same-label `d2` *would* conflict on this
+/// brute-force L0 path: a top-k scan genuinely ranks every `Doc` it reads, so
+/// the result depends on each — a path-specific over-approximation, hence not
+/// asserted here.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sparse_query_disjoint_label_no_false_abort() -> Result<()> {
+    let db = sparse_matrix_db().await?;
+    let sa = db.session();
+    let ta = sa.tx().await?;
+    ta.query_with(
+        "CALL uni.sparse.query('Doc', 'emb', $q, 1, null, null, {}) \
+         YIELD node, score RETURN node.id AS id",
+    )
+    .param("q", sparse_query())
+    .fetch_all()
+    .await?;
+
+    {
+        let tb = db.session().tx().await?;
+        tb.execute("MATCH (n:Other {id: 'o1'}) SET n.val = 1")
+            .await?;
+        assert_committed(tb.commit().await);
+    }
+
+    ta.execute_with("CREATE (:Doc {id: 'sentinel_ok', val: 0, emb: $emb})")
+        .param("emb", sparse_query())
+        .run()
+        .await?;
+    assert_committed(ta.commit().await);
     Ok(())
 }

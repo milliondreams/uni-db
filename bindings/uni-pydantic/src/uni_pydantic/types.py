@@ -29,6 +29,12 @@ try:
 except ImportError:
     _PyBtic = None
 
+# Import the Rust SparseVector binding (optional, like Btic above).
+try:
+    from uni_db import SparseVector as _PySparseVector
+except ImportError:
+    _PySparseVector = None
+
 # Type variable for vector dimensions
 N = TypeVar("N", bound=int)
 
@@ -140,6 +146,131 @@ def get_vector_dimensions(type_hint: Any) -> int | None:
         return dims
     origin = get_origin(type_hint)
     if origin is Vector:
+        args = get_args(type_hint)
+        if args and isinstance(args[0], int):
+            return args[0]
+    return None
+
+
+class SparseVectorMeta(type):
+    """Metaclass for SparseVector enabling subscripting with a vocabulary size."""
+
+    _cache: dict[int, type[SparseVector[Any]]] = {}
+
+    def __getitem__(cls, dimensions: int) -> type[SparseVector[Any]]:
+        if not isinstance(dimensions, int) or dimensions <= 0:
+            raise TypeError(
+                f"SparseVector dimensions must be a positive integer, got {dimensions}"
+            )
+
+        if dimensions in cls._cache:
+            return cls._cache[dimensions]
+
+        # A distinct attribute name (`__sparse_dimensions__`, not the dense
+        # `__dimensions__`) keeps `get_vector_dimensions` from misclassifying a
+        # sparse field as a dense vector.
+        new_cls = type(
+            f"SparseVector[{dimensions}]",
+            (SparseVector,),
+            {"__sparse_dimensions__": dimensions, "__origin__": SparseVector},
+        )
+        cls._cache[dimensions] = new_cls
+        return new_cls
+
+
+class SparseVector(Generic[N], metaclass=SparseVectorMeta):
+    """
+    A learned-sparse (SPLADE / BGE-M3) vector over a fixed-size vocabulary.
+
+    Usage:
+        terms: SparseVector[30522]  # SPLADE head over a 30522-term BERT vocab
+
+    At runtime, holds parallel ``indices`` (term ids) and ``values`` (weights).
+    Accepts a ``dict[int, float]`` of term id -> weight, a ``uni_db.SparseVector``,
+    or an existing instance; ingestion serializes to the typed Rust binding when
+    available, otherwise to an ``{"indices": [...], "values": [...]}`` mapping.
+    """
+
+    __sparse_dimensions__: int = 0
+    __origin__: type | None = None
+
+    def __init__(self, indices: list[int], values: list[float]) -> None:
+        if len(indices) != len(values):
+            raise ValueError(
+                f"SparseVector indices/values length mismatch: "
+                f"{len(indices)} vs {len(values)}"
+            )
+        self._indices = [int(i) for i in indices]
+        self._values = [float(v) for v in values]
+
+    @property
+    def indices(self) -> list[int]:
+        return self._indices
+
+    @property
+    def values(self) -> list[float]:
+        return self._values
+
+    @classmethod
+    def from_dict(cls, mapping: dict[int, float]) -> SparseVector[Any]:
+        """Build from a ``{term_id: weight}`` mapping (sorted by term id)."""
+        items = sorted(mapping.items())
+        return cls([k for k, _ in items], [v for _, v in items])
+
+    def __repr__(self) -> str:
+        dims = self.__class__.__sparse_dimensions__
+        return f"SparseVector[{dims}](indices={self._indices}, values={self._values})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SparseVector):
+            return self._indices == other._indices and self._values == other._values
+        return False
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        """Make SparseVector compatible with Pydantic v2."""
+        dimensions = getattr(source_type, "__sparse_dimensions__", 0)
+        sv_cls = source_type if dimensions > 0 else cls
+
+        def validate_sparse(v: Any) -> SparseVector:  # type: ignore[type-arg]
+            if isinstance(v, SparseVector):
+                return v
+            if _PySparseVector is not None and isinstance(v, _PySparseVector):
+                return sv_cls(list(v.indices), list(v.values))
+            if isinstance(v, dict):
+                return sv_cls.from_dict(v)
+            if isinstance(v, (tuple, list)) and len(v) == 2:
+                return sv_cls(list(v[0]), list(v[1]))
+            raise TypeError(
+                f"Expected SparseVector, dict, or (indices, values), got {type(v)}"
+            )
+
+        def serialize_sparse(v: SparseVector) -> Any:  # type: ignore[type-arg]
+            if _PySparseVector is not None:
+                return _PySparseVector(v.indices, v.values)
+            return {"indices": v.indices, "values": v.values}
+
+        return core_schema.no_info_plain_validator_function(
+            validate_sparse,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                serialize_sparse,
+                info_arg=False,
+            ),
+        )
+
+
+def get_sparse_vector_dimensions(type_hint: Any) -> int | None:
+    """Extract the vocabulary size from a SparseVector[N] type hint."""
+    if hasattr(type_hint, "__sparse_dimensions__"):
+        dims: int = type_hint.__sparse_dimensions__
+        return dims
+    origin = get_origin(type_hint)
+    if origin is SparseVector:
         args = get_args(type_hint)
         if args and isinstance(args[0], int):
             return args[0]
@@ -445,6 +576,11 @@ def python_type_to_uni(type_hint: Any, *, nullable: bool = False) -> tuple[str, 
     if is_opt:
         uni_type, _ = python_type_to_uni(inner_type)
         return uni_type, True
+
+    # Check for SparseVector types (before dense Vector: distinct marker attr).
+    sparse_dims = get_sparse_vector_dimensions(type_hint)
+    if sparse_dims is not None:
+        return f"sparse_vector:{sparse_dims}", nullable
 
     # Check for Vector types
     dims = get_vector_dimensions(type_hint)

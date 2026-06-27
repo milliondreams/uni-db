@@ -28,8 +28,11 @@
 //! identical, deterministic state — and amortizing the build (the dominating
 //! per-case cost) is what makes the ≥100k nightly volume feasible.
 
+pub mod dense;
+pub mod multi;
 pub mod norec;
 pub mod seed;
+pub mod sparse;
 pub mod structural;
 pub mod tlp;
 

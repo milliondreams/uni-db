@@ -323,6 +323,49 @@ async fn crash_after_merge_is_atomic() -> Result<()> {
     assert_atomic_and_usable(&db, 3).await
 }
 
+/// Lost-commit regression: a crash mid-flush (panic AFTER the L0 rotation but
+/// BEFORE the Lance write) followed by a graceful close must not drop an
+/// acknowledged commit that was sitting in the rotated buffer.
+///
+/// The failed flush leaves its buffer in `pending_flush` (WAL retains the data);
+/// the subsequent shutdown flush must not truncate that buffer's WAL nor publish
+/// a `wal_high_water_mark` past it. The bug keyed both off the pending buffer's
+/// HIGH watermark (`wal_lsn_at_flush`) instead of its START watermark, so the
+/// shutdown flush deleted the committed `n = 5` segment and checkpointed past it
+/// — the value vanished on reopen. (Under a real, `Drop`-less crash the WAL was
+/// already durable, so only the graceful-close path lost data.)
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_during_flush_preserves_committed_unflushed_commit() -> Result<()> {
+    let h = DiskHarness::new()?;
+    {
+        let db = Arc::new(h.open().await?);
+        init_schema_and_seed(&db).await?; // commits n = 0
+        db.flush().await?; // n = 0 durable in L1
+        // An acknowledged, unflushed commit — the value the crashing flush is
+        // mid-rotating when it panics.
+        {
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.execute("MATCH (c:C {id: 'x'}) SET c.n = 5").await?;
+            tx.commit().await?;
+        }
+        fail::cfg("flush::after-rotate-before-lance", "panic").unwrap();
+        let db_f = db.clone();
+        let res = tokio::spawn(async move { db_f.flush().await }).await;
+        fail::remove("flush::after-rotate-before-lance");
+        assert!(res.is_err(), "flush task should have panicked at the seam");
+        drop(db);
+    }
+    let db = h.open().await?;
+    assert_eq!(
+        read_n(&db).await?,
+        5,
+        "acknowledged commit lost across crash-during-flush + graceful reopen"
+    );
+    Ok(())
+}
+
 /// A corrupt (torn) WAL segment at the TAIL must not block reopen
 /// (architecture review §2.5): the torn segment belongs to a commit that was
 /// never acknowledged, so recovery skips it with a warning and replays

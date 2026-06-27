@@ -585,6 +585,15 @@ impl StorageBackend for LanceDbBackend {
         Ok(())
     }
 
+    async fn lock_table_for_write(&self, name: &str) -> crate::backend::traits::TableWriteGuard {
+        // Same per-table mutex `write` / `merge_insert` / `create_table` take, exposed as
+        // an owned guard so a multi-step read-modify-write (the MUVERA FDE backfill's
+        // scan → overwrite) can hold it across both calls and serialize against flush
+        // appends. `replace_table_atomic`'s table-exists path takes no internal lock, so a
+        // holder calling it does not deadlock.
+        crate::backend::traits::TableWriteGuard::held(self.write_lock_for(name).lock_owned().await)
+    }
+
     // ========================
     // Versioning / MVCC
     // ========================
@@ -871,11 +880,127 @@ impl StorageBackend for LanceDbBackend {
             .map_err(|e| anyhow!("Failed to collect FTS results from '{}': {}", table, e))
     }
 
-    async fn create_scalar_index(
+    async fn create_vector_index(
         &self,
         table: &str,
         column: &str,
+        name: &str,
+        params: VectorIndexParams,
+    ) -> Result<()> {
+        use lancedb::index::Index;
+        use lancedb::index::vector::{
+            IvfFlatIndexBuilder, IvfHnswFlatIndexBuilder, IvfHnswPqIndexBuilder,
+            IvfHnswSqIndexBuilder, IvfPqIndexBuilder, IvfRqIndexBuilder, IvfSqIndexBuilder,
+        };
+
+        let dt = match params.metric {
+            DistanceMetric::L2 => lancedb::DistanceType::L2,
+            DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
+            DistanceMetric::Dot => lancedb::DistanceType::Dot,
+        };
+
+        let index = match params.kind {
+            // Flat is a single-partition IVF, matching the prior raw-Dataset mapping.
+            VectorIndexKind::Flat => Index::IvfFlat(
+                IvfFlatIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(1),
+            ),
+            VectorIndexKind::IvfFlat { num_partitions } => Index::IvfFlat(
+                IvfFlatIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions),
+            ),
+            VectorIndexKind::IvfPq {
+                num_partitions,
+                num_sub_vectors,
+                num_bits,
+            } => Index::IvfPq(
+                IvfPqIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions)
+                    .num_sub_vectors(num_sub_vectors)
+                    .num_bits(u32::from(num_bits)),
+            ),
+            VectorIndexKind::IvfSq { num_partitions } => Index::IvfSq(
+                IvfSqIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions),
+            ),
+            VectorIndexKind::IvfRq {
+                num_partitions,
+                num_bits,
+            } => {
+                let mut b = IvfRqIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions);
+                if let Some(bits) = num_bits {
+                    b = b.num_bits(u32::from(bits));
+                }
+                Index::IvfRq(b)
+            }
+            VectorIndexKind::HnswFlat {
+                m,
+                ef_construction,
+                num_partitions,
+            } => Index::IvfHnswFlat(
+                IvfHnswFlatIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions)
+                    .num_edges(m)
+                    .ef_construction(ef_construction),
+            ),
+            VectorIndexKind::HnswSq {
+                m,
+                ef_construction,
+                num_partitions,
+            } => Index::IvfHnswSq(
+                IvfHnswSqIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions)
+                    .num_edges(m)
+                    .ef_construction(ef_construction),
+            ),
+            VectorIndexKind::HnswPq {
+                m,
+                ef_construction,
+                num_sub_vectors,
+                num_partitions,
+            } => Index::IvfHnswPq(
+                IvfHnswPqIndexBuilder::default()
+                    .distance_type(dt)
+                    .num_partitions(num_partitions)
+                    .num_edges(m)
+                    .ef_construction(ef_construction)
+                    .num_sub_vectors(num_sub_vectors)
+                    // 8 bits matches the prior `PQBuildParams::new(_, 8)` default.
+                    .num_bits(8),
+            ),
+        };
+
+        let tbl = self.get_or_open_table(table).await?;
+        tbl.create_index(&[column], index)
+            .name(name.to_string())
+            .replace(true)
+            .execute()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create vector index '{}' on '{}.{}': {}",
+                    name,
+                    table,
+                    column,
+                    e
+                )
+            })
+    }
+
+    async fn create_scalar_index(
+        &self,
+        table: &str,
+        columns: &[&str],
         index_type: ScalarIndexType,
+        name: Option<&str>,
     ) -> Result<()> {
         let tbl = self.get_or_open_table(table).await?;
         let lance_idx = match index_type {
@@ -889,35 +1014,56 @@ impl StorageBackend for LanceDbBackend {
                 lancedb::index::scalar::LabelListIndexBuilder::default(),
             ),
         };
-        tbl.create_index(&[column], lance_idx)
-            .execute()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to create {:?} index on '{}.{}': {}",
-                    index_type,
-                    table,
-                    column,
-                    e
-                )
-            })
+        let mut builder = tbl.create_index(columns, lance_idx).replace(true);
+        if let Some(n) = name {
+            builder = builder.name(n.to_string());
+        }
+        builder.execute().await.map_err(|e| {
+            anyhow!(
+                "Failed to create {:?} index on '{}.{:?}': {}",
+                index_type,
+                table,
+                columns,
+                e
+            )
+        })
     }
 
-    async fn create_fts_index(&self, table: &str, column: &str) -> Result<()> {
+    async fn create_fts_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        name: Option<&str>,
+        with_positions: bool,
+    ) -> Result<()> {
         let tbl = self.get_or_open_table(table).await?;
-        let fts_params =
-            lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default());
-        tbl.create_index(&[column], fts_params)
-            .execute()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to create FTS index on '{}.{}': {}",
-                    table,
-                    column,
-                    e
-                )
-            })
+        let fts_params = lancedb::index::Index::FTS(
+            lancedb::index::scalar::FtsIndexBuilder::default().with_position(with_positions),
+        );
+        let mut builder = tbl.create_index(columns, fts_params).replace(true);
+        if let Some(n) = name {
+            builder = builder.name(n.to_string());
+        }
+        builder.execute().await.map_err(|e| {
+            anyhow!(
+                "Failed to create FTS index on '{}.{:?}': {}",
+                table,
+                columns,
+                e
+            )
+        })
+    }
+
+    async fn drop_index(&self, table: &str, index_name: &str) -> Result<()> {
+        let tbl = self.get_or_open_table(table).await?;
+        tbl.drop_index(index_name).await.map_err(|e| {
+            anyhow!(
+                "Failed to drop index '{}' on '{}': {}",
+                index_name,
+                table,
+                e
+            )
+        })
     }
 
     async fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
@@ -968,6 +1114,58 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lock_table_for_write_provides_mutual_exclusion() {
+        // The MUVERA FDE backfill holds this guard across its scan→overwrite so a
+        // concurrent flush append cannot interleave and be lost (issue #96). Prove the
+        // guard actually serializes two holders of the same table name: a second
+        // acquisition must not proceed while the first is held, and a different table
+        // name must not block.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, backend) = create_test_backend().await;
+        let backend = Arc::new(backend);
+
+        let held = backend.lock_table_for_write("vertices_Doc").await;
+
+        // A different table name is independent — acquiring it must not block.
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.lock_table_for_write("vertices_Other"),
+        )
+        .await;
+        assert!(
+            other.is_ok(),
+            "a different table's lock must be independent"
+        );
+        drop(other);
+
+        // A second acquisition of the SAME name must block until the first is dropped.
+        let entered = Arc::new(AtomicBool::new(false));
+        let b2 = Arc::clone(&backend);
+        let e2 = Arc::clone(&entered);
+        let waiter = tokio::spawn(async move {
+            let _g = b2.lock_table_for_write("vertices_Doc").await;
+            e2.store(true, Ordering::SeqCst);
+        });
+
+        // While we hold the guard, the waiter must not have acquired it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "second holder acquired the same-name lock while it was still held"
+        );
+
+        drop(held);
+        // Now the waiter can proceed.
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter did not acquire the lock after release")
+            .unwrap();
+        assert!(entered.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

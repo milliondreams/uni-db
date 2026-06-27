@@ -107,3 +107,19 @@ Feature: YIELD Value Columns
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where src = 'D1'
     And the command result 0 should be a Query containing row where w = 0.9
+
+  # ── Property KEY column without FOLD must materialize in QUERY (issue #112) ─
+
+  Scenario: KEY property column without FOLD projects its value in QUERY
+    Given having executed:
+      """
+      CREATE (:Tag {name: 'a'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE tags AS MATCH (t:Tag) YIELD KEY t.name AS tag
+      QUERY tags RETURN tag
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 1 rows
+    And the command result 0 should be a Query containing row where tag = 'a'

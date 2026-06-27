@@ -8,31 +8,11 @@ use crate::backend::table_names;
 use crate::backend::types::ScanRequest;
 #[cfg(feature = "lance-backend")]
 use crate::storage::inverted_index::InvertedIndex;
+#[cfg(feature = "lance-backend")]
+use crate::storage::sparse_index::SparseVectorIndex;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-#[cfg(feature = "lance-backend")]
-use lance::index::DatasetIndexExt;
-#[cfg(feature = "lance-backend")]
-use lance::index::vector::VectorIndexParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::IndexType;
-#[cfg(feature = "lance-backend")]
-use lance_index::progress::IndexBuildProgress;
-#[cfg(feature = "lance-backend")]
-use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
-#[cfg(feature = "lance-backend")]
-use lance_index::vector::bq::RQBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::vector::ivf::IvfBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::vector::pq::PQBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_index::vector::sq::builder::SQBuildParams;
-#[cfg(feature = "lance-backend")]
-use lance_linalg::distance::MetricType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(feature = "lance-backend")]
@@ -47,61 +27,9 @@ use uni_common::core::schema::SchemaManager;
 #[cfg(feature = "lance-backend")]
 use uni_common::core::schema::{
     DistanceMetric, FullTextIndexConfig, InvertedIndexConfig, JsonFtsIndexConfig,
-    ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, VectorIndexType,
+    ScalarIndexConfig, ScalarIndexType, SparseVectorIndexConfig, VectorIndexConfig,
+    VectorIndexType,
 };
-
-/// Tracing-based progress reporter for Lance index builds.
-///
-/// Emits structured log events at each stage boundary, enabling
-/// observability into index build duration and progress.
-#[cfg(feature = "lance-backend")]
-#[derive(Debug)]
-pub struct TracingIndexProgress {
-    index_name: String,
-}
-
-#[cfg(feature = "lance-backend")]
-impl TracingIndexProgress {
-    pub fn arc(index_name: &str) -> Arc<dyn IndexBuildProgress> {
-        Arc::new(Self {
-            index_name: index_name.to_string(),
-        })
-    }
-}
-
-#[cfg(feature = "lance-backend")]
-#[async_trait::async_trait]
-impl IndexBuildProgress for TracingIndexProgress {
-    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
-        info!(
-            index = %self.index_name,
-            stage,
-            ?total,
-            unit,
-            "Index build stage started"
-        );
-        Ok(())
-    }
-
-    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
-        debug!(
-            index = %self.index_name,
-            stage,
-            completed,
-            "Index build progress"
-        );
-        Ok(())
-    }
-
-    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
-        info!(
-            index = %self.index_name,
-            stage,
-            "Index build stage complete"
-        );
-        Ok(())
-    }
-}
 
 /// Status of an index rebuild task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +77,95 @@ fn resolve_vector_dim(t: &uni_common::DataType) -> Option<usize> {
     }
 }
 
+/// Maps a schema [`VectorIndexType`] to the backend's [`VectorIndexParams`].
+///
+/// The logical MUVERA type is resolved to its `inner` shape by the caller
+/// (`create_vector_index_inner`) before reaching here, so a `Muvera` value is a
+/// programming error. The `Option<num_partitions>` HNSW default of "auto" is
+/// resolved to a single partition, matching the prior raw-`Dataset` mapping.
+///
+/// # Errors
+/// Returns an error if a `Muvera` type reaches this physical-build mapping.
+#[cfg(feature = "lance-backend")]
+fn to_backend_vector_params(
+    metric: DistanceMetric,
+    index_type: &VectorIndexType,
+) -> Result<crate::backend::types::VectorIndexParams> {
+    use crate::backend::types::{VectorIndexKind, VectorIndexParams};
+    // `DistanceMetric` here is the schema (uni_common) enum; the backend has its
+    // own. Both are `#[non_exhaustive]`, so the catch-all arms are required.
+    let backend_metric = match metric {
+        DistanceMetric::L2 => crate::backend::types::DistanceMetric::L2,
+        DistanceMetric::Cosine => crate::backend::types::DistanceMetric::Cosine,
+        DistanceMetric::Dot => crate::backend::types::DistanceMetric::Dot,
+        other => return Err(anyhow!("Unsupported vector index metric: {:?}", other)),
+    };
+    let kind = match index_type {
+        VectorIndexType::Flat => VectorIndexKind::Flat,
+        VectorIndexType::IvfFlat { num_partitions } => VectorIndexKind::IvfFlat {
+            num_partitions: *num_partitions,
+        },
+        VectorIndexType::IvfPq {
+            num_partitions,
+            num_sub_vectors,
+            bits_per_subvector,
+        } => VectorIndexKind::IvfPq {
+            num_partitions: *num_partitions,
+            num_sub_vectors: *num_sub_vectors,
+            num_bits: *bits_per_subvector,
+        },
+        VectorIndexType::IvfSq { num_partitions } => VectorIndexKind::IvfSq {
+            num_partitions: *num_partitions,
+        },
+        VectorIndexType::IvfRq {
+            num_partitions,
+            num_bits,
+        } => VectorIndexKind::IvfRq {
+            num_partitions: *num_partitions,
+            num_bits: *num_bits,
+        },
+        VectorIndexType::HnswFlat {
+            m,
+            ef_construction,
+            num_partitions,
+        } => VectorIndexKind::HnswFlat {
+            m: *m,
+            ef_construction: *ef_construction,
+            num_partitions: num_partitions.unwrap_or(1),
+        },
+        VectorIndexType::HnswSq {
+            m,
+            ef_construction,
+            num_partitions,
+        } => VectorIndexKind::HnswSq {
+            m: *m,
+            ef_construction: *ef_construction,
+            num_partitions: num_partitions.unwrap_or(1),
+        },
+        VectorIndexType::HnswPq {
+            m,
+            ef_construction,
+            num_sub_vectors,
+            num_partitions,
+        } => VectorIndexKind::HnswPq {
+            m: *m,
+            ef_construction: *ef_construction,
+            num_sub_vectors: *num_sub_vectors,
+            num_partitions: num_partitions.unwrap_or(1),
+        },
+        VectorIndexType::Muvera { .. } => {
+            return Err(anyhow!(
+                "MUVERA must be resolved to its inner index type before the physical build"
+            ));
+        }
+        other => return Err(anyhow!("Unsupported vector index type: {:?}", other)),
+    };
+    Ok(VectorIndexParams {
+        metric: backend_metric,
+        kind,
+    })
+}
+
 /// Manages physical and logical indexes across all vertex datasets.
 pub struct IndexManager {
     base_uri: String,
@@ -184,6 +201,26 @@ impl IndexManager {
         self
     }
 
+    /// Serialize writers to a single index's postings dataset.
+    ///
+    /// The sparse and set-membership inverted indexes persist their postings with an
+    /// unconditional `WriteMode::Overwrite`. A DDL `CREATE … INDEX` backfill and a
+    /// concurrent flush incremental update both load-modify-overwrite the *same* postings
+    /// path; without serialization the second overwrite clobbers the first (a silent lost
+    /// update → a vid's posting vanishes from search candidates — issue #95). Keyed by the
+    /// postings dataset path, reusing the backend's per-key write-lock map. Returns `None`
+    /// when no backend is attached (offline rebuild paths cannot race a flush).
+    #[cfg(feature = "lance-backend")]
+    async fn postings_write_guard(
+        &self,
+        postings_path: &str,
+    ) -> Option<crate::backend::traits::TableWriteGuard> {
+        match self.backend.as_ref() {
+            Some(backend) => Some(backend.lock_table_for_write(postings_path).await),
+            None => None,
+        }
+    }
+
     /// Build and persist an inverted index for set-membership queries.
     #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
@@ -196,24 +233,39 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
+
+        // Serialize this full-rebuild overwrite against a concurrent flush incremental
+        // update of the same postings dataset (issue #95).
+        let postings_path = format!("{}/indexes/{}/{}_inverted", self.base_uri, label, property);
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
 
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
 
-        let ds = VertexDataset::new(&self.base_uri, label, label_meta.id);
-
-        // Check if dataset exists
-        if ds.open_raw().await.is_ok() {
-            index
-                .build_from_dataset(&ds, |n| info!("Indexed {} terms", n))
-                .await?;
+        // Backfill from the flushed vertex table via the storage backend. The
+        // LanceDB-managed table is not at the raw `{base}/vertices_<label>`
+        // path a `VertexDataset` open would target, and the backend read is
+        // branch-aware. Mirrors the sparse-index backfill. A not-yet-flushed
+        // table legitimately yields an empty index, populated on the next flush.
+        let table = table_names::vertex_table_name(label);
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                let batches = backend.scan(ScanRequest::all(&table)).await?;
+                index
+                    .build_from_batches(&batches, |n| info!("Indexed {} terms", n))
+                    .await?;
+            } else {
+                debug!(
+                    "Table '{}' not flushed yet; creating empty inverted index (populated on flush)",
+                    table
+                );
+            }
         } else {
             warn!(
-                "Dataset for label '{}' not found, creating empty inverted index",
-                label
+                "No storage backend available; inverted index '{}' left empty (populated on flush)",
+                config.name
             );
         }
 
@@ -364,7 +416,10 @@ impl IndexManager {
             return Ok(());
         };
         let table = table_names::vertex_table_name(&spec.label);
-        if !backend.table_exists(&table).await.unwrap_or(false) {
+        // Err propagates (a backend fault must not silently skip the backfill and
+        // leave the FDE column NULL); Ok(false) is the create-before-ingest case
+        // where the flush path will materialize the column.
+        if !backend.table_exists(&table).await? {
             return Ok(());
         }
 
@@ -382,6 +437,16 @@ impl IndexManager {
             .and_then(|p| p.get(&spec.source_prop))
             .map(|m| m.r#type.clone());
         let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)?;
+
+        // Serialize the scan → splice → overwrite against concurrent flush appends.
+        // `replace_table_atomic` overwrites the WHOLE vertex table, so a row a flush
+        // appends between our scan and our overwrite would be silently dropped —
+        // durable loss of committed data (issue #96). The flush append takes this same
+        // per-table write lock inside `StorageBackend::write`, so holding it across the
+        // read-modify-write makes the two mutually exclusive and guarantees we scan the
+        // post-append state. The lock must wrap BOTH the scan and the replace (not just
+        // the replace) to close the read→overwrite TOCTOU window.
+        let _table_guard = backend.lock_table_for_write(&table).await;
 
         let batches = backend.scan(ScanRequest::all(&table)).await?;
         let mut new_batches = Vec::with_capacity(batches.len());
@@ -414,10 +479,9 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
         // Fail fast on an invalid PQ configuration before touching Lance (which
         // would otherwise error opaquely at build time). The embedding dimension
@@ -455,129 +519,42 @@ impl IndexManager {
             ));
         }
 
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+        let params = to_backend_vector_params(config.metric.clone(), &config.index_type)?;
+        let table = table_names::vertex_table_name(label);
 
-        match ds_wrapper.open_raw().await {
-            Ok(mut lance_ds) => {
-                let metric_type = match &config.metric {
-                    DistanceMetric::L2 => MetricType::L2,
-                    DistanceMetric::Cosine => MetricType::Cosine,
-                    DistanceMetric::Dot => MetricType::Dot,
-                    _ => return Err(anyhow!("Unsupported metric: {:?}", config.metric)),
-                };
+        let Some(backend) = self.backend.as_ref() else {
+            warn!(
+                "No storage backend; physical vector index '{}' deferred until a flush",
+                config.name
+            );
+            return Ok(());
+        };
 
-                let params = match config.index_type.clone() {
-                    VectorIndexType::Flat => {
-                        let ivf = IvfBuildParams::new(1);
-                        VectorIndexParams::with_ivf_flat_params(metric_type, ivf)
-                    }
-                    VectorIndexType::IvfFlat { num_partitions } => {
-                        let ivf = IvfBuildParams::new(num_partitions as usize);
-                        VectorIndexParams::with_ivf_flat_params(metric_type, ivf)
-                    }
-                    VectorIndexType::IvfPq {
-                        num_partitions,
-                        num_sub_vectors,
-                        bits_per_subvector,
-                    } => {
-                        let ivf = IvfBuildParams::new(num_partitions as usize);
-                        let pq = PQBuildParams::new(
-                            num_sub_vectors as usize,
-                            bits_per_subvector as usize,
-                        );
-                        VectorIndexParams::with_ivf_pq_params(metric_type, ivf, pq)
-                    }
-                    VectorIndexType::IvfSq { num_partitions } => {
-                        let ivf = IvfBuildParams::new(num_partitions as usize);
-                        let sq = SQBuildParams::default();
-                        VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
-                    }
-                    VectorIndexType::IvfRq {
-                        num_partitions,
-                        num_bits,
-                    } => {
-                        let ivf = IvfBuildParams::new(num_partitions as usize);
-                        let mut rq = RQBuildParams::default();
-                        if let Some(bits) = num_bits {
-                            rq.num_bits = bits;
-                        }
-                        VectorIndexParams::with_ivf_rq_params(metric_type, ivf, rq)
-                    }
-                    VectorIndexType::HnswFlat {
-                        m,
-                        ef_construction,
-                        num_partitions,
-                    } => {
-                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
-                        let hnsw = HnswBuildParams::default()
-                            .num_edges(m as usize)
-                            .ef_construction(ef_construction as usize);
-                        VectorIndexParams::ivf_hnsw(metric_type, ivf, hnsw)
-                    }
-                    VectorIndexType::HnswSq {
-                        m,
-                        ef_construction,
-                        num_partitions,
-                    } => {
-                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
-                        let hnsw = HnswBuildParams::default()
-                            .num_edges(m as usize)
-                            .ef_construction(ef_construction as usize);
-                        let sq = SQBuildParams::default();
-                        VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
-                    }
-                    VectorIndexType::HnswPq {
-                        m,
-                        ef_construction,
-                        num_sub_vectors,
-                        num_partitions,
-                    } => {
-                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
-                        let hnsw = HnswBuildParams::default()
-                            .num_edges(m as usize)
-                            .ef_construction(ef_construction as usize);
-                        let pq = PQBuildParams::new(num_sub_vectors as usize, 8);
-                        VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf, hnsw, pq)
-                    }
-                    _ => {
-                        return Err(anyhow!(
-                            "Unsupported vector index type: {:?}",
-                            config.index_type
-                        ));
-                    }
-                };
-
-                // Ignore errors during creation if dataset is empty or similar, but try
-                let progress = TracingIndexProgress::arc(&config.name);
-                match lance_ds
-                    .create_index_builder(&[property], IndexType::Vector, &params)
-                    .name(config.name.clone())
-                    .replace(true)
-                    .progress(progress)
-                    .await
-                {
-                    Ok(metadata) => {
-                        info!(
-                            index_name = %metadata.name,
-                            index_uuid = %metadata.uuid,
-                            dataset_version = metadata.dataset_version,
-                            "Vector index created"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create physical vector index (dataset might be empty): {}",
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
+        // Build only once the table is flushed; create-before-flush is a no-op
+        // here and is materialized by the next flush's rebuild. A build failure
+        // on a tiny/degenerate column is tolerated (Lance may clamp or defer ANN
+        // training) — the schema definition is still persisted by the caller.
+        if backend.table_exists(&table).await? {
+            info!(
+                "Building physical vector index '{}' on '{}'",
+                config.name, table
+            );
+            if let Err(e) = backend
+                .create_vector_index(&table, property, &config.name, params)
+                .await
+            {
                 warn!(
-                    "Dataset not found for label '{}', skipping physical index creation but saving schema definition. Error: {}",
-                    label, e
+                    "Failed to build physical vector index '{}' (column may be empty): {}",
+                    config.name, e
                 );
+            } else {
+                info!("Vector index '{}' created", config.name);
             }
+        } else {
+            debug!(
+                "Label '{}' not flushed yet; physical vector index '{}' built on next flush",
+                label, config.name
+            );
         }
 
         Ok(())
@@ -595,56 +572,49 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+        let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
+        // Map the schema scalar type to the backend's; anything other than the
+        // explicit Bitmap/LabelList falls back to BTree (matching the prior
+        // `ScalarIndexParams::default()`).
+        let backend_idx_type = match config.index_type {
+            ScalarIndexType::Bitmap => crate::backend::types::ScalarIndexType::Bitmap,
+            ScalarIndexType::LabelList => crate::backend::types::ScalarIndexType::LabelList,
+            _ => crate::backend::types::ScalarIndexType::BTree,
+        };
+        let table = table_names::vertex_table_name(label);
 
-        match ds_wrapper.open_raw().await {
-            Ok(mut lance_ds) => {
-                let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
-
-                let progress = TracingIndexProgress::arc(&config.name);
-                let scalar_params = match config.index_type {
-                    ScalarIndexType::Bitmap => {
-                        ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap)
-                    }
-                    ScalarIndexType::LabelList => {
-                        ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList)
-                    }
-                    _ => ScalarIndexParams::default(),
-                };
-                match lance_ds
-                    .create_index_builder(&columns, IndexType::Scalar, &scalar_params)
-                    .name(config.name.clone())
-                    .replace(true)
-                    .progress(progress)
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                info!(
+                    "Building physical scalar index '{}' on '{}'",
+                    config.name, table
+                );
+                if let Err(e) = backend
+                    .create_scalar_index(&table, &columns, backend_idx_type, Some(&config.name))
                     .await
                 {
-                    Ok(metadata) => {
-                        info!(
-                            index_name = %metadata.name,
-                            index_uuid = %metadata.uuid,
-                            dataset_version = metadata.dataset_version,
-                            "Scalar index created"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create physical scalar index (dataset might be empty): {}",
-                            e
-                        );
-                    }
+                    warn!(
+                        "Failed to build physical scalar index '{}' (table may be empty): {}",
+                        config.name, e
+                    );
+                } else {
+                    info!("Scalar index '{}' created", config.name);
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (scalar index), skipping physical creation. Error: {}",
-                    label, e
+            } else {
+                debug!(
+                    "Label '{}' not flushed yet; physical scalar index '{}' built on next flush",
+                    label, config.name
                 );
             }
+        } else {
+            warn!(
+                "No storage backend; physical scalar index '{}' deferred until a flush",
+                config.name
+            );
         }
 
         self.schema_manager
@@ -665,50 +635,41 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+        let columns: Vec<&str> = config.properties.iter().map(|s| s.as_str()).collect();
+        let table = table_names::vertex_table_name(label);
 
-        match ds_wrapper.open_raw().await {
-            Ok(mut lance_ds) => {
-                let columns: Vec<&str> = config.properties.iter().map(|s| s.as_str()).collect();
-
-                let fts_params =
-                    InvertedIndexParams::default().with_position(config.with_positions);
-
-                let progress = TracingIndexProgress::arc(&config.name);
-                match lance_ds
-                    .create_index_builder(&columns, IndexType::Inverted, &fts_params)
-                    .name(config.name.clone())
-                    .replace(true)
-                    .progress(progress)
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                info!(
+                    "Building physical FTS index '{}' on '{}'",
+                    config.name, table
+                );
+                if let Err(e) = backend
+                    .create_fts_index(&table, &columns, Some(&config.name), config.with_positions)
                     .await
                 {
-                    Ok(metadata) => {
-                        info!(
-                            index_name = %metadata.name,
-                            index_uuid = %metadata.uuid,
-                            dataset_version = metadata.dataset_version,
-                            "FTS index created"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create physical FTS index (dataset might be empty): {}",
-                            e
-                        );
-                    }
+                    warn!(
+                        "Failed to build physical FTS index '{}' (table may be empty): {}",
+                        config.name, e
+                    );
+                } else {
+                    info!("FTS index '{}' created", config.name);
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (FTS index), skipping physical creation. Error: {}",
-                    label, e
+            } else {
+                debug!(
+                    "Label '{}' not flushed yet; physical FTS index '{}' built on next flush",
+                    label, config.name
                 );
             }
+        } else {
+            warn!(
+                "No storage backend; physical FTS index '{}' deferred until a flush",
+                config.name
+            );
         }
 
         self.schema_manager
@@ -733,48 +694,45 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+        let table = table_names::vertex_table_name(label);
 
-        match ds_wrapper.open_raw().await {
-            Ok(mut lance_ds) => {
-                let fts_params =
-                    InvertedIndexParams::default().with_position(config.with_positions);
-
-                let progress = TracingIndexProgress::arc(&config.name);
-                match lance_ds
-                    .create_index_builder(&[column.as_str()], IndexType::Inverted, &fts_params)
-                    .name(config.name.clone())
-                    .replace(true)
-                    .progress(progress)
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                info!(
+                    "Building physical JSON FTS index '{}' on '{}'",
+                    config.name, table
+                );
+                if let Err(e) = backend
+                    .create_fts_index(
+                        &table,
+                        &[column.as_str()],
+                        Some(&config.name),
+                        config.with_positions,
+                    )
                     .await
                 {
-                    Ok(metadata) => {
-                        info!(
-                            index_name = %metadata.name,
-                            index_uuid = %metadata.uuid,
-                            dataset_version = metadata.dataset_version,
-                            "JSON FTS index created"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create physical JSON FTS index (dataset might be empty): {}",
-                            e
-                        );
-                    }
+                    warn!(
+                        "Failed to build physical JSON FTS index '{}' (table may be empty): {}",
+                        config.name, e
+                    );
+                } else {
+                    info!("JSON FTS index '{}' created", config.name);
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (JSON FTS index), skipping physical creation. Error: {}",
-                    label, e
+            } else {
+                debug!(
+                    "Label '{}' not flushed yet; physical JSON FTS index '{}' built on next flush",
+                    label, config.name
                 );
             }
+        } else {
+            warn!(
+                "No storage backend; physical JSON FTS index '{}' deferred until a flush",
+                config.name
+            );
         }
 
         self.schema_manager
@@ -795,30 +753,19 @@ impl IndexManager {
             .get_index(name)
             .ok_or_else(|| anyhow!("Index '{}' not found in schema", name))?;
 
-        // Attempt physical index drop on the underlying Lance dataset.
+        // Drop the physical index through the backend. Best-effort: the index
+        // may never have been physically built (e.g. created before any flush),
+        // so a failure here is non-fatal.
         let label = idx_def.label();
-        let schema = self.schema_manager.schema();
-        if let Some(label_meta) = schema.labels.get(label) {
-            let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
-            match ds_wrapper.open_raw().await {
-                Ok(mut lance_ds) => {
-                    if let Err(e) = lance_ds.drop_index(name).await {
-                        // Log but don't fail — the index may never have been
-                        // physically built (e.g. empty dataset at creation time).
-                        warn!(
-                            "Physical index drop for '{}' returned error (non-fatal): {}",
-                            name, e
-                        );
-                    } else {
-                        info!("Physical index '{}' dropped from Lance dataset", name);
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Could not open dataset for label '{}' to drop physical index: {}",
-                        label, e
-                    );
-                }
+        let table = table_names::vertex_table_name(label);
+        if let Some(backend) = self.backend.as_ref() {
+            if let Err(e) = backend.drop_index(&table, name).await {
+                warn!(
+                    "Physical index drop for '{}' returned error (non-fatal): {}",
+                    name, e
+                );
+            } else {
+                info!("Physical index '{}' dropped from '{}'", name, table);
             }
         }
 
@@ -852,6 +799,7 @@ impl IndexManager {
                 IndexDefinition::FullText(cfg) => self.create_fts_index(cfg).await?,
                 IndexDefinition::Inverted(cfg) => self.create_inverted_index(cfg).await?,
                 IndexDefinition::JsonFullText(cfg) => self.create_json_fts_index(cfg).await?,
+                IndexDefinition::Sparse(cfg) => self.create_sparse_vector_index(cfg).await?,
                 _ => warn!("Unknown index type encountered during rebuild, skipping"),
             }
         }
@@ -862,55 +810,57 @@ impl IndexManager {
     #[cfg(feature = "lance-backend")]
     pub async fn create_composite_index(&self, label: &str, properties: &[String]) -> Result<()> {
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
-        // Lance supports multi-column indexes
-        let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+        // Lance supports multi-column indexes.
+        let index_name = format!("{}_{}_composite", label, properties.join("_"));
+        let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
+        let table = table_names::vertex_table_name(label);
 
-        // We need to verify dataset exists
-        if let Ok(mut ds) = ds_wrapper.open_raw().await {
-            // Create composite BTree index
-            let index_name = format!("{}_{}_composite", label, properties.join("_"));
-
-            // Convert properties to slice of &str
-            let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
-
-            let progress = TracingIndexProgress::arc(&index_name);
-            match ds
-                .create_index_builder(&columns, IndexType::Scalar, &ScalarIndexParams::default())
-                .name(index_name.clone())
-                .replace(true)
-                .progress(progress)
-                .await
-            {
-                Ok(metadata) => {
-                    info!(
-                        index_name = %metadata.name,
-                        index_uuid = %metadata.uuid,
-                        dataset_version = metadata.dataset_version,
-                        "Composite index created"
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                info!("Building composite index '{}' on '{}'", index_name, table);
+                if let Err(e) = backend
+                    .create_scalar_index(
+                        &table,
+                        &columns,
+                        crate::backend::types::ScalarIndexType::BTree,
+                        Some(&index_name),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to build composite index '{}' (table may be empty): {}",
+                        index_name, e
                     );
+                } else {
+                    info!("Composite index '{}' created", index_name);
                 }
-                Err(e) => {
-                    warn!("Failed to create physical composite index: {}", e);
-                }
+
+                let config = ScalarIndexConfig {
+                    name: index_name,
+                    label: label.to_string(),
+                    properties: properties.to_vec(),
+                    index_type: uni_common::core::schema::ScalarIndexType::BTree,
+                    where_clause: None,
+                    metadata: Default::default(),
+                };
+                self.schema_manager
+                    .add_index(IndexDefinition::Scalar(config))?;
+                self.schema_manager.save().await?;
+            } else {
+                debug!(
+                    "Label '{}' not flushed yet; composite index for {:?} built on next flush",
+                    label, properties
+                );
             }
-
-            let config = ScalarIndexConfig {
-                name: index_name,
-                label: label.to_string(),
-                properties: properties.to_vec(),
-                index_type: uni_common::core::schema::ScalarIndexType::BTree,
-                where_clause: None,
-                metadata: Default::default(),
-            };
-
-            self.schema_manager
-                .add_index(IndexDefinition::Scalar(config))?;
-            self.schema_manager.save().await?;
+        } else {
+            warn!(
+                "No storage backend; composite index for {:?} deferred until a flush",
+                properties
+            );
         }
 
         Ok(())
@@ -941,7 +891,124 @@ impl IndexManager {
             "Incrementally updating inverted index"
         );
 
+        // Serialize this load-modify-overwrite against a concurrent DDL backfill of the
+        // same postings dataset (issue #95).
+        let postings_path = format!(
+            "{}/indexes/{}/{}_inverted",
+            self.base_uri, config.label, config.property
+        );
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
         index.apply_incremental_updates(added, removed).await
+    }
+
+    /// Create (and backfill) a scored sparse-vector index. Mirrors
+    /// `create_inverted_index`: build from the flushed vertex dataset if it
+    /// exists, then register + persist the config.
+    #[cfg(feature = "lance-backend")]
+    #[instrument(skip(self), level = "info")]
+    pub async fn create_sparse_vector_index(&self, config: SparseVectorIndexConfig) -> Result<()> {
+        let label = &config.label;
+        let property = &config.property;
+        info!(
+            "Creating Sparse Vector Index '{}' on {}.{}",
+            config.name, label, property
+        );
+
+        let schema = self.schema_manager.schema();
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
+
+        // Serialize this full-rebuild overwrite against a concurrent flush incremental
+        // update of the same postings dataset (issue #95).
+        let postings_path = format!("{}/indexes/{}/{}_sparse", self.base_uri, label, property);
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
+        let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
+
+        // Backfill from the flushed vertex table via the storage backend (the
+        // LanceDB-managed table is not at the raw `{base}/vertices_<label>`
+        // path a `VertexDataset::open` expects). Mirrors the MUVERA backfill.
+        let table = table_names::vertex_table_name(label);
+        if let Some(backend) = self.backend.as_ref() {
+            // Err propagates (a backend fault must surface, not silently build an empty
+            // index); Ok(false) is the not-yet-flushed create-before-ingest case.
+            if backend.table_exists(&table).await? {
+                let batches = backend.scan(ScanRequest::all(&table)).await?;
+                index
+                    .build_from_batches(&batches, |n| debug!("Indexed {} sparse docs", n))
+                    .await?;
+            } else {
+                debug!(
+                    "Table '{}' not flushed yet; creating empty sparse index (populated on flush)",
+                    table
+                );
+            }
+        } else {
+            warn!(
+                "No storage backend available; sparse index '{}' left empty (populated on flush)",
+                config.name
+            );
+        }
+
+        self.schema_manager
+            .add_index(IndexDefinition::Sparse(config))?;
+        self.schema_manager.save().await?;
+
+        Ok(())
+    }
+
+    /// Applies incremental updates to a sparse-vector index (load-modify-write,
+    /// same semantics as the set-membership inverted index).
+    #[cfg(feature = "lance-backend")]
+    #[instrument(skip(self, added, removed), level = "info", fields(
+        label = %config.label,
+        property = %config.property
+    ))]
+    pub async fn update_sparse_vector_index_incremental(
+        &self,
+        config: &SparseVectorIndexConfig,
+        added: &HashMap<Vid, Vec<(u32, f32)>>,
+        removed: &HashSet<Vid>,
+    ) -> Result<()> {
+        info!(
+            added = added.len(),
+            removed = removed.len(),
+            "Incrementally updating sparse vector index"
+        );
+        // Serialize this load-modify-overwrite against a concurrent DDL backfill of the
+        // same postings dataset (issue #95).
+        let postings_path = format!(
+            "{}/indexes/{}/{}_sparse",
+            self.base_uri, config.label, config.property
+        );
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
+        let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
+        index.apply_incremental_updates(added, removed).await
+    }
+
+    /// Open a sparse-vector index for querying, given its label + property.
+    /// Errors if no `IndexDefinition::Sparse` is registered for that pair.
+    #[cfg(feature = "lance-backend")]
+    pub async fn sparse_vector_index(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<SparseVectorIndex> {
+        let schema = self.schema_manager.schema();
+        let config = schema
+            .indexes
+            .iter()
+            .find_map(|idx| match idx {
+                IndexDefinition::Sparse(cfg) if cfg.label == label && cfg.property == property => {
+                    Some(cfg.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("No sparse vector index found for {}.{}", label, property))?;
+        SparseVectorIndex::new(&self.base_uri, config).await
     }
 }

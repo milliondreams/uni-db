@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{
     EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig,
-    ScalarIndexType, Schema, TokenizerConfig, VectorIndexConfig,
+    ScalarIndexType, Schema, SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
 };
 use uni_cypher::ast::{
     AlterEdgeType, AlterLabel, BinaryOp, CallKind, Clause, CreateConstraint, CreateEdgeType,
@@ -1790,6 +1790,16 @@ pub enum FusionKind {
     /// primary's and fork-local FTS indexes combined via standard
     /// RRF (`score = sum 1 / (k_rrf + rank_i)`, k_rrf = 60).
     Bm25Rrf,
+    /// M4 — hybrid RRF that includes a learned-sparse (SPLADE) source:
+    /// emitted for `uni.search` whose properties map carries a `sparse`
+    /// key, fused via N-ary RRF in `run_hybrid_search`. Independent of
+    /// fork-local indexes.
+    SparseRrf,
+    /// M4 — sparse dot-product rerank: the `uni.sparse.query` analogue of
+    /// [`FusionKind::AnnRerank`], fusing primary's and fork-local sparse
+    /// indexes. Reserved: emitted once fork-local sparse indexes land
+    /// (issue #95 Task #4 introduces `ForkLocalIndexKind::Sparse`).
+    SparseDot,
 }
 
 /// Logical query plan produced by [`QueryPlanner`].
@@ -2094,6 +2104,13 @@ pub enum LogicalPlan {
     // DDL Plans
     CreateVectorIndex {
         config: VectorIndexConfig,
+        if_not_exists: bool,
+    },
+    /// Scored sparse-vector (SPLADE / learned-sparse) index. Reached via
+    /// `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}`, which shares the vector
+    /// DDL surface but is a distinct index kind.
+    CreateSparseIndex {
+        config: SparseVectorIndexConfig,
         if_not_exists: bool,
     },
     CreateFullTextIndex {
@@ -8362,6 +8379,52 @@ impl QueryPlanner {
                 use uni_common::vector_index_opts::{
                     VectorIndexOpts, build_vector_index_type, parse_vector_metric,
                 };
+                // `CREATE VECTOR INDEX … OPTIONS{type:'sparse'}` shares the vector DDL
+                // surface but is a scored inverted index, not a dense ANN — route it to
+                // the sparse path (mirrors the `uni.schema.createIndex` SPARSE arm in
+                // `ddl_procedures.rs`). `build_vector_index_type` has no "sparse" case
+                // and would otherwise fall through to the dense IVF_PQ default.
+                if c.options.get("type").and_then(|v| v.as_str()) == Some("sparse") {
+                    let dimensions = self
+                        .schema
+                        .properties
+                        .get(&c.label)
+                        .and_then(|props| props.get(&c.property))
+                        .and_then(|meta| match &meta.r#type {
+                            uni_common::DataType::SparseVector { dimensions } => Some(*dimensions),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Property '{}' is not a SparseVector column; cannot create a sparse index",
+                                c.property
+                            )
+                        })?;
+                    let quantize = c
+                        .options
+                        .get("quantize")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    // `OPTIONS{type:'sparse', embedding:{alias, source}}` auto-embeds
+                    // a text column into the sparse column (same parser as dense).
+                    let embedding_config = match c.options.get("embedding") {
+                        Some(emb_val) => Self::parse_embedding_config(emb_val)?,
+                        None => None,
+                    };
+                    let config = SparseVectorIndexConfig {
+                        name: c.name,
+                        label: c.label,
+                        property: c.property,
+                        dimensions,
+                        quantize,
+                        embedding_config,
+                        metadata: Default::default(),
+                    };
+                    return Ok(LogicalPlan::CreateSparseIndex {
+                        config,
+                        if_not_exists: c.if_not_exists,
+                    });
+                }
                 // Accept either a numeric value (`partitions: 256`) or a quoted string
                 // (`partitions: '256'`) — Cypher map literals produce the former.
                 let opt = |key: &str| -> Option<u32> {
@@ -9854,6 +9917,8 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
 ///   when a `Vector` fork-local index exists.
 /// - `uni.fts.query(label, column, query, k)` → `Bm25Rrf` when a
 ///   `FullText` fork-local index exists.
+/// - `uni.sparse.query(label, column, query_vec, k)` → `SparseDot`
+///   when a `Sparse` fork-local index marker exists.
 ///
 /// Returns `None` for any other procedure (no rewrite) or when the
 /// registry has no matching entry.
@@ -9865,6 +9930,21 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
     if arguments.len() < 2 {
         return None;
     }
+
+    // `uni.search` hybrid: a `sparse` key in the inline properties map means the
+    // call fuses a learned-sparse source via RRF (`run_hybrid_search`). This is
+    // independent of fork-local indexes, so it is not gated on `lookup`.
+    // Limitation: a properties map passed as a `$param` (not an inline
+    // `Expr::Map`) is opaque here and stays unlabeled.
+    if procedure_name == "uni.search" {
+        if let Expr::Map(entries) = &arguments[1]
+            && entries.iter().any(|(key, _)| key.as_str() == "sparse")
+        {
+            return Some(FusionKind::SparseRrf);
+        }
+        return None;
+    }
+
     let label = match &arguments[0] {
         Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
         _ => return None,
@@ -9876,6 +9956,12 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
     let expected = match procedure_name {
         "uni.vector.query" => uni_store::fork::ForkLocalIndexKind::Vector,
         "uni.fts.query" => uni_store::fork::ForkLocalIndexKind::FullText,
+        // `uni.sparse.query` fork-fusion observability: a registered fork-local
+        // `Sparse` marker (issue #95 Task #4) switches the call to the `SparseDot`
+        // fused operator. Retrieval itself is a brute-force branch scan re-scored
+        // by `sparse_dot` (`StorageManager::sparse_search`); the marker drives the
+        // planner/EXPLAIN view, the `AnnRerank`/`Bm25Rrf` analogue.
+        "uni.sparse.query" => uni_store::fork::ForkLocalIndexKind::Sparse,
         _ => return None,
     };
     let registered = lookup.fork_index_for(label, column)?;
@@ -9896,6 +9982,7 @@ fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> Option<FusionK
         K::Sorted => Some(FusionKind::SortedKWayMerge),
         K::Vector => Some(FusionKind::AnnRerank),
         K::FullText => Some(FusionKind::Bm25Rrf),
+        K::Sparse => Some(FusionKind::SparseDot),
         // `ForkLocalIndexKind` is `#[non_exhaustive]`; future kinds
         // we don't yet handle are silently passed through as a
         // regular Scan so a forward-incompatible binary doesn't

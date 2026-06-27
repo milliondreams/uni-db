@@ -180,6 +180,9 @@ Use edge properties sparingly for relationship metadata:
 | `Timestamp` | Date/time | created_at, published_at |
 | `Btic` | Temporal intervals with granularity | valid_period, event_when |
 | `Vector` | Embeddings | embedding, image_vector |
+| `List<T>` | Typed arrays | tags (`List<String>`), scores (`List<Float64>`) |
+| `List<Vector>` | Multi-vector (ColBERT / late-interaction) | tokens (`List<Vector(96)>`) |
+| `Map<K, V>` | Typed string-keyed maps | scores (`Map<String, Float64>`) |
 | `Json` | Semi-structured | metadata, config |
 | `Bytes` | Raw binary blobs | image, audio, pdf, model_weights |
 
@@ -263,6 +266,33 @@ For different embedding types, use separate properties:
   }
 }
 ```
+
+### Multi-Vector (ColBERT) Properties
+
+For late-interaction retrieval, store **many vectors per row** (one per token) in a `List<Vector(dim)>` property. Multi-vectors must be schema-declared — they cannot live on a schemaless property:
+
+```cypher
+CREATE LABEL Document (
+  title  STRING,
+  tokens LIST<VECTOR(96)>   -- per-token (ColBERT) vectors
+)
+```
+
+Pair it with a MUVERA index for fast first-stage retrieval, then exact MaxSim re-ranking. See [Vector Search — Multi-Vector](../features/vector-search.md#multi-vector-search-colbert-late-interaction).
+
+### Typed Collection Properties
+
+Beyond vectors, properties can declare typed collections — `List<T>` and string-keyed `Map<K, V>`, including nested forms:
+
+```cypher
+CREATE LABEL Document (
+  tags     LIST<STRING>,             -- typed list
+  scores   MAP<STRING, FLOAT>,       -- typed map
+  sections MAP<STRING, LIST<INT>>    -- nested
+)
+```
+
+Use a typed collection when the shape is known (it stores compactly and validates on write); fall back to `Json` for ad-hoc, varying structures.
 
 ### Embedding Versioning
 

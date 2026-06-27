@@ -70,6 +70,7 @@ pub const TAG_VECTOR: u8 = 16;
 pub const TAG_LOCALTIME: u8 = 17;
 pub const TAG_LOCALDATETIME: u8 = 18;
 pub const TAG_BTIC: u8 = 19;
+pub const TAG_SPARSE_VECTOR: u8 = 20;
 
 // ---------------------------------------------------------------------------
 // rmp_serde + UniError::Storage wrappers
@@ -94,6 +95,28 @@ fn decode_msgpack<'de, T: Deserialize<'de>>(
 fn encode_msgpack<T: Serialize>(buf: &mut Vec<u8>, tag: u8, value: &T, type_name: &'static str) {
     buf.push(tag);
     rmp_serde::encode::write(buf, value).unwrap_or_else(|_| panic!("{type_name} encode failed"));
+}
+
+/// Canonicalize a `(indices, values)` pair into a valid [`uni_sparse_vector::SparseVector`].
+///
+/// Defensive, infallible counterpart to ingest validation: sorts term ids, sums the
+/// weights of duplicates, and drops non-finite weights (mirroring the auto-embed
+/// canonicalizer) so the durable [`encode`] path can never panic on a value that
+/// bypassed the executor's `coerce_and_validate_property_value` (issue #95). Mismatched
+/// array lengths collapse to the shorter side rather than aborting the write.
+fn canonical_sparse_vector(indices: &[u32], values: &[f32]) -> uni_sparse_vector::SparseVector {
+    let pairs: Vec<(u32, f32)> = indices
+        .iter()
+        .copied()
+        .zip(values.iter().copied())
+        .filter(|&(_, w)| w.is_finite())
+        .collect();
+    // `from_pairs` over finite weights only re-errors if a duplicate-term summation
+    // overflows to ±inf; fall back to the empty vector so encoding never panics.
+    uni_sparse_vector::SparseVector::from_pairs(pairs).unwrap_or_else(|_| {
+        uni_sparse_vector::SparseVector::new(Vec::new(), Vec::new())
+            .expect("empty sparse vector is always valid")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +261,16 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
                 hi: btic.hi(),
                 meta: btic.meta(),
             }))
+        }
+        TAG_SPARSE_VECTOR => {
+            let sv = uni_sparse_vector::encode::decode_slice(payload).map_err(|e| {
+                UniError::Storage {
+                    message: format!("failed to decode SparseVector: {e}"),
+                    source: None,
+                }
+            })?;
+            let (indices, values) = sv.into_parts();
+            Ok(Value::SparseVector { indices, values })
         }
         _ => Err(UniError::Storage {
             message: format!("unknown CypherValue tag: {tag}"),
@@ -422,6 +455,18 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
             encode_msgpack(buf, TAG_PATH, &payload, "path");
         }
         Value::Vector(v) => encode_msgpack(buf, TAG_VECTOR, v, "vector"),
+        Value::SparseVector { indices, values } => {
+            buf.push(TAG_SPARSE_VECTOR);
+            // `encode` is infallible and runs on the durable WAL path, so it must never
+            // panic (M-PANIC-IS-STOP). User writes are canonicalized + validated at ingest
+            // (`coerce_and_validate_property_value`), so on every normal path this is a
+            // no-op re-canonicalization. A value that somehow arrives non-canonical here
+            // (e.g. a direct Rust-API construction bypassing the executor) is sorted, its
+            // duplicate term ids summed, and any non-finite weight dropped — matching the
+            // auto-embed canonicalizer — instead of aborting the write.
+            let sv = canonical_sparse_vector(indices, values);
+            buf.extend_from_slice(&uni_sparse_vector::encode::encode(&sv));
+        }
         Value::Temporal(t) => match t {
             crate::value::TemporalValue::Date { days_since_epoch } => {
                 encode_msgpack(buf, TAG_DATE, days_since_epoch, "date");
@@ -693,6 +738,91 @@ mod tests {
         let v = Value::Vector(vec![0.1, 0.2, 0.3]);
         let bytes = encode(&v);
         assert_eq!(bytes[0], TAG_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector() {
+        let v = Value::SparseVector {
+            indices: vec![1, 7, 42],
+            values: vec![0.25, -1.5, 3.0],
+        };
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_SPARSE_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn encode_canonicalizes_non_canonical_sparse_without_panicking() {
+        // Regression for issue #95: a `Value::SparseVector` with unsorted/duplicate
+        // term ids or a non-finite weight previously `.expect()`-panicked here on the
+        // durable WAL path. Encoding must now canonicalize defensively and never panic.
+        // Unsorted + duplicate term ids are sorted and summed.
+        let v = Value::SparseVector {
+            indices: vec![9, 1, 9],
+            values: vec![1.0, 2.0, 0.5],
+        };
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_SPARSE_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            Value::SparseVector {
+                indices: vec![1, 9],
+                values: vec![2.0, 1.5],
+            }
+        );
+
+        // A NaN / ±inf weight is dropped rather than panicking.
+        let v = Value::SparseVector {
+            indices: vec![1, 5],
+            values: vec![f32::NAN, 2.0],
+        };
+        let bytes = encode(&v);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            Value::SparseVector {
+                indices: vec![5],
+                values: vec![2.0],
+            }
+        );
+
+        // A length mismatch collapses to the shorter side instead of aborting.
+        let v = Value::SparseVector {
+            indices: vec![1, 2, 3],
+            values: vec![1.0],
+        };
+        let _ = encode(&v); // must not panic
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector_empty() {
+        let v = Value::SparseVector {
+            indices: vec![],
+            values: vec![],
+        };
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_SPARSE_VECTOR);
+        assert_eq!(decode(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn test_round_trip_sparse_vector_nested_in_map() {
+        // Nested-in-Map exercises the CV path used for non-declared/nested
+        // sparse values (the tag framing must survive map recursion).
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "emb".to_string(),
+            Value::SparseVector {
+                indices: vec![3, 9],
+                values: vec![1.0, 2.0],
+            },
+        );
+        let v = Value::Map(m);
+        let bytes = encode(&v);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, v);
     }

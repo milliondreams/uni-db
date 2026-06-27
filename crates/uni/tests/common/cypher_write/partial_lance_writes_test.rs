@@ -86,23 +86,20 @@ async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
         let untouched = row.get::<String>("u").unwrap();
         assert_eq!(untouched, format!("orig{i}"), "row {id}: untouched mutated");
         let emb = row.value("e").unwrap();
-        if let Value::List(items) = emb {
+        // A dense `Vector` column projects back as `Value::Vector` (the typed
+        // representation), not `Value::List`.
+        if let Value::Vector(items) = emb {
             assert_eq!(items.len(), 8, "row {id}: embedding length wrong");
-            for (j, v) in items.iter().enumerate() {
-                if let Value::Float(f) = v {
-                    let want = i as f64 + j as f64 * 0.01;
-                    // Use f32 epsilon: embedding round-trips through
-                    // Lance's Float32 encoding.
-                    assert!(
-                        (f - want).abs() < 1e-5,
-                        "row {id}: embedding[{j}] = {f}, want {want}"
-                    );
-                } else {
-                    panic!("row {id}: embedding[{j}] not Float");
-                }
+            for (j, f) in items.iter().enumerate() {
+                let want = i as f64 + j as f64 * 0.01;
+                // f32 epsilon: embedding round-trips through Lance's Float32 encoding.
+                assert!(
+                    (*f as f64 - want).abs() < 1e-5,
+                    "row {id}: embedding[{j}] = {f}, want {want}"
+                );
             }
         } else {
-            panic!("row {id}: embedding is not a list");
+            panic!("row {id}: embedding not preserved as a vector: {emb:?}");
         }
         if i < 5 {
             assert_eq!(
@@ -116,6 +113,189 @@ async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
             }
         } else {
             assert_eq!(row.get::<i64>("f").unwrap(), 0);
+        }
+    }
+    Ok(())
+}
+
+/// T1b — #121 regression: same as T1 but CREATE and the scalar SET coalesce in
+/// ONE L0 window (no flush between), so the row is never flushed before the partial
+/// SET. The untouched `embedding` (a `FixedSizeList`) must still read back intact —
+/// the partial MergeInsert preserves columns absent from its sub-schema source.
+#[tokio::test]
+async fn t1b_partial_set_preserves_embedding_no_intervening_flush() -> Result<()> {
+    let db = Uni::in_memory().config(flag_on_config()).build().await?;
+    db.schema()
+        .label("Entity")
+        .property("id", DataType::String)
+        .property_nullable("frequency", DataType::Int64)
+        .vector("embedding", 8)
+        .done()
+        .apply()
+        .await?;
+
+    // CREATE then SET in the SAME L0 window — no flush between.
+    let tx = db.session().tx().await?;
+    for i in 0..5 {
+        let emb: Vec<Value> = (0..8)
+            .map(|j| Value::Float(i as f64 + j as f64 * 0.01))
+            .collect();
+        tx.execute_with("CREATE (:Entity {id: $id, frequency: 0, embedding: $e})")
+            .param("id", Value::String(format!("e{i}")))
+            .param("e", Value::List(emb))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    let tx = db.session().tx().await?;
+    for i in 0..3 {
+        tx.execute_with("MATCH (n:Entity {id: $id}) SET n.frequency = $f")
+            .param("id", Value::String(format!("e{i}")))
+            .param("f", Value::Int(100 + i as i64))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?; // single flush over the coalesced CREATE+SET
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.id AS id, n.embedding AS e ORDER BY id")
+        .await?;
+    assert_eq!(r.rows().len(), 5);
+    for (i, row) in r.rows().iter().enumerate() {
+        let emb = row.value("e").unwrap();
+        if let Value::Vector(items) = emb {
+            assert_eq!(items.len(), 8, "row e{i}: embedding length wrong");
+            assert!(
+                (items[0] as f64 - i as f64).abs() < 1e-5,
+                "row e{i}: embedding[0] = {}",
+                items[0]
+            );
+        } else {
+            panic!("row e{i}: embedding lost on no-intervening-flush partial SET: {emb:?}");
+        }
+    }
+    Ok(())
+}
+
+/// T1c — #121 regression: a non-touched multivector `List<Vector>` column (an Arrow
+/// `List`) is preserved across a scalar-only partial SET.
+#[tokio::test]
+async fn t1c_partial_set_preserves_multivector() -> Result<()> {
+    let db = Uni::in_memory().config(flag_on_config()).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("id", DataType::String)
+        .property_nullable("frequency", DataType::Int64)
+        .property_nullable(
+            "tokens",
+            DataType::List(Box::new(DataType::Vector { dimensions: 4 })),
+        )
+        .apply()
+        .await?;
+
+    let tokens = |i: usize| {
+        Value::List(
+            (0..3)
+                .map(|t| {
+                    Value::List(
+                        (0..4)
+                            .map(|d| Value::Float((i * 10 + t * 4 + d) as f64))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    };
+
+    let tx = db.session().tx().await?;
+    for i in 0..3 {
+        tx.execute_with("CREATE (:Doc {id: $id, frequency: 0, tokens: $tk})")
+            .param("id", Value::String(format!("d{i}")))
+            .param("tk", tokens(i))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Doc {id: 'd0'}) SET n.frequency = 7")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Doc) RETURN n.id AS id, n.tokens AS tk ORDER BY id")
+        .await?;
+    assert_eq!(r.rows().len(), 3);
+    for (i, row) in r.rows().iter().enumerate() {
+        match row.value("tk").unwrap() {
+            Value::List(toks) => assert_eq!(
+                toks.len(),
+                3,
+                "row d{i}: multivector token count lost on partial SET"
+            ),
+            other => panic!("row d{i}: tokens not a list (lost on partial SET): {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// T1d — #121 regression: a non-touched `SparseVector` column (an Arrow `Struct`)
+/// is preserved across a scalar-only partial SET, indices + values intact.
+#[tokio::test]
+async fn t1d_partial_set_preserves_sparse_vector() -> Result<()> {
+    let db = Uni::in_memory().config(flag_on_config()).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("id", DataType::String)
+        .property_nullable("frequency", DataType::Int64)
+        .property_nullable("emb", DataType::SparseVector { dimensions: 100 })
+        .apply()
+        .await?;
+
+    let sv = |base: u32| Value::SparseVector {
+        indices: vec![base, base + 1, base + 2],
+        values: vec![1.0, 2.0, 3.0],
+    };
+
+    let tx = db.session().tx().await?;
+    for i in 0..3u32 {
+        tx.execute_with("CREATE (:Doc {id: $id, frequency: 0, emb: $e})")
+            .param("id", Value::String(format!("d{i}")))
+            .param("e", sv(i * 10))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Doc {id: 'd0'}) SET n.frequency = 7")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Doc) RETURN n.id AS id, n.emb AS e ORDER BY id")
+        .await?;
+    assert_eq!(r.rows().len(), 3);
+    for (i, row) in r.rows().iter().enumerate() {
+        match row.value("e").unwrap() {
+            Value::SparseVector { indices, values } => {
+                let base = i as u32 * 10;
+                assert_eq!(
+                    indices,
+                    &vec![base, base + 1, base + 2],
+                    "row d{i}: sparse indices lost on partial SET"
+                );
+                assert_eq!(values, &vec![1.0f32, 2.0, 3.0], "row d{i}: sparse values");
+            }
+            other => panic!("row d{i}: emb not SparseVector (lost on partial SET): {other:?}"),
         }
     }
     Ok(())

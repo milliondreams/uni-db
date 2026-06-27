@@ -201,6 +201,26 @@ impl IndexManager {
         self
     }
 
+    /// Serialize writers to a single index's postings dataset.
+    ///
+    /// The sparse and set-membership inverted indexes persist their postings with an
+    /// unconditional `WriteMode::Overwrite`. A DDL `CREATE … INDEX` backfill and a
+    /// concurrent flush incremental update both load-modify-overwrite the *same* postings
+    /// path; without serialization the second overwrite clobbers the first (a silent lost
+    /// update → a vid's posting vanishes from search candidates — issue #95). Keyed by the
+    /// postings dataset path, reusing the backend's per-key write-lock map. Returns `None`
+    /// when no backend is attached (offline rebuild paths cannot race a flush).
+    #[cfg(feature = "lance-backend")]
+    async fn postings_write_guard(
+        &self,
+        postings_path: &str,
+    ) -> Option<crate::backend::traits::TableWriteGuard> {
+        match self.backend.as_ref() {
+            Some(backend) => Some(backend.lock_table_for_write(postings_path).await),
+            None => None,
+        }
+    }
+
     /// Build and persist an inverted index for set-membership queries.
     #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
@@ -216,6 +236,11 @@ impl IndexManager {
         if !schema.labels.contains_key(label) {
             return Err(anyhow!("Label '{}' not found", label));
         }
+
+        // Serialize this full-rebuild overwrite against a concurrent flush incremental
+        // update of the same postings dataset (issue #95).
+        let postings_path = format!("{}/indexes/{}/{}_inverted", self.base_uri, label, property);
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
 
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
 
@@ -391,7 +416,10 @@ impl IndexManager {
             return Ok(());
         };
         let table = table_names::vertex_table_name(&spec.label);
-        if !backend.table_exists(&table).await.unwrap_or(false) {
+        // Err propagates (a backend fault must not silently skip the backfill and
+        // leave the FDE column NULL); Ok(false) is the create-before-ingest case
+        // where the flush path will materialize the column.
+        if !backend.table_exists(&table).await? {
             return Ok(());
         }
 
@@ -409,6 +437,16 @@ impl IndexManager {
             .and_then(|p| p.get(&spec.source_prop))
             .map(|m| m.r#type.clone());
         let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)?;
+
+        // Serialize the scan → splice → overwrite against concurrent flush appends.
+        // `replace_table_atomic` overwrites the WHOLE vertex table, so a row a flush
+        // appends between our scan and our overwrite would be silently dropped —
+        // durable loss of committed data (issue #96). The flush append takes this same
+        // per-table write lock inside `StorageBackend::write`, so holding it across the
+        // read-modify-write makes the two mutually exclusive and guarantees we scan the
+        // post-append state. The lock must wrap BOTH the scan and the replace (not just
+        // the replace) to close the read→overwrite TOCTOU window.
+        let _table_guard = backend.lock_table_for_write(&table).await;
 
         let batches = backend.scan(ScanRequest::all(&table)).await?;
         let mut new_batches = Vec::with_capacity(batches.len());
@@ -853,6 +891,14 @@ impl IndexManager {
             "Incrementally updating inverted index"
         );
 
+        // Serialize this load-modify-overwrite against a concurrent DDL backfill of the
+        // same postings dataset (issue #95).
+        let postings_path = format!(
+            "{}/indexes/{}/{}_inverted",
+            self.base_uri, config.label, config.property
+        );
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
         index.apply_incremental_updates(added, removed).await
     }
@@ -875,6 +921,11 @@ impl IndexManager {
             return Err(anyhow!("Label '{}' not found", label));
         }
 
+        // Serialize this full-rebuild overwrite against a concurrent flush incremental
+        // update of the same postings dataset (issue #95).
+        let postings_path = format!("{}/indexes/{}/{}_sparse", self.base_uri, label, property);
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
         let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
 
         // Backfill from the flushed vertex table via the storage backend (the
@@ -882,7 +933,9 @@ impl IndexManager {
         // path a `VertexDataset::open` expects). Mirrors the MUVERA backfill.
         let table = table_names::vertex_table_name(label);
         if let Some(backend) = self.backend.as_ref() {
-            if backend.table_exists(&table).await.unwrap_or(false) {
+            // Err propagates (a backend fault must surface, not silently build an empty
+            // index); Ok(false) is the not-yet-flushed create-before-ingest case.
+            if backend.table_exists(&table).await? {
                 let batches = backend.scan(ScanRequest::all(&table)).await?;
                 index
                     .build_from_batches(&batches, |n| debug!("Indexed {} sparse docs", n))
@@ -925,6 +978,14 @@ impl IndexManager {
             removed = removed.len(),
             "Incrementally updating sparse vector index"
         );
+        // Serialize this load-modify-overwrite against a concurrent DDL backfill of the
+        // same postings dataset (issue #95).
+        let postings_path = format!(
+            "{}/indexes/{}/{}_sparse",
+            self.base_uri, config.label, config.property
+        );
+        let _postings_guard = self.postings_write_guard(&postings_path).await;
+
         let mut index = SparseVectorIndex::new(&self.base_uri, config.clone()).await?;
         index.apply_incremental_updates(added, removed).await
     }

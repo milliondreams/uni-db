@@ -1837,8 +1837,10 @@ impl StorageManager {
 
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
-        if !backend.table_exists(&name).await.unwrap_or(false) {
-            // Nothing flushed yet; L0-only candidates are merged upstream.
+        // Distinguish "table genuinely absent" (Ok(false) → nothing flushed yet, L0-only
+        // candidates merged upstream) from a transient backend fault (Err): the latter
+        // must surface, not silently degrade to incomplete results (issue #96).
+        if !backend.table_exists(&name).await? {
             return Ok(Vec::new());
         }
 
@@ -1921,8 +1923,9 @@ impl StorageManager {
             .as_ref()
             .is_some_and(|s| s.branch_for(&name).is_some());
         if branched {
-            if !backend.table_exists(&name).await.unwrap_or(false) {
-                // Nothing flushed on the branch; fork L0 rows are merged upstream.
+            // Ok(false) = nothing flushed on the branch (fork L0 rows merged upstream);
+            // Err = a backend fault that must surface rather than degrade silently (#96).
+            if !backend.table_exists(&name).await? {
                 return Ok(Vec::new());
             }
             let mut filter_parts = vec![Self::build_active_filter(filter)];
@@ -1951,7 +1954,8 @@ impl StorageManager {
         }
 
         let mut results = Vec::new();
-        if backend.table_exists(&name).await.unwrap_or(false) {
+        // Ok(false) = no flushed table yet (L0-only); Err must propagate, not fail open (#96).
+        if backend.table_exists(&name).await? {
             let backend_metric = match &metric {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
@@ -2033,8 +2037,9 @@ impl StorageManager {
                 // on large fork corpora, but it re-implements by hand the fusion /
                 // tombstone / nested-fork correctness this scan gets from Lance.
                 let backend = self.backend.as_ref();
-                if !backend.table_exists(&name).await.unwrap_or(false) {
-                    // Nothing flushed on the branch; fork L0 rows merge upstream.
+                // Ok(false) = nothing flushed on the branch (fork L0 rows merge upstream);
+                // Err = a backend fault that must surface, not fail open silently (#95).
+                if !backend.table_exists(&name).await? {
                     return Ok(Vec::new());
                 }
                 let request = ScanRequest::all(&name)

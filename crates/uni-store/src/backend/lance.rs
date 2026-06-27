@@ -585,6 +585,15 @@ impl StorageBackend for LanceDbBackend {
         Ok(())
     }
 
+    async fn lock_table_for_write(&self, name: &str) -> crate::backend::traits::TableWriteGuard {
+        // Same per-table mutex `write` / `merge_insert` / `create_table` take, exposed as
+        // an owned guard so a multi-step read-modify-write (the MUVERA FDE backfill's
+        // scan → overwrite) can hold it across both calls and serialize against flush
+        // appends. `replace_table_atomic`'s table-exists path takes no internal lock, so a
+        // holder calling it does not deadlock.
+        crate::backend::traits::TableWriteGuard::held(self.write_lock_for(name).lock_owned().await)
+    }
+
     // ========================
     // Versioning / MVCC
     // ========================
@@ -1105,6 +1114,58 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lock_table_for_write_provides_mutual_exclusion() {
+        // The MUVERA FDE backfill holds this guard across its scan→overwrite so a
+        // concurrent flush append cannot interleave and be lost (issue #96). Prove the
+        // guard actually serializes two holders of the same table name: a second
+        // acquisition must not proceed while the first is held, and a different table
+        // name must not block.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, backend) = create_test_backend().await;
+        let backend = Arc::new(backend);
+
+        let held = backend.lock_table_for_write("vertices_Doc").await;
+
+        // A different table name is independent — acquiring it must not block.
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.lock_table_for_write("vertices_Other"),
+        )
+        .await;
+        assert!(
+            other.is_ok(),
+            "a different table's lock must be independent"
+        );
+        drop(other);
+
+        // A second acquisition of the SAME name must block until the first is dropped.
+        let entered = Arc::new(AtomicBool::new(false));
+        let b2 = Arc::clone(&backend);
+        let e2 = Arc::clone(&entered);
+        let waiter = tokio::spawn(async move {
+            let _g = b2.lock_table_for_write("vertices_Doc").await;
+            e2.store(true, Ordering::SeqCst);
+        });
+
+        // While we hold the guard, the waiter must not have acquired it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "second holder acquired the same-name lock while it was still held"
+        );
+
+        drop(held);
+        // Now the waiter can proceed.
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter did not acquire the lock after release")
+            .unwrap();
+        assert!(entered.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

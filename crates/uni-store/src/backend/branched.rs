@@ -521,6 +521,12 @@ impl StorageBackend for BranchedBackend {
         super::lance_branch::replace_branch_tip(&uri, &branch, reader).await
     }
 
+    async fn lock_table_for_write(&self, name: &str) -> crate::backend::traits::TableWriteGuard {
+        // Forward to the primary backend so a backfill and a flush that pass the same
+        // table name serialize on the same per-table mutex.
+        self.inner.lock_table_for_write(name).await
+    }
+
     // ── MVCC ─────────────────────────────────────────────────────────
 
     async fn get_table_version(&self, table_name: &str) -> Result<Option<u64>> {

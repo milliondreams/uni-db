@@ -893,3 +893,157 @@ async fn sparse_recovered_delete_hides_doc_without_rebuild() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// Attempt to CREATE a `Doc` carrying `emb`, returning the write `Result` so a
+/// test can assert acceptance or rejection of a (possibly malformed) value.
+async fn try_insert_emb(db: &Uni, title: &str, emb: Value) -> anyhow::Result<()> {
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Doc {title: $title, emb: $emb})")
+        .param("title", Value::String(title.to_string()))
+        .param("emb", emb)
+        .run()
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()> {
+    // Regression for issue #95: a malformed `Value::SparseVector` supplied through the
+    // query-parameter surface previously reached the WAL value codec and `.expect()`-
+    // panicked the commit/write task. Ingest validation must now reject it as a clean
+    // `TypeError`, and canonicalize (rather than reject) merely-unsorted/duplicate input.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+
+    // (a) Non-finite weight → rejected.
+    assert!(
+        try_insert_emb(
+            &db,
+            "nan",
+            Value::SparseVector { indices: vec![1, 5], values: vec![f32::NAN, 2.0] },
+        )
+        .await
+        .is_err(),
+        "a NaN weight must be rejected at ingest"
+    );
+
+    // (b) Length mismatch → rejected.
+    assert!(
+        try_insert_emb(
+            &db,
+            "lenmismatch",
+            Value::SparseVector { indices: vec![1, 2, 3], values: vec![1.0] },
+        )
+        .await
+        .is_err(),
+        "a length-mismatched sparse vector must be rejected at ingest"
+    );
+
+    // (c) Term id at/beyond the declared term space (dimensions = VOCAB) → rejected.
+    assert!(
+        try_insert_emb(
+            &db,
+            "outofrange",
+            Value::SparseVector { indices: vec![VOCAB as u32], values: vec![1.0] },
+        )
+        .await
+        .is_err(),
+        "a term id >= dimensions must be rejected at ingest"
+    );
+
+    // (d) Unsorted + duplicate term ids → accepted and canonicalized (sorted, summed).
+    try_insert_emb(
+        &db,
+        "canon",
+        Value::SparseVector { indices: vec![9, 1, 9], values: vec![1.0, 2.0, 0.5] },
+    )
+    .await?;
+    db.flush().await?;
+    let rows = db
+        .session()
+        .query("MATCH (d:Doc {title: 'canon'}) RETURN d.emb AS emb")
+        .await?;
+    match rows.rows()[0].value("emb") {
+        Some(Value::SparseVector { indices, values }) => {
+            assert_eq!(indices, &vec![1u32, 9], "canonicalized indices (sorted)");
+            assert_eq!(values, &vec![2.0f32, 1.5], "canonicalized values (summed dup)");
+        }
+        other => panic!("expected canonicalized SparseVector, got {other:?}"),
+    }
+
+    // The database is still alive and writable after the rejected writes (no panic).
+    insert_docs(&db, &build_corpus(10, 0xA11_5EED), true).await?;
+    Ok(())
+}
+
+/// Recall@k of the engine's returned titles against the oracle's true top-k.
+fn recall_at_k(engine: &[(String, f64)], corpus: &[(String, Sparse)], k: usize) -> f64 {
+    let q = query_vec();
+    let mut ranked: Vec<(&str, f64)> = corpus
+        .iter()
+        .map(|(t, s)| (t.as_str(), sparse_dot_oracle(&q, s)))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(b.0)));
+    let truth: std::collections::HashSet<&str> =
+        ranked.iter().take(k).map(|(t, _)| *t).collect();
+    if truth.is_empty() {
+        return 1.0;
+    }
+    let got = engine
+        .iter()
+        .filter(|(t, _)| truth.contains(t.as_str()))
+        .count();
+    got as f64 / truth.len() as f64
+}
+
+/// A corpus with controlled query-term overlap so there is a non-trivial oracle
+/// top-k the candidate stage must preserve: each doc draws a random subset of the
+/// query's terms (scaled weights) plus random noise terms.
+fn build_overlap_corpus(n: usize, seed: u64) -> Vec<(String, Sparse)> {
+    let q = query_vec();
+    let mut rng = Rng(seed);
+    (0..n)
+        .map(|i| {
+            let mut m: BTreeMap<u32, f32> = BTreeMap::new();
+            // 1..=5 query terms, weighted, so dot scores spread across the corpus.
+            let take = 1 + (rng.next_u64() as usize % q.0.len());
+            for &t in q.0.iter().take(take) {
+                m.insert(t, rng.weight());
+            }
+            for _ in 0..6 {
+                m.insert(rng.term(), rng.weight());
+            }
+            (
+                format!("d{i}"),
+                (m.keys().copied().collect(), m.values().copied().collect()),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sparse_recall_at_10_is_perfect_on_overlap_corpus() -> anyhow::Result<()> {
+    // Closes the headline test gap (issue #95 SP-TG-1): the benchmark *printed*
+    // recall@10 but never asserted it, so a regression in the `k * over_fetch`
+    // candidate cutoff or in quantization could silently drop recall below 1.0.
+    // This asserts recall@10 == 1.0 against the exact f64 oracle over a few-thousand
+    // doc corpus with real query-term overlap, on both the quantized (default) and
+    // lossless index layouts.
+    for quantize in [true, false] {
+        let db = Uni::temporary().build().await?;
+        define_schema_quantize(&db, quantize).await?;
+        let corpus = build_overlap_corpus(2000, 0x5ECA_11ED ^ quantize as u64);
+        insert_docs(&db, &corpus, true).await?;
+
+        let results = query_results(&db, 10).await?;
+        let recall = recall_at_k(&results, &corpus, 10);
+        assert!(
+            (recall - 1.0).abs() < f64::EPSILON,
+            "recall@10 regressed (quantize={quantize}): {recall} (engine={results:?})"
+        );
+        assert_matches_oracle(&results, &corpus);
+    }
+    Ok(())
+}

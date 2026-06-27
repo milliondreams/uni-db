@@ -3048,6 +3048,17 @@ impl Executor {
             return Ok(val);
         };
 
+        // Sparse vectors carry invariants the type system cannot express (strictly
+        // ascending unique term ids, finite weights, equal-length arrays, term ids
+        // within the declared term space). Canonicalize and validate the native value
+        // at ingest so a malformed sparse vector is a clean `TypeError` here, rather
+        // than a panic deep in the durable WAL value codec — which reconstructs via
+        // `SparseVector::new` and previously `.expect()`ed (issue #95). The degraded
+        // `Value::Map` / `Null` forms fall through to `accepts` unchanged.
+        if let (DataType::SparseVector { dimensions }, Value::SparseVector { .. }) = (dt, &val) {
+            return Self::canonicalize_sparse_vector(prop_name, val, *dimensions);
+        }
+
         // Directly storable: scalars, the intentional `Int`→`Float`/`Int32` and
         // `Temporal`→`Timestamp` widenings, declared composite columns (`Map`/`List`/
         // `Vector`) receiving their matching value, and `Null` (always accepted).
@@ -3093,6 +3104,60 @@ impl Executor {
             dt,
             value_type_name(&val)
         );
+    }
+
+    /// Canonicalizes and validates a value destined for a `SparseVector` column.
+    ///
+    /// Sorts term ids ascending and sums the weights of duplicate term ids (via
+    /// [`uni_sparse_vector::SparseVector::from_pairs`]), then rejects mismatched array
+    /// lengths, non-finite weights, and term ids outside the declared `dimensions` term
+    /// space. Running this at the write boundary keeps the durable WAL codec's
+    /// `SparseVector::new(..)` reconstruction infallible and mirrors the auto-embed
+    /// path, which canonicalizes through the same kernel constructor (issue #95).
+    ///
+    /// # Errors
+    /// Returns a `TypeError` if the value violates a sparse-vector invariant or carries
+    /// a term id at or beyond `dimensions`.
+    fn canonicalize_sparse_vector(prop_name: &str, val: Value, dimensions: usize) -> Result<Value> {
+        let Value::SparseVector { indices, values } = val else {
+            // The caller only routes native `Value::SparseVector` values here.
+            anyhow::bail!(
+                "TypeError: property '{}' is declared SparseVector but got {}",
+                prop_name,
+                value_type_name(&val)
+            );
+        };
+        if indices.len() != values.len() {
+            anyhow::bail!(
+                "TypeError: property '{}' sparse vector has {} term ids but {} weights",
+                prop_name,
+                indices.len(),
+                values.len()
+            );
+        }
+        let pairs: Vec<(u32, f32)> = indices.into_iter().zip(values).collect();
+        let sv = uni_sparse_vector::SparseVector::from_pairs(pairs).map_err(|e| {
+            anyhow!(
+                "TypeError: property '{}' has an invalid sparse vector: {}",
+                prop_name,
+                e
+            )
+        })?;
+        // `dimensions` is the term-space cardinality (max term id + 1); the largest
+        // term id of a canonical (ascending) vector is its last index.
+        if let Some(&max_term) = sv.indices().last()
+            && max_term as usize >= dimensions
+        {
+            anyhow::bail!(
+                "TypeError: property '{}' sparse vector term id {} is outside the declared \
+                 term space (dimensions = {})",
+                prop_name,
+                max_term,
+                dimensions
+            );
+        }
+        let (indices, values) = sv.into_parts();
+        Ok(Value::SparseVector { indices, values })
     }
 
     /// Coerces and validates every property in `props` against the declared types for `labels`.

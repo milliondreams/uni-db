@@ -263,6 +263,13 @@ impl SparseVectorIndex {
                 continue;
             };
             for (term, weight) in indices.into_iter().zip(values) {
+                // Defense in depth: ingest validation now rejects non-finite weights, but
+                // a corrupt / manually-spliced on-disk segment must not poison scoring —
+                // a single NaN weight would make a vid's accumulated dot product NaN and
+                // corrupt top-k ordering (issue #95). Skip non-finite postings on read.
+                if !weight.is_finite() {
+                    continue;
+                }
                 postings.entry(term).or_default().push((vid, weight));
             }
             count += 1;

@@ -261,7 +261,14 @@ async fn rerank_candidates(
         }
         let rerank_map: HashMap<Vid, f32> = scored.iter().copied().collect();
         let mut reranked = scored;
-        reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic tie-break by ascending vid, matching the DAAT storage path
+                // (`HeapEntry`), so top-k *membership* at a score tie is stable rather than
+                // dependent on HashSet/HashMap candidate iteration order (issue #95).
+                .then_with(|| a.0.as_u64().cmp(&b.0.as_u64()))
+        });
         reranked.truncate(k);
         return Ok((
             reranked,
@@ -302,7 +309,14 @@ async fn rerank_candidates(
         .iter()
         .map(|sd| (vids[sd.index], sigmoid(sd.score)))
         .collect();
-    reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    reranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic tie-break by ascending vid, matching the DAAT storage path
+            // (`HeapEntry`), so top-k *membership* at a score tie is stable rather than
+            // dependent on HashSet/HashMap candidate iteration order (issue #95).
+            .then_with(|| a.0.as_u64().cmp(&b.0.as_u64()))
+    });
     reranked.truncate(k);
 
     let rerank_map: HashMap<Vid, f32> = scored
@@ -460,7 +474,14 @@ pub(crate) async fn multivector_rerank(
     }
 
     // 6. Top-k by similarity (higher = better).
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic tie-break by ascending vid, matching the DAAT storage path
+            // (`HeapEntry`), so top-k *membership* at a score tie is stable rather than
+            // dependent on HashSet/HashMap candidate iteration order (issue #95).
+            .then_with(|| a.0.as_u64().cmp(&b.0.as_u64()))
+    });
     scored.truncate(k);
 
     Ok((scored, props_map))
@@ -546,7 +567,14 @@ pub(crate) async fn sparse_rerank(
     }
 
     // 6. Top-k by similarity (higher = better).
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Deterministic tie-break by ascending vid, matching the DAAT storage path
+            // (`HeapEntry`), so top-k *membership* at a score tie is stable rather than
+            // dependent on HashSet/HashMap candidate iteration order (issue #95).
+            .then_with(|| a.0.as_u64().cmp(&b.0.as_u64()))
+    });
     scored.truncate(k);
     Ok((scored, props_map))
 }
@@ -634,7 +662,17 @@ pub(crate) async fn run_sparse_query(
     let k = require_int_arg(args, 3, "uni.sparse.query: fourth argument (k)")?;
     // `filter` is accepted for API symmetry; MVCC/tombstone visibility is
     // already enforced by the property fetch in `sparse_rerank`.
-    let _filter = extract_optional_filter(args, 4);
+    // `uni.sparse.query` does not yet scope candidates by a user predicate (only MVCC /
+    // tombstone visibility from the property fetch applies). Reject a non-null `filter`
+    // explicitly rather than silently ignoring it, so a caller is not misled into
+    // believing results are constrained (issue #95; the filtered/hybrid surface is #114).
+    if extract_optional_filter(args, 4).is_some() {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "uni.sparse.query: the `filter` argument is not yet supported — results are not \
+             scoped by it. Omit it, or pre-filter via a hybrid/Cypher query."
+                .to_string(),
+        ));
+    }
     let threshold = extract_optional_threshold(args, 5);
     let options_map = args
         .get(6)

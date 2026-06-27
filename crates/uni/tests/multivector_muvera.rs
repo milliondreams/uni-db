@@ -821,3 +821,47 @@ async fn dense_ivfpq_via_schema_builder_path() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn muvera_wrong_dim_token_does_not_wedge_flush() -> anyhow::Result<()> {
+    // Regression for issue #96: a source multi-vector token whose dimension != the index
+    // `input_dim` made the FDE encoder hard-error inside `materialize_fde_columns`, which
+    // aborted the WHOLE flush and wedged L0 (the rotated buffer stuck on the pending list,
+    // so every subsequent flush re-hit the bad row and also failed). The flush must now
+    // skip the malformed row (leaving its FDE NULL) and succeed, with well-formed docs
+    // still retrievable.
+    let db = Uni::temporary().build().await?;
+    define_schema(&db).await?;
+    create_muvera_index(&db, MUVERA_OPTS).await?;
+
+    // Well-formed corpus (including the exact-match `target`), all in L0.
+    let corpus = build_corpus(8, 0xBAD_D1ED);
+    insert_docs(&db, &corpus).await?;
+
+    // Plus one doc whose single token has the WRONG dimension (DIM + 1).
+    let bad_tokens = Value::List(vec![Value::List(
+        (0..DIM + 1).map(|i| Value::Float(i as f64)).collect(),
+    )]);
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Doc {title: $title, tokens: $toks})")
+        .param("title", Value::String("malformed".to_string()))
+        .param("toks", bad_tokens)
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    // The critical step: the flush must NOT wedge on the malformed row.
+    db.flush().await?;
+    // A second flush still succeeds (the bad row never got stuck on the pending list).
+    db.flush().await?;
+
+    // The well-formed exact match is still retrievable and ranks first; the malformed doc
+    // (NULL FDE under the Dot first stage) must not crowd out real results.
+    let titles = query_titles(&db, 8).await?;
+    assert_eq!(
+        titles.first().map(String::as_str),
+        Some("target"),
+        "exact match must still rank first after a malformed row was skipped: {titles:?}"
+    );
+    Ok(())
+}

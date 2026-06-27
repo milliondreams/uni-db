@@ -3591,9 +3591,25 @@ impl Writer {
                     Some(v) => crate::storage::muvera_index::value_to_multivec(v),
                     None => continue, // source absent → leave the FDE column NULL
                 };
-                let fde = encoder.encode_doc(&tokens).map_err(|e| {
-                    anyhow!("MUVERA index '{}' vid {:?}: {e}", spec.index_name, vid)
-                })?;
+                // A source token with the wrong dimension makes `encode_doc` error.
+                // Skipping the row (leaving the FDE column NULL → ranks last under the
+                // mandatory Dot metric; harmless) keeps one malformed document from
+                // wedging *every* flush of this label, matching the normal multi-vector
+                // column path, which null-fills a dimension mismatch rather than failing
+                // the flush (issue #96).
+                let fde = match encoder.encode_doc(&tokens) {
+                    Ok(fde) => fde,
+                    Err(e) => {
+                        tracing::warn!(
+                            index = %spec.index_name,
+                            vid = ?vid,
+                            error = %e,
+                            "muvera.fde.skip_malformed: leaving FDE NULL for a source \
+                             multi-vector that failed encoding"
+                        );
+                        continue;
+                    }
+                };
                 if let Some(props) = guard.vertex_properties.get_mut(&vid) {
                     props.insert(spec.derived_col.clone(), Value::Vector(fde));
                 }
@@ -4737,6 +4753,15 @@ impl Writer {
                                 .zip(values.iter().copied())
                                 .collect();
                             added.insert(*vid, pairs);
+                            // An in-place SET re-flushes an already-indexed vid. The
+                            // sparse postings are a `Vec` with no per-vid dedup, so unless
+                            // the vid is also marked removed, `apply_incremental_updates`
+                            // appends the new postings *alongside* the stale ones — leaking
+                            // duplicates that grow unboundedly on hot-updated docs and
+                            // double-count the advisory `query_topk` score (issue #95).
+                            // Mark every updated vid removed so its prior postings are
+                            // purged before the new ones are appended (remove-then-add).
+                            removed.insert(*vid);
                         }
                     }
                     // Tombstones are not in `vertices`; pull from tombstones_by_label.

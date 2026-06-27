@@ -17,6 +17,39 @@ use super::types::*;
 /// A record batch stream returned by [`StorageBackend::scan_stream`].
 pub type RecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
+/// RAII guard serializing writes to a single table, from
+/// [`StorageBackend::lock_table_for_write`].
+///
+/// Held across a multi-step read-modify-write (e.g. an index backfill's
+/// scan → transform → [`StorageBackend::replace_table_atomic`]) so a concurrent
+/// [`StorageBackend::write`] append cannot interleave between the read and the
+/// overwrite and be silently discarded. A no-op for backends without per-table
+/// write locking.
+#[must_use = "the table write lock is released as soon as the guard is dropped"]
+pub struct TableWriteGuard(
+    // Held purely for its `Drop` side effect (releasing the per-table mutex).
+    #[expect(dead_code, reason = "guard is held only to release the lock on drop")]
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+);
+
+impl std::fmt::Debug for TableWriteGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableWriteGuard").finish_non_exhaustive()
+    }
+}
+
+impl TableWriteGuard {
+    /// A no-op guard for backends that do not serialize writes per table.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Wrap an owned per-table mutex guard.
+    pub fn held(guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self(Some(guard))
+    }
+}
+
 /// Core storage backend trait.
 ///
 /// All persistent storage operations go through this trait. Backends must be
@@ -130,6 +163,21 @@ pub trait StorageBackend: Send + Sync + 'static {
         batches: Vec<RecordBatch>,
         schema: Arc<ArrowSchema>,
     ) -> Result<()>;
+
+    /// Acquire the per-table write lock, returning a guard held until dropped.
+    ///
+    /// A caller performing a read-modify-write that spans multiple backend calls —
+    /// a scan followed by [`Self::replace_table_atomic`], as the MUVERA FDE backfill
+    /// does — must hold this across the whole sequence. Otherwise a concurrent
+    /// [`Self::write`] append can land between the read and the full-table overwrite
+    /// and be silently lost. [`Self::write`] / [`Self::merge_insert`] take the same
+    /// lock internally, so holding it here makes them mutually exclusive.
+    ///
+    /// Backends without per-table write locking return a no-op guard.
+    async fn lock_table_for_write(&self, name: &str) -> TableWriteGuard {
+        let _ = name;
+        TableWriteGuard::none()
+    }
 
     // ========================
     // Versioning / MVCC

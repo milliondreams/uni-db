@@ -1175,7 +1175,17 @@ pub struct PropertyExtractor<'a> {
 /// Returns `None` for any other value (→ a null struct row).
 fn sparse_pair_from_value(v: &Value) -> Option<(Vec<u32>, Vec<f32>)> {
     match v {
-        Value::SparseVector { indices, values } => Some((indices.clone(), values.clone())),
+        Value::SparseVector { indices, values } => {
+            // Guard the native arm the same way the `Value::Map` arm below does: a
+            // length-mismatched value would otherwise emit an Arrow struct whose
+            // `indices`/`values` child lists desync, which the reader silently
+            // truncates via `.zip()` — pairing weights with the wrong term ids
+            // (issue #95). Reject it to a null struct row instead.
+            if indices.len() != values.len() {
+                return None;
+            }
+            Some((indices.clone(), values.clone()))
+        }
         Value::Map(m) => {
             let idx = match m.get("indices") {
                 Some(Value::List(l)) => l,

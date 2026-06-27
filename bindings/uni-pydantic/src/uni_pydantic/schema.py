@@ -364,9 +364,7 @@ class SchemaGenerator:
                         cfg = {"type": "sparse"}
                         if prop.data_type.startswith("sparse_vector:"):
                             cfg["dimensions"] = int(prop.data_type.split(":")[1])
-                        await (
-                            db.schema().label(label).index(prop.name, cfg).apply()
-                        )
+                        await db.schema().label(label).index(prop.name, cfg).apply()
                     except Exception:
                         pass  # Index may already exist
                 elif prop.index_type == "fulltext":

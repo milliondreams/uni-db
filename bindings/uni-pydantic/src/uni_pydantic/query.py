@@ -619,8 +619,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         }
 
         cypher = (
-            f"CALL uni.sparse.query('{label}', '{ss.property_name}', "
-            f"$sparse_q, {ss.k})"
+            f"CALL uni.sparse.query('{label}', '{ss.property_name}', $sparse_q, {ss.k})"
         )
         cypher += " YIELD node, score"
 

@@ -363,7 +363,7 @@ impl MainVertexDataset {
             }
             log::info!("Creating {} index on main_vertices", column);
             if let Err(e) = backend
-                .create_scalar_index(table_name, column, idx_type)
+                .create_scalar_index(table_name, &[column], idx_type, None)
                 .await
             {
                 log::warn!("Failed to create {} index on main_vertices: {}", column, e);

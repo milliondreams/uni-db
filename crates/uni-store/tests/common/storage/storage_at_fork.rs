@@ -4,7 +4,8 @@
 //! Integration test for `StorageManager::at_fork`.
 //!
 //! Verifies that a fork-scoped storage manager:
-//! 1. Routes vertex_dataset reads through Lance branches (when registered)
+//! 1. Routes vertex-data reads through Lance branches via the (branch-aware)
+//!    `StorageBackend` — `VertexDataset` no longer opens on-disk data itself.
 //! 2. Sees fork-point data — primary writes after fork creation are invisible
 //! 3. Returns the primary (un-branched) dataset when no branch is recorded
 //!    for that name (graceful fallback for new labels created post-fork —
@@ -52,7 +53,8 @@ async fn at_fork_routes_vertex_reads_through_branch() {
     //    the standard backend trait. We bypass writer/L0 by using the lance
     //    crate directly — Phase 1 doesn't need write paths through forked
     //    storage, only reads, so a synthetic seed is sufficient here.
-    let dataset_uri = format!("{storage_str}/vertices_Person");
+    // Seed at the canonical `{base}/{name}.lance` path the backend reads from.
+    let dataset_uri = format!("{storage_str}/vertices_Person.lance");
     seed_initial_dataset(&dataset_uri).await;
 
     // 4. Register a fork in the registry, branching that one dataset.
@@ -83,13 +85,15 @@ async fn at_fork_routes_vertex_reads_through_branch() {
     ));
     let forked_storage = storage.at_fork(scope.clone());
 
-    // 6. Sanity: the forked storage manager reports its scope, and its
-    //    vertex_dataset returns a dataset that opens against the branch.
+    // 6. Sanity: the forked storage manager reports its scope, and a read
+    //    through its (branch-aware) backend sees the fork-point rows.
     assert!(forked_storage.fork_scope().is_some());
-    let vd = forked_storage.vertex_dataset("Person").unwrap();
-    let ds = vd.open_raw().await.unwrap();
-    let count = ds.count_rows(None).await.unwrap();
-    assert_eq!(count, 3, "branched dataset should see fork-point rows");
+    let count = forked_storage
+        .backend()
+        .count_rows("vertices_Person", None)
+        .await
+        .unwrap();
+    assert_eq!(count, 3, "branched read should see fork-point rows");
 
     // 7. Append rows on primary AFTER the fork was taken.
     append_rows(&dataset_uri).await;
@@ -98,18 +102,23 @@ async fn at_fork_routes_vertex_reads_through_branch() {
 
     // 8. The fork still sees only the original 3 rows — snapshot
     //    isolation at fork point per spec §10.
-    let vd2 = forked_storage.vertex_dataset("Person").unwrap();
-    let ds2 = vd2.open_raw().await.unwrap();
+    let fork_count = forked_storage
+        .backend()
+        .count_rows("vertices_Person", None)
+        .await
+        .unwrap();
     assert_eq!(
-        ds2.count_rows(None).await.unwrap(),
-        3,
+        fork_count, 3,
         "post-fork primary writes must not leak into branch"
     );
 
     // 9. Primary StorageManager (no scope) still sees the full 5 rows.
-    let primary_vd = storage.vertex_dataset("Person").unwrap();
-    let primary_ds = primary_vd.open_raw().await.unwrap();
-    assert_eq!(primary_ds.count_rows(None).await.unwrap(), 5);
+    let primary_count = storage
+        .backend()
+        .count_rows("vertices_Person", None)
+        .await
+        .unwrap();
+    assert_eq!(primary_count, 5);
 }
 
 #[tokio::test]

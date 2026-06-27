@@ -574,30 +574,42 @@ impl StorageBackend for BranchedBackend {
 
     // ── Index management — Phase 5 will revisit ─────────────────────
 
+    // Index creation on a fork is built directly on the branch via
+    // `fork/index_builder.rs` → `lance_branch::*_on_branch`, never through these
+    // trait methods (the primary `IndexManager` only ever builds on the main
+    // backend). They bail so an accidental fork-scoped call surfaces loudly.
     async fn create_vector_index(
         &self,
         _table: &str,
         _column: &str,
-        _config: VectorIndexConfig,
+        _name: &str,
+        _params: VectorIndexParams,
     ) -> Result<()> {
-        anyhow::bail!("create_vector_index on a forked backend is not supported in Phase 1")
+        anyhow::bail!("create_vector_index on a forked backend is not supported")
     }
 
-    async fn create_fts_index(&self, _table: &str, _column: &str) -> Result<()> {
-        anyhow::bail!("create_fts_index on a forked backend is not supported in Phase 1")
+    async fn create_fts_index(
+        &self,
+        _table: &str,
+        _columns: &[&str],
+        _name: Option<&str>,
+        _with_positions: bool,
+    ) -> Result<()> {
+        anyhow::bail!("create_fts_index on a forked backend is not supported")
     }
 
     async fn create_scalar_index(
         &self,
         _table: &str,
-        _column: &str,
+        _columns: &[&str],
         _index_type: ScalarIndexType,
+        _name: Option<&str>,
     ) -> Result<()> {
-        anyhow::bail!("create_scalar_index on a forked backend is not supported in Phase 1")
+        anyhow::bail!("create_scalar_index on a forked backend is not supported")
     }
 
     async fn drop_index(&self, _table: &str, _index_name: &str) -> Result<()> {
-        anyhow::bail!("drop_index on a forked backend is not supported in Phase 1")
+        anyhow::bail!("drop_index on a forked backend is not supported")
     }
 
     async fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {

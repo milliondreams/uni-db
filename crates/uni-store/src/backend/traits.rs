@@ -236,27 +236,54 @@ pub trait StorageBackend: Send + Sync + 'static {
         anyhow::bail!("Full-text search not supported by this backend")
     }
 
-    /// Create a vector index on a column.
+    /// Create a named vector (ANN) index on a column with the given parameters.
+    ///
+    /// `name` is the index name to assign; an existing index of the same name is
+    /// replaced. `params` selects the physical index shape and metric.
+    ///
+    /// # Errors
+    /// Returns an error if the backend does not support vector indexing or the
+    /// build fails.
     async fn create_vector_index(
         &self,
         _table: &str,
         _column: &str,
-        _config: VectorIndexConfig,
+        _name: &str,
+        _params: VectorIndexParams,
     ) -> Result<()> {
         anyhow::bail!("Vector indexing not supported by this backend")
     }
 
-    /// Create a full-text search index on a column.
-    async fn create_fts_index(&self, _table: &str, _column: &str) -> Result<()> {
+    /// Create a full-text search index over one or more columns.
+    ///
+    /// `name` is the index name (`None` lets the backend choose a default).
+    /// `with_positions` enables phrase/position postings.
+    ///
+    /// # Errors
+    /// Returns an error if the backend does not support FTS or the build fails.
+    async fn create_fts_index(
+        &self,
+        _table: &str,
+        _columns: &[&str],
+        _name: Option<&str>,
+        _with_positions: bool,
+    ) -> Result<()> {
         anyhow::bail!("FTS indexing not supported by this backend")
     }
 
-    /// Create a scalar index on a column.
+    /// Create a scalar index over one or more columns.
+    ///
+    /// `name` is the index name (`None` lets the backend choose a default).
+    ///
+    /// # Errors
+    /// Returns an error if the backend does not support scalar indexing or the
+    /// build fails.
     async fn create_scalar_index(
         &self,
         _table: &str,
-        _column: &str,
+        _columns: &[&str],
         _index_type: ScalarIndexType,
+        _name: Option<&str>,
     ) -> Result<()> {
         anyhow::bail!("Scalar indexing not supported by this backend")
     }

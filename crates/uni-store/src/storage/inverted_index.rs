@@ -8,7 +8,6 @@
 //! maintaining a term-to-VID mapping. Supports both full rebuilds and
 //! incremental updates for optimal performance during mutations.
 
-use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -205,46 +204,6 @@ impl InvertedIndex {
                 temp_segments.push(std::mem::take(&mut postings));
             }
         }
-        self.finish_build(postings, temp_segments).await
-    }
-
-    /// Rebuild the index by scanning `vertex_dataset` directly (raw Lance).
-    ///
-    /// Used where a [`VertexDataset`] is required — notably fork branch reads,
-    /// which the storage backend's primary-table scan cannot serve. The
-    /// primary backfill path is [`Self::build_from_batches`] via the backend.
-    /// Calls `progress` per batch with the running document count and uses
-    /// segmented accumulation to stay within the 256 MB memory limit.
-    ///
-    /// # Errors
-    /// Returns an error if a batch is missing `_vid` or the indexed property
-    /// is not `List<String>`, or if persisting the postings fails.
-    pub async fn build_from_dataset(
-        &mut self,
-        vertex_dataset: &VertexDataset,
-        progress: impl Fn(usize),
-    ) -> Result<()> {
-        let mut postings: HashMap<String, Vec<u64>> = HashMap::new();
-        let mut temp_segments: Vec<HashMap<String, Vec<u64>>> = Vec::new();
-        let mut count = 0;
-
-        debug!(property = %self.property, "Building inverted index from dataset");
-
-        if let Ok(ds) = vertex_dataset.open().await {
-            let scanner = ds.scan();
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                debug!(rows = batch.num_rows(), "Processing batch");
-                count += self.accumulate_batch(&batch, &mut postings)?;
-                progress(count);
-                if estimated_postings_memory(&postings) > DEFAULT_MAX_POSTINGS_MEMORY {
-                    temp_segments.push(std::mem::take(&mut postings));
-                }
-            }
-        } else {
-            debug!("Vertex dataset not found, creating empty index");
-        }
-
         self.finish_build(postings, temp_segments).await
     }
 

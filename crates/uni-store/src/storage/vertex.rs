@@ -10,8 +10,6 @@ use anyhow::{Result, anyhow};
 use arrow_array::builder::{FixedSizeBinaryBuilder, ListBuilder, StringBuilder};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema as ArrowSchema, TimeUnit};
-#[cfg(feature = "lance-backend")]
-use lance::dataset::Dataset;
 use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,56 +17,29 @@ use uni_common::Properties;
 use uni_common::core::id::{UniId, Vid};
 use uni_common::core::schema::Schema;
 
+/// A per-label vertex dataset handle.
+///
+/// Builds the Arrow record batches for a label's vertex table and derives
+/// vertex identity. The on-disk data is read and written exclusively through
+/// the [`StorageBackend`](crate::backend::StorageBackend); this type no longer
+/// opens a raw `lance::Dataset`, so the on-disk path lives in exactly one place
+/// (the backend) and cannot drift.
 pub struct VertexDataset {
-    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
-    uri: String,
     label: String,
-    _label_id: u16,
-    /// Lance branch to read from. `None` = primary (main).
-    ///
-    /// Set by `StorageManager::vertex_dataset` when the manager has a
-    /// fork scope active. Branched opens go through
-    /// `crate::backend::lance_branch::open_branch`; primary opens use
-    /// the default `Dataset::open` path. Writes are gated at the API
-    /// layer in Phase 1, so a forked dataset never reaches a write path.
     #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
-    branch: Option<String>,
+    _label_id: u16,
 }
 
 impl VertexDataset {
-    /// Construct a primary (unbranched) per-label vertex dataset handle.
+    /// Construct a per-label vertex dataset handle.
     ///
-    /// The `uri` mirrors the backend's canonical `{base}/{table_name}.lance`
-    /// (built from [`table_names::vertex_table_name`]) so the direct-open path
-    /// (`open`/`open_at`/`open_raw`, `lance-backend` only) targets the exact
-    /// dataset the live `StorageBackend` writes. The `.lance` suffix is
-    /// mandatory: LanceDB stores tables at `{base}/{name}.lance`, and
-    /// `Dataset::open` does not append it. Omitting it (the original bug)
-    /// pointed every raw read at a non-existent path that failed silently.
-    pub fn new(base_uri: &str, label: &str, label_id: u16) -> Self {
-        let uri = format!(
-            "{}/{}.lance",
-            base_uri,
-            table_names::vertex_table_name(label)
-        );
+    /// `base_uri` is accepted for call-site stability but unused — the on-disk
+    /// data is reached through the `StorageBackend`, not a path constructed here.
+    pub fn new(_base_uri: &str, label: &str, label_id: u16) -> Self {
         Self {
-            uri,
             label: label.to_string(),
             _label_id: label_id,
-            branch: None,
         }
-    }
-
-    /// Construct a vertex dataset that reads from a Lance branch.
-    pub fn new_branched(
-        base_uri: &str,
-        label: &str,
-        label_id: u16,
-        branch: impl Into<String>,
-    ) -> Self {
-        let mut ds = Self::new(base_uri, label, label_id);
-        ds.branch = Some(branch.into());
-        ds
     }
 
     /// Compute UniId from vertex content.
@@ -98,54 +69,6 @@ impl VertexDataset {
 
         let hash: [u8; 32] = hasher.finalize().into();
         UniId::from_bytes(hash)
-    }
-
-    #[cfg(feature = "lance-backend")]
-    pub async fn open(&self) -> Result<Arc<Dataset>> {
-        self.open_at(None).await
-    }
-
-    #[cfg(feature = "lance-backend")]
-    pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
-        let mut ds = self.open_raw_inner().await?;
-        if let Some(v) = version {
-            ds = ds.checkout_version(v).await?;
-        }
-        Ok(Arc::new(ds))
-    }
-
-    /// Open the underlying Lance [`Dataset`] directly, bypassing the
-    /// [`StorageBackend`](crate::backend::StorageBackend) abstraction.
-    ///
-    /// This is the narrow escape hatch for the operations that genuinely need a
-    /// raw `lance::Dataset` rather than record batches — chiefly Lance-native
-    /// index construction (`create_index_builder` for ANN/scalar/FTS indexes),
-    /// which the backend trait does not expose. Data reads (counts, scans,
-    /// constraint checks) must go through the `StorageBackend` instead. Since
-    /// [`VertexDataset::new`] now builds the canonical `{base}/{name}.lance`
-    /// path, this opens the same dataset the live backend writes — for a
-    /// flushed table it succeeds; for a not-yet-flushed label it errors, which
-    /// callers treat as "build on the next flush".
-    ///
-    /// # Errors
-    /// Returns an error if the dataset does not exist on disk (e.g. the label
-    /// has not been flushed) or cannot be opened.
-    #[cfg(feature = "lance-backend")]
-    pub async fn open_raw(&self) -> Result<Dataset> {
-        self.open_raw_inner().await
-    }
-
-    /// Open the underlying Lance dataset, routing through a branch
-    /// when this `VertexDataset` was constructed with one.
-    #[cfg(feature = "lance-backend")]
-    async fn open_raw_inner(&self) -> Result<Dataset> {
-        match &self.branch {
-            Some(branch) => crate::backend::lance_branch::open_branch(&self.uri, branch).await,
-            None => {
-                let ds = Dataset::open(&self.uri).await?;
-                Ok(ds)
-            }
-        }
     }
 
     /// Build a record batch from vertices with optional timestamp metadata.
@@ -488,7 +411,7 @@ impl VertexDataset {
             }
             log::info!("Creating {} BTree index for label '{}'", column, self.label);
             if let Err(e) = backend
-                .create_scalar_index(&table_name, column, ScalarIndexType::BTree)
+                .create_scalar_index(&table_name, &[*column], ScalarIndexType::BTree, None)
                 .await
             {
                 log::warn!(

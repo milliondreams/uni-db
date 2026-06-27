@@ -140,26 +140,63 @@ pub enum DistanceMetric {
     Dot,
 }
 
-/// Vector index type.
+/// The buildable physical vector-index shapes and their tuning parameters.
+///
+/// A backend-agnostic mirror of the ANN index families a storage backend can
+/// construct. The logical MUVERA type is resolved to its `inner` shape before
+/// reaching the backend, so it never appears here. `num_partitions` is already
+/// resolved to a concrete value (the logical `Option` default of "auto" is
+/// mapped to a single partition by the caller, matching the prior behavior).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorIndexType {
-    /// Inverted File Index with Product Quantization.
-    IvfPq,
-    /// Inverted File Index with HNSW and Scalar Quantization.
-    IvfHnswSq,
+pub enum VectorIndexKind {
+    /// Brute-force flat index (a single IVF partition).
+    Flat,
+    /// IVF with uncompressed vectors.
+    IvfFlat { num_partitions: u32 },
+    /// IVF with Product Quantization.
+    IvfPq {
+        num_partitions: u32,
+        num_sub_vectors: u32,
+        num_bits: u8,
+    },
+    /// IVF with Scalar Quantization.
+    IvfSq { num_partitions: u32 },
+    /// IVF with RabitQ Quantization. `num_bits` `None` keeps the backend default.
+    IvfRq {
+        num_partitions: u32,
+        num_bits: Option<u8>,
+    },
+    /// IVF-HNSW without quantization (highest recall).
+    HnswFlat {
+        m: u32,
+        ef_construction: u32,
+        num_partitions: u32,
+    },
+    /// IVF-HNSW with Scalar Quantization.
+    HnswSq {
+        m: u32,
+        ef_construction: u32,
+        num_partitions: u32,
+    },
+    /// IVF-HNSW with Product Quantization.
+    HnswPq {
+        m: u32,
+        ef_construction: u32,
+        num_sub_vectors: u32,
+        num_partitions: u32,
+    },
 }
 
-/// Vector index configuration.
-#[derive(Debug, Clone)]
-pub struct VectorIndexConfig {
-    /// Distance metric for the index.
+/// Parameters for building a physical vector (ANN) index.
+///
+/// Pairs the distance metric with the index shape ([`VectorIndexKind`]). This is
+/// the backend-agnostic input to [`StorageBackend::create_vector_index`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorIndexParams {
+    /// Distance metric used to compare vectors.
     pub metric: DistanceMetric,
-    /// Type of vector index to build.
-    pub index_type: VectorIndexType,
-    /// Number of IVF partitions.
-    pub num_partitions: Option<usize>,
-    /// Number of PQ sub-vectors.
-    pub num_sub_vectors: Option<usize>,
+    /// The index shape and its tuning parameters.
+    pub kind: VectorIndexKind,
 }
 
 /// Scalar index type.

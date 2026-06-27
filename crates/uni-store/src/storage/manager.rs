@@ -1615,22 +1615,18 @@ impl StorageManager {
         Ok(vids)
     }
 
+    /// Construct a [`VertexDataset`] batch-builder for `label`.
+    ///
+    /// `VertexDataset` no longer opens on-disk data, so there is nothing to
+    /// branch here — fork-scoped reads of vertex data go through the
+    /// (branch-aware) `StorageBackend`.
     pub fn vertex_dataset(&self, label: &str) -> Result<VertexDataset> {
         let schema = self.schema_manager.schema();
         let label_meta = schema
             .labels
             .get(label)
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
-        let key = format!("vertices_{label}");
-        match self.fork_branch_for(&key) {
-            Some(branch) => Ok(VertexDataset::new_branched(
-                &self.base_uri,
-                label,
-                label_meta.id,
-                branch,
-            )),
-            None => Ok(VertexDataset::new(&self.base_uri, label, label_meta.id)),
-        }
+        Ok(VertexDataset::new(&self.base_uri, label, label_meta.id))
     }
 
     #[cfg(feature = "lance-backend")]

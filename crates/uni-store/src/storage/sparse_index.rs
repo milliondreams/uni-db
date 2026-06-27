@@ -23,7 +23,6 @@
 //! exactly as the dense `vector_search` path does — this module is the storage
 //! kernel.
 
-use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use arrow_array::types::{Float32Type, UInt8Type, UInt64Type};
 use arrow_array::{
@@ -309,35 +308,6 @@ impl SparseVectorIndex {
             if estimated_postings_memory(&postings) > DEFAULT_MAX_POSTINGS_MEMORY {
                 temp_segments.push(std::mem::take(&mut postings));
             }
-        }
-        self.finish_build(postings, temp_segments).await
-    }
-
-    /// Rebuild the index by scanning `vertex_dataset` directly (raw Lance). Used
-    /// where a `VertexDataset` is available (e.g. fork branch reads); the
-    /// primary backfill path is [`Self::build_from_batches`] via the backend.
-    pub async fn build_from_dataset(
-        &mut self,
-        vertex_dataset: &VertexDataset,
-        progress: impl Fn(usize),
-    ) -> Result<()> {
-        let mut postings: Postings = HashMap::new();
-        let mut temp_segments: Vec<Postings> = Vec::new();
-        let mut count = 0;
-
-        debug!(property = %self.property, "Building sparse index from dataset");
-        if let Ok(ds) = vertex_dataset.open().await {
-            let scanner = ds.scan();
-            let mut stream = scanner.try_into_stream().await?;
-            while let Some(batch) = stream.try_next().await? {
-                count += self.accumulate_batch(&batch, &mut postings)?;
-                progress(count);
-                if estimated_postings_memory(&postings) > DEFAULT_MAX_POSTINGS_MEMORY {
-                    temp_segments.push(std::mem::take(&mut postings));
-                }
-            }
-        } else {
-            debug!("Vertex dataset not found, creating empty sparse index");
         }
         self.finish_build(postings, temp_segments).await
     }

@@ -38,37 +38,12 @@ async fn db_with_flushed_items(n: usize) -> Result<Uni> {
     Ok(db)
 }
 
-/// THE contract pin (#117's highest-value guard): after a flush, the raw
-/// `VertexDataset::open_raw()` path and the `StorageBackend` must agree on the
-/// row count for a label. This fails loudly the instant the two on-disk-path
-/// reconstructions drift again — the exact root cause of #115.
-#[tokio::test]
-async fn open_raw_row_count_matches_backend_after_flush() -> Result<()> {
-    let db = db_with_flushed_items(50).await?;
-    let storage = db.storage();
-    let table = uni_db::store::backend::table_names::vertex_table_name("Item");
-
-    let backend_count = storage.backend().count_rows(&table, None).await?;
-
-    let raw_count = storage
-        .vertex_dataset("Item")?
-        .open_raw()
-        .await
-        .expect(
-            "open_raw must open the flushed vertex table; if this errors, the \
-             VertexDataset path and the backend path have drifted (#115)",
-        )
-        .count_rows(None)
-        .await?;
-
-    assert_eq!(
-        raw_count, backend_count,
-        "open_raw and StorageBackend disagree on row count — the storage-path \
-         reconstructions have drifted (root cause of #115)"
-    );
-    assert_eq!(backend_count, 50, "all 50 rows should be flushed");
-    Ok(())
-}
+// NOTE: the original `open_raw_row_count_matches_backend_after_flush` contract
+// test was removed when the raw-open escape hatch was deleted. With index
+// building fully routed through the `StorageBackend`, there is no longer a
+// second on-disk-path reconstruction that can drift from the backend's — the
+// #115 bug *class* is gone, not merely fixed. The `list_indexes` mechanism
+// tests below now carry the post-flush-build coverage.
 
 /// On-disk layout: the flushed vertex table must live at
 /// `{base}/vertices_<label>.lance` (the `.lance` suffix the backend writes and

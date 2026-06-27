@@ -21,7 +21,7 @@ use uni_common::core::schema::Schema;
 ///
 /// Builds the Arrow record batches for a label's vertex table and derives
 /// vertex identity. The on-disk data is read and written exclusively through
-/// the [`StorageBackend`](crate::backend::StorageBackend); this type no longer
+/// the [`StorageBackend`]; this type no longer
 /// opens a raw `lance::Dataset`, so the on-disk path lives in exactly one place
 /// (the backend) and cannot drift.
 pub struct VertexDataset {

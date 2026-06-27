@@ -190,7 +190,8 @@ pub enum VectorIndexKind {
 /// Parameters for building a physical vector (ANN) index.
 ///
 /// Pairs the distance metric with the index shape ([`VectorIndexKind`]). This is
-/// the backend-agnostic input to [`StorageBackend::create_vector_index`].
+/// the backend-agnostic input to
+/// [`StorageBackend::create_vector_index`](crate::backend::StorageBackend::create_vector_index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorIndexParams {
     /// Distance metric used to compare vectors.

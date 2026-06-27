@@ -48,6 +48,28 @@ async fn test_rebuild_indexes_finds_correct_dataset() -> anyhow::Result<()> {
     //    because VertexDataset.uri pointed to a non-existent path)
     db.indexes().rebuild("Chunk", false).await?;
 
+    // 3b. MECHANISM (the bug this test actually guards): `open_raw()` must FIND
+    //     the flushed dataset. The original failure was silent — a wrong path
+    //     (`vertices_Chunk`, no `.lance`) returned `Err`, so no index was built,
+    //     yet vector search still returned correct results via the brute-force
+    //     fallback (step 4 below). Asserting results alone therefore could not
+    //     catch the bug (#117). Pin the `open_raw` <-> backend path agreement.
+    let storage = db.storage();
+    let table = uni_db::store::backend::table_names::vertex_table_name("Chunk");
+    let backend_count = storage.backend().count_rows(&table, None).await?;
+    let raw_count = storage
+        .vertex_dataset("Chunk")?
+        .open_raw()
+        .await
+        .expect("open_raw must find the flushed Chunk dataset — the path bug this test guards")
+        .count_rows(None)
+        .await?;
+    assert_eq!(
+        raw_count, backend_count,
+        "open_raw and the backend disagree on row count — storage paths have drifted"
+    );
+    assert_eq!(backend_count, 3, "all 3 chunks should be flushed");
+
     // 4. Verify vector search still works after rebuild
     let result = db
         .session()

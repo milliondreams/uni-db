@@ -18,6 +18,8 @@ pub mod bytes_list_functions;
 pub mod bytes_maps_projection;
 pub mod bytes_pipeline;
 pub mod graph_projection_tx_visibility;
+pub mod issue115_storage_path_contract;
+pub mod issue116_composite_key_flush;
 pub mod issue43_insert_latency_diagnostic;
 pub mod issue43_repro;
 pub mod issue46_compaction_race;

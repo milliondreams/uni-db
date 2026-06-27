@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+#[cfg(feature = "lance-backend")]
+use crate::backend::table_names;
 use crate::runtime::context::QueryContext;
 use crate::runtime::flush_coordinator::{
     FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
@@ -1973,10 +1975,16 @@ impl Writer {
                         vid_list.join(", ")
                     );
 
-                    if let Ok(ds) = self.storage.vertex_dataset(label)
-                        && let Ok(lance_ds) = ds.open_raw().await
-                    {
-                        let count = lance_ds.count_rows(Some(filter.clone())).await?;
+                    // Count flushed duplicates through the `StorageBackend`
+                    // (branch-aware, correct `.lance` path). A missing table
+                    // means nothing is flushed yet — the L0/pending/tx checks
+                    // above already covered in-memory rows — so skip cleanly;
+                    // any other backend error must abort the write rather than
+                    // silently fail open (the prior `open_raw()` foot-gun).
+                    let backend = self.storage.backend();
+                    let table = table_names::vertex_table_name(label);
+                    if backend.table_exists(&table).await? {
+                        let count = backend.count_rows(&table, Some(filter.as_str())).await?;
                         if count > 0 {
                             return Err(anyhow!(
                                 "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
@@ -2306,17 +2314,22 @@ impl Writer {
             current_vid.as_u64()
         ));
 
+        // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
+        // correct `.lance` path). Skip cleanly when the table is not yet
+        // flushed; propagate any real backend error instead of failing open.
         #[cfg(feature = "lance-backend")]
-        if let Ok(ds) = self.storage.vertex_dataset(label)
-            && let Ok(lance_ds) = ds.open_raw().await
         {
-            let count = lance_ds.count_rows(Some(filter.clone())).await?;
-            if count > 0 {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
-                    label,
-                    filter
-                ));
+            let backend = self.storage.backend();
+            let table = table_names::vertex_table_name(label);
+            if backend.table_exists(&table).await? {
+                let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                if count > 0 {
+                    return Err(anyhow!(
+                        "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
+                        label,
+                        filter
+                    ));
+                }
             }
         }
 

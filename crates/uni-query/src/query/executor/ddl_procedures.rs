@@ -432,12 +432,15 @@ async fn create_index_internal(
         }
         // Remaining non-vector indexes keep the build-if-data-exists optimization.
         other => {
-            let count = if let Ok(ds) = storage.vertex_dataset(label) {
-                if let Ok(raw) = ds.open_raw().await {
-                    raw.count_rows(None).await.unwrap_or(0)
-                } else {
-                    0
-                }
+            // Build-if-data-exists gate, read through the `StorageBackend`
+            // (correct `.lance` path). With the prior raw-dataset read this
+            // counted 0 for any flushed table, so the physical index was
+            // silently skipped after a flush (#115). A not-yet-flushed table
+            // legitimately has no rows here and is populated on the next flush.
+            let backend = storage.backend();
+            let table = uni_store::backend::table_names::vertex_table_name(label);
+            let count = if backend.table_exists(&table).await? {
+                backend.count_rows(&table, None).await?
             } else {
                 0
             };

@@ -199,24 +199,34 @@ impl IndexManager {
         );
 
         let schema = self.schema_manager.schema();
-        let label_meta = schema
-            .labels
-            .get(label)
-            .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
+        if !schema.labels.contains_key(label) {
+            return Err(anyhow!("Label '{}' not found", label));
+        }
 
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
 
-        let ds = VertexDataset::new(&self.base_uri, label, label_meta.id);
-
-        // Check if dataset exists
-        if ds.open_raw().await.is_ok() {
-            index
-                .build_from_dataset(&ds, |n| info!("Indexed {} terms", n))
-                .await?;
+        // Backfill from the flushed vertex table via the storage backend. The
+        // LanceDB-managed table is not at the raw `{base}/vertices_<label>`
+        // path a `VertexDataset` open would target, and the backend read is
+        // branch-aware. Mirrors the sparse-index backfill. A not-yet-flushed
+        // table legitimately yields an empty index, populated on the next flush.
+        let table = table_names::vertex_table_name(label);
+        if let Some(backend) = self.backend.as_ref() {
+            if backend.table_exists(&table).await? {
+                let batches = backend.scan(ScanRequest::all(&table)).await?;
+                index
+                    .build_from_batches(&batches, |n| info!("Indexed {} terms", n))
+                    .await?;
+            } else {
+                debug!(
+                    "Table '{}' not flushed yet; creating empty inverted index (populated on flush)",
+                    table
+                );
+            }
         } else {
             warn!(
-                "Dataset for label '{}' not found, creating empty inverted index",
-                label
+                "No storage backend available; inverted index '{}' left empty (populated on flush)",
+                config.name
             );
         }
 
@@ -403,6 +413,25 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Whether the flushed vertex table for `label` exists on disk.
+    ///
+    /// The physical index builders below open the vertex table through
+    /// [`VertexDataset::open_raw`] — the one place a raw `lance::Dataset` is
+    /// genuinely required, since Lance ANN/scalar/FTS index construction has no
+    /// `StorageBackend` equivalent. This guard lets them tell a not-yet-flushed
+    /// label (create-before-flush: the physical build is legitimately skipped
+    /// and performed by the next flush) apart from a real open failure on an
+    /// existing table, which must surface loudly rather than silently leave the
+    /// index unbuilt — the failure mode behind #115.
+    #[cfg(feature = "lance-backend")]
+    async fn flushed_vertex_table_exists(&self, label: &str) -> bool {
+        let table = table_names::vertex_table_name(label);
+        match self.backend.as_ref() {
+            Some(backend) => backend.table_exists(&table).await.unwrap_or(false),
+            None => false,
+        }
+    }
+
     /// Build the physical Lance ANN index described by `config` over `config.property`
     /// with `config.metric`. Does NOT persist the schema index definition — the caller
     /// does, possibly under a different logical config (see MUVERA in
@@ -576,9 +605,17 @@ impl IndexManager {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}', skipping physical index creation but saving schema definition. Error: {}",
-                    label, e
+                if self.flushed_vertex_table_exists(label).await {
+                    return Err(anyhow!(
+                        "Failed to open flushed vertex table '{}' to build vector index '{}': {}",
+                        table_names::vertex_table_name(label),
+                        config.name,
+                        e
+                    ));
+                }
+                debug!(
+                    "Label '{}' not flushed yet; physical vector index '{}' built on next flush",
+                    label, config.name
                 );
             }
         }
@@ -643,9 +680,17 @@ impl IndexManager {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (scalar index), skipping physical creation. Error: {}",
-                    label, e
+                if self.flushed_vertex_table_exists(label).await {
+                    return Err(anyhow!(
+                        "Failed to open flushed vertex table '{}' to build scalar index '{}': {}",
+                        table_names::vertex_table_name(label),
+                        config.name,
+                        e
+                    ));
+                }
+                debug!(
+                    "Label '{}' not flushed yet; physical scalar index '{}' built on next flush",
+                    label, config.name
                 );
             }
         }
@@ -707,9 +752,17 @@ impl IndexManager {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (FTS index), skipping physical creation. Error: {}",
-                    label, e
+                if self.flushed_vertex_table_exists(label).await {
+                    return Err(anyhow!(
+                        "Failed to open flushed vertex table '{}' to build FTS index '{}': {}",
+                        table_names::vertex_table_name(label),
+                        config.name,
+                        e
+                    ));
+                }
+                debug!(
+                    "Label '{}' not flushed yet; physical FTS index '{}' built on next flush",
+                    label, config.name
                 );
             }
         }
@@ -773,9 +826,17 @@ impl IndexManager {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Dataset not found for label '{}' (JSON FTS index), skipping physical creation. Error: {}",
-                    label, e
+                if self.flushed_vertex_table_exists(label).await {
+                    return Err(anyhow!(
+                        "Failed to open flushed vertex table '{}' to build JSON FTS index '{}': {}",
+                        table_names::vertex_table_name(label),
+                        config.name,
+                        e
+                    ));
+                }
+                debug!(
+                    "Label '{}' not flushed yet; physical JSON FTS index '{}' built on next flush",
+                    label, config.name
                 );
             }
         }
@@ -874,47 +935,68 @@ impl IndexManager {
         // Lance supports multi-column indexes
         let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
 
-        // We need to verify dataset exists
-        if let Ok(mut ds) = ds_wrapper.open_raw().await {
-            // Create composite BTree index
-            let index_name = format!("{}_{}_composite", label, properties.join("_"));
+        // Verify the flushed dataset exists. A real open failure on an existing
+        // table must surface loudly rather than silently skip the build (#115);
+        // a not-yet-flushed label is built on the next flush.
+        match ds_wrapper.open_raw().await {
+            Ok(mut ds) => {
+                // Create composite BTree index
+                let index_name = format!("{}_{}_composite", label, properties.join("_"));
 
-            // Convert properties to slice of &str
-            let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
+                // Convert properties to slice of &str
+                let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
 
-            let progress = TracingIndexProgress::arc(&index_name);
-            match ds
-                .create_index_builder(&columns, IndexType::Scalar, &ScalarIndexParams::default())
-                .name(index_name.clone())
-                .replace(true)
-                .progress(progress)
-                .await
-            {
-                Ok(metadata) => {
-                    info!(
-                        index_name = %metadata.name,
-                        index_uuid = %metadata.uuid,
-                        dataset_version = metadata.dataset_version,
-                        "Composite index created"
-                    );
+                let progress = TracingIndexProgress::arc(&index_name);
+                match ds
+                    .create_index_builder(
+                        &columns,
+                        IndexType::Scalar,
+                        &ScalarIndexParams::default(),
+                    )
+                    .name(index_name.clone())
+                    .replace(true)
+                    .progress(progress)
+                    .await
+                {
+                    Ok(metadata) => {
+                        info!(
+                            index_name = %metadata.name,
+                            index_uuid = %metadata.uuid,
+                            dataset_version = metadata.dataset_version,
+                            "Composite index created"
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to create physical composite index: {}", e);
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to create physical composite index: {}", e);
-                }
+
+                let config = ScalarIndexConfig {
+                    name: index_name,
+                    label: label.to_string(),
+                    properties: properties.to_vec(),
+                    index_type: uni_common::core::schema::ScalarIndexType::BTree,
+                    where_clause: None,
+                    metadata: Default::default(),
+                };
+
+                self.schema_manager
+                    .add_index(IndexDefinition::Scalar(config))?;
+                self.schema_manager.save().await?;
             }
-
-            let config = ScalarIndexConfig {
-                name: index_name,
-                label: label.to_string(),
-                properties: properties.to_vec(),
-                index_type: uni_common::core::schema::ScalarIndexType::BTree,
-                where_clause: None,
-                metadata: Default::default(),
-            };
-
-            self.schema_manager
-                .add_index(IndexDefinition::Scalar(config))?;
-            self.schema_manager.save().await?;
+            Err(e) => {
+                if self.flushed_vertex_table_exists(label).await {
+                    return Err(anyhow!(
+                        "Failed to open flushed vertex table '{}' to build composite index: {}",
+                        table_names::vertex_table_name(label),
+                        e
+                    ));
+                }
+                debug!(
+                    "Label '{}' not flushed yet; composite index for {:?} built on next flush",
+                    label, properties
+                );
+            }
         }
 
         Ok(())

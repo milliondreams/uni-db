@@ -130,12 +130,12 @@ impl ProcedurePlugin for SchemaLabelsProc {
                     .get(label_name)
                     .map(|p| p.len() as i64)
                     .unwrap_or(0);
-                let node_count = if let Ok(ds) = storage.vertex_dataset(label_name) {
-                    if let Ok(raw) = ds.open_raw().await {
-                        raw.count_rows(None).await.unwrap_or(0) as i64
-                    } else {
-                        0
-                    }
+                // Node count via the `StorageBackend` (correct `.lance` path);
+                // the prior raw-dataset read reported 0 for flushed tables.
+                let backend = storage.backend();
+                let table = uni_store::backend::table_names::vertex_table_name(label_name);
+                let node_count = if backend.table_exists(&table).await.unwrap_or(false) {
+                    backend.count_rows(&table, None).await.unwrap_or(0) as i64
                 } else {
                     0
                 };

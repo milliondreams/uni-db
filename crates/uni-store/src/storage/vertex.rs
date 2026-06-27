@@ -36,8 +36,21 @@ pub struct VertexDataset {
 }
 
 impl VertexDataset {
+    /// Construct a primary (unbranched) per-label vertex dataset handle.
+    ///
+    /// The `uri` mirrors the backend's canonical `{base}/{table_name}.lance`
+    /// (built from [`table_names::vertex_table_name`]) so the direct-open path
+    /// (`open`/`open_at`/`open_raw`, `lance-backend` only) targets the exact
+    /// dataset the live `StorageBackend` writes. The `.lance` suffix is
+    /// mandatory: LanceDB stores tables at `{base}/{name}.lance`, and
+    /// `Dataset::open` does not append it. Omitting it (the original bug)
+    /// pointed every raw read at a non-existent path that failed silently.
     pub fn new(base_uri: &str, label: &str, label_id: u16) -> Self {
-        let uri = format!("{}/vertices_{}", base_uri, label);
+        let uri = format!(
+            "{}/{}.lance",
+            base_uri,
+            table_names::vertex_table_name(label)
+        );
         Self {
             uri,
             label: label.to_string(),
@@ -101,6 +114,22 @@ impl VertexDataset {
         Ok(Arc::new(ds))
     }
 
+    /// Open the underlying Lance [`Dataset`] directly, bypassing the
+    /// [`StorageBackend`](crate::backend::StorageBackend) abstraction.
+    ///
+    /// This is the narrow escape hatch for the operations that genuinely need a
+    /// raw `lance::Dataset` rather than record batches — chiefly Lance-native
+    /// index construction (`create_index_builder` for ANN/scalar/FTS indexes),
+    /// which the backend trait does not expose. Data reads (counts, scans,
+    /// constraint checks) must go through the `StorageBackend` instead. Since
+    /// [`VertexDataset::new`] now builds the canonical `{base}/{name}.lance`
+    /// path, this opens the same dataset the live backend writes — for a
+    /// flushed table it succeeds; for a not-yet-flushed label it errors, which
+    /// callers treat as "build on the next flush".
+    ///
+    /// # Errors
+    /// Returns an error if the dataset does not exist on disk (e.g. the label
+    /// has not been flushed) or cannot be opened.
     #[cfg(feature = "lance-backend")]
     pub async fn open_raw(&self) -> Result<Dataset> {
         self.open_raw_inner().await

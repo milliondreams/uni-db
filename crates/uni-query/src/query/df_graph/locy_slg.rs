@@ -380,9 +380,16 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
         _ => return raw_rows,
     };
 
-    // If yield has no non-key items with expressions, skip projection
-    let has_non_key_exprs = yield_items.iter().any(|item| !item.is_key);
-    if !has_non_key_exprs {
+    // Projection is required when any YIELD item needs expression evaluation:
+    // a non-key column, OR a KEY column whose expression is not a bare variable
+    // already present in the raw row. A property-access KEY like
+    // `YIELD KEY i.tag AS tag` is exposed by the raw `MATCH ... RETURN *` rows
+    // only as `i.tag` / the node `i`, never as a top-level `tag`, so without
+    // projecting it the column resolves to Null in `RETURN tag` (issue #112).
+    let needs_projection = yield_items
+        .iter()
+        .any(|item| !item.is_key || !matches!(&item.expr, Expr::Variable(_)));
+    if !needs_projection {
         return raw_rows;
     }
 
@@ -398,7 +405,11 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                 let name = name.clone();
 
                 if item.is_key {
-                    // KEY columns: copy from raw row (node/edge variables)
+                    // KEY columns: copy a matching raw column (the output name,
+                    // or a bare KEY variable that is the graph entity itself);
+                    // otherwise evaluate the KEY expression against the raw row
+                    // — e.g. a property-access KEY like `i.tag AS tag`, which is
+                    // present only as `i.tag` in the raw rows (issue #112).
                     if let Some(val) = raw_row.get(&name) {
                         projected.insert(name, val.clone());
                     } else if let Expr::Variable(var_name) = &item.expr
@@ -406,6 +417,15 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                     {
                         // KEY variable might be the graph entity itself
                         projected.insert(name, val.clone());
+                    } else {
+                        match eval_expr(&item.expr, &raw_row) {
+                            Ok(val) => {
+                                projected.insert(name, val);
+                            }
+                            Err(_) => {
+                                projected.insert(name, Value::Null);
+                            }
+                        }
                     }
                 } else {
                     // Non-key columns: evaluate the YIELD expression against the raw row

@@ -232,6 +232,18 @@ fn get_property(value: &Value, property: &str) -> Value {
         Value::Node(n) => n.properties.get(property).cloned().unwrap_or(Value::Null),
         Value::Edge(e) => e.properties.get(property).cloned().unwrap_or(Value::Null),
         Value::Map(m) => m.get(property).cloned().unwrap_or(Value::Null),
+        // Temporal component accessors (`d.days`, `dt.year`, …) so that the
+        // in-memory evaluator matches Cypher. Without this, a Duration produced
+        // by `duration.inDays(...)` in a YIELD value column had `.days` resolve
+        // to Null in the SLG path (issue #111, decision C). Mirrors the
+        // `_duration_property` / `_temporal_property` UDFs used in the DataFusion
+        // path; an unknown component falls back to Null.
+        Value::Temporal(uni_common::TemporalValue::Duration { .. }) => {
+            crate::query::datetime::eval_duration_accessor(&value.to_string(), property)
+                .unwrap_or(Value::Null)
+        }
+        Value::Temporal(_) => crate::query::datetime::eval_temporal_accessor_value(value, property)
+            .unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }

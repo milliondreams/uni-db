@@ -548,12 +548,22 @@ impl GraphExecutionContext {
         // warming/reads (see StorageManager::snapshot_version_hwm).
         let version = self.storage.snapshot_version_hwm();
         for &etype_id in edge_type_ids {
-            // Skip if AM already has data (CSR or overlay) for this edge type.
-            // The overlay contains edges from dual-write (Writer), so warming
-            // would duplicate them.
-            if !am.is_active_for(etype_id, direction) {
-                for &dir in direction.expand() {
-                    // Use coalesced warming to prevent cache stampede (Issue #13)
+            for &dir in direction.expand() {
+                // Warm each (edge_type, direction) CSR exactly once, gated on the
+                // CSR itself — NOT on the dual-write overlay. The previous
+                // `is_active_for` gate skipped warming whenever the overlay held
+                // ANY edge for the direction; on a fork a single relationship
+                // `SET` dual-writes one edge into that direction's overlay, which
+                // then suppressed loading the inherited L1/L2 edges — silently
+                // dropping every inherited edge from reads of that direction
+                // (reverse traversal in #110). `get_neighbors` always merges the
+                // CSR with the overlay and dedups by `eid`, so warming when the
+                // overlay also holds edges never double-counts; committed-
+                // unflushed edges remain in the overlay until flush re-warms the
+                // CSR (executor `apply_compaction` → `AdjacencyManager::warm`).
+                // `warm_adjacency_coalesced` fast-paths on `has_csr`, keeping
+                // this idempotent (warm-once) and stampede-safe (Issue #13).
+                if !am.has_csr(etype_id, dir) {
                     self.storage
                         .warm_adjacency_coalesced(etype_id, dir, version)
                         .await?;

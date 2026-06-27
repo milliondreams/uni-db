@@ -255,6 +255,8 @@ jobs:
           # missing entry fails the release with "no matching package named ...".
           publish_crate uni-btic
           sleep 30
+          publish_crate uni-sparse-vector
+          sleep 30
           publish_crate uni-common
           sleep 30
           publish_crate uni-cypher

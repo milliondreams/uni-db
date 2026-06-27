@@ -921,7 +921,10 @@ async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()>
         try_insert_emb(
             &db,
             "nan",
-            Value::SparseVector { indices: vec![1, 5], values: vec![f32::NAN, 2.0] },
+            Value::SparseVector {
+                indices: vec![1, 5],
+                values: vec![f32::NAN, 2.0]
+            },
         )
         .await
         .is_err(),
@@ -933,7 +936,10 @@ async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()>
         try_insert_emb(
             &db,
             "lenmismatch",
-            Value::SparseVector { indices: vec![1, 2, 3], values: vec![1.0] },
+            Value::SparseVector {
+                indices: vec![1, 2, 3],
+                values: vec![1.0]
+            },
         )
         .await
         .is_err(),
@@ -945,7 +951,10 @@ async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()>
         try_insert_emb(
             &db,
             "outofrange",
-            Value::SparseVector { indices: vec![VOCAB as u32], values: vec![1.0] },
+            Value::SparseVector {
+                indices: vec![VOCAB as u32],
+                values: vec![1.0]
+            },
         )
         .await
         .is_err(),
@@ -956,7 +965,10 @@ async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()>
     try_insert_emb(
         &db,
         "canon",
-        Value::SparseVector { indices: vec![9, 1, 9], values: vec![1.0, 2.0, 0.5] },
+        Value::SparseVector {
+            indices: vec![9, 1, 9],
+            values: vec![1.0, 2.0, 0.5],
+        },
     )
     .await?;
     db.flush().await?;
@@ -967,7 +979,11 @@ async fn sparse_malformed_value_is_rejected_not_panicked() -> anyhow::Result<()>
     match rows.rows()[0].value("emb") {
         Some(Value::SparseVector { indices, values }) => {
             assert_eq!(indices, &vec![1u32, 9], "canonicalized indices (sorted)");
-            assert_eq!(values, &vec![2.0f32, 1.5], "canonicalized values (summed dup)");
+            assert_eq!(
+                values,
+                &vec![2.0f32, 1.5],
+                "canonicalized values (summed dup)"
+            );
         }
         other => panic!("expected canonicalized SparseVector, got {other:?}"),
     }
@@ -986,8 +1002,7 @@ fn recall_at_k(engine: &[(String, f64)], corpus: &[(String, Sparse)], k: usize) 
         .filter(|(_, s)| *s > 0.0)
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(b.0)));
-    let truth: std::collections::HashSet<&str> =
-        ranked.iter().take(k).map(|(t, _)| *t).collect();
+    let truth: std::collections::HashSet<&str> = ranked.iter().take(k).map(|(t, _)| *t).collect();
     if truth.is_empty() {
         return 1.0;
     }

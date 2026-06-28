@@ -29,6 +29,7 @@ permissions:
 
 jobs:
   soak:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Soak & Stress (run-ignored)
     runs-on: ubuntu-xlarge
     timeout-minutes: 120
@@ -82,6 +83,7 @@ jobs:
             -E 'test(/soak/) | test(/stress/)'
 
   cloud:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Cloud Integration (LocalStack)
     runs-on: linux-xlarge-32
     timeout-minutes: 60
@@ -140,6 +142,7 @@ jobs:
             -E 'test(/^hybrid_localstack_e2e::/)'
 
   fuzz:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Fuzz (parsers & codecs)
     runs-on: ubuntu-xlarge
     timeout-minutes: 60
@@ -196,6 +199,7 @@ jobs:
           if-no-files-found: ignore
 
   model-check:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Concurrency Model Check (loom + shuttle)
     runs-on: ubuntu-xlarge
     timeout-minutes: 60
@@ -236,6 +240,7 @@ jobs:
         run: cargo nextest run -p uni-store --features shuttle --test occ_model
 
   metamorphic:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Metamorphic Query Oracles (TLP + NoREC)
     runs-on: ubuntu-xlarge
     timeout-minutes: 60
@@ -280,6 +285,7 @@ jobs:
             --run-ignored ignored-only -E 'test(/metamorphic::/) and test(soak)'
 
   tsan:
+    if: github.repository == 'rustic-ai/uni-db'
     name: ThreadSanitizer (SSI commit path)
     runs-on: ubuntu-xlarge
     timeout-minutes: 90
@@ -349,6 +355,7 @@ jobs:
           if-no-files-found: warn
 
   bench:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Benchmarks (artifact upload)
     runs-on: ubuntu-xlarge
     timeout-minutes: 90

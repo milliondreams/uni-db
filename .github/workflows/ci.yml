@@ -38,6 +38,7 @@ jobs:
   # Conformance modes the PR does not run: openCypher sidecar + both Locy lanes.
   # This job is the cache "saver" for main's shared "ci" cache (no save-if:false).
   tck-full:
+    if: github.repository == 'rustic-ai/uni-db'
     name: TCK (sidecar + Locy)
     runs-on: linux-xlarge-64
     steps:
@@ -71,6 +72,7 @@ jobs:
   # ONNX reranker integration — both linking modes (compiles uni-db with the
   # opt-in provider-onnx features, so it reads but does not save the base cache).
   reranker:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Reranker Integration (ONNX)
     runs-on: linux-xlarge-64
     steps:
@@ -124,6 +126,7 @@ jobs:
 
   # Cloud storage integration tests with LocalStack.
   cloud:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Cloud Integration Tests
     runs-on: linux-xlarge-32
     services:
@@ -185,6 +188,7 @@ jobs:
 
   # rustdoc gate + generated-notebook freshness check.
   docs:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Documentation
     runs-on: ubuntu-latest
     steps:
@@ -231,6 +235,7 @@ jobs:
   # Flagship Locy notebook executions (heavier than the PR Python tests; built
   # from a release wheel and run serially-stable under the runtime guard).
   notebooks:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Flagship Notebooks
     runs-on: linux-xlarge-32
     steps:
@@ -292,6 +297,7 @@ jobs:
   # and an incomplete crates.io publish list slip through the workspace build and
   # only fail at release time; these reproduce both failure modes cheaply.
   release-guards:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Release Guards
     runs-on: linux-xlarge-32
     steps:
@@ -338,6 +344,7 @@ jobs:
   # running build scripts (no nvcc / CUDA toolkit needed). Real CUDA wheel
   # builds run in `release-wheels.yml` on tag-push.
   wheels-cuda-smoke:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Wheel-graph smoke check (uni-db-cuda)
     runs-on: ubuntu-latest
     steps:
@@ -357,6 +364,7 @@ jobs:
   # Keep this literal name so release.yml is unchanged; it succeeds only if every
   # thorough job above passed, making it the authoritative release signal.
   gate:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Test
     needs: [tck-full, reranker, cloud, docs, notebooks, release-guards, wheels-cuda-smoke]
     runs-on: ubuntu-latest

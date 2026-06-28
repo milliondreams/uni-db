@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'rustic-ai/uni-db'
     runs-on: ubuntu-xlarge
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +141,7 @@ jobs:
           path: ./website/site
 
   deploy:
+    if: github.repository == 'rustic-ai/uni-db'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

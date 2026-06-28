@@ -52,6 +52,7 @@ env:
 
 jobs:
   validate:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Validate
     runs-on: ubuntu-latest
     permissions:
@@ -141,6 +142,7 @@ jobs:
   # ONNX-only `uni-db-onnx`. CUDA-equipped variants live in dedicated jobs
   # below to isolate the CUDA toolchain dependency.
   build-linux:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} Linux wheels (${{ matrix.target }})
     needs: [validate]
     runs-on: ${{ matrix.runner }}
@@ -196,6 +198,7 @@ jobs:
           path: dist
 
   build-macos:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} macOS wheels (${{ matrix.target }})
     needs: [validate]
     runs-on: macos-latest-large
@@ -247,6 +250,7 @@ jobs:
   # Metal/CoreML stacks aren't worth supporting separately for retired
   # Intel Macs.
   build-metal:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} macOS wheels (aarch64)
     needs: [validate]
     runs-on: macos-latest
@@ -282,6 +286,7 @@ jobs:
           path: dist
 
   build-windows:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} Windows wheels (x86_64)
     needs: [validate]
     runs-on: windows-latest-l
@@ -327,6 +332,7 @@ jobs:
   # too — its kernels need nvcc, so it builds in `build-cuda-toolkit-linux`
   # (manylinux_2_34 + CUDA toolkit) below.
   build-cuda-linux:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA)
     needs: [validate]
     runs-on: ubuntu-latest
@@ -426,6 +432,7 @@ jobs:
   # `export PATH=...`, which propagates to the maturin step inside the
   # same container session.
   build-cuda-toolkit-linux:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA toolkit)
     needs: [validate]
     runs-on: ubuntu-latest
@@ -583,6 +590,7 @@ jobs:
           path: dist
 
   build-sdist:
+    if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} source distribution
     needs: [validate]
     runs-on: ubuntu-latest
@@ -615,7 +623,7 @@ jobs:
     needs: [validate, build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
-    if: needs.validate.outputs.publish_target == 'testpypi'
+    if: github.repository == 'rustic-ai/uni-db' && needs.validate.outputs.publish_target == 'testpypi'
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -642,7 +650,7 @@ jobs:
     needs: [validate, build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
-    if: needs.validate.outputs.publish_target == 'pypi'
+    if: github.repository == 'rustic-ai/uni-db' && needs.validate.outputs.publish_target == 'pypi'
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -678,7 +686,7 @@ jobs:
       contents: write
     # Only on a real version-tag release (the same trigger under which
     # release.yml creates the GitHub Release). Skipped for workflow_dispatch.
-    if: github.event_name == 'push'
+    if: github.repository == 'rustic-ai/uni-db' && github.event_name == 'push'
     steps:
       - name: Download all wheels and sdists
         uses: actions/download-artifact@v4
@@ -725,7 +733,8 @@ jobs:
     # target=pypi, testpypi on target=testpypi), so `always()` + gate on
     # whichever one ran succeeding.
     if: |
-      always() && inputs.dry_run != true && needs.validate.result == 'success'
+      github.repository == 'rustic-ai/uni-db'
+      && always() && inputs.dry_run != true && needs.validate.result == 'success'
       && (needs.publish-pypi.result == 'success' || needs.publish-testpypi.result == 'success')
     env:
       # Mirrors the resolved publish target. build-pydantic only runs when a
@@ -810,7 +819,8 @@ jobs:
     # skipped before its custom gate is evaluated. `!cancelled()` + the
     # explicit `result == 'success'` gate publishes only on a clean success.
     if: |
-      !cancelled()
+      github.repository == 'rustic-ai/uni-db'
+      && !cancelled()
       && needs.build-pydantic.result == 'success'
       && needs.validate.outputs.publish_target == 'testpypi'
     steps:
@@ -840,7 +850,8 @@ jobs:
     # successful build. The `result == 'success'` gate keeps publishing
     # conditional on a clean build.
     if: |
-      !cancelled()
+      github.repository == 'rustic-ai/uni-db'
+      && !cancelled()
       && needs.build-pydantic.result == 'success'
       && needs.validate.outputs.publish_target == 'pypi'
     steps:

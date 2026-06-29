@@ -315,10 +315,20 @@ postfix_expression = { primary_expression ~ postfix_suffix* }
 
 postfix_suffix = {
     "." ~ identifier_or_keyword                              // Property access
-    | "[" ~ expression ~ "]"                                  // Index
-    | "[" ~ expression? ~ dot_dot ~ expression? ~ "]"        // Slice
+    | "[" ~ index_or_slice ~ "]"                             // Index or slice
     | "(" ~ DISTINCT? ~ expression_list? ~ ")" ~ window_spec? // Function call with optional DISTINCT
     | "{" ~ map_projection_items ~ "}"                       // Map projection
+}
+
+// Index `[e]` and slice `[e..]` / `[e..e]` / `[..e]` / `[..]`, sharing the `[`
+// `expression` prefix. Silent (`_`) so the inner `expression`/`dot_dot` pairs
+// flatten into `postfix_suffix`, preserving the prior shape (index = a lone
+// `expression`, slice = contains `dot_dot`). Factoring the shared prefix means
+// `expression` is parsed once instead of once per index/slice alternative, which
+// previously caused exponential backtracking on runs of unmatched `[`.
+index_or_slice = _{
+    expression ~ (dot_dot ~ expression?)?
+    | dot_dot ~ expression?
 }
 
 window_spec = { OVER ~ "(" ~ partition_clause? ~ order_clause? ~ ")" }

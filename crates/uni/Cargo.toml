@@ -185,6 +185,14 @@ harness = false
 name = "sparse_retrieval"
 harness = false
 
+[[bench]]
+name = "dense_retrieval"
+harness = false
+
+[[bench]]
+name = "multivec_retrieval"
+harness = false
+
 [features]
 default = [
     "lance-backend",

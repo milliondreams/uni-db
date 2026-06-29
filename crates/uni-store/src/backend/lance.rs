@@ -764,6 +764,9 @@ impl StorageBackend for LanceDbBackend {
         if let Some(r) = opts.refine_factor {
             query_builder = query_builder.refine_factor(r);
         }
+        if let Some(ef) = opts.ef {
+            query_builder = query_builder.ef(ef);
+        }
         if let FilterExpr::Sql(sql) = &filter {
             query_builder = query_builder.only_if(sql);
         }
@@ -825,6 +828,9 @@ impl StorageBackend for LanceDbBackend {
         }
         if let Some(r) = opts.refine_factor {
             query_builder = query_builder.refine_factor(r);
+        }
+        if let Some(ef) = opts.ef {
+            query_builder = query_builder.ef(ef);
         }
         if let FilterExpr::Sql(sql) = &filter {
             query_builder = query_builder.only_if(sql);

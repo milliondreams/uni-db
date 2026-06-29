@@ -100,9 +100,10 @@ fn parse_distance_metric(s: &str) -> DistanceMetric {
     }
 }
 
-/// Parse the `nprobes` / `refine_factor` ANN tuning knobs from a procedure's
-/// `options` map (`None` for either = Lance default). Applies to dense and
-/// multi-vector queries alike.
+/// Parse the `nprobes` / `refine_factor` / `ef_search` ANN tuning knobs from a
+/// procedure's `options` map (`None` for any = Lance default). Applies to dense
+/// and multi-vector queries alike. `ef_search` accepts `ef` as an alias and sets
+/// the HNSW search-time beam width (candidate list size).
 fn parse_vector_query_opts(
     options_map: Option<&HashMap<String, Value>>,
 ) -> uni_store::VectorQueryOpts {
@@ -114,9 +115,14 @@ fn parse_vector_query_opts(
         .and_then(|m| m.get("refine_factor"))
         .and_then(|v| v.as_u64())
         .map(|r| r as u32);
+    let ef = options_map
+        .and_then(|m| m.get("ef_search").or_else(|| m.get("ef")))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
     uni_store::VectorQueryOpts {
         nprobes,
         refine_factor,
+        ef,
     }
 }
 

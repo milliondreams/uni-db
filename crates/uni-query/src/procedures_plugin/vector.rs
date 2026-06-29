@@ -71,7 +71,9 @@ fn signature() -> &'static ProcedureSignature {
                 name: smol_str::SmolStr::new("options"),
                 ty: ArgType::CypherValue,
                 default: None,
-                doc: "Optional reranker / extra options map.".to_owned(),
+                doc: "Optional options map: ANN tuning (`nprobes`, `refine_factor`, \
+                      `ef_search`), candidate `over_fetch`, and reranker keys."
+                    .to_owned(),
             },
         ],
         yields: vector_query_yields(),

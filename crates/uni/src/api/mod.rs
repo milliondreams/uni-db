@@ -82,7 +82,7 @@ use uni_common::core::snapshot::SnapshotManifest;
 use uni_common::{CloudStorageConfig, UniConfig};
 use uni_common::{Result, UniError};
 use uni_store::cloud::build_cloud_store;
-use uni_xervo::api::{ModelAliasSpec, ModelTask};
+use uni_xervo::api::ModelAliasSpec;
 use uni_xervo::runtime::ModelRuntime;
 
 use uni_common::core::schema::SchemaManager;
@@ -3480,22 +3480,15 @@ impl UniBuilder {
             .map_err(UniError::Internal)?,
         );
 
-        let required_embed_aliases: std::collections::BTreeSet<String> = schema_manager
-            .schema()
-            .indexes
-            .iter()
-            .filter_map(|idx| {
-                if let uni_common::core::schema::IndexDefinition::Vector(cfg) = idx {
-                    cfg.embedding_config.as_ref().map(|emb| emb.alias.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Per-alias embedding-head requirements across both Vector (dense/multi-vector)
+        // and Sparse indexes that carry an auto-embed config.
+        let schema_for_embed = schema_manager.schema();
+        let required_embed_heads =
+            uni_store::runtime::embed_caps::required_embed_heads(&schema_for_embed);
 
         // A prebuilt runtime (`.xervo_runtime(...)`) already carries its catalog, so it
         // satisfies the embedding-alias requirement just as a `.xervo_catalog(...)` does.
-        if !required_embed_aliases.is_empty()
+        if !required_embed_heads.is_empty()
             && self.xervo_catalog.is_none()
             && self.prebuilt_xervo_runtime.is_none()
         {
@@ -3507,17 +3500,35 @@ impl UniBuilder {
         let xervo_runtime = if let Some(runtime) = self.prebuilt_xervo_runtime {
             Some(runtime)
         } else if let Some(catalog) = self.xervo_catalog {
-            for alias in &required_embed_aliases {
+            // Capability check (#129/#130): each alias's task must produce — from a text
+            // source — every embedding head its bound columns require. A hybrid alias
+            // (e.g. BGE-M3) covers any subset; a single-task alias covers only its own
+            // head. This replaces the old blanket `task != Embed` check, which wrongly
+            // rejected hybrid / multi-vector / sparse aliases at reopen, and additionally
+            // validates sparse aliases (previously unchecked).
+            for (alias, required) in &required_embed_heads {
                 let spec = catalog.iter().find(|s| &s.alias == alias).ok_or_else(|| {
                     UniError::Internal(anyhow::anyhow!(
                         "Missing Uni-Xervo alias '{}' referenced by vector index embedding config",
                         alias
                     ))
                 })?;
-                if spec.task != ModelTask::Embed {
+                let supported = uni_store::runtime::embed_caps::text_embedding_heads(spec.task);
+                if !supported.contains(required.heads) {
+                    let offending: Vec<&str> = required
+                        .columns
+                        .iter()
+                        .filter(|(_, head)| !supported.contains(*head))
+                        .map(|(col, _)| col.as_str())
+                        .collect();
                     return Err(UniError::Internal(anyhow::anyhow!(
-                        "Uni-Xervo alias '{}' must be an embed task",
-                        alias
+                        "Uni-Xervo alias '{alias}' (task {:?}) cannot produce the embedding \
+                         head(s) required by column(s) {:?}: alias supports {:?}, columns \
+                         require {:?}",
+                        spec.task,
+                        offending,
+                        supported,
+                        required.heads
                     )));
                 }
             }

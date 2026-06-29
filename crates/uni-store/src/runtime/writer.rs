@@ -4,6 +4,7 @@
 #[cfg(feature = "lance-backend")]
 use crate::backend::table_names;
 use crate::runtime::context::QueryContext;
+use crate::runtime::embed_caps::is_multivector_property;
 use crate::runtime::flush_coordinator::{
     FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
 };
@@ -32,26 +33,10 @@ use uni_common::core::fork::ForkId;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema::{ConstraintTarget, ConstraintType, IndexDefinition};
 use uni_common::core::snapshot::{EdgeSnapshot, LabelSnapshot, SnapshotManifest};
+use uni_xervo::error::RuntimeError;
 use uni_xervo::runtime::ModelRuntime;
+use uni_xervo::traits::hybrid::{HeadSet, HybridEmbedResult};
 use uuid::Uuid;
-
-/// Whether `property` on `label` is a multi-vector (`List<Vector>`) column — the
-/// late-interaction (ColBERT) shape that auto-embeds per-token via the multi-vector model
-/// (issue #104). A plain `Vector` column uses the dense single-vector model.
-fn is_multivector_property(
-    schema: &uni_common::core::schema::Schema,
-    label: &str,
-    property: &str,
-) -> bool {
-    schema
-        .properties
-        .get(label)
-        .and_then(|p| p.get(property))
-        .is_some_and(|m| {
-            matches!(&m.r#type, uni_common::DataType::List(inner)
-                if matches!(**inner, uni_common::DataType::Vector { .. }))
-        })
-}
 
 /// Convert per-token embedding vectors into the stored `List<Vector>` representation:
 /// a `Value::List` whose elements are each a `Value::List<Float>` (one token vector).
@@ -111,11 +96,11 @@ async fn embed_group(
     Option<Vec<Vec<Vec<f32>>>>,
     Option<Vec<Vec<(u32, f32)>>>,
 )> {
-    use uni_xervo::traits::hybrid::HeadSet;
     let heads_wanted = u8::from(want_dense) + u8::from(want_multi) + u8::from(want_sparse);
     if heads_wanted > 1 {
         // Single-pass hybrid: one model, one inference, all requested heads
-        // (e.g. BGE-M3 fills dense + sparse from one forward pass).
+        // (e.g. BGE-M3 fills dense + sparse from one forward pass). A group with >1 head
+        // can only be served by a hybrid model (one alias = one task), so route directly.
         let mut heads = HeadSet::empty();
         if want_dense {
             heads |= HeadSet::DENSE;
@@ -153,15 +138,86 @@ async fn embed_group(
         };
         Ok((dense, multi, sparse))
     } else if want_multi {
-        let embedder = runtime.multi_vector_embedder(alias).await?;
-        Ok((None, Some(embedder.embed(texts).await?.vectors), None))
+        // Lone multi-vector head: prefer the narrow facade, but fall back to a hybrid
+        // model on the same alias (issue #129) when it doesn't implement the narrow trait.
+        match runtime.multi_vector_embedder(alias).await {
+            Ok(embedder) => Ok((None, Some(embedder.embed(texts).await?.vectors), None)),
+            Err(e) if is_capability_mismatch(&e) => {
+                let multi = hybrid_single_head(runtime, alias, texts, HeadSet::MULTI_VECTOR)
+                    .await?
+                    .multi_vector
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "model '{alias}' exposes no multi-vector head for a List<Vector> target"
+                        )
+                    })?;
+                Ok((None, Some(multi), None))
+            }
+            Err(e) => Err(e.into()),
+        }
     } else if want_sparse {
-        let embedder = runtime.sparse_embedder(alias).await?;
-        Ok((None, None, Some(embedder.embed(texts).await?.vectors)))
+        // Lone sparse head: narrow facade, else hybrid fallback (issue #129).
+        match runtime.sparse_embedder(alias).await {
+            Ok(embedder) => Ok((None, None, Some(embedder.embed(texts).await?.vectors))),
+            Err(e) if is_capability_mismatch(&e) => {
+                let sparse = hybrid_single_head(runtime, alias, texts, HeadSet::SPARSE)
+                    .await?
+                    .sparse
+                    .ok_or_else(|| {
+                        anyhow!("model '{alias}' exposes no sparse head for a SparseVector target")
+                    })?;
+                Ok((None, None, Some(sparse)))
+            }
+            Err(e) => Err(e.into()),
+        }
     } else {
-        let embedder = runtime.embedding(alias).await?;
-        Ok((Some(embedder.embed(texts).await?.vectors), None, None))
+        // Lone dense head: narrow facade, else hybrid fallback (issue #129 — a hybrid
+        // model like BGE-M3 serving a single dense column on its own alias).
+        match runtime.embedding(alias).await {
+            Ok(embedder) => Ok((Some(embedder.embed(texts).await?.vectors), None, None)),
+            Err(e) if is_capability_mismatch(&e) => {
+                let dense = hybrid_single_head(runtime, alias, texts, HeadSet::DENSE)
+                    .await?
+                    .dense
+                    .ok_or_else(|| {
+                        anyhow!("model '{alias}' exposes no dense head for a Vector target")
+                    })?;
+                Ok((Some(dense), None, None))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
+}
+
+/// Whether `err` means the alias's model does not implement the requested narrow
+/// embedding trait, so the hybrid model on the same alias should be tried instead.
+///
+/// `embedding()` reports a missing dense trait as `RuntimeError::CapabilityMismatch`;
+/// the sparse / multi-vector / hybrid facades report it as
+/// `RuntimeError::ProviderCapabilityMissing`. Both mean "wrong facade for this model",
+/// as opposed to a load or inference failure, which must propagate unchanged.
+fn is_capability_mismatch(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::CapabilityMismatch(_) | RuntimeError::ProviderCapabilityMissing { .. }
+    )
+}
+
+/// Run ONE hybrid forward pass over `texts` producing only `head`, for the lone-head
+/// capability fallback (issue #129).
+///
+/// The hybrid embedder is cached per alias and the model is keyed by its task, so this
+/// reuses the model already loaded by the failed narrow attempt (no second load). The
+/// caller extracts the matching field of the result; a `None` there means the model does
+/// not expose `head` and must be surfaced as a hard error, never a silently-empty column.
+async fn hybrid_single_head(
+    runtime: &ModelRuntime,
+    alias: &str,
+    texts: &[&str],
+    head: HeadSet,
+) -> Result<HybridEmbedResult> {
+    let embedder = runtime.hybrid_embedder(alias).await?;
+    embedder.embed(texts, head).await.map_err(Into::into)
 }
 
 /// Group a label's auto-embed configs by `(alias, source_properties)`, classifying each target

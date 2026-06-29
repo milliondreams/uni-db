@@ -2,6 +2,9 @@
 // Copyright 2024-2026 Dragonscale Team
 
 pub mod context;
+/// Embedding-capability mapping (task→heads) and per-alias head requirements,
+/// shared by open-time validation and write-time auto-embed routing.
+pub mod embed_caps;
 pub mod flush_coordinator;
 pub mod id_allocator;
 pub mod id_reservoir;

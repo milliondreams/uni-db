@@ -2181,7 +2181,7 @@ impl StorageManager {
             })
             .collect();
 
-        let target_edge_types: HashSet<u32> = edge_types.iter().cloned().collect();
+        let target_edge_types: HashSet<u32> = edge_types.iter().copied().collect();
 
         // Initialize frontier
         let mut frontier: Vec<Vid> = start_vids.to_vec();

@@ -476,168 +476,76 @@ pub fn locy_runtime_error_to_pyerr(e: uni_locy::LocyError) -> PyErr {
 
 /// Register all exception types on the Python module.
 pub fn register_exceptions(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("UniError", py.get_type::<UniError>())?;
+    // Each exception is registered under its own type name (via `stringify!`),
+    // so the Python-visible attribute name always matches the Rust type.
+    macro_rules! register {
+        ($($ty:ident),+ $(,)?) => {
+            $( m.add(stringify!($ty), py.get_type::<$ty>())?; )+
+        };
+    }
 
-    // Database lifecycle
-    m.add("UniNotFoundError", py.get_type::<UniNotFoundError>())?;
-    m.add(
-        "UniDatabaseLockedError",
-        py.get_type::<UniDatabaseLockedError>(),
-    )?;
-
-    // Schema
-    m.add("UniSchemaError", py.get_type::<UniSchemaError>())?;
-    m.add(
-        "UniLabelNotFoundError",
-        py.get_type::<UniLabelNotFoundError>(),
-    )?;
-    m.add(
-        "UniEdgeTypeNotFoundError",
-        py.get_type::<UniEdgeTypeNotFoundError>(),
-    )?;
-    m.add(
-        "UniPropertyNotFoundError",
-        py.get_type::<UniPropertyNotFoundError>(),
-    )?;
-    m.add(
-        "UniIndexNotFoundError",
-        py.get_type::<UniIndexNotFoundError>(),
-    )?;
-    m.add(
-        "UniLabelAlreadyExistsError",
-        py.get_type::<UniLabelAlreadyExistsError>(),
-    )?;
-    m.add(
-        "UniEdgeTypeAlreadyExistsError",
-        py.get_type::<UniEdgeTypeAlreadyExistsError>(),
-    )?;
-    m.add("UniConstraintError", py.get_type::<UniConstraintError>())?;
-    m.add(
-        "UniInvalidIdentifierError",
-        py.get_type::<UniInvalidIdentifierError>(),
-    )?;
-
-    // Query & parse
-    m.add("UniParseError", py.get_type::<UniParseError>())?;
-    m.add("UniQueryError", py.get_type::<UniQueryError>())?;
-    m.add("UniTypeError", py.get_type::<UniTypeError>())?;
-
-    // Transaction
-    m.add("UniTransactionError", py.get_type::<UniTransactionError>())?;
-    m.add(
-        "UniTransactionConflictError",
-        py.get_type::<UniTransactionConflictError>(),
-    )?;
-    m.add(
-        "UniTransactionAlreadyCompletedError",
-        py.get_type::<UniTransactionAlreadyCompletedError>(),
-    )?;
-    m.add(
-        "UniTransactionExpiredError",
-        py.get_type::<UniTransactionExpiredError>(),
-    )?;
-    m.add(
-        "UniCommitTimeoutError",
-        py.get_type::<UniCommitTimeoutError>(),
-    )?;
-    m.add(
-        "UniConstraintConflictError",
-        py.get_type::<UniConstraintConflictError>(),
-    )?;
-    m.add("UniLockTimeoutError", py.get_type::<UniLockTimeoutError>())?;
-
-    // Resource limits
-    m.add(
-        "UniMemoryLimitExceededError",
-        py.get_type::<UniMemoryLimitExceededError>(),
-    )?;
-    m.add("UniTimeoutError", py.get_type::<UniTimeoutError>())?;
-    m.add(
-        "UniLocyIncompleteError",
-        py.get_type::<UniLocyIncompleteError>(),
-    )?;
-
-    // Access control
-    m.add("UniReadOnlyError", py.get_type::<UniReadOnlyError>())?;
-    m.add(
-        "UniPermissionDeniedError",
-        py.get_type::<UniPermissionDeniedError>(),
-    )?;
-
-    // Storage & I/O
-    m.add("UniStorageError", py.get_type::<UniStorageError>())?;
-    m.add("UniIOError", py.get_type::<UniIOError>())?;
-    m.add("UniInternalError", py.get_type::<UniInternalError>())?;
-
-    // Snapshot
-    m.add(
-        "UniSnapshotNotFoundError",
-        py.get_type::<UniSnapshotNotFoundError>(),
-    )?;
-
-    // Arguments
-    m.add(
-        "UniInvalidArgumentError",
-        py.get_type::<UniInvalidArgumentError>(),
-    )?;
-
-    // Concurrency
-    m.add(
-        "UniWriteContextAlreadyActiveError",
-        py.get_type::<UniWriteContextAlreadyActiveError>(),
-    )?;
-    m.add("UniCancelledError", py.get_type::<UniCancelledError>())?;
-
-    // Locy-specific
-    m.add(
-        "UniStaleDerivedFactsError",
-        py.get_type::<UniStaleDerivedFactsError>(),
-    )?;
-    m.add(
-        "UniRuleConflictError",
-        py.get_type::<UniRuleConflictError>(),
-    )?;
-    m.add(
-        "UniHookRejectedError",
-        py.get_type::<UniHookRejectedError>(),
-    )?;
-    m.add("UniLocyCompileError", py.get_type::<UniLocyCompileError>())?;
-    m.add("UniLocyRuntimeError", py.get_type::<UniLocyRuntimeError>())?;
-
-    // Fork lifecycle (Phase 4b)
-    m.add(
-        "UniForkNotFoundError",
-        py.get_type::<UniForkNotFoundError>(),
-    )?;
-    m.add(
-        "UniForkAlreadyExistsError",
-        py.get_type::<UniForkAlreadyExistsError>(),
-    )?;
-    m.add("UniForkInUseError", py.get_type::<UniForkInUseError>())?;
-    m.add(
-        "UniForkInflightTxError",
-        py.get_type::<UniForkInflightTxError>(),
-    )?;
-    m.add(
-        "UniForkHasChildrenError",
-        py.get_type::<UniForkHasChildrenError>(),
-    )?;
-    m.add(
-        "UniForkSubtreeInUseError",
-        py.get_type::<UniForkSubtreeInUseError>(),
-    )?;
-    m.add(
-        "UniForkBudgetExceededError",
-        py.get_type::<UniForkBudgetExceededError>(),
-    )?;
-    m.add(
-        "UniForkCorruptRegistryError",
-        py.get_type::<UniForkCorruptRegistryError>(),
-    )?;
-    m.add(
-        "UniForkLifecycleError",
-        py.get_type::<UniForkLifecycleError>(),
-    )?;
+    register!(
+        UniError,
+        // Database lifecycle
+        UniNotFoundError,
+        UniDatabaseLockedError,
+        // Schema
+        UniSchemaError,
+        UniLabelNotFoundError,
+        UniEdgeTypeNotFoundError,
+        UniPropertyNotFoundError,
+        UniIndexNotFoundError,
+        UniLabelAlreadyExistsError,
+        UniEdgeTypeAlreadyExistsError,
+        UniConstraintError,
+        UniInvalidIdentifierError,
+        // Query & parse
+        UniParseError,
+        UniQueryError,
+        UniTypeError,
+        // Transaction
+        UniTransactionError,
+        UniTransactionConflictError,
+        UniTransactionAlreadyCompletedError,
+        UniTransactionExpiredError,
+        UniCommitTimeoutError,
+        UniConstraintConflictError,
+        UniLockTimeoutError,
+        // Resource limits
+        UniMemoryLimitExceededError,
+        UniTimeoutError,
+        UniLocyIncompleteError,
+        // Access control
+        UniReadOnlyError,
+        UniPermissionDeniedError,
+        // Storage & I/O
+        UniStorageError,
+        UniIOError,
+        UniInternalError,
+        // Snapshot
+        UniSnapshotNotFoundError,
+        // Arguments
+        UniInvalidArgumentError,
+        // Concurrency
+        UniWriteContextAlreadyActiveError,
+        UniCancelledError,
+        // Locy-specific
+        UniStaleDerivedFactsError,
+        UniRuleConflictError,
+        UniHookRejectedError,
+        UniLocyCompileError,
+        UniLocyRuntimeError,
+        // Fork lifecycle (Phase 4b)
+        UniForkNotFoundError,
+        UniForkAlreadyExistsError,
+        UniForkInUseError,
+        UniForkInflightTxError,
+        UniForkHasChildrenError,
+        UniForkSubtreeInUseError,
+        UniForkBudgetExceededError,
+        UniForkCorruptRegistryError,
+        UniForkLifecycleError,
+    );
 
     Ok(())
 }

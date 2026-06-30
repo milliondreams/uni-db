@@ -140,13 +140,13 @@ impl WatchBuilder {
 
     /// Only receive notifications that affect the given labels.
     pub fn labels(mut self, labels: &[&str]) -> Self {
-        self.label_filter = Some(labels.iter().map(|s| s.to_string()).collect());
+        self.label_filter = Some(labels.iter().map(|s| (*s).to_owned()).collect());
         self
     }
 
     /// Only receive notifications that affect the given edge types.
     pub fn edge_types(mut self, types: &[&str]) -> Self {
-        self.edge_type_filter = Some(types.iter().map(|s| s.to_string()).collect());
+        self.edge_type_filter = Some(types.iter().map(|s| (*s).to_owned()).collect());
         self
     }
 
@@ -158,7 +158,7 @@ impl WatchBuilder {
 
     /// Exclude notifications from the given session ID.
     pub fn exclude_session(mut self, session_id: &str) -> Self {
-        self.exclude_session = Some(session_id.to_string());
+        self.exclude_session = Some(session_id.to_owned());
         self
     }
 

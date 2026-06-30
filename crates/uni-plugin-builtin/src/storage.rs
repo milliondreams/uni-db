@@ -504,12 +504,12 @@ pub struct LanceFilterPushdown;
 #[cfg(feature = "lance-backend")]
 impl uni_plugin::traits::pushdown::SupportsFilterPushdown for LanceFilterPushdown {
     fn push_filters(&self, filters: &[Expr]) -> uni_plugin::traits::pushdown::FilterApplication {
-        let mut fully_handled = Vec::new();
-        for (idx, expr) in filters.iter().enumerate() {
-            if expr_to_lance_filter(expr).is_ok() {
-                fully_handled.push(idx);
-            }
-        }
+        let fully_handled = filters
+            .iter()
+            .enumerate()
+            .filter(|(_, expr)| expr_to_lance_filter(expr).is_ok())
+            .map(|(idx, _)| idx)
+            .collect();
         uni_plugin::traits::pushdown::FilterApplication {
             fully_handled,
             partially_handled: Vec::new(),

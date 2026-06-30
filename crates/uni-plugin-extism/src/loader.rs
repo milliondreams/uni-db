@@ -458,9 +458,7 @@ impl ExtismLoader {
         for entry in registration.entries {
             match entry {
                 crate::exports::RegistrationEntry::Scalar { qname, signature } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}"))
-                    })?;
+                    let parsed_qname = parse_entry_qname(&qname)?;
                     let sig = crate::wire_translate::wire_fn_sig_to_internal(&signature)?;
                     let adapter = std::sync::Arc::new(crate::adapter::ExtismScalarFn::new(
                         std::sync::Arc::clone(&pool),
@@ -479,9 +477,7 @@ impl ExtismLoader {
                     signature,
                     state,
                 } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}"))
-                    })?;
+                    let parsed_qname = parse_entry_qname(&qname)?;
                     let sig = crate::wire_translate::wire_agg_sig_to_internal(&signature, &state)?;
                     let adapter =
                         std::sync::Arc::new(crate::adapter_aggregate::ExtismAggregateFn::new(
@@ -502,9 +498,7 @@ impl ExtismLoader {
                     yields,
                     mode,
                 } => {
-                    let parsed_qname = uni_plugin::QName::parse(&qname).map_err(|e| {
-                        ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}"))
-                    })?;
+                    let parsed_qname = parse_entry_qname(&qname)?;
                     let sig =
                         crate::wire_translate::wire_proc_sig_to_internal(&args, &yields, &mode)?;
                     let adapter =
@@ -538,6 +532,16 @@ impl ExtismLoader {
             pool,
         })
     }
+}
+
+/// Parse a registration entry's qname, mapping a parse failure to
+/// [`ExtismError::OutputDecode`].
+///
+/// Shared by the three `RegistrationEntry` arms in [`ExtismLoader::load`]
+/// so every entry kind reports an invalid qname identically.
+fn parse_entry_qname(qname: &str) -> Result<uni_plugin::QName, ExtismError> {
+    uni_plugin::QName::parse(qname)
+        .map_err(|e| ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}")))
 }
 
 /// Build an `extism::Plugin` from owned-data inputs.

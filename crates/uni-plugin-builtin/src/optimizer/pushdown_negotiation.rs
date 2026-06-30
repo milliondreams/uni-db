@@ -131,10 +131,10 @@ fn try_rewrite_filter(
     else {
         return Ok(Err(plan));
     };
-    let LogicalPlan::TableScan(TableScan { source, .. }) = input.as_ref() else {
+    let LogicalPlan::TableScan(scan) = input.as_ref() else {
         return Ok(Err(plan));
     };
-    let Some(markers) = downcast_markers(source.as_any()) else {
+    let Some(markers) = downcast_markers(scan.source.as_any()) else {
         return Ok(Err(plan));
     };
     let Some(filter_marker) = markers.filter.as_ref() else {
@@ -154,9 +154,6 @@ fn try_rewrite_filter(
         // Without this, the rule strips the Filter node from the
         // logical plan but the source sees an empty predicate slice
         // and returns every row — silent over-fetch.
-        let LogicalPlan::TableScan(scan) = input.as_ref() else {
-            return Ok(Err(plan));
-        };
         let mut new_scan = scan.clone();
         new_scan.filters.push(predicate.clone());
         return Ok(Ok(LogicalPlan::TableScan(new_scan)));

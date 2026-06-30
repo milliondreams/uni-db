@@ -1296,19 +1296,21 @@ impl Expr {
                 when_then,
                 else_expr,
             } => {
+                use std::fmt::Write as _;
                 let mut s = "CASE".to_string();
                 if let Some(e) = expr {
-                    s.push_str(&format!(" {}", e.to_string_repr()));
+                    let _ = write!(s, " {}", e.to_string_repr());
                 }
                 for (w, t) in when_then {
-                    s.push_str(&format!(
+                    let _ = write!(
+                        s,
                         " WHEN {} THEN {}",
                         w.to_string_repr(),
                         t.to_string_repr()
-                    ));
+                    );
                 }
                 if let Some(e) = else_expr {
-                    s.push_str(&format!(" ELSE {}", e.to_string_repr()));
+                    let _ = write!(s, " ELSE {}", e.to_string_repr());
                 }
                 s.push_str(" END");
                 s

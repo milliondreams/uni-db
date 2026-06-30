@@ -4,6 +4,7 @@
 //! canonical implementation.
 
 use crate::sparse::SparseVector;
+use std::cmp::Ordering;
 
 /// Dot product of two sparse vectors via a linear merge-join over their
 /// (ascending) term ids. This is the SPLADE/learned-sparse scoring primitive
@@ -18,9 +19,9 @@ pub fn sparse_dot(a: &SparseVector, b: &SparseVector) -> f32 {
     let mut acc = 0.0f32;
     while i < ai.len() && j < bi.len() {
         match ai[i].cmp(&bi[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
                 acc += av[i] * bv[j];
                 i += 1;
                 j += 1;
@@ -58,7 +59,7 @@ pub fn prune_top_k(v: &SparseVector, k: usize) -> SparseVector {
         values[y]
             .abs()
             .partial_cmp(&values[x].abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
             .then(indices[x].cmp(&indices[y]))
     });
     order.truncate(k);

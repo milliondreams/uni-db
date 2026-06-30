@@ -34,15 +34,9 @@ fn parse_param_list(s: &str) -> Vec<(String, ProcedureValueType)> {
     }
     trimmed
         .split(',')
-        .map(|part| {
-            let parts: Vec<&str> = part.split("::").collect();
-            let name = parts[0].trim().to_string();
-            let ptype = if parts.len() > 1 {
-                parse_type(parts[1])
-            } else {
-                ProcedureValueType::Any
-            };
-            (name, ptype)
+        .map(|part| match part.split_once("::") {
+            Some((name, type_str)) => (name.trim().to_string(), parse_type(type_str)),
+            None => (part.trim().to_string(), ProcedureValueType::Any),
         })
         .collect()
 }
@@ -68,25 +62,16 @@ fn parse_procedure_signature(
     let proc_name = sig[..open_paren].trim().to_string();
     let rest = &sig[open_paren..];
 
-    // Split on ") :: (" to separate input params from output params
-    // Handle both ") :: (" and ")::(" patterns
-    let separator_patterns = [") :: (", ")::(", ") ::(", "):: ("];
-    let mut split_pos = None;
-    let mut sep_len = 0;
+    // Split on the ") :: (" separator (and its spacing variants) to separate
+    // input params from output params.
+    let separator = [") :: (", ")::(", ") ::(", "):: ("]
+        .into_iter()
+        .find_map(|pattern| rest.find(pattern).map(|pos| (pos, pattern.len())));
 
-    for pattern in &separator_patterns {
-        if let Some(pos) = rest.find(pattern) {
-            split_pos = Some(pos);
-            sep_len = pattern.len();
-            break;
-        }
-    }
-
-    let (input_str, output_str) = if let Some(pos) = split_pos {
+    let (input_str, output_str) = if let Some((pos, sep_len)) = separator {
         // Extract content between parentheses
         let input_part = &rest[1..pos]; // skip opening '('
-        let output_part = &rest[pos + sep_len..];
-        let output_part = output_part
+        let output_part = rest[pos + sep_len..]
             .trim()
             .trim_end_matches(')')
             .trim_end_matches(':');

@@ -95,7 +95,7 @@ pub fn build_engine(effective_caps: &CapabilitySet, host_fns: &RhaiHostFnRegistr
 /// Stub variant used when the `rhai-runtime` feature is disabled — keeps
 /// the crate compiling for embedders that only want the trait surface.
 #[cfg(not(feature = "rhai-runtime"))]
-pub fn build_engine(_effective_caps: &CapabilitySet, _host_fns: &RhaiHostFnRegistry) -> () {}
+pub fn build_engine(_effective_caps: &CapabilitySet, _host_fns: &RhaiHostFnRegistry) {}
 
 #[cfg(feature = "rhai-runtime")]
 fn apply_resource_limits(engine: &mut Engine, caps: &CapabilitySet) {

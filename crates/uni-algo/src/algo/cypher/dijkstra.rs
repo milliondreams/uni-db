@@ -66,7 +66,7 @@ impl GraphAlgoAdapter for DijkstraAdapter {
             let distance = result
                 .distances
                 .iter()
-                .find_map(|(vid, d)| if *vid == target { Some(*d) } else { None })
+                .find_map(|(vid, d)| (*vid == target).then_some(*d))
                 .unwrap_or(0.0);
             let path_json: Vec<Value> = path.into_iter().map(|v| json!(v.as_u64())).collect();
             return Ok(vec![AlgoResultRow {

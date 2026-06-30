@@ -61,9 +61,7 @@ pub fn arrow_array_to_pyarrow_capsules<'py>(
     let schema_cap = make_arrow_capsule(py, ffi_schema, SCHEMA_CAPSULE_NAME)?;
     let array_cap = make_arrow_capsule(py, ffi_array, ARRAY_CAPSULE_NAME)?;
 
-    let tuple =
-        PyTuple::new(py, [schema_cap.as_any(), array_cap.as_any()]).map_err(PyPluginError::from)?;
-    Ok(tuple)
+    PyTuple::new(py, [schema_cap.as_any(), array_cap.as_any()]).map_err(PyPluginError::from)
 }
 
 /// Build a `_PyArrowCapsuleHolder`-shaped object that pyarrow can
@@ -125,14 +123,11 @@ pub fn arrow_array_to_pyarrow<'py>(
     // back to the holder — it still round-trips through
     // `pyarrow_to_arrow_array`.
     match py.import("pyarrow") {
-        Ok(pa) => {
-            let arr = pa
-                .getattr("array")
-                .map_err(PyPluginError::from)?
-                .call1((instance,))
-                .map_err(PyPluginError::from)?;
-            Ok(arr)
-        }
+        Ok(pa) => pa
+            .getattr("array")
+            .map_err(PyPluginError::from)?
+            .call1((instance,))
+            .map_err(PyPluginError::from),
         Err(_) => Ok(instance),
     }
 }

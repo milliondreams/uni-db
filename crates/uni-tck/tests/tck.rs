@@ -182,9 +182,8 @@ fn discover_scenarios(feature_dir: &Path) -> Vec<(PathBuf, String, usize)> {
 
 /// Recursively collect `.feature` files from a directory.
 fn collect_feature_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -220,13 +219,11 @@ fn collect_expanded_scenarios(
         } else {
             // Scenario Outline: expand each examples table row
             for example in &scenario.examples {
-                let table = match &example.table {
-                    Some(t) => t,
-                    None => continue,
+                let Some(table) = &example.table else {
+                    continue;
                 };
-                let (header, rows) = match table.rows.split_first() {
-                    Some(pair) => pair,
-                    None => continue,
+                let Some((header, rows)) = table.rows.split_first() else {
+                    continue;
                 };
 
                 for (id, row) in rows.iter().enumerate() {
@@ -242,13 +239,7 @@ fn collect_expanded_scenarios(
                             header
                                 .iter()
                                 .zip(row.iter())
-                                .find_map(|(h, v)| {
-                                    if h == placeholder {
-                                        Some(v.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
+                                .find_map(|(h, v)| (h == placeholder).then_some(v.as_str()))
                                 .unwrap_or("")
                         });
 

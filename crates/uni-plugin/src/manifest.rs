@@ -102,9 +102,7 @@ impl PluginDep {
     /// Check whether the supplied `version` satisfies this dependency.
     #[must_use]
     pub fn satisfied_by(&self, version: &Version) -> bool {
-        VersionReq::parse(&self.version_req)
-            .map(|r| r.matches(version))
-            .unwrap_or(false)
+        VersionReq::parse(&self.version_req).is_ok_and(|r| r.matches(version))
     }
 }
 

@@ -123,9 +123,12 @@ impl UniWorld {
             return Ok(());
         }
 
-        // Use in_memory for fastest initialization
-        // Disable background tasks for test databases (they create many short-lived instances)
-        #[allow(clippy::field_reassign_with_default)]
+        // Use in_memory for fastest initialization. Disable background tasks for
+        // test databases (they create many short-lived instances).
+        #[expect(
+            clippy::field_reassign_with_default,
+            reason = "UniConfig has no builder for these fields; reassigning defaults is clearest"
+        )]
         let config = {
             let mut config = uni_common::UniConfig::default();
             config.auto_flush_interval = None; // Disable auto-flush background task

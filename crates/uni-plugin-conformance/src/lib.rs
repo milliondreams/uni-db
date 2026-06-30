@@ -89,9 +89,8 @@ impl ConformanceReport {
             return;
         }
         use std::fmt::Write as _;
-        let failures: Vec<&CheckResult> = self.checks.iter().filter(|c| !c.passed).collect();
         let mut msg = String::from("conformance failures:\n");
-        for f in failures {
+        for f in self.checks.iter().filter(|c| !c.passed) {
             let _ = writeln!(msg, "  - {} [{}]: {}", f.name, f.id, f.detail);
         }
         panic!("{msg}");
@@ -320,19 +319,15 @@ fn check<F>(id: &str, name: &str, body: F) -> CheckResult
 where
     F: FnOnce() -> Result<(), String>,
 {
-    match body() {
-        Ok(()) => CheckResult {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            passed: true,
-            detail: String::new(),
-        },
-        Err(detail) => CheckResult {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            passed: false,
-            detail,
-        },
+    let (passed, detail) = match body() {
+        Ok(()) => (true, String::new()),
+        Err(detail) => (false, detail),
+    };
+    CheckResult {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        passed,
+        detail,
     }
 }
 

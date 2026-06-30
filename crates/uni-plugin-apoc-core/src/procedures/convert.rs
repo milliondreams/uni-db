@@ -154,8 +154,7 @@ impl ProcedurePlugin for ConvertProc {
                     ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
                     ScalarValue::Int64(Some(i)) => Some(i.to_string()),
                     ScalarValue::Float64(Some(f)) => Some(f.to_string()),
-                    ScalarValue::Utf8(Some(s)) => Some(s),
-                    ScalarValue::LargeUtf8(Some(s)) => Some(s),
+                    ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s),
                     _ => None,
                 };
                 nullable_string_result(result)

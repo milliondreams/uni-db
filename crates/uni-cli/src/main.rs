@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use colored::*;
+use colored::Colorize;
 use prettytable::{Cell, Row, Table};
 use std::path::PathBuf;
 use uni_plugin::{Capability, CapabilitySet};
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
             citations,
             output,
         } => {
-            println!("Importing dataset '{}'...", name);
+            println!("Importing dataset '{name}'...");
             crate::demo::semantic_scholar::import_semantic_scholar(&papers, &citations, &output)
                 .await?;
         }

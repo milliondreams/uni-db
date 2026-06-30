@@ -437,11 +437,12 @@ impl BulkWriter {
         };
 
         // Track buffer size and add to buffer
-        let buffer = self.pending_vertices.entry(label.to_string()).or_default();
-        for (i, props) in vertices.into_iter().enumerate() {
-            self.buffer_size_bytes += Self::estimate_properties_size(&props);
-            buffer.push((vids[i], props));
-        }
+        let added_size: usize = vertices.iter().map(Self::estimate_properties_size).sum();
+        self.buffer_size_bytes += added_size;
+        self.pending_vertices
+            .entry(label.to_string())
+            .or_default()
+            .extend(vids.iter().copied().zip(vertices));
 
         self.touched_labels.insert(label.to_string());
 
@@ -670,38 +671,37 @@ impl BulkWriter {
         match op {
             "=" | "==" => Ok(prop_val == &target_val),
             "!=" | "<>" => Ok(prop_val != &target_val),
-            ">" => self.compare_values(prop_val, &target_val).map(|c| c > 0),
-            "<" => self.compare_values(prop_val, &target_val).map(|c| c < 0),
-            ">=" => self.compare_values(prop_val, &target_val).map(|c| c >= 0),
-            "<=" => self.compare_values(prop_val, &target_val).map(|c| c <= 0),
+            ">" => Ok(self.compare_values(prop_val, &target_val)?.is_gt()),
+            "<" => Ok(self.compare_values(prop_val, &target_val)?.is_lt()),
+            ">=" => Ok(self.compare_values(prop_val, &target_val)?.is_ge()),
+            "<=" => Ok(self.compare_values(prop_val, &target_val)?.is_le()),
             _ => Ok(true), // Unknown operator - allow
         }
     }
 
-    /// Compare two values, returning -1, 0, or 1.
+    /// Compare two values for ordering.
     ///
-    /// Incomparable floats (NaN) compare as equal (0), matching the prior
-    /// branch-based implementation.
-    fn compare_values(&self, a: &Value, b: &Value) -> Result<i8> {
-        let ordering = match (a, b) {
-            (Value::Int(n1), Value::Int(n2)) => n1.cmp(n2),
-            (Value::Float(f1), Value::Float(f2)) => f1.partial_cmp(f2).unwrap_or(Ordering::Equal),
+    /// Incomparable floats (NaN) compare as [`Ordering::Equal`], matching the
+    /// prior branch-based implementation.
+    fn compare_values(&self, a: &Value, b: &Value) -> Result<Ordering> {
+        match (a, b) {
+            (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
+            (Value::Float(f1), Value::Float(f2)) => {
+                Ok(f1.partial_cmp(f2).unwrap_or(Ordering::Equal))
+            }
             (Value::Int(n), Value::Float(f)) => {
-                (*n as f64).partial_cmp(f).unwrap_or(Ordering::Equal)
+                Ok((*n as f64).partial_cmp(f).unwrap_or(Ordering::Equal))
             }
             (Value::Float(f), Value::Int(n)) => {
-                f.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal)
+                Ok(f.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal))
             }
-            (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
-            _ => {
-                return Err(anyhow!(
-                    "Cannot compare incompatible types: {:?} vs {:?}",
-                    a,
-                    b
-                ));
-            }
-        };
-        Ok(ordering as i8)
+            (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
+            _ => Err(anyhow!(
+                "Cannot compare incompatible types: {:?} vs {:?}",
+                a,
+                b
+            )),
+        }
     }
 
     /// Checkpoint: flush all pending data to storage.
@@ -746,6 +746,26 @@ impl BulkWriter {
         Ok(())
     }
 
+    /// Record a table's pre-load Lance version the first time it is touched.
+    ///
+    /// Subsequent calls for the same table are no-ops, preserving the version
+    /// captured before the bulk load's first write (used for abort rollback).
+    async fn record_initial_version(&mut self, table_name: &str) -> Result<()> {
+        if self.initial_table_versions.contains_key(table_name) {
+            return Ok(());
+        }
+        let version = self
+            .backend
+            .storage
+            .backend()
+            .get_table_version(table_name)
+            .await
+            .map_err(UniError::Internal)?;
+        self.initial_table_versions
+            .insert(table_name.to_string(), version);
+        Ok(())
+    }
+
     /// Flush vertex buffer to LanceDB storage.
     ///
     /// Records the initial table version before first write for rollback support.
@@ -756,29 +776,11 @@ impl BulkWriter {
                 return Ok(());
             }
 
-            // Record initial version for abort rollback (only once per table)
+            // Record initial versions for abort rollback (only once per table)
             let table_name = uni_store::backend::table_names::vertex_table_name(label);
-            if !self.initial_table_versions.contains_key(&table_name) {
-                let backend = self.backend.storage.backend();
-                let version = backend
-                    .get_table_version(&table_name)
-                    .await
-                    .map_err(UniError::Internal)?;
-                self.initial_table_versions.insert(table_name, version);
-            }
-
-            // Record main vertices table version for rollback
-            let main_table_name =
-                uni_store::backend::table_names::main_vertex_table_name().to_string();
-            if !self.initial_table_versions.contains_key(&main_table_name) {
-                let backend = self.backend.storage.backend();
-                let version = backend
-                    .get_table_version(&main_table_name)
-                    .await
-                    .map_err(UniError::Internal)?;
-                self.initial_table_versions
-                    .insert(main_table_name.clone(), version);
-            }
+            self.record_initial_version(&table_name).await?;
+            self.record_initial_version(uni_store::backend::table_names::main_vertex_table_name())
+                .await?;
 
             // Durably record the intent to mutate these tables BEFORE writing
             // any of them, so a crash between the per-label and main commits is
@@ -965,53 +967,24 @@ impl BulkWriter {
     ///
     /// Records initial table versions before first write for rollback support.
     /// Writes to both per-type delta tables and main edges table.
-    #[expect(
-        clippy::map_entry,
-        reason = "async code between contains_key and insert"
-    )]
     async fn flush_edges_buffer(&mut self, edge_type: &str) -> Result<()> {
         if let Some(entries) = self.pending_edges.remove(edge_type) {
             if entries.is_empty() {
                 return Ok(());
             }
 
-            let schema = self.backend.schema.schema();
-            let backend = self.backend.storage.backend();
-
-            // Record initial versions for abort rollback (FWD and BWD tables)
+            // Record initial versions for abort rollback (FWD, BWD, and main).
             let fwd_table_name =
                 uni_store::backend::table_names::delta_table_name(edge_type, "fwd");
-            if !self.initial_table_versions.contains_key(&fwd_table_name) {
-                let version = backend
-                    .get_table_version(&fwd_table_name)
-                    .await
-                    .map_err(UniError::Internal)?;
-                self.initial_table_versions.insert(fwd_table_name, version);
-            }
+            self.record_initial_version(&fwd_table_name).await?;
             let bwd_table_name =
                 uni_store::backend::table_names::delta_table_name(edge_type, "bwd");
-            if !self.initial_table_versions.contains_key(&bwd_table_name) {
-                let version = backend
-                    .get_table_version(&bwd_table_name)
-                    .await
-                    .map_err(UniError::Internal)?;
-                self.initial_table_versions.insert(bwd_table_name, version);
-            }
+            self.record_initial_version(&bwd_table_name).await?;
+            self.record_initial_version(uni_store::backend::table_names::main_edge_table_name())
+                .await?;
 
-            // Record main edges table version for rollback
-            let main_edge_table_name =
-                uni_store::backend::table_names::main_edge_table_name().to_string();
-            if !self
-                .initial_table_versions
-                .contains_key(&main_edge_table_name)
-            {
-                let version = backend
-                    .get_table_version(&main_edge_table_name)
-                    .await
-                    .map_err(UniError::Internal)?;
-                self.initial_table_versions
-                    .insert(main_edge_table_name.clone(), version);
-            }
+            let schema = self.backend.schema.schema();
+            let backend = self.backend.storage.backend();
 
             // Record the intent before writing any of the three edge datasets
             // (fwd delta, bwd delta, main edges) — see the vertex path (H9).
@@ -1028,7 +1001,6 @@ impl BulkWriter {
             let fwd_batch = fwd_ds
                 .build_record_batch(&fwd_entries, &schema)
                 .map_err(UniError::Internal)?;
-            let backend = self.backend.storage.backend();
             fwd_ds
                 .write_run(backend, fwd_batch)
                 .await

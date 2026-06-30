@@ -153,12 +153,7 @@ impl ProcedurePlugin for CreateProc {
 
         // `create` emits N rows, so it builds its own batch rather than using
         // the single-row `support::one_row_stream`.
-        let arr = Arc::new(StringArray::from(
-            values
-                .into_iter()
-                .map(Some)
-                .collect::<Vec<Option<String>>>(),
-        )) as Arc<dyn Array>;
+        let arr = Arc::new(StringArray::from(values)) as Arc<dyn Array>;
         support::one_row_stream(schema, arr, batch_err::CREATE, "create")
     }
 }
@@ -177,8 +172,7 @@ fn generate_uuid_v4() -> String {
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as u64);
     let tid = std::thread::current().id();
     // Use the thread-id's debug representation hash as entropy.
     let tid_hash = {

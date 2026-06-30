@@ -151,22 +151,24 @@ fn start_stream(
     let from_lsn = checkpoint.and_then(|c| c.lookup(name));
     match provider.start(CdcStartContext::new(from_lsn)) {
         Ok(stream) => {
-            if late {
-                tracing::info!(provider = %name, from_lsn = ?from_lsn, "CdcRuntime: late-registered provider started");
+            let kind = if late {
+                "late-registered provider"
             } else {
-                tracing::info!(provider = %name, from_lsn = ?from_lsn, "CdcRuntime: provider started");
-            }
+                "provider"
+            };
+            tracing::info!(provider = %name, from_lsn = ?from_lsn, "CdcRuntime: {kind} started");
             Some(ActiveStream {
                 name: name.to_owned(),
                 stream,
             })
         }
         Err(e) => {
-            if late {
-                tracing::warn!(provider = %name, error = %e, "CdcRuntime: late-registered provider start failed");
+            let detail = if late {
+                "late-registered provider start failed"
             } else {
-                tracing::warn!(provider = %name, error = %e, "CdcRuntime: provider start failed; skipping");
-            }
+                "provider start failed; skipping"
+            };
+            tracing::warn!(provider = %name, error = %e, "CdcRuntime: {detail}");
             None
         }
     }
@@ -218,7 +220,7 @@ impl CdcRuntime {
     #[must_use]
     pub fn spawn(
         registry: &Arc<PluginRegistry>,
-        commit_rx: broadcast::Receiver<Arc<CommitNotification>>,
+        mut commit_rx: broadcast::Receiver<Arc<CommitNotification>>,
         data_path: Option<PathBuf>,
         shutdown: &ShutdownHandle,
     ) -> Arc<Self> {
@@ -242,7 +244,6 @@ impl CdcRuntime {
         // Err (lagged or closed) we re-loop; on `recv` of an
         // `Arc<CommitNotification>` we forward.
         let runtime_clone = Arc::clone(&runtime);
-        let mut commit_rx = commit_rx;
         let mut shutdown_rx = shutdown.subscribe();
         let handle = tokio::spawn(async move {
             loop {
@@ -317,7 +318,7 @@ impl CdcRuntime {
         // event-row schema so downstream filters see consistent
         // column types.
         let mutations = notif.mutations.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(arrow_array::RecordBatch::new_empty(
+            Arc::new(arrow_array::RecordBatch::new_empty(
                 crate::triggers::event_row_schema(),
             ))
         });

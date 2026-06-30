@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Dragonscale Team
+
+//! Graceful shutdown coordination for the host's background tasks.
+//!
+//! A shared broadcast channel signals shutdown to every spawned driver
+//! (CDC, scheduler, deferral tick); tracked join handles are awaited up
+//! to a configurable timeout so tasks drain before the process exits.
+
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;

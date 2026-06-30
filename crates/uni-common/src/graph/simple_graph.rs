@@ -79,11 +79,9 @@ impl SimpleGraph {
 
     /// Adds a vertex to the graph. Returns true if the vertex was newly added.
     pub fn add_vertex(&mut self, vid: Vid) -> bool {
-        if self.vertices.contains_key(&vid) {
-            return false;
-        }
-        self.vertices.insert(vid, ());
-        true
+        // Single hash lookup: `insert` returns the previous value, so `None`
+        // means the vertex was not already present.
+        self.vertices.insert(vid, ()).is_none()
     }
 
     /// Removes a vertex and all its edges from the graph.
@@ -194,11 +192,7 @@ impl SimpleGraph {
 
     /// Checks if a vertex exists and returns it (identity).
     pub fn vertex(&self, vid: Vid) -> Option<Vid> {
-        if self.vertices.contains_key(&vid) {
-            Some(vid)
-        } else {
-            None
-        }
+        self.vertices.contains_key(&vid).then_some(vid)
     }
 
     /// Returns the total number of edges in the graph.

@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use colored::*;
+use colored::Colorize;
 use prettytable::{Cell, Row, Table};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -50,7 +50,7 @@ pub async fn run_repl(db: Uni) -> Result<()> {
                 break;
             }
             Err(err) => {
-                println!("Error: {:?}", err);
+                println!("Error: {err:?}");
                 break;
             }
         }
@@ -88,7 +88,7 @@ fn strip_query_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Print a query execution error to stdout in the REPL's red error style.
 fn print_query_error(e: impl std::fmt::Display) {
-    println!("{}", format!("Error: {}", e).red());
+    println!("{}", format!("Error: {e}").red());
 }
 
 pub async fn execute_query(db: &Uni, query: &str) {
@@ -129,10 +129,10 @@ fn print_results(results: QueryResult, duration: std::time::Duration) {
         if results.columns().is_empty() {
             println!(
                 "{}",
-                format!("Query executed successfully in {:?}", duration).dimmed()
+                format!("Query executed successfully in {duration:?}").dimmed()
             );
         } else {
-            println!("{}", format!("No results found ({:?})", duration).yellow());
+            println!("{}", format!("No results found ({duration:?})").yellow());
         }
         return;
     }
@@ -153,11 +153,9 @@ fn print_results(results: QueryResult, duration: std::time::Duration) {
             .values()
             .iter()
             .map(|v| {
-                let json_val = serde_json::Value::from(v.clone());
-                let s = if let serde_json::Value::String(str_val) = json_val {
-                    str_val
-                } else {
-                    json_val.to_string()
+                let s = match serde_json::Value::from(v.clone()) {
+                    serde_json::Value::String(str_val) => str_val,
+                    json_val => json_val.to_string(),
                 };
                 Cell::new(&s)
             })

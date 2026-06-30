@@ -248,12 +248,13 @@ impl ServerConfig {
 
     /// Returns a security warning if the config is insecure.
     pub fn security_warning(&self) -> Option<&'static str> {
-        if self.allowed_origins.contains(&"*".to_string()) && self.api_key.is_none() {
+        let allows_all_origins = self.allowed_origins.iter().any(|o| o == "*");
+        if allows_all_origins && self.api_key.is_none() {
             Some(
                 "Server config has permissive CORS (allow all origins) and no API key. \
                  This is insecure for production deployments.",
             )
-        } else if self.allowed_origins.contains(&"*".to_string()) {
+        } else if allows_all_origins {
             Some(
                 "Server config has permissive CORS (allow all origins). \
                  Consider restricting to specific origins for production.",
@@ -628,9 +629,7 @@ pub struct UniConfig {
 
 impl Default for UniConfig {
     fn default() -> Self {
-        let parallelism = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let parallelism = thread::available_parallelism().map_or(4, |n| n.get());
 
         Self {
             cache_size: 1024 * 1024 * 1024, // 1GB
@@ -667,13 +666,10 @@ impl Default for UniConfig {
             // suspected async-flush regressions and for the sync-only
             // benchmarks in `flush_pressure.rs`. Unset = default
             // behavior (true).
-            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH")
-                .ok()
-                .map(|v| {
-                    let v = v.to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "no")
-                })
-                .unwrap_or(true),
+            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH").map_or(true, |v| {
+                let v = v.to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "no")
+            }),
             max_pending_flushes: 2,
             drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,

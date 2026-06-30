@@ -221,13 +221,12 @@ where
         }
     }
     for uid in &keys_a {
-        match keys_b.contains(uid) {
-            true => {
-                let row_a = a.remove(uid).expect("key from keys_a");
-                let row_b = b.remove(uid).expect("shared key in b");
-                common.push((*uid, row_a, row_b));
-            }
-            false => mk_deleted(*uid, a.remove(uid).expect("key from keys_a")),
+        if keys_b.contains(uid) {
+            let row_a = a.remove(uid).expect("key from keys_a");
+            let row_b = b.remove(uid).expect("shared key in b");
+            common.push((*uid, row_a, row_b));
+        } else {
+            mk_deleted(*uid, a.remove(uid).expect("key from keys_a"));
         }
     }
     common
@@ -323,6 +322,15 @@ fn escape_backticks(s: &str) -> String {
     s.replace('`', "``")
 }
 
+/// Render an iterator of VID-bearing values as a comma-separated list of
+/// their `u64` ids for a Cypher `id(n) IN [...]` clause.
+fn vid_in_list(vids: impl IntoIterator<Item = u64>) -> String {
+    vids.into_iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve a set of UIDs to their primary VIDs in two queries
 /// regardless of the input size.
 ///
@@ -362,12 +370,13 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     // branch-isolated, so a single UID may have a fork-only VID and
     // a primary VID both registered — we keep both and let the
     // primary Cypher MATCH below decide which is real.
-    let candidates_per_uid: HashMap<UniId, Vec<Vid>> = match primary_storage.uid_index(label).ok() {
-        Some(uix) => match resolve_all_candidate_vids(&uix, uids).await {
-            Ok(m) => m,
-            Err(_) => return (out, true),
-        },
-        None => return (out, true),
+    // A missing index or a failed scan both degrade to "not present" (the
+    // `degraded` flag tells the caller the resulting inserts are unverified).
+    let Ok(uix) = primary_storage.uid_index(label) else {
+        return (out, true);
+    };
+    let Ok(candidates_per_uid) = resolve_all_candidate_vids(&uix, uids).await else {
+        return (out, true);
     };
     if candidates_per_uid.is_empty() {
         return (out, false);
@@ -379,15 +388,13 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
         .values()
         .flat_map(|vs| vs.iter().map(|v| v.as_u64()))
         .collect();
-    let vid_list: Vec<String> = vid_set.iter().map(|v| v.to_string()).collect();
     let cypher = format!(
         "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN id(n) AS vid",
         escape_backticks(label),
-        vid_list.join(", ")
+        vid_in_list(vid_set)
     );
-    let rs = match primary.query(&cypher).await {
-        Ok(rs) => rs,
-        Err(_) => return (out, true),
+    let Ok(rs) = primary.query(&cypher).await else {
+        return (out, true);
     };
     let primary_vids: HashSet<u64> = rs
         .rows()
@@ -443,14 +450,10 @@ async fn batch_resolve_primary_by_ext_id<Q: ForkQueryHost + ?Sized>(
     if ext_to_vid.is_empty() {
         return out;
     }
-    let vid_list: Vec<String> = ext_to_vid
-        .values()
-        .map(|v| v.as_u64().to_string())
-        .collect();
     let cypher = format!(
         "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN id(n) AS vid, n AS node",
         escape_backticks(label),
-        vid_list.join(", ")
+        vid_in_list(ext_to_vid.values().map(|v| v.as_u64()))
     );
     let Ok(rs) = primary.query(&cypher).await else {
         return out;
@@ -544,10 +547,15 @@ async fn resolve_all_candidate_vids(
 }
 
 fn uid_to_hex(uid: &UniId) -> String {
-    uid.as_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    use std::fmt::Write as _;
+
+    let bytes = uid.as_bytes();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Infallible: writing to a `String` never errors.
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 // ============================================================================
@@ -803,14 +811,11 @@ where
                     else {
                         continue;
                     };
-                    let a_label = match a.labels.first() {
-                        Some(l) => l.clone(),
-                        None => continue,
+                    let (Some(a_label), Some(b_label)) = (a.labels.first(), b.labels.first())
+                    else {
+                        continue;
                     };
-                    let b_label = match b.labels.first() {
-                        Some(l) => l.clone(),
-                        None => continue,
-                    };
+                    let (a_label, b_label) = (a_label.clone(), b_label.clone());
                     let src_uid = VertexDataset::compute_vertex_uid(
                         &a_label,
                         ext_id_for(&fork_ext_ids, a.vid),
@@ -885,15 +890,13 @@ where
                         resolved_pairs.iter().map(|(s, _)| s.as_u64()).collect();
                     let dst_vids: HashSet<u64> =
                         resolved_pairs.iter().map(|(_, d)| d.as_u64()).collect();
-                    let src_list: Vec<String> = src_vids.iter().map(|v| v.to_string()).collect();
-                    let dst_list: Vec<String> = dst_vids.iter().map(|v| v.to_string()).collect();
                     let dedup_cypher = format!(
                         "MATCH (a)-[r:`{}`]->(b) \
                          WHERE id(a) IN [{}] AND id(b) IN [{}] \
                          RETURN a, r, b",
                         escape_backticks(edge_type),
-                        src_list.join(", "),
-                        dst_list.join(", "),
+                        vid_in_list(src_vids),
+                        vid_in_list(dst_vids),
                     );
                     if let Ok(rs) = primary.query(&dedup_cypher).await {
                         for row in rs.rows() {

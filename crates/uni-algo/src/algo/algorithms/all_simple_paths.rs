@@ -46,13 +46,11 @@ impl Algorithm for AllSimplePaths {
     }
 
     fn run(graph: &GraphProjection, config: Self::Config) -> Self::Result {
-        let source_slot = match graph.to_slot(config.source) {
-            Some(s) => s,
-            None => return AllSimplePathsResult { paths: Vec::new() },
+        let Some(source_slot) = graph.to_slot(config.source) else {
+            return AllSimplePathsResult { paths: Vec::new() };
         };
-        let target_slot = match graph.to_slot(config.target) {
-            Some(s) => s,
-            None => return AllSimplePathsResult { paths: Vec::new() },
+        let Some(target_slot) = graph.to_slot(config.target) else {
+            return AllSimplePathsResult { paths: Vec::new() };
         };
 
         let mut paths = Vec::new();

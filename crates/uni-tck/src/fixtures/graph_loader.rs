@@ -12,6 +12,12 @@ pub struct GraphLoader {
     graphs_dir: PathBuf,
 }
 
+impl Default for GraphLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GraphLoader {
     pub fn new() -> Self {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -25,16 +31,15 @@ impl GraphLoader {
 
         // Read JSON metadata
         let metadata_path = graph_dir.join(format!("{}.json", name));
-        let metadata: GraphMetadata =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_path).with_context(|| {
-                format!("Failed to read graph metadata: {}", metadata_path.display())
-            })?)
-            .with_context(|| {
-                format!(
-                    "Failed to parse graph metadata: {}",
-                    metadata_path.display()
-                )
-            })?;
+        let metadata_json = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!("Failed to read graph metadata: {}", metadata_path.display())
+        })?;
+        let metadata: GraphMetadata = serde_json::from_str(&metadata_json).with_context(|| {
+            format!(
+                "Failed to parse graph metadata: {}",
+                metadata_path.display()
+            )
+        })?;
 
         // Execute each Cypher script
         for script_name in &metadata.scripts {

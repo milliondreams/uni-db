@@ -932,29 +932,28 @@ fn build_locy_comparison_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, Pa
     build_locy_additive_expression(children.into_iter().next().unwrap())
 }
 
-fn build_locy_additive_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
-    let children: Vec<_> = pair.into_inner().collect();
-    if children.len() == 1 {
-        return build_locy_multiplicative_expression(children.into_iter().next().unwrap());
-    }
-
-    // Pattern: term (op term)*
-    let mut iter = children.into_iter();
-    let mut result = build_locy_multiplicative_expression(iter.next().unwrap())?;
+/// Left-fold an interleaved `term (op term)*` precedence level into a
+/// left-associative `LocyExpr::BinaryOp` chain.
+///
+/// Operands are built with `build_operand`; operator tokens are mapped with
+/// `map_op`, which returns `None` for an unexpected rule (producing an error
+/// naming `level` for diagnostics). A single operand is returned unwrapped.
+fn fold_interleaved_binary(
+    pair: Pair<LocyRule>,
+    level: &str,
+    map_op: impl Fn(LocyRule) -> Option<LocyBinaryOp>,
+    build_operand: fn(Pair<LocyRule>) -> Result<LocyExpr, ParseError>,
+) -> Result<LocyExpr, ParseError> {
+    let mut iter = pair.into_inner();
+    let mut result = build_operand(iter.next().unwrap())?;
     while let Some(op_pair) = iter.next() {
-        let op = match op_pair.as_rule() {
-            LocyRule::plus => LocyBinaryOp::Add,
-            LocyRule::minus => LocyBinaryOp::Sub,
-            _ => {
-                // This is a multiplicative expression, not an operator
-                // This shouldn't happen with correct grammar
-                return Err(ParseError::new(format!(
-                    "Unexpected token in additive expression: {:?}",
-                    op_pair.as_rule()
-                )));
-            }
-        };
-        let right = build_locy_multiplicative_expression(iter.next().unwrap())?;
+        let op = map_op(op_pair.as_rule()).ok_or_else(|| {
+            ParseError::new(format!(
+                "Unexpected token in {level} expression: {:?}",
+                op_pair.as_rule()
+            ))
+        })?;
+        let right = build_operand(iter.next().unwrap())?;
         result = LocyExpr::BinaryOp {
             left: Box::new(result),
             op,
@@ -964,34 +963,31 @@ fn build_locy_additive_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, Pars
     Ok(result)
 }
 
-fn build_locy_multiplicative_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
-    let children: Vec<_> = pair.into_inner().collect();
-    if children.len() == 1 {
-        return build_locy_power_expression(children.into_iter().next().unwrap());
-    }
+fn build_locy_additive_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
+    fold_interleaved_binary(
+        pair,
+        "additive",
+        |rule| match rule {
+            LocyRule::plus => Some(LocyBinaryOp::Add),
+            LocyRule::minus => Some(LocyBinaryOp::Sub),
+            _ => None,
+        },
+        build_locy_multiplicative_expression,
+    )
+}
 
-    let mut iter = children.into_iter();
-    let mut result = build_locy_power_expression(iter.next().unwrap())?;
-    while let Some(op_pair) = iter.next() {
-        let op = match op_pair.as_rule() {
-            LocyRule::star => LocyBinaryOp::Mul,
-            LocyRule::slash => LocyBinaryOp::Div,
-            LocyRule::percent => LocyBinaryOp::Mod,
-            _ => {
-                return Err(ParseError::new(format!(
-                    "Unexpected token in multiplicative expression: {:?}",
-                    op_pair.as_rule()
-                )));
-            }
-        };
-        let right = build_locy_power_expression(iter.next().unwrap())?;
-        result = LocyExpr::BinaryOp {
-            left: Box::new(result),
-            op,
-            right: Box::new(right),
-        };
-    }
-    Ok(result)
+fn build_locy_multiplicative_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
+    fold_interleaved_binary(
+        pair,
+        "multiplicative",
+        |rule| match rule {
+            LocyRule::star => Some(LocyBinaryOp::Mul),
+            LocyRule::slash => Some(LocyBinaryOp::Div),
+            LocyRule::percent => Some(LocyBinaryOp::Mod),
+            _ => None,
+        },
+        build_locy_power_expression,
+    )
 }
 
 fn build_locy_power_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {

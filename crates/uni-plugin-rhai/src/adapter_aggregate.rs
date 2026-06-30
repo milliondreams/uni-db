@@ -132,7 +132,7 @@ impl PluginAccumulator for RhaiAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<(), FnError> {
         self.check_init()?;
         let accumulate_fn = format!("{}_accumulate", self.name);
-        let n = values.first().map(|a| a.len()).unwrap_or(0);
+        let n = values.first().map_or(0, |a| a.len());
 
         for row in 0..n {
             let mut dyn_args: Vec<Dynamic> = Vec::with_capacity(values.len() + 1);

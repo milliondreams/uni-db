@@ -338,18 +338,13 @@ impl ExecutionPlan for StorageScanExec {
 
         let inner = stream::once(async move {
             let _ = full_schema_for_stream;
-            let res = storage.read_batch(&table, predicate.as_ref()).await;
-            match res {
+            match storage.read_batch(&table, predicate.as_ref()).await {
                 Ok(s) => Ok(s),
                 Err(e) if e.code == STORAGE_FILTER_UNENCODABLE => {
                     storage.read_batch(&table, None).await.map_err(fn_err_to_df)
                 }
                 Err(e) => Err(fn_err_to_df(e)),
             }
-        })
-        .map(|res| match res {
-            Ok(stream) => Ok(stream),
-            Err(e) => Err(e),
         })
         .try_flatten();
 
@@ -491,12 +486,12 @@ pub struct StorageFilterPushdown;
 
 impl SupportsFilterPushdown for StorageFilterPushdown {
     fn push_filters(&self, filters: &[Expr]) -> FilterApplication {
-        let mut fully_handled = Vec::new();
-        for (idx, expr) in filters.iter().enumerate() {
-            if datafusion::sql::unparser::expr_to_sql(expr).is_ok() {
-                fully_handled.push(idx);
-            }
-        }
+        let fully_handled = filters
+            .iter()
+            .enumerate()
+            .filter(|(_, expr)| datafusion::sql::unparser::expr_to_sql(expr).is_ok())
+            .map(|(idx, _)| idx)
+            .collect();
         FilterApplication {
             fully_handled,
             partially_handled: Vec::new(),

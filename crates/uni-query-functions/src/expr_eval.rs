@@ -31,14 +31,8 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
     }
 
     match op {
-        BinaryOp::Eq => Ok(match cypher_eq(left, right) {
-            Some(b) => Value::Bool(b),
-            None => Value::Null,
-        }),
-        BinaryOp::NotEq => Ok(match cypher_eq(left, right) {
-            Some(b) => Value::Bool(!b),
-            None => Value::Null,
-        }),
+        BinaryOp::Eq => Ok(cypher_eq(left, right).map_or(Value::Null, Value::Bool)),
+        BinaryOp::NotEq => Ok(cypher_eq(left, right).map_or(Value::Null, |b| Value::Bool(!b))),
         BinaryOp::And => {
             // Three-valued logic: false dominates, null propagates with true
             match (left.as_bool(), right.as_bool()) {
@@ -1220,13 +1214,7 @@ fn eval_nodes(arg: &Value) -> Result<Value> {
         Value::Path(p) => Ok(Value::List(
             p.nodes.iter().map(|n| Value::Node(n.clone())).collect(),
         )),
-        Value::Map(map) => {
-            if let Some(nodes) = map.get("nodes") {
-                Ok(nodes.clone())
-            } else {
-                Ok(Value::Null)
-            }
-        }
+        Value::Map(map) => Ok(map.get("nodes").cloned().unwrap_or(Value::Null)),
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("nodes() expects a Path")),
     }
@@ -1237,13 +1225,7 @@ fn eval_relationships(arg: &Value) -> Result<Value> {
         Value::Path(p) => Ok(Value::List(
             p.edges.iter().map(|e| Value::Edge(e.clone())).collect(),
         )),
-        Value::Map(map) => {
-            if let Some(rels) = map.get("relationships") {
-                Ok(rels.clone())
-            } else {
-                Ok(Value::Null)
-            }
-        }
+        Value::Map(map) => Ok(map.get("relationships").cloned().unwrap_or(Value::Null)),
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("relationships() expects a Path")),
     }
@@ -2008,7 +1990,7 @@ fn eval_valid_at(args: &[Value]) -> Result<Value> {
     };
 
     // Half-open interval: [valid_from, valid_to)
-    let is_valid = valid_from <= query_time && valid_to.map(|vt| query_time < vt).unwrap_or(true);
+    let is_valid = valid_from <= query_time && valid_to.is_none_or(|vt| query_time < vt);
 
     Ok(Value::Bool(is_valid))
 }

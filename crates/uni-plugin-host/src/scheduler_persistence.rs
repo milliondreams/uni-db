@@ -224,11 +224,8 @@ impl SchedulerPersistence for SystemLabelSchedulerPersistence {
                 // are never written by this backend (every `QName` it persists
                 // is namespaced) and would only appear from hand-edited or
                 // foreign-written sidecars.
-                let parts: Vec<&str> = r.qname.rsplitn(2, '.').collect();
-                let qname = match parts.as_slice() {
-                    [local, ns] => QName::new(*ns, *local),
-                    _ => return None,
-                };
+                let (ns, local) = r.qname.rsplit_once('.')?;
+                let qname = QName::new(ns, local);
                 Some(SchedulerJobRecord {
                     id: qname,
                     // Restored jobs always re-enter as `Pending`: on restart the

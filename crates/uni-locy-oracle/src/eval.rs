@@ -18,6 +18,11 @@ use crate::ir::{OracleClause, OracleProgram, Tuple};
 /// A relation: the set of derived (or base) fact tuples for one rule.
 pub type Relation = HashSet<Tuple>;
 
+/// Whether `fact` begins with `subj` (matching on the leading subject columns).
+fn matches_subject(fact: &[i64], subj: &[i64]) -> bool {
+    fact.len() >= subj.len() && fact[..subj.len()] == *subj
+}
+
 /// Evaluates a program to its least fixpoint, returning each rule's relation.
 ///
 /// Strata are processed in order; each is driven to a fixpoint (re-derive every
@@ -86,7 +91,7 @@ fn eval_clause(clause: &OracleClause, rels: &HashMap<String, Relation>) -> Vec<T
         for b in &bindings {
             let subj: Tuple = r.subjects.iter().map(|s| b[s]).collect();
             for fact in target_rel {
-                if fact.len() >= subj.len() && fact[..subj.len()] == subj[..] {
+                if matches_subject(fact, &subj) {
                     let mut nb = b.clone();
                     if let Some(t) = &r.target {
                         nb.insert(t.clone(), fact[subj.len()]);
@@ -104,9 +109,7 @@ fn eval_clause(clause: &OracleClause, rels: &HashMap<String, Relation>) -> Vec<T
         let banned = rels.get(&r.rule).unwrap_or(&empty);
         bindings.retain(|b| {
             let subj: Tuple = r.subjects.iter().map(|s| b[s]).collect();
-            !banned
-                .iter()
-                .any(|fact| fact.len() >= subj.len() && fact[..subj.len()] == subj[..])
+            !banned.iter().any(|fact| matches_subject(fact, &subj))
         });
     }
 

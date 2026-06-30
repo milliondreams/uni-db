@@ -196,13 +196,9 @@ where
         }
         // The slot is reserved; construct a fresh instance. If
         // construction fails, give the slot back.
-        let inst = match (self.factory.lock())() {
-            Ok(v) => v,
-            Err(err) => {
-                self.metrics.live.fetch_sub(1, Ordering::SeqCst);
-                return Err(err);
-            }
-        };
+        let inst = (self.factory.lock())().inspect_err(|_| {
+            self.metrics.live.fetch_sub(1, Ordering::SeqCst);
+        })?;
         self.metrics.misses.fetch_add(1, Ordering::SeqCst);
         Ok(inst)
     }

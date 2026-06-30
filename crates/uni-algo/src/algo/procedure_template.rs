@@ -167,11 +167,11 @@ pub trait GraphAlgoAdapter: Send + Sync + 'static {
     /// non-standard knobs (e.g. direction-derived reverse, as in
     /// `degree_centrality`).
     fn customize_projection(builder: ProjectionBuilder, args: &[Value]) -> ProjectionBuilder {
-        let builder = match Self::weight_arg_index().and_then(|i| args.get(i)) {
-            Some(arg) => match arg.as_str() {
-                Some(prop) => builder.weight_property(prop),
-                None => builder,
-            },
+        let weight_prop = Self::weight_arg_index()
+            .and_then(|i| args.get(i))
+            .and_then(Value::as_str);
+        let builder = match weight_prop {
+            Some(prop) => builder.weight_property(prop),
             None => builder,
         };
         builder.include_reverse(Self::include_reverse())

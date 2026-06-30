@@ -126,13 +126,10 @@ impl BaseRvSet {
             Self::Inline { bits, base } => {
                 let bits = *bits;
                 let base = *base;
-                Box::new((0u32..64).filter_map(move |i| {
-                    if (bits >> i) & 1 == 1 {
-                        Some(BaseRv(base + i))
-                    } else {
-                        None
-                    }
-                }))
+                Box::new(
+                    (0u32..64)
+                        .filter_map(move |i| ((bits >> i) & 1 == 1).then_some(BaseRv(base + i))),
+                )
             }
             Self::Vec(v) => Box::new(v.iter().map(|x| BaseRv(*x))),
         }

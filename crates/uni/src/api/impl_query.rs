@@ -131,6 +131,108 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     }
 }
 
+/// Map a streaming-execution error into the appropriate `UniError`.
+///
+/// The streaming cursor paths cannot encounter cancellation or timeout (those
+/// are enforced around the eager `execute` call), so this is the
+/// [`into_execution_error`] classification minus those two arms.
+fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
+    let msg = normalize_error_message(&e.to_string(), cypher);
+    if msg.contains("TypeError:") {
+        UniError::Type {
+            expected: msg,
+            actual: String::new(),
+        }
+    } else if msg.starts_with("ConstraintVerificationFailed:") {
+        UniError::Constraint { message: msg }
+    } else {
+        UniError::Query {
+            message: msg,
+            query: Some(cypher.to_string()),
+        }
+    }
+}
+
+/// Determine the output column order for a result set.
+///
+/// Uses the planner's projection order when available; otherwise falls back to
+/// the first row's keys, sorted for deterministic output. An empty result set
+/// yields no columns.
+fn columns_for_results(
+    results: &[HashMap<String, ApiValue>],
+    projection_order: Option<Vec<String>>,
+) -> Arc<Vec<String>> {
+    if results.is_empty() {
+        Arc::new(vec![])
+    } else if let Some(order) = projection_order {
+        Arc::new(order)
+    } else {
+        let mut cols: Vec<String> = results[0].keys().cloned().collect();
+        cols.sort();
+        Arc::new(cols)
+    }
+}
+
+/// Project per-column-name result maps into ordered [`Row`]s.
+///
+/// When `normalize` is set, each value passes through
+/// [`ResultNormalizer::normalize_value`] so Node/Edge/Path types are produced;
+/// the streaming cursor paths skip normalization (it is applied downstream).
+/// Missing columns become `Null`.
+fn rows_for_results(
+    results: Vec<HashMap<String, ApiValue>>,
+    columns: &Arc<Vec<String>>,
+    normalize: bool,
+) -> Vec<Row> {
+    results
+        .into_iter()
+        .map(|map| {
+            let mut values = Vec::with_capacity(columns.len());
+            for col in columns.iter() {
+                let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                let value = if normalize {
+                    ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null)
+                } else {
+                    value
+                };
+                values.push(value);
+            }
+            Row::new(columns.clone(), values)
+        })
+        .collect()
+}
+
+/// Reject a result set whose estimated in-memory size exceeds `max_mem` bytes.
+///
+/// A `max_mem` of `0` disables the limit. The estimate is a coarse per-value
+/// size plus a fixed 64-byte overhead, matching the historical accounting.
+fn enforce_memory_limit(
+    results: &[HashMap<String, ApiValue>],
+    max_mem: usize,
+    cypher: &str,
+) -> Result<()> {
+    if max_mem == 0 {
+        return Ok(());
+    }
+    let estimated_bytes: usize = results
+        .iter()
+        .map(|row| {
+            row.values()
+                .map(|v| std::mem::size_of_val(v) + 64)
+                .sum::<usize>()
+        })
+        .sum();
+    if estimated_bytes > max_mem {
+        return Err(UniError::Query {
+            message: format!(
+                "Query exceeded memory limit ({estimated_bytes} bytes > {max_mem} byte limit)"
+            ),
+            query: Some(cypher.to_string()),
+        });
+    }
+    Ok(())
+}
+
 /// Extract projection column names from a LogicalPlan, preserving query order.
 /// Returns None if the plan doesn't have projections at the top level.
 fn extract_projection_order(plan: &LogicalPlan) -> Option<Vec<String>> {
@@ -182,6 +284,25 @@ impl crate::api::UniInner {
         }
     }
 
+    /// Install this database's session-constant state onto a fresh executor.
+    ///
+    /// Sets the Xervo runtime, procedure registry, the custom-function registry
+    /// (only when non-empty, to avoid a needless clone), and the writer handle.
+    /// The per-query `config` and transaction overrides are applied separately
+    /// by callers.
+    fn apply_session_executor_state(&self, executor: &mut uni_query::Executor) {
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+    }
+
     /// Explain a Cypher query plan without executing it.
     pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
@@ -215,18 +336,8 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
 
-        // Extract projection order
         let projection_order = extract_projection_order(&logical_plan);
 
         let (results, profile_output) = executor
@@ -234,31 +345,8 @@ impl crate::api::UniInner {
             .await
             .map_err(|e| into_execution_error(e, cypher))?;
 
-        // Convert results to QueryResult
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    // Normalize to ensure proper Node/Edge/Path types
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect();
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         Ok((
             QueryResult::new(columns, rows, Vec::new(), Default::default()),
@@ -283,16 +371,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
         let projection_order_for_rows = projection_order.clone();
@@ -304,49 +383,12 @@ impl crate::api::UniInner {
         // Convert raw hash-map batches to Row batches, chunked by batch_size.
         let row_stream = stream
             .map(move |batch_res| {
-                let results = batch_res.map_err(|e| {
-                    let msg = normalize_error_message(&e.to_string(), &cypher_for_error);
-                    if msg.contains("TypeError:") {
-                        UniError::Type {
-                            expected: msg,
-                            actual: String::new(),
-                        }
-                    } else if msg.starts_with("ConstraintVerificationFailed:") {
-                        UniError::Constraint { message: msg }
-                    } else {
-                        UniError::Query {
-                            message: msg,
-                            query: Some(cypher_for_error.clone()),
-                        }
-                    }
-                })?;
-
+                let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
                 if results.is_empty() {
                     return Ok(vec![]);
                 }
-
-                // Determine columns for this batch
-                let columns = if let Some(order) = &projection_order_for_rows {
-                    Arc::new(order.clone())
-                } else {
-                    let mut cols: Vec<String> = results[0].keys().cloned().collect();
-                    cols.sort();
-                    Arc::new(cols)
-                };
-
-                let rows = results
-                    .into_iter()
-                    .map(|map| {
-                        let mut values = Vec::with_capacity(columns.len());
-                        for col in columns.iter() {
-                            let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                            values.push(value);
-                        }
-                        Row::new(columns.clone(), values)
-                    })
-                    .collect::<Vec<Row>>();
-
-                Ok(rows)
+                let columns = columns_for_results(&results, projection_order_for_rows.clone());
+                Ok(rows_for_results(results, &columns, false))
             })
             // Re-chunk into batch_size-sized pieces
             .flat_map(
@@ -361,11 +403,7 @@ impl crate::api::UniInner {
             );
 
         // We need columns ahead of time for QueryCursor if possible.
-        let columns = if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            Arc::new(vec![])
-        };
+        let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
 
         Ok(QueryCursor::new(columns, Box::pin(row_stream)))
     }
@@ -502,31 +540,8 @@ impl crate::api::UniInner {
             .map_err(|e| into_execution_error(e, cypher))?;
         let exec_time = exec_start.elapsed();
 
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows: Vec<Row> = {
-            results
-                .into_iter()
-                .map(|map| {
-                    let mut values = Vec::with_capacity(columns.len());
-                    for col in columns.iter() {
-                        let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                        let normalized =
-                            ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                        values.push(normalized);
-                    }
-                    Row::new(columns.clone(), values)
-                })
-                .collect()
-        };
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         let metrics = QueryMetrics {
             parse_time,
@@ -585,16 +600,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
         executor.set_read_snapshot(read_snapshot);
         if let Some(r) = id_reservoir {
@@ -608,29 +614,8 @@ impl crate::api::UniInner {
             .await
             .map_err(|e| into_execution_error(e, cypher))?;
 
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows: Vec<Row> = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect();
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         Ok((
             QueryResult::new(columns, rows, executor.take_warnings(), Default::default()),
@@ -670,16 +655,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
 
         let projection_order = extract_projection_order(&logical_plan);
@@ -691,48 +667,12 @@ impl crate::api::UniInner {
 
         let row_stream = stream
             .map(move |batch_res| {
-                let results = batch_res.map_err(|e| {
-                    let msg = normalize_error_message(&e.to_string(), &cypher_for_error);
-                    if msg.contains("TypeError:") {
-                        UniError::Type {
-                            expected: msg,
-                            actual: String::new(),
-                        }
-                    } else if msg.starts_with("ConstraintVerificationFailed:") {
-                        UniError::Constraint { message: msg }
-                    } else {
-                        UniError::Query {
-                            message: msg,
-                            query: Some(cypher_for_error.clone()),
-                        }
-                    }
-                })?;
-
+                let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
                 if results.is_empty() {
                     return Ok(vec![]);
                 }
-
-                let columns = if let Some(order) = &projection_order_for_rows {
-                    Arc::new(order.clone())
-                } else {
-                    let mut cols: Vec<String> = results[0].keys().cloned().collect();
-                    cols.sort();
-                    Arc::new(cols)
-                };
-
-                let rows = results
-                    .into_iter()
-                    .map(|map| {
-                        let mut values = Vec::with_capacity(columns.len());
-                        for col in columns.iter() {
-                            let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                            values.push(value);
-                        }
-                        Row::new(columns.clone(), values)
-                    })
-                    .collect::<Vec<Row>>();
-
-                Ok(rows)
+                let columns = columns_for_results(&results, projection_order_for_rows.clone());
+                Ok(rows_for_results(results, &columns, false))
             })
             .flat_map(
                 move |batch_res: std::result::Result<Vec<Row>, UniError>| match batch_res {
@@ -745,11 +685,7 @@ impl crate::api::UniInner {
                 },
             );
 
-        let columns = if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            Arc::new(vec![])
-        };
+        let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
 
         Ok(QueryCursor::new(columns, Box::pin(row_stream)))
     }
@@ -852,16 +788,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
 
         let projection_order = extract_projection_order(&logical_plan);
@@ -873,29 +800,8 @@ impl crate::api::UniInner {
             .map_err(|e| into_execution_error(e, cypher))?;
         let exec_time = exec_start.elapsed();
 
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect::<Vec<Row>>();
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         let metrics = QueryMetrics {
             parse_time: std::time::Duration::ZERO,
@@ -939,16 +845,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
@@ -975,51 +872,10 @@ impl crate::api::UniInner {
             });
         }
 
-        // Enforce per-query memory limit on the result set.
-        let max_mem = config.max_query_memory;
-        if max_mem > 0 {
-            let estimated_bytes: usize = results
-                .iter()
-                .map(|row| {
-                    row.values()
-                        .map(|v| std::mem::size_of_val(v) + 64)
-                        .sum::<usize>()
-                })
-                .sum();
-            if estimated_bytes > max_mem {
-                return Err(UniError::Query {
-                    message: format!(
-                        "Query exceeded memory limit ({} bytes > {} byte limit)",
-                        estimated_bytes, max_mem
-                    ),
-                    query: Some(cypher.to_string()),
-                });
-            }
-        }
+        enforce_memory_limit(&results, config.max_query_memory, cypher)?;
 
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect::<Vec<Row>>();
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         let metrics = QueryMetrics {
             parse_time: std::time::Duration::ZERO,
@@ -1088,16 +944,7 @@ impl crate::api::UniInner {
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
+        self.apply_session_executor_state(&mut executor);
         if let Some(token) = cancellation_token {
             executor.set_cancellation_token(token);
         }
@@ -1126,50 +973,10 @@ impl crate::api::UniInner {
             });
         }
 
-        let max_mem = config.max_query_memory;
-        if max_mem > 0 {
-            let estimated_bytes: usize = results
-                .iter()
-                .map(|row| {
-                    row.values()
-                        .map(|v| std::mem::size_of_val(v) + 64)
-                        .sum::<usize>()
-                })
-                .sum();
-            if estimated_bytes > max_mem {
-                return Err(UniError::Query {
-                    message: format!(
-                        "Query exceeded memory limit ({} bytes > {} byte limit)",
-                        estimated_bytes, max_mem
-                    ),
-                    query: Some(cypher.to_string()),
-                });
-            }
-        }
+        enforce_memory_limit(&results, config.max_query_memory, cypher)?;
 
-        let columns = if results.is_empty() {
-            Arc::new(vec![])
-        } else if let Some(order) = projection_order {
-            Arc::new(order)
-        } else {
-            let mut cols: Vec<String> = results[0].keys().cloned().collect();
-            cols.sort();
-            Arc::new(cols)
-        };
-
-        let rows: Vec<Row> = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect();
+        let columns = columns_for_results(&results, projection_order);
+        let rows = rows_for_results(results, &columns, true);
 
         let metrics = QueryMetrics {
             parse_time: std::time::Duration::ZERO,

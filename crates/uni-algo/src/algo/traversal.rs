@@ -68,17 +68,17 @@ impl<'a> DirectTraversal<'a> {
         min_hops: u32,
         max_hops: u32,
     ) -> Option<Path> {
-        // Handle special case: source == target
+        // Handle special case: source == target. A self-path has 0 edges, so
+        // it only satisfies the bound when `min_hops == 0`.
         if source == target {
-            if min_hops == 0 {
-                return Some(Path {
+            return if min_hops == 0 {
+                Some(Path {
                     vertices: vec![source],
                     edges: Vec::new(),
-                });
+                })
             } else {
-                // Need at least min_hops edges, but source == target with no edges is 0 hops
-                return None;
-            }
+                None
+            };
         }
 
         // Invalid configuration
@@ -173,16 +173,17 @@ impl<'a> DirectTraversal<'a> {
         min_hops: u32,
         max_hops: u32,
     ) -> Vec<Path> {
-        // Handle special case: source == target
+        // Handle special case: source == target. A self-path has 0 edges, so
+        // it only satisfies the bound when `min_hops == 0`.
         if source == target {
-            if min_hops == 0 {
-                return vec![Path {
+            return if min_hops == 0 {
+                vec![Path {
                     vertices: vec![source],
                     edges: Vec::new(),
-                }];
+                }]
             } else {
-                return Vec::new();
-            }
+                Vec::new()
+            };
         }
 
         // Invalid configuration
@@ -255,7 +256,10 @@ impl<'a> DirectTraversal<'a> {
     }
 
     /// DFS to enumerate all shortest paths.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recursive DFS threads its full traversal state (path, edges, visited, accumulator) through each call"
+    )]
     fn enumerate_shortest_paths(
         &self,
         current: Vid,

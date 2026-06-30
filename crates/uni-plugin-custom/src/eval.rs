@@ -335,10 +335,7 @@ fn eval_case(
     else_expr: Option<&Expr>,
     params: &HashMap<String, Value>,
 ) -> Result<Value, EvalError> {
-    let scrutinee_val = match scrutinee {
-        Some(e) => Some(eval_expr(e, params)?),
-        None => None,
-    };
+    let scrutinee_val = scrutinee.map(|e| eval_expr(e, params)).transpose()?;
     for (w, t) in when_then {
         let w_val = eval_expr(w, params)?;
         let matched = match &scrutinee_val {

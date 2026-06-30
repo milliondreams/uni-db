@@ -61,7 +61,7 @@ fn ann_type(o: &VectorIndexOpts, t: Option<&str>) -> VectorIndexType {
             ef_construction: o.ef_construction.unwrap_or(200),
             num_partitions: o.partitions,
         },
-        Some("hnsw") | Some("hnsw_sq") => VectorIndexType::HnswSq {
+        Some("hnsw" | "hnsw_sq") => VectorIndexType::HnswSq {
             m: o.m.unwrap_or(16),
             ef_construction: o.ef_construction.unwrap_or(200),
             num_partitions: o.partitions,
@@ -107,7 +107,7 @@ pub fn build_vector_index_type(o: &VectorIndexOpts) -> VectorIndexType {
 /// (the ColBERT/vector default). Shared by both paths so the error text matches.
 pub fn parse_vector_metric(s: Option<&str>) -> Result<DistanceMetric> {
     match s.map(|m| m.to_ascii_lowercase()).as_deref() {
-        Some("l2") | Some("euclidean") => Ok(DistanceMetric::L2),
+        Some("l2" | "euclidean") => Ok(DistanceMetric::L2),
         Some("dot") => Ok(DistanceMetric::Dot),
         Some("cosine") | None => Ok(DistanceMetric::Cosine),
         Some(other) => Err(anyhow::anyhow!(

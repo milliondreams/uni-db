@@ -33,7 +33,7 @@ impl VectorClock {
     pub fn merge_clock(&mut self, other: &VectorClock) {
         for (actor, &count) in &other.clocks {
             let entry = self.clocks.entry(actor.clone()).or_insert(0);
-            *entry = std::cmp::max(*entry, count);
+            *entry = (*entry).max(count);
         }
     }
 

@@ -353,19 +353,19 @@ impl fmt::Display for PromotePattern {
             Self::Vertex {
                 label,
                 where_clause: Some(w),
-            } => write!(f, "(:{} WHERE {})", label, w),
+            } => write!(f, "(:{label} WHERE {w})"),
             Self::Vertex {
                 label,
                 where_clause: None,
-            } => write!(f, "(:{})", label),
+            } => write!(f, "(:{label})"),
             Self::Edge {
                 edge_type,
                 where_clause: Some(w),
-            } => write!(f, "[:{} WHERE {}]", edge_type, w),
+            } => write!(f, "[:{edge_type} WHERE {w}]"),
             Self::Edge {
                 edge_type,
                 where_clause: None,
-            } => write!(f, "[:{}]", edge_type),
+            } => write!(f, "[:{edge_type}]"),
         }
     }
 }

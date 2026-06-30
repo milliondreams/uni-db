@@ -236,10 +236,7 @@ fn parse_date_only_component(
 
 /// Strip timezone suffix from a datetime string, returning (cleaned, offset_secs).
 fn strip_timezone(s: &str) -> (&str, i32) {
-    if let Some(stripped) = s.strip_suffix('Z') {
-        return (stripped, 0);
-    }
-    if let Some(stripped) = s.strip_suffix('z') {
+    if let Some(stripped) = s.strip_suffix(['Z', 'z']) {
         return (stripped, 0);
     }
 

@@ -194,18 +194,11 @@ impl Ord for Btic {
 
 impl fmt::Display for Btic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let lo_str = if self.lo == NEG_INF {
-            "-inf".to_string()
-        } else {
-            format_ms_as_datetime(self.lo)
-        };
-        let hi_str = if self.hi == POS_INF {
-            "+inf".to_string()
-        } else {
-            format_ms_as_datetime(self.hi)
-        };
-
-        write!(f, "[{lo_str}, {hi_str})")?;
+        f.write_str("[")?;
+        write_bound(f, self.lo, NEG_INF, "-inf")?;
+        f.write_str(", ")?;
+        write_bound(f, self.hi, POS_INF, "+inf")?;
+        f.write_str(")")?;
 
         // Append granularity info
         if self.lo != NEG_INF && self.hi != POS_INF {
@@ -251,15 +244,30 @@ impl fmt::Debug for Btic {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Format milliseconds since epoch as an ISO 8601 datetime string.
-fn format_ms_as_datetime(ms: i64) -> String {
+/// Write a bound to the formatter: the sentinel marker when `value` equals
+/// `sentinel`, otherwise the bound rendered as an ISO 8601 datetime.
+fn write_bound(
+    f: &mut fmt::Formatter<'_>,
+    value: i64,
+    sentinel: i64,
+    sentinel_str: &str,
+) -> fmt::Result {
+    if value == sentinel {
+        f.write_str(sentinel_str)
+    } else {
+        write_ms_as_datetime(f, value)
+    }
+}
+
+/// Write milliseconds since epoch to the formatter as an ISO 8601 datetime.
+fn write_ms_as_datetime(f: &mut fmt::Formatter<'_>, ms: i64) -> fmt::Result {
     use chrono::{DateTime, Utc};
 
     let secs = ms.div_euclid(1000);
     let nanos = (ms.rem_euclid(1000) * 1_000_000) as u32;
     match DateTime::<Utc>::from_timestamp(secs, nanos) {
-        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-        None => format!("{ms}ms"),
+        Some(dt) => write!(f, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.3fZ")),
+        None => write!(f, "{ms}ms"),
     }
 }
 

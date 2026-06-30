@@ -16,6 +16,7 @@ use uni_db::query::executor::Executor;
 use uni_db::query::planner::QueryPlanner;
 use uni_db::runtime::property_manager::PropertyManager;
 use uni_db::storage::manager::StorageManager;
+use uni_db::{Uni, Value};
 
 #[tokio::test]
 async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
@@ -275,4 +276,126 @@ impl SchemaManagerExt for Arc<SchemaManager> {
         // SchemaManager::schema() now returns Arc<Schema> (Phase 4 Part B).
         self.schema()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two-way (dense vector + FTS) `uni.search` fusion — high-level ergonomic API.
+//
+// Mirrors the three-way `setup_hybrid`/`run_hybrid` in `sparse_scoring.rs` but
+// omits the sparse arm: `{vector, fts}` only. Asserts both branch scores
+// (`vector_score`, `fts_score`) surface and the dual-relevant doc ranks first
+// under RRF and weighted fusion.
+// ---------------------------------------------------------------------------
+
+/// `Doc(title, content, embedding)` + FTS on `content`, with a 2-doc corpus.
+/// `target` matches both the query vector `[0.9, 0.1]` and the FTS term `zebra`;
+/// `other` matches neither.
+async fn setup_two_way(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("content", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 2 })
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (:Doc {title: $t, content: $c, embedding: [0.9, 0.1]})")
+        .param("t", Value::String("target".into()))
+        .param("c", Value::String("zebra stripes pattern".into()))
+        .run()
+        .await?;
+    tx.execute_with("CREATE (:Doc {title: $t, content: $c, embedding: [0.1, 0.9]})")
+        .param("t", Value::String("other".into()))
+        .param("c", Value::String("a quiet meadow".into()))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let tx2 = db.session().tx().await?;
+    tx2.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON EACH [d.content]")
+        .await?;
+    tx2.commit().await?;
+
+    db.flush().await?;
+    db.indexes().rebuild("Doc", false).await?;
+    Ok(())
+}
+
+/// Run a two-way `uni.search` with the given fusion `options` and return
+/// `(title, score, vector_score, fts_score)` rows in engine order.
+async fn run_two_way(
+    db: &Uni,
+    options: &str,
+) -> anyhow::Result<Vec<(String, f64, Option<f64>, Option<f64>)>> {
+    let cypher = format!(
+        "CALL uni.search('Doc', {{vector: 'embedding', fts: 'content'}}, \
+         'zebra', $qvec, 5, null, {options}) \
+         YIELD node, score, vector_score, fts_score \
+         RETURN node.title AS title, score, vector_score, fts_score"
+    );
+    let rows = db
+        .session()
+        .query_with(&cypher)
+        .param(
+            "qvec",
+            Value::List(vec![Value::Float(0.9), Value::Float(0.1)]),
+        )
+        .fetch_all()
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+                r.get::<f64>("vector_score").ok(),
+                r.get::<f64>("fts_score").ok(),
+            )
+        })
+        .collect())
+}
+
+#[tokio::test]
+async fn hybrid_two_way_rrf_ranks_dual_relevant_first() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    setup_two_way(&db).await?;
+
+    let results = run_two_way(&db, "{method: 'rrf'}").await?;
+    assert!(!results.is_empty(), "hybrid returned no rows");
+
+    // `target` is the unique vector+FTS maximizer → ranked first under RRF.
+    assert_eq!(
+        results[0].0, "target",
+        "target should rank first under RRF: {results:?}"
+    );
+    // Both branch scores surface for the target row.
+    let target = results
+        .iter()
+        .find(|(t, ..)| t == "target")
+        .expect("target present");
+    assert!(
+        target.2.is_some(),
+        "vector_score populated for target: {target:?}"
+    );
+    assert!(
+        target.3.is_some(),
+        "fts_score populated for target: {target:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hybrid_two_way_weighted_favors_vector() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    setup_two_way(&db).await?;
+
+    // alpha=0.7 favors the vector branch; target wins on both branches anyway.
+    let results = run_two_way(&db, "{method: 'weighted', alpha: 0.7}").await?;
+    assert!(!results.is_empty(), "hybrid returned no rows");
+    assert_eq!(
+        results[0].0, "target",
+        "target should rank first under weighted fusion: {results:?}"
+    );
+    Ok(())
 }

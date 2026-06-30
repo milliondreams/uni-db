@@ -496,6 +496,42 @@ async fn test_schema_round_trip_hnsw_pq() {
     .await;
 }
 
+#[tokio::test]
+async fn test_schema_round_trip_hnsw_flat() {
+    // HnswFlat is its own distinct arm (unlike Hnsw/HnswSq which collapse to HnswSq):
+    // it maps to Lance IvfHnswFlat — graph search with no quantization.
+    assert_schema_stores_index_type(
+        VectorAlgo::HnswFlat {
+            m: 16,
+            ef_construction: 200,
+            partitions: None,
+        },
+        VectorIndexType::HnswFlat {
+            m: 16,
+            ef_construction: 200,
+            num_partitions: None,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_ivf_rq_4bit() {
+    // IvfRq = RaBitQ quantization; `num_bits: Some(n)` selects the per-dimension bit
+    // width (the existing ivf_rq test only covers the backend-default `None`).
+    assert_schema_stores_index_type(
+        VectorAlgo::IvfRq {
+            partitions: 32,
+            num_bits: Some(4),
+        },
+        VectorIndexType::IvfRq {
+            num_partitions: 32,
+            num_bits: Some(4),
+        },
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // T2: Integration — insert data, build index, query nearest neighbor
 // ---------------------------------------------------------------------------
@@ -593,6 +629,25 @@ async fn test_vector_query_hnsw_pq() {
         ef_construction: 16,
         sub_vectors: 4,
         partitions: None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_vector_query_hnsw_flat() {
+    assert_vector_query_works(VectorAlgo::HnswFlat {
+        m: 4,
+        ef_construction: 16,
+        partitions: None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_vector_query_ivf_rq_4bit() {
+    assert_vector_query_works(VectorAlgo::IvfRq {
+        partitions: 2,
+        num_bits: Some(4),
     })
     .await;
 }

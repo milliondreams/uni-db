@@ -206,6 +206,44 @@ RETURN paper.title, author.name, distance
 
 ---
 
+## Sparse Vectors
+
+Sparse vector indexes serve **learned-sparse** retrieval (SPLADE, BGE-M3's sparse head, and similar). A sparse vector is a high-dimensional, mostly-zero weight vector over a term space: each non-zero entry is a `(term_id, weight)` pair. The index stores an inverted layout (term id → posting list of `(vid, weight)`) and scores candidates by the **dot product** of query weights against stored document weights — higher is more similar.
+
+A sparse column has type `SparseVector { dimensions }` (`sparse_vector(N)` in Cypher DDL). It is indexed with the `sparse` index kind:
+
+```cypher
+CREATE VECTOR INDEX doc_sparse
+FOR (d:Doc) ON (d.emb)
+OPTIONS { type: 'sparse', quantize: false }
+```
+
+```rust
+use uni_db::{DataType, IndexType};
+
+db.schema()
+    .label("Doc")
+        .property_nullable("emb", DataType::SparseVector { dimensions: 30522 })
+        .index("emb", IndexType::sparse(30522))
+    .apply()
+    .await?;
+```
+
+### Term-Space Sizing (`dimensions`)
+
+`dimensions` is the **term-space cardinality** — `max_term_id + 1`, i.e. the size of the index space the model emits, not the number of non-zeros per document. For vocabulary-based models this is the tokenizer vocabulary size (e.g. 30522 for BERT-style models, 250002 for BGE-M3's XLM-RoBERTa vocabulary). Any `term_id` the model can produce must fall inside `[0, dimensions)`. Individual document vectors remain sparse — typically tens to a few hundred non-zeros.
+
+### Quantization
+
+| `quantize` | Storage | Fidelity |
+|---|---|---|
+| `true` (**default**) | 8-bit quantized weights | Smaller index, near-lossless ranking for most corpora |
+| `false` | Lossless `f32` weights | Exact dot products, larger postings |
+
+`quantize` defaults to **true** (8-bit weight quantization). Set `quantize: false` for lossless `f32` weights when you need exact scores. Query sparse columns with `uni.sparse.query` (YIELD `vid, score, rerank_score`; `score` is the dot product). See the [Sparse Vector Search guide](../guides/sparse-vectors.md) and [BGE-M3 Hybrid Retrieval](../guides/bge-m3-hybrid-retrieval.md) for end-to-end usage.
+
+---
+
 ## Scalar Indexes
 
 Scalar indexes optimize exact match and range queries on primitive properties.

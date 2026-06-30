@@ -7528,7 +7528,78 @@ impl QueryPlanner {
             LogicalPlan::CrossJoin { left, right } => Self::find_scan_label_id(left, variable)
                 .or_else(|| Self::find_scan_label_id(right, variable)),
             LogicalPlan::Traverse { input, .. } => Self::find_scan_label_id(input, variable),
-            _ => None,
+            // Every other node is a non-target for scan-label lookup. This is
+            // deliberately conservative: only plain `Scan`/`ScanAll` are
+            // predicate-push targets, and we must NOT descend through nodes
+            // that would change semantics if a predicate were pushed past them
+            // (Distinct/Window/Unwind/Aggregate-output/path binders), nor
+            // through leaves that bind the variable in a non-pushable form.
+            // The match is exhaustive — no `_ => None` — so a new variant is
+            // forced to be classified here (the #131 bug class).
+            // `Scan`/`ScanAll` reach here only when their `var == variable`
+            // guard above failed (a different variable) → not this scan.
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::ScanAll { .. }
+            | LogicalPlan::FusedIndexScan { .. }
+            | LogicalPlan::FusedIndexScanWrapped { .. }
+            | LogicalPlan::ExtIdLookup { .. }
+            | LogicalPlan::ScanMainByLabels { .. }
+            | LogicalPlan::VectorKnn { .. }
+            | LogicalPlan::InvertedIndexLookup { .. }
+            | LogicalPlan::ProcedureCall { .. }
+            | LogicalPlan::TraverseMainByType { .. }
+            | LogicalPlan::ShortestPath { .. }
+            | LogicalPlan::AllShortestPaths { .. }
+            | LogicalPlan::QuantifiedPattern { .. }
+            | LogicalPlan::BindZeroLengthPath { .. }
+            | LogicalPlan::BindPath { .. }
+            | LogicalPlan::Unwind { .. }
+            | LogicalPlan::Distinct { .. }
+            | LogicalPlan::Window { .. }
+            | LogicalPlan::Union { .. }
+            | LogicalPlan::RecursiveCTE { .. }
+            | LogicalPlan::SubqueryCall { .. }
+            | LogicalPlan::Create { .. }
+            | LogicalPlan::CreateBatch { .. }
+            | LogicalPlan::Merge { .. }
+            | LogicalPlan::Set { .. }
+            | LogicalPlan::Remove { .. }
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::Foreach { .. }
+            | LogicalPlan::Explain { .. }
+            | LogicalPlan::LocyProgram { .. }
+            | LogicalPlan::LocyFold { .. }
+            | LogicalPlan::LocyBestBy { .. }
+            | LogicalPlan::LocyPriority { .. }
+            | LogicalPlan::LocyDerivedScan { .. }
+            | LogicalPlan::LocyProject { .. }
+            | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
+            | LogicalPlan::CreateFullTextIndex { .. }
+            | LogicalPlan::CreateScalarIndex { .. }
+            | LogicalPlan::CreateJsonFtsIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::ShowIndexes { .. }
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Backup { .. }
+            | LogicalPlan::ShowDatabase
+            | LogicalPlan::ShowConfig
+            | LogicalPlan::ShowStatistics
+            | LogicalPlan::Vacuum
+            | LogicalPlan::Checkpoint
+            | LogicalPlan::CopyTo { .. }
+            | LogicalPlan::CopyFrom { .. }
+            | LogicalPlan::CreateLabel(_)
+            | LogicalPlan::CreateEdgeType(_)
+            | LogicalPlan::AlterLabel(_)
+            | LogicalPlan::AlterEdgeType(_)
+            | LogicalPlan::DropLabel(_)
+            | LogicalPlan::DropEdgeType(_)
+            | LogicalPlan::CreateConstraint(_)
+            | LogicalPlan::DropConstraint(_)
+            | LogicalPlan::ShowConstraints(_) => None,
         }
     }
 
@@ -7868,7 +7939,126 @@ impl QueryPlanner {
                 Self::collect_plan_variables_impl(input, vars);
                 Self::collect_plan_variables_impl(subquery, vars);
             }
-            _ => {}
+            // Remaining scan leaves bind a single node variable (parity with the
+            // `Scan`/`VectorKnn` arms above; see `collect_variable_kinds`). The
+            // match is intentionally exhaustive — no `_ => {}` — so a new
+            // variable-producing variant must be classified here rather than
+            // silently dropped (the #131 bug class).
+            LogicalPlan::FusedIndexScan { variable, .. }
+            | LogicalPlan::ExtIdLookup { variable, .. }
+            | LogicalPlan::ScanAll { variable, .. }
+            | LogicalPlan::ScanMainByLabels { variable, .. }
+            | LogicalPlan::InvertedIndexLookup { variable, .. } => {
+                vars.insert(variable.clone());
+            }
+            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+                Self::collect_plan_variables_impl(inner, vars);
+            }
+            LogicalPlan::TraverseMainByType {
+                target_variable,
+                step_variable,
+                input,
+                path_variable,
+                ..
+            } => {
+                vars.insert(target_variable.clone());
+                if let Some(sv) = step_variable {
+                    vars.insert(sv.clone());
+                }
+                if let Some(pv) = path_variable {
+                    vars.insert(pv.clone());
+                }
+                Self::collect_plan_variables_impl(input, vars);
+            }
+            LogicalPlan::BindPath {
+                input,
+                node_variables,
+                edge_variables,
+                path_variable,
+            } => {
+                for v in node_variables.iter().chain(edge_variables) {
+                    vars.insert(v.clone());
+                }
+                vars.insert(path_variable.clone());
+                Self::collect_plan_variables_impl(input, vars);
+            }
+            LogicalPlan::BindZeroLengthPath {
+                input,
+                node_variable,
+                path_variable,
+            } => {
+                vars.insert(node_variable.clone());
+                vars.insert(path_variable.clone());
+                Self::collect_plan_variables_impl(input, vars);
+            }
+            LogicalPlan::QuantifiedPattern {
+                input,
+                pattern_plan,
+                path_variable,
+                start_variable,
+                binding_variable,
+                ..
+            } => {
+                vars.insert(start_variable.clone());
+                vars.insert(binding_variable.clone());
+                if let Some(pv) = path_variable {
+                    vars.insert(pv.clone());
+                }
+                Self::collect_plan_variables_impl(input, vars);
+                Self::collect_plan_variables_impl(pattern_plan, vars);
+            }
+            LogicalPlan::Union { left, right, .. } => {
+                Self::collect_plan_variables_impl(left, vars);
+                Self::collect_plan_variables_impl(right, vars);
+            }
+            LogicalPlan::Window { input, .. }
+            | LogicalPlan::Create { input, .. }
+            | LogicalPlan::CreateBatch { input, .. }
+            | LogicalPlan::Merge { input, .. }
+            | LogicalPlan::Set { input, .. }
+            | LogicalPlan::Remove { input, .. }
+            | LogicalPlan::Delete { input, .. }
+            | LogicalPlan::Foreach { input, .. } => {
+                Self::collect_plan_variables_impl(input, vars);
+            }
+            LogicalPlan::Explain { plan } => {
+                Self::collect_plan_variables_impl(plan, vars);
+            }
+            // Locy program/post-fixpoint operators and all leaf / DDL / admin
+            // statements bind no Cypher-visible variables in this context.
+            LogicalPlan::LocyProgram { .. }
+            | LogicalPlan::LocyFold { .. }
+            | LogicalPlan::LocyBestBy { .. }
+            | LogicalPlan::LocyPriority { .. }
+            | LogicalPlan::LocyDerivedScan { .. }
+            | LogicalPlan::LocyProject { .. }
+            | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
+            | LogicalPlan::CreateFullTextIndex { .. }
+            | LogicalPlan::CreateScalarIndex { .. }
+            | LogicalPlan::CreateJsonFtsIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::ShowIndexes { .. }
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Backup { .. }
+            | LogicalPlan::ShowDatabase
+            | LogicalPlan::ShowConfig
+            | LogicalPlan::ShowStatistics
+            | LogicalPlan::Vacuum
+            | LogicalPlan::Checkpoint
+            | LogicalPlan::CopyTo { .. }
+            | LogicalPlan::CopyFrom { .. }
+            | LogicalPlan::CreateLabel(_)
+            | LogicalPlan::CreateEdgeType(_)
+            | LogicalPlan::AlterLabel(_)
+            | LogicalPlan::AlterEdgeType(_)
+            | LogicalPlan::DropLabel(_)
+            | LogicalPlan::DropEdgeType(_)
+            | LogicalPlan::CreateConstraint(_)
+            | LogicalPlan::DropConstraint(_)
+            | LogicalPlan::ShowConstraints(_) => {}
         }
     }
 
@@ -8926,8 +9116,55 @@ fn collect_properties_recursive(
             // wrapped LocyProject's projection walk.
             collect_properties_recursive(input, properties);
         }
-        // DDL and other plans don't reference properties
-        _ => {}
+        // A fork-fused scan carries the same equality filter as the plain
+        // `Scan` it replaced; collect its properties so the filtered column is
+        // materialized (parity with the `Scan { filter: Some }` arm). The
+        // wrapped form forwards to its inner scan. Missing these is the #131
+        // bug class — a dropped filter column risks under-materialization.
+        LogicalPlan::FusedIndexScan {
+            filter: Some(expr), ..
+        } => {
+            collect_properties_from_expr_into(expr, properties);
+        }
+        LogicalPlan::FusedIndexScan { filter: None, .. } => {}
+        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            collect_properties_recursive(inner, properties);
+        }
+        LogicalPlan::Explain { plan } => {
+            collect_properties_recursive(plan, properties);
+        }
+        // Nodes that reference no node properties: the Locy program node, Locy
+        // derived scans (read materialized derived columns, not graph
+        // properties), and every leaf / DDL / admin statement. The match is
+        // exhaustive — no `_ => {}` — so a new variant must be classified here.
+        LogicalPlan::LocyProgram { .. }
+        | LogicalPlan::LocyDerivedScan { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::CreateVectorIndex { .. }
+        | LogicalPlan::CreateSparseIndex { .. }
+        | LogicalPlan::CreateFullTextIndex { .. }
+        | LogicalPlan::CreateScalarIndex { .. }
+        | LogicalPlan::CreateJsonFtsIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::ShowIndexes { .. }
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::Backup { .. }
+        | LogicalPlan::ShowDatabase
+        | LogicalPlan::ShowConfig
+        | LogicalPlan::ShowStatistics
+        | LogicalPlan::Vacuum
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CopyTo { .. }
+        | LogicalPlan::CopyFrom { .. }
+        | LogicalPlan::CreateLabel(_)
+        | LogicalPlan::CreateEdgeType(_)
+        | LogicalPlan::AlterLabel(_)
+        | LogicalPlan::AlterEdgeType(_)
+        | LogicalPlan::DropLabel(_)
+        | LogicalPlan::DropEdgeType(_)
+        | LogicalPlan::CreateConstraint(_)
+        | LogicalPlan::DropConstraint(_)
+        | LogicalPlan::ShowConstraints(_) => {}
     }
 }
 

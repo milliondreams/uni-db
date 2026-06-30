@@ -1627,7 +1627,12 @@ fn build_is_ref_predicate(
         if node_vars.contains(var_name) {
             // Use "var._vid" as a variable name — Column::from_name won't split
             // on the dot, so DataFusion resolves this to the physical `var._vid`
-            // column from the graph scan (UInt64).
+            // column from the graph scan (UInt64). This baked form compiles
+            // correctly both as a whole predicate and as an individually
+            // extracted equi-join key, which lets the physical planner recover a
+            // HashJoinExec for the IS-ref join: `collect_plan_variables` registers
+            // this exact `var._vid` name for node scans, so `classify_join_predicate`
+            // recognizes the conjunct as a cross-side equi-pair (#131).
             Expr::Variable(format!("{}._vid", var_name))
         } else {
             Expr::Variable(var_name.to_string())

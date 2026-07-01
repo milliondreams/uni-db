@@ -310,6 +310,14 @@ class TestQueryBuilderCypherGeneration:
         # Sparse score is a dot product → threshold is a lower bound.
         assert "score >= 0.5" in cypher
 
+    def test_vector_search_rejects_bad_property(self):
+        with pytest.raises(CypherInjectionError):
+            self._make_builder().vector_search("bad;name", [1.0])
+
+    def test_sparse_search_rejects_bad_property(self):
+        with pytest.raises(CypherInjectionError):
+            self._make_builder().sparse_search("bad;name", {1: 1.0})
+
 
 class TestHybridSearchCypher:
     """Unit tests for hybrid_search() Cypher generation."""
@@ -414,6 +422,72 @@ class TestHybridSearchCypher:
         cypher, _ = q._build_cypher()
         assert "vector: 'embedding'" in cypher
         assert "fts: 'name'" in cypher
+
+    def test_model_filter_chain_appends_where(self):
+        # A model .filter() chain becomes a trailing WHERE over `node`.
+        q = (
+            self._make_builder()
+            .hybrid_search(vector=("embedding", [1.0]))
+            .filter(FilterExpr("age", FilterOp.GE, 18))
+        )
+        cypher, params = q._build_cypher()
+        assert "WHERE node.age >= $p1" in cypher
+        assert params["p1"] == 18
+
+    def test_query_text_overrides_fts(self):
+        q = self._make_builder().hybrid_search(
+            fts=("name", "fts text"), query_text="override"
+        )
+        _, params = q._build_cypher()
+        assert params["qtext"] == "override"
+
+    def test_rrf_k_and_over_fetch_emitted(self):
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0]), rrf_k=42, over_fetch=3.0
+        )
+        cypher, _ = q._build_cypher()
+        assert "rrf_k: 42" in cypher
+        assert "over_fetch: 3.0" in cypher
+
+    def test_limit_emitted(self):
+        q = self._make_builder().hybrid_search(vector=("embedding", [1.0])).limit(7)
+        cypher, _ = q._build_cypher()
+        assert "LIMIT 7" in cypher
+
+    def test_weighted_three_sources_no_weights_ok(self):
+        # Not an error: the engine falls back to equal thirds.
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0]),
+            fts=("name", "q"),
+            sparse=("emb", {1: 1.0}),
+            method="weighted",
+        )
+        cypher, _ = q._build_cypher()
+        assert "method: 'weighted'" in cypher
+        assert "weights:" not in cypher
+
+    def test_injection_property_name_raises(self):
+        with pytest.raises(CypherInjectionError):
+            self._make_builder().hybrid_search(vector=("emb'} ) //", [1.0]))
+        with pytest.raises(CypherInjectionError):
+            self._make_builder().hybrid_search(fts=("bad name", "q"))
+        with pytest.raises(CypherInjectionError):
+            self._make_builder().hybrid_search(sparse=("bad;name", {1: 1.0}))
+
+    def test_non_tuple_sparse_raises(self):
+        with pytest.raises(QueryError):
+            self._make_builder().hybrid_search(sparse="emb")
+
+    def test_invalid_sparse_query_type_raises(self):
+        with pytest.raises(TypeError):
+            self._make_builder().hybrid_search(sparse=("emb", object()))
+
+    def test_hybrid_search_returns_new_builder(self):
+        q1 = self._make_builder()
+        q2 = q1.hybrid_search(vector=("embedding", [1.0]))
+        assert q1 is not q2
+        assert q1._hybrid_search is None
+        assert q2._hybrid_search is not None
 
 
 def _search_session(rows: list[dict]) -> MagicMock:
@@ -544,6 +618,38 @@ class TestSearchScoreSurfacing:
         )
         assert results[0].search_scores.sparse is None
         assert results[0].search_scores.fts is None
+
+    def test_non_search_query_has_no_scores(self):
+        # A plain match query hydrates without a scores sidecar.
+        rows = [{"_props": {"name": "Eve"}, "_vid": 6, "_labels": ["Person"]}]
+        results = QueryBuilder(_search_session(rows), Person).all()
+        assert len(results) == 1
+        assert results[0].search_scores is None
+
+    def test_empty_results(self):
+        results = (
+            QueryBuilder(_search_session([]), Person)
+            .hybrid_search(vector=("embedding", [1.0]))
+            .all()
+        )
+        assert results == []
+
+    def test_first_carries_scores(self):
+        rows = [
+            {
+                "_props": {"name": "Fay"},
+                "_vid": 7,
+                "_labels": ["Person"],
+                "score": 0.5,
+            }
+        ]
+        result = (
+            QueryBuilder(_search_session(rows), Person)
+            .hybrid_search(vector=("embedding", [1.0]))
+            .first()
+        )
+        assert result is not None
+        assert result.search_scores.score == 0.5
 
 
 class TestPropertyValidation:

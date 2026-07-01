@@ -475,6 +475,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         """Perform vector similarity search. Returns a new builder."""
         new = self._clone()
         name = prop._property_name if isinstance(prop, PropertyProxy) else prop
+        _validate_property(name)
         new._vector_search = VectorSearchConfig(
             property_name=name,
             query_vector=query_vector,
@@ -500,6 +501,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         """
         new = self._clone()
         name = prop._property_name if isinstance(prop, PropertyProxy) else prop
+        _validate_property(name)
         indices, values = _coerce_sparse_query(query)
         new._sparse_search = SparseSearchConfig(
             property_name=name,
@@ -577,6 +579,10 @@ class _QueryBuilderBase(Generic[NodeT]):
         sparse_property: str | None = None
         sparse_query: tuple[list[int], list[float]] | None = None
         if sparse is not None:
+            if not (isinstance(sparse, (tuple, list)) and len(sparse) == 2):
+                raise QueryError(
+                    "sparse= must be a (property, query) tuple"
+                )
             sprop, squery = sparse
             sparse_property = (
                 sprop._property_name if isinstance(sprop, PropertyProxy) else sprop
@@ -591,6 +597,12 @@ class _QueryBuilderBase(Generic[NodeT]):
             raise QueryError(
                 "weights must be length-3 [vector, fts, sparse]"
             )
+
+        # Format-only validation of the interpolated property names (they are
+        # f-string'd into the properties map); rejects injection attempts.
+        for _name in (vector_property, fts_property, sparse_property):
+            if _name is not None:
+                _validate_property(_name)
 
         resolved_text = (
             query_text

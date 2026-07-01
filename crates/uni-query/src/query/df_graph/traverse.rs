@@ -1819,14 +1819,22 @@ enum GraphTraverseMainState {
         input_stream: SendableRecordBatchStream,
         buffered: Vec<RecordBatch>,
     },
-    /// Loading adjacency map from main edges table.
+    /// Loading adjacency map (and hydrated target props) from storage.
     LoadingEdges {
-        future: Pin<Box<dyn std::future::Future<Output = DFResult<EdgeAdjacencyMap>> + Send>>,
+        #[allow(clippy::type_complexity)]
+        future: Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = DFResult<(EdgeAdjacencyMap, HashMap<Vid, uni_common::Properties>)>,
+                    > + Send,
+            >,
+        >,
         buffered: Vec<RecordBatch>,
     },
     /// Replaying the buffered input batches against the loaded adjacency.
     Processing {
         adjacency: EdgeAdjacencyMap,
+        target_props: Arc<HashMap<Vid, uni_common::Properties>>,
         buffered: std::vec::IntoIter<RecordBatch>,
     },
     /// Stream is done.
@@ -1951,6 +1959,7 @@ impl GraphTraverseMainStream {
         &self,
         input: &RecordBatch,
         adjacency: &EdgeAdjacencyMap,
+        target_props: &HashMap<Vid, uni_common::Properties>,
     ) -> DFResult<RecordBatch> {
         // Extract source VIDs from source column
         let source_col = input.column_by_name(&self.source_column).ok_or_else(|| {
@@ -2163,25 +2172,28 @@ impl GraphTraverseMainStream {
             columns.push(Arc::new(UInt64Array::from(eids)));
         }
 
-        // Add target property columns (hydrate from L0 buffers)
+        // Add target property columns. Values are hydrated from `target_props`,
+        // which merges the L0 buffers AND persisted (Lance) storage under the
+        // query's MVCC visibility (see `build_edge_adjacency_and_target_props`).
+        // Reading L0 alone here dropped every target property once the vertex
+        // was auto-flushed out of L0 into Lance (issue #135).
         {
-            let l0_ctx = self.graph_ctx.l0_context();
-
             for prop_name in &self.target_properties {
                 if prop_name == "_all_props" {
-                    // Build full CypherValue blob from all L0 vertex properties
+                    // Build a full CypherValue blob from all target properties.
                     let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                     for (_, target_vid, _, _, _) in &expansions {
                         // Merge in `Value` space so typed values (temporals) survive.
-                        let mut merged_props: HashMap<String, uni_common::Value> = HashMap::new();
-                        for l0 in l0_ctx.iter_l0_buffers() {
-                            let guard = l0.read();
-                            if let Some(props) = guard.vertex_properties.get(target_vid) {
-                                for (k, v) in props.iter() {
-                                    merged_props.insert(k.clone(), v.clone());
-                                }
-                            }
-                        }
+                        let merged_props: HashMap<String, uni_common::Value> = target_props
+                            .get(target_vid)
+                            .map(|props| {
+                                props
+                                    .iter()
+                                    .filter(|(_, v)| !v.is_null())
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         if merged_props.is_empty() {
                             builder.append_null();
                         } else {
@@ -2192,23 +2204,17 @@ impl GraphTraverseMainStream {
                     }
                     columns.push(Arc::new(builder.finish()));
                 } else {
-                    // Extract individual property from L0 and encode as CypherValue
+                    // Extract an individual property and encode as CypherValue.
                     let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
                     for (_, target_vid, _, _, _) in &expansions {
-                        let mut found = false;
-                        for l0 in l0_ctx.iter_l0_buffers() {
-                            let guard = l0.read();
-                            if let Some(props) = guard.vertex_properties.get(target_vid)
-                                && let Some(val) = props.get(prop_name.as_str())
-                                && !val.is_null()
-                            {
+                        match target_props
+                            .get(target_vid)
+                            .and_then(|props| props.get(prop_name.as_str()))
+                        {
+                            Some(val) if !val.is_null() => {
                                 builder.append_value(uni_common::cypher_value_codec::encode(val));
-                                found = true;
-                                break;
                             }
-                        }
-                        if !found {
-                            builder.append_null();
+                            _ => builder.append_null(),
                         }
                     }
                     columns.push(Arc::new(builder.finish()));
@@ -2435,6 +2441,73 @@ async fn build_edge_adjacency_map(
     Ok(adjacency)
 }
 
+/// Build the edge adjacency map AND hydrate the traversed target vertices'
+/// properties from BOTH the L0 buffers and persisted (Lance) storage.
+///
+/// The single-hop [`GraphTraverseMainStream`] used to materialise target
+/// properties inline from the L0 buffers only (see `expand_batch`). Once the
+/// auto-flush migrated a vertex's row out of L0 into Lance, that inline read
+/// found nothing and emitted NULL for every target property — while the same
+/// row stayed perfectly readable via a node scan (issue #135). Pre-fetching
+/// through [`PropertyManager::get_batch_vertex_props`], which merges L0 +
+/// storage under the query's MVCC visibility, closes that tier gap.
+async fn build_edge_adjacency_and_target_props(
+    graph_ctx: &GraphExecutionContext,
+    type_names: &[String],
+    direction: Direction,
+    source_vids: Option<HashSet<Vid>>,
+    target_properties: &[String],
+) -> DFResult<(EdgeAdjacencyMap, HashMap<Vid, uni_common::Properties>)> {
+    let adjacency = build_edge_adjacency_map(graph_ctx, type_names, direction, source_vids).await?;
+
+    if target_properties.is_empty() {
+        return Ok((adjacency, HashMap::new()));
+    }
+
+    // Collect the distinct target vids reachable through this adjacency. The map
+    // is keyed by the traversal source; each neighbour tuple's first element is
+    // the materialised target vid.
+    let mut target_vids: Vec<Vid> = Vec::new();
+    let mut seen: HashSet<Vid> = HashSet::new();
+    for neighbors in adjacency.values() {
+        for (tvid, _, _, _) in neighbors {
+            if seen.insert(*tvid) {
+                target_vids.push(*tvid);
+            }
+        }
+    }
+
+    // Decide which property names to fetch. `_all_props` needs every property:
+    // union the schema-declared names across all labels (schemaless props ride
+    // along via the overflow/props blob, which `get_batch_vertex_props` always
+    // reads).
+    let wants_all = target_properties.iter().any(|p| p == "_all_props");
+    let mut names: HashSet<String> = target_properties
+        .iter()
+        .filter(|p| p.as_str() != "_all_props")
+        .cloned()
+        .collect();
+    if wants_all {
+        let schema = graph_ctx.storage().schema_manager().schema();
+        for props in schema.properties.values() {
+            names.extend(props.keys().cloned());
+        }
+    }
+
+    if target_vids.is_empty() || (!wants_all && names.is_empty()) {
+        return Ok((adjacency, HashMap::new()));
+    }
+
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let query_ctx = graph_ctx.query_context();
+    let props = graph_ctx
+        .property_manager()
+        .get_batch_vertex_props(&target_vids, &name_refs, Some(&query_ctx))
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    Ok((adjacency, props))
+}
+
 /// Build the edge-property `EidFilter` for a typed variable-length traversal.
 ///
 /// For a pattern like `[r:KNOWS*1..3 {year: 1988}]` the inline edge-property
@@ -2530,12 +2603,14 @@ impl Stream for GraphTraverseMainStream {
                         let loading_ctx = self.graph_ctx.clone();
                         let loading_types = self.type_names.clone();
                         let direction = self.direction;
+                        let target_properties = self.target_properties.clone();
                         let fut = async move {
-                            build_edge_adjacency_map(
+                            build_edge_adjacency_and_target_props(
                                 &loading_ctx,
                                 &loading_types,
                                 direction,
                                 source_vids,
+                                &target_properties,
                             )
                             .await
                         };
@@ -2557,10 +2632,11 @@ impl Stream for GraphTraverseMainStream {
                     mut future,
                     buffered,
                 } => match future.as_mut().poll(cx) {
-                    Poll::Ready(Ok(adjacency)) => {
+                    Poll::Ready(Ok((adjacency, target_props))) => {
                         // Move to processing state with loaded adjacency
                         self.state = GraphTraverseMainState::Processing {
                             adjacency,
+                            target_props: Arc::new(target_props),
                             buffered: buffered.into_iter(),
                         };
                         // Continue loop to start processing
@@ -2576,6 +2652,7 @@ impl Stream for GraphTraverseMainStream {
                 },
                 GraphTraverseMainState::Processing {
                     adjacency,
+                    target_props,
                     mut buffered,
                 } => {
                     // Check timeout
@@ -2588,10 +2665,11 @@ impl Stream for GraphTraverseMainStream {
                     match buffered.next() {
                         Some(batch) => {
                             // Expand batch using adjacency map
-                            let result = self.expand_batch(&batch, &adjacency);
+                            let result = self.expand_batch(&batch, &adjacency, &target_props);
 
                             self.state = GraphTraverseMainState::Processing {
                                 adjacency,
+                                target_props,
                                 buffered,
                             };
 

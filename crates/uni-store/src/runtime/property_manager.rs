@@ -418,7 +418,16 @@ impl PropertyManager {
                 .collect();
             // Note: don't skip when valid_props is empty; overflow_json may have the properties
 
-            let ds = self.storage.vertex_dataset(label_name)?;
+            // A label resolved from the VidLabelsIndex (or the schema fallback)
+            // may not have a per-label typed dataset — a schemaless label, or a
+            // label whose typed table isn't visible in this (e.g. fork-scoped)
+            // storage schema. Skip it gracefully rather than failing the whole
+            // batch fetch, mirroring the `table_exists` skip just below. Its
+            // properties, if any, come from the L0 overlay / main table instead.
+            let ds = match self.storage.vertex_dataset(label_name) {
+                Ok(ds) => ds,
+                Err(_) => continue,
+            };
             let backend = self.storage.backend();
             let vtable_name = ds.table_name();
 

@@ -4795,11 +4795,38 @@ similar = session.query(Person) \
     .vector_search("embedding", query_vector, k=10) \
     .all()
 
+# Sparse (SPLADE) search -- query is a SparseVector, dict[int, float], or (indices, values)
+sparse_hits = session.query(Document) \
+    .sparse_search("splade", {1: 1.4, 7: 0.9}, k=10) \
+    .all()
+
+# Hybrid search -- three-way fused dense + FTS + sparse (wraps CALL uni.search)
+hits = session.query(Document) \
+    .hybrid_search(
+        vector=("embedding", query_vector),    # (property, precomputed vec); bare "embedding" auto-embeds
+        fts=("content", "quarterly revenue"),   # (property, FTS query text)
+        sparse=("splade", sparse_vec),          # (property, sparse query)
+        method="rrf",                           # or "weighted" with weights=[v, f, s] / alpha=
+        k=10,
+    ) \
+    .all()
+
+# Relevance scores ride alongside each hydrated node via .search_scores
+for doc in hits:
+    s = doc.search_scores                       # SearchScores | None (None for non-search queries)
+    print(doc.title, s.score, s.vector, s.fts, s.sparse)
+
 # Eager load relationships
 people = session.query(Person) \
     .eager_load("friends", "employer") \
     .all()
 ```
+
+`.search_scores` is a `SearchScores` sidecar (`score` fused, plus per-arm `vector` / `fts` /
+`sparse` / `rerank` / `distance`) attached to every result from `vector_search`, `sparse_search`,
+and `hybrid_search`; its column vocabulary mirrors the [Hybrid Search](#hybrid-search) `uni.search`
+YIELD names. `hybrid_search` requires at least one of `vector` / `fts` / `sparse`; a single shared
+`query_text` (from `fts`'s text or the `query_text=` kwarg) drives both FTS and dense auto-embed.
 
 ### Filter Operators
 

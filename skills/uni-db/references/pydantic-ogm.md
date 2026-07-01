@@ -309,9 +309,23 @@ class QueryBuilder(Generic[NodeT]):
     def eager_load(self, *relationships) -> QueryBuilder[NodeT]
     def vector_search(self, prop, query_vector: list[float], k=10,
                       threshold=None, pre_filter=None) -> QueryBuilder[NodeT]
+    def sparse_search(self, prop, query, k=10,
+                      threshold=None, pre_filter=None) -> QueryBuilder[NodeT]
+    def hybrid_search(self, *, vector=None, fts=None, sparse=None,
+                      query_text=None, k=10, method="rrf",
+                      weights=None, alpha=None, rrf_k=None,
+                      over_fetch=None, filter=None) -> QueryBuilder[NodeT]
     def timeout(self, seconds: float) -> QueryBuilder[NodeT]
     def max_memory(self, bytes_: int) -> QueryBuilder[NodeT]
 ```
+
+`sparse_search` `query` is a `SparseVector`, `dict[int, float]`, or `(indices, values)` pair.
+`hybrid_search` wraps the engine's `uni.search` (three-way fused dense + FTS + sparse); each of
+`vector` / `fts` accepts a `(property, query)` tuple or a bare property (`PropertyProxy` | `str`,
+which auto-embeds from the shared text), and `sparse` is a `(property, query)` tuple. Supply at
+least one source. A single `query_text` (from `fts`'s text or the `query_text=` kwarg) drives both
+FTS and dense auto-embed. `method="weighted"` takes `weights=[vector, fts, sparse]` (3-way) or
+`alpha=` (2-way). See [vector-hybrid-search.md](vector-hybrid-search.md) §5 for the fusion engine.
 
 ### Terminal Methods
 
@@ -324,6 +338,24 @@ class QueryBuilder(Generic[NodeT]):
 | `exists()` | `bool` | Whether any match exists |
 | `delete()` | `int` | DETACH DELETE, returns count |
 | `update(**kwargs)` | `int` | SET properties, returns count |
+
+### Search Scores
+
+Results from `vector_search` / `sparse_search` / `hybrid_search` carry a `.search_scores` sidecar
+(a `SearchScores`) on each hydrated node; it is `None` for ordinary (non-search) queries. Kept off
+the model's own fields, so a user field literally named `score` never collides.
+
+| Attribute | Meaning |
+|---|---|
+| `score` | Primary score used for ordering: fused (hybrid) or per-source (single-source) |
+| `vector` / `fts` / `sparse` | Per-arm branch scores (populated when that arm contributed, else `None`) |
+| `rerank` | Second-stage reranker score, when a reranker ran |
+| `distance` | Raw dense distance (vector arm) |
+
+```python
+for doc in hits:
+    print(doc.title, doc.search_scores.score, doc.search_scores.vector)
+```
 
 ### AsyncQueryBuilder
 
@@ -346,6 +378,20 @@ similar = (
     .vector_search(Document.embedding, query_vec, k=5, threshold=0.8)
     .all()
 )
+
+# Three-way fused hybrid (dense + FTS + sparse); scores via .search_scores
+hits = (
+    session.query(Document)
+    .hybrid_search(
+        vector=("embedding", query_vec),
+        fts=("content", "quarterly revenue"),
+        sparse=("splade", sparse_vec),
+        method="rrf",
+        k=5,
+    )
+    .all()
+)
+top = hits[0].search_scores.score  # fused score
 
 deleted = session.query(Person).filter(Person.age < 18).delete()
 updated = session.query(Person).filter(Person.age < 18).update(status="minor")
@@ -528,6 +574,38 @@ with UniSession(db) as session:
         .vector_search(Document.embedding, [0.2] * 1536, k=5, threshold=0.8)
         .all()
     )
+```
+
+### RAG with Hybrid Search
+
+```python
+from uni_pydantic import UniNode, UniSession, Field, Vector, SparseVector
+
+class Document(UniNode):
+    title: str = Field(index="btree")
+    content: str = Field(index="fulltext", tokenizer="standard")
+    embedding: Vector[1536] = Field(metric="cosine")
+    splade: SparseVector[30522]                      # learned-sparse (SPLADE) arm
+
+with UniSession(db) as session:
+    session.register(Document)
+    session.sync_schema()
+    # ... add documents ...
+
+    hits = (
+        session.query(Document)
+        .hybrid_search(
+            vector=("embedding", query_vec),          # precomputed dense (or bare "embedding" to auto-embed)
+            fts=("content", "quarterly revenue"),      # FTS query text (also the auto-embed text)
+            sparse=("splade", SparseVector.from_dict({1: 1.4, 7: 0.9})),
+            method="rrf",                              # or "weighted" + weights=[v, f, s] / alpha=
+            k=10,
+        )
+        .all()
+    )
+    for doc in hits:
+        s = doc.search_scores                          # fused .score + per-arm .vector/.fts/.sparse
+        print(doc.title, s.score, s.vector, s.fts, s.sparse)
 ```
 
 ---

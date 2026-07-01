@@ -523,7 +523,7 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Writing/debugging Cypher queries, WHERE clauses, pattern matching | `references/cypher.md` |
 | Python API usage, async patterns, builders, result types | `references/python-api.md` |
 | Rust API usage, builders, error handling, blocking API | `references/rust-api.md` |
-| Pydantic models, OGM, QueryBuilder, relationships | `references/pydantic-ogm.md` |
+| Pydantic models, OGM, QueryBuilder (incl. `vector_search`/`sparse_search`/`hybrid_search` + `.search_scores`), relationships | `references/pydantic-ogm.md` |
 | Vector search, sparse vectors, FTS, 3-way hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
 | Locy neural predicates: CREATE MODEL/FEATURES/CALIBRATE/VALIDATE/NeuralProvenance EXPLAIN | `references/neural-predicates.md` |

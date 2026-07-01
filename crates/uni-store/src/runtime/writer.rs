@@ -619,6 +619,7 @@ impl Writer {
             let finalize_fn: Arc<dyn FinalizeFn> = Arc::new(WriterFinalizer);
             Some(Arc::new(FlushCoordinator::new(
                 config.max_pending_flushes,
+                config.flush_stream_timeout,
                 shared,
                 finalize_fn,
             )))
@@ -1447,70 +1448,83 @@ impl Writer {
         if self.should_flush() {
             if self.config.async_flush_enabled
                 && let Some(coord) = self.flush_coordinator.as_ref()
-                && coord.pending_flush_count() < self.config.max_pending_flushes
             {
-                match coord.try_acquire_permit() {
-                    Some(permit) => {
-                        match self.flush_l0_rotate().await {
-                            Ok(rotate_out) => {
-                                // Allocate the rotate seq and bump pending ONLY
-                                // after the rotate succeeds (Bug #3). A failed
-                                // rotate must consume neither: the finalizer
-                                // advances strictly in consecutive seq order and
-                                // only decrements pending on finalize, so a
-                                // leaked seq/pending from a failed rotate would
-                                // wedge the finalizer forever and climb pending
-                                // toward `max_pending_flushes`. The seq is still
-                                // allocated under `flush_lock` (immediately after
-                                // the rotate, before the guard drops below), so
-                                // concurrent rotates keep seq order == rotation
-                                // order, and the seq is not used until submit.
-                                let seq = coord.next_rotate_seq();
-                                coord.note_pending();
-                                // Release flush_lock BEFORE the spawn so concurrent
-                                // commits can proceed while the stream runs.
-                                drop(_flush_lock_guard);
-                                let parent_manifest = self.cached_manifest.lock().clone();
-                                let rotated = crate::runtime::flush_coordinator::RotatedFlush {
-                                    seq,
-                                    old_l0_arc: rotate_out.old_l0_arc.clone(),
-                                    wal_lsn: rotate_out.wal_lsn,
-                                    current_version: rotate_out.current_version,
-                                    name: None,
-                                    parent_manifest,
-                                    permit,
-                                    flush_in_progress_guard: rotate_out.flush_in_progress_guard,
-                                };
-                                let writer = self.clone();
-                                let _ticket = coord.submit_for_stream(
-                                    rotated,
-                                    move |old_l0, wal, ver, n| async move {
-                                        let outcome =
-                                            writer.flush_stream_l1(old_l0, wal, ver, n).await?;
-                                        Ok(crate::runtime::flush_coordinator::FlushOutcome {
-                                            new_manifest: outcome.manifest,
-                                            snapshot_id: outcome.snapshot_id,
-                                        })
-                                    },
-                                );
-                                flush_pending = true;
-                                // Early return — flush_lock already dropped.
-                                return Ok((wal_lsn, flush_pending));
-                            }
-                            Err(e) => {
-                                tracing::warn!("Async rotate failed (non-critical): {}", e);
-                                // No seq was allocated and pending was not
-                                // bumped (both moved into the Ok arm for Bug
-                                // #3), so the finalizer is not wedged. The
-                                // permit drops here, freeing the slot.
+                // Async mode: submit only when a pipeline slot is free, else SKIP
+                // (a later commit retries). Never fall back to a blocking inline
+                // flush here — under a stalled flush (issue #132) that inline
+                // flush would hit the same stall with no timeout and hang holding
+                // `flush_lock`, cascading into a full runtime park. A stalled
+                // async flush is instead bounded by `flush_stream_timeout`, which
+                // frees its permit for the retry.
+                if coord.pending_flush_count() < self.config.max_pending_flushes {
+                    match coord.try_acquire_permit() {
+                        Some(permit) => {
+                            match self.flush_l0_rotate().await {
+                                Ok(rotate_out) => {
+                                    // Allocate the rotate seq and bump pending ONLY
+                                    // after the rotate succeeds (Bug #3). A failed
+                                    // rotate must consume neither: the finalizer
+                                    // advances strictly in consecutive seq order and
+                                    // only decrements pending on finalize, so a
+                                    // leaked seq/pending from a failed rotate would
+                                    // wedge the finalizer forever and climb pending
+                                    // toward `max_pending_flushes`. The seq is still
+                                    // allocated under `flush_lock` (immediately after
+                                    // the rotate, before the guard drops below), so
+                                    // concurrent rotates keep seq order == rotation
+                                    // order, and the seq is not used until submit.
+                                    let seq = coord.next_rotate_seq();
+                                    coord.note_pending();
+                                    // Release flush_lock BEFORE the spawn so concurrent
+                                    // commits can proceed while the stream runs.
+                                    drop(_flush_lock_guard);
+                                    let parent_manifest = self.cached_manifest.lock().clone();
+                                    let rotated = crate::runtime::flush_coordinator::RotatedFlush {
+                                        seq,
+                                        old_l0_arc: rotate_out.old_l0_arc.clone(),
+                                        wal_lsn: rotate_out.wal_lsn,
+                                        current_version: rotate_out.current_version,
+                                        name: None,
+                                        parent_manifest,
+                                        permit,
+                                        flush_in_progress_guard: rotate_out.flush_in_progress_guard,
+                                    };
+                                    let writer = self.clone();
+                                    let _ticket = coord.submit_for_stream(
+                                        rotated,
+                                        move |old_l0, wal, ver, n| async move {
+                                            let outcome =
+                                                writer.flush_stream_l1(old_l0, wal, ver, n).await?;
+                                            Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                                                new_manifest: outcome.manifest,
+                                                snapshot_id: outcome.snapshot_id,
+                                            })
+                                        },
+                                    );
+                                    flush_pending = true;
+                                    // Early return — flush_lock already dropped.
+                                    return Ok((wal_lsn, flush_pending));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Async rotate failed (non-critical): {}", e);
+                                    // No seq was allocated and pending was not
+                                    // bumped (both moved into the Ok arm for Bug
+                                    // #3), so the finalizer is not wedged. The
+                                    // permit drops here, freeing the slot.
+                                }
                             }
                         }
+                        None => {
+                            // Race: someone else grabbed the last permit. Skip;
+                            // next commit will retry should_flush().
+                            metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
+                        }
                     }
-                    None => {
-                        // Race: someone else grabbed the last permit. Skip;
-                        // next commit will retry should_flush().
-                        metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
-                    }
+                } else {
+                    // Pipeline full — possibly a stalled flush occupying a slot.
+                    // Skip and retry on a later commit rather than blocking on an
+                    // inline flush that could hit the same stall (issue #132).
+                    metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
                 }
             } else if let Err(e) = self.flush_inline_under_lock(None).await {
                 tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
@@ -4145,6 +4159,20 @@ impl Writer {
         // window open to drive the unique-constraint-hole regression
         // (Bug #9 Mechanism A).
         fail::fail_point!("flush::after-rotate-before-lance");
+
+        // Test-only (issue #132): model a STALLED flush stream. A lost-wakeup in
+        // the sparse/multivec Lance read-modify-write is an *async* future that
+        // never resolves while the worker stays idle. The `fail` crate's
+        // `sleep`/`pause` actions block the worker thread synchronously — which
+        // both mis-models a lost-wakeup and defeats `tokio::time::timeout` (a
+        // timeout can't cancel a blocking call, and once the inner future
+        // completes `timeout` returns `Ok`). So stall at an async `.await`
+        // instead, letting the flush-stream timeout convert it into a data-safe
+        // failure. Arm with `flush::stream-async-stall = 1*return` (fires once).
+        #[cfg(feature = "failpoints")]
+        if fail::eval("flush::stream-async-stall", |_| ()).is_some() {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
 
         // Phase B: materialize any deferred embeddings before column
         // extraction. No-op when `defer_embeddings` is off (the set will

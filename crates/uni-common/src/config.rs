@@ -548,6 +548,18 @@ pub struct UniConfig {
     /// memory growth. Default: 2.
     pub max_pending_flushes: usize,
 
+    /// Maximum wall-clock time an async L0→L1 stream phase may run before the
+    /// flush coordinator converts it into a data-safe flush *failure* (issue
+    /// #132). A stalled sparse/multi-vector Lance read-modify-write would
+    /// otherwise never submit its rotate-seq, wedging the finalizer's
+    /// consecutive-seq pipeline and — via back-pressure permit saturation —
+    /// parking every later commit forever on `flush_lock`. On timeout the old
+    /// L0 is retained in `pending_flush`, WAL data is NOT truncated, the
+    /// permit is released, and `expected` advances; recovery is via WAL replay
+    /// / a later retry. Only meaningful when `async_flush_enabled` is true.
+    /// Default: 60s. Override with `UNI_FLUSH_STREAM_TIMEOUT` (seconds).
+    pub flush_stream_timeout: Duration,
+
     /// Maximum time `drop_fork` will wait for pending async flushes on
     /// that fork before failing with `PendingFlushTimeout`. Only meaningful
     /// when `async_flush_enabled` is true. Default: 10s.
@@ -671,6 +683,15 @@ impl Default for UniConfig {
                 !(v == "0" || v == "false" || v == "no")
             }),
             max_pending_flushes: 2,
+            // Bound a stalled async flush stream so a lost-wakeup in the
+            // sparse/multivec Lance RMW can't permanently wedge the pipeline
+            // (issue #132). 60s ≈ 200× a healthy flush, so it never kills a
+            // legitimately-slow flush, yet recovers a true stall in a minute.
+            flush_stream_timeout: std::env::var("UNI_FLUSH_STREAM_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(60)),
             drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,
             fork_default_ttl: None,

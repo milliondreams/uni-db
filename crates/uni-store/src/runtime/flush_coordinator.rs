@@ -132,6 +132,10 @@ pub struct FlushCoordinator {
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     drain_notify: Arc<tokio::sync::Notify>,
     max_pending_flushes: usize,
+    /// Wall-clock bound on a single stream phase. A stream that exceeds this
+    /// is converted into a data-safe flush *failure* so its rotate-seq is
+    /// still submitted and the finalizer never wedges (issue #132).
+    stream_timeout: std::time::Duration,
     /// Tracked for `ShutdownHandle::track_task` registration AND for
     /// `shutdown()`'s await. Set to None after either takes it.
     finalizer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -146,9 +150,63 @@ pub struct FlushCoordinator {
     stream_handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// RAII guard that guarantees a rotated flush's `seq` is ALWAYS submitted to
+/// the finalizer — even if the stream task's future is dropped/cancelled
+/// before it reaches the normal `submit` (issue #132). The finalizer advances
+/// `expected` strictly in consecutive seq order, so a seq that is never
+/// submitted wedges every later flush and holds its back-pressure permit
+/// forever. On the normal path the caller [`disarm`](Self::disarm)s the guard
+/// to hand the `RotatedFlush` + `ack` to `submit`; if the guard is dropped
+/// while still armed, its `Drop` submits a synthetic failure so
+/// `finalize_failure` runs (releasing the permit and advancing `expected`).
+struct FlushSeqGuard {
+    coord: Arc<FlushCoordinator>,
+    seq: u64,
+    rotated: Option<RotatedFlush>,
+    ack: Option<oneshot::Sender<anyhow::Result<String>>>,
+}
+
+impl FlushSeqGuard {
+    /// Normal completion path: take back ownership so the caller can submit the
+    /// real stream result. Leaves the guard disarmed so its `Drop` is a no-op.
+    fn disarm(
+        mut self,
+    ) -> (
+        RotatedFlush,
+        Option<oneshot::Sender<anyhow::Result<String>>>,
+    ) {
+        (
+            self.rotated
+                .take()
+                .expect("FlushSeqGuard::disarm called more than once"),
+            self.ack.take(),
+        )
+    }
+}
+
+impl Drop for FlushSeqGuard {
+    fn drop(&mut self) {
+        // Armed only if `disarm` never ran (the RotatedFlush is still here).
+        // Submit a synthetic failure so the finalizer advances past this seq
+        // and the back-pressure permit is released. No panics in Drop.
+        if let Some(rotated) = self.rotated.take() {
+            self.coord.submit(
+                self.seq,
+                rotated,
+                Err(anyhow::anyhow!(
+                    "flush stream task dropped before completion (seq {})",
+                    self.seq
+                )),
+                self.ack.take(),
+            );
+        }
+    }
+}
+
 impl FlushCoordinator {
     pub fn new(
         max_pending_flushes: usize,
+        stream_timeout: std::time::Duration,
         shared: SharedFlushCtx,
         finalize_fn: Arc<dyn FinalizeFn>,
     ) -> Self {
@@ -175,6 +233,7 @@ impl FlushCoordinator {
             pending_count,
             drain_notify,
             max_pending_flushes,
+            stream_timeout,
             finalizer_handle: parking_lot::Mutex::new(Some(handle)),
             stream_handles: parking_lot::Mutex::new(Vec::new()),
         }
@@ -311,15 +370,45 @@ impl FlushCoordinator {
         let wal_lsn = rotated.wal_lsn;
         let current_version = rotated.current_version;
         let name = rotated.name.clone();
+        let stream_timeout = self.stream_timeout;
         let handle = tokio::spawn(async move {
-            // Catch a panic in the stream future and turn it into a flush
-            // *failure* that is still submitted. Otherwise a panicking `seq`
-            // would never reach the finalizer, which finalizes strictly in
-            // consecutive seq order — the missing seq would block every later
-            // flush forever and `drain()`/`shutdown()` would hang. (review H2)
-            let result =
-                run_stream_catching(run_stream(old_l0, wal_lsn, current_version, name)).await;
-            coord.submit(seq, rotated, result, Some(ack_tx));
+            // The seq guard guarantees this seq is submitted even if the task's
+            // future is dropped before the normal `submit` below (issue #132).
+            let guard = FlushSeqGuard {
+                coord: coord.clone(),
+                seq,
+                rotated: Some(rotated),
+                ack: Some(ack_tx),
+            };
+            // `run_stream_catching` converts a panic into a submitted *failure*
+            // (review H2). `timeout` additionally converts a STALLED stream — a
+            // lost-wakeup in the sparse/multivec Lance read-modify-write — into
+            // a data-safe failure, so it can neither wedge the finalizer's
+            // consecutive-seq pipeline nor hold a back-pressure permit forever
+            // (issue #132). Both cases still finalize via `finalize_failure`,
+            // which retains the old L0 in `pending_flush` and the WAL data.
+            let stream_fut =
+                run_stream_catching(run_stream(old_l0, wal_lsn, current_version, name));
+            let result = match tokio::time::timeout(stream_timeout, stream_fut).await {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    tracing::error!(
+                        seq,
+                        timeout_secs = stream_timeout.as_secs(),
+                        "flush stream exceeded timeout; converting to a data-safe flush \
+                         failure (old L0 retained in pending_flush, WAL retained, \
+                         recovery via replay/retry)"
+                    );
+                    metrics::counter!("uni_flush_stream_timeouts_total").increment(1);
+                    Err(anyhow::anyhow!(
+                        "flush stream timed out after {:?} (seq {})",
+                        stream_timeout,
+                        seq
+                    ))
+                }
+            };
+            let (rotated, ack) = guard.disarm();
+            coord.submit(seq, rotated, result, ack);
         });
         // Track the handle so `shutdown()` can await all stream tasks'
         // destructors. Opportunistically prune finished handles to keep

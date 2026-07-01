@@ -99,6 +99,52 @@ async fn doc_count(db: &Uni, title: &str) -> Result<usize> {
         .len())
 }
 
+/// Issue #132 (multi-vector / MUVERA flush path): a persistently STALLED flush
+/// stream must NOT wedge the pipeline. Mirrors the sparse variant in
+/// `sparse_resilience.rs` — the flush-stream timeout + skip-on-saturation fix is
+/// schema-agnostic, but this exercises the multi-vector flush columns named in
+/// the issue. Every flush fails (stalls → times out), so all committed docs must
+/// stay live in L0/WAL while commits keep succeeding (no runtime park).
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_multivec_flush_stream_recovers_not_wedges() -> Result<()> {
+    let h = DiskHarness::new()?;
+    let cfg = uni_db::UniConfig {
+        async_flush_enabled: true,
+        flush_stream_timeout: std::time::Duration::from_millis(500),
+        auto_flush_threshold: 1,
+        auto_flush_min_mutations: 1,
+        auto_flush_interval: None,
+        max_pending_flushes: 2,
+        ..Default::default()
+    };
+    let db = h.open_with(cfg).await?;
+    define_multi_schema(&db).await?;
+    fail::cfg("flush::stream-async-stall", "return").unwrap();
+    const N: usize = 6;
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for i in 0..N {
+            insert_doc(&db, &format!("doc-{i}"), &target_tokens()).await?;
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    fail::remove("flush::stream-async-stall");
+    assert!(
+        recovered.is_ok(),
+        "issue #132 regression: multi-vector flush pipeline wedged under a persistent stall"
+    );
+    recovered.expect("bounded above")?;
+    for i in 0..N {
+        assert_eq!(
+            doc_count(&db, &format!("doc-{i}")).await?,
+            1,
+            "doc-{i} lost while every multi-vector flush was failing"
+        );
+    }
+    Ok(())
+}
+
 /// The title of the top-1 MaxSim match to `target_tokens()` via `uni.vector.query`.
 async fn top_multi_title(db: &Uni) -> Result<Option<String>> {
     let lit = cypher_lit(&target_tokens());

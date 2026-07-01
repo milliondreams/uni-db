@@ -14,7 +14,7 @@ from uni_pydantic import (
     QueryBuilder,
     UniNode,
 )
-from uni_pydantic.exceptions import CypherInjectionError
+from uni_pydantic.exceptions import CypherInjectionError, QueryError
 
 
 class Person(UniNode):
@@ -24,6 +24,13 @@ class Person(UniNode):
     age: int | None = None
     email: str | None = None
     active: bool = True
+
+
+class Doc(UniNode):
+    """Test model with a user field literally named ``score`` (collision test)."""
+
+    title: str
+    score: float
 
 
 class TestPropertyProxy:
@@ -264,7 +271,11 @@ class TestQueryBuilderCypherGeneration:
         cypher, params = q._build_cypher()
         assert "uni.vector.query" in cypher
         assert "YIELD node, distance, score" in cypher
-        assert "RETURN node AS n" in cypher
+        # Must return the properties()/id()/labels() triple so rows hydrate;
+        # `node AS n` would silently yield zero rows (regression guard).
+        assert "RETURN properties(node) AS _props" in cypher
+        assert "labels(node) AS _labels, distance, score ORDER BY distance" in cypher
+        assert "node AS n" not in cypher
         assert params["query_vec"] == [1.0, 2.0]
 
     def test_vector_search_with_threshold(self):
@@ -279,7 +290,11 @@ class TestQueryBuilderCypherGeneration:
         cypher, params = q._build_cypher()
         assert "uni.sparse.query" in cypher
         assert "YIELD node, score" in cypher
-        assert "RETURN node AS n, score ORDER BY score DESC" in cypher
+        assert (
+            "RETURN properties(node) AS _props, id(node) AS _vid, "
+            "labels(node) AS _labels, score ORDER BY score DESC" in cypher
+        )
+        assert "node AS n" not in cypher
         # dict canonicalized to sorted parallel arrays.
         assert params["sparse_q"] == {"indices": [1, 5], "values": [1.0, 2.0]}
 
@@ -294,6 +309,241 @@ class TestQueryBuilderCypherGeneration:
         cypher, _ = q._build_cypher()
         # Sparse score is a dot product → threshold is a lower bound.
         assert "score >= 0.5" in cypher
+
+
+class TestHybridSearchCypher:
+    """Unit tests for hybrid_search() Cypher generation."""
+
+    def _make_builder(self) -> QueryBuilder[Person]:
+        return QueryBuilder(MagicMock(), Person)
+
+    def test_three_way_precomputed_rrf(self):
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0, 2.0]),
+            fts=("name", "hello world"),
+            sparse=("emb", {5: 2.0, 1: 1.0}),
+            method="rrf",
+            k=10,
+        )
+        cypher, params = q._build_cypher()
+        assert "CALL uni.search('Person'," in cypher
+        assert "vector: 'embedding'" in cypher
+        assert "fts: 'name'" in cypher
+        assert "sparse: 'emb'" in cypher
+        assert "YIELD node, score, vector_score, fts_score, sparse_score" in cypher
+        assert "RETURN properties(node) AS _props" in cypher
+        assert "node AS n" not in cypher
+        assert "method: 'rrf'" in cypher
+        assert "sparse_query: $sparse_q" in cypher
+        assert "ORDER BY score DESC" in cypher
+        assert params["qtext"] == "hello world"
+        assert params["qvec"] == [1.0, 2.0]
+        assert params["sparse_q"] == {"indices": [1, 5], "values": [1.0, 2.0]}
+
+    def test_two_way_weighted_alpha(self):
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0]),
+            fts=("name", "q"),
+            method="weighted",
+            alpha=0.7,
+        )
+        cypher, _ = q._build_cypher()
+        assert "method: 'weighted'" in cypher
+        assert "alpha: 0.7" in cypher
+        # No sparse arm: neither the properties key nor the option is emitted.
+        assert "sparse: '" not in cypher
+        assert "sparse_query" not in cypher
+
+    def test_three_way_weights(self):
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0]),
+            fts=("name", "q"),
+            sparse=("emb", {1: 1.0}),
+            method="weighted",
+            weights=[0.5, 0.3, 0.2],
+        )
+        cypher, _ = q._build_cypher()
+        assert "weights: [0.5, 0.3, 0.2]" in cypher
+
+    def test_dense_auto_embed(self):
+        # Bare vector property + query_text ⇒ null query-vector positional.
+        q = self._make_builder().hybrid_search(
+            vector="embedding",
+            query_text="find me",
+        )
+        cypher, params = q._build_cypher()
+        assert "vector: 'embedding'" in cypher
+        assert "$qtext, null, 10," in cypher
+        assert params["qtext"] == "find me"
+        assert "qvec" not in params
+
+    def test_sparse_arm_requires_both(self):
+        # sparse= present ⇒ both the map key AND options.sparse_query.
+        q = self._make_builder().hybrid_search(sparse=("emb", {1: 1.0}))
+        cypher, params = q._build_cypher()
+        assert "sparse: 'emb'" in cypher
+        assert "sparse_query: $sparse_q" in cypher
+        assert params["sparse_q"] == {"indices": [1], "values": [1.0]}
+
+    def test_filter_positional_bound(self):
+        q = self._make_builder().hybrid_search(
+            vector=("embedding", [1.0]),
+            filter="node.active = true",
+        )
+        cypher, params = q._build_cypher()
+        assert "$qtext, $qvec, 10, $filter," in cypher
+        assert params["filter"] == "node.active = true"
+
+    def test_no_sources_raises(self):
+        with pytest.raises(QueryError):
+            self._make_builder().hybrid_search(k=10)
+
+    def test_bad_weights_length_raises(self):
+        with pytest.raises(QueryError):
+            self._make_builder().hybrid_search(
+                vector=("embedding", [1.0]), weights=[0.5, 0.5]
+            )
+
+    def test_property_proxy_resolves(self):
+        # PropertyProxy args resolve to bare property names.
+        q = self._make_builder().hybrid_search(
+            vector=(PropertyProxy("embedding", Person), [1.0]),
+            fts=PropertyProxy("name", Person),
+            query_text="q",
+        )
+        cypher, _ = q._build_cypher()
+        assert "vector: 'embedding'" in cypher
+        assert "fts: 'name'" in cypher
+
+
+def _search_session(rows: list[dict]) -> MagicMock:
+    """A mock session that returns ``rows`` and hydrates via from_properties."""
+    session = MagicMock()
+    result = []
+    for r in rows:
+        m = MagicMock()
+        m.to_dict.return_value = r
+        result.append(m)
+    session._db_session.query.return_value = result
+
+    def _to_model(node_data, model):
+        data = dict(node_data)
+        vid = data.pop("_vid", None)
+        data.pop("_label", None)
+        return model.from_properties(data, vid=vid)
+
+    session._result_to_model.side_effect = _to_model
+    return session
+
+
+class TestSearchScoreSurfacing:
+    """Execution tests: search builders hydrate instances carrying .search_scores."""
+
+    def test_hybrid_scores_surfaced(self):
+        rows = [
+            {
+                "_props": {"name": "Alice"},
+                "_vid": 1,
+                "_labels": ["Person"],
+                "score": 0.9,
+                "vector_score": 0.8,
+                "fts_score": 0.5,
+                "sparse_score": 0.3,
+            }
+        ]
+        results = (
+            QueryBuilder(_search_session(rows), Person)
+            .hybrid_search(
+                vector=("embedding", [1.0]),
+                fts=("name", "a"),
+                sparse=("emb", {1: 1.0}),
+            )
+            .all()
+        )
+        assert len(results) == 1
+        p = results[0]
+        assert p.name == "Alice"
+        assert p.search_scores is not None
+        assert p.search_scores.score == 0.9
+        assert p.search_scores.vector == 0.8
+        assert p.search_scores.fts == 0.5
+        assert p.search_scores.sparse == 0.3
+
+    def test_vector_search_hydrates_with_scores(self):
+        # Regression guard: the old `node AS n` RETURN would yield zero rows.
+        rows = [
+            {
+                "_props": {"name": "Bob"},
+                "_vid": 2,
+                "_labels": ["Person"],
+                "distance": 0.1,
+                "score": 0.95,
+            }
+        ]
+        results = (
+            QueryBuilder(_search_session(rows), Person)
+            .vector_search("embedding", [1.0], k=5)
+            .all()
+        )
+        assert len(results) == 1
+        assert results[0].name == "Bob"
+        assert results[0].search_scores.score == 0.95
+        assert results[0].search_scores.distance == 0.1
+
+    def test_sparse_search_hydrates_with_scores(self):
+        rows = [
+            {
+                "_props": {"name": "Cara"},
+                "_vid": 3,
+                "_labels": ["Person"],
+                "score": 0.7,
+            }
+        ]
+        results = (
+            QueryBuilder(_search_session(rows), Person)
+            .sparse_search("emb", {1: 1.0}, k=5)
+            .all()
+        )
+        assert len(results) == 1
+        assert results[0].search_scores.score == 0.7
+
+    def test_score_field_no_collision(self):
+        # A model with its own `score` field: model field intact, search score
+        # reachable via .search_scores (the sidecar's reason to exist).
+        rows = [
+            {
+                "_props": {"title": "Doc A", "score": 1.5},
+                "_vid": 4,
+                "_labels": ["Doc"],
+                "score": 0.42,
+                "vector_score": 0.4,
+            }
+        ]
+        results = (
+            QueryBuilder(_search_session(rows), Doc)
+            .hybrid_search(vector=("embedding", [1.0]))
+            .all()
+        )
+        assert len(results) == 1
+        assert results[0].score == 1.5
+        assert results[0].search_scores.score == 0.42
+
+    def test_missing_arm_is_none(self):
+        rows = [
+            {
+                "_props": {"name": "Dee"},
+                "_vid": 5,
+                "_labels": ["Person"],
+                "score": 0.6,
+            }
+        ]
+        results = (
+            QueryBuilder(_search_session(rows), Person)
+            .hybrid_search(vector=("embedding", [1.0]))
+            .all()
+        )
+        assert results[0].search_scores.sparse is None
+        assert results[0].search_scores.fts is None
 
 
 class TestPropertyValidation:

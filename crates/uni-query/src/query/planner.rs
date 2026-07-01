@@ -40,6 +40,25 @@ use uni_cypher::ast::{
 /// this name (deferred follow-up).
 pub(crate) const STRUCT_ONLY_SENTINEL: &str = "__set_struct__";
 
+/// Provenance marker for a bare entity variable forwarded through a WITH
+/// projection (`WITH n …`).
+///
+/// Emitted instead of `"*"` so [`reconcile_passthrough_properties`] can tell a
+/// *forwarded* variable — which only needs the properties actually accessed
+/// downstream — from one genuinely returned whole. Always resolved to either
+/// `"*"` or [`STRUCT_ONLY_SENTINEL`] before scan planning; it never reaches a
+/// scan (a defensive filter treats a stray marker like the struct-only one).
+pub(crate) const WITH_PASSTHROUGH_SENTINEL: &str = "__with_passthrough__";
+
+/// Prefix for a transient marker recording that a projected variable is an
+/// alias of another (`WITH n AS m` records `__alias_of__n` on `m`).
+///
+/// Recorded by [`collect_properties_from_plan`] during the same complete plan
+/// walk that gathers properties — so alias discovery is guaranteed complete —
+/// and consumed and removed by [`reconcile_passthrough_properties`]. Never
+/// reaches scan planning.
+pub(crate) const ALIAS_OF_PREFIX: &str = "__alias_of__";
+
 /// Type of variable in scope for semantic validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariableType {
@@ -8828,6 +8847,154 @@ pub fn collect_properties_from_plan(plan: &LogicalPlan) -> HashMap<String, HashS
     properties
 }
 
+/// Resolve WITH-passthrough provenance markers into concrete projection markers.
+///
+/// A bare entity variable forwarded through a WITH projection is tagged with
+/// [`WITH_PASSTHROUGH_SENTINEL`] by [`collect_properties_from_plan`]. This pass
+/// converts every such marker to either `"*"` — the variable is returned whole,
+/// another site genuinely needs all its properties, or it is not safely
+/// narrowable — or [`STRUCT_ONLY_SENTINEL`], meaning only the downstream-accessed
+/// properties are materialized and the wide columns are skipped. No marker
+/// survives this pass.
+///
+/// `narrowable` lists the variables that may be narrowed: vertex/edge entities
+/// whose struct is built from flat property columns. Path / edge-list / unknown
+/// variables are always kept wide. If the query's output shape cannot be
+/// identified, every forwarded variable is kept wide (safe default).
+pub(crate) fn reconcile_passthrough_properties(
+    plan: &LogicalPlan,
+    properties: &mut HashMap<String, HashSet<String>>,
+    narrowable: &HashSet<String>,
+) {
+    // 1. Extract alias→source links recorded by the Project walk (`WITH n AS m`
+    //    records `__alias_of__n` on `m`), removing the transient markers.
+    //    Discovery is complete because the recording happened during the same
+    //    full plan traversal that gathered properties.
+    let mut alias_source: HashMap<String, String> = HashMap::new();
+    for (var, set) in properties.iter_mut() {
+        let mut source = None;
+        set.retain(|p| match p.strip_prefix(ALIAS_OF_PREFIX) {
+            Some(src) => {
+                source = Some(src.to_string());
+                false
+            }
+            None => true,
+        });
+        if let Some(src) = source {
+            alias_source.insert(var.clone(), src);
+        }
+    }
+
+    // Fold each alias's accessed properties onto its source. This is
+    // unconditional and safe: if the source is later kept wide the extra
+    // properties are subsumed by "*", and if it is narrowed it needs exactly
+    // these. A single non-cascading pass (props are read from a pre-fold
+    // snapshot) suffices because rename *chains* keep their endpoints wide (see
+    // `keep_wide` below), so cascading folds are never required for correctness.
+    let real_props: HashMap<String, Vec<String>> = properties
+        .iter()
+        .map(|(v, set)| {
+            let props: Vec<String> = set
+                .iter()
+                .filter(|p| {
+                    p.as_str() != "*"
+                        && p.as_str() != STRUCT_ONLY_SENTINEL
+                        && p.as_str() != WITH_PASSTHROUGH_SENTINEL
+                })
+                .cloned()
+                .collect();
+            (v.clone(), props)
+        })
+        .collect();
+    for (alias, src) in &alias_source {
+        if let Some(props) = real_props.get(alias)
+            && !props.is_empty()
+        {
+            properties
+                .entry(src.clone())
+                .or_default()
+                .extend(props.iter().cloned());
+        }
+    }
+
+    // 2. Determine which variables must stay wide (returned whole). A bare
+    //    entity in the terminal projection keeps every property; if it is an
+    //    alias, its source must stay wide too.
+    let terminal = terminal_projection(plan);
+    let mut returned_whole: HashSet<String> = HashSet::new();
+    match terminal {
+        Some(projections) => {
+            for (expr, _alias) in projections {
+                if let Expr::Variable(v) = expr
+                    && !v.contains('.')
+                {
+                    returned_whole.insert(v.clone());
+                    if let Some(src) = alias_source.get(v) {
+                        returned_whole.insert(src.clone());
+                    }
+                }
+            }
+        }
+        None => {
+            // Output shape unknown (write op, UNION, …) — keep every forwarded
+            // variable wide rather than risk narrowing a returned entity.
+            for set in properties.values_mut() {
+                if set.remove(WITH_PASSTHROUGH_SENTINEL) {
+                    set.insert("*".to_string());
+                }
+            }
+            return;
+        }
+    }
+
+    // 3. Resolve each passthrough marker to "*" (kept wide) or the struct-only
+    //    sentinel (narrowed to the folded, accessed properties).
+    for (var, set) in properties.iter_mut() {
+        if !set.remove(WITH_PASSTHROUGH_SENTINEL) {
+            continue;
+        }
+        // Keep wide when the variable is returned whole, is already required
+        // whole by another site ("*"), is not a narrowable entity (paths, edge
+        // lists, unknown kinds), or participates in a rename chain — either it
+        // is itself an alias of something, or one of its aliases is renamed
+        // further (a chain endpoint whose narrowed set could not be kept
+        // consistent across every level). Otherwise materialize only the
+        // accessed properties via a struct-only projection.
+        let keep_wide = set.contains("*")
+            || returned_whole.contains(var)
+            || !narrowable.contains(var)
+            || alias_source.contains_key(var)
+            || has_chained_alias(&alias_source, var);
+        if keep_wide {
+            set.insert("*".to_string());
+        } else {
+            set.insert(STRUCT_ONLY_SENTINEL.to_string());
+        }
+    }
+}
+
+/// True if any alias of `v` is itself renamed further (`WITH v AS m … WITH m AS
+/// p`), making `v` a rename-chain endpoint that must stay wide.
+fn has_chained_alias(alias_source: &HashMap<String, String>, v: &str) -> bool {
+    alias_source
+        .iter()
+        .filter(|(_, src)| src.as_str() == v)
+        .any(|(alias, _)| alias_source.values().any(|s| s == alias))
+}
+
+/// Descend result-shaping wrappers (`Sort`/`Limit`/`Distinct`) to the outermost
+/// projection — the query's terminal output shape — or `None` if the root is
+/// not a projection-topped plan.
+fn terminal_projection(plan: &LogicalPlan) -> Option<&Vec<(Expr, Option<String>)>> {
+    match plan {
+        LogicalPlan::Project { projections, .. } => Some(projections),
+        LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => terminal_projection(input),
+        _ => None,
+    }
+}
+
 /// Recursively walk the LogicalPlan tree and collect all property references.
 fn collect_properties_recursive(
     plan: &LogicalPlan,
@@ -8845,8 +9012,35 @@ fn collect_properties_recursive(
             collect_properties_recursive(input, properties);
         }
         LogicalPlan::Project { input, projections } => {
-            for (expr, _alias) in projections {
-                collect_properties_from_expr_into(expr, properties);
+            for (expr, alias) in projections {
+                // A bare entity variable forwarded through a projection
+                // (`WITH n`, `WITH n AS m`, `RETURN n`) would otherwise hit the
+                // bare-`Variable` arm and mark the source "*", pulling the full
+                // schema even when only narrow properties are accessed downstream
+                // (issue #134 family). Emit a provenance marker on the source
+                // instead; for a rename also record the alias→source link so
+                // `reconcile_passthrough_properties` can fold the alias's
+                // accessed properties back onto the source. That pass keeps "*"
+                // for variables returned whole and downgrades the rest to a
+                // struct-only projection of the accessed properties.
+                if let Expr::Variable(src) = expr
+                    && !src.contains('.')
+                {
+                    properties
+                        .entry(src.clone())
+                        .or_default()
+                        .insert(WITH_PASSTHROUGH_SENTINEL.to_string());
+                    if let Some(alias) = alias
+                        && alias != src
+                    {
+                        properties
+                            .entry(alias.clone())
+                            .or_default()
+                            .insert(format!("{ALIAS_OF_PREFIX}{src}"));
+                    }
+                } else {
+                    collect_properties_from_expr_into(expr, properties);
+                }
             }
             collect_properties_recursive(input, properties);
         }
@@ -9320,11 +9514,28 @@ fn collect_properties_from_expr_into(
             window_spec,
             ..
         } => {
-            // Analyze function for property requirements (pushdown hydration)
-            analyze_function_property_requirements(name, args, properties);
+            // Analyze function for property requirements (pushdown hydration).
+            // Returns the entity-argument indices it authoritatively handled.
+            let handled_args = analyze_function_property_requirements(name, args, properties);
 
-            // Collect from arguments
-            for arg in args {
+            // Collect from arguments, but skip bare-variable entity args already
+            // accounted for by the analysis above. Re-recursing into them would
+            // hit the bare-`Variable` arm and mark them "*", pulling the full
+            // schema and defeating column projection (issue #134). Non-entity
+            // args — and non-variable entity args — are still walked so nested
+            // property accesses such as `sum(n.x)` are collected.
+            //
+            // This applies to DISTINCT aggregates too: `count(DISTINCT n)` is
+            // rewritten in df_planner to dedup on the entity's identity column
+            // (`n._vid`/`_eid`, a base column), so the property struct no longer
+            // needs materializing. `collect(DISTINCT n)` is `no_entity` (never
+            // skipped) and still widens to "*", correctly, as it returns whole
+            // nodes.
+            for (i, arg) in args.iter().enumerate() {
+                if handled_args.contains(&i) && matches!(arg, Expr::Variable(v) if !v.contains('.'))
+                {
+                    continue;
+                }
                 collect_properties_from_expr_into(arg, properties);
             }
 
@@ -9552,7 +9763,7 @@ fn collect_properties_from_subquery(
     }
 }
 
-/// Analyze function calls to extract property requirements for pushdown hydration
+/// Analyze function calls to extract property requirements for pushdown hydration.
 ///
 /// This function examines function calls and their arguments to determine which properties
 /// need to be loaded for entity arguments. For example:
@@ -9561,11 +9772,16 @@ fn collect_properties_from_subquery(
 ///
 /// The extracted requirements are added to the properties map for later use during
 /// scan planning.
+///
+/// Returns the argument indices this analysis authoritatively accounts for (the
+/// function's entity arguments). The caller uses these to avoid re-recursing into
+/// those bare-variable arguments, which would otherwise mark them with `*` and
+/// defeat column projection. See issue #134.
 fn analyze_function_property_requirements(
     name: &str,
     args: &[Expr],
     properties: &mut HashMap<String, HashSet<String>>,
-) {
+) -> Vec<usize> {
     use crate::query::function_props::get_function_spec;
 
     /// Helper to mark a variable as needing all properties.
@@ -9590,17 +9806,19 @@ fn analyze_function_property_requirements(
                 .or_default()
                 .insert(col.to_string());
         }
-        return;
+        // The single entity argument is fully accounted for here.
+        return vec![0];
     }
 
     let Some(spec) = get_function_spec(name) else {
-        // Unknown function: conservatively require all properties for variable args
+        // Unknown function: conservatively require all properties for variable args.
+        // Nothing is authoritatively narrowed, so claim no handled arguments.
         for arg in args {
             if let Expr::Variable(var) = arg {
                 mark_wildcard(var, properties);
             }
         }
-        return;
+        return Vec::new();
     };
 
     // Extract property names from string literal arguments
@@ -9631,6 +9849,12 @@ fn analyze_function_property_requirements(
             }
         }
     }
+
+    // The spec's entity arguments are authoritatively handled above (a specific
+    // property set, `*`, or nothing at all). The caller must not re-recurse into
+    // these bare-variable arguments, which would mark them `*` and defeat
+    // projection (issue #134).
+    spec.entity_args.to_vec()
 }
 
 // ============================================================================
@@ -10405,5 +10629,249 @@ mod pushdown_tests {
 
         assert!(properties.contains_key("e"));
         assert!(properties.get("e").unwrap().contains("name"));
+    }
+
+    // ---- issue #134: scalar-function-over-entity must not leak "*" ----
+
+    /// Build a non-window, non-distinct function-call expression for tests.
+    fn func(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name: name.to_string(),
+            args,
+            distinct: false,
+            window_spec: None,
+        }
+    }
+
+    fn collect(expr: &Expr) -> HashMap<String, HashSet<String>> {
+        let mut properties = HashMap::new();
+        collect_properties_from_expr_into(expr, &mut properties);
+        properties
+    }
+
+    /// True if `var` was marked as needing all properties (`*`).
+    fn widened(properties: &HashMap<String, HashSet<String>>, var: &str) -> bool {
+        properties.get(var).is_some_and(|s| s.contains("*"))
+    }
+
+    #[test]
+    fn test_entity_arg_functions_do_not_widen() {
+        // id(n)/elementId(n)/count(n) take an entity but need no properties:
+        // the variable must NOT be widened to "*" (would defeat projection).
+        for name in ["id", "elementId", "count"] {
+            let properties = collect(&func(name, vec![Expr::Variable("n".to_string())]));
+            assert!(
+                !widened(&properties, "n"),
+                "{name}(n) must not widen n to '*'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_and_endpoint_functions_do_not_widen() {
+        // type(r)/startNode(r)/endNode(r) need only edge metadata, not props.
+        for name in ["type", "startNode", "endNode"] {
+            let properties = collect(&func(name, vec![Expr::Variable("r".to_string())]));
+            assert!(
+                !widened(&properties, "r"),
+                "{name}(r) must not widen r to '*'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_created_at_maps_to_timestamp_column_only() {
+        // created_at(n) → n: {_created_at}, never "*".
+        let properties = collect(&func("created_at", vec![Expr::Variable("n".to_string())]));
+        assert!(!widened(&properties, "n"), "created_at(n) must not widen n");
+        assert!(properties.get("n").unwrap().contains("_created_at"));
+    }
+
+    #[test]
+    fn test_full_entity_functions_still_widen() {
+        // Guard against over-fixing: keys(n)/properties(n) genuinely need "*".
+        for name in ["keys", "properties"] {
+            let properties = collect(&func(name, vec![Expr::Variable("n".to_string())]));
+            assert!(widened(&properties, "n"), "{name}(n) must still widen n");
+        }
+    }
+
+    #[test]
+    fn test_collect_whole_node_still_widens() {
+        // collect(n) materializes whole nodes into a list — "*" is correct here.
+        let properties = collect(&func("collect", vec![Expr::Variable("n".to_string())]));
+        assert!(widened(&properties, "n"), "collect(n) must widen n to '*'");
+    }
+
+    #[test]
+    fn test_distinct_count_over_entity_does_not_widen() {
+        // count(DISTINCT r) dedups on the identity column (`r._eid`, rewritten in
+        // df_planner), so the property struct must NOT be materialized — r must
+        // not widen to '*' (issue #134 family; df_planner handles the identity
+        // rewrite so openCypher Return6 [16] still passes).
+        let call = Expr::FunctionCall {
+            name: "count".to_string(),
+            args: vec![Expr::Variable("r".to_string())],
+            distinct: true,
+            window_spec: None,
+        };
+        let properties = collect(&call);
+        assert!(
+            !widened(&properties, "r"),
+            "count(DISTINCT r) must not widen r to '*'"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_over_property_narrows() {
+        // sum(n.x) reads only n.x — no wildcard, just the accessed property.
+        let arg = Expr::Property(Box::new(Expr::Variable("n".to_string())), "x".to_string());
+        let properties = collect(&func("sum", vec![arg]));
+        assert!(!widened(&properties, "n"), "sum(n.x) must not widen n");
+        assert!(properties.get("n").unwrap().contains("x"));
+    }
+
+    // ---- WITH-passthrough narrowing (issue #134 family, Phase B) ----
+
+    fn scan(var: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            label_id: 0,
+            labels: vec!["Doc".to_string()],
+            variable: var.to_string(),
+            filter: None,
+            optional: false,
+        }
+    }
+
+    fn project(input: LogicalPlan, items: Vec<(Expr, Option<String>)>) -> LogicalPlan {
+        LogicalPlan::Project {
+            input: Box::new(input),
+            projections: items,
+        }
+    }
+
+    fn prop(var: &str, name: &str) -> Expr {
+        Expr::Property(Box::new(Expr::Variable(var.to_string())), name.to_string())
+    }
+
+    /// Run the full collect + reconcile pipeline over `plan`, treating every
+    /// listed variable as a narrowable (Node/Edge) entity.
+    fn reconciled(plan: &LogicalPlan, narrowable: &[&str]) -> HashMap<String, HashSet<String>> {
+        let mut props = collect_properties_from_plan(plan);
+        let set: HashSet<String> = narrowable.iter().map(|s| s.to_string()).collect();
+        reconcile_passthrough_properties(plan, &mut props, &set);
+        props
+    }
+
+    #[test]
+    fn test_with_passthrough_narrows_forwarded_variable() {
+        // MATCH (n) WITH n RETURN n.title → n materializes only {title}.
+        let plan = project(
+            project(scan("n"), vec![(Expr::Variable("n".to_string()), None)]),
+            vec![(prop("n", "title"), None)],
+        );
+        let props = reconciled(&plan, &["n"]);
+        let n = props.get("n").expect("n present");
+        assert!(!n.contains("*"), "forwarded n must not stay wide");
+        assert!(n.contains(STRUCT_ONLY_SENTINEL), "n must be struct-only");
+        assert!(n.contains("title"), "n must keep the accessed property");
+        assert!(!n.contains(WITH_PASSTHROUGH_SENTINEL), "no marker survives");
+    }
+
+    #[test]
+    fn test_returned_whole_entity_stays_wide() {
+        // MATCH (n) WITH n RETURN n → n is returned whole, must keep "*".
+        let plan = project(
+            project(scan("n"), vec![(Expr::Variable("n".to_string()), None)]),
+            vec![(Expr::Variable("n".to_string()), None)],
+        );
+        let props = reconciled(&plan, &["n"]);
+        assert!(
+            props.get("n").unwrap().contains("*"),
+            "returned n stays wide"
+        );
+    }
+
+    #[test]
+    fn test_with_rename_folds_alias_props_onto_source() {
+        // MATCH (n) WITH n AS m RETURN m.title → source n materializes {title}.
+        let plan = project(
+            project(
+                scan("n"),
+                vec![(Expr::Variable("n".to_string()), Some("m".to_string()))],
+            ),
+            vec![(prop("m", "title"), None)],
+        );
+        let props = reconciled(&plan, &["n"]);
+        let n = props.get("n").expect("source n present");
+        assert!(!n.contains("*"), "renamed source must not stay wide");
+        assert!(n.contains(STRUCT_ONLY_SENTINEL));
+        assert!(
+            n.contains("title"),
+            "alias's accessed property must fold onto source (silent-NULL guard)"
+        );
+    }
+
+    #[test]
+    fn test_with_rename_returned_whole_keeps_source_wide() {
+        // MATCH (n) WITH n AS m RETURN m → m returns the whole entity, so the
+        // source n must stay wide (else m loses properties).
+        let plan = project(
+            project(
+                scan("n"),
+                vec![(Expr::Variable("n".to_string()), Some("m".to_string()))],
+            ),
+            vec![(Expr::Variable("m".to_string()), None)],
+        );
+        let props = reconciled(&plan, &["n"]);
+        assert!(
+            props.get("n").unwrap().contains("*"),
+            "source of a whole-returned alias stays wide"
+        );
+    }
+
+    #[test]
+    fn test_non_narrowable_variable_stays_wide() {
+        // A forwarded variable that is not a narrowable entity (e.g. a path)
+        // must be kept wide.
+        let plan = project(
+            project(scan("p"), vec![(Expr::Variable("p".to_string()), None)]),
+            vec![(prop("p", "x"), None)],
+        );
+        let props = reconciled(&plan, &[]); // p NOT narrowable
+        assert!(
+            props.get("p").unwrap().contains("*"),
+            "non-entity stays wide"
+        );
+    }
+
+    #[test]
+    fn test_issue_134_dense_scan_projects_only_referenced_column() {
+        // Mirrors issue #134: `RETURN id(n), similar_to([n.embedding], [$q])`.
+        // Only `embedding` must be projected; id(n) must not pull the full
+        // schema (which would decode unread wide columns like a ColBERT list).
+        let mut properties = HashMap::new();
+        collect_properties_from_expr_into(
+            &func("id", vec![Expr::Variable("n".to_string())]),
+            &mut properties,
+        );
+        collect_properties_from_expr_into(
+            &func(
+                "similar_to",
+                vec![
+                    Expr::List(vec![Expr::Property(
+                        Box::new(Expr::Variable("n".to_string())),
+                        "embedding".to_string(),
+                    )]),
+                    Expr::List(vec![Expr::Parameter("q".to_string())]),
+                ],
+            ),
+            &mut properties,
+        );
+
+        assert!(!widened(&properties, "n"), "n must not be widened to '*'");
+        let n_props = properties.get("n").expect("n should need embedding");
+        assert!(n_props.contains("embedding"));
+        assert_eq!(n_props.len(), 1, "only embedding should be projected");
     }
 }

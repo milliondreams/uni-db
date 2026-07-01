@@ -53,7 +53,8 @@ use crate::query::df_graph::{
     OptionalFilterExec,
 };
 use crate::query::planner::{
-    LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
+    LogicalPlan, STRUCT_ONLY_SENTINEL, WITH_PASSTHROUGH_SENTINEL, aggregate_column_name,
+    collect_properties_from_plan, reconcile_passthrough_properties,
 };
 use anyhow::{Result, anyhow};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -259,6 +260,7 @@ impl HybridPhysicalPlanner {
                         .filter(|p| {
                             *p != "*"
                                 && *p != STRUCT_ONLY_SENTINEL
+                                && *p != WITH_PASSTHROUGH_SENTINEL
                                 && (!p.starts_with('_')
                                     || matches!(p.as_str(), "_created_at" | "_updated_at"))
                         })
@@ -291,6 +293,7 @@ impl HybridPhysicalPlanner {
                         .filter(|p| {
                             *p != "*"
                                 && *p != STRUCT_ONLY_SENTINEL
+                                && *p != WITH_PASSTHROUGH_SENTINEL
                                 && !SYSTEM_COLUMNS.contains(&p.as_str())
                         })
                         .cloned()
@@ -666,7 +669,10 @@ impl HybridPhysicalPlanner {
         let logical_rewritten = merge_unwind_in_filters(logical, &self.params);
 
         // Collect all properties needed anywhere in the plan tree
-        let all_properties = collect_properties_from_plan(&logical_rewritten);
+        let mut all_properties = collect_properties_from_plan(&logical_rewritten);
+        // Resolve WITH-passthrough markers: narrow forwarded entities to the
+        // properties actually accessed downstream (issue #134 family).
+        apply_passthrough_reconciliation(&logical_rewritten, &mut all_properties);
 
         // Delegate to internal planning with properties context
         self.plan_internal(&logical_rewritten, &all_properties)
@@ -688,6 +694,7 @@ impl HybridPhysicalPlanner {
         for (var, props) in extra_properties {
             all_properties.entry(var).or_default().extend(props);
         }
+        apply_passthrough_reconciliation(&logical_rewritten, &mut all_properties);
         self.plan_internal(&logical_rewritten, &all_properties)
     }
 
@@ -4884,9 +4891,29 @@ impl HybridPhysicalPlanner {
                     // reference so that null rows (from OPTIONAL MATCH) are excluded.
                     if matches!(args.first(), Some(uni_cypher::ast::Expr::Wildcard)) {
                         count(datafusion::logical_expr::lit(1))
-                    } else if matches!(args.first(), Some(uni_cypher::ast::Expr::Variable(_))) {
+                    } else if let Some(uni_cypher::ast::Expr::Variable(var)) = args.first() {
                         if *distinct {
-                            count(get_arg()?)
+                            // COUNT(DISTINCT entity) dedups by identity (_vid/_eid),
+                            // NOT the full materialized struct — this avoids reading
+                            // every property column just to compute distinctness
+                            // (issue #134 family). The identity column is a
+                            // non-nullable base column always present in the scan,
+                            // and stays null for unmatched OPTIONAL MATCH rows so
+                            // they are excluded exactly as before. Scalar-bound
+                            // variables (not Node/Edge) keep their own column.
+                            let id_col = match ctx.variable_kinds.get(var) {
+                                Some(VariableKind::Node) => Some("_vid"),
+                                Some(VariableKind::Edge) => Some("_eid"),
+                                _ => None,
+                            };
+                            match id_col {
+                                Some(suffix) => {
+                                    count(DfExpr::Column(datafusion::common::Column::from_name(
+                                        format!("{var}.{suffix}"),
+                                    )))
+                                }
+                                None => count(get_arg()?),
+                            }
                         } else {
                             count(datafusion::logical_expr::lit(1))
                         }
@@ -6545,6 +6572,24 @@ fn resolve_fold_bindings(
             }
         })
         .collect()
+}
+
+/// Resolve WITH-passthrough markers, narrowing forwarded entity variables.
+///
+/// Computes the narrowable (Node/Edge) variables from the plan and delegates to
+/// [`reconcile_passthrough_properties`]. See issue #134 family.
+fn apply_passthrough_reconciliation(
+    plan: &LogicalPlan,
+    properties: &mut HashMap<String, HashSet<String>>,
+) {
+    let mut kinds = HashMap::new();
+    collect_variable_kinds(plan, &mut kinds);
+    let narrowable: HashSet<String> = kinds
+        .into_iter()
+        .filter(|(_, k)| matches!(k, VariableKind::Node | VariableKind::Edge))
+        .map(|(v, _)| v)
+        .collect();
+    reconcile_passthrough_properties(plan, properties, &narrowable);
 }
 
 /// Recursively collect variable kinds (node, edge, path) from a LogicalPlan.

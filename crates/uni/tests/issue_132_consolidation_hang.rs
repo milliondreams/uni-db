@@ -25,7 +25,11 @@ const VOCAB: usize = 2000;
 const MV_DIM: usize = 16;
 
 fn dense(seed: usize) -> Value {
-    Value::Vector((0..DENSE_DIM).map(|i| ((seed + i) % 7) as f32 * 0.1).collect())
+    Value::Vector(
+        (0..DENSE_DIM)
+            .map(|i| ((seed + i) % 7) as f32 * 0.1)
+            .collect(),
+    )
 }
 
 fn sparse(seed: usize) -> Value {
@@ -39,7 +43,13 @@ fn sparse(seed: usize) -> Value {
 fn multivec(seed: usize) -> Value {
     Value::List(
         (0..3)
-            .map(|t| Value::Vector((0..MV_DIM).map(|i| ((seed + t + i) % 5) as f32 * 0.2).collect()))
+            .map(|t| {
+                Value::Vector(
+                    (0..MV_DIM)
+                        .map(|i| ((seed + t + i) % 5) as f32 * 0.2)
+                        .collect(),
+                )
+            })
             .collect(),
     )
 }
@@ -48,7 +58,12 @@ async fn define_schema(db: &Uni) -> Result<()> {
     db.schema()
         .label("Obs")
         .property("oid", DataType::Int64)
-        .property("dense", DataType::Vector { dimensions: DENSE_DIM })
+        .property(
+            "dense",
+            DataType::Vector {
+                dimensions: DENSE_DIM,
+            },
+        )
         .property("sparse", DataType::SparseVector { dimensions: VOCAB })
         .property(
             "multi",
@@ -57,7 +72,11 @@ async fn define_schema(db: &Uni) -> Result<()> {
         .index("sparse", IndexType::sparse(VOCAB))
         .apply()
         .await?;
-    db.schema().label("Fact").property("fid", DataType::Int64).apply().await?;
+    db.schema()
+        .label("Fact")
+        .property("fid", DataType::Int64)
+        .apply()
+        .await?;
     db.schema()
         .edge_type("DERIVED", &["Fact"], &["Obs"])
         .apply()
@@ -94,12 +113,10 @@ async fn ingest_and_consolidate(db: &Uni, rows: usize) -> Result<()> {
             .fetch_all()
             .await?;
         let tx = db.session().tx().await?;
-        tx.execute_with(
-            "MATCH (o:Obs {oid: $o}) CREATE (f:Fact {fid: $o})-[:DERIVED]->(o)",
-        )
-        .param("o", Value::Int(i as i64))
-        .run()
-        .await?;
+        tx.execute_with("MATCH (o:Obs {oid: $o}) CREATE (f:Fact {fid: $o})-[:DERIVED]->(o)")
+            .param("o", Value::Int(i as i64))
+            .run()
+            .await?;
         tx.commit().await?;
     }
     Ok(())
@@ -147,6 +164,10 @@ async fn consolidation_sweep_never_wedges() -> Result<()> {
         .await?
         .rows()
         .len();
-    assert_eq!(n, 2 * 15, "all ingested Obs must be queryable after the sweep");
+    assert_eq!(
+        n,
+        2 * 15,
+        "all ingested Obs must be queryable after the sweep"
+    );
     Ok(())
 }

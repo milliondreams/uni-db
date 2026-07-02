@@ -55,7 +55,10 @@ async fn issue_135_traversal_props_survive_flush() -> anyhow::Result<()> {
     let pre = rel_ids(&db, REL).await?;
     eprintln!("PRE-FLUSH  REL ids = {pre:?}");
     assert_eq!(pre.len(), 4, "pre-flush: 4 children expected");
-    assert!(pre.iter().all(|x| x.is_some()), "pre-flush props must be non-null");
+    assert!(
+        pre.iter().all(|x| x.is_some()),
+        "pre-flush props must be non-null"
+    );
 
     // Force the L0 -> Lance transition (what the 5s auto-flush timer does).
     db.flush().await?;
@@ -66,7 +69,10 @@ async fn issue_135_traversal_props_survive_flush() -> anyhow::Result<()> {
     eprintln!("POST-FLUSH REL  ids = {rel:?}");
 
     assert_eq!(scan.len(), 4);
-    assert!(scan.iter().all(|x| x.is_some()), "node scan must read flushed props");
+    assert!(
+        scan.iter().all(|x| x.is_some()),
+        "node scan must read flushed props"
+    );
 
     assert_eq!(rel.len(), 4, "post-flush: 4 children still expanded");
     assert!(
@@ -83,7 +89,11 @@ async fn issue_135_traversal_props_survive_flush() -> anyhow::Result<()> {
         )
         .fetch_all()
         .await?;
-    let visits: Vec<Option<i64>> = whole.rows().iter().map(|r| r.get::<i64>("v").ok()).collect();
+    let visits: Vec<Option<i64>> = whole
+        .rows()
+        .iter()
+        .map(|r| r.get::<i64>("v").ok())
+        .collect();
     assert!(
         visits.iter().all(|x| x.is_some()),
         "BUG #135: multi-property traversal NULL after flush: {visits:?}"

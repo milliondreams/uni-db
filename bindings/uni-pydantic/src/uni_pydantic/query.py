@@ -580,9 +580,7 @@ class _QueryBuilderBase(Generic[NodeT]):
         sparse_query: tuple[list[int], list[float]] | None = None
         if sparse is not None:
             if not (isinstance(sparse, (tuple, list)) and len(sparse) == 2):
-                raise QueryError(
-                    "sparse= must be a (property, query) tuple"
-                )
+                raise QueryError("sparse= must be a (property, query) tuple")
             sprop, squery = sparse
             sparse_property = (
                 sprop._property_name if isinstance(sprop, PropertyProxy) else sprop
@@ -594,9 +592,7 @@ class _QueryBuilderBase(Generic[NodeT]):
                 "hybrid_search requires at least one of vector=, fts=, sparse="
             )
         if weights is not None and len(weights) != 3:
-            raise QueryError(
-                "weights must be length-3 [vector, fts, sparse]"
-            )
+            raise QueryError("weights must be length-3 [vector, fts, sparse]")
 
         # Format-only validation of the interpolated property names (they are
         # f-string'd into the properties map); rejects injection attempts.
@@ -929,9 +925,7 @@ class _QueryBuilderBase(Generic[NodeT]):
 
     def _is_search(self) -> bool:
         """Whether this builder is a vector/sparse/hybrid search query."""
-        return bool(
-            self._vector_search or self._sparse_search or self._hybrid_search
-        )
+        return bool(self._vector_search or self._sparse_search or self._hybrid_search)
 
     def _rows_to_instances(self, results: list[dict[str, Any]]) -> list[NodeT]:
         """Convert result rows to model instances."""
@@ -945,9 +939,7 @@ class _QueryBuilderBase(Generic[NodeT]):
                 instances.append(instance)
         return instances
 
-    def _rows_to_scored_instances(
-        self, results: list[dict[str, Any]]
-    ) -> list[NodeT]:
+    def _rows_to_scored_instances(self, results: list[dict[str, Any]]) -> list[NodeT]:
         """Convert search result rows to instances carrying ``.search_scores``.
 
         Hydrates the node exactly as ``_rows_to_instances`` does, then reads the

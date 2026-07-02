@@ -31,7 +31,7 @@ Example:
     >>> adults = session.query(Person).filter(Person.age >= 18).all()
 """
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 # Base classes
 # Async support

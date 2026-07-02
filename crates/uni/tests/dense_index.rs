@@ -539,12 +539,11 @@ fn hnsw_cosine() -> IndexType {
 }
 
 /// Recall@k of the engine's returned titles against the brute-force cosine-oracle
-/// top-k over the same corpus.
-fn recall_at_k(engine: &[(String, f64)], corpus: &[(String, Dense)], k: usize) -> f64 {
-    let q = query_vec();
+/// top-k for `q` over the same corpus.
+fn recall_at_k(q: &Dense, engine: &[(String, f64)], corpus: &[(String, Dense)], k: usize) -> f64 {
     let mut scored: Vec<(&str, f64)> = corpus
         .iter()
-        .map(|(t, d)| (t.as_str(), dense_score_oracle(&q, d)))
+        .map(|(t, d)| (t.as_str(), dense_score_oracle(q, d)))
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let truth: std::collections::HashSet<&str> = scored.iter().take(k).map(|(t, _)| *t).collect();
@@ -555,10 +554,11 @@ fn recall_at_k(engine: &[(String, f64)], corpus: &[(String, Dense)], k: usize) -
     hit as f64 / truth.len().max(1) as f64
 }
 
-/// Run `uni.vector.query` for the standard query with an explicit options literal
+/// Run `uni.vector.query` for `q` with an explicit options literal
 /// (e.g. `{ef_search: 512}`), returning `(title, score)` in engine rank order.
 async fn query_results_opts(
     db: &Uni,
+    q: &Dense,
     k: usize,
     options: &str,
 ) -> anyhow::Result<Vec<(String, f64)>> {
@@ -569,7 +569,7 @@ async fn query_results_opts(
     let rows = db
         .session()
         .query_with(&cypher)
-        .param("q", vec_value(&query_vec()))
+        .param("q", vec_value(q))
         .param("k", Value::Int(k as i64))
         .fetch_all()
         .await?;
@@ -584,13 +584,45 @@ async fn query_results_opts(
         .collect())
 }
 
+/// Mean recall@k across many deterministic probe queries.
+///
+/// A single recall@k sample is quantized in `1/k` steps and — because the HNSW
+/// graph build is nondeterministic — occasionally lands on `1.0` even for the
+/// default beam, which made a strict `high > low` assertion flaky (~1/4 runs).
+/// Averaging over [`PROBE_QUERIES`] independent probes concentrates the mean so
+/// the low-vs-wide beam separation is stable across graph builds.
+async fn mean_recall(
+    db: &Uni,
+    corpus: &[(String, Dense)],
+    queries: &[Dense],
+    k: usize,
+    options: &str,
+) -> anyhow::Result<f64> {
+    let mut total = 0.0;
+    for q in queries {
+        let engine = query_results_opts(db, q, k, options).await?;
+        total += recall_at_k(q, &engine, corpus, k);
+    }
+    Ok(total / queries.len() as f64)
+}
+
+/// Number of probe queries the HNSW recall means are averaged over.
+const PROBE_QUERIES: usize = 32;
+
+/// Deterministic random probe queries (NOT planted in the corpus, so a narrow
+/// beam has no trivially reachable exact match to get lucky on).
+fn probe_queries(seed: u64) -> Vec<Dense> {
+    let mut rng = Rng(seed);
+    (0..PROBE_QUERIES).map(|_| random_dense(&mut rng)).collect()
+}
+
 #[tokio::test]
 async fn dense_hnsw_ef_search_raises_recall() -> anyhow::Result<()> {
-    // On an APPROXIMATE HNSW index, the default search beam (`1.5 * k`) under-explores
-    // the graph and misses true neighbors. Passing a larger `ef_search` widens the
-    // beam and must recover recall — proving the query-time knob is plumbed end-to-end
-    // (regression: `ef_search` was previously unparsed and never reached lancedb's
-    // `.ef()`, silently pinning recall to the tiny default).
+    // On an APPROXIMATE HNSW index, a narrow search beam under-explores the graph
+    // and misses true neighbors; a wide `ef_search` must recover recall — proving
+    // the query-time knob is plumbed end-to-end (regression: `ef_search` was
+    // previously unparsed and never reached lancedb's `.ef()`, silently pinning
+    // recall to the tiny default of `1.5 * k`).
     let db = Uni::temporary().build().await?;
     db.schema()
         .label("Doc")
@@ -600,28 +632,37 @@ async fn dense_hnsw_ef_search_raises_recall() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    // ~1000 docs: large enough that HNSW with the tiny default beam demonstrably
-    // misses neighbors (the regime the recall bench surfaced at recall ≈ 0.6).
+    // ~1000 docs: large enough that HNSW with a narrow beam demonstrably misses
+    // neighbors (the regime the recall bench surfaced at recall ≈ 0.6).
     let corpus = build_corpus(1000, 0xEF5E_A4C8);
     insert_docs(&db, &corpus, true).await?;
     db.indexes().rebuild("Doc", false).await?;
 
+    // Mean recall over many probes: a single-query recall@10 sample is quantized
+    // in 0.1 steps and — because the HNSW graph build is nondeterministic —
+    // occasionally hit 1.000 even for the narrow beam, so the old strict
+    // `high > low` flaked (~1/4 runs). Both beams go through the `ef_search`
+    // knob (minimal `k` vs wide 512): if the option ever stops reaching the
+    // index search again, both searches are identical and the gap is exactly 0.
+    //
+    // Thresholds calibrated over 30 independent builds (2026-07-01):
+    // low ∈ [0.77, 0.89], high = 0.9875 constant, gap ∈ [0.097, 0.216]
+    // (gap mean 0.163, σ 0.028 → 0.05 is ~4σ safe; high has 0.0375 headroom).
     let k = 10;
-    let low = recall_at_k(&query_results_opts(&db, k, "{}").await?, &corpus, k);
-    let high = recall_at_k(
-        &query_results_opts(&db, k, "{ef_search: 512}").await?,
-        &corpus,
-        k,
-    );
+    let queries = probe_queries(0xBEA7_5EED);
+    let low = mean_recall(&db, &corpus, &queries, k, "{ef_search: 10}").await?;
+    let high = mean_recall(&db, &corpus, &queries, k, "{ef_search: 512}").await?;
 
     assert!(
-        high > low,
-        "ef_search must improve HNSW recall: default beam recall@{k}={low:.3} \
-         vs ef_search=512 recall@{k}={high:.3}"
+        high - low >= 0.05,
+        "ef_search must widen the beam and raise mean HNSW recall: ef_search=10 \
+         mean recall@{k}={low:.3} vs ef_search=512 mean recall@{k}={high:.3} \
+         (a zero gap means the knob never reached the index search)"
     );
     assert!(
-        high >= 0.85,
-        "a wide ef_search should recover strong recall: got {high:.3} (default {low:.3})"
+        high >= 0.95,
+        "a wide ef_search should recover strong recall: got mean {high:.3} \
+         (narrow beam {low:.3})"
     );
     Ok(())
 }

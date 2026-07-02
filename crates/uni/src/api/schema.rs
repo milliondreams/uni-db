@@ -160,21 +160,16 @@ impl<'a> SchemaBuilder<'a> {
                     nullable,
                     description,
                 } => {
-                    match manager.add_property_with_desc(
-                        &label_or_type,
-                        &name,
-                        data_type,
-                        nullable,
-                        description,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) if e.to_string().contains("already exists") => {}
-                        Err(e) => {
-                            return Err(UniError::Schema {
-                                message: e.to_string(),
-                            });
-                        }
-                    }
+                    // `declare_property` is idempotent for an identical re-declaration
+                    // (the register-on-every-open pattern) but errors on a type or
+                    // nullability conflict. The old `add_property_with_desc` +
+                    // swallow-"already exists" combination silently ignored dim
+                    // changes like VECTOR(4) → VECTOR(8) (issue #137).
+                    manager
+                        .declare_property(&label_or_type, &name, data_type, nullable, description)
+                        .map_err(|e| UniError::Schema {
+                            message: e.to_string(),
+                        })?;
                 }
                 SchemaChange::AddIndex(idx) => {
                     // Skip the synchronous Lance rebuild when the index is

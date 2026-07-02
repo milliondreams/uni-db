@@ -774,11 +774,93 @@ impl Writer {
                 // `check_unique_constraint_multi` after recovery and a
                 // duplicate of it could be created.
                 self.rebuild_constraint_index(&mut l0_guard);
+                // Null out wrong-dimension vector values recovered from a WAL written
+                // before dimension enforcement (issue #137). The flush path now fails
+                // closed on a dimension mismatch, so without this pass a single
+                // pre-fix value would make every flush of its label fail forever,
+                // leaving the database unopenable (the ghost-commit hazard documented
+                // on `commit_transaction_l0`). Nulling preserves exactly the pre-fix
+                // flush outcome for these values, with a loud signal.
+                self.sanitize_replayed_vector_dims(&mut l0_guard);
             }
 
             Ok(count)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Nulls wrong-dimension vector values in a recovered L0 buffer (issue #137).
+    ///
+    /// Only runs during WAL replay, where the offending value was written by a
+    /// version without write-time dimension enforcement and can no longer be
+    /// rejected. Live writes never reach this — they fail in the validation and
+    /// coercion guards.
+    fn sanitize_replayed_vector_dims(&self, l0_guard: &mut L0Buffer) {
+        let schema = self.schema_manager.schema();
+
+        // Collect fixes first: `vertex_labels` / `edge_types` are borrowed immutably
+        // from the same guard the property maps are mutated through.
+        let mut vertex_fixes: Vec<(Vid, String)> = Vec::new();
+        for (&vid, props) in &l0_guard.vertex_properties {
+            let Some(labels) = l0_guard.vertex_labels.get(&vid) else {
+                continue;
+            };
+            for label in labels {
+                let Some(props_meta) = schema.properties.get(label) else {
+                    continue;
+                };
+                for (prop_name, meta) in props_meta {
+                    if let Some(value) = props.get(prop_name)
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        log::warn!(
+                            "WAL replay: nulling wrong-dimension value for '{}.{}' on vid {:?} \
+                             ({}) — written before dimension enforcement (issue #137)",
+                            label,
+                            prop_name,
+                            vid,
+                            e
+                        );
+                        vertex_fixes.push((vid, prop_name.clone()));
+                    }
+                }
+            }
+        }
+        for (vid, prop) in vertex_fixes {
+            if let Some(props) = l0_guard.vertex_properties.get_mut(&vid) {
+                props.insert(prop, Value::Null);
+            }
+        }
+
+        let mut edge_fixes: Vec<(Eid, String)> = Vec::new();
+        for (&eid, props) in &l0_guard.edge_properties {
+            let Some(type_name) = l0_guard.edge_types.get(&eid) else {
+                continue;
+            };
+            let Some(props_meta) = schema.properties.get(type_name) else {
+                continue;
+            };
+            for (prop_name, meta) in props_meta {
+                if let Some(value) = props.get(prop_name)
+                    && let Err(e) = meta.r#type.check_vector_dims(value)
+                {
+                    log::warn!(
+                        "WAL replay: nulling wrong-dimension value for '{}.{}' on eid {:?} \
+                         ({}) — written before dimension enforcement (issue #137)",
+                        type_name,
+                        prop_name,
+                        eid,
+                        e
+                    );
+                    edge_fixes.push((eid, prop_name.clone()));
+                }
+            }
+        }
+        for (eid, prop) in edge_fixes {
+            if let Some(props) = l0_guard.edge_properties.get_mut(&eid) {
+                props.insert(prop, Value::Null);
+            }
         }
     }
 
@@ -1605,8 +1687,24 @@ impl Writer {
             //    validated) value.
             if let Some(props_meta) = schema.properties.get(label) {
                 for (prop_name, meta) in props_meta {
+                    let present = properties.get(prop_name);
+
+                    // Declared vector/multi-vector columns: enforce dimensions here so
+                    // writes that bypass the Cypher coercion guard (python bulk insert,
+                    // auto-embed output) can't smuggle in a wrong-length vector that the
+                    // Arrow converters would otherwise null at flush (issue #137).
+                    if let Some(value) = present
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        return Err(anyhow!(
+                            "vector dimension mismatch: property '{}.{}': {}",
+                            label,
+                            prop_name,
+                            e
+                        ));
+                    }
+
                     if !meta.nullable {
-                        let present = properties.get(prop_name);
                         if partial && present.is_none() {
                             continue;
                         }
@@ -1830,6 +1928,19 @@ impl Writer {
         if let Some(props_meta) = schema.properties.get(label) {
             for (idx, properties) in properties_batch.iter().enumerate() {
                 for (prop_name, meta) in props_meta {
+                    // Enforce declared vector dimensions on the batch path too — the
+                    // python bulk API reaches here without the Cypher guard (issue #137).
+                    if let Some(value) = properties.get(prop_name)
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        return Err(anyhow!(
+                            "vector dimension mismatch at index {}: property '{}.{}': {}",
+                            idx,
+                            label,
+                            prop_name,
+                            e
+                        ));
+                    }
                     if !meta.nullable && properties.get(prop_name).is_none_or(|v| v.is_null()) {
                         return Err(anyhow!(
                             "Constraint violation at index {}: Property '{}' cannot be null",
@@ -3664,9 +3775,10 @@ impl Writer {
                 // A source token with the wrong dimension makes `encode_doc` error.
                 // Skipping the row (leaving the FDE column NULL → ranks last under the
                 // mandatory Dot metric; harmless) keeps one malformed document from
-                // wedging *every* flush of this label, matching the normal multi-vector
-                // column path, which null-fills a dimension mismatch rather than failing
-                // the flush (issue #96).
+                // wedging *every* flush of this label (issue #96). Post-#137 the write
+                // paths reject wrong-dimension tokens and WAL replay nulls pre-fix
+                // ones, so this skip is defense-in-depth for values that predate
+                // dimension enforcement.
                 let fde = match encoder.encode_doc(&tokens) {
                     Ok(fde) => fde,
                     Err(e) => {
@@ -3688,6 +3800,72 @@ impl Writer {
                 {
                     touched.insert(spec.derived_col.clone());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates auto-embed dense output width against the declared `VECTOR(dim)` targets.
+    ///
+    /// A schema/model dimension mismatch fails here with a message naming the embedding
+    /// alias, instead of surfacing later as a generic dimension error — or, on the
+    /// deferred path, as a flush failure (issue #137).
+    fn check_dense_embed_dims(
+        schema: &uni_common::core::schema::Schema,
+        label: &str,
+        alias: &str,
+        targets: &[String],
+        actual: usize,
+    ) -> Result<()> {
+        use uni_common::core::schema::DataType;
+        for target in targets {
+            let declared = schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(target))
+                .map(|meta| &meta.r#type);
+            if let Some(DataType::Vector { dimensions }) = declared
+                && actual != *dimensions
+            {
+                return Err(anyhow!(
+                    "auto-embed: model alias '{alias}' produced a {actual}-dimensional \
+                     embedding but '{label}.{target}' is declared VECTOR({dimensions}); \
+                     fix the schema dimensions or the embedding model"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates auto-embed multi-vector output against declared `List(Vector(dim))` targets.
+    ///
+    /// Multi-vector sibling of [`Self::check_dense_embed_dims`]: every emitted token must
+    /// match the declared per-token dimensions.
+    fn check_multi_embed_dims(
+        schema: &uni_common::core::schema::Schema,
+        label: &str,
+        alias: &str,
+        targets: &[String],
+        tokens: &[Vec<f32>],
+    ) -> Result<()> {
+        use uni_common::core::schema::DataType;
+        for target in targets {
+            let declared = schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(target))
+                .map(|meta| &meta.r#type);
+            if let Some(DataType::List(inner)) = declared
+                && let DataType::Vector { dimensions } = inner.as_ref()
+                && let Some(bad) = tokens.iter().find(|tok| tok.len() != *dimensions)
+            {
+                return Err(anyhow!(
+                    "auto-embed: model alias '{alias}' produced a token with {} dimensions \
+                     but '{label}.{target}' is declared as a multi-vector of \
+                     {dimensions}-dimensional tokens; fix the schema dimensions or the \
+                     embedding model",
+                    bad.len()
+                ));
             }
         }
         Ok(())
@@ -3777,6 +3955,20 @@ impl Writer {
                 want_sparse,
             )
             .await?;
+
+            // Reject a schema/model width mismatch before inserting anything — on the
+            // deferred (flush-time) path this is the only guard between the model output
+            // and the fail-closed column builders (issue #137).
+            if let Some(d) = dense.as_ref() {
+                for vec in d {
+                    Self::check_dense_embed_dims(&schema, label, alias, &group.dense, vec.len())?;
+                }
+            }
+            if let Some(m) = multi.as_ref() {
+                for tokens in m {
+                    Self::check_multi_embed_dims(&schema, label, alias, &group.multi, tokens)?;
+                }
+            }
 
             for (i, &row) in needs.iter().enumerate() {
                 if let Some(vec) = dense.as_ref().and_then(|d| d.get(i)) {
@@ -3876,6 +4068,8 @@ impl Writer {
             .await?;
 
             if let Some(vec) = dense.as_ref().and_then(|d| d.first()) {
+                // Alias-naming guard for the schema/model width mismatch (issue #137).
+                Self::check_dense_embed_dims(&schema, label, alias, &group.dense, vec.len())?;
                 let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
                 for t in &group.dense {
                     if !properties.contains_key(t) {
@@ -3884,6 +4078,7 @@ impl Writer {
                 }
             }
             if let Some(tokens) = multi.as_ref().and_then(|m| m.first()) {
+                Self::check_multi_embed_dims(&schema, label, alias, &group.multi, tokens)?;
                 let mv = multivec_to_value(tokens);
                 for t in &group.multi {
                     if !properties.contains_key(t) {

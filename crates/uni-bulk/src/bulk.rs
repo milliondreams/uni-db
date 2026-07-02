@@ -514,6 +514,20 @@ impl BulkWriter {
             for (idx, props) in vertices.iter().enumerate() {
                 // NOT NULL constraints
                 for (prop_name, meta) in props_meta {
+                    // Declared vector/multi-vector columns: enforce dimensions so a
+                    // wrong-length vector fails the bulk write instead of being nulled
+                    // by the Arrow converters at flush (issue #137).
+                    if let Some(value) = props.get(prop_name)
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        return Err(anyhow!(
+                            "vector dimension mismatch at row {}: property '{}' for label '{}': {}",
+                            idx,
+                            prop_name,
+                            label,
+                            e
+                        ));
+                    }
                     if !meta.nullable && props.get(prop_name).is_none_or(|v| v.is_null()) {
                         return Err(anyhow!(
                             "NOT NULL constraint violation at row {}: property '{}' cannot be null for label '{}'",

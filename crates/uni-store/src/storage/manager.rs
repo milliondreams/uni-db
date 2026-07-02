@@ -1761,6 +1761,28 @@ impl StorageManager {
 
         // Look up vector index config to get the correct distance metric.
         let schema = self.schema_manager.schema();
+
+        // A query vector that doesn't match the declared column dimensions can never
+        // score a row — every candidate would be skipped by the length guards below
+        // and in the backend, silently returning 0 rows. Error instead (issue #137).
+        // Undeclared (schemaless) properties skip the check: no dim is authoritative.
+        if let Some(meta) = schema
+            .properties
+            .get(label)
+            .and_then(|props| props.get(property))
+            && let uni_common::core::schema::DataType::Vector { dimensions } = &meta.r#type
+            && query.len() != *dimensions
+        {
+            return Err(anyhow!(
+                "vector dimension mismatch: query vector has {} dimensions but '{}.{}' is \
+                 declared VECTOR({})",
+                query.len(),
+                label,
+                property,
+                dimensions
+            ));
+        }
+
         let metric = schema
             .vector_index_for_property(label, property)
             .map(|config| config.metric.clone())
@@ -2471,6 +2493,12 @@ fn merge_l0_into_vector_results(
                 && let Some(emb) = extract_embedding_from_props(props, property)
             {
                 if emb.len() != query.len() {
+                    // Inner defense only: `vector_search` rejects wrong-dim queries
+                    // against declared columns up front, and the write paths reject
+                    // wrong-dim values (issue #137), so for post-#137 data this skip
+                    // is unreachable. It still guards mixed-dim rows written by older
+                    // versions and undeclared (schemaless) properties, where
+                    // `compute_distance` would panic on a length mismatch.
                     continue; // dimension mismatch
                 }
                 let dist = metric.compute_distance(&emb, query);

@@ -834,6 +834,29 @@ pub fn extract_vector_f32_values(
     }
 }
 
+/// Fail-closed sibling of [`extract_vector_f32_values`] for declared-schema columns.
+///
+/// The lenient extractor silently nulls a wrong-dimension or wrong-shape value —
+/// which is how issue #137's corruption reached storage. On the declared-schema
+/// flush path (`PropertyExtractor::build_vector_column` and the multi-vector list
+/// builder) that is always a bug or a guard bypass, so this variant errors instead.
+/// Deleted rows and genuine nulls (`None` / `Value::Null`) keep the lenient
+/// behavior — they are legal null rows, not data loss.
+///
+/// # Errors
+/// Returns the underlying [`VectorDimError`] when a present, non-null value has the
+/// wrong dimensions, a non-numeric element, or is not a vector at all.
+pub fn extract_vector_f32_values_strict(
+    val: Option<&Value>,
+    is_deleted: bool,
+    dimensions: usize,
+) -> Result<(Vec<f32>, bool)> {
+    if !is_deleted && let Some(v) = val {
+        uni_common::core::schema::check_dense_vector_value(v, dimensions)?;
+    }
+    Ok(extract_vector_f32_values(val, is_deleted, dimensions))
+}
+
 fn values_to_fixed_size_list_f32_array(values: &[Value], size: i32) -> ArrayRef {
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), size);
     for v in values {
@@ -1162,6 +1185,8 @@ pub fn values_to_array(values: &[Value], dt: &ArrowDataType) -> Result<ArrayRef>
 
 /// Property value extractor for building Arrow columns from entity properties.
 pub struct PropertyExtractor<'a> {
+    /// Property name, carried for actionable flush-error messages (issue #137).
+    name: &'a str,
     data_type: &'a DataType,
 }
 
@@ -1290,8 +1315,8 @@ pub fn build_multivector_array(values: &[Option<Value>], dimensions: usize) -> A
 }
 
 impl<'a> PropertyExtractor<'a> {
-    pub fn new(_name: &'a str, data_type: &'a DataType) -> Self {
-        Self { data_type }
+    pub fn new(name: &'a str, data_type: &'a DataType) -> Self {
+        Self { name, data_type }
     }
 
     /// Build an Arrow column from a slice of property maps.
@@ -1649,7 +1674,20 @@ impl<'a> PropertyExtractor<'a> {
 
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
             let val = get_props(i);
-            let (values, valid) = extract_vector_f32_values(val, is_deleted, dimensions);
+            // Fail closed on a wrong-dimension value instead of nulling it: the write
+            // paths reject these (issue #137), so reaching one here means an older
+            // WAL/version wrote it or a write path bypassed validation.
+            let (values, valid) = extract_vector_f32_values_strict(val, is_deleted, dimensions)
+                .map_err(|e| {
+                    anyhow!(
+                        "flush: property '{}' row {}: {}; wrong-dimension vectors are rejected \
+                         at write time as of issue #137 — this value was likely written by an \
+                         older version",
+                        self.name,
+                        i,
+                        e
+                    )
+                })?;
             for v in values {
                 builder.values().append_value(v);
             }
@@ -1833,13 +1871,32 @@ impl<'a> PropertyExtractor<'a> {
                 let mut builder =
                     ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dim));
                 for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-                    let val_array = get_props(i).and_then(|v| v.as_array());
+                    let raw = get_props(i);
+                    // Fail closed on a wrong-dimension / wrong-shape token set instead
+                    // of nulling it: the write paths reject these (issue #137), so
+                    // reaching one here means an older WAL/version wrote it or a write
+                    // path bypassed validation. `check_vector_dims` reports the
+                    // offending token index; nulls stay legal null rows.
+                    if !is_deleted && let Some(v) = raw {
+                        self.data_type.check_vector_dims(v).map_err(|e| {
+                            anyhow!(
+                                "flush: property '{}' row {}: {}; wrong-dimension vectors \
+                                 are rejected at write time as of issue #137 — this value \
+                                 was likely written by an older version",
+                                self.name,
+                                i,
+                                e
+                            )
+                        })?;
+                    }
+                    let val_array = raw.and_then(|v| v.as_array());
                     if val_array.is_none() && is_deleted {
                         builder.append_null();
                     } else if let Some(arr) = val_array {
                         // Variable token count per row: append one fixed-size inner
                         // vector per token. `extract_vector_f32_values` always yields
-                        // exactly `dimensions` values, satisfying the FixedSizeList stride.
+                        // exactly `dimensions` values, satisfying the FixedSizeList stride
+                        // (tokens are pre-validated above, so nothing is silently nulled).
                         for tok in arr {
                             let (vals, valid) =
                                 extract_vector_f32_values(Some(tok), false, *dimensions);
@@ -2691,6 +2748,9 @@ mod tests {
 
     #[test]
     fn test_extract_vector_f32_values_vector_wrong_dims() {
+        // Pins the LENIENT read-path helper: wrong dims null out. The declared-schema
+        // flush path uses `extract_vector_f32_values_strict`, which errors instead
+        // (issue #137).
         let v = vec![1.0, 2.0];
         let val = Value::Vector(v);
         let (result, valid) = extract_vector_f32_values(Some(&val), false, 3);
@@ -2709,6 +2769,7 @@ mod tests {
 
     #[test]
     fn test_extract_vector_f32_values_list_wrong_dims() {
+        // Pins the LENIENT read-path helper (see the strict variant for the flush path).
         let v = vec![Value::Float(1.0), Value::Float(2.0)];
         let val = Value::List(v);
         let (result, valid) = extract_vector_f32_values(Some(&val), false, 3);
@@ -3093,34 +3154,132 @@ mod tests {
 
     #[test]
     fn test_build_multivector_invalid_inner_tokens() {
-        // A row whose tokens have wrong dimension or non-numeric content: each
-        // bad token becomes a null inner entry (zeros, invalid) without crashing,
-        // and valid tokens in the same row are preserved.
+        // A row with a wrong-dimension token fails the build (fail-closed, issue
+        // #137) instead of silently nulling the token, and the error names the
+        // property and the offending token index.
         let data_type = DataType::List(Box::new(DataType::Vector { dimensions: 2 }));
         let extractor = PropertyExtractor::new("tokens", &data_type);
 
         let props = [Some(Value::List(vec![
-            Value::Vector(vec![1.0, 2.0]),                           // valid
-            Value::Vector(vec![9.0, 9.0, 9.0]),                      // wrong dim -> null
-            Value::String("nope".to_string()),                       // non-vector -> null
-            Value::List(vec![Value::Float(3.0), Value::Float(4.0)]), // valid (list form)
+            Value::Vector(vec![1.0, 2.0]),      // valid
+            Value::Vector(vec![9.0, 9.0, 9.0]), // wrong dim -> error
         ]))];
         let deleted = [false];
 
-        let arr_ref = extractor
+        let err = extractor
             .build_column(1, &deleted, |i| props[i].as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'tokens'"), "message: {err}");
+        assert!(err.contains("token 1"), "message: {err}");
+
+        // A non-vector token fails too.
+        let props = [Some(Value::List(vec![Value::String("nope".to_string())]))];
+        let err = extractor
+            .build_column(1, &deleted, |i| props[i].as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("token 0"), "message: {err}");
+    }
+
+    #[test]
+    fn test_build_multivector_valid_tokens_and_null_rows() {
+        // Happy path: valid tokens (both Vector and numeric-List form) build, a
+        // missing/null value stays a legal null row, and an empty token list is a
+        // legal empty multi-vector.
+        let data_type = DataType::List(Box::new(DataType::Vector { dimensions: 2 }));
+        let extractor = PropertyExtractor::new("tokens", &data_type);
+
+        let props = [
+            Some(Value::List(vec![
+                Value::Vector(vec![1.0, 2.0]),
+                Value::List(vec![Value::Float(3.0), Value::Float(4.0)]),
+            ])),
+            None,
+            Some(Value::Null),
+            Some(Value::List(vec![])),
+        ];
+        let deleted = [false; 4];
+
+        let arr_ref = extractor
+            .build_column(4, &deleted, |i| props[i].as_ref())
             .unwrap();
         let outer = arr_ref.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(outer.is_valid(0));
+        assert!(!outer.is_valid(1)); // absent -> null row
+        assert!(!outer.is_valid(2)); // explicit Null -> null row
+        assert!(outer.is_valid(3)); // empty multi-vector row
         let inner_row = outer.value(0);
         let inner = inner_row
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
-        assert_eq!(inner.len(), 4);
-        assert!(inner.is_valid(0)); // [1,2]
-        assert!(!inner.is_valid(1)); // wrong dim -> null
-        assert!(!inner.is_valid(2)); // non-vector -> null
-        assert!(inner.is_valid(3)); // [3,4] from list form
+        assert_eq!(inner.len(), 2);
+        assert!(inner.is_valid(0));
+        assert!(inner.is_valid(1));
+        assert_eq!(outer.value(3).len(), 0);
+    }
+
+    #[test]
+    fn test_build_vector_column_wrong_dims_is_error() {
+        // Fail-closed flush for single dense vectors (issue #137): a wrong-dimension
+        // value errors with the property name and row instead of becoming NULL.
+        let data_type = DataType::Vector { dimensions: 3 };
+        let extractor = PropertyExtractor::new("embedding", &data_type);
+
+        let props = [
+            Some(Value::Vector(vec![1.0, 2.0, 3.0])),
+            Some(Value::Vector(vec![1.0, 2.0])),
+        ];
+        let deleted = [false; 2];
+
+        let err = extractor
+            .build_column(2, &deleted, |i| props[i].as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'embedding'"), "message: {err}");
+        assert!(err.contains("row 1"), "message: {err}");
+
+        // Null rows and deleted rows still build fine.
+        let props = [
+            Some(Value::Vector(vec![1.0, 2.0, 3.0])),
+            None,
+            Some(Value::Null),
+        ];
+        let deleted = [false, false, true];
+        let arr_ref = extractor
+            .build_column(3, &deleted, |i| props[i].as_ref())
+            .unwrap();
+        let arr = arr_ref
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert!(arr.is_valid(0));
+        assert!(!arr.is_valid(1));
+    }
+
+    #[test]
+    fn test_extract_vector_f32_values_strict() {
+        // Wrong dim -> Err; null/none -> Ok null row; deleted -> Ok valid zeros.
+        assert!(
+            extract_vector_f32_values_strict(Some(&Value::Vector(vec![1.0, 2.0])), false, 3)
+                .is_err()
+        );
+        assert!(
+            extract_vector_f32_values_strict(Some(&Value::String("x".into())), false, 3).is_err()
+        );
+        let (vals, valid) = extract_vector_f32_values_strict(None, false, 3).unwrap();
+        assert_eq!((vals, valid), (vec![0.0, 0.0, 0.0], false));
+        let (vals, valid) = extract_vector_f32_values_strict(Some(&Value::Null), false, 3).unwrap();
+        assert_eq!((vals, valid), (vec![0.0, 0.0, 0.0], false));
+        let (vals, valid) =
+            extract_vector_f32_values_strict(Some(&Value::Vector(vec![1.0, 2.0])), true, 3)
+                .unwrap();
+        assert_eq!((vals, valid), (vec![0.0, 0.0, 0.0], true));
+        let (vals, valid) =
+            extract_vector_f32_values_strict(Some(&Value::Vector(vec![1.0, 2.0, 3.0])), false, 3)
+                .unwrap();
+        assert_eq!((vals, valid), (vec![1.0, 2.0, 3.0], true));
     }
 
     #[test]

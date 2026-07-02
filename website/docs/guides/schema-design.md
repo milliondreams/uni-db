@@ -244,6 +244,8 @@ Vector dimensions are immutable after schema creation:
 }
 ```
 
+The declared dimension is enforced at write time (since 2.5.0): a wrong-length vector fails with a `TypeError` naming the declared and actual lengths, and an auto-embed model whose output width differs from the declared dimension errors, naming the embedding alias. Re-applying an identical schema is idempotent, but re-declaring an existing property with a different type or dimension (e.g. `VECTOR(4)` → `VECTOR(8)`) raises a schema conflict error (Python: `UniSchemaError`) — use a new property name (see [Embedding Versioning](#embedding-versioning)) or migrate the data.
+
 **Choosing Dimensions:**
 
 | Model Family | Typical Dimensions | Notes |
@@ -683,8 +685,8 @@ Safe operation—new types get new ID ranges:
 ### Breaking Changes (Avoid)
 
 These require data migration:
-- Changing property types
-- Changing vector dimensions
+- Changing property types (re-declaring an existing property with a different type raises a schema conflict error — Python: `UniSchemaError`)
+- Changing vector dimensions (same schema conflict error — declare a new property instead)
 - Renaming labels (ID is fixed)
 - Changing edge type direction semantics
 

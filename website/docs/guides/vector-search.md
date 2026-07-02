@@ -74,6 +74,8 @@ Add a `Vector` type property to your schema:
 }
 ```
 
+Declared dimensions are **enforced** (since 2.5.0): writing a vector of the wrong length into a declared `VECTOR(dim)` property fails with a `TypeError` naming the declared and actual lengths — on Cypher `CREATE`/`SET`, the bulk insert APIs, and auto-embed output (a model whose output width differs from the declared dimension errors, naming the embedding alias). Multi-vector `LIST<VECTOR(dim)>` columns enforce the dimension of every token vector. Previously such values were silently accepted and nulled at flush.
+
 **Dimension Guidelines:**
 
 | Model | Dimensions | Use Case |
@@ -182,6 +184,8 @@ ORDER BY score DESC
 - `node`: Full node object with all properties
 - `vid`: Vertex ID (for efficient joins)
 - `score`: Normalized similarity score (higher is better, range 0-1)
+
+The query vector's length must match the property's declared dimension — a mismatch errors with "vector dimension mismatch" instead of silently returning 0 rows (since 2.5.0). The same check applies to the dense arm of hybrid search (`uni.search`).
 
 ### Auto-Embed Text Queries
 

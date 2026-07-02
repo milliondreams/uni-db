@@ -737,6 +737,7 @@ Key rules:
 - **Label/type IDs are never reused** — append-only registry in `schema.json`
 - **Nullable properties require no data rewrite** — existing rows return NULL
 - **Defaults can be backfilled asynchronously** after schema changes
+- **Property types are immutable** (since 2.5.0) — re-applying an identical schema is idempotent (the register-on-every-open pattern stays cheap), but re-declaring an existing property with a different type or vector dimension (e.g. `VECTOR(4)` → `VECTOR(8)`) raises a schema conflict error (Python: `UniSchemaError`). Use a new property name or migrate the data.
 
 ## Defining a Schema
 
@@ -821,6 +822,16 @@ db.schema() \
         .property("weight", DataType.FLOAT64()) \
     .apply()
 ```
+
+## Vector Dimension Enforcement
+
+Since 2.5.0 (#137), declared `VECTOR(dim)` and multi-vector `List(Vector(dim))` columns **enforce their dimensions everywhere**:
+
+- **Write-time**: a wrong-length vector — or a list with non-numeric elements, or an empty list — written into a declared `VECTOR(dim)` column fails with a `TypeError` naming the declared and actual lengths. This applies to Cypher `CREATE`/`SET`, the bulk insert APIs, and auto-embed output (a model whose output width differs from the declared dimension fails with an error naming the embedding alias). Multi-vector columns enforce the dimension of every token vector.
+- **Query-time**: `uni.vector.query` (and the dense arm of hybrid search) errors with "vector dimension mismatch" when the query vector's length differs from the declared column dimension, instead of silently returning 0 rows.
+- **Flush is fail-closed**: a wrong-dimension value that somehow reaches flush errors instead of being silently nulled. WAL replay of values written by pre-2.5.0 versions nulls them with a warning log, so old databases stay recoverable.
+
+Previously, mismatched values were silently accepted at write time and nulled at flush.
 
 ## Schema Design Best Practices
 
@@ -2308,6 +2319,8 @@ RETURN node.title, score
 ```
 
 Score normalization: Returns a 0-1 similarity score regardless of distance metric. Uses metric-aware conversion: Cosine → `(2-d)/2`, L2 → `1/(1+d)`, Dot → pass-through.
+
+Dimension check: the query vector's length must match the column's declared `VECTOR(dim)` — a mismatch errors with "vector dimension mismatch" (since 2.5.0; previously it silently returned 0 rows). The same check applies to the dense arm of hybrid search. See [Vector Dimension Enforcement](#vector-dimension-enforcement).
 
 **Example — vector search with cross-encoder reranking:**
 

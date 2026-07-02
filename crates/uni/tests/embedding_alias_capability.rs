@@ -855,3 +855,47 @@ async fn explicit_value_preserved_on_hybrid_lone_dense() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #137: a schema/model width mismatch (column declared wider than the model's
+/// output) fails the write with an error naming the alias — instead of the
+/// pre-fix behavior where the wrong-width embedding was inserted, silently
+/// nulled by the Arrow converters at flush, and detonated at shutdown.
+#[tokio::test]
+async fn autoembed_model_output_dim_mismatch_is_actionable_error() -> anyhow::Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let loads = Arc::new(AtomicUsize::new(0));
+    let db = Uni::temporary()
+        .xervo_runtime(hybrid_runtime(calls.clone(), loads.clone(), HeadSet::ALL).await)
+        .build()
+        .await?;
+    db.schema()
+        .label("Doc")
+        .property("content", DataType::String)
+        // Declared wider than the mock model's DIM-wide output.
+        .property_nullable(
+            "embedding",
+            DataType::Vector {
+                dimensions: DIM + 4,
+            },
+        )
+        .index("embedding", dense_index("hybrid/mock", "content"))
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    let err = tx
+        .query_with("CREATE (:Doc {content: 'hello world'})")
+        .fetch_all()
+        .await
+        .expect_err("a model emitting DIM-wide vectors into VECTOR(DIM+4) must fail the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hybrid/mock"),
+        "the error must name the embedding alias so the misconfiguration is actionable: {msg}"
+    );
+    assert!(
+        msg.contains(&DIM.to_string()) && msg.contains(&(DIM + 4).to_string()),
+        "the error must carry both widths: {msg}"
+    );
+    Ok(())
+}

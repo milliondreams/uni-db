@@ -67,6 +67,8 @@ Uni provides native vector search over embedding properties with 8 single-vector
     print(rows)
     ```
 
+Declared `VECTOR(dim)` dimensions are enforced (since 2.5.0): wrong-length writes fail with a `TypeError` naming the declared and actual lengths (including auto-embed output, which errors naming the embedding alias), and a query vector of the wrong length errors with "vector dimension mismatch" instead of silently returning 0 rows.
+
 ## Auto-Embedding Queries
 
 With an embedding configuration on your index, you can query with text directly:

@@ -844,8 +844,9 @@ pub fn extract_vector_f32_values(
 /// behavior — they are legal null rows, not data loss.
 ///
 /// # Errors
-/// Returns the underlying [`VectorDimError`] when a present, non-null value has the
-/// wrong dimensions, a non-numeric element, or is not a vector at all.
+/// Returns the underlying [`VectorDimError`](uni_common::core::schema::VectorDimError)
+/// when a present, non-null value has the wrong dimensions, a non-numeric element,
+/// or is not a vector at all.
 pub fn extract_vector_f32_values_strict(
     val: Option<&Value>,
     is_deleted: bool,

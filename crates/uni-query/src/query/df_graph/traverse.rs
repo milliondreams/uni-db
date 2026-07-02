@@ -2477,24 +2477,20 @@ async fn build_edge_adjacency_and_target_props(
         }
     }
 
-    // Decide which property names to fetch. `_all_props` needs every property:
-    // union the schema-declared names across all labels (schemaless props ride
-    // along via the overflow/props blob, which `get_batch_vertex_props` always
-    // reads).
+    // Decide which property names to fetch. `_all_props` is a wildcard: pass the
+    // sentinel straight through to `get_batch_vertex_props`, which reads every
+    // property across all tiers (declared per-label columns, the overflow/main
+    // `props_json` blob, and the L0 overlay). Enumerating schema-declared names
+    // here instead would yield nothing for schemaless labels, dropping the
+    // target's properties (e.g. an intermediate node in a multi-hop traversal).
     let wants_all = target_properties.iter().any(|p| p == "_all_props");
-    let mut names: HashSet<String> = target_properties
-        .iter()
-        .filter(|p| p.as_str() != "_all_props")
-        .cloned()
-        .collect();
+    let mut names: HashSet<String> = target_properties.iter().cloned().collect();
     if wants_all {
-        let schema = graph_ctx.storage().schema_manager().schema();
-        for props in schema.properties.values() {
-            names.extend(props.keys().cloned());
-        }
+        // Keep only the wildcard; individual names are subsumed by it.
+        names.retain(|p| p == "_all_props");
     }
 
-    if target_vids.is_empty() || (!wants_all && names.is_empty()) {
+    if target_vids.is_empty() || names.is_empty() {
         return Ok((adjacency, HashMap::new()));
     }
 

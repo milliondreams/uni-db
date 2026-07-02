@@ -9,7 +9,8 @@
 //! MUVERA index, a long document, batched ingest, and a close/reopen catalog-rehydration cycle.
 //!
 //! Gated on `provider-onnx` (static ORT) + `#[ignore]` (downloads / loads a ~2.1 GB model).
-//! Point it at a local model dir via the `cache_dir` option (no network if files are present).
+//! Uses the standard Hugging Face hub cache by default (override via `BGE_M3_DIR`);
+//! no network if the model files are already cached.
 
 #![cfg(feature = "provider-onnx")]
 
@@ -26,11 +27,26 @@ const DIM: usize = 1024; // bge-m3 dense + ColBERT token dim
 const VOCAB: usize = 250002; // XLM-RoBERTa vocab
 const ALIAS: &str = "hybrid/bge-m3";
 
-/// Local dir holding model.onnx + model.onnx.data + Constant_685_attr__value + tokenizer.json.
-/// Set `BGE_M3_DIR` to the directory containing the downloaded `aapot/bge-m3-onnx` files;
-/// defaults to `./bge-m3-onnx` relative to the current working directory.
+/// hf-hub cache root holding the `aapot/bge-m3-onnx` snapshot (model.onnx +
+/// model.onnx.data + Constant_685_attr__value + tokenizer.json).
+///
+/// Set `BGE_M3_DIR` to override. Defaults to the standard Hugging Face hub
+/// cache (`$HF_HUB_CACHE`, then `$HF_HOME/hub`, then `~/.cache/huggingface/hub`)
+/// so the ~2.1 GB download is shared across checkouts — the provider treats
+/// `cache_dir` as an hf-hub cache root, and a relative default used to strand
+/// the model inside the source tree (cargo test CWD = the crate root).
 fn model_dir() -> String {
-    std::env::var("BGE_M3_DIR").unwrap_or_else(|_| "bge-m3-onnx".to_string())
+    if let Ok(dir) = std::env::var("BGE_M3_DIR") {
+        return dir;
+    }
+    if let Ok(dir) = std::env::var("HF_HUB_CACHE") {
+        return dir;
+    }
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        return format!("{hf_home}/hub");
+    }
+    let home = std::env::var("HOME").expect("HOME must be set to locate the HF hub cache");
+    format!("{home}/.cache/huggingface/hub")
 }
 
 fn spec() -> ModelAliasSpec {

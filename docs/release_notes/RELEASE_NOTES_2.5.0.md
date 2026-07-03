@@ -5,7 +5,7 @@ knob backed by at-scale recall benchmarks for all three vector modalities, capab
 embedding-alias routing (one BGE-M3 alias can now serve dense, sparse, and multi-vector columns),
 and a query-planner correctness/performance pass (equi-join recovery, projection-pushdown leaks).
 
-This is a minor release covering everything since **2.4.1**. 22 commits; version bumped across the
+This is a minor release covering everything since **2.4.1**. 29 commits; version bumped across the
 Rust workspace and the Python packages (`uni-db`, `uni-pydantic`) to **2.5.0**. New public surfaces:
 the OGM `hybrid_search()` builder and `.search_scores` sidecar, the `ef_search` option on
 `uni.vector.query`, and `UniConfig::flush_stream_timeout`. API-boundary behavior changes are listed
@@ -113,6 +113,37 @@ Two related property-materialization gaps, both reported as mysterious NULL/empt
   now threaded through the batch property helpers, which also gained a main-table (`props_json`)
   fallback for flushed schemaless vertices. Fixes the schemaless-lane openCypher TCK
   `MatchWhere6 [7]/[8]` and Locy TCK `AssumeAbduce` failures.
+
+### 🔹 Traversal label resolution survives the L0 → Lance flush — the `_labels` family, #141, #140
+
+A vertex's *labels*, like its properties (#135), leave the in-memory L0 buffers once it is flushed
+to Lance and live only in the persisted `VidLabelsIndex`. Three label-resolution seams read L0 only
+and misbehaved after a flush (the ~5 s auto-flush, an explicit `db.flush()`, or a fork, which
+flushes all data before branching):
+
+- **Output columns (the `_labels` family).** Three traversal output builders — the single-hop sync
+  fast-path and both variable-length-path builders (schema-aware and schemaless) — resolved a
+  target's `_labels` column from L0 only, so `labels(m)` / `hasLabel(m, …)` over a flushed or forked
+  vertex returned an **empty** label set. All three now route through a shared per-row resolver
+  (`resolve_vertex_labels`: L0 chain then persisted index), making every current and future
+  traversal label-column correct by construction; a nullable-aware builder covers unmatched VLP rows.
+- **VLP label filters over-admitted (#141).** The variable-length-path predicates
+  `check_target_label` (terminal `(m:Label)`) and `check_state_constraint` (QPP intermediate
+  `(y:Label)`) read L0-only labels and failed **open** — admitting a flushed vertex without checking
+  its label. `MATCH (a)-[:R*1..n]->(m:Label)` and QPP intermediate-label constraints could return
+  paths through vertices that don't carry the required label. Both predicates now evaluate against
+  the vertex's real labels via `resolve_vertex_labels`. **Behavior-changing**: affected VLP/QPP
+  queries now reject rows they previously over-admitted.
+- **Deleted-vertex label resurrection (#140).** `resolve_vertex_labels` consulted the persisted
+  index without checking tombstones, so a flushed-then-deleted vertex — its tombstone recorded in a
+  live L0, its index entry not yet re-flushed — could resolve to its **stale** labels. The resolver
+  now returns an empty label set for a tombstoned vid, so every label predicate rejects the deleted
+  vertex instead of admitting it through a fail-open path. (End-to-end this is masked by cascade
+  edge-tombstoning; the guard closes the seam at the resolution chokepoint.)
+
+Each fix ships with tests verified red-before / green-after: the QPP over-admission is the observable
+#141 regression, a white-box resolver test is the #140 regression, and the terminal-filter hardening
+is defense-in-depth behind a downstream `_labels` filter that already resolves correctly.
 
 ### 🔹 Declared `VECTOR(dim)` columns now enforce their dimensions — #137
 
@@ -239,6 +270,12 @@ both directions on every PR, so the stub can no longer drift silently.
     (previously silently nulled at flush), mismatched query vectors to `uni.vector.query` error
     instead of returning 0 rows, and re-declaring an existing property with a different
     type/dimension raises a schema conflict error (Python: `UniSchemaError`).
+  - Variable-length / QPP label-scoped traversals now filter against the vertex's persisted labels
+    (#141): `MATCH (a)-[:R*1..n]->(m:Label)` and QPP intermediate-label constraints reject
+    flushed endpoints that lack the required label, where they were previously over-admitted. Label
+    resolution also no longer returns the stale labels of a deleted-but-unflushed vertex (#140).
+    `labels(m)` / `hasLabel(m, …)` over flushed or forked traversal targets now return the real
+    label set instead of an empty one.
 - No breaking changes to existing Cypher or Locy surfaces; queries that relied on over-wide `WITH`
   projections (#134) keep their results — returned-whole entities and paths are deliberately kept
   wide.
@@ -246,4 +283,4 @@ both directions on every PR, so the stub can no longer drift silently.
 ## Closed issues
 
 #114, #129, #130, #131, #132, #133 (closed as misattributed; superseded by positive BGE-M3
-coverage), #134, #135, #137.
+coverage), #134, #135, #137, #140, #141.

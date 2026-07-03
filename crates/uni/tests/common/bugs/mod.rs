@@ -18,6 +18,7 @@ pub mod bytes_list_functions;
 pub mod bytes_maps_projection;
 pub mod bytes_pipeline;
 pub mod collect_plan_vars_join_recovery;
+pub mod deleted_vertex_label_resurrection;
 pub mod graph_projection_tx_visibility;
 pub mod issue115_storage_path_contract;
 pub mod issue116_composite_key_flush;

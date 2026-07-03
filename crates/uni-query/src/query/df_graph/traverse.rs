@@ -5037,6 +5037,83 @@ mod tests {
         );
     }
 
+    /// White-box guard (#140): `resolve_vertex_labels` must not resurrect the
+    /// labels of a flushed-then-deleted vertex from the stale persisted index.
+    ///
+    /// The vertex is flushed so its label lives only in `VidLabelsIndex`, then a
+    /// tombstone is recorded in the live L0 (mirroring a committed-but-unflushed
+    /// `DELETE`, which leaves the persisted index entry in place until the next
+    /// flush). Before the fix the index fallback returned the stale
+    /// `["Person"]`; the tombstone guard resolves the deleted vertex to an empty
+    /// label set so every label predicate rejects it rather than admitting it.
+    #[tokio::test]
+    async fn test_resolve_labels_does_not_resurrect_deleted_vertex() {
+        use uni_common::core::schema::{DataType as UniDataType, SchemaManager};
+        use uni_store::runtime::l0::L0Buffer;
+        use uni_store::runtime::property_manager::PropertyManager;
+        use uni_store::runtime::writer::Writer;
+        use uni_store::storage::manager::StorageManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let schema_manager = SchemaManager::load(path.join("schema.json")).await.unwrap();
+        schema_manager.add_label("Person").unwrap();
+        schema_manager
+            .add_property("Person", "name", UniDataType::String, true)
+            .unwrap();
+        schema_manager.save().await.unwrap();
+        let schema_manager = Arc::new(schema_manager);
+
+        let storage = Arc::new(
+            StorageManager::new(
+                path.join("storage").to_str().unwrap(),
+                schema_manager.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+            .await
+            .unwrap();
+        let deleted_vid = writer.next_vid().await.unwrap();
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), UniValue::from("Alice"));
+        writer
+            .insert_vertex_with_labels(deleted_vid, props, &["Person".to_string()], None)
+            .await
+            .unwrap();
+        // Flush so the label lives only in the persisted VidLabelsIndex.
+        writer.flush_to_l1(None).await.unwrap();
+
+        // Pre-condition for the bug: the index still holds the stale label after
+        // the flush, so an unguarded fallback would resurrect it.
+        assert_eq!(
+            storage.get_labels_from_index(deleted_vid),
+            Some(vec!["Person".to_string()]),
+            "persisted index must still carry the label (the resurrection source)"
+        );
+
+        let property_manager = Arc::new(PropertyManager::new(
+            storage.clone(),
+            schema_manager.clone(),
+            100,
+        ));
+        // A live L0 carrying the vertex's tombstone (committed-but-unflushed DELETE).
+        let l0 = Arc::new(parking_lot::RwLock::new(L0Buffer::new(0, None)));
+        l0.write().vertex_tombstones.insert(deleted_vid);
+        let graph_ctx = GraphExecutionContext::new(storage.clone(), l0, property_manager);
+        let query_ctx = graph_ctx.query_context();
+
+        let got = graph_ctx.resolve_vertex_labels(deleted_vid, &query_ctx);
+        assert_eq!(
+            got,
+            Some(Vec::new()),
+            "a deleted vertex must resolve to empty labels, not the stale persisted index entry"
+        );
+    }
+
     #[test]
     fn test_traverse_schema_with_edge() {
         let input_schema = Arc::new(Schema::new(vec![Field::new(

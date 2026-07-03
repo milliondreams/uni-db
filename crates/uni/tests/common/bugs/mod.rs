@@ -51,4 +51,5 @@ pub mod repro_edge_export;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;
+pub mod traverse_labels_after_flush;
 pub mod unwind_correlated_hash_index_pushdown;

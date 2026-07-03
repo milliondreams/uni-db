@@ -1823,7 +1823,19 @@ impl StorageManager {
                 )
                 .await?;
 
-            results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
+            // Re-score ANN candidates with an EXACT distance rather than trusting
+            // Lance's `_distance`. Lance's cosine ANN distance is on a different
+            // scale (`2(1-cos)`) than the flat path (`1-cos`) that
+            // `calculate_score` expects, so the raw value makes the final
+            // similarity depend on whether an ANN index served the query
+            // (issue #138). The candidate vectors come back in `batches`, so
+            // re-scoring needs no extra fetch and puts these candidates on the
+            // same `compute_distance` scale as the L0 candidates merged below.
+            results = extract_vid_and_vector_pairs(&batches, "_vid", property)?
+                .into_iter()
+                .filter(|(_, emb)| emb.len() == query.len())
+                .map(|(vid, emb)| (vid, metric.compute_distance(&emb, query)))
+                .collect();
         }
 
         // Merge L0 buffer vertices into results for visibility of unflushed data.
@@ -2423,6 +2435,54 @@ fn extract_vid_score_pairs(
         }
     }
     Ok(results)
+}
+
+/// Extracts `(vid, embedding)` pairs from vector-search result batches, decoding
+/// the dense `FixedSizeList<Float32>` vector column.
+///
+/// Used to re-score ANN candidates with an exact `compute_distance` (issue #138):
+/// Lance's cosine `_distance` scale differs between the ANN-index path
+/// (`2(1-cos)`) and the flat path (`1-cos`), so the raw value cannot be trusted
+/// for the final similarity. Rows whose vector is null or the wrong length are
+/// skipped by the caller.
+fn extract_vid_and_vector_pairs(
+    batches: &[arrow_array::RecordBatch],
+    vid_column: &str,
+    vector_column: &str,
+) -> Result<Vec<(Vid, Vec<f32>)>> {
+    use arrow_array::{Array, FixedSizeListArray};
+    let mut out = Vec::new();
+    for batch in batches {
+        let vid_col = batch
+            .column_by_name(vid_column)
+            .ok_or_else(|| anyhow!("Missing {} column", vid_column))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("Invalid {} column type", vid_column))?;
+
+        let vec_col = batch
+            .column_by_name(vector_column)
+            .ok_or_else(|| anyhow!("Missing vector column {}", vector_column))?
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| anyhow!("Vector column {} is not FixedSizeList", vector_column))?;
+
+        for i in 0..batch.num_rows() {
+            if vec_col.is_null(i) {
+                continue;
+            }
+            let element = vec_col.value(i);
+            let floats = element
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    anyhow!("Vector column {} inner type is not Float32", vector_column)
+                })?;
+            let emb: Vec<f32> = (0..floats.len()).map(|j| floats.value(j)).collect();
+            out.push((Vid::from(vid_col.value(i)), emb));
+        }
+    }
+    Ok(out)
 }
 
 /// Extracts a dense `Vec<f32>` embedding from an L0 property value.

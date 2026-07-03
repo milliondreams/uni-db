@@ -193,6 +193,20 @@ harness = false
 name = "multivec_retrieval"
 harness = false
 
+[[example]]
+name = "locomo_profile"
+required-features = ["provider-onnx"]
+
+[[example]]
+name = "locomo_hybrid"
+required-features = ["provider-onnx"]
+
+[[example]]
+name = "hybrid_multiindex_repro"
+
+[[example]]
+name = "projection_leak_repro"
+
 [features]
 default = [
     "lance-backend",

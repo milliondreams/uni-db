@@ -960,11 +960,35 @@ impl PropertyManager {
     /// Queries L0 layers in-memory, then fetches remaining VIDs from LanceDB in
     /// a single `_vid IN (...)` query on the label table. Much faster than
     /// per-vertex `get_all_vertex_props_with_ctx` when many vertices need loading.
+    ///
+    /// Fetches every columnar property. Callers that only need a subset (e.g. a
+    /// vector/search procedure materializing `RETURN node.<prop>`) should prefer
+    /// [`Self::get_batch_vertex_props_for_label_projected`] to avoid decoding
+    /// unread heavy columns such as `List(Vector)` (issue #134).
     pub async fn get_batch_vertex_props_for_label(
         &self,
         vids: &[Vid],
         label: &str,
         ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Vid, Properties>> {
+        self.get_batch_vertex_props_for_label_projected(vids, label, ctx, None)
+            .await
+    }
+
+    /// Like [`Self::get_batch_vertex_props_for_label`], but restricts the LanceDB
+    /// fetch to `requested_props` (plus the id/version/overflow bookkeeping
+    /// columns) when `Some`. Unread columnar properties — notably heavy
+    /// `List(Vector)` columns — are then never decoded (issue #134). `None`
+    /// fetches all columnar properties, identical to the unprojected method.
+    ///
+    /// Requested names that are not declared columnar properties are ignored
+    /// here; they are served from `overflow_json`, which is always fetched.
+    pub async fn get_batch_vertex_props_for_label_projected(
+        &self,
+        vids: &[Vid],
+        label: &str,
+        ctx: Option<&QueryContext>,
+        requested_props: Option<&[String]>,
     ) -> Result<HashMap<Vid, Properties>> {
         let mut result: HashMap<Vid, Properties> = HashMap::new();
         let mut need_storage: Vec<Vid> = Vec::new();
@@ -999,7 +1023,17 @@ impl PropertyManager {
 
         let mut prop_names: Vec<String> = Vec::new();
         if let Some(props) = label_props {
-            prop_names = props.keys().cloned().collect();
+            prop_names = match requested_props {
+                // Prune to the requested columnar props; any requested name that
+                // is not a declared column is served from overflow_json below, so
+                // dropping it here is safe and avoids decoding unread columns.
+                Some(reqs) => reqs
+                    .iter()
+                    .filter(|r| props.contains_key(r.as_str()))
+                    .cloned()
+                    .collect(),
+                None => props.keys().cloned().collect(),
+            };
         }
 
         let mut columns: Vec<String> = vec![

@@ -867,8 +867,15 @@ async fn build_result_batch(
         let property_manager = graph_ctx.property_manager();
         let query_ctx = graph_ctx.query_context();
 
+        // Prune the fetch to the properties actually hydrated below, so unread
+        // heavy columns (e.g. `List(Vector)`) are not decoded (issue #134).
         let props_map = property_manager
-            .get_batch_vertex_props_for_label(vids, label_name, Some(&query_ctx))
+            .get_batch_vertex_props_for_label_projected(
+                vids,
+                label_name,
+                Some(&query_ctx),
+                Some(target_properties),
+            )
             .await
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 

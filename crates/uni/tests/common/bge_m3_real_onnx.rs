@@ -11,8 +11,9 @@
 //! Gated on `provider-onnx` (static ORT) + `#[ignore]` (downloads / loads a ~2.1 GB model).
 //! Uses the standard Hugging Face hub cache by default (override via `BGE_M3_DIR`);
 //! no network if the model files are already cached.
-
-#![cfg(feature = "provider-onnx")]
+//!
+//! NOTE: the `provider-onnx` feature gate now lives on the `mod bge_m3_real_onnx;`
+//! declaration in `integration.rs` (this file is folded into that binary).
 
 use std::sync::Arc;
 

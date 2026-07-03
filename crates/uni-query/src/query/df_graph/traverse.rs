@@ -3151,9 +3151,13 @@ impl GraphVariableLengthTraverseExecData {
     fn check_target_label(&self, vid: Vid) -> bool {
         if let Some(ref label_name) = self.target_label_name {
             let query_ctx = self.graph_ctx.query_context();
-            match l0_visibility::get_vertex_labels_optional(vid, &query_ctx) {
+            // Resolve from the L0 chain then the persisted `VidLabelsIndex`, so a
+            // flushed (Lance-only) vertex is judged against its real labels rather
+            // than admitted by a fail-open L0-only miss (#141). A vertex unknown to
+            // both still trusts storage-level filtering.
+            match self.graph_ctx.resolve_vertex_labels(vid, &query_ctx) {
                 Some(labels) => labels.contains(label_name),
-                None => true, // not in L0, trust storage
+                None => true, // unknown to L0 and the index — trust storage
             }
         } else {
             true
@@ -3165,9 +3169,13 @@ impl GraphVariableLengthTraverseExecData {
         match constraint {
             super::nfa::VertexConstraint::Label(label_name) => {
                 let query_ctx = self.graph_ctx.query_context();
-                match l0_visibility::get_vertex_labels_optional(vid, &query_ctx) {
+                // Resolve from the L0 chain then the persisted `VidLabelsIndex`, so a
+                // flushed intermediate node is judged against its real labels rather
+                // than admitted by a fail-open L0-only miss — otherwise a `*1..n`
+                // QPP over-admits paths through wrong-label intermediates (#141).
+                match self.graph_ctx.resolve_vertex_labels(vid, &query_ctx) {
                     Some(labels) => labels.contains(label_name),
-                    None => true, // not in L0, trust storage
+                    None => true, // unknown to L0 and the index — trust storage
                 }
             }
         }

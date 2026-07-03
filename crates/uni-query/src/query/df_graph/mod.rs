@@ -472,9 +472,16 @@ impl GraphExecutionContext {
 
     /// Resolve a vertex's labels for a traversal-time label predicate.
     ///
-    /// Checks the L0 chain first (which also records the read for SSI), then
-    /// the persisted `VidLabelsIndex`. The L0 chain covers fork-local and
-    /// committed-but-unflushed writes; the index covers vertices that live
+    /// A vertex deleted in a live (unflushed) L0 layer resolves to an empty
+    /// label set: its tombstone is recorded but its persisted `VidLabelsIndex`
+    /// entry survives until the next flush, so consulting the index directly
+    /// would resurrect stale labels for a deleted vertex (#140). Returning
+    /// `Some(empty)` — rather than `None` — makes every label predicate reject
+    /// the deleted vertex instead of admitting it through a fail-open path.
+    ///
+    /// Otherwise checks the L0 chain first (which also records the read for
+    /// SSI), then the persisted `VidLabelsIndex`. The L0 chain covers fork-local
+    /// and committed-but-unflushed writes; the index covers vertices that live
     /// only in Lance storage — notably every vertex on a fork, whose data is
     /// flushed to Lance before branching. Returns `None` only when the vertex
     /// is absent from both, in which case callers fall back to the label that
@@ -488,6 +495,9 @@ impl GraphExecutionContext {
     /// }
     /// ```
     pub fn resolve_vertex_labels(&self, vid: Vid, query_ctx: &QueryContext) -> Option<Vec<String>> {
+        if uni_store::runtime::l0_visibility::is_vertex_deleted(vid, Some(query_ctx)) {
+            return Some(Vec::new());
+        }
         uni_store::runtime::l0_visibility::get_vertex_labels_optional(vid, query_ctx)
             .or_else(|| self.storage.get_labels_from_index(vid))
     }

@@ -729,12 +729,36 @@ impl GraphTraverseStream {
     }
 }
 
-/// Build the target-vertex labels column for `hasLabel` filters.
+/// Resolve one traversal target's labels for a `_labels` output column.
 ///
-/// Resolves each target's labels from the L0 chain and then the persisted
-/// `VidLabelsIndex`, so `hasLabel(b, "B")` evaluates correctly for vertices
-/// that live only in Lance storage (e.g. on a fork). Only when a vertex is
-/// absent from both does it fall back to the label that scoped the traversal.
+/// Consults the L0 chain and then the persisted `VidLabelsIndex` via
+/// `GraphExecutionContext::resolve_vertex_labels`, so labels that live only in
+/// Lance storage (after a flush or on a fork) are not dropped. A vertex absent
+/// from both falls back to `target_label_name` — the schema label that scoped
+/// the traversal, which storage already filtered to — or an empty set.
+fn resolve_output_labels(
+    vid: Vid,
+    target_label_name: &Option<String>,
+    graph_ctx: &GraphExecutionContext,
+    query_ctx: &uni_store::runtime::context::QueryContext,
+) -> Vec<String> {
+    match graph_ctx.resolve_vertex_labels(vid, query_ctx) {
+        Some(labels) => labels,
+        // Unknown to both L0 and the index — trust the schema label that
+        // scoped the traversal (storage already filtered to it).
+        None => match target_label_name {
+            Some(label_name) => vec![label_name.clone()],
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Build the target-vertex labels column for `hasLabel` filters and outputs.
+///
+/// Resolves each target's labels via `resolve_output_labels`, so `hasLabel(b,
+/// "B")` and `labels(b)` evaluate correctly for vertices that live only in
+/// Lance storage (e.g. on a fork). Every target vid must be present; use
+/// `build_target_labels_column_opt` where unmatched (null) rows are possible.
 fn build_target_labels_column(
     target_vids: &[Vid],
     target_label_name: &Option<String>,
@@ -744,18 +768,37 @@ fn build_target_labels_column(
     let mut labels_builder = ListBuilder::new(StringBuilder::new());
     let query_ctx = graph_ctx.query_context();
     for vid in target_vids {
-        let row_labels: Vec<String> = match graph_ctx.resolve_vertex_labels(*vid, &query_ctx) {
-            Some(labels) => labels,
-            None => {
-                // Unknown to both L0 and the index — trust the schema label
-                // that scoped the traversal (storage already filtered to it).
-                if let Some(label_name) = target_label_name {
-                    vec![label_name.clone()]
-                } else {
-                    vec![]
-                }
-            }
+        let row_labels = resolve_output_labels(*vid, target_label_name, graph_ctx, &query_ctx);
+        let values = labels_builder.values();
+        for lbl in &row_labels {
+            values.append_value(lbl);
+        }
+        labels_builder.append(true);
+    }
+    Arc::new(labels_builder.finish())
+}
+
+/// Build the target-vertex labels column, allowing unmatched (null) rows.
+///
+/// A `None` vid yields a null list row (an unmatched variable-length path); a
+/// `Some` vid resolves via `resolve_output_labels`. This is the
+/// variable-length-path counterpart of `build_target_labels_column`, sharing
+/// the same L0-then-persisted-`VidLabelsIndex` resolution so labels are not
+/// dropped for flushed or forked vertices.
+fn build_target_labels_column_opt(
+    target_vids: &[Option<Vid>],
+    target_label_name: &Option<String>,
+    graph_ctx: &GraphExecutionContext,
+) -> ArrayRef {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    let mut labels_builder = ListBuilder::new(StringBuilder::new());
+    let query_ctx = graph_ctx.query_context();
+    for vid in target_vids {
+        let Some(vid) = vid else {
+            labels_builder.append(false);
+            continue;
         };
+        let row_labels = resolve_output_labels(*vid, target_label_name, graph_ctx, &query_ctx);
         let values = labels_builder.values();
         for lbl in &row_labels {
             values.append_value(lbl);
@@ -1270,6 +1313,7 @@ impl Stream for GraphTraverseStream {
                                     &expansions,
                                     &self.schema,
                                     self.edge_variable.as_ref(),
+                                    &self.target_label_name,
                                     &self.graph_ctx,
                                     self.optional,
                                     &self.optional_pattern_vars,
@@ -1351,11 +1395,13 @@ impl Stream for GraphTraverseStream {
 ///
 /// Only called when both `target_properties` and `edge_properties` are empty,
 /// so no property columns need to be materialized.
+#[expect(clippy::too_many_arguments)]
 fn build_traverse_output_batch_sync(
     input: &RecordBatch,
     expansions: &[(usize, Vid, u64, u32)],
     schema: &SchemaRef,
     edge_variable: Option<&String>,
+    target_label_name: &Option<String>,
     graph_ctx: &GraphExecutionContext,
     optional: bool,
     optional_pattern_vars: &HashSet<String>,
@@ -1400,30 +1446,16 @@ fn build_traverse_output_batch_sync(
         .collect();
     columns.push(Arc::new(UInt64Array::from(target_vids)));
 
-    // Add target ._labels column (from L0 buffers)
+    // Add target ._labels column. Resolve via the L0 chain and then the
+    // persisted VidLabelsIndex (shared with the async path), so labels that
+    // live only in Lance storage after a flush or on a fork are not dropped.
     {
-        use arrow_array::builder::{ListBuilder, StringBuilder};
-        let l0_ctx = graph_ctx.l0_context();
-        let mut labels_builder = ListBuilder::new(StringBuilder::new());
-        for (_, vid, _, _) in expansions {
-            let mut row_labels: Vec<String> = Vec::new();
-            for l0 in l0_ctx.iter_l0_buffers() {
-                let guard = l0.read();
-                if let Some(l0_labels) = guard.vertex_labels.get(vid) {
-                    for lbl in l0_labels {
-                        if !row_labels.contains(lbl) {
-                            row_labels.push(lbl.clone());
-                        }
-                    }
-                }
-            }
-            let values = labels_builder.values();
-            for lbl in &row_labels {
-                values.append_value(lbl);
-            }
-            labels_builder.append(true);
-        }
-        columns.push(Arc::new(labels_builder.finish()));
+        let target_vids: Vec<Vid> = expansions.iter().map(|(_, vid, _, _)| *vid).collect();
+        columns.push(build_target_labels_column(
+            &target_vids,
+            target_label_name,
+            graph_ctx,
+        ));
     }
 
     // Add edge columns if edge is bound (no properties in sync path)
@@ -3119,9 +3151,13 @@ impl GraphVariableLengthTraverseExecData {
     fn check_target_label(&self, vid: Vid) -> bool {
         if let Some(ref label_name) = self.target_label_name {
             let query_ctx = self.graph_ctx.query_context();
-            match l0_visibility::get_vertex_labels_optional(vid, &query_ctx) {
+            // Resolve from the L0 chain then the persisted `VidLabelsIndex`, so a
+            // flushed (Lance-only) vertex is judged against its real labels rather
+            // than admitted by a fail-open L0-only miss (#141). A vertex unknown to
+            // both still trusts storage-level filtering.
+            match self.graph_ctx.resolve_vertex_labels(vid, &query_ctx) {
                 Some(labels) => labels.contains(label_name),
-                None => true, // not in L0, trust storage
+                None => true, // unknown to L0 and the index — trust storage
             }
         } else {
             true
@@ -3133,9 +3169,13 @@ impl GraphVariableLengthTraverseExecData {
         match constraint {
             super::nfa::VertexConstraint::Label(label_name) => {
                 let query_ctx = self.graph_ctx.query_context();
-                match l0_visibility::get_vertex_labels_optional(vid, &query_ctx) {
+                // Resolve from the L0 chain then the persisted `VidLabelsIndex`, so a
+                // flushed intermediate node is judged against its real labels rather
+                // than admitted by a fail-open L0-only miss — otherwise a `*1..n`
+                // QPP over-admits paths through wrong-label intermediates (#141).
+                match self.graph_ctx.resolve_vertex_labels(vid, &query_ctx) {
                     Some(labels) => labels.contains(label_name),
-                    None => true, // not in L0, trust storage
+                    None => true, // unknown to L0 and the index — trust storage
                 }
             }
         }
@@ -3651,44 +3691,23 @@ impl GraphVariableLengthTraverseStream {
             columns.push(Arc::new(UInt64Array::from(target_vids.clone())));
         }
 
-        // Add target ._labels column (only if not already in input)
+        // Add target ._labels column (only if not already in input). Resolve
+        // via the L0 chain then the persisted VidLabelsIndex (shared with the
+        // single-hop paths) so labels are not dropped for vertices that live
+        // only in Lance storage after a flush or on a fork.
         let target_labels_name = format!("{}._labels", self.exec.target_variable);
         if input
             .schema()
             .column_with_name(&target_labels_name)
             .is_none()
         {
-            use arrow_array::builder::{ListBuilder, StringBuilder};
-            let query_ctx = self.exec.graph_ctx.query_context();
-            let mut labels_builder = ListBuilder::new(StringBuilder::new());
-            for target_vid in &target_vids {
-                let Some(vid_u64) = target_vid else {
-                    labels_builder.append(false);
-                    continue;
-                };
-                let vid = Vid::from(*vid_u64);
-                let row_labels: Vec<String> =
-                    match l0_visibility::get_vertex_labels_optional(vid, &query_ctx) {
-                        Some(labels) => {
-                            // Vertex is in L0 — use actual labels only
-                            labels
-                        }
-                        None => {
-                            // Vertex not in L0 — trust schema label (storage already filtered)
-                            if let Some(ref label_name) = self.exec.target_label_name {
-                                vec![label_name.clone()]
-                            } else {
-                                vec![]
-                            }
-                        }
-                    };
-                let values = labels_builder.values();
-                for lbl in &row_labels {
-                    values.append_value(lbl);
-                }
-                labels_builder.append(true);
-            }
-            columns.push(Arc::new(labels_builder.finish()));
+            let target_vid_opts: Vec<Option<Vid>> =
+                target_vids.iter().map(|v| v.map(Vid::from)).collect();
+            columns.push(build_target_labels_column_opt(
+                &target_vid_opts,
+                &self.exec.target_label_name,
+                &self.exec.graph_ctx,
+            ));
         }
 
         // Add null placeholder columns for target properties (hydrated async if needed, skip if already in input)
@@ -4598,35 +4617,33 @@ impl GraphVariableLengthTraverseMainStream {
             columns.push(Arc::new(UInt64Array::from(target_vids)));
         }
 
-        // Add target ._labels column (only if not already in input)
+        // Add target ._labels column (only if not already in input). Resolve
+        // via the L0 chain then the persisted VidLabelsIndex (shared with the
+        // single-hop paths) so labels are not dropped for vertices that live
+        // only in Lance storage after a flush or on a fork. This schemaless
+        // path has no scoping label, so a vertex absent from both yields no
+        // labels rather than a fallback.
         let target_labels_name = format!("{}._labels", self.target_variable);
         if batch
             .schema()
             .column_with_name(&target_labels_name)
             .is_none()
         {
-            use arrow_array::builder::{ListBuilder, StringBuilder};
-            let mut labels_builder = ListBuilder::new(StringBuilder::new());
-            for (_, vid, _, node_path, edge_path) in expansions.iter() {
-                if node_path.is_empty() && edge_path.is_empty() {
-                    labels_builder.append(false);
-                    continue;
-                }
-                let mut row_labels: Vec<String> = Vec::new();
-                let labels =
-                    l0_visibility::get_vertex_labels(*vid, &self.graph_ctx.query_context());
-                for lbl in &labels {
-                    if !row_labels.contains(lbl) {
-                        row_labels.push(lbl.clone());
+            let target_vid_opts: Vec<Option<Vid>> = expansions
+                .iter()
+                .map(|(_, vid, _, node_path, edge_path)| {
+                    if node_path.is_empty() && edge_path.is_empty() {
+                        None
+                    } else {
+                        Some(*vid)
                     }
-                }
-                let values = labels_builder.values();
-                for lbl in &row_labels {
-                    values.append_value(lbl);
-                }
-                labels_builder.append(true);
-            }
-            columns.push(Arc::new(labels_builder.finish()));
+                })
+                .collect();
+            columns.push(build_target_labels_column_opt(
+                &target_vid_opts,
+                &None,
+                &self.graph_ctx,
+            ));
         }
 
         // Add hop count column
@@ -4922,6 +4939,179 @@ mod tests {
         assert_eq!(output_schema.field(1).name(), "m._vid");
         assert_eq!(output_schema.field(2).name(), "m._labels");
         assert_eq!(output_schema.field(3).name(), "__eid_to_m");
+    }
+
+    /// White-box guard: the synchronous relationship-scan builder must resolve
+    /// a target's labels from the persisted `VidLabelsIndex`, not L0 alone.
+    ///
+    /// Complements the end-to-end tests by pinning the private sync builder
+    /// directly, so a future planner change that stops routing to it cannot
+    /// silently drop this coverage. The vertex is flushed to Lance and the L0
+    /// chain is empty, so the label can only come from the persisted index.
+    #[tokio::test]
+    async fn test_sync_builder_resolves_labels_from_persisted_index() {
+        use arrow_array::{ListArray, StringArray};
+        use uni_common::core::schema::{DataType as UniDataType, SchemaManager};
+        use uni_store::runtime::l0::L0Buffer;
+        use uni_store::runtime::property_manager::PropertyManager;
+        use uni_store::runtime::writer::Writer;
+        use uni_store::storage::manager::StorageManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let schema_manager = SchemaManager::load(path.join("schema.json")).await.unwrap();
+        schema_manager.add_label("Person").unwrap();
+        schema_manager
+            .add_property("Person", "name", UniDataType::String, true)
+            .unwrap();
+        schema_manager.save().await.unwrap();
+        let schema_manager = Arc::new(schema_manager);
+
+        let storage = Arc::new(
+            StorageManager::new(
+                path.join("storage").to_str().unwrap(),
+                schema_manager.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+            .await
+            .unwrap();
+        let target_vid = writer.next_vid().await.unwrap();
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), UniValue::from("Alice"));
+        writer
+            .insert_vertex_with_labels(target_vid, props, &["Person".to_string()], None)
+            .await
+            .unwrap();
+        // Flush so the label lives only in the persisted index, not L0.
+        writer.flush_to_l1(None).await.unwrap();
+
+        let property_manager = Arc::new(PropertyManager::new(
+            storage.clone(),
+            schema_manager.clone(),
+            100,
+        ));
+        // Fresh empty L0 chain => the label is reachable only via the index.
+        let empty_l0 = Arc::new(parking_lot::RwLock::new(L0Buffer::new(0, None)));
+        let graph_ctx = GraphExecutionContext::new(storage.clone(), empty_l0, property_manager);
+
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "a._vid",
+            DataType::UInt64,
+            false,
+        )]));
+        let input = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![1u64]))],
+        )
+        .unwrap();
+        let output_schema =
+            GraphTraverseExec::build_schema(input_schema, "m", None, &[], &[], None, None, false);
+        let expansions = vec![(0usize, target_vid, 0u64, 0u32)];
+
+        let out = build_traverse_output_batch_sync(
+            &input,
+            &expansions,
+            &output_schema,
+            None,
+            // No scoping label: labels must come from the index, not a fallback.
+            &None,
+            &graph_ctx,
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let labels_col = out.column(2).as_any().downcast_ref::<ListArray>().unwrap();
+        let row0 = labels_col.value(0);
+        let strs = row0.as_any().downcast_ref::<StringArray>().unwrap();
+        let got: Vec<String> = strs.iter().flatten().map(|s| s.to_string()).collect();
+        assert_eq!(
+            got,
+            vec!["Person".to_string()],
+            "sync builder must resolve labels from the persisted VidLabelsIndex"
+        );
+    }
+
+    /// White-box guard (#140): `resolve_vertex_labels` must not resurrect the
+    /// labels of a flushed-then-deleted vertex from the stale persisted index.
+    ///
+    /// The vertex is flushed so its label lives only in `VidLabelsIndex`, then a
+    /// tombstone is recorded in the live L0 (mirroring a committed-but-unflushed
+    /// `DELETE`, which leaves the persisted index entry in place until the next
+    /// flush). Before the fix the index fallback returned the stale
+    /// `["Person"]`; the tombstone guard resolves the deleted vertex to an empty
+    /// label set so every label predicate rejects it rather than admitting it.
+    #[tokio::test]
+    async fn test_resolve_labels_does_not_resurrect_deleted_vertex() {
+        use uni_common::core::schema::{DataType as UniDataType, SchemaManager};
+        use uni_store::runtime::l0::L0Buffer;
+        use uni_store::runtime::property_manager::PropertyManager;
+        use uni_store::runtime::writer::Writer;
+        use uni_store::storage::manager::StorageManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let schema_manager = SchemaManager::load(path.join("schema.json")).await.unwrap();
+        schema_manager.add_label("Person").unwrap();
+        schema_manager
+            .add_property("Person", "name", UniDataType::String, true)
+            .unwrap();
+        schema_manager.save().await.unwrap();
+        let schema_manager = Arc::new(schema_manager);
+
+        let storage = Arc::new(
+            StorageManager::new(
+                path.join("storage").to_str().unwrap(),
+                schema_manager.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+            .await
+            .unwrap();
+        let deleted_vid = writer.next_vid().await.unwrap();
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), UniValue::from("Alice"));
+        writer
+            .insert_vertex_with_labels(deleted_vid, props, &["Person".to_string()], None)
+            .await
+            .unwrap();
+        // Flush so the label lives only in the persisted VidLabelsIndex.
+        writer.flush_to_l1(None).await.unwrap();
+
+        // Pre-condition for the bug: the index still holds the stale label after
+        // the flush, so an unguarded fallback would resurrect it.
+        assert_eq!(
+            storage.get_labels_from_index(deleted_vid),
+            Some(vec!["Person".to_string()]),
+            "persisted index must still carry the label (the resurrection source)"
+        );
+
+        let property_manager = Arc::new(PropertyManager::new(
+            storage.clone(),
+            schema_manager.clone(),
+            100,
+        ));
+        // A live L0 carrying the vertex's tombstone (committed-but-unflushed DELETE).
+        let l0 = Arc::new(parking_lot::RwLock::new(L0Buffer::new(0, None)));
+        l0.write().vertex_tombstones.insert(deleted_vid);
+        let graph_ctx = GraphExecutionContext::new(storage.clone(), l0, property_manager);
+        let query_ctx = graph_ctx.query_context();
+
+        let got = graph_ctx.resolve_vertex_labels(deleted_vid, &query_ctx);
+        assert_eq!(
+            got,
+            Some(Vec::new()),
+            "a deleted vertex must resolve to empty labels, not the stale persisted index entry"
+        );
     }
 
     #[test]

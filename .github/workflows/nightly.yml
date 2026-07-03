@@ -27,11 +27,23 @@ env:
 permissions:
   contents: read
 
+# Runner targeting is indirected through the SAME repository variables as ci.yml
+# so the self-hosted pool can be cut over (and rolled back) for CI and Nightly
+# together, without editing either file. Each falls back to the self-hosted
+# aks-isolated-linux runner label (by core count) when its variable is unset, so
+# this file targets the self-hosted pool by default; set the variables in Settings
+# > Secrets and variables > Actions > Variables only to override:
+#   CI_RUNNER_XLARGE64 (default linux-64core)  — soak, fuzz, model-check,
+#                                                 metamorphic, tsan, bench
+#   CI_RUNNER_XLARGE32 (default linux-32core)  — cloud (LocalStack, matches ci.yml)
+# Set a single unique runner label string to redirect a tier; to roll back, clear
+# the variable. Both fallbacks now match ci.yml exactly (linux-64core /
+# linux-32core), since the CI_RUNNER_* variables are shared across the two files.
 jobs:
   soak:
     if: github.repository == 'rustic-ai/uni-db'
     name: Soak & Stress (run-ignored)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +97,7 @@ jobs:
   cloud:
     if: github.repository == 'rustic-ai/uni-db'
     name: Cloud Integration (LocalStack)
-    runs-on: linux-xlarge-32
+    runs-on: ${{ vars.CI_RUNNER_XLARGE32 || 'linux-32core' }}
     timeout-minutes: 60
     services:
       localstack:
@@ -144,7 +156,7 @@ jobs:
   fuzz:
     if: github.repository == 'rustic-ai/uni-db'
     name: Fuzz (parsers & codecs)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -201,7 +213,7 @@ jobs:
   model-check:
     if: github.repository == 'rustic-ai/uni-db'
     name: Concurrency Model Check (loom + shuttle)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -242,7 +254,7 @@ jobs:
   metamorphic:
     if: github.repository == 'rustic-ai/uni-db'
     name: Metamorphic Query Oracles (TLP + NoREC)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -287,7 +299,7 @@ jobs:
   tsan:
     if: github.repository == 'rustic-ai/uni-db'
     name: ThreadSanitizer (SSI commit path)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -357,7 +369,7 @@ jobs:
   bench:
     if: github.repository == 'rustic-ai/uni-db'
     name: Benchmarks (artifact upload)
-    runs-on: ubuntu-xlarge
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

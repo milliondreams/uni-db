@@ -821,6 +821,23 @@ fn hash_f64_normalized<H: Hasher>(f: f64, state: &mut H) {
     bits.hash(state);
 }
 
+/// Hashes an `f32` with signed-zero and NaN normalization.
+///
+/// The `f32` counterpart of [`hash_f64_normalized`], used by the `Vector` and
+/// `SparseVector` arms: `Vec<f32>` weights compare via IEEE-754 `==` (so
+/// `0.0 == -0.0`), so they must hash with the same normalization to uphold the
+/// `Hash`/`Eq` contract.
+fn hash_f32_normalized<H: Hasher>(f: f32, state: &mut H) {
+    let bits = if f == 0.0 {
+        0.0f32.to_bits()
+    } else if f.is_nan() {
+        f32::NAN.to_bits()
+    } else {
+        f.to_bits()
+    };
+    bits.hash(state);
+}
+
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Discriminant first for type safety
@@ -845,14 +862,7 @@ impl Hash for Value {
                 // with the same signed-zero/NaN normalization to stay consistent.
                 v.len().hash(state);
                 for f in v {
-                    let bits = if *f == 0.0f32 {
-                        0.0f32.to_bits()
-                    } else if f.is_nan() {
-                        f32::NAN.to_bits()
-                    } else {
-                        f.to_bits()
-                    };
-                    bits.hash(state);
+                    hash_f32_normalized(*f, state);
                 }
             }
             Value::SparseVector { indices, values } => {
@@ -862,14 +872,7 @@ impl Hash for Value {
                 indices.hash(state);
                 values.len().hash(state);
                 for f in values {
-                    let bits = if *f == 0.0f32 {
-                        0.0f32.to_bits()
-                    } else if f.is_nan() {
-                        f32::NAN.to_bits()
-                    } else {
-                        f.to_bits()
-                    };
-                    bits.hash(state);
+                    hash_f32_normalized(*f, state);
                 }
             }
             Value::Temporal(t) => t.hash(state),

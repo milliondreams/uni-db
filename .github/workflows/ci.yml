@@ -34,13 +34,26 @@ env:
 permissions:
   contents: read
 
+# Runner targeting is indirected through repository variables so the pool can be
+# cut over (and rolled back) without editing this file. Each falls back to the
+# original GitHub-larger-runner label when its variable is unset, so this file is
+# a behavioral no-op until you set them in Settings > Secrets and variables >
+# Actions > Variables:
+#   CI_RUNNER_HEAVY  (default linux-xlarge-64) — tck-full, reranker
+#   CI_RUNNER_STD    (default linux-xlarge-32) — cloud, notebooks, release-guards
+#   CI_RUNNER_LIGHT  (default ubuntu-latest)   — docs, wheels-cuda-smoke
+# Set a single unique self-hosted label string (e.g. "uni-ci-heavy"); to roll
+# back, clear the variable. The `gate` job stays pinned to ubuntu-latest on
+# purpose: it is the authoritative release check and should run on GitHub's
+# infra regardless of the self-hosted pool's health.
+# Canary order: flip LIGHT first (cheap, no secrets/Docker), then STD, then HEAVY.
 jobs:
   # Conformance modes the PR does not run: openCypher sidecar + both Locy lanes.
   # This job is the cache "saver" for main's shared "ci" cache (no save-if:false).
   tck-full:
     if: github.repository == 'rustic-ai/uni-db'
     name: TCK (sidecar + Locy)
-    runs-on: linux-xlarge-64
+    runs-on: ${{ vars.CI_RUNNER_HEAVY || 'linux-xlarge-64' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -74,7 +87,7 @@ jobs:
   reranker:
     if: github.repository == 'rustic-ai/uni-db'
     name: Reranker Integration (ONNX)
-    runs-on: linux-xlarge-64
+    runs-on: ${{ vars.CI_RUNNER_HEAVY || 'linux-xlarge-64' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -128,7 +141,7 @@ jobs:
   cloud:
     if: github.repository == 'rustic-ai/uni-db'
     name: Cloud Integration Tests
-    runs-on: linux-xlarge-32
+    runs-on: ${{ vars.CI_RUNNER_STD || 'linux-xlarge-32' }}
     services:
       localstack:
         image: localstack/localstack:4.13.1
@@ -190,7 +203,7 @@ jobs:
   docs:
     if: github.repository == 'rustic-ai/uni-db'
     name: Documentation
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER_LIGHT || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -237,7 +250,7 @@ jobs:
   notebooks:
     if: github.repository == 'rustic-ai/uni-db'
     name: Flagship Notebooks
-    runs-on: linux-xlarge-32
+    runs-on: ${{ vars.CI_RUNNER_STD || 'linux-xlarge-32' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -299,7 +312,7 @@ jobs:
   release-guards:
     if: github.repository == 'rustic-ai/uni-db'
     name: Release Guards
-    runs-on: linux-xlarge-32
+    runs-on: ${{ vars.CI_RUNNER_STD || 'linux-xlarge-32' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -346,7 +359,7 @@ jobs:
   wheels-cuda-smoke:
     if: github.repository == 'rustic-ai/uni-db'
     name: Wheel-graph smoke check (uni-db-cuda)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER_LIGHT || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 

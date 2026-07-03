@@ -9,7 +9,6 @@ use crate::core;
 use crate::types::*;
 use ::uni_db::Uni;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -63,13 +62,7 @@ impl QueryCursor {
     /// Fetch a single row, or `None` if exhausted.
     fn fetch_one(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
         match self.next_row(py)? {
-            Some(row) => {
-                let dict = PyDict::new(py);
-                for (col, val) in row.as_map() {
-                    dict.set_item(col, convert::value_to_py(py, val)?)?;
-                }
-                Ok(Some(dict.into()))
-            }
+            Some(row) => Ok(Some(convert::row_to_dict(py, &row)?.into())),
             None => Ok(None),
         }
     }
@@ -80,13 +73,7 @@ impl QueryCursor {
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
             match self.next_row(py)? {
-                Some(row) => {
-                    let dict = PyDict::new(py);
-                    for (col, val) in row.as_map() {
-                        dict.set_item(col, convert::value_to_py(py, val)?)?;
-                    }
-                    result.push(dict.into());
-                }
+                Some(row) => result.push(convert::row_to_dict(py, &row)?.into()),
                 None => break,
             }
         }

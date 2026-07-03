@@ -31,13 +31,13 @@ Example:
     >>> adults = session.query(Person).filter(Person.age >= 18).all()
 """
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 # Base classes
 # Async support
 from .async_query import AsyncQueryBuilder
 from .async_session import AsyncUniSession, AsyncUniTransaction
-from .base import UniEdge, UniNode
+from .base import SearchScores, UniEdge, UniNode
 
 # Database wrappers
 from .database import AsyncUniDatabase, UniDatabase
@@ -89,6 +89,7 @@ from .hooks import (
 from .query import (
     FilterExpr,
     FilterOp,
+    HybridSearchConfig,
     ModelProxy,
     OrderByClause,
     PropertyProxy,
@@ -134,6 +135,7 @@ __all__ = [
     # Base classes
     "UniNode",
     "UniEdge",
+    "SearchScores",
     # Session
     "UniSession",
     "UniTransaction",
@@ -175,6 +177,7 @@ __all__ = [
     "TraversalStep",
     "VectorSearchConfig",
     "SparseSearchConfig",
+    "HybridSearchConfig",
     # Schema
     "SchemaGenerator",
     "DatabaseSchema",

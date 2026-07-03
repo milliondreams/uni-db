@@ -416,6 +416,63 @@ Person.age.in_([25, 30, 35])
 Person.age.not_in([25, 30, 35])
 ```
 
+### Vector Search
+
+```python
+# Dense similarity search; k results, metric set at schema level
+similar = (
+    session.query(Document)
+    .vector_search("embedding", query_vec, k=5, threshold=0.8)
+    .all()
+)
+```
+
+### Sparse Search
+
+```python
+# Learned-sparse (SPLADE); query is a SparseVector, dict[int, float], or (indices, values)
+hits = (
+    session.query(Document)
+    .sparse_search("splade", {1: 1.4, 7: 0.9}, k=10)
+    .all()
+)
+```
+
+### Hybrid Search
+
+Three-way fused dense + full-text + sparse retrieval, wrapping the
+[`uni.search`](../features/hybrid-search.md) procedure. Supply at least one of
+`vector` / `fts` / `sparse`; a single shared query text (from `fts` or the `query_text=`
+kwarg) drives both full-text matching and dense auto-embed.
+
+```python
+hits = (
+    session.query(Document)
+    .hybrid_search(
+        vector=("embedding", query_vec),       # (property, precomputed vec) or bare "embedding" to auto-embed
+        fts=("content", "quarterly revenue"),   # (property, full-text query)
+        sparse=("splade", sparse_vec),          # (property, sparse query)
+        method="rrf",                           # or "weighted" with weights=[v, f, s] / alpha=
+        k=10,
+    )
+    .all()
+)
+```
+
+Each result carries a `.search_scores` sidecar (`None` for non-search queries):
+
+| Attribute | Meaning |
+|---|---|
+| `score` | Fused score (hybrid) or per-source score (single-source), used for ordering |
+| `vector` / `fts` / `sparse` | Per-arm branch scores (`None` when that arm is off) |
+| `rerank` | Reranker score, when a reranker ran |
+| `distance` | Raw dense distance |
+
+```python
+for doc in hits:
+    print(doc.title, doc.search_scores.score, doc.search_scores.vector)
+```
+
 ### Bulk Operations
 
 ```python

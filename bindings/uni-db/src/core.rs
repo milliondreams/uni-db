@@ -617,39 +617,24 @@ pub fn create_index_definition(
     property: &str,
     index_type: &str,
 ) -> Result<IndexDefinition, String> {
+    // The scalar index kinds differ only by their `ScalarIndexType`; build the
+    // shared config once and select the kind.
+    let scalar_index = |index_type: ScalarIndexType| {
+        IndexDefinition::Scalar(ScalarIndexConfig {
+            name: format!("idx_{}_{}", label, property),
+            label: label.to_string(),
+            properties: vec![property.to_string()],
+            index_type,
+            where_clause: None,
+            metadata: Default::default(),
+        })
+    };
+
     match index_type.to_lowercase().as_str() {
-        "btree" | "scalar" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
-            name: format!("idx_{}_{}", label, property),
-            label: label.to_string(),
-            properties: vec![property.to_string()],
-            index_type: ScalarIndexType::BTree,
-            where_clause: None,
-            metadata: Default::default(),
-        })),
-        "hash" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
-            name: format!("idx_{}_{}", label, property),
-            label: label.to_string(),
-            properties: vec![property.to_string()],
-            index_type: ScalarIndexType::Hash,
-            where_clause: None,
-            metadata: Default::default(),
-        })),
-        "bitmap" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
-            name: format!("idx_{}_{}", label, property),
-            label: label.to_string(),
-            properties: vec![property.to_string()],
-            index_type: ScalarIndexType::Bitmap,
-            where_clause: None,
-            metadata: Default::default(),
-        })),
-        "label_list" | "labellist" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
-            name: format!("idx_{}_{}", label, property),
-            label: label.to_string(),
-            properties: vec![property.to_string()],
-            index_type: ScalarIndexType::LabelList,
-            where_clause: None,
-            metadata: Default::default(),
-        })),
+        "btree" | "scalar" => Ok(scalar_index(ScalarIndexType::BTree)),
+        "hash" => Ok(scalar_index(ScalarIndexType::Hash)),
+        "bitmap" => Ok(scalar_index(ScalarIndexType::Bitmap)),
+        "label_list" | "labellist" => Ok(scalar_index(ScalarIndexType::LabelList)),
         // No options here, so use the canonical defaults from the shared parser (IVF_PQ /
         // Cosine) — identical to the DDL, procedure, and config-map paths.
         "vector" => Ok(IndexDefinition::Vector(VectorIndexConfig {

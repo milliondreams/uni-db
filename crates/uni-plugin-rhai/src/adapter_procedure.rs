@@ -142,14 +142,8 @@ fn coerce_for(target: &DataType, value: Dynamic) -> Result<Dynamic, FnError> {
         // Rhai often returns INT for a Float-declared field (and vice versa
         // for Int-declared fields); coerce the mismatched numeric type and
         // pass everything else through unchanged.
-        DataType::Float64 => match value.as_int() {
-            Ok(i) => Ok(Dynamic::from(i as f64)),
-            Err(_) => Ok(value),
-        },
-        DataType::Int64 => match value.as_float() {
-            Ok(f) => Ok(Dynamic::from(f as i64)),
-            Err(_) => Ok(value),
-        },
+        DataType::Float64 => Ok(value.as_int().map_or(value, |i| Dynamic::from(i as f64))),
+        DataType::Int64 => Ok(value.as_float().map_or(value, |f| Dynamic::from(f as i64))),
         _ => Ok(value),
     }
 }

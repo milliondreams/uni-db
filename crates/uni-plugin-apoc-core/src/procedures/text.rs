@@ -334,10 +334,7 @@ impl ProcedurePlugin for TextProc {
             Self::IndexOf => {
                 let haystack = str_arg(0)?;
                 let needle = str_arg(1)?;
-                let idx = haystack
-                    .find(needle.as_str())
-                    .map(|p| p as i64)
-                    .unwrap_or(-1);
+                let idx = haystack.find(needle.as_str()).map_or(-1, |p| p as i64);
                 int_result(idx)
             }
         };

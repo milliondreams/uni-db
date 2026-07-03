@@ -123,19 +123,17 @@ impl ScalarPluginFn for ExtismScalarFn {
         let bytes = encode_batch(&batch).map_err(extism_err_to_fn_err)?;
 
         let mut leased = acquire(&self.pool)?;
-        let out_bytes: Vec<u8> = {
-            let plugin = leased.get_mut();
-            let out: &[u8] = plugin
-                .call(&self.export_name, bytes.as_slice())
-                .map_err(|e| {
-                    FnError::new(
-                        FnError::CODE_UNEXPECTED_NULL,
-                        format!("extism call `{}` failed: {e}", self.export_name),
-                    )
-                })?;
-            // Copy out of the plugin's borrow before releasing the lease.
-            out.to_vec()
-        };
+        // Copy out of the plugin's borrow before releasing the lease.
+        let out_bytes: Vec<u8> = leased
+            .get_mut()
+            .call::<&[u8], &[u8]>(&self.export_name, bytes.as_slice())
+            .map_err(|e| {
+                FnError::new(
+                    FnError::CODE_UNEXPECTED_NULL,
+                    format!("extism call `{}` failed: {e}", self.export_name),
+                )
+            })?
+            .to_vec();
         drop(leased);
 
         let out_batch = decode_batch(&out_bytes)

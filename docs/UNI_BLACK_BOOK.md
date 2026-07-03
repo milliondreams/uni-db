@@ -737,6 +737,7 @@ Key rules:
 - **Label/type IDs are never reused** — append-only registry in `schema.json`
 - **Nullable properties require no data rewrite** — existing rows return NULL
 - **Defaults can be backfilled asynchronously** after schema changes
+- **Property types are immutable** (since 2.5.0) — re-applying an identical schema is idempotent (the register-on-every-open pattern stays cheap), but re-declaring an existing property with a different type or vector dimension (e.g. `VECTOR(4)` → `VECTOR(8)`) raises a schema conflict error (Python: `UniSchemaError`). Use a new property name or migrate the data.
 
 ## Defining a Schema
 
@@ -821,6 +822,16 @@ db.schema() \
         .property("weight", DataType.FLOAT64()) \
     .apply()
 ```
+
+## Vector Dimension Enforcement
+
+Since 2.5.0 (#137), declared `VECTOR(dim)` and multi-vector `List(Vector(dim))` columns **enforce their dimensions everywhere**:
+
+- **Write-time**: a wrong-length vector — or a list with non-numeric elements, or an empty list — written into a declared `VECTOR(dim)` column fails with a `TypeError` naming the declared and actual lengths. This applies to Cypher `CREATE`/`SET`, the bulk insert APIs, and auto-embed output (a model whose output width differs from the declared dimension fails with an error naming the embedding alias). Multi-vector columns enforce the dimension of every token vector.
+- **Query-time**: `uni.vector.query` (and the dense arm of hybrid search) errors with "vector dimension mismatch" when the query vector's length differs from the declared column dimension, instead of silently returning 0 rows.
+- **Flush is fail-closed**: a wrong-dimension value that somehow reaches flush errors instead of being silently nulled. WAL replay of values written by pre-2.5.0 versions nulls them with a warning log, so old databases stay recoverable.
+
+Previously, mismatched values were silently accepted at write time and nulled at flush.
 
 ## Schema Design Best Practices
 
@@ -1489,6 +1500,19 @@ CREATE VECTOR INDEX idx_embed ON Document (embedding)
 | `Dot` | Negative dot product | Pass-through | Unbounded | Maximum inner product search |
 
 Score conversion is **metric-aware**: `uni.vector.query`, `uni.search`, and `similar_to()` all use the same `calculate_score(distance, metric)` function to normalize raw Lance distances into similarity scores, regardless of which metric the vector index was created with.
+
+**Sparse (learned-sparse / SPLADE) index kind.** Beyond the dense ANN families above, a vector index may be created with `type: 'sparse'` to index high-dimensional, mostly-zero `SparseVector` columns (SPLADE-style term-weight vectors). It is backed by an inverted term→(VID, weight) structure rather than HNSW/IVF graphs, and scores by sparse dot product. One knob is specific to it:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `quantize` | Bool | `true` | `true` = 8-bit quantization of term weights (smaller, lossy); `false` = lossless `f32` weights |
+
+```cypher
+CREATE VECTOR INDEX idx_sparse FOR (d:Doc) ON (d.emb)
+  OPTIONS { type: 'sparse', quantize: false }
+```
+
+Query it through `uni.sparse.query` (see Part VIII, [Sparse Vectors](#sparse-vectors)).
 
 ### Full-Text Indexes (BM25)
 
@@ -2296,6 +2320,8 @@ RETURN node.title, score
 
 Score normalization: Returns a 0-1 similarity score regardless of distance metric. Uses metric-aware conversion: Cosine → `(2-d)/2`, L2 → `1/(1+d)`, Dot → pass-through.
 
+Dimension check: the query vector's length must match the column's declared `VECTOR(dim)` — a mismatch errors with "vector dimension mismatch" (since 2.5.0; previously it silently returned 0 rows). The same check applies to the dense arm of hybrid search. See [Vector Dimension Enforcement](#vector-dimension-enforcement).
+
 **Example — vector search with cross-encoder reranking:**
 
 ```cypher
@@ -2479,6 +2505,105 @@ The `GraphExecutionContext` and `SessionContext` are available in `NativeExecuti
 | `ABDUCE ... WHERE` | In-memory | Yes | No | No | No |
 | `ASSUME ... WHERE` | In-memory | Yes | No | No | No |
 
+## Sparse Vectors
+
+Uni supports **learned-sparse retrieval** (SPLADE-style): instead of a dense embedding, a model emits a high-dimensional, mostly-zero weight vector over a term vocabulary. Each non-zero entry is a `(term_id, weight)` pair, and relevance is the **sparse dot product** of query and document vectors. Sparse vectors complement dense vectors — they capture exact-term signal (lexical match) that dense embeddings tend to smear away — and are a first-class arm of [Hybrid Search](#hybrid-search).
+
+### The `sparse_vector(N)` Type
+
+A sparse-vector property is declared with the Cypher type `sparse_vector(N)` (Rust: `DataType::SparseVector { dimensions: N }`), where `N` is the **term-space cardinality** — the size of the vocabulary, i.e. `max_term_id + 1`. It bounds the index space; the value itself stores only its non-zero entries.
+
+```cypher
+CREATE (:Doc {
+  content: 'graph databases for beginners',
+  emb: sparse_vector(30522)        -- 30 522-term vocabulary (e.g. BERT WordPiece)
+})
+```
+
+In the Rust schema builder:
+
+```rust
+db.schema()
+    .label("Doc")
+    .property("content", DataType::String)
+    .property_nullable("emb", DataType::SparseVector { dimensions: 30522 })
+    .apply()
+    .await?;
+```
+
+### Value Shape
+
+A sparse-vector value is a `{indices, values}` map: `indices` is the list of non-zero term ids, `values` the parallel list of their weights. The two lists must be the same length; `indices` are term ids in `[0, N)`.
+
+```cypher
+-- Literal write of a 3-term sparse vector
+CREATE (:Doc {emb: {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]}})
+```
+
+The same `{indices, values}` shape is accepted as the query value for `uni.sparse.query` (a native sparse vector is also accepted directly).
+
+### Storage Layout
+
+On disk a sparse-vector column is an **Arrow struct of two lists** — `indices` (a list of integer term ids) and `values` (a list of `f32` weights) — one struct entry per row. This is the columnar analogue of the `{indices, values}` map: only non-zeros are materialized, so storage scales with vector sparsity, not with the vocabulary size `N`.
+
+### The Sparse Index
+
+A sparse index is created as a `VECTOR INDEX` with `type: 'sparse'` (see Part VI, [Vector Indexes](#vector-indexes-hnsw-ivf-pq-flat)):
+
+```cypher
+CREATE VECTOR INDEX idx_sparse FOR (d:Doc) ON (d.emb)
+  OPTIONS { type: 'sparse', quantize: false }
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `type` | String | — | Must be `'sparse'` to select the learned-sparse index kind |
+| `quantize` | Bool | `true` | `true` = 8-bit term-weight quantization (smaller, lossy); `false` = lossless `f32` weights |
+
+Quantization defaults **on** (8-bit) for compactness; set `quantize: false` when exact weight fidelity matters more than index size.
+
+### `uni.sparse.query`
+
+```cypher
+CALL uni.sparse.query(label, property, query, k [, filter] [, threshold] [, options])
+YIELD vid, score, rerank_score
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `label` | String | Vertex label to search |
+| `property` | String | `SparseVector` property name |
+| `query` | Map or SparseVector | Query as a `{indices, values}` map or a native sparse vector |
+| `k` | Integer | Number of results |
+| `filter` | String (optional) | WHERE predicate string |
+| `threshold` | Float (optional) | Minimum score |
+| `options` | Map (optional) | Reranker configuration (see [Cross-Encoder Reranking](#cross-encoder-reranking)) |
+
+The YIELD columns are exactly **`vid`, `score`, `rerank_score`** — there is no `sparse_score` or `distance` column here (those names belong to the hybrid `uni.search` YIELD). **`score` is the raw sparse dot product** of the query and stored vectors (not a normalized [0, 1] similarity), with larger meaning more relevant. `rerank_score` is populated only when a cross-encoder reranker is configured in `options`.
+
+```cypher
+-- Sparse retrieval over a SPLADE column, top 10
+CALL uni.sparse.query('Doc', 'emb',
+    {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]}, 10)
+YIELD vid, score
+RETURN vid, score
+ORDER BY score DESC
+```
+
+The query is **MVCC- and L0-aware**: candidates retrieved from the index are exact-rescored against the live row state, so freshly written or updated sparse vectors that have not yet been flushed into the index are scored correctly rather than served stale.
+
+### Best Practices
+
+- **Pair sparse with dense, don't choose.** Sparse retrieval recovers exact-term matches that dense embeddings miss; the two are most effective fused through [Hybrid Search](#hybrid-search), not used in isolation.
+- **Auto-embed from one model.** With a hybrid alias (e.g. BGE-M3) you do not hand-build `{indices, values}`; declaring a `SparseVector` index over a text source and registering an `EmbedHybrid` alias fills the column from a forward pass. See [Hybrid Search](#hybrid-search) and [Host-Side Model Runtime (Uni-Xervo)](#host-side-model-runtime-uni-xervo).
+- **Keep `N` honest.** `dimensions` must cover every term id the model can emit (`max_term_id + 1`); an undersized `N` silently drops or rejects high term ids.
+- **Use `quantize: false` only when needed.** Lossless `f32` weights cost more space; the 8-bit default is sufficient for ranking in most workloads.
+
+### Anti-Patterns
+
+- **Reading `score` as a similarity.** Sparse `score` is an unbounded dot product, not a [0, 1] cosine. Do not threshold it on a `> 0.8`-style cutoff calibrated for dense search; calibrate against your own corpus.
+- **Expecting a `sparse_score` / `distance` column.** Those columns exist only on `uni.search`; `uni.sparse.query` yields `vid, score, rerank_score`.
+
 ## Full-Text Search
 
 ```cypher
@@ -2497,37 +2622,120 @@ RETURN node.title, score
 ## Hybrid Search
 
 ```cypher
-CALL uni.search(label, properties, query_text [, query_vector] [, k]
-    [, filter] [, options])
-YIELD node, score, vector_score, fts_score, rerank_score, vid
+CALL uni.search(label, properties, query_text, query_vector, k, filter, options)
+YIELD node, score, vector_score, fts_score, sparse_score, rerank_score, distance, vid
 ```
 
-Combines vector and full-text search with score fusion:
+Combines vector, full-text, and (optionally) sparse search with score fusion. Arguments are **positional**: `query_vector` and `filter` are passed as `null` when not used.
+
+The `properties` argument is a map `{vector, fts, sparse}` selecting which property feeds each arm. A bare string is shorthand for "use this same property for both the vector and FTS arms, sparse off."
 
 | Option | Values | Description |
 |---|---|---|
 | `method` | `'rrf'` (default), `'weighted'` | Score fusion method |
-| `alpha` | 0.0 - 1.0 | Weight for vector vs FTS (weighted mode) |
+| `alpha` | 0.0 - 1.0 | Vector-vs-FTS weight (2-way `weighted` mode only) |
+| `weights` | List\<Float\> `[vector, fts, sparse]` | Per-arm weights for 3-way `weighted` fusion |
+| `rrf_k` | Integer (default: `60`) | RRF constant (higher = less weight to rank position) |
 | `over_fetch` | Float (default: 2.0) | Over-fetch factor for pagination |
-| `reranker` | String | Xervo alias for cross-encoder model (see below) |
+| `sparse_query` | Map or SparseVector | Query vector for the sparse arm (`{indices, values}` or native) |
+| `reranker` | String | Cross-encoder alias, **or** `'maxsim'` for multi-vector/ColBERT late-interaction rerank |
 | `reranker_property` | String | Node text property for cross-encoder document input |
 | `reranker_k` | Integer (default: k×3) | Over-fetch for reranking (clamped to [k, 1000]) |
 | `reranker_query` | String | Override query text for cross-encoder |
+| `maxsim_query` | List\<Vector\> | Query token vectors for `reranker: 'maxsim'` |
+| `maxsim_metric` | String | Distance metric for MaxSim late interaction |
+
+> ANN tuning knobs (`nprobes`, `refine_factor`, `ef_search`) are **not** plumbed through `uni.search`; tune them at index-create time or via `uni.vector.query`.
 
 ```cypher
--- Basic hybrid search with RRF
+-- Basic 2-way hybrid search with RRF
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
-    'graph databases', null, 10)
+    'graph databases', null, 10, null, {})
 YIELD node, score
 RETURN node.title, score
 
--- Hybrid search with cross-encoder reranking
+-- 2-way hybrid with cross-encoder reranking
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'graph databases', null, 10, null,
     {method: 'rrf', reranker: 'rerank/minilm', reranker_property: 'content'})
 YIELD node, score, rerank_score, vector_score, fts_score
 RETURN node.title, score
 ```
+
+### 3-Way Hybrid (vector + FTS + sparse)
+
+The sparse arm is **opt-in and requires two things together**: a `sparse:` key in the `properties` map **and** a `sparse_query` in `options`. Supplying only one of them is a **silent no-op** — the sparse arm simply does not run. When active, fuse all three arms with `method: 'weighted'` and a 3-element `weights: [vector, fts, sparse]`.
+
+```cypher
+-- 3-way fusion: dense + lexical + learned-sparse, optionally MaxSim-reranked
+CALL uni.search(
+    'Document',
+    {vector: 'embedding', fts: 'content', sparse: 'emb'},
+    'graph databases',
+    null,                         -- query_vector (auto-embedded from query_text)
+    10,
+    null,                         -- filter
+    {
+      method: 'weighted',
+      weights: [0.5, 0.2, 0.3],   -- [vector, fts, sparse]
+      sparse_query: {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]},
+      reranker: 'maxsim',         -- multi-vector / ColBERT late interaction
+      maxsim_query: $query_token_vectors
+    })
+YIELD node, score, vector_score, fts_score, sparse_score, rerank_score, distance
+RETURN node.title, score
+ORDER BY score DESC
+```
+
+Here the full YIELD surface is available: `vector_score`, `fts_score`, and `sparse_score` carry the per-arm contributions, `score` the fused (or reranked) final score, `rerank_score` the late-interaction score when `reranker` is set, and `distance` the raw vector distance.
+
+### Single-Pass BGE-M3 Hybrid (`EmbedHybrid`)
+
+The cleanest way to feed a 3-way hybrid is one model that emits all three representations at once. **BGE-M3** does exactly this: a single forward pass yields a dense embedding, a learned-sparse vector, and a multi-vector / ColBERT token matrix. Uni models this as **one catalog alias** with task `EmbedHybrid` (provider `local/onnx`, model `aapot/bge-m3-onnx`).
+
+```json
+{
+  "alias": "embed/bge-m3",
+  "task": "EmbedHybrid",
+  "provider_id": "local/onnx",
+  "model_id": "aapot/bge-m3-onnx"
+}
+```
+
+The key move is **sharing one alias and one source property across three index configs**. You declare three destination columns of different `DataType`s, each pointing its `embedding: { alias, source }` at the same alias and the same text source:
+
+| Destination `DataType` | Routed head | Index |
+|---|---|---|
+| `Vector` | dense | dense vector index |
+| `SparseVector` | sparse | sparse index (`type: 'sparse'`) |
+| `List<Vector>` | multi-vector | multi-vector / ColBERT index |
+
+Because the alias and source match, the engine treats the three configs as **one hybrid group and runs a single forward pass**, fanning the result out to the three columns. **Head routing is inferred from the destination column's `DataType`** — `Vector` → dense, `SparseVector` → sparse, `List<Vector>` → multi-vector — so there is **no `head:` sub-key** to set. At index-open time a capability check enforces that the heads required by the declared columns are a subset of the heads the alias actually exposes (`required_heads ⊆ available_heads`); a mismatch fails fast at open rather than silently producing empty columns.
+
+```rust
+// One EmbedHybrid alias + one source ("content") → three columns, one pass.
+let hybrid = EmbeddingCfg {
+    alias: "embed/bge-m3".into(),
+    source_properties: vec!["content".into()],
+    ..Default::default()
+};
+
+db.schema()
+    .label("Doc")
+    .property("content", DataType::String)
+    .property_nullable("embedding", DataType::Vector { dimensions: 1024 })
+    .property_nullable("emb", DataType::SparseVector { dimensions: 250002 })
+    .property_nullable("tokens", DataType::List(Box::new(DataType::Vector { dimensions: 1024 })))
+    .index("embedding", dense_index_with(hybrid.clone()))         // → dense head
+    .index("emb", IndexType::sparse_with_embedding(250002, hybrid.clone())) // → sparse head
+    .index("tokens", dense_index_with(hybrid.clone()))            // → multi-vector head
+    .apply()
+    .await?;
+```
+
+> A passing end-to-end test of this exact pattern (mock 3-head hybrid model, all three columns round-tripping post-flush, pre-flush L0, deferred-batch, and Cypher literal) lives at `crates/uni/tests/bge_m3_hybrid_3way.rs`.
+
+The `EmbedHybrid` alias is dispatched through the same host-side model runtime as every other embedding — see [Host-Side Model Runtime (Uni-Xervo)](#host-side-model-runtime-uni-xervo) for catalog configuration, prefetch, and the `uni-xervo` types (`HybridEmbeddingModel`, `HeadSet`) that back it.
 
 ## Host-Side Model Runtime (Uni-Xervo)
 
@@ -4600,11 +4808,38 @@ similar = session.query(Person) \
     .vector_search("embedding", query_vector, k=10) \
     .all()
 
+# Sparse (SPLADE) search -- query is a SparseVector, dict[int, float], or (indices, values)
+sparse_hits = session.query(Document) \
+    .sparse_search("splade", {1: 1.4, 7: 0.9}, k=10) \
+    .all()
+
+# Hybrid search -- three-way fused dense + FTS + sparse (wraps CALL uni.search)
+hits = session.query(Document) \
+    .hybrid_search(
+        vector=("embedding", query_vector),    # (property, precomputed vec); bare "embedding" auto-embeds
+        fts=("content", "quarterly revenue"),   # (property, FTS query text)
+        sparse=("splade", sparse_vec),          # (property, sparse query)
+        method="rrf",                           # or "weighted" with weights=[v, f, s] / alpha=
+        k=10,
+    ) \
+    .all()
+
+# Relevance scores ride alongside each hydrated node via .search_scores
+for doc in hits:
+    s = doc.search_scores                       # SearchScores | None (None for non-search queries)
+    print(doc.title, s.score, s.vector, s.fts, s.sparse)
+
 # Eager load relationships
 people = session.query(Person) \
     .eager_load("friends", "employer") \
     .all()
 ```
+
+`.search_scores` is a `SearchScores` sidecar (`score` fused, plus per-arm `vector` / `fts` /
+`sparse` / `rerank` / `distance`) attached to every result from `vector_search`, `sparse_search`,
+and `hybrid_search`; its column vocabulary mirrors the [Hybrid Search](#hybrid-search) `uni.search`
+YIELD names. `hybrid_search` requires at least one of `vector` / `fts` / `sparse`; a single shared
+`query_text` (from `fts`'s text or the `query_text=` kwarg) drives both FTS and dense auto-embed.
 
 ### Filter Operators
 

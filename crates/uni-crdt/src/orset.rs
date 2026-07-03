@@ -144,16 +144,9 @@ impl<T: Hash + Eq + Clone> PartialEq for ORSet<T> {
 
 impl<T: Hash + Eq + Clone> CrdtMerge for ORSet<T> {
     fn merge(&mut self, other: &Self) {
-        // Union of element keys across both replicas.
-        let mut keys: Vec<T> = Vec::new();
-        {
-            let mut seen: FxHashSet<&T> = FxHashSet::default();
-            for k in self.dots.keys().chain(other.dots.keys()) {
-                if seen.insert(k) {
-                    keys.push(k.clone());
-                }
-            }
-        }
+        // Union of element keys across both replicas. Per-key reconciliation is
+        // order-independent, so a plain dedup'd set of keys suffices.
+        let keys: FxHashSet<T> = self.dots.keys().chain(other.dots.keys()).cloned().collect();
 
         let empty: FxHashSet<Dot> = FxHashSet::default();
         for key in keys {
@@ -163,22 +156,20 @@ impl<T: Hash + Eq + Clone> CrdtMerge for ORSet<T> {
 
             let mut surviving: FxHashSet<Dot> = FxHashSet::default();
             // Dots both replicas still hold are kept.
-            for d in sd.intersection(od) {
-                surviving.insert(d.clone());
-            }
+            surviving.extend(sd.intersection(od).cloned());
             // Self-only dots survive unless `other` has already observed them
             // (observed-but-absent ⇒ removed by other).
-            for d in sd.difference(od) {
-                if d.1 > other.vv.get(&d.0).copied().unwrap_or(0) {
-                    surviving.insert(d.clone());
-                }
-            }
+            surviving.extend(
+                sd.difference(od)
+                    .filter(|d| d.1 > other.vv.get(&d.0).copied().unwrap_or(0))
+                    .cloned(),
+            );
             // Symmetric: other-only dots survive unless self has observed them.
-            for d in od.difference(&sd) {
-                if d.1 > self.vv.get(&d.0).copied().unwrap_or(0) {
-                    surviving.insert(d.clone());
-                }
-            }
+            surviving.extend(
+                od.difference(&sd)
+                    .filter(|d| d.1 > self.vv.get(&d.0).copied().unwrap_or(0))
+                    .cloned(),
+            );
 
             if surviving.is_empty() {
                 self.dots.remove(&key);
@@ -190,9 +181,7 @@ impl<T: Hash + Eq + Clone> CrdtMerge for ORSet<T> {
         // Join the version vectors (pointwise max).
         for (actor, &counter) in &other.vv {
             let entry = self.vv.entry(actor.clone()).or_insert(0);
-            if counter > *entry {
-                *entry = counter;
-            }
+            *entry = (*entry).max(counter);
         }
     }
 }

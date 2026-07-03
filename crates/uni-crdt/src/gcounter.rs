@@ -27,8 +27,7 @@ impl GCounter {
         if value == 0 {
             return;
         }
-        let count = self.counts.entry(actor.to_string()).or_insert(0);
-        *count += value;
+        *self.counts.entry(actor.to_string()).or_insert(0) += value;
     }
 
     /// Get the current total value of the counter.

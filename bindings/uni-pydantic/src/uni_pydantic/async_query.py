@@ -54,7 +54,10 @@ class AsyncQueryBuilder(_QueryBuilderBase[NodeT]):
         """Execute the query and return all results."""
         cypher, params = self._build_cypher()
         results = await self._execute_query(cypher, params)
-        instances = self._rows_to_instances(results)
+        if self._is_search():
+            instances = self._rows_to_scored_instances(results)
+        else:
+            instances = self._rows_to_instances(results)
         if self._eager_load and instances:
             await self._session._async_eager_load_relationships(
                 instances, self._eager_load

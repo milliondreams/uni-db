@@ -222,7 +222,7 @@ impl CalibratorFitter for PlattFitter {
     ) -> Result<Arc<dyn Calibrator>, CalibrationError> {
         validate_inputs(predictions, labels)?;
         let z: Vec<f64> = predictions.iter().map(|p| logit(*p)).collect();
-        let y: Vec<f64> = labels.iter().map(|l| if *l { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = labels.iter().map(|l| f64::from(*l)).collect();
         let n = predictions.len() as f64;
         // Initialize at A=0, B=0 so the prior is identity-on-the-mean
         // (σ(0)=0.5). Adam will move toward the data-optimal point.
@@ -328,7 +328,7 @@ impl CalibratorFitter for IsotonicFitter {
         // PAV: each block holds (sum_y, count, max_x_in_block).
         let mut blocks: Vec<(f64, usize, f64)> = Vec::with_capacity(predictions.len());
         for &i in &idx {
-            let y = if labels[i] { 1.0 } else { 0.0 };
+            let y = f64::from(labels[i]);
             let x = predictions[i];
             blocks.push((y, 1, x));
             // Merge while the previous block's mean exceeds this one's.
@@ -386,7 +386,7 @@ impl CalibratorFitter for TemperatureFitter {
     ) -> Result<Arc<dyn Calibrator>, CalibrationError> {
         validate_inputs(predictions, labels)?;
         let z: Vec<f64> = predictions.iter().map(|p| logit(*p)).collect();
-        let y: Vec<f64> = labels.iter().map(|l| if *l { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = labels.iter().map(|l| f64::from(*l)).collect();
         let n = predictions.len() as f64;
         let mut log_t: f64 = 0.0; // T = 1 initially
         let lr = 0.1;
@@ -459,7 +459,7 @@ impl CalibratorFitter for BetaFitter {
             .iter()
             .map(|p| (1.0 - p.clamp(LOGIT_EPS, 1.0 - LOGIT_EPS)).ln())
             .collect();
-        let y: Vec<f64> = labels.iter().map(|l| if *l { 1.0 } else { 0.0 }).collect();
+        let y: Vec<f64> = labels.iter().map(|l| f64::from(*l)).collect();
         let n = predictions.len() as f64;
         // Initialize at identity-ish: a=1, b=-1, c=0 → logit-equivalent
         // to the unscaled log-odds.
@@ -579,7 +579,7 @@ impl CalibratorFitter for ConformalFitter {
         scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = scores.len() as f64;
         let raw_idx = ((1.0 - self.alpha) * (n + 1.0)).ceil() as isize - 1;
-        let idx = raw_idx.max(0).min(scores.len() as isize - 1) as usize;
+        let idx = raw_idx.clamp(0, scores.len() as isize - 1) as usize;
         let quantile = scores[idx];
         Ok(Arc::new(ConformalPredictor {
             alpha: self.alpha,
@@ -912,8 +912,7 @@ pub fn brier_score(preds: &[f64], labels: &[bool]) -> f64 {
     }
     let mut sum = 0.0;
     for (p, y) in preds.iter().zip(labels.iter()) {
-        let y_f = if *y { 1.0 } else { 0.0 };
-        let d = p - y_f;
+        let d = p - f64::from(*y);
         sum += d * d;
     }
     sum / preds.len() as f64
@@ -950,7 +949,7 @@ pub fn expected_calibration_error(preds: &[f64], labels: &[bool], n_bins: usize)
         let idx = (pc * n_bins as f64) as usize;
         let idx = idx.min(n_bins - 1);
         bin_sum[idx] += pc;
-        bin_pos[idx] += if *y { 1.0 } else { 0.0 };
+        bin_pos[idx] += f64::from(*y);
         bin_n[idx] += 1;
     }
     let n_total = preds.len() as f64;
@@ -993,7 +992,7 @@ pub fn debiased_ece(preds: &[f64], labels: &[bool], n_bins: usize) -> f64 {
         let pc = p.clamp(0.0, 1.0 - f64::EPSILON);
         let idx = ((pc * n_bins as f64) as usize).min(n_bins - 1);
         bin_sum[idx] += pc;
-        bin_pos[idx] += if *y { 1.0 } else { 0.0 };
+        bin_pos[idx] += f64::from(*y);
         bin_n[idx] += 1;
     }
     let n_total = preds.len() as f64;
@@ -1019,13 +1018,11 @@ pub fn accuracy(preds: &[f64], labels: &[bool]) -> f64 {
     if preds.is_empty() {
         return 0.0;
     }
-    let mut hits = 0usize;
-    for (p, y) in preds.iter().zip(labels.iter()) {
-        let pred_label = *p >= 0.5;
-        if pred_label == *y {
-            hits += 1;
-        }
-    }
+    let hits = preds
+        .iter()
+        .zip(labels.iter())
+        .filter(|(p, y)| (**p >= 0.5) == **y)
+        .count();
     hits as f64 / preds.len() as f64
 }
 

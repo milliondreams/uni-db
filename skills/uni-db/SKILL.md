@@ -523,8 +523,8 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Writing/debugging Cypher queries, WHERE clauses, pattern matching | `references/cypher.md` |
 | Python API usage, async patterns, builders, result types | `references/python-api.md` |
 | Rust API usage, builders, error handling, blocking API | `references/rust-api.md` |
-| Pydantic models, OGM, QueryBuilder, relationships | `references/pydantic-ogm.md` |
-| Vector search, FTS, hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
+| Pydantic models, OGM, QueryBuilder (incl. `vector_search`/`sparse_search`/`hybrid_search` + `.search_scores`), relationships | `references/pydantic-ogm.md` |
+| Vector search, sparse vectors, FTS, 3-way hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
 | Locy neural predicates: CREATE MODEL/FEATURES/CALIBRATE/VALIDATE/NeuralProvenance EXPLAIN | `references/neural-predicates.md` |
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
@@ -539,3 +539,4 @@ Load **multiple references** when a task spans domains. Examples:
 - Rust graph algorithms: `references/graph-algorithms.md` + `references/rust-api.md`
 - BTIC temporal queries in Python: `references/btic.md` + `references/python-api.md`
 - RAG with Xervo embeddings: `references/xervo.md` + `references/vector-hybrid-search.md`
+- BGE-M3 multi-head hybrid (dense + sparse + ColBERT): `references/xervo.md` + `references/vector-hybrid-search.md`

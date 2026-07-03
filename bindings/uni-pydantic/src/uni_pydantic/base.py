@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -155,6 +156,29 @@ class UniModelMeta(type(BaseModel)):  # type: ignore[misc]
         raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
 
 
+@dataclass(frozen=True)
+class SearchScores:
+    """Relevance scores attached to a hydrated search result.
+
+    Populated on instances returned by the search builders
+    (``vector_search`` / ``sparse_search`` / ``hybrid_search``) and reachable
+    via :attr:`UniNode.search_scores`. Kept in a sidecar (rather than as a model
+    field) so it never collides with a user field named ``score`` and survives
+    hydration under ``extra="forbid"``.
+
+    ``score`` is the primary score used for ordering (the fused score for
+    hybrid; the per-source score for single-source search). The per-arm fields
+    are populated only when that retrieval source contributed, ``None`` otherwise.
+    """
+
+    score: float
+    vector: float | None = None
+    fts: float | None = None
+    sparse: float | None = None
+    rerank: float | None = None
+    distance: float | None = None
+
+
 class UniNode(BaseModel, metaclass=UniModelMeta):
     """
     Base class for graph node models.
@@ -204,6 +228,7 @@ class UniNode(BaseModel, metaclass=UniModelMeta):
     _session: UniSession | None = PrivateAttr(default=None)
     _dirty: set[str] = PrivateAttr(default_factory=set)
     _is_new: bool = PrivateAttr(default=True)
+    _scores: SearchScores | None = PrivateAttr(default=None)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -235,6 +260,14 @@ class UniNode(BaseModel, metaclass=UniModelMeta):
     def is_dirty(self) -> bool:
         """Whether this node has unsaved changes."""
         return bool(self._dirty)
+
+    @property
+    def search_scores(self) -> SearchScores | None:
+        """Relevance scores, if this instance came from a search builder.
+
+        ``None`` for instances from ordinary queries. See :class:`SearchScores`.
+        """
+        return self._scores
 
     def __setattr__(self, name: str, value: Any) -> None:
         # Track dirty fields (but not private attributes)

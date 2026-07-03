@@ -829,10 +829,7 @@ pub mod procedures {
                 )
             })?;
             let dependencies = parse_deps(args, 4)?;
-            let declared_by = ctx
-                .principal
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| "anonymous".to_owned());
+            let declared_by = principal_id(&ctx);
 
             let record = DeclaredPlugin {
                 qname: qname.clone(),
@@ -1114,10 +1111,7 @@ pub mod procedures {
                 )
             })?;
             let dependencies = parse_deps(args, 6)?;
-            let declared_by = ctx
-                .principal
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| "anonymous".to_owned());
+            let declared_by = principal_id(&ctx);
 
             let record = DeclaredPlugin {
                 qname: qname.clone(),
@@ -1291,10 +1285,7 @@ pub mod procedures {
                         }
                     }
                     let dependencies = parse_deps(args, $field_count - 1)?;
-                    let declared_by = ctx
-                        .principal
-                        .map(|p| p.id.clone())
-                        .unwrap_or_else(|| "anonymous".to_owned());
+                    let declared_by = principal_id(&ctx);
                     // `body` mirrors the first positional arg after
                     // `qname` (position 1), looked up by its signature
                     // name.
@@ -1433,6 +1424,15 @@ pub mod procedures {
             _ => format!("declare procedure arg `{name}` not Utf8"),
         };
         Err(FnError::new(FnError::CODE_TYPE_COERCION, msg))
+    }
+
+    /// Principal id of the declaring caller, or `"anonymous"` when the
+    /// invocation carries no principal. Shared by every `declare*`
+    /// procedure to stamp [`DeclaredPlugin::declared_by`].
+    fn principal_id(ctx: &ProcedureContext<'_>) -> String {
+        ctx.principal
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "anonymous".to_owned())
     }
 
     fn single_bool(col: &str, v: bool) -> Result<SendableRecordBatchStream, FnError> {

@@ -520,6 +520,153 @@ async fn dense_snapshot_isolates_reader_from_concurrent_insert() -> anyhow::Resu
 // Result-surface — projecting a dense vector in RETURN
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// HNSW query-time `ef_search` tuning
+// ---------------------------------------------------------------------------
+
+/// An approximate HNSW Cosine index. Unlike `Flat`, its recall depends on the
+/// search-time beam width `ef_search`, so it exercises the query-time knob.
+fn hnsw_cosine() -> IndexType {
+    IndexType::Vector(VectorIndexCfg {
+        algorithm: VectorAlgo::Hnsw {
+            m: 16,
+            ef_construction: 100,
+            partitions: None,
+        },
+        metric: VectorMetric::Cosine,
+        embedding: None,
+    })
+}
+
+/// Recall@k of the engine's returned titles against the brute-force cosine-oracle
+/// top-k for `q` over the same corpus.
+fn recall_at_k(q: &Dense, engine: &[(String, f64)], corpus: &[(String, Dense)], k: usize) -> f64 {
+    let mut scored: Vec<(&str, f64)> = corpus
+        .iter()
+        .map(|(t, d)| (t.as_str(), dense_score_oracle(q, d)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let truth: std::collections::HashSet<&str> = scored.iter().take(k).map(|(t, _)| *t).collect();
+    let hit = engine
+        .iter()
+        .filter(|(t, _)| truth.contains(t.as_str()))
+        .count();
+    hit as f64 / truth.len().max(1) as f64
+}
+
+/// Run `uni.vector.query` for `q` with an explicit options literal
+/// (e.g. `{ef_search: 512}`), returning `(title, score)` in engine rank order.
+async fn query_results_opts(
+    db: &Uni,
+    q: &Dense,
+    k: usize,
+    options: &str,
+) -> anyhow::Result<Vec<(String, f64)>> {
+    let cypher = format!(
+        "CALL uni.vector.query('Doc', 'emb', $q, $k, null, null, {options}) \
+         YIELD node, score RETURN node.title AS title, score"
+    );
+    let rows = db
+        .session()
+        .query_with(&cypher)
+        .param("q", vec_value(q))
+        .param("k", Value::Int(k as i64))
+        .fetch_all()
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
+        .collect())
+}
+
+/// Mean recall@k across many deterministic probe queries.
+///
+/// A single recall@k sample is quantized in `1/k` steps and — because the HNSW
+/// graph build is nondeterministic — occasionally lands on `1.0` even for the
+/// default beam, which made a strict `high > low` assertion flaky (~1/4 runs).
+/// Averaging over [`PROBE_QUERIES`] independent probes concentrates the mean so
+/// the low-vs-wide beam separation is stable across graph builds.
+async fn mean_recall(
+    db: &Uni,
+    corpus: &[(String, Dense)],
+    queries: &[Dense],
+    k: usize,
+    options: &str,
+) -> anyhow::Result<f64> {
+    let mut total = 0.0;
+    for q in queries {
+        let engine = query_results_opts(db, q, k, options).await?;
+        total += recall_at_k(q, &engine, corpus, k);
+    }
+    Ok(total / queries.len() as f64)
+}
+
+/// Number of probe queries the HNSW recall means are averaged over.
+const PROBE_QUERIES: usize = 32;
+
+/// Deterministic random probe queries (NOT planted in the corpus, so a narrow
+/// beam has no trivially reachable exact match to get lucky on).
+fn probe_queries(seed: u64) -> Vec<Dense> {
+    let mut rng = Rng(seed);
+    (0..PROBE_QUERIES).map(|_| random_dense(&mut rng)).collect()
+}
+
+#[tokio::test]
+async fn dense_hnsw_ef_search_raises_recall() -> anyhow::Result<()> {
+    // On an APPROXIMATE HNSW index, a narrow search beam under-explores the graph
+    // and misses true neighbors; a wide `ef_search` must recover recall — proving
+    // the query-time knob is plumbed end-to-end (regression: `ef_search` was
+    // previously unparsed and never reached lancedb's `.ef()`, silently pinning
+    // recall to the tiny default of `1.5 * k`).
+    let db = Uni::temporary().build().await?;
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("emb", DataType::Vector { dimensions: DIM })
+        .index("emb", hnsw_cosine())
+        .apply()
+        .await?;
+
+    // ~1000 docs: large enough that HNSW with a narrow beam demonstrably misses
+    // neighbors (the regime the recall bench surfaced at recall ≈ 0.6).
+    let corpus = build_corpus(1000, 0xEF5E_A4C8);
+    insert_docs(&db, &corpus, true).await?;
+    db.indexes().rebuild("Doc", false).await?;
+
+    // Mean recall over many probes: a single-query recall@10 sample is quantized
+    // in 0.1 steps and — because the HNSW graph build is nondeterministic —
+    // occasionally hit 1.000 even for the narrow beam, so the old strict
+    // `high > low` flaked (~1/4 runs). Both beams go through the `ef_search`
+    // knob (minimal `k` vs wide 512): if the option ever stops reaching the
+    // index search again, both searches are identical and the gap is exactly 0.
+    //
+    // Thresholds calibrated over 30 independent builds (2026-07-01):
+    // low ∈ [0.77, 0.89], high = 0.9875 constant, gap ∈ [0.097, 0.216]
+    // (gap mean 0.163, σ 0.028 → 0.05 is ~4σ safe; high has 0.0375 headroom).
+    let k = 10;
+    let queries = probe_queries(0xBEA7_5EED);
+    let low = mean_recall(&db, &corpus, &queries, k, "{ef_search: 10}").await?;
+    let high = mean_recall(&db, &corpus, &queries, k, "{ef_search: 512}").await?;
+
+    assert!(
+        high - low >= 0.05,
+        "ef_search must widen the beam and raise mean HNSW recall: ef_search=10 \
+         mean recall@{k}={low:.3} vs ef_search=512 mean recall@{k}={high:.3} \
+         (a zero gap means the knob never reached the index search)"
+    );
+    assert!(
+        high >= 0.95,
+        "a wide ef_search should recover strong recall: got mean {high:.3} \
+         (narrow beam {low:.3})"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn dense_property_projection_in_return() -> anyhow::Result<()> {
     // `RETURN d.emb` must materialise the dense `Value::Vector` result column (not

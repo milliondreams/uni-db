@@ -49,8 +49,7 @@ fn reject_secret_handles(batch: &RecordBatch) -> Result<(), IpcError> {
         if field
             .metadata()
             .get(ARROW_EXTENSION_KEY)
-            .map(String::as_str)
-            == Some(SECRET_HANDLE_EXTENSION)
+            .is_some_and(|name| name == SECRET_HANDLE_EXTENSION)
         {
             return Err(IpcError::SecretLeakAttempt {
                 column: field.name().clone(),

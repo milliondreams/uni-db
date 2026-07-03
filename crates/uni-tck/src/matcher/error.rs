@@ -122,15 +122,11 @@ fn classify_phase(
     // Some runtime errors are currently surfaced through compile-time typed error
     // wrappers. Use detail codes to preserve TCK runtime expectations.
     if expected_phase == ErrorPhase::Runtime {
-        if let Some(detail) = detail_code {
-            if is_runtime_detail_code(detail) {
-                return ErrorPhase::Runtime;
-            }
-        }
-        if let Some(detail) = extract_detail_code(&error.to_string()) {
-            if is_runtime_detail_code(&detail) {
-                return ErrorPhase::Runtime;
-            }
+        let declared_runtime = detail_code.is_some_and(is_runtime_detail_code);
+        let surfaced_runtime =
+            extract_detail_code(&error.to_string()).is_some_and(|d| is_runtime_detail_code(&d));
+        if declared_runtime || surfaced_runtime {
+            return ErrorPhase::Runtime;
         }
     }
 
@@ -179,20 +175,12 @@ fn extract_detail_code(message: &str) -> Option<String> {
         }
     }
 
-    let mut code = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            code.push(ch);
-        } else {
-            break;
-        }
-    }
+    let code: String = text
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
 
-    if code.is_empty() {
-        None
-    } else {
-        Some(code)
-    }
+    (!code.is_empty()).then_some(code)
 }
 
 fn classify_error(error: &UniError) -> TckErrorType {

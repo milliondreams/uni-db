@@ -100,9 +100,10 @@ fn parse_distance_metric(s: &str) -> DistanceMetric {
     }
 }
 
-/// Parse the `nprobes` / `refine_factor` ANN tuning knobs from a procedure's
-/// `options` map (`None` for either = Lance default). Applies to dense and
-/// multi-vector queries alike.
+/// Parse the `nprobes` / `refine_factor` / `ef_search` ANN tuning knobs from a
+/// procedure's `options` map (`None` for any = Lance default). Applies to dense
+/// and multi-vector queries alike. `ef_search` accepts `ef` as an alias and sets
+/// the HNSW search-time beam width (candidate list size).
 fn parse_vector_query_opts(
     options_map: Option<&HashMap<String, Value>>,
 ) -> uni_store::VectorQueryOpts {
@@ -114,9 +115,14 @@ fn parse_vector_query_opts(
         .and_then(|m| m.get("refine_factor"))
         .and_then(|v| v.as_u64())
         .map(|r| r as u32);
+    let ef = options_map
+        .and_then(|m| m.get("ef_search").or_else(|| m.get("ef")))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
     uni_store::VectorQueryOpts {
         nprobes,
         refine_factor,
+        ef,
     }
 }
 
@@ -852,6 +858,31 @@ pub(super) struct BatchBuildCtx<'a> {
     pub rerank_ctx: Option<&'a RerankContext>,
 }
 
+/// Columnar properties the node yield(s) will actually emit: the union of
+/// `target_properties[output]` over every `node`-canonical yield.
+///
+/// `build_node_yield_columns` emits exactly these props, so restricting the
+/// property fetch to this set is lossless while skipping unread heavy columns
+/// (issue #134). Returns `Some(empty)` when no node yield narrows to any prop
+/// (nothing is emitted, so nothing need be fetched).
+fn node_yield_requested_props(batch_ctx: &BatchBuildCtx<'_>) -> Option<Vec<String>> {
+    let mut requested: Vec<String> = Vec::new();
+    for (name, alias) in batch_ctx.yield_items {
+        if map_yield_to_canonical(name) != "node" {
+            continue;
+        }
+        let output_name = alias.as_ref().unwrap_or(name);
+        if let Some(props) = batch_ctx.target_properties.get(output_name) {
+            for p in props {
+                if !requested.contains(p) {
+                    requested.push(p.clone());
+                }
+            }
+        }
+    }
+    Some(requested)
+}
+
 fn build_node_yield_columns(
     vids: &[Vid],
     label: &str,
@@ -929,8 +960,18 @@ async fn build_search_result_batch(
                     .to_string(),
             )
         })?;
+        // Only fetch the properties actually emitted for the node yield(s) —
+        // `build_node_yield_columns` emits exactly `target_properties[output]`,
+        // so pruning the Lance fetch to that set is lossless and avoids decoding
+        // unread heavy columns such as `List(Vector)` (issue #134).
+        let requested = node_yield_requested_props(batch_ctx);
         owned_props = property_manager
-            .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
+            .get_batch_vertex_props_for_label_projected(
+                &vids,
+                label,
+                Some(&query_ctx),
+                requested.as_deref(),
+            )
             .await
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         &owned_props
@@ -1033,8 +1074,18 @@ async fn build_hybrid_search_batch(
                     .to_string(),
             )
         })?;
+        // Only fetch the properties actually emitted for the node yield(s) —
+        // `build_node_yield_columns` emits exactly `target_properties[output]`,
+        // so pruning the Lance fetch to that set is lossless and avoids decoding
+        // unread heavy columns such as `List(Vector)` (issue #134).
+        let requested = node_yield_requested_props(batch_ctx);
         owned_props = property_manager
-            .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
+            .get_batch_vertex_props_for_label_projected(
+                &vids,
+                label,
+                Some(&query_ctx),
+                requested.as_deref(),
+            )
             .await
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         &owned_props

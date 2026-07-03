@@ -57,9 +57,7 @@ impl<T: Hash + Eq + Clone> GSet<T> {
 
 impl<T: Hash + Eq + Clone> CrdtMerge for GSet<T> {
     fn merge(&mut self, other: &Self) {
-        for element in &other.elements {
-            self.elements.insert(element.clone());
-        }
+        self.elements.extend(other.elements.iter().cloned());
     }
 }
 

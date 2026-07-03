@@ -180,15 +180,29 @@ pub fn parse_registration_json(bytes: &[u8]) -> Result<RegistrationManifest, Ext
 pub fn read_manifest_export(
     plugin: &mut extism::Plugin,
 ) -> Result<ExtismPluginManifest, ExtismError> {
-    if !plugin.function_exists("manifest") {
-        return Err(ExtismError::InvalidPlugin(
-            "plugin does not export required `manifest` function".to_owned(),
-        ));
+    let bytes = read_required_export(plugin, "manifest")?;
+    parse_manifest_json(&bytes)
+}
+
+/// Call a required no-input plugin export and return its raw output bytes.
+///
+/// Shared by [`read_manifest_export`] and [`read_register_export`]: both
+/// require the export to exist, both pass an empty input, and both surface
+/// a missing export or a failed call as [`ExtismError::InvalidPlugin`].
+///
+/// # Errors
+///
+/// - [`ExtismError::InvalidPlugin`] if the export is absent or the call fails.
+fn read_required_export(plugin: &mut extism::Plugin, export: &str) -> Result<Vec<u8>, ExtismError> {
+    if !plugin.function_exists(export) {
+        return Err(ExtismError::InvalidPlugin(format!(
+            "plugin does not export required `{export}` function"
+        )));
     }
-    let bytes: &[u8] = plugin
-        .call("manifest", "")
-        .map_err(|e| ExtismError::InvalidPlugin(format!("call manifest: {e}")))?;
-    parse_manifest_json(bytes)
+    plugin
+        .call::<&str, &[u8]>(export, "")
+        .map(<[u8]>::to_vec)
+        .map_err(|e| ExtismError::InvalidPlugin(format!("call {export}: {e}")))
 }
 
 /// Call a live plugin's `register` export and parse the response.
@@ -206,15 +220,8 @@ pub fn read_manifest_export(
 pub fn read_register_export(
     plugin: &mut extism::Plugin,
 ) -> Result<RegistrationManifest, ExtismError> {
-    if !plugin.function_exists("register") {
-        return Err(ExtismError::InvalidPlugin(
-            "plugin does not export required `register` function".to_owned(),
-        ));
-    }
-    let bytes: &[u8] = plugin
-        .call("register", "")
-        .map_err(|e| ExtismError::InvalidPlugin(format!("call register: {e}")))?;
-    parse_registration_json(bytes)
+    let bytes = read_required_export(plugin, "register")?;
+    parse_registration_json(&bytes)
 }
 
 #[cfg(test)]

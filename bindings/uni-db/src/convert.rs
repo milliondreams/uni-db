@@ -12,6 +12,37 @@ use uni_common::value::TemporalValue;
 
 use crate::types::{PyEdge, PyNode, PyPath};
 
+/// Split a nanos-since-midnight count into `(hour, minute, second, microsecond)`.
+///
+/// Shared by the `LocalTime` and `Time` temporal arms, which differ only in
+/// whether they attach a timezone.
+fn split_time_of_day(nanos_since_midnight: i64) -> (i64, i64, i64, i64) {
+    let total_micros = nanos_since_midnight / 1_000;
+    let hour = total_micros / 3_600_000_000;
+    let minute = (total_micros % 3_600_000_000) / 60_000_000;
+    let second = (total_micros % 60_000_000) / 1_000_000;
+    let microsecond = total_micros % 1_000_000;
+    (hour, minute, second, microsecond)
+}
+
+/// Build a Python `datetime.timezone` with the given UTC offset in seconds.
+fn fixed_timezone<'py>(
+    py: Python<'py>,
+    datetime_module: &Bound<'py, PyModule>,
+    offset_seconds: i32,
+) -> PyResult<Bound<'py, PyAny>> {
+    let tz_class = datetime_module.getattr("timezone")?;
+    let td_class = datetime_module.getattr("timedelta")?;
+    let td = td_class.call1(pyo3::types::PyTuple::new(
+        py,
+        &[
+            0i32.into_pyobject(py)?.into_any(),
+            offset_seconds.into_pyobject(py)?.into_any(),
+        ],
+    )?)?;
+    tz_class.call1((td,))
+}
+
 /// Convert a Rust `Node` to a Python `Node` object.
 pub fn node_to_py(py: Python, n: &::uni_db::Node) -> PyResult<Py<PyNode>> {
     let mut properties = HashMap::new();
@@ -98,11 +129,8 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                 TemporalValue::LocalTime {
                     nanos_since_midnight,
                 } => {
-                    let total_micros = nanos_since_midnight / 1_000;
-                    let hour = total_micros / 3_600_000_000;
-                    let minute = (total_micros % 3_600_000_000) / 60_000_000;
-                    let second = (total_micros % 60_000_000) / 1_000_000;
-                    let microsecond = total_micros % 1_000_000;
+                    let (hour, minute, second, microsecond) =
+                        split_time_of_day(*nanos_since_midnight);
                     let time_class = datetime_module.getattr("time")?;
                     let result = time_class.call1((hour, minute, second, microsecond))?;
                     Ok(result.into_py_any(py)?)
@@ -111,21 +139,9 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                     nanos_since_midnight,
                     offset_seconds,
                 } => {
-                    let total_micros = nanos_since_midnight / 1_000;
-                    let hour = total_micros / 3_600_000_000;
-                    let minute = (total_micros % 3_600_000_000) / 60_000_000;
-                    let second = (total_micros % 60_000_000) / 1_000_000;
-                    let microsecond = total_micros % 1_000_000;
-                    let tz_class = datetime_module.getattr("timezone")?;
-                    let td_class = datetime_module.getattr("timedelta")?;
-                    let td = td_class.call1(pyo3::types::PyTuple::new(
-                        py,
-                        &[
-                            0i32.into_pyobject(py)?.into_any(),
-                            offset_seconds.into_pyobject(py)?.into_any(),
-                        ],
-                    )?)?;
-                    let tz = tz_class.call1((td,))?;
+                    let (hour, minute, second, microsecond) =
+                        split_time_of_day(*nanos_since_midnight);
+                    let tz = fixed_timezone(py, &datetime_module, *offset_seconds)?;
                     let time_class = datetime_module.getattr("time")?;
                     let result = time_class.call1((hour, minute, second, microsecond, tz))?;
                     Ok(result.into_py_any(py)?)
@@ -147,16 +163,7 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                 } => {
                     let secs = nanos_since_epoch / 1_000_000_000;
                     let micros = (nanos_since_epoch % 1_000_000_000) / 1_000;
-                    let tz_class = datetime_module.getattr("timezone")?;
-                    let td_class = datetime_module.getattr("timedelta")?;
-                    let td = td_class.call1(pyo3::types::PyTuple::new(
-                        py,
-                        &[
-                            0i32.into_pyobject(py)?.into_any(),
-                            offset_seconds.into_pyobject(py)?.into_any(),
-                        ],
-                    )?)?;
-                    let tz = tz_class.call1((td,))?;
+                    let tz = fixed_timezone(py, &datetime_module, *offset_seconds)?;
                     let dt_class = datetime_module.getattr("datetime")?;
                     let result = dt_class.call_method1(
                         "fromtimestamp",
@@ -506,6 +513,17 @@ pub fn convert_params_ref(
         map.insert(k.clone(), py_object_to_value(py, v)?);
     }
     Ok(map)
+}
+
+/// Convert a single query result row to a Python `{column: value}` dict.
+///
+/// Shared by the sync and async cursor `fetch_*` / iteration paths.
+pub fn row_to_dict<'py>(py: Python<'py>, row: &::uni_db::Row) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    for (col, val) in row.as_map() {
+        dict.set_item(col, value_to_py(py, val)?)?;
+    }
+    Ok(dict)
 }
 
 /// Convert query result rows to Python Row objects.

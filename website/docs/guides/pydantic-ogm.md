@@ -246,6 +246,57 @@ updated_count = (
 )
 ```
 
+### Vector, Sparse & Hybrid Search
+
+The query builder wraps uni's retrieval procedures, so you stay in typed, model-bound code instead
+of hand-writing Cypher.
+
+```python
+# Dense vector search
+similar = (
+    session.query(Document)
+    .vector_search("embedding", query_vec, k=5, threshold=0.8)
+    .all()
+)
+
+# Learned-sparse (SPLADE) search
+# query is a SparseVector, dict[int, float], or (indices, values) pair
+sparse_hits = (
+    session.query(Document)
+    .sparse_search("splade", {1: 1.4, 7: 0.9}, k=10)
+    .all()
+)
+
+# Three-way fused hybrid search (dense + full-text + sparse)
+hits = (
+    session.query(Document)
+    .hybrid_search(
+        vector=("embedding", query_vec),       # (property, precomputed vec); bare "embedding" auto-embeds
+        fts=("content", "quarterly revenue"),   # (property, full-text query text)
+        sparse=("splade", sparse_vec),          # (property, sparse query)
+        method="rrf",                           # or "weighted" with weights=[v, f, s] / alpha=
+        k=10,
+    )
+    .all()
+)
+```
+
+Every result from these three methods carries a `.search_scores` sidecar:
+
+```python
+for doc in hits:
+    s = doc.search_scores             # SearchScores (None for ordinary queries)
+    print(doc.title, s.score)         # fused score used for ordering
+    print(s.vector, s.fts, s.sparse)  # per-arm branch scores (None when that arm is off)
+```
+
+!!! note "Under the hood"
+    `hybrid_search()` wraps the [`uni.search`](../features/hybrid-search.md) procedure. Supply at
+    least one of `vector` / `fts` / `sparse`; a single shared query text (from `fts`'s text or the
+    `query_text=` kwarg) drives both full-text matching and dense auto-embed. See
+    [Hybrid Search](../features/hybrid-search.md) for fusion methods (RRF vs weighted) and score
+    transparency.
+
 ## Creating Edges
 
 ```python
@@ -436,5 +487,6 @@ with session.transaction() as tx:
 ## Next Steps
 
 - [Pydantic OGM Reference](../reference/pydantic-ogm.md) - Complete API documentation
+- [Hybrid Search](../features/hybrid-search.md) - Fusion methods behind `hybrid_search()`
 - [Example Notebooks](../examples/index.md) - Interactive examples with uni-pydantic
 - [Schema Design](schema-design.md) - Best practices for graph modeling

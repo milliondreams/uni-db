@@ -47,6 +47,8 @@ nav:
       - Cypher Querying: guides/cypher-querying.md
       - Temporal Intervals (BTIC): guides/temporal-intervals.md
       - Vector Search: guides/vector-search.md
+      - Sparse Vectors (SPLADE): guides/sparse-vectors.md
+      - BGE-M3 Hybrid Retrieval: guides/bge-m3-hybrid-retrieval.md
       - Data Ingestion: guides/data-ingestion.md
       - Schema Design: guides/schema-design.md
       - Pydantic OGM: guides/pydantic-ogm.md

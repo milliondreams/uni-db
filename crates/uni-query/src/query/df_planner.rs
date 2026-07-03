@@ -53,7 +53,8 @@ use crate::query::df_graph::{
     OptionalFilterExec,
 };
 use crate::query::planner::{
-    LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
+    LogicalPlan, STRUCT_ONLY_SENTINEL, WITH_PASSTHROUGH_SENTINEL, aggregate_column_name,
+    collect_properties_from_plan, reconcile_passthrough_properties,
 };
 use anyhow::{Result, anyhow};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -259,6 +260,7 @@ impl HybridPhysicalPlanner {
                         .filter(|p| {
                             *p != "*"
                                 && *p != STRUCT_ONLY_SENTINEL
+                                && *p != WITH_PASSTHROUGH_SENTINEL
                                 && (!p.starts_with('_')
                                     || matches!(p.as_str(), "_created_at" | "_updated_at"))
                         })
@@ -291,6 +293,7 @@ impl HybridPhysicalPlanner {
                         .filter(|p| {
                             *p != "*"
                                 && *p != STRUCT_ONLY_SENTINEL
+                                && *p != WITH_PASSTHROUGH_SENTINEL
                                 && !SYSTEM_COLUMNS.contains(&p.as_str())
                         })
                         .cloned()
@@ -492,6 +495,11 @@ impl HybridPhysicalPlanner {
                 variable,
                 labels: scan_labels,
                 ..
+            }
+            | LogicalPlan::FusedIndexScan {
+                variable,
+                labels: scan_labels,
+                ..
             } => {
                 if let Some(first) = scan_labels.first() {
                     labels.insert(variable.clone(), first.clone());
@@ -563,7 +571,74 @@ impl HybridPhysicalPlanner {
             LogicalPlan::Explain { plan } => {
                 self.collect_variable_labels(plan, labels);
             }
-            _ => {}
+            // Path binders and the wrapped scan carry a child subtree whose
+            // scans may bind labeled variables — recurse so those labels are
+            // not lost (exhaustive; no `_ => {}` so a new variant must be
+            // classified here — the #131 bug class).
+            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+                self.collect_variable_labels(inner, labels);
+            }
+            LogicalPlan::ShortestPath { input, .. }
+            | LogicalPlan::AllShortestPaths { input, .. }
+            | LogicalPlan::BindZeroLengthPath { input, .. }
+            | LogicalPlan::BindPath { input, .. } => {
+                self.collect_variable_labels(input, labels);
+            }
+            LogicalPlan::QuantifiedPattern {
+                input,
+                pattern_plan,
+                ..
+            } => {
+                self.collect_variable_labels(input, labels);
+                self.collect_variable_labels(pattern_plan, labels);
+            }
+            LogicalPlan::RecursiveCTE {
+                initial, recursive, ..
+            } => {
+                self.collect_variable_labels(initial, labels);
+                self.collect_variable_labels(recursive, labels);
+            }
+            // Unlabeled / non-graph leaves: nothing to map. (`ScanAll` is the
+            // unlabeled scan; the search/proc leaves and Locy/DDL nodes bind no
+            // label-resolvable graph variable in this context.)
+            LogicalPlan::ScanAll { .. }
+            | LogicalPlan::ExtIdLookup { .. }
+            | LogicalPlan::VectorKnn { .. }
+            | LogicalPlan::InvertedIndexLookup { .. }
+            | LogicalPlan::ProcedureCall { .. }
+            | LogicalPlan::LocyProgram { .. }
+            | LogicalPlan::LocyFold { .. }
+            | LogicalPlan::LocyBestBy { .. }
+            | LogicalPlan::LocyPriority { .. }
+            | LogicalPlan::LocyDerivedScan { .. }
+            | LogicalPlan::LocyProject { .. }
+            | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
+            | LogicalPlan::CreateFullTextIndex { .. }
+            | LogicalPlan::CreateScalarIndex { .. }
+            | LogicalPlan::CreateJsonFtsIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::ShowIndexes { .. }
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Backup { .. }
+            | LogicalPlan::ShowDatabase
+            | LogicalPlan::ShowConfig
+            | LogicalPlan::ShowStatistics
+            | LogicalPlan::Vacuum
+            | LogicalPlan::Checkpoint
+            | LogicalPlan::CopyTo { .. }
+            | LogicalPlan::CopyFrom { .. }
+            | LogicalPlan::CreateLabel(_)
+            | LogicalPlan::CreateEdgeType(_)
+            | LogicalPlan::AlterLabel(_)
+            | LogicalPlan::AlterEdgeType(_)
+            | LogicalPlan::DropLabel(_)
+            | LogicalPlan::DropEdgeType(_)
+            | LogicalPlan::CreateConstraint(_)
+            | LogicalPlan::DropConstraint(_)
+            | LogicalPlan::ShowConstraints(_) => {}
         }
     }
 
@@ -594,7 +669,10 @@ impl HybridPhysicalPlanner {
         let logical_rewritten = merge_unwind_in_filters(logical, &self.params);
 
         // Collect all properties needed anywhere in the plan tree
-        let all_properties = collect_properties_from_plan(&logical_rewritten);
+        let mut all_properties = collect_properties_from_plan(&logical_rewritten);
+        // Resolve WITH-passthrough markers: narrow forwarded entities to the
+        // properties actually accessed downstream (issue #134 family).
+        apply_passthrough_reconciliation(&logical_rewritten, &mut all_properties);
 
         // Delegate to internal planning with properties context
         self.plan_internal(&logical_rewritten, &all_properties)
@@ -616,6 +694,7 @@ impl HybridPhysicalPlanner {
         for (var, props) in extra_properties {
             all_properties.entry(var).or_default().extend(props);
         }
+        apply_passthrough_reconciliation(&logical_rewritten, &mut all_properties);
         self.plan_internal(&logical_rewritten, &all_properties)
     }
 
@@ -3940,6 +4019,27 @@ impl HybridPhysicalPlanner {
         let left_plan = self.plan_internal(&left_with_filter, all_properties)?;
         let right_plan = self.plan_internal(&right_with_filter, all_properties)?;
 
+        // Mirror the CrossJoin lowering (the `LogicalPlan::CrossJoin` arm): for a
+        // Locy IS-ref join (graph scan × derived scan), strip the structural
+        // bare-variable struct columns ("it", "b", …) from the left that collide
+        // with the derived scan's column names. Without this, the left subtree
+        // exposes both `it._vid` (flat) and a bare struct `it`, and the derived
+        // scan re-introduces a bare `it` (UInt64) — so downstream references and
+        // the post-join filter resolve the wrong "it"/"b" (Struct vs UInt64),
+        // failing physical planning. The CrossJoin path strips these before the
+        // join; the HashJoin path must too (issue #131).
+        let left_plan = if matches!(right, LogicalPlan::LocyDerivedScan { .. }) {
+            let derived_schema = right_plan.schema();
+            let derived_names: HashSet<&str> = derived_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            strip_conflicting_structural_columns(left_plan, &derived_names)?
+        } else {
+            left_plan
+        };
+
         // Compile each (l_expr, r_expr) pair, wrapping both sides in tointeger
         // for type unification (handles UInt64 _vid vs LargeBinary CV property).
         // If any pair can't be unified, fall through to FilterExec.
@@ -4791,9 +4891,29 @@ impl HybridPhysicalPlanner {
                     // reference so that null rows (from OPTIONAL MATCH) are excluded.
                     if matches!(args.first(), Some(uni_cypher::ast::Expr::Wildcard)) {
                         count(datafusion::logical_expr::lit(1))
-                    } else if matches!(args.first(), Some(uni_cypher::ast::Expr::Variable(_))) {
+                    } else if let Some(uni_cypher::ast::Expr::Variable(var)) = args.first() {
                         if *distinct {
-                            count(get_arg()?)
+                            // COUNT(DISTINCT entity) dedups by identity (_vid/_eid),
+                            // NOT the full materialized struct — this avoids reading
+                            // every property column just to compute distinctness
+                            // (issue #134 family). The identity column is a
+                            // non-nullable base column always present in the scan,
+                            // and stays null for unmatched OPTIONAL MATCH rows so
+                            // they are excluded exactly as before. Scalar-bound
+                            // variables (not Node/Edge) keep their own column.
+                            let id_col = match ctx.variable_kinds.get(var) {
+                                Some(VariableKind::Node) => Some("_vid"),
+                                Some(VariableKind::Edge) => Some("_eid"),
+                                _ => None,
+                            };
+                            match id_col {
+                                Some(suffix) => {
+                                    count(DfExpr::Column(datafusion::common::Column::from_name(
+                                        format!("{var}.{suffix}"),
+                                    )))
+                                }
+                                None => count(get_arg()?),
+                            }
                         } else {
                             count(datafusion::logical_expr::lit(1))
                         }
@@ -6454,6 +6574,24 @@ fn resolve_fold_bindings(
         .collect()
 }
 
+/// Resolve WITH-passthrough markers, narrowing forwarded entity variables.
+///
+/// Computes the narrowable (Node/Edge) variables from the plan and delegates to
+/// [`reconcile_passthrough_properties`]. See issue #134 family.
+fn apply_passthrough_reconciliation(
+    plan: &LogicalPlan,
+    properties: &mut HashMap<String, HashSet<String>>,
+) {
+    let mut kinds = HashMap::new();
+    collect_variable_kinds(plan, &mut kinds);
+    let narrowable: HashSet<String> = kinds
+        .into_iter()
+        .filter(|(_, k)| matches!(k, VariableKind::Node | VariableKind::Edge))
+        .map(|(v, _)| v)
+        .collect();
+    reconcile_passthrough_properties(plan, properties, &narrowable);
+}
+
 /// Recursively collect variable kinds (node, edge, path) from a LogicalPlan.
 ///
 /// This information is used by the expression translator to resolve bare variable
@@ -6719,8 +6857,51 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         LogicalPlan::Explain { plan } => {
             collect_mutation_node_hints(plan, hints);
         }
-        // Leaf nodes — nothing to collect
-        _ => {}
+        // Leaf nodes hold no CREATE/MERGE pattern (those are wrapper nodes,
+        // recursed above). Exhaustive — no `_ => {}` — so a new variant must be
+        // classified here rather than silently skipped (the #131 bug class).
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ScanAll { .. }
+        | LogicalPlan::ScanMainByLabels { .. }
+        | LogicalPlan::ExtIdLookup { .. }
+        | LogicalPlan::FusedIndexScan { .. }
+        | LogicalPlan::FusedIndexScanWrapped { .. }
+        | LogicalPlan::VectorKnn { .. }
+        | LogicalPlan::InvertedIndexLookup { .. }
+        | LogicalPlan::ProcedureCall { .. }
+        | LogicalPlan::LocyProgram { .. }
+        | LogicalPlan::LocyFold { .. }
+        | LogicalPlan::LocyBestBy { .. }
+        | LogicalPlan::LocyPriority { .. }
+        | LogicalPlan::LocyDerivedScan { .. }
+        | LogicalPlan::LocyProject { .. }
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::CreateVectorIndex { .. }
+        | LogicalPlan::CreateSparseIndex { .. }
+        | LogicalPlan::CreateFullTextIndex { .. }
+        | LogicalPlan::CreateScalarIndex { .. }
+        | LogicalPlan::CreateJsonFtsIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::ShowIndexes { .. }
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::Backup { .. }
+        | LogicalPlan::ShowDatabase
+        | LogicalPlan::ShowConfig
+        | LogicalPlan::ShowStatistics
+        | LogicalPlan::Vacuum
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CopyTo { .. }
+        | LogicalPlan::CopyFrom { .. }
+        | LogicalPlan::CreateLabel(_)
+        | LogicalPlan::CreateEdgeType(_)
+        | LogicalPlan::AlterLabel(_)
+        | LogicalPlan::AlterEdgeType(_)
+        | LogicalPlan::DropLabel(_)
+        | LogicalPlan::DropEdgeType(_)
+        | LogicalPlan::CreateConstraint(_)
+        | LogicalPlan::DropConstraint(_)
+        | LogicalPlan::ShowConstraints(_) => {}
     }
 }
 
@@ -6805,7 +6986,51 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         LogicalPlan::Explain { plan } => {
             collect_mutation_edge_hints(plan, hints);
         }
-        _ => {}
+        // Leaf nodes hold no CREATE/MERGE pattern (those are wrapper nodes,
+        // recursed above). Exhaustive — no `_ => {}` — so a new variant must be
+        // classified here rather than silently skipped (the #131 bug class).
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::ScanAll { .. }
+        | LogicalPlan::ScanMainByLabels { .. }
+        | LogicalPlan::ExtIdLookup { .. }
+        | LogicalPlan::FusedIndexScan { .. }
+        | LogicalPlan::FusedIndexScanWrapped { .. }
+        | LogicalPlan::VectorKnn { .. }
+        | LogicalPlan::InvertedIndexLookup { .. }
+        | LogicalPlan::ProcedureCall { .. }
+        | LogicalPlan::LocyProgram { .. }
+        | LogicalPlan::LocyFold { .. }
+        | LogicalPlan::LocyBestBy { .. }
+        | LogicalPlan::LocyPriority { .. }
+        | LogicalPlan::LocyDerivedScan { .. }
+        | LogicalPlan::LocyProject { .. }
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::Empty
+        | LogicalPlan::CreateVectorIndex { .. }
+        | LogicalPlan::CreateSparseIndex { .. }
+        | LogicalPlan::CreateFullTextIndex { .. }
+        | LogicalPlan::CreateScalarIndex { .. }
+        | LogicalPlan::CreateJsonFtsIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::ShowIndexes { .. }
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::Backup { .. }
+        | LogicalPlan::ShowDatabase
+        | LogicalPlan::ShowConfig
+        | LogicalPlan::ShowStatistics
+        | LogicalPlan::Vacuum
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CopyTo { .. }
+        | LogicalPlan::CopyFrom { .. }
+        | LogicalPlan::CreateLabel(_)
+        | LogicalPlan::CreateEdgeType(_)
+        | LogicalPlan::AlterLabel(_)
+        | LogicalPlan::AlterEdgeType(_)
+        | LogicalPlan::DropLabel(_)
+        | LogicalPlan::DropEdgeType(_)
+        | LogicalPlan::CreateConstraint(_)
+        | LogicalPlan::DropConstraint(_)
+        | LogicalPlan::ShowConstraints(_) => {}
     }
 }
 
@@ -6902,19 +7127,42 @@ pub(crate) fn collect_plan_variables(plan: &LogicalPlan) -> HashSet<String> {
     out
 }
 
+/// Insert a node variable plus its flat `{var}._vid` column.
+///
+/// Registering `{var}._vid` lets an equi-join key written in the baked
+/// `var._vid` form (Locy IS-ref node keys) match this side exactly — and,
+/// crucially, a side that only carries a bare *scalar* column of the same name
+/// (e.g. a derived-relation KEY column) does NOT, so the classifier never
+/// confuses a node `b._vid` with a derived scalar `b` (issue #131).
+fn insert_node_var(variable: &str, out: &mut HashSet<String>) {
+    out.insert(variable.to_string());
+    out.insert(format!("{variable}._vid"));
+}
+
+/// Collect the output variable/column names a plan exposes.
+///
+/// This MUST stay in lockstep with [`collect_variable_kinds`]: every variant
+/// that binds a name there must bind it here, or an equi-join over that
+/// operator silently degrades to a quadratic `CrossJoinExec` because
+/// `classify_join_predicate` cannot see the column (the root cause of #131,
+/// where `LocyDerivedScan` was the missing variant). The match is intentionally
+/// exhaustive — do NOT add a `_ => {}` arm; a new `LogicalPlan` variant should
+/// fail to compile here until it is classified as binding or non-binding.
 fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
     match plan {
+        // Wrapped scan: recurse so the inner scan's variable is still collected.
+        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            collect_plan_variables_into(inner, out);
+        }
+        // Leaf node scans — each binds one node variable (+ `_vid`).
         LogicalPlan::Scan { variable, .. }
+        | LogicalPlan::FusedIndexScan { variable, .. }
         | LogicalPlan::ExtIdLookup { variable, .. }
         | LogicalPlan::ScanAll { variable, .. }
-        | LogicalPlan::ScanMainByLabels { variable, .. } => {
-            out.insert(variable.clone());
-        }
-        LogicalPlan::Unwind {
-            input, variable, ..
-        } => {
-            out.insert(variable.clone());
-            collect_plan_variables_into(input, out);
+        | LogicalPlan::ScanMainByLabels { variable, .. }
+        | LogicalPlan::VectorKnn { variable, .. }
+        | LogicalPlan::InvertedIndexLookup { variable, .. } => {
+            insert_node_var(variable, out);
         }
         LogicalPlan::Traverse {
             input,
@@ -6923,18 +7171,8 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
             step_variable,
             path_variable,
             ..
-        } => {
-            collect_plan_variables_into(input, out);
-            out.insert(source_variable.clone());
-            out.insert(target_variable.clone());
-            if let Some(s) = step_variable {
-                out.insert(s.clone());
-            }
-            if let Some(p) = path_variable {
-                out.insert(p.clone());
-            }
         }
-        LogicalPlan::TraverseMainByType {
+        | LogicalPlan::TraverseMainByType {
             input,
             source_variable,
             target_variable,
@@ -6943,8 +7181,8 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
             ..
         } => {
             collect_plan_variables_into(input, out);
-            out.insert(source_variable.clone());
-            out.insert(target_variable.clone());
+            insert_node_var(source_variable, out);
+            insert_node_var(target_variable, out);
             if let Some(s) = step_variable {
                 out.insert(s.clone());
             }
@@ -6952,16 +7190,72 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
                 out.insert(p.clone());
             }
         }
-        LogicalPlan::Union { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
-            collect_plan_variables_into(left, out);
-            collect_plan_variables_into(right, out);
+        LogicalPlan::ShortestPath {
+            input,
+            source_variable,
+            target_variable,
+            path_variable,
+            ..
         }
-        LogicalPlan::Apply {
-            input, subquery, ..
+        | LogicalPlan::AllShortestPaths {
+            input,
+            source_variable,
+            target_variable,
+            path_variable,
+            ..
         } => {
             collect_plan_variables_into(input, out);
-            collect_plan_variables_into(subquery, out);
+            insert_node_var(source_variable, out);
+            insert_node_var(target_variable, out);
+            out.insert(path_variable.clone());
         }
+        LogicalPlan::QuantifiedPattern {
+            input,
+            pattern_plan,
+            path_variable,
+            start_variable,
+            binding_variable,
+            ..
+        } => {
+            collect_plan_variables_into(input, out);
+            collect_plan_variables_into(pattern_plan, out);
+            insert_node_var(start_variable, out);
+            insert_node_var(binding_variable, out);
+            if let Some(p) = path_variable {
+                out.insert(p.clone());
+            }
+        }
+        LogicalPlan::BindZeroLengthPath {
+            input,
+            node_variable,
+            path_variable,
+        } => {
+            collect_plan_variables_into(input, out);
+            insert_node_var(node_variable, out);
+            out.insert(path_variable.clone());
+        }
+        LogicalPlan::BindPath {
+            input,
+            node_variables,
+            edge_variables,
+            path_variable,
+        } => {
+            collect_plan_variables_into(input, out);
+            for nv in node_variables {
+                insert_node_var(nv, out);
+            }
+            for ev in edge_variables {
+                out.insert(ev.clone());
+            }
+            out.insert(path_variable.clone());
+        }
+        LogicalPlan::Unwind {
+            input, variable, ..
+        } => {
+            out.insert(variable.clone());
+            collect_plan_variables_into(input, out);
+        }
+        // Wrapper nodes — pass their input's variables through.
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -6979,8 +7273,93 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
         | LogicalPlan::SubqueryCall { input, .. } => {
             collect_plan_variables_into(input, out);
         }
-        // Leaf or unsupported: no variables collected.
-        _ => {}
+        LogicalPlan::Union { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+            collect_plan_variables_into(left, out);
+            collect_plan_variables_into(right, out);
+        }
+        LogicalPlan::Apply {
+            input, subquery, ..
+        } => {
+            collect_plan_variables_into(input, out);
+            collect_plan_variables_into(subquery, out);
+        }
+        LogicalPlan::RecursiveCTE {
+            initial, recursive, ..
+        } => {
+            collect_plan_variables_into(initial, out);
+            collect_plan_variables_into(recursive, out);
+        }
+        LogicalPlan::Explain { plan } => {
+            collect_plan_variables_into(plan, out);
+        }
+        LogicalPlan::ProcedureCall {
+            procedure_name,
+            yield_items,
+            ..
+        } => {
+            use crate::query::df_graph::procedure_call::{
+                is_node_yield_procedure_static, map_yield_to_canonical,
+            };
+            for (name, alias) in yield_items {
+                let var = alias.as_ref().unwrap_or(name);
+                if is_node_yield_procedure_static(procedure_name.as_str())
+                    && map_yield_to_canonical(name) == "node"
+                {
+                    insert_node_var(var, out);
+                } else {
+                    out.insert(var.clone());
+                }
+            }
+        }
+        // A Locy derived-relation scan (the right side of a positive IS-ref
+        // CrossJoin) exposes its rule's yield columns by name (KEY/value
+        // columns, e.g. `it`, `sup`, `b`). They must be visible here so that
+        // `classify_join_predicate` recognizes the IS-ref equality conjuncts
+        // (`it._vid = it`) as cross-side equi-pairs and lets
+        // `try_plan_cross_join_as_hash_join` recover a HashJoinExec — without
+        // this, the join stays a quadratic CrossJoinExec (issue #131).
+        LogicalPlan::LocyDerivedScan { schema, .. } => {
+            for f in schema.fields() {
+                out.insert(f.name().clone());
+            }
+        }
+        // Locy program/post-fixpoint operators expose no user-join-keyable
+        // variables here (their bindings are evaluated row-wise inside the
+        // fixpoint/SLG executor, never as a DataFusion CrossJoin). Mirrors the
+        // `{}` arm in `collect_variable_kinds`.
+        LogicalPlan::LocyProgram { .. }
+        | LogicalPlan::LocyFold { .. }
+        | LogicalPlan::LocyBestBy { .. }
+        | LogicalPlan::LocyPriority { .. }
+        | LogicalPlan::LocyProject { .. }
+        | LogicalPlan::LocyModelInvoke { .. } => {}
+        // Leaf nodes / DDL / admin statements bind no variables.
+        LogicalPlan::Empty
+        | LogicalPlan::CreateVectorIndex { .. }
+        | LogicalPlan::CreateSparseIndex { .. }
+        | LogicalPlan::CreateFullTextIndex { .. }
+        | LogicalPlan::CreateScalarIndex { .. }
+        | LogicalPlan::CreateJsonFtsIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::ShowIndexes { .. }
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::Backup { .. }
+        | LogicalPlan::ShowDatabase
+        | LogicalPlan::ShowConfig
+        | LogicalPlan::ShowStatistics
+        | LogicalPlan::Vacuum
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CopyTo { .. }
+        | LogicalPlan::CopyFrom { .. }
+        | LogicalPlan::CreateLabel(_)
+        | LogicalPlan::CreateEdgeType(_)
+        | LogicalPlan::AlterLabel(_)
+        | LogicalPlan::AlterEdgeType(_)
+        | LogicalPlan::DropLabel(_)
+        | LogicalPlan::DropEdgeType(_)
+        | LogicalPlan::CreateConstraint(_)
+        | LogicalPlan::DropConstraint(_)
+        | LogicalPlan::ShowConstraints(_) => {}
     }
 }
 

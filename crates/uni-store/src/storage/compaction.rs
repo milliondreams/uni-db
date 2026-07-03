@@ -508,7 +508,7 @@ impl Compactor {
         }
 
         // Final Flush
-        if src_vid_builder.len() > 0 {
+        if !src_vid_builder.is_empty() {
             let src_arr = Arc::new(src_vid_builder.finish());
             let neighbors_arr = Arc::new(neighbors_builder.finish());
             let edge_ids_arr = Arc::new(edge_ids_builder.finish());

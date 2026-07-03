@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -427,12 +427,11 @@ fn build_legacy_arg_vec(
     let Some(end) = last_supplied else {
         return out; // bare 2-slot internal vector — no optional args supplied.
     };
-    for (i, (name, _ty, default)) in opt.iter().enumerate().take(end + 1) {
+    for (name, _ty, default) in opt.iter().take(end + 1) {
         let v = config
             .get(*name)
             .cloned()
             .unwrap_or_else(|| default.clone());
-        let _ = i;
         out.push(v);
     }
     out
@@ -589,7 +588,6 @@ pub fn register_into(
     r: &mut PluginRegistrar<'_>,
     algo_registry: &Arc<AlgorithmRegistry>,
 ) -> Result<(), PluginError> {
-    let _ = DataType::Utf8; // silence unused-import lint if it ever appears
     for name in algo_registry.list() {
         let Some(proc) = algo_registry.get(name) else {
             continue;

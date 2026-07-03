@@ -379,6 +379,8 @@ impl DataType {
                 value,
                 Value::String(_) | Value::List(_) | Value::Temporal(TemporalValue::Btic { .. })
             ),
+            // Shape-only: declared dimensions are enforced by `check_vector_dims`,
+            // which the write paths call alongside this predicate (issue #137).
             DataType::Vector { .. } => matches!(value, Value::Vector(_) | Value::List(_)),
             // `Value::Map` is the degraded form a `SparseVector` collapses into
             // when round-tripped through `#[serde(untagged)]` persistence (e.g.
@@ -387,9 +389,234 @@ impl DataType {
             DataType::SparseVector { .. } => {
                 matches!(value, Value::SparseVector { .. } | Value::Map(_))
             }
+            // Shape-only: for `List(Vector)` multi-vector columns, per-token
+            // dimensions are enforced by `check_vector_dims` (issue #137).
             DataType::List(_) => matches!(value, Value::List(_)),
             DataType::Map(_, _) => matches!(value, Value::Map(_)),
         }
+    }
+
+    /// Checks a value's dimensions against a declared vector column type.
+    ///
+    /// The dimension-aware companion to [`DataType::accepts`] (which is shape-only):
+    /// for `Vector { dimensions }` columns the value must be a `Value::Vector` or an
+    /// all-numeric `Value::List` of exactly `dimensions` elements; for
+    /// `List(Vector { dimensions })` multi-vector columns every token must satisfy the
+    /// same rule (an empty token list is a legal empty multi-vector). `Value::Null` is
+    /// always accepted — nullability is enforced separately — and every non-vector
+    /// `DataType` returns `Ok(())`, so callers may invoke this unconditionally.
+    ///
+    /// Guards against the silent data loss of issue #137, where wrong-length vectors
+    /// were accepted at write time and nulled at flush by the Arrow converters.
+    ///
+    /// # Errors
+    /// Returns a [`VectorDimError`] describing the first offending value: a length
+    /// mismatch, a non-numeric list element, a non-vector value in a vector column,
+    /// or their per-token counterparts for multi-vector columns.
+    pub fn check_vector_dims(&self, value: &crate::value::Value) -> Result<(), VectorDimError> {
+        use crate::value::Value;
+
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+
+        match self {
+            DataType::Vector { dimensions } => check_dense_vector_value(value, *dimensions),
+            DataType::List(inner) => {
+                let DataType::Vector { dimensions } = inner.as_ref() else {
+                    return Ok(());
+                };
+                let Value::List(tokens) = value else {
+                    return Err(VectorDimError::NotATokenList {
+                        actual: value_variant_name(value),
+                    });
+                };
+                for (token, token_value) in tokens.iter().enumerate() {
+                    check_dense_vector_value(token_value, *dimensions)
+                        .map_err(|e| e.for_token(token))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Why a value cannot be stored in a declared `VECTOR(dim)` or multi-vector column.
+///
+/// Produced by [`DataType::check_vector_dims`] and [`check_dense_vector_value`].
+/// Messages carry the declared and actual lengths so write-path errors are
+/// actionable; callers prefix the property name and declared type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorDimError {
+    /// The vector has the wrong number of elements.
+    WrongLength {
+        /// Declared column dimensions.
+        expected: usize,
+        /// Actual element count of the offending value.
+        actual: usize,
+    },
+    /// A list element is not `Int` or `Float`.
+    NonNumericElement {
+        /// Zero-based index of the offending element.
+        index: usize,
+    },
+    /// The value is not a vector or list at all.
+    NotAVector {
+        /// Variant name of the offending value.
+        actual: &'static str,
+    },
+    /// A multi-vector token has the wrong number of elements.
+    TokenWrongLength {
+        /// Zero-based token index within the multi-vector.
+        token: usize,
+        /// Declared per-token dimensions.
+        expected: usize,
+        /// Actual element count of the offending token.
+        actual: usize,
+    },
+    /// A multi-vector token contains a non-numeric element.
+    TokenNonNumericElement {
+        /// Zero-based token index within the multi-vector.
+        token: usize,
+        /// Zero-based index of the offending element within the token.
+        index: usize,
+    },
+    /// A multi-vector token is not a vector or list.
+    TokenNotAVector {
+        /// Zero-based token index within the multi-vector.
+        token: usize,
+        /// Variant name of the offending token.
+        actual: &'static str,
+    },
+    /// The value for a multi-vector column is not a list of tokens.
+    NotATokenList {
+        /// Variant name of the offending value.
+        actual: &'static str,
+    },
+}
+
+impl VectorDimError {
+    /// Maps a dense-kernel error to its per-token counterpart for multi-vector columns.
+    fn for_token(self, token: usize) -> Self {
+        match self {
+            Self::WrongLength { expected, actual } => Self::TokenWrongLength {
+                token,
+                expected,
+                actual,
+            },
+            Self::NonNumericElement { index } => Self::TokenNonNumericElement { token, index },
+            Self::NotAVector { actual } => Self::TokenNotAVector { token, actual },
+            other => other,
+        }
+    }
+}
+
+impl std::fmt::Display for VectorDimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongLength { expected, actual } => write!(
+                f,
+                "got a vector of length {actual}, expected {expected} dimensions"
+            ),
+            Self::NonNumericElement { index } => {
+                write!(f, "element {index} is not numeric")
+            }
+            Self::NotAVector { actual } => {
+                write!(f, "got a non-vector value of type {actual}")
+            }
+            Self::TokenWrongLength {
+                token,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "token {token} has {actual} dimensions, expected {expected}"
+            ),
+            Self::TokenNonNumericElement { token, index } => {
+                write!(f, "token {token} element {index} is not numeric")
+            }
+            Self::TokenNotAVector { token, actual } => {
+                write!(f, "token {token} is not a vector (got {actual})")
+            }
+            Self::NotATokenList { actual } => write!(
+                f,
+                "got a non-list value of type {actual} for a multi-vector column"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VectorDimError {}
+
+/// Checks one dense vector value against a declared dimension count.
+///
+/// The per-token kernel behind [`DataType::check_vector_dims`], exposed so the
+/// storage-layer converters can validate individual multi-vector tokens with the
+/// same semantics: `Value::Null` is accepted (a legal null row), a `Value::Vector`
+/// must have exactly `dimensions` elements, and a `Value::List` must additionally
+/// be all-numeric (`Int` or `Float`).
+///
+/// # Errors
+/// Returns [`VectorDimError::WrongLength`] on a length mismatch (an empty list
+/// reports `actual: 0`), [`VectorDimError::NonNumericElement`] for a `String`,
+/// `Null`, or other non-numeric list element, and [`VectorDimError::NotAVector`]
+/// for any other value variant.
+pub fn check_dense_vector_value(
+    value: &crate::value::Value,
+    dimensions: usize,
+) -> Result<(), VectorDimError> {
+    use crate::value::Value;
+
+    match value {
+        Value::Null => Ok(()),
+        Value::Vector(v) => {
+            if v.len() == dimensions {
+                Ok(())
+            } else {
+                Err(VectorDimError::WrongLength {
+                    expected: dimensions,
+                    actual: v.len(),
+                })
+            }
+        }
+        Value::List(items) => {
+            if items.len() != dimensions {
+                return Err(VectorDimError::WrongLength {
+                    expected: dimensions,
+                    actual: items.len(),
+                });
+            }
+            if let Some(index) = items.iter().position(|e| !e.is_number()) {
+                return Err(VectorDimError::NonNumericElement { index });
+            }
+            Ok(())
+        }
+        other => Err(VectorDimError::NotAVector {
+            actual: value_variant_name(other),
+        }),
+    }
+}
+
+/// Returns a short variant name for a `Value`, used in dimension-mismatch messages.
+fn value_variant_name(value: &crate::value::Value) -> &'static str {
+    use crate::value::Value;
+
+    match value {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::String(_) => "String",
+        Value::Bytes(_) => "Bytes",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::Node(_) => "Node",
+        Value::Edge(_) => "Edge",
+        Value::Path(_) => "Path",
+        Value::Vector(_) => "Vector",
+        Value::SparseVector { .. } => "SparseVector",
+        Value::Temporal(_) => "Temporal",
     }
 }
 
@@ -1576,6 +1803,73 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Declares a property, idempotent when an identical declaration already exists.
+    ///
+    /// The schema-builder counterpart to [`Self::add_property_with_desc`] (which
+    /// hard-errors on *any* re-add, as DDL `ALTER` semantics require). Re-applying a
+    /// schema is common — every `apply()` re-declares — so an existing property with
+    /// the same `data_type` and `nullable` is a no-op (`Ok(false)`; a differing
+    /// `description` is ignored as docs-only). A differing type or nullability is a
+    /// hard conflict: silently swallowing it let `VECTOR(4)` be "re-declared" as
+    /// `VECTOR(8)` while the column stayed 4-dimensional (issue #137).
+    ///
+    /// Returns `true` if this call newly inserted the property.
+    ///
+    /// # Errors
+    /// Returns an error when the property exists with a different type or nullability
+    /// (the message deliberately does not contain "already exists", which callers
+    /// historically string-matched to ignore benign re-adds), or when the property
+    /// name is invalid.
+    pub fn declare_property(
+        &self,
+        label_or_type: &str,
+        prop_name: &str,
+        data_type: DataType,
+        nullable: bool,
+        description: Option<String>,
+    ) -> Result<bool> {
+        validate_property_name(prop_name)?;
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let version = schema.schema_version;
+        let props = schema
+            .properties
+            .entry(label_or_type.to_string())
+            .or_default();
+
+        if let Some(existing) = props.get(prop_name) {
+            if existing.r#type == data_type && existing.nullable == nullable {
+                return Ok(false); // identical re-declaration (idempotent)
+            }
+            return Err(anyhow!(
+                "Property '{}' on '{}' is declared as {:?} (nullable: {}); cannot re-declare \
+                 as {:?} (nullable: {}). Property types are immutable — use a new property \
+                 name or migrate the data",
+                prop_name,
+                label_or_type,
+                existing.r#type,
+                existing.nullable,
+                data_type,
+                nullable
+            ));
+        }
+
+        props.insert(
+            prop_name.to_string(),
+            PropertyMeta {
+                r#type: data_type,
+                nullable,
+                added_in: version,
+                state: SchemaElementState::Active,
+                generation_expression: None,
+                description,
+            },
+        );
+        // Bump after stamping `added_in` with the pre-bump `version`.
+        schema.bump_version();
+        Ok(true)
+    }
+
     /// Register an INTERNAL property (underscore-prefixed name allowed) that is
     /// materialised by the storage layer, not written by the user — e.g. the MUVERA
     /// `__fde_*` derived column. Bypasses the user-facing underscore-prefix rule but
@@ -2021,6 +2315,185 @@ mod tests {
 
         // Opaque columns accept anything.
         assert!(DataType::CypherValue.accepts(&Value::Map(Default::default())));
+    }
+
+    #[test]
+    fn test_check_vector_dims_matrix() {
+        let vec3 = DataType::Vector { dimensions: 3 };
+        let multi2 = DataType::List(Box::new(DataType::Vector { dimensions: 2 }));
+        let flist = |vals: &[f64]| Value::List(vals.iter().map(|f| Value::Float(*f)).collect());
+
+        // Null is accepted everywhere (nullability enforced separately).
+        assert!(vec3.check_vector_dims(&Value::Null).is_ok());
+        assert!(multi2.check_vector_dims(&Value::Null).is_ok());
+
+        // Correct-dimension values pass; Int elements are numeric.
+        assert!(
+            vec3.check_vector_dims(&Value::Vector(vec![1.0, 2.0, 3.0]))
+                .is_ok()
+        );
+        assert!(vec3.check_vector_dims(&flist(&[1.0, 2.0, 3.0])).is_ok());
+        assert!(
+            vec3.check_vector_dims(&Value::List(vec![
+                Value::Int(1),
+                Value::Float(2.0),
+                Value::Int(3)
+            ]))
+            .is_ok()
+        );
+
+        // The #137 cases: wrong length, empty list, non-numeric element, wrong shape.
+        assert_eq!(
+            vec3.check_vector_dims(&Value::Vector(vec![1.0, 2.0])),
+            Err(VectorDimError::WrongLength {
+                expected: 3,
+                actual: 2
+            })
+        );
+        assert_eq!(
+            vec3.check_vector_dims(&flist(&[1.0, 2.0, 3.0, 4.0, 5.0])),
+            Err(VectorDimError::WrongLength {
+                expected: 3,
+                actual: 5
+            })
+        );
+        assert_eq!(
+            vec3.check_vector_dims(&Value::List(vec![])),
+            Err(VectorDimError::WrongLength {
+                expected: 3,
+                actual: 0
+            })
+        );
+        assert_eq!(
+            vec3.check_vector_dims(&Value::List(vec![
+                Value::Float(1.0),
+                Value::String("x".into()),
+                Value::Float(3.0),
+            ])),
+            Err(VectorDimError::NonNumericElement { index: 1 })
+        );
+        assert_eq!(
+            vec3.check_vector_dims(&Value::List(vec![
+                Value::Float(1.0),
+                Value::Null,
+                Value::Float(3.0)
+            ])),
+            Err(VectorDimError::NonNumericElement { index: 1 })
+        );
+        assert_eq!(
+            vec3.check_vector_dims(&Value::String("not a vector".into())),
+            Err(VectorDimError::NotAVector { actual: "String" })
+        );
+
+        // Multi-vector: empty token list is a legal empty multi-vector; each
+        // token must match the declared per-token dimensions.
+        assert!(multi2.check_vector_dims(&Value::List(vec![])).is_ok());
+        assert!(
+            multi2
+                .check_vector_dims(&Value::List(vec![flist(&[1.0, 2.0]), flist(&[3.0, 4.0])]))
+                .is_ok()
+        );
+        assert_eq!(
+            multi2.check_vector_dims(&Value::List(vec![
+                flist(&[1.0, 2.0]),
+                flist(&[9.0, 9.0, 9.0])
+            ])),
+            Err(VectorDimError::TokenWrongLength {
+                token: 1,
+                expected: 2,
+                actual: 3
+            })
+        );
+        assert_eq!(
+            multi2.check_vector_dims(&Value::List(vec![Value::String("tok".into())])),
+            Err(VectorDimError::TokenNotAVector {
+                token: 0,
+                actual: "String"
+            })
+        );
+        assert_eq!(
+            multi2.check_vector_dims(&Value::Vector(vec![1.0, 2.0])),
+            Err(VectorDimError::NotATokenList { actual: "Vector" })
+        );
+
+        // Non-vector declared types never object, so callers may check unconditionally.
+        assert!(
+            DataType::Int64
+                .check_vector_dims(&Value::String("x".into()))
+                .is_ok()
+        );
+        assert!(
+            DataType::List(Box::new(DataType::Float64))
+                .check_vector_dims(&Value::List(vec![Value::String("x".into())]))
+                .is_ok()
+        );
+        assert!(
+            DataType::SparseVector { dimensions: 8 }
+                .check_vector_dims(&Value::Map(Default::default()))
+                .is_ok()
+        );
+
+        // Error rendering carries both lengths so write errors are actionable.
+        let msg = VectorDimError::WrongLength {
+            expected: 4,
+            actual: 5,
+        }
+        .to_string();
+        assert!(msg.contains('4') && msg.contains('5'), "message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_declare_property_idempotent_and_conflicting() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store.clone(), &path).await?;
+
+        manager.add_label("Doc")?;
+        let vec4 = DataType::Vector { dimensions: 4 };
+
+        // First declaration inserts.
+        assert!(manager.declare_property("Doc", "embedding", vec4.clone(), true, None)?);
+
+        // Identical re-declaration is an idempotent no-op — the register-on-every-open
+        // pattern; a differing description is docs-only and also ignored.
+        assert!(!manager.declare_property("Doc", "embedding", vec4.clone(), true, None)?);
+        assert!(!manager.declare_property(
+            "Doc",
+            "embedding",
+            vec4.clone(),
+            true,
+            Some("new docs".into())
+        )?);
+
+        // A dimension change is a conflict (#137 case c), and the message must not
+        // contain "already exists" (historically string-matched and swallowed).
+        let err = manager
+            .declare_property(
+                "Doc",
+                "embedding",
+                DataType::Vector { dimensions: 8 },
+                true,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('4') && err.contains('8'), "message: {err}");
+        assert!(!err.contains("already exists"), "message: {err}");
+
+        // Nullability flips are conflicts too — they change NOT NULL enforcement.
+        assert!(
+            manager
+                .declare_property("Doc", "embedding", vec4.clone(), false, None)
+                .is_err()
+        );
+
+        // The schema still holds the original declaration.
+        let schema = manager.schema();
+        let meta = &schema.properties["Doc"]["embedding"];
+        assert_eq!(meta.r#type, vec4);
+        assert!(meta.nullable);
+        Ok(())
     }
 
     #[tokio::test]

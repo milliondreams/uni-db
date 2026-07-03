@@ -124,8 +124,7 @@ impl CircuitBreaker {
         let key = (plugin.clone(), qname.clone());
         self.states
             .get(&key)
-            .map(|s| s.consecutive_failures.load(Ordering::SeqCst))
-            .unwrap_or(0)
+            .map_or(0, |s| s.consecutive_failures.load(Ordering::SeqCst))
     }
 }
 

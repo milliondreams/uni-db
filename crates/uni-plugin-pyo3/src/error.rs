@@ -85,9 +85,7 @@ impl PyPluginError {
     pub fn with_qname(self, qname: impl Into<String>) -> Self {
         match self {
             PyPluginError::PythonException {
-                qname: _,
-                message,
-                traceback,
+                message, traceback, ..
             } => PyPluginError::PythonException {
                 qname: qname.into(),
                 message,

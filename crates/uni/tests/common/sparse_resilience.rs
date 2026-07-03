@@ -282,6 +282,74 @@ async fn sparse_crash_during_flush_loses_no_committed_data() -> Result<()> {
     Ok(())
 }
 
+/// Issue #132: a STALLED async flush stream (modelling a lost-wakeup in the
+/// sparse Lance read-modify-write) must NOT permanently wedge the flush
+/// pipeline. Pre-fix, the stalled stream never submits its rotate-seq, so the
+/// finalizer wedges, back-pressure permits saturate, and the next commits fall
+/// to the inline flush path and block forever on `flush_lock`. With the
+/// flush-stream timeout the stall becomes a data-safe *failure*: the finalizer
+/// advances, the permit releases, and later commits + an explicit flush all
+/// complete — and no committed data is lost (the stalled flush's rows stay in
+/// L0/WAL and remain queryable).
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_sparse_flush_stream_recovers_not_wedges() -> Result<()> {
+    let h = DiskHarness::new()?;
+    // Flush on every commit via the ASYNC path (the one the timeout guards);
+    // a 500ms stream timeout converts the stall quickly; no time-based trigger.
+    let cfg = uni_db::UniConfig {
+        async_flush_enabled: true,
+        flush_stream_timeout: std::time::Duration::from_millis(500),
+        auto_flush_threshold: 1,
+        auto_flush_min_mutations: 1,
+        auto_flush_interval: None,
+        max_pending_flushes: 2,
+        ..Default::default()
+    };
+    let db = h.open_with(cfg).await?;
+    define_sparse_schema(&db).await?;
+
+    // Arm a PERSISTENT async stall: EVERY flush stream sleeps far past the
+    // timeout. Each async flush therefore times out into a data-safe failure,
+    // frees its permit, and a later commit retries — but no flush ever
+    // completes, so all committed data must remain live in L0/WAL. Armed AFTER
+    // schema setup so the stalls hit async (timeout-guarded) flushes.
+    fail::cfg("flush::stream-async-stall", "return").unwrap();
+
+    // Commit enough docs to SATURATE the flush pipeline (both permits held by
+    // stalled flushes). Pre-fix, the (max_pending+1)th commit falls to the
+    // blocking inline flush path, hits the same stall with no timeout, and hangs
+    // holding `flush_lock` → the whole runtime parks. Post-fix, a saturated
+    // async pipeline SKIPs the flush (retry later) so every commit completes,
+    // and stalled async flushes are bounded by `flush_stream_timeout`. Bound the
+    // wall clock so a regression fails loudly instead of hanging CI.
+    const N: usize = 6;
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for i in 0..N {
+            insert_doc(&db, &format!("doc-{i}"), target_emb()).await?;
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    fail::remove("flush::stream-async-stall");
+    assert!(
+        recovered.is_ok(),
+        "issue #132 regression: flush pipeline wedged — a commit hung after the pipeline stalled"
+    );
+    recovered.expect("bounded above")?;
+
+    // Data-safety: with EVERY flush failing, all committed docs must still be
+    // queryable from the L0/WAL union (finalize_failure retains them).
+    for i in 0..N {
+        assert_eq!(
+            read_emb(&db, &format!("doc-{i}")).await?,
+            Some(target_emb()),
+            "doc-{i} lost while every flush was failing (finalize_failure must retain L0/WAL)"
+        );
+    }
+    Ok(())
+}
+
 /// A torn (corrupt) WAL segment at the TAIL must not block reopen: the torn
 /// segment belongs to an unacknowledged sparse commit, so recovery skips it and
 /// replays everything before it — the flushed baseline sparse doc survives.

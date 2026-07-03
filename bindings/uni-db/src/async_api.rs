@@ -10,7 +10,6 @@ use crate::types::*;
 use ::uni_db::Uni;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -3151,13 +3150,9 @@ impl AsyncQueryCursor {
         let buffer = self.buffer.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match next_row_async(&cursor, &buffer).await {
-                Ok(Some(row)) => Python::attach(|py| {
-                    let dict = PyDict::new(py);
-                    for (col, val) in row.as_map() {
-                        dict.set_item(col, convert::value_to_py(py, val)?)?;
-                    }
-                    Ok(Some(dict.into_py_any(py)?))
-                }),
+                Ok(Some(row)) => {
+                    Python::attach(|py| Ok(Some(convert::row_to_dict(py, &row)?.into_py_any(py)?)))
+                }
                 Ok(None) => Ok(None),
                 Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
             }
@@ -3228,13 +3223,9 @@ impl AsyncQueryCursor {
         let buffer = self.buffer.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match next_row_async(&cursor, &buffer).await {
-                Ok(Some(row)) => Python::attach(|py| {
-                    let dict = PyDict::new(py);
-                    for (col, val) in row.as_map() {
-                        dict.set_item(col, convert::value_to_py(py, val)?)?;
-                    }
-                    dict.into_py_any(py)
-                }),
+                Ok(Some(row)) => {
+                    Python::attach(|py| convert::row_to_dict(py, &row)?.into_py_any(py))
+                }
                 Ok(None) => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
                     "end of cursor",
                 )),

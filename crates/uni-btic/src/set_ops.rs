@@ -109,11 +109,11 @@ fn pick_bound_meta(
     a: &Btic,
     b: &Btic,
     side: BoundSide,
-    pick: std::cmp::Ordering,
+    pick: Ordering,
 ) -> (Granularity, Certainty) {
     debug_assert_ne!(
         pick,
-        std::cmp::Ordering::Equal,
+        Ordering::Equal,
         "pick_bound_meta requires Greater or Less"
     );
 
@@ -123,7 +123,7 @@ fn pick_bound_meta(
     let (gb, cb) = bound_meta(b, side);
 
     match va.cmp(&vb) {
-        std::cmp::Ordering::Equal => (ga.finer(gb), ca.least_certain(cb)),
+        Ordering::Equal => (ga.finer(gb), ca.least_certain(cb)),
         ord if ord == pick => (ga, ca),
         _ => (gb, cb),
     }

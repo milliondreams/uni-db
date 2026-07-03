@@ -3059,6 +3059,20 @@ impl Executor {
             return Self::canonicalize_sparse_vector(prop_name, val, *dimensions);
         }
 
+        // Dense and multi-vector columns: enforce the declared dimensions here so a
+        // wrong-length vector is a clean `TypeError` at write time, rather than being
+        // silently nulled by the Arrow converters at flush and detonating as an
+        // "unexpected null" internal error at shutdown (issue #137). `accepts` below
+        // stays shape-only.
+        if let Err(e) = dt.check_vector_dims(&val) {
+            anyhow::bail!(
+                "TypeError: property '{}' is declared {:?} but {}",
+                prop_name,
+                dt,
+                e
+            );
+        }
+
         // Directly storable: scalars, the intentional `Int`→`Float`/`Int32` and
         // `Temporal`→`Timestamp` widenings, declared composite columns (`Map`/`List`/
         // `Vector`) receiving their matching value, and `Null` (always accepted).

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyTuple};
+use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods};
 use smol_str::SmolStr;
 
 use uni_plugin::traits::scalar::{ArgType, FnSignature, NullHandling};
@@ -704,27 +704,9 @@ pub fn make_procedure_trampoline(
 }
 
 fn extract_args_list(obj: &Bound<'_, PyAny>) -> PyResult<Vec<SmolStr>> {
-    // Accept list / tuple / iterable of strings.
-    if let Ok(list) = obj.cast::<PyList>() {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            out.push(SmolStr::new(item.extract::<String>()?));
-        }
-        return Ok(out);
-    }
-    if let Ok(tuple) = obj.cast::<PyTuple>() {
-        let len = tuple.len();
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            let item = tuple.get_item(i)?;
-            out.push(SmolStr::new(item.extract::<String>()?));
-        }
-        return Ok(out);
-    }
-    // Generic iterable.
+    // Accept any iterable of strings (list / tuple / generator / ...).
     let mut out = Vec::new();
-    let iter = obj.try_iter()?;
-    for item in iter {
+    for item in obj.try_iter()? {
         out.push(SmolStr::new(item?.extract::<String>()?));
     }
     Ok(out)

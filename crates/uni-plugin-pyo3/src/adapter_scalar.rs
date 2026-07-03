@@ -138,12 +138,13 @@ impl PyScalarFn {
 
         let local_name = self.local_name.clone();
         let result_arr = Python::attach(|py| -> Result<ArrayRef, FnError> {
-            let mut py_args: Vec<Bound<'_, PyAny>> = Vec::with_capacity(arr_args.len());
-            for arr in &arr_args {
-                let py_arr = arrow_array_to_pyarrow(py, arr.as_ref())
-                    .map_err(|e| FnError::new(0x83, e.to_string()))?;
-                py_args.push(py_arr);
-            }
+            let py_args: Vec<Bound<'_, PyAny>> = arr_args
+                .iter()
+                .map(|arr| {
+                    arrow_array_to_pyarrow(py, arr.as_ref())
+                        .map_err(|e| FnError::new(0x83, e.to_string()))
+                })
+                .collect::<Result<_, FnError>>()?;
             let bound = callable.bind(py);
             let tuple = PyTuple::new(py, py_args)
                 .map_err(|e| classify_pyerr(0x820, "", local_name.as_str(), e))?;

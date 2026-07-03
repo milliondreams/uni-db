@@ -300,7 +300,7 @@ Error: Query execution failed: Out of memory
 1. **Embedding model mismatch:** Ensure the same embedding model is used for indexing and querying.
    - Auto-embedding routes through any provider in the catalog. `local/candle` (BERT-style) and `local/onnx` (FastEmbed-compatible alias strings via the unified ONNX Embed task) are the two local backends. Remote APIs (OpenAI, Gemini, Vertex, Voyage, Cohere) are supported through their respective `provider-*` features.
 
-2. **Dimension mismatch:**
+2. **Dimension mismatch:** since 2.5.0 this surfaces as an error, not as poor results — a query vector whose length differs from the declared column dimension fails with "vector dimension mismatch" (previously it silently returned 0 rows), and wrong-length writes fail with a `TypeError`.
    ```bash
    # Check schema dimensions
    uni query "CALL uni.schema.labelInfo('Paper')" --path ./storage

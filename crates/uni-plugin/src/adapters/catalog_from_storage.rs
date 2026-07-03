@@ -152,8 +152,7 @@ impl CatalogTable for StorageCatalogTable {
         };
 
         let inner = stream::once(async move {
-            let res = storage.read_batch(&table, predicate.as_ref()).await;
-            match res {
+            match storage.read_batch(&table, predicate.as_ref()).await {
                 Ok(s) => Ok(s),
                 // Backend rejected the encoded predicate — retry
                 // unfiltered. Planner-side `Filter` re-applies it.
@@ -162,10 +161,6 @@ impl CatalogTable for StorageCatalogTable {
                 }
                 Err(e) => Err(fn_err_to_df(e)),
             }
-        })
-        .map(|res| match res {
-            Ok(stream) => Ok(stream),
-            Err(e) => Err(e),
         })
         .try_flatten();
 
@@ -232,14 +227,12 @@ impl ProjectionAndLimitStream {
     }
 
     fn apply(&self, batch: RecordBatch) -> Result<RecordBatch, DataFusionError> {
-        let projected = if let Some(p) = self.projection.as_deref() {
-            batch
+        match self.projection.as_deref() {
+            Some(p) => batch
                 .project(p)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        } else {
-            batch
-        };
-        Ok(projected)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+            None => Ok(batch),
+        }
     }
 }
 

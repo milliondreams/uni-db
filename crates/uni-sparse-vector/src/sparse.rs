@@ -34,12 +34,15 @@ impl SparseVector {
                 values: values.len(),
             });
         }
-        for i in 1..indices.len() {
-            if indices[i] <= indices[i - 1] {
+        for (prev_pos, pair) in indices.windows(2).enumerate() {
+            let [prev, curr] = [pair[0], pair[1]];
+            if curr <= prev {
                 return Err(SparseError::UnsortedIndices {
-                    position: i,
-                    prev: indices[i - 1],
-                    curr: indices[i],
+                    // `pair` starts at index `prev_pos`, so the violating
+                    // element `curr` sits at `prev_pos + 1`.
+                    position: prev_pos + 1,
+                    prev,
+                    curr,
                 });
             }
         }

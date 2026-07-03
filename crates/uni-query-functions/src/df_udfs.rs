@@ -7126,13 +7126,39 @@ impl CypherCollectAccumulator {
     /// Pushes `val` into the accumulator, skipping duplicates when `distinct`.
     fn push_value(&mut self, val: Value) {
         if self.distinct {
-            // Use string repr for dedup (consistent with CountDistinct).
-            let repr = val.to_string();
-            if self.values.iter().any(|v| v.to_string() == repr) {
+            let key = Self::distinct_key(&val);
+            if self.values.iter().any(|v| Self::distinct_key(v) == key) {
                 return;
             }
         }
         self.values.push(val);
+    }
+
+    /// Deduplication key for `collect(DISTINCT ...)`.
+    ///
+    /// Entities dedup by identity (`_vid` / `_eid`) so two references to the
+    /// same node/edge collapse to one regardless of property values — matching
+    /// openCypher's identity-based DISTINCT (issue #134 family). Graph entities
+    /// surface here as `Value::Map` (a node/edge struct carrying `_vid`/`_eid`),
+    /// whose `to_string()` is order-nondeterministic (backed by a `HashMap`) and
+    /// so cannot be used as a key. Non-entity values dedup by their string
+    /// representation, as before. The `\0` prefixes keep entity keys from
+    /// colliding with any scalar's string form.
+    fn distinct_key(val: &Value) -> String {
+        match val {
+            Value::Node(n) => format!("\0n{}", n.vid),
+            Value::Edge(e) => format!("\0e{}", e.eid),
+            Value::Map(m) => {
+                if let Some(vid) = m.get("_vid") {
+                    format!("\0n{vid}")
+                } else if let Some(eid) = m.get("_eid") {
+                    format!("\0e{eid}")
+                } else {
+                    val.to_string()
+                }
+            }
+            other => other.to_string(),
+        }
     }
 }
 

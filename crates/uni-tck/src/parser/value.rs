@@ -21,15 +21,11 @@ fn nom_err(input: &str, kind: nom::error::ErrorKind) -> nom::Err<nom::error::Err
 
 /// Parse a TCK value string into a `Value`, failing on trailing input.
 pub fn parse_value(input: &str) -> Result<Value, String> {
-    match value(input.trim()) {
-        Ok((remaining, val)) => {
-            if remaining.trim().is_empty() {
-                Ok(val)
-            } else {
-                Err(format!("Unexpected trailing input: {}", remaining))
-            }
-        }
-        Err(e) => Err(format!("Parse error: {}", e)),
+    let (remaining, val) = value(input.trim()).map_err(|e| format!("Parse error: {}", e))?;
+    if remaining.trim().is_empty() {
+        Ok(val)
+    } else {
+        Err(format!("Unexpected trailing input: {}", remaining))
     }
 }
 
@@ -74,15 +70,15 @@ fn number(input: &str) -> IResult<&str, Value> {
     .parse(input)?;
 
     if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
-        match num_str.parse::<f64>() {
-            Ok(f) => Ok((input, Value::Float(f))),
-            Err(_) => Err(nom_err(input, nom::error::ErrorKind::Float)),
-        }
+        let f = num_str
+            .parse::<f64>()
+            .map_err(|_| nom_err(input, nom::error::ErrorKind::Float))?;
+        Ok((input, Value::Float(f)))
     } else {
-        match num_str.parse::<i64>() {
-            Ok(i) => Ok((input, Value::Int(i))),
-            Err(_) => Err(nom_err(input, nom::error::ErrorKind::Digit)),
-        }
+        let i = num_str
+            .parse::<i64>()
+            .map_err(|_| nom_err(input, nom::error::ErrorKind::Digit))?;
+        Ok((input, Value::Int(i)))
     }
 }
 
@@ -270,8 +266,9 @@ fn path(input: &str) -> IResult<&str, Path> {
     loop {
         let (input, _) = multispace0(remaining)?;
 
-        // Try to parse edge: <-[edge]- or -[edge]->
-        match (
+        // Try to parse an edge: <-[edge]- or -[edge]->. Stop at the first
+        // position that is not an edge (e.g. the closing `>`).
+        let Ok((input, (left_arrow, _, mut edge_val, _, right_arrow))) = (
             opt(char('<')),
             char('-'),
             edge_in_path,
@@ -279,31 +276,30 @@ fn path(input: &str) -> IResult<&str, Path> {
             opt(char('>')),
         )
             .parse(input)
-        {
-            Ok((input, (left_arrow, _, mut edge_val, _, right_arrow))) => {
-                // Determine direction: -> is outgoing, <- is incoming
-                let outgoing = left_arrow.is_none() && right_arrow.is_some();
+        else {
+            break;
+        };
 
-                // Parse next node and give it a distinct positional vid.
-                let (input, mut next_node) = node(input)?;
-                next_node.vid = Vid::from(next_vid);
-                next_vid += 1;
+        // Determine direction: -> is outgoing, <- is incoming
+        let outgoing = left_arrow.is_none() && right_arrow.is_some();
 
-                // Set edge source/destination based on direction
-                if outgoing {
-                    edge_val.src = nodes.last().unwrap().vid;
-                    edge_val.dst = next_node.vid;
-                } else {
-                    edge_val.src = next_node.vid;
-                    edge_val.dst = nodes.last().unwrap().vid;
-                }
+        // Parse next node and give it a distinct positional vid.
+        let (input, mut next_node) = node(input)?;
+        next_node.vid = Vid::from(next_vid);
+        next_vid += 1;
 
-                edges.push(edge_val);
-                nodes.push(next_node);
-                remaining = input;
-            }
-            Err(_) => break,
+        // Set edge source/destination based on direction
+        if outgoing {
+            edge_val.src = nodes.last().unwrap().vid;
+            edge_val.dst = next_node.vid;
+        } else {
+            edge_val.src = next_node.vid;
+            edge_val.dst = nodes.last().unwrap().vid;
         }
+
+        edges.push(edge_val);
+        nodes.push(next_node);
+        remaining = input;
     }
 
     let (input, _) = multispace0(remaining)?;

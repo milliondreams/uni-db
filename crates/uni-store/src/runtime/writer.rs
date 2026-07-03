@@ -4,6 +4,7 @@
 #[cfg(feature = "lance-backend")]
 use crate::backend::table_names;
 use crate::runtime::context::QueryContext;
+use crate::runtime::embed_caps::is_multivector_property;
 use crate::runtime::flush_coordinator::{
     FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
 };
@@ -32,26 +33,10 @@ use uni_common::core::fork::ForkId;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema::{ConstraintTarget, ConstraintType, IndexDefinition};
 use uni_common::core::snapshot::{EdgeSnapshot, LabelSnapshot, SnapshotManifest};
+use uni_xervo::error::RuntimeError;
 use uni_xervo::runtime::ModelRuntime;
+use uni_xervo::traits::hybrid::{HeadSet, HybridEmbedResult};
 use uuid::Uuid;
-
-/// Whether `property` on `label` is a multi-vector (`List<Vector>`) column — the
-/// late-interaction (ColBERT) shape that auto-embeds per-token via the multi-vector model
-/// (issue #104). A plain `Vector` column uses the dense single-vector model.
-fn is_multivector_property(
-    schema: &uni_common::core::schema::Schema,
-    label: &str,
-    property: &str,
-) -> bool {
-    schema
-        .properties
-        .get(label)
-        .and_then(|p| p.get(property))
-        .is_some_and(|m| {
-            matches!(&m.r#type, uni_common::DataType::List(inner)
-                if matches!(**inner, uni_common::DataType::Vector { .. }))
-        })
-}
 
 /// Convert per-token embedding vectors into the stored `List<Vector>` representation:
 /// a `Value::List` whose elements are each a `Value::List<Float>` (one token vector).
@@ -111,11 +96,11 @@ async fn embed_group(
     Option<Vec<Vec<Vec<f32>>>>,
     Option<Vec<Vec<(u32, f32)>>>,
 )> {
-    use uni_xervo::traits::hybrid::HeadSet;
     let heads_wanted = u8::from(want_dense) + u8::from(want_multi) + u8::from(want_sparse);
     if heads_wanted > 1 {
         // Single-pass hybrid: one model, one inference, all requested heads
-        // (e.g. BGE-M3 fills dense + sparse from one forward pass).
+        // (e.g. BGE-M3 fills dense + sparse from one forward pass). A group with >1 head
+        // can only be served by a hybrid model (one alias = one task), so route directly.
         let mut heads = HeadSet::empty();
         if want_dense {
             heads |= HeadSet::DENSE;
@@ -153,15 +138,86 @@ async fn embed_group(
         };
         Ok((dense, multi, sparse))
     } else if want_multi {
-        let embedder = runtime.multi_vector_embedder(alias).await?;
-        Ok((None, Some(embedder.embed(texts).await?.vectors), None))
+        // Lone multi-vector head: prefer the narrow facade, but fall back to a hybrid
+        // model on the same alias (issue #129) when it doesn't implement the narrow trait.
+        match runtime.multi_vector_embedder(alias).await {
+            Ok(embedder) => Ok((None, Some(embedder.embed(texts).await?.vectors), None)),
+            Err(e) if is_capability_mismatch(&e) => {
+                let multi = hybrid_single_head(runtime, alias, texts, HeadSet::MULTI_VECTOR)
+                    .await?
+                    .multi_vector
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "model '{alias}' exposes no multi-vector head for a List<Vector> target"
+                        )
+                    })?;
+                Ok((None, Some(multi), None))
+            }
+            Err(e) => Err(e.into()),
+        }
     } else if want_sparse {
-        let embedder = runtime.sparse_embedder(alias).await?;
-        Ok((None, None, Some(embedder.embed(texts).await?.vectors)))
+        // Lone sparse head: narrow facade, else hybrid fallback (issue #129).
+        match runtime.sparse_embedder(alias).await {
+            Ok(embedder) => Ok((None, None, Some(embedder.embed(texts).await?.vectors))),
+            Err(e) if is_capability_mismatch(&e) => {
+                let sparse = hybrid_single_head(runtime, alias, texts, HeadSet::SPARSE)
+                    .await?
+                    .sparse
+                    .ok_or_else(|| {
+                        anyhow!("model '{alias}' exposes no sparse head for a SparseVector target")
+                    })?;
+                Ok((None, None, Some(sparse)))
+            }
+            Err(e) => Err(e.into()),
+        }
     } else {
-        let embedder = runtime.embedding(alias).await?;
-        Ok((Some(embedder.embed(texts).await?.vectors), None, None))
+        // Lone dense head: narrow facade, else hybrid fallback (issue #129 — a hybrid
+        // model like BGE-M3 serving a single dense column on its own alias).
+        match runtime.embedding(alias).await {
+            Ok(embedder) => Ok((Some(embedder.embed(texts).await?.vectors), None, None)),
+            Err(e) if is_capability_mismatch(&e) => {
+                let dense = hybrid_single_head(runtime, alias, texts, HeadSet::DENSE)
+                    .await?
+                    .dense
+                    .ok_or_else(|| {
+                        anyhow!("model '{alias}' exposes no dense head for a Vector target")
+                    })?;
+                Ok((Some(dense), None, None))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
+}
+
+/// Whether `err` means the alias's model does not implement the requested narrow
+/// embedding trait, so the hybrid model on the same alias should be tried instead.
+///
+/// `embedding()` reports a missing dense trait as `RuntimeError::CapabilityMismatch`;
+/// the sparse / multi-vector / hybrid facades report it as
+/// `RuntimeError::ProviderCapabilityMissing`. Both mean "wrong facade for this model",
+/// as opposed to a load or inference failure, which must propagate unchanged.
+fn is_capability_mismatch(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::CapabilityMismatch(_) | RuntimeError::ProviderCapabilityMissing { .. }
+    )
+}
+
+/// Run ONE hybrid forward pass over `texts` producing only `head`, for the lone-head
+/// capability fallback (issue #129).
+///
+/// The hybrid embedder is cached per alias and the model is keyed by its task, so this
+/// reuses the model already loaded by the failed narrow attempt (no second load). The
+/// caller extracts the matching field of the result; a `None` there means the model does
+/// not expose `head` and must be surfaced as a hard error, never a silently-empty column.
+async fn hybrid_single_head(
+    runtime: &ModelRuntime,
+    alias: &str,
+    texts: &[&str],
+    head: HeadSet,
+) -> Result<HybridEmbedResult> {
+    let embedder = runtime.hybrid_embedder(alias).await?;
+    embedder.embed(texts, head).await.map_err(Into::into)
 }
 
 /// Group a label's auto-embed configs by `(alias, source_properties)`, classifying each target
@@ -563,6 +619,7 @@ impl Writer {
             let finalize_fn: Arc<dyn FinalizeFn> = Arc::new(WriterFinalizer);
             Some(Arc::new(FlushCoordinator::new(
                 config.max_pending_flushes,
+                config.flush_stream_timeout,
                 shared,
                 finalize_fn,
             )))
@@ -717,11 +774,93 @@ impl Writer {
                 // `check_unique_constraint_multi` after recovery and a
                 // duplicate of it could be created.
                 self.rebuild_constraint_index(&mut l0_guard);
+                // Null out wrong-dimension vector values recovered from a WAL written
+                // before dimension enforcement (issue #137). The flush path now fails
+                // closed on a dimension mismatch, so without this pass a single
+                // pre-fix value would make every flush of its label fail forever,
+                // leaving the database unopenable (the ghost-commit hazard documented
+                // on `commit_transaction_l0`). Nulling preserves exactly the pre-fix
+                // flush outcome for these values, with a loud signal.
+                self.sanitize_replayed_vector_dims(&mut l0_guard);
             }
 
             Ok(count)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Nulls wrong-dimension vector values in a recovered L0 buffer (issue #137).
+    ///
+    /// Only runs during WAL replay, where the offending value was written by a
+    /// version without write-time dimension enforcement and can no longer be
+    /// rejected. Live writes never reach this — they fail in the validation and
+    /// coercion guards.
+    fn sanitize_replayed_vector_dims(&self, l0_guard: &mut L0Buffer) {
+        let schema = self.schema_manager.schema();
+
+        // Collect fixes first: `vertex_labels` / `edge_types` are borrowed immutably
+        // from the same guard the property maps are mutated through.
+        let mut vertex_fixes: Vec<(Vid, String)> = Vec::new();
+        for (&vid, props) in &l0_guard.vertex_properties {
+            let Some(labels) = l0_guard.vertex_labels.get(&vid) else {
+                continue;
+            };
+            for label in labels {
+                let Some(props_meta) = schema.properties.get(label) else {
+                    continue;
+                };
+                for (prop_name, meta) in props_meta {
+                    if let Some(value) = props.get(prop_name)
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        log::warn!(
+                            "WAL replay: nulling wrong-dimension value for '{}.{}' on vid {:?} \
+                             ({}) — written before dimension enforcement (issue #137)",
+                            label,
+                            prop_name,
+                            vid,
+                            e
+                        );
+                        vertex_fixes.push((vid, prop_name.clone()));
+                    }
+                }
+            }
+        }
+        for (vid, prop) in vertex_fixes {
+            if let Some(props) = l0_guard.vertex_properties.get_mut(&vid) {
+                props.insert(prop, Value::Null);
+            }
+        }
+
+        let mut edge_fixes: Vec<(Eid, String)> = Vec::new();
+        for (&eid, props) in &l0_guard.edge_properties {
+            let Some(type_name) = l0_guard.edge_types.get(&eid) else {
+                continue;
+            };
+            let Some(props_meta) = schema.properties.get(type_name) else {
+                continue;
+            };
+            for (prop_name, meta) in props_meta {
+                if let Some(value) = props.get(prop_name)
+                    && let Err(e) = meta.r#type.check_vector_dims(value)
+                {
+                    log::warn!(
+                        "WAL replay: nulling wrong-dimension value for '{}.{}' on eid {:?} \
+                         ({}) — written before dimension enforcement (issue #137)",
+                        type_name,
+                        prop_name,
+                        eid,
+                        e
+                    );
+                    edge_fixes.push((eid, prop_name.clone()));
+                }
+            }
+        }
+        for (eid, prop) in edge_fixes {
+            if let Some(props) = l0_guard.edge_properties.get_mut(&eid) {
+                props.insert(prop, Value::Null);
+            }
         }
     }
 
@@ -1391,70 +1530,83 @@ impl Writer {
         if self.should_flush() {
             if self.config.async_flush_enabled
                 && let Some(coord) = self.flush_coordinator.as_ref()
-                && coord.pending_flush_count() < self.config.max_pending_flushes
             {
-                match coord.try_acquire_permit() {
-                    Some(permit) => {
-                        match self.flush_l0_rotate().await {
-                            Ok(rotate_out) => {
-                                // Allocate the rotate seq and bump pending ONLY
-                                // after the rotate succeeds (Bug #3). A failed
-                                // rotate must consume neither: the finalizer
-                                // advances strictly in consecutive seq order and
-                                // only decrements pending on finalize, so a
-                                // leaked seq/pending from a failed rotate would
-                                // wedge the finalizer forever and climb pending
-                                // toward `max_pending_flushes`. The seq is still
-                                // allocated under `flush_lock` (immediately after
-                                // the rotate, before the guard drops below), so
-                                // concurrent rotates keep seq order == rotation
-                                // order, and the seq is not used until submit.
-                                let seq = coord.next_rotate_seq();
-                                coord.note_pending();
-                                // Release flush_lock BEFORE the spawn so concurrent
-                                // commits can proceed while the stream runs.
-                                drop(_flush_lock_guard);
-                                let parent_manifest = self.cached_manifest.lock().clone();
-                                let rotated = crate::runtime::flush_coordinator::RotatedFlush {
-                                    seq,
-                                    old_l0_arc: rotate_out.old_l0_arc.clone(),
-                                    wal_lsn: rotate_out.wal_lsn,
-                                    current_version: rotate_out.current_version,
-                                    name: None,
-                                    parent_manifest,
-                                    permit,
-                                    flush_in_progress_guard: rotate_out.flush_in_progress_guard,
-                                };
-                                let writer = self.clone();
-                                let _ticket = coord.submit_for_stream(
-                                    rotated,
-                                    move |old_l0, wal, ver, n| async move {
-                                        let outcome =
-                                            writer.flush_stream_l1(old_l0, wal, ver, n).await?;
-                                        Ok(crate::runtime::flush_coordinator::FlushOutcome {
-                                            new_manifest: outcome.manifest,
-                                            snapshot_id: outcome.snapshot_id,
-                                        })
-                                    },
-                                );
-                                flush_pending = true;
-                                // Early return — flush_lock already dropped.
-                                return Ok((wal_lsn, flush_pending));
-                            }
-                            Err(e) => {
-                                tracing::warn!("Async rotate failed (non-critical): {}", e);
-                                // No seq was allocated and pending was not
-                                // bumped (both moved into the Ok arm for Bug
-                                // #3), so the finalizer is not wedged. The
-                                // permit drops here, freeing the slot.
+                // Async mode: submit only when a pipeline slot is free, else SKIP
+                // (a later commit retries). Never fall back to a blocking inline
+                // flush here — under a stalled flush (issue #132) that inline
+                // flush would hit the same stall with no timeout and hang holding
+                // `flush_lock`, cascading into a full runtime park. A stalled
+                // async flush is instead bounded by `flush_stream_timeout`, which
+                // frees its permit for the retry.
+                if coord.pending_flush_count() < self.config.max_pending_flushes {
+                    match coord.try_acquire_permit() {
+                        Some(permit) => {
+                            match self.flush_l0_rotate().await {
+                                Ok(rotate_out) => {
+                                    // Allocate the rotate seq and bump pending ONLY
+                                    // after the rotate succeeds (Bug #3). A failed
+                                    // rotate must consume neither: the finalizer
+                                    // advances strictly in consecutive seq order and
+                                    // only decrements pending on finalize, so a
+                                    // leaked seq/pending from a failed rotate would
+                                    // wedge the finalizer forever and climb pending
+                                    // toward `max_pending_flushes`. The seq is still
+                                    // allocated under `flush_lock` (immediately after
+                                    // the rotate, before the guard drops below), so
+                                    // concurrent rotates keep seq order == rotation
+                                    // order, and the seq is not used until submit.
+                                    let seq = coord.next_rotate_seq();
+                                    coord.note_pending();
+                                    // Release flush_lock BEFORE the spawn so concurrent
+                                    // commits can proceed while the stream runs.
+                                    drop(_flush_lock_guard);
+                                    let parent_manifest = self.cached_manifest.lock().clone();
+                                    let rotated = crate::runtime::flush_coordinator::RotatedFlush {
+                                        seq,
+                                        old_l0_arc: rotate_out.old_l0_arc.clone(),
+                                        wal_lsn: rotate_out.wal_lsn,
+                                        current_version: rotate_out.current_version,
+                                        name: None,
+                                        parent_manifest,
+                                        permit,
+                                        flush_in_progress_guard: rotate_out.flush_in_progress_guard,
+                                    };
+                                    let writer = self.clone();
+                                    let _ticket = coord.submit_for_stream(
+                                        rotated,
+                                        move |old_l0, wal, ver, n| async move {
+                                            let outcome =
+                                                writer.flush_stream_l1(old_l0, wal, ver, n).await?;
+                                            Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                                                new_manifest: outcome.manifest,
+                                                snapshot_id: outcome.snapshot_id,
+                                            })
+                                        },
+                                    );
+                                    flush_pending = true;
+                                    // Early return — flush_lock already dropped.
+                                    return Ok((wal_lsn, flush_pending));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Async rotate failed (non-critical): {}", e);
+                                    // No seq was allocated and pending was not
+                                    // bumped (both moved into the Ok arm for Bug
+                                    // #3), so the finalizer is not wedged. The
+                                    // permit drops here, freeing the slot.
+                                }
                             }
                         }
+                        None => {
+                            // Race: someone else grabbed the last permit. Skip;
+                            // next commit will retry should_flush().
+                            metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
+                        }
                     }
-                    None => {
-                        // Race: someone else grabbed the last permit. Skip;
-                        // next commit will retry should_flush().
-                        metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
-                    }
+                } else {
+                    // Pipeline full — possibly a stalled flush occupying a slot.
+                    // Skip and retry on a later commit rather than blocking on an
+                    // inline flush that could hit the same stall (issue #132).
+                    metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
                 }
             } else if let Err(e) = self.flush_inline_under_lock(None).await {
                 tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
@@ -1535,8 +1687,24 @@ impl Writer {
             //    validated) value.
             if let Some(props_meta) = schema.properties.get(label) {
                 for (prop_name, meta) in props_meta {
+                    let present = properties.get(prop_name);
+
+                    // Declared vector/multi-vector columns: enforce dimensions here so
+                    // writes that bypass the Cypher coercion guard (python bulk insert,
+                    // auto-embed output) can't smuggle in a wrong-length vector that the
+                    // Arrow converters would otherwise null at flush (issue #137).
+                    if let Some(value) = present
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        return Err(anyhow!(
+                            "vector dimension mismatch: property '{}.{}': {}",
+                            label,
+                            prop_name,
+                            e
+                        ));
+                    }
+
                     if !meta.nullable {
-                        let present = properties.get(prop_name);
                         if partial && present.is_none() {
                             continue;
                         }
@@ -1760,6 +1928,19 @@ impl Writer {
         if let Some(props_meta) = schema.properties.get(label) {
             for (idx, properties) in properties_batch.iter().enumerate() {
                 for (prop_name, meta) in props_meta {
+                    // Enforce declared vector dimensions on the batch path too — the
+                    // python bulk API reaches here without the Cypher guard (issue #137).
+                    if let Some(value) = properties.get(prop_name)
+                        && let Err(e) = meta.r#type.check_vector_dims(value)
+                    {
+                        return Err(anyhow!(
+                            "vector dimension mismatch at index {}: property '{}.{}': {}",
+                            idx,
+                            label,
+                            prop_name,
+                            e
+                        ));
+                    }
                     if !meta.nullable && properties.get(prop_name).is_none_or(|v| v.is_null()) {
                         return Err(anyhow!(
                             "Constraint violation at index {}: Property '{}' cannot be null",
@@ -3594,9 +3775,10 @@ impl Writer {
                 // A source token with the wrong dimension makes `encode_doc` error.
                 // Skipping the row (leaving the FDE column NULL → ranks last under the
                 // mandatory Dot metric; harmless) keeps one malformed document from
-                // wedging *every* flush of this label, matching the normal multi-vector
-                // column path, which null-fills a dimension mismatch rather than failing
-                // the flush (issue #96).
+                // wedging *every* flush of this label (issue #96). Post-#137 the write
+                // paths reject wrong-dimension tokens and WAL replay nulls pre-fix
+                // ones, so this skip is defense-in-depth for values that predate
+                // dimension enforcement.
                 let fde = match encoder.encode_doc(&tokens) {
                     Ok(fde) => fde,
                     Err(e) => {
@@ -3618,6 +3800,72 @@ impl Writer {
                 {
                     touched.insert(spec.derived_col.clone());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates auto-embed dense output width against the declared `VECTOR(dim)` targets.
+    ///
+    /// A schema/model dimension mismatch fails here with a message naming the embedding
+    /// alias, instead of surfacing later as a generic dimension error — or, on the
+    /// deferred path, as a flush failure (issue #137).
+    fn check_dense_embed_dims(
+        schema: &uni_common::core::schema::Schema,
+        label: &str,
+        alias: &str,
+        targets: &[String],
+        actual: usize,
+    ) -> Result<()> {
+        use uni_common::core::schema::DataType;
+        for target in targets {
+            let declared = schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(target))
+                .map(|meta| &meta.r#type);
+            if let Some(DataType::Vector { dimensions }) = declared
+                && actual != *dimensions
+            {
+                return Err(anyhow!(
+                    "auto-embed: model alias '{alias}' produced a {actual}-dimensional \
+                     embedding but '{label}.{target}' is declared VECTOR({dimensions}); \
+                     fix the schema dimensions or the embedding model"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates auto-embed multi-vector output against declared `List(Vector(dim))` targets.
+    ///
+    /// Multi-vector sibling of [`Self::check_dense_embed_dims`]: every emitted token must
+    /// match the declared per-token dimensions.
+    fn check_multi_embed_dims(
+        schema: &uni_common::core::schema::Schema,
+        label: &str,
+        alias: &str,
+        targets: &[String],
+        tokens: &[Vec<f32>],
+    ) -> Result<()> {
+        use uni_common::core::schema::DataType;
+        for target in targets {
+            let declared = schema
+                .properties
+                .get(label)
+                .and_then(|props| props.get(target))
+                .map(|meta| &meta.r#type);
+            if let Some(DataType::List(inner)) = declared
+                && let DataType::Vector { dimensions } = inner.as_ref()
+                && let Some(bad) = tokens.iter().find(|tok| tok.len() != *dimensions)
+            {
+                return Err(anyhow!(
+                    "auto-embed: model alias '{alias}' produced a token with {} dimensions \
+                     but '{label}.{target}' is declared as a multi-vector of \
+                     {dimensions}-dimensional tokens; fix the schema dimensions or the \
+                     embedding model",
+                    bad.len()
+                ));
             }
         }
         Ok(())
@@ -3707,6 +3955,20 @@ impl Writer {
                 want_sparse,
             )
             .await?;
+
+            // Reject a schema/model width mismatch before inserting anything — on the
+            // deferred (flush-time) path this is the only guard between the model output
+            // and the fail-closed column builders (issue #137).
+            if let Some(d) = dense.as_ref() {
+                for vec in d {
+                    Self::check_dense_embed_dims(&schema, label, alias, &group.dense, vec.len())?;
+                }
+            }
+            if let Some(m) = multi.as_ref() {
+                for tokens in m {
+                    Self::check_multi_embed_dims(&schema, label, alias, &group.multi, tokens)?;
+                }
+            }
 
             for (i, &row) in needs.iter().enumerate() {
                 if let Some(vec) = dense.as_ref().and_then(|d| d.get(i)) {
@@ -3806,6 +4068,8 @@ impl Writer {
             .await?;
 
             if let Some(vec) = dense.as_ref().and_then(|d| d.first()) {
+                // Alias-naming guard for the schema/model width mismatch (issue #137).
+                Self::check_dense_embed_dims(&schema, label, alias, &group.dense, vec.len())?;
                 let vals: Vec<Value> = vec.iter().map(|f| Value::Float(*f as f64)).collect();
                 for t in &group.dense {
                     if !properties.contains_key(t) {
@@ -3814,6 +4078,7 @@ impl Writer {
                 }
             }
             if let Some(tokens) = multi.as_ref().and_then(|m| m.first()) {
+                Self::check_multi_embed_dims(&schema, label, alias, &group.multi, tokens)?;
                 let mv = multivec_to_value(tokens);
                 for t in &group.multi {
                     if !properties.contains_key(t) {
@@ -4089,6 +4354,20 @@ impl Writer {
         // window open to drive the unique-constraint-hole regression
         // (Bug #9 Mechanism A).
         fail::fail_point!("flush::after-rotate-before-lance");
+
+        // Test-only (issue #132): model a STALLED flush stream. A lost-wakeup in
+        // the sparse/multivec Lance read-modify-write is an *async* future that
+        // never resolves while the worker stays idle. The `fail` crate's
+        // `sleep`/`pause` actions block the worker thread synchronously — which
+        // both mis-models a lost-wakeup and defeats `tokio::time::timeout` (a
+        // timeout can't cancel a blocking call, and once the inner future
+        // completes `timeout` returns `Ok`). So stall at an async `.await`
+        // instead, letting the flush-stream timeout convert it into a data-safe
+        // failure. Arm with `flush::stream-async-stall = 1*return` (fires once).
+        #[cfg(feature = "failpoints")]
+        if fail::eval("flush::stream-async-stall", |_| ()).is_some() {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
 
         // Phase B: materialize any deferred embeddings before column
         // extraction. No-op when `defer_embeddings` is off (the set will

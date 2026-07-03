@@ -6,14 +6,41 @@
 // ONNX-based embed tests require the 'provider-onnx' feature flag.
 
 use anyhow::Result;
+use serde_json::json;
 use uni_db::Uni;
+use uni_xervo::api::{ModelAliasSpec, ModelTask, WarmupPolicy};
+
+/// Build a [`ModelAliasSpec`] for a Candle text-embedding model.
+///
+/// The inline `CREATE VECTOR INDEX … embedding: { alias, source }` DDL
+/// references a model by catalog alias; the alias must be registered on the
+/// runtime via `Uni::temporary().xervo_catalog(...)`. `model_id` is a Candle
+/// model name such as `all-MiniLM-L6-v2`.
+fn candle_alias(alias: &str, model_id: &str) -> ModelAliasSpec {
+    ModelAliasSpec {
+        alias: alias.to_string(),
+        task: ModelTask::Embed,
+        provider_id: "local/candle".to_string(),
+        model_id: model_id.to_string(),
+        revision: None,
+        warmup: WarmupPolicy::Lazy,
+        required: false,
+        timeout: None,
+        load_timeout: None,
+        retry: None,
+        options: json!({}),
+    }
+}
 
 /// Test that Candle embedding works for vector search.
 /// Candle is the default embedding provider.
 #[tokio::test]
 #[ignore] // Requires model download from HuggingFace Hub
 async fn test_candle_embedding_basic() -> Result<()> {
-    let db = Uni::temporary().build().await?;
+    let db = Uni::temporary()
+        .xervo_catalog(vec![candle_alias("embed/default", "all-MiniLM-L6-v2")])
+        .build()
+        .await?;
 
     // 1. Create label with content property
     // 2. Create vector index with Candle auto-embedding
@@ -27,8 +54,7 @@ async fn test_candle_embedding_basic() -> Result<()> {
         OPTIONS {
             metric: 'cosine',
             embedding: {
-                provider: 'Candle',
-                model: 'all-MiniLM-L6-v2',
+                alias: 'embed/default',
                 source: ['content']
             }
         }
@@ -66,7 +92,10 @@ async fn test_candle_embedding_basic() -> Result<()> {
 #[tokio::test]
 #[ignore] // Requires model download from HuggingFace Hub
 async fn test_candle_multiple_embeddings() -> Result<()> {
-    let db = Uni::temporary().build().await?;
+    let db = Uni::temporary()
+        .xervo_catalog(vec![candle_alias("embed/default", "all-MiniLM-L6-v2")])
+        .build()
+        .await?;
 
     let tx = db.session().tx().await?;
     tx.execute("CREATE LABEL Article (title STRING, body STRING)")
@@ -78,8 +107,7 @@ async fn test_candle_multiple_embeddings() -> Result<()> {
         OPTIONS {
             metric: 'cosine',
             embedding: {
-                provider: 'Candle',
-                model: 'all-MiniLM-L6-v2',
+                alias: 'embed/default',
                 source: ['title', 'body']
             }
         }

@@ -77,7 +77,7 @@ Uni provides hybrid search that combines vector similarity and full-text search 
 
 ```cypher
 CALL uni.search(label, properties, query_text [, query_vector] [, k] [, filter] [, options])
-YIELD vid, score, node [, vector_score] [, fts_score]
+YIELD vid, score, node [, vector_score] [, fts_score] [, sparse_score] [, distance]
 ```
 
 **Parameters:**
@@ -85,9 +85,9 @@ YIELD vid, score, node [, vector_score] [, fts_score]
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `label` | String | Node label to search |
-| `properties` | Map | `{vector: 'prop1', fts: 'prop2'}` |
+| `properties` | Map | `{vector: 'prop', fts: 'prop', sparse: 'prop'}` — a bare string means same prop for vector + fts, sparse off |
 | `query_text` | String | Text for FTS and auto-embedding |
-| `query_vector` | List or null | Pre-computed vector (optional) |
+| `query_vector` | List or null | Pre-computed dense vector (optional) |
 | `k` | Integer | Number of results (default: 10) |
 | `filter` | String | WHERE clause for pre-filtering |
 | `options` | Map | Fusion options |
@@ -97,8 +97,11 @@ YIELD vid, score, node [, vector_score] [, fts_score]
 | Option | Values | Description |
 |--------|--------|-------------|
 | `method` | `'rrf'` (default), `'weighted'` | Fusion algorithm |
-| `alpha` | 0.0 - 1.0 | Vector weight for weighted fusion |
+| `alpha` | 0.0 - 1.0 | Vector weight for **2-way** weighted fusion (default: 0.5) |
+| `weights` | `[vector, fts, sparse]` | Per-arm weights for **3-way** weighted fusion |
+| `rrf_k` | Integer | RRF constant (default: 60) |
 | `over_fetch` | Float | Over-fetch factor (default: 2.0) |
+| `sparse_query` | Map or sparse vector | `{indices, values}` query enabling the sparse arm (see below) |
 | `reranker` | String | `'maxsim'` for in-process late-interaction, or a Xervo alias for a cross-encoder model (see [Reranking](#reranking-cross-encoder-maxsim)) |
 | `reranker_property` | String | Node property: text for a cross-encoder, or the multi-vector property for MaxSim |
 | `reranker_k` | Integer | Candidates for reranking (default: k×3, max: 1000) |
@@ -174,6 +177,39 @@ CALL uni.search(
 YIELD node, score, vector_score, fts_score
 RETURN node.title, score, vector_score, fts_score
 ```
+
+### 3-Way: Dense + FTS + Sparse
+
+`uni.search` can fuse a third arm — **learned-sparse** (SPLADE / BGE-M3 sparse). The sparse arm is **opt-in**: it activates only when you supply **both** a `sparse:` key in the `properties` map **and** an `options.sparse_query`. Supplying just one of the two is a silent no-op.
+
+```cypher
+CALL uni.search(
+    'Document',
+    {vector: 'embedding', fts: 'content', sparse: 'emb'},   -- all three arms
+    'machine learning optimization',
+    null,                                                    -- auto-embed dense
+    10,
+    null,
+    {
+        method: 'weighted',
+        weights: [0.4, 0.2, 0.4],                            -- [vector, fts, sparse]
+        sparse_query: {indices: [42, 9001], values: [1.0, 0.5]}
+    }
+)
+YIELD node, score, vector_score, fts_score, sparse_score
+RETURN node.title, score, vector_score, fts_score, sparse_score
+ORDER BY score DESC
+```
+
+- `properties` map keys are `{vector, fts, sparse}`. A bare string in place of the map uses that one property for vector + FTS, with the sparse arm off.
+- `options.sparse_query` is a `{indices, values}` map (equal-length lists) or a native sparse vector.
+- `weights` is `[vector, fts, sparse]` for 3-way weighted fusion; for RRF (default) omit `weights` and use `method: 'rrf'`.
+- The `sparse_score` YIELD column exposes the per-arm sparse dot-product score (higher = more similar).
+
+!!! warning "Sparse arm needs both pieces"
+    `sparse: 'emb'` in the `properties` map **and** `options.sparse_query` must both be present. Either alone silently disables the sparse arm. ANN-tuning knobs (`nprobes`/`refine_factor`/`ef_search`) are **not** plumbed through `uni.search`.
+
+For the headline end-to-end pattern — one BGE-M3 pass filling a dense, sparse, and multi-vector column, then a 3-way search with MaxSim re-rank — see the [BGE-M3 Hybrid Retrieval guide](../guides/bge-m3-hybrid-retrieval.md) and the [Sparse Vector Search guide](../guides/sparse-vectors.md).
 
 ## Expression Form: `similar_to`
 

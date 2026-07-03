@@ -19,7 +19,7 @@ YIELD node, score, distance, vector_score, rerank_score, vid
 | `k` | Integer | Yes | Number of results |
 | `filter` | String | No | Lance/DataFusion WHERE predicate for **pre-filtering** |
 | `threshold` | Float | No | Minimum similarity score (0-1); results below are excluded |
-| `options` | Map | No | Reranker configuration (see [Section 11](#11-cross-encoder-reranking)) |
+| `options` | Map | No | Reranker configuration (see [Section 12](#12-cross-encoder-reranking)) |
 
 | YIELD Column | Type | Description |
 |---|---|---|
@@ -55,7 +55,75 @@ RETURN node.title, score
 
 ---
 
-## 2. `similar_to()` Expression Function
+## 2. Sparse Vector Search -- `uni.sparse.query`
+
+Sparse vectors (SPLADE / learned-sparse, BM25-style term weights) are stored as a `{indices, values}` pair over a fixed term space. Scoring is **dot product** (higher = more similar), computed exactly and MVCC/L0-aware (sees unflushed writes, exact rescoring).
+
+### Property Type
+
+| Type | Cypher DDL | Description |
+|---|---|---|
+| `DataType::SparseVector { dimensions }` | `sparse_vector(N)` | `dimensions` = term-space cardinality (max term id + 1) |
+
+### Sparse Index DDL
+
+```cypher
+-- Sparse index (8-bit weight quantization by default)
+CREATE VECTOR INDEX idx_sparse FOR (d:Document) ON (d.sparse_embedding)
+OPTIONS { type: 'sparse' }
+
+-- Lossless f32 weights (quantize: false)
+CREATE VECTOR INDEX idx_sparse FOR (d:Document) ON (d.sparse_embedding)
+OPTIONS { type: 'sparse', quantize: false }
+```
+
+`quantize` defaults **TRUE** (8-bit weight quantization); set `false` for lossless f32 weights.
+
+Procedure path:
+```cypher
+CALL uni.schema.createIndex('Document', 'sparse_embedding',
+    {"type": "VECTOR", "algorithm": "SPARSE"})
+```
+
+### Query Procedure
+
+```cypher
+CALL uni.sparse.query(label, property, query, k [, filter] [, threshold] [, options])
+YIELD vid, score, rerank_score
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `label` | String | Yes | Vertex label to search |
+| `property` | String | Yes | Sparse vector property name |
+| `query` | Map or sparse vector | Yes | `{indices, values}` (equal-length lists) or a native sparse vector |
+| `k` | Integer | Yes | Number of results |
+| `filter` | String | No | Pre-filter WHERE predicate |
+| `threshold` | Float | No | Minimum score |
+| `options` | Map | No | Supports `over_fetch` |
+
+| YIELD Column | Type | Description |
+|---|---|---|
+| `vid` | Integer | Vertex ID |
+| `score` | Float | Dot product (higher = more similar) |
+| `rerank_score` | Float | Cross-encoder score (null when reranker not configured) |
+
+> **Note:** the YIELD columns are exactly `vid, score, rerank_score`. There is **no** `sparse_score` and **no** `distance` column on `uni.sparse.query` (`score` *is* the dot product). `sparse_score` only appears on `uni.search` (Section 5).
+
+### Example
+
+```cypher
+-- query is a {indices, values} map over the term space
+CALL uni.sparse.query('Document', 'sparse_embedding',
+    {indices: [3, 17, 482], values: [0.7, 0.4, 0.9]}, 10)
+YIELD vid, score
+RETURN vid, score
+ORDER BY score DESC
+```
+
+---
+
+## 3. `similar_to()` Expression Function
 
 ```cypher
 similar_to(source, query [, options]) -> Float
@@ -169,7 +237,7 @@ The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusio
 
 ---
 
-## 3. Full-Text Search -- `uni.fts.query`
+## 4. Full-Text Search -- `uni.fts.query`
 
 ```cypher
 CALL uni.fts.query(label, property, search_term, k [, filter] [, threshold] [, options])
@@ -184,7 +252,7 @@ YIELD node, score, fts_score, rerank_score, vid
 | `k` | Integer | Yes | Number of results |
 | `filter` | String | No | Pre-filter predicate |
 | `threshold` | Float | No | Minimum score (0-1) |
-| `options` | Map | No | Reranker configuration (see [Section 11](#11-cross-encoder-reranking)) |
+| `options` | Map | No | Reranker configuration (see [Section 12](#12-cross-encoder-reranking)) |
 
 Scores are BM25, normalized to 0-1 relative to top match.
 
@@ -199,35 +267,61 @@ ORDER BY score DESC
 
 ---
 
-## 4. Hybrid Search -- `uni.search`
+## 5. Hybrid Search -- `uni.search`
 
 ```cypher
-CALL uni.search(label, properties, query_text [, query_vector] [, k]
-    [, filter] [, options])
-YIELD node, score, vector_score, fts_score, rerank_score, vid
+CALL uni.search(label, properties, query_text, query_vector, k, filter, options)
+YIELD vid, score, rerank_score, vector_score, fts_score, sparse_score, distance
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `label` | String | Yes | Node label |
-| `properties` | Map | Yes | `{vector: 'prop1', fts: 'prop2'}` |
+| `properties` | Map or String | Yes | `{vector, fts, sparse}` map. A bare string = same prop for vector + fts (sparse off) |
 | `query_text` | String | Yes | Text for FTS and auto-embedding |
 | `query_vector` | List or null | No | Pre-computed vector; null = auto-embed `query_text` |
 | `k` | Integer | No | Number of results (default: 10) |
 | `filter` | String | No | WHERE clause for pre-filtering |
 | `options` | Map | No | Fusion options (see below) |
 
+The `properties` map keys are `{vector, fts, sparse}`.
+
+### 3-Way (dense + FTS + sparse)
+
+The sparse arm is **opt-in** and requires **both** halves — either alone is a silent no-op:
+1. `sparse: 'prop'` in the `properties` map (the sparse vector property), AND
+2. `options.sparse_query` — a `{indices, values}` map or a native sparse vector.
+
 ### Fusion Options
 
 | Option | Values | Default | Description |
 |---|---|---|---|
 | `method` | `'rrf'`, `'weighted'` | `'rrf'` | Fusion algorithm |
-| `alpha` | 0.0 - 1.0 | 0.5 | Vector weight for weighted fusion |
+| `alpha` | 0.0 - 1.0 | 0.5 | Vector/FTS blend weight (**2-way only**) |
+| `weights` | List\<Float\> | — | 3-way weights `[vector, fts, sparse]` (weighted method) |
+| `rrf_k` | Integer | 60 | RRF constant |
 | `over_fetch` | Float | 2.0 | Over-fetch factor; each branch retrieves `k * over_fetch` |
-| `reranker` | String | `null` | Xervo alias for cross-encoder model (see [Section 11](#11-cross-encoder-reranking)) |
+| `sparse_query` | Map or sparse vector | `null` | `{indices, values}`; enables the sparse arm (with `sparse:` key) |
+| `reranker` | String | `null` | Xervo alias for cross-encoder, OR the literal `'maxsim'` for ColBERT MaxSim rerank (see [Section 12](#12-cross-encoder-reranking)) |
 | `reranker_property` | String | FTS property | Node text property for cross-encoder document input |
 | `reranker_k` | Integer | `k * 3` | Over-fetch for reranking (clamped to [k, 1000]) |
 | `reranker_query` | String | `query_text` | Override query text for cross-encoder |
+| `maxsim_query` | List\<Vector\> | — | Multivector query (only when `reranker: 'maxsim'`) |
+| `maxsim_metric` | String | — | MaxSim distance metric (only when `reranker: 'maxsim'`) |
+
+> **Not plumbed through `uni.search`:** ANN-tuning knobs `nprobes` / `refine_factor` / `ef_search` are not exposed here.
+
+### YIELD Columns
+
+| Column | Type | Description |
+|---|---|---|
+| `vid` | Integer | Vertex ID |
+| `score` | Float | Fused score (or reranker score when reranking is active) |
+| `rerank_score` | Float | Cross-encoder / MaxSim score (null when no reranker) |
+| `vector_score` | Float | Dense branch score |
+| `fts_score` | Float | FTS (BM25) branch score |
+| `sparse_score` | Float | Sparse branch score (only populated when the sparse arm is active) |
+| `distance` | Float | Raw dense distance |
 
 ### Fusion Formulas
 
@@ -255,23 +349,37 @@ CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     {method: 'weighted', alpha: 0.7})
 YIELD node, score, vector_score, fts_score
 RETURN node.title, score, vector_score, fts_score
+
+-- 3-way: dense + FTS + sparse (sparse needs BOTH the `sparse:` key
+-- AND options.sparse_query — either alone is a silent no-op)
+CALL uni.search('Document',
+    {vector: 'embedding', fts: 'content', sparse: 'sparse_embedding'},
+    'graph databases', null, 10, null,
+    {method: 'weighted',
+     weights: [0.5, 0.2, 0.3],
+     sparse_query: {indices: [3, 17, 482], values: [0.7, 0.4, 0.9]}})
+YIELD vid, score, vector_score, fts_score, sparse_score
+RETURN vid, score, vector_score, fts_score, sparse_score
+ORDER BY score DESC
 ```
 
-**Prerequisites:** Hybrid search requires both a vector index (with embedding config) and a fulltext index on the respective properties.
+**Prerequisites:** Hybrid search requires both a vector index (with embedding config) and a fulltext index on the respective properties. The 3-way form additionally needs a sparse index on the `sparse:` property.
 
 ---
 
-## 5. Vector Index Configuration
+## 6. Vector Index Configuration
 
 ### Index Type Decision Tree
 
 | Dataset Size | Recommended | Notes |
 |---|---|---|
 | < 10k vectors | **Flat** | Exact brute-force; no tuning needed |
-| 10k - 1M vectors | **HNSW-SQ** (default) | Best recall-latency tradeoff with scalar quantization |
+| 10k - 1M vectors | **HNSW-SQ** (recommended) | Best recall-latency tradeoff with scalar quantization |
 | > 1M vectors, high recall | **HNSW-PQ** | Graph-based with product quantization for memory savings |
 | > 1M vectors, memory-constrained | **IVF-PQ** | Partition-based with product quantization, smallest footprint |
 | > 1M vectors, quality priority | **IVF-SQ** | Partition-based with scalar quantization, better recall than PQ |
+
+> **No-type default = IVF-PQ.** `CREATE VECTOR INDEX ... OPTIONS { metric: 'cosine' }` with no `type` (and the short form `... WITH { metric: 'cosine' }`) produces **IVF-PQ** (256 partitions / 16 sub_vectors / 8 bits), not HNSW-SQ. HNSW-SQ is a *recommended* choice for the 10k–1M band, but it is never the implicit default — request it explicitly with `type: 'hnsw_sq'`.
 
 ### Algorithm Variants
 
@@ -297,7 +405,7 @@ All 8 algorithms available, grouped by architecture:
 | Type | Quantization | Parameters | Best For |
 |---|---|---|---|
 | **HNSW-Flat** | None | `m`, `ef_construction`, `partitions` | Exact graph search, no compression loss |
-| **HNSW-SQ** | Scalar (int8) | `m`, `ef_construction`, `partitions` | Default choice. Best recall-latency tradeoff |
+| **HNSW-SQ** | Scalar (int8) | `m`, `ef_construction`, `partitions` | Recommended for 10k–1M. Best recall-latency tradeoff |
 | **HNSW-PQ** | Product | `m`, `ef_construction`, `sub_vectors`, `partitions` | Large datasets needing graph-speed with memory savings |
 
 ### Parameter Reference
@@ -322,12 +430,12 @@ Score conversion is **metric-aware** and shared across `uni.vector.query`, `uni.
 
 ---
 
-## 6. Creating Vector Indexes
+## 7. Creating Vector Indexes
 
 ### Cypher DDL
 
 ```cypher
--- HNSW-SQ (default, recommended)
+-- HNSW-SQ (recommended for 10k–1M; must be requested explicitly)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'hnsw_sq', metric: 'cosine' }
 
@@ -378,7 +486,11 @@ OPTIONS {
     }
 }
 
--- Short form (defaults to HNSW-SQ)
+-- No type given → IVF-PQ (256 partitions / 16 sub_vectors / 8 bits)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { metric: 'cosine' }
+
+-- Short form also defaults to IVF-PQ
 CREATE VECTOR INDEX idx_embed ON Document (embedding) WITH { metric: 'cosine' }
 ```
 
@@ -425,7 +537,7 @@ db.schema() \
 
 ---
 
-## 7. Full-Text Index Configuration
+## 8. Full-Text Index Configuration
 
 ### BM25 Fulltext Index
 
@@ -454,7 +566,7 @@ MATCH (d:Doc) WHERE d.body CONTAINS 'vector' RETURN d.title
 
 ---
 
-## 8. Auto-Embedding / Xervo
+## 9. Auto-Embedding / Xervo
 
 ### Embedding Config on Vector Index
 
@@ -513,7 +625,7 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 
 ---
 
-## 9. Best Practices
+## 10. Best Practices
 
 ### Metric Matching
 - Use **Cosine** for most text embedding models (they output normalized vectors).
@@ -522,7 +634,7 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 
 ### Index Type Selection
 - **< 10k rows:** Flat (exact). Graph/partition-based indexes need minimum data to be effective.
-- **10k - 1M rows:** HNSW-SQ (default, best recall-latency tradeoff with scalar quantization).
+- **10k - 1M rows:** HNSW-SQ (recommended, best recall-latency tradeoff with scalar quantization). Request explicitly with `type: 'hnsw_sq'` — the no-type default is IVF-PQ.
 - **> 1M rows, quality priority:** HNSW-PQ or IVF-SQ (graph speed or good recall with moderate compression).
 - **> 1M rows, memory-constrained:** IVF-PQ (most aggressive compression, smallest footprint).
 - **Experimental:** IVF-RQ (residual quantization, potentially better accuracy than PQ at same compression).
@@ -548,7 +660,7 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 
 ---
 
-## 10. Examples
+## 11. Examples
 
 ### RAG Pipeline End-to-End
 
@@ -626,7 +738,7 @@ LIMIT 20
 
 ---
 
-## 11. Cross-Encoder Reranking
+## 12. Cross-Encoder Reranking
 
 All three search procedures (`uni.vector.query`, `uni.fts.query`, `uni.search`) support an optional **cross-encoder reranking** stage. A cross-encoder jointly attends to a (query, document) pair to produce a more accurate relevance score than bi-encoder similarity or BM25, but is too expensive to run on the full corpus. By running it on a small over-fetched candidate set, you get fast retrieval with high-precision final ranking.
 

@@ -15,10 +15,11 @@ use crate::error::RhaiError;
 
 /// Convert a wire-level type name to an Arrow `DataType`.
 ///
-/// Accepted names (case-insensitive): `"float"`, `"float64"`, `"double"`
-/// → `Float64`; `"int"`, `"int64"`, `"long"` → `Int64`; `"string"`,
-/// `"utf8"`, `"str"` → `Utf8`; `"bool"`, `"boolean"` → `Boolean`;
-/// `"null"`, `"void"`, `"()"` → `Null`.
+/// Accepted names (case-insensitive): `"float"`, `"float64"`, `"double"`,
+/// `"f64"` → `Float64`; `"float32"`, `"f32"` → `Float32`; `"int"`,
+/// `"int64"`, `"long"`, `"i64"` → `Int64`; `"int32"`, `"i32"` → `Int32`;
+/// `"string"`, `"utf8"`, `"str"` → `Utf8`; `"bool"`, `"boolean"` →
+/// `Boolean`; `"null"`, `"void"`, `"()"` → `Null`.
 pub fn type_name_to_datatype(name: &str) -> Result<DataType, RhaiError> {
     let normalized = name.trim().to_ascii_lowercase();
     Ok(match normalized.as_str() {

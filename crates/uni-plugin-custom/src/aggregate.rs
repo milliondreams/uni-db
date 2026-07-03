@@ -333,8 +333,9 @@ pub fn install_aggregate_into_registry(
         qname: qname.clone(),
         signature,
         function: Arc::new(agg) as Arc<dyn AggregatePluginFn>,
+        manifest: std::sync::OnceLock::new(),
     };
-    let manifest = plugin.manifest_owned();
+    let manifest = plugin.build_manifest();
     let caps = manifest.capabilities.clone();
     let mut r = PluginRegistrar::new(manifest.id, &caps, registry);
     plugin
@@ -355,6 +356,12 @@ struct SyntheticAggregatePlugin {
     qname: QName,
     signature: AggSignature,
     function: Arc<dyn AggregatePluginFn>,
+    /// Lazily-built, then cached, manifest. Mirrors
+    /// [`super::procedures::SyntheticScalarPlugin`]: each synthetic
+    /// plugin has a distinct manifest, so it cannot be a shared static;
+    /// the `OnceLock` gives `manifest()` a stable `&` reference without
+    /// leaking a fresh `Box` on every call.
+    manifest: std::sync::OnceLock<PluginManifest>,
 }
 
 impl std::fmt::Debug for SyntheticAggregatePlugin {
@@ -367,7 +374,7 @@ impl std::fmt::Debug for SyntheticAggregatePlugin {
 }
 
 impl SyntheticAggregatePlugin {
-    fn manifest_owned(&self) -> PluginManifest {
+    fn build_manifest(&self) -> PluginManifest {
         PluginManifest {
             id: self.plugin_id.clone(),
             version: Version::new(0, 0, 1),
@@ -388,10 +395,7 @@ impl SyntheticAggregatePlugin {
 
 impl Plugin for SyntheticAggregatePlugin {
     fn manifest(&self) -> &PluginManifest {
-        // M-UNSAFE: no `unsafe` used — `Box::leak` is the safe API.
-        // Mirrors `SyntheticScalarPlugin::manifest_cell` in lib.rs; the
-        // leak is bounded by declared-plugin count.
-        Box::leak(Box::new(self.manifest_owned()))
+        self.manifest.get_or_init(|| self.build_manifest())
     }
 
     fn register(&self, r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {

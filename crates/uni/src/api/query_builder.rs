@@ -74,8 +74,8 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
-    /// Execute the query and fetch all results into memory.
-    pub async fn fetch_all(self) -> Result<QueryResult> {
+    /// Apply this builder's per-query overrides onto the database's base config.
+    fn effective_config(&self) -> uni_common::UniConfig {
         let mut db_config = self.db.inner.config.clone();
         if let Some(t) = self.timeout {
             db_config.query_timeout = t;
@@ -83,7 +83,12 @@ impl<'a> QueryBuilder<'a> {
         if let Some(m) = self.max_memory {
             db_config.max_query_memory = m;
         }
+        db_config
+    }
 
+    /// Execute the query and fetch all results into memory.
+    pub async fn fetch_all(self) -> Result<QueryResult> {
+        let db_config = self.effective_config();
         self.db
             .inner
             .execute_internal_with_config(&self.cypher, self.params, db_config)
@@ -117,14 +122,7 @@ impl<'a> QueryBuilder<'a> {
     ///
     /// Useful for large result sets to avoid loading everything into memory.
     pub async fn query_cursor(self) -> Result<QueryCursor> {
-        let mut db_config = self.db.inner.config.clone();
-        if let Some(t) = self.timeout {
-            db_config.query_timeout = t;
-        }
-        if let Some(m) = self.max_memory {
-            db_config.max_query_memory = m;
-        }
-
+        let db_config = self.effective_config();
         self.db
             .inner
             .execute_cursor_internal_with_config(&self.cypher, self.params, db_config)

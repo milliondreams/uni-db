@@ -195,15 +195,6 @@ async fn when_evaluating_with_semiring(
     kind: String,
     step: &cucumber::gherkin::Step,
 ) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
     let semiring = match kind.as_str() {
         "AddMultProb" => uni_locy::SemiringKind::AddMultProb,
         "MaxMinProb" => uni_locy::SemiringKind::MaxMinProb,
@@ -218,18 +209,7 @@ async fn when_evaluating_with_semiring(
         other => panic!("unknown semiring kind: {other}"),
     };
 
-    let config = uni_locy::LocyConfig {
-        semiring,
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    run_with_config(world, step, |c| c.semiring = semiring).await;
 }
 
 /// Phase C gate-closure: the neural-predicates feature is GA;
@@ -241,28 +221,12 @@ async fn when_evaluating_with_neural_preview_disabled(
     world: &mut LocyWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
-    let config = uni_locy::LocyConfig {
-        neural_predicates_preview: false,
-        classifier_registry: world.classifier_registry.clone(),
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    let classifier_registry = world.classifier_registry.clone();
+    run_with_config(world, step, |c| {
+        c.neural_predicates_preview = false;
+        c.classifier_registry = classifier_registry;
+    })
+    .await;
 }
 
 #[when("evaluating the following Locy program with neural_predicates_preview:")]
@@ -270,30 +234,14 @@ async fn when_evaluating_with_neural_preview(
     world: &mut LocyWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    let program = step
-        .docstring()
-        .expect("Expected a docstring with the Locy program to evaluate");
-
-    world
-        .init_db()
-        .await
-        .expect("Failed to initialize database");
-
-    let config = uni_locy::LocyConfig {
-        neural_predicates_preview: true,
-        // Pull any classifiers staged by `Given a registered mock
-        // classifier ...` so neural invocations dispatch correctly.
-        classifier_registry: world.classifier_registry.clone(),
-        ..Default::default()
-    };
-    let result = world
-        .db()
-        .session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await;
-    apply_derived_and_store(world, result).await;
+    // Pull any classifiers staged by `Given a registered mock classifier ...`
+    // so neural invocations dispatch correctly.
+    let classifier_registry = world.classifier_registry.clone();
+    run_with_config(world, step, |c| {
+        c.neural_predicates_preview = true;
+        c.classifier_registry = classifier_registry;
+    })
+    .await;
 }
 
 #[when("evaluating the following Locy program with params:")]

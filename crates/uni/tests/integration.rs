@@ -115,3 +115,68 @@ mod triggers;
 // compiles into this binary instead of its own.
 #[path = "common/plugin_trust.rs"]
 mod plugin_trust;
+
+// Folded-in vector / sparse / multivector / auto-embed suites (each was formerly
+// a standalone `tests/*.rs` binary with its own crate link step). Every file is
+// self-contained and wrapped as its own `mod`, so their heavy top-level helper
+// duplication (`const DIM`, `fn build_corpus`, `async fn setup`, module-local
+// `macro_rules!`, …) stays module-scoped and cannot collide.
+//
+// `reranker_integration` is deliberately NOT here: CI rebuilds it with
+// `--no-default-features --features provider-onnx-dynamic`, which is mutually
+// exclusive with the default static `provider-onnx` this binary compiles under.
+#[path = "common/autoembed_multimodel.rs"]
+mod autoembed_multimodel;
+#[path = "common/autoembed_parity.rs"]
+mod autoembed_parity;
+#[path = "common/bge_m3_hybrid_3way.rs"]
+mod bge_m3_hybrid_3way;
+// Gated on the (default-on) static ORT feature; all tests are `#[ignore]` (loads
+// a ~2.1 GB model), so it compiles here but never runs without an explicit model.
+#[cfg(feature = "provider-onnx")]
+#[path = "common/bge_m3_real_onnx.rs"]
+mod bge_m3_real_onnx;
+#[path = "common/dense_index.rs"]
+mod dense_index;
+#[path = "common/embedding_alias_capability.rs"]
+mod embedding_alias_capability;
+#[path = "common/hybrid_autoembed.rs"]
+mod hybrid_autoembed;
+#[path = "common/issue_132_consolidation_hang.rs"]
+mod issue_132_consolidation_hang;
+#[path = "common/issue_134_followups.rs"]
+mod issue_134_followups;
+#[path = "common/issue_134_projection_readamp.rs"]
+mod issue_134_projection_readamp;
+#[path = "common/issue_135_post_flush_traversal_props.rs"]
+mod issue_135_post_flush_traversal_props;
+#[path = "common/map_ddl_type.rs"]
+mod map_ddl_type;
+#[path = "common/multivec_autoembed.rs"]
+mod multivec_autoembed;
+#[path = "common/multivector_index.rs"]
+mod multivector_index;
+#[path = "common/multivector_l0.rs"]
+mod multivector_l0;
+#[path = "common/multivector_maxsim.rs"]
+mod multivector_maxsim;
+#[path = "common/multivector_muvera.rs"]
+mod multivector_muvera;
+#[path = "common/multivector_snapshot.rs"]
+mod multivector_snapshot;
+#[path = "common/recovery_index_no_rebuild.rs"]
+mod recovery_index_no_rebuild;
+#[path = "common/schemaless_multihop_intermediate_props.rs"]
+mod schemaless_multihop_intermediate_props;
+#[path = "common/sparse_autoembed.rs"]
+mod sparse_autoembed;
+#[path = "common/sparse_ddl_type.rs"]
+mod sparse_ddl_type;
+#[path = "common/sparse_index.rs"]
+mod sparse_index;
+#[path = "common/sparse_scoring.rs"]
+mod sparse_scoring;
+#[path = "common/value_fidelity.rs"]
+mod value_fidelity;
+#[path = "common/vector_recall.rs"]
+mod vector_recall;

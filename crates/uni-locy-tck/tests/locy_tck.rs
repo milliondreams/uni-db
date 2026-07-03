@@ -250,13 +250,8 @@ fn collect_expanded_scenarios(
                             header
                                 .iter()
                                 .zip(row.iter())
-                                .find_map(|(h, v)| {
-                                    if h == placeholder {
-                                        Some(v.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
+                                .find(|(h, _)| *h == placeholder)
+                                .map(|(_, v)| v.as_str())
                                 .unwrap_or("")
                         });
 

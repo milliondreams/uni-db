@@ -601,13 +601,7 @@ impl WasmLoader {
         let pool = build_scalar_pool(bytes, &prepared)?;
 
         // Use one warm instance to read the register export.
-        let registration = {
-            let mut leased = crate::pool::PooledInstance::acquire(Arc::clone(&pool))
-                .map_err(|e| WasmError::Instantiate(format!("acquire warm instance: {e}")))?;
-            let r = leased.get_mut().read_register()?;
-            drop(leased);
-            r
-        };
+        let registration = read_registration(&pool)?;
 
         let names = apply_registration(bytes, &prepared, &pool, registration, registrar)?;
 
@@ -658,13 +652,7 @@ impl WasmLoader {
         // Pass 2 — intersect caps, build the scalar pool, read register.
         let prepared = self.prepare_parsed(parsed_manifest, host_grants);
         let scalar_pool = build_scalar_pool(bytes, &prepared)?;
-        let registration = {
-            let mut leased = crate::pool::PooledInstance::acquire(Arc::clone(&scalar_pool))
-                .map_err(|e| WasmError::Instantiate(format!("acquire warm instance: {e}")))?;
-            let r = leased.get_mut().read_register()?;
-            drop(leased);
-            r
-        };
+        let registration = read_registration(&scalar_pool)?;
         let manifest = synthesize_plugin_manifest(&prepared.manifest, &registration)?;
         Ok(Box::new(ComponentPlugin {
             manifest,
@@ -936,6 +924,13 @@ where
     Ok(Arc::new(pool))
 }
 
+/// Parse a wire qname into a [`uni_plugin::QName`], tagging a parse failure
+/// as [`WasmError::InvalidWasm`].
+fn parse_qname(qname: &str) -> Result<uni_plugin::QName, WasmError> {
+    uni_plugin::QName::parse(qname)
+        .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))
+}
+
 /// Qnames registered by [`apply_registration`], grouped by surface.
 struct RegisteredQNames {
     scalars: Vec<String>,
@@ -965,8 +960,7 @@ fn apply_registration(
     for entry in registration.entries {
         match entry {
             RegistrationEntry::Scalar { qname, signature } => {
-                let parsed_qname = uni_plugin::QName::parse(&qname)
-                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let parsed_qname = parse_qname(&qname)?;
                 let sig = wire_fn_sig_to_internal(&signature)?;
                 let adapter = Arc::new(ComponentScalarFn::new(
                     Arc::clone(scalar_pool),
@@ -985,8 +979,7 @@ fn apply_registration(
                 signature,
                 state,
             } => {
-                let parsed_qname = uni_plugin::QName::parse(&qname)
-                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let parsed_qname = parse_qname(&qname)?;
                 let sig = wire_agg_sig_to_internal(&signature, &state)?;
                 let pool_ref = match &agg_pool {
                     Some(p) => Arc::clone(p),
@@ -1014,8 +1007,7 @@ fn apply_registration(
                 yields,
                 mode,
             } => {
-                let parsed_qname = uni_plugin::QName::parse(&qname)
-                    .map_err(|e| WasmError::InvalidWasm(format!("invalid qname `{qname}`: {e}")))?;
+                let parsed_qname = parse_qname(&qname)?;
                 let sig = wire_proc_sig_to_internal(&args, &yields, &mode)?;
                 let pool_ref = match &proc_pool {
                     Some(p) => Arc::clone(p),
@@ -1170,6 +1162,21 @@ impl uni_plugin::Plugin for ComponentPlugin {
         })?;
         Ok(())
     }
+}
+
+/// Lease one warm scalar instance and read its `register` export.
+///
+/// Both [`WasmLoader::load`] and [`WasmLoader::load_as_plugin`] need the
+/// parsed registration before they can build adapters; they share this so the
+/// acquire-read-release dance stays in one place.
+fn read_registration(
+    pool: &Arc<WasmInstancePool<ScalarPluginInstance>>,
+) -> Result<RegistrationManifest, WasmError> {
+    let mut leased = crate::pool::PooledInstance::acquire(Arc::clone(pool))
+        .map_err(|e| WasmError::Instantiate(format!("acquire warm instance: {e}")))?;
+    let registration = leased.get_mut().read_register()?;
+    drop(leased);
+    Ok(registration)
 }
 
 fn build_scalar_pool(

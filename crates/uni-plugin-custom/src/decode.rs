@@ -9,8 +9,6 @@
 //! stringifier, type-name parser, qname splitters, and error mappers.
 //! They live here so there is a single source of truth.
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
 };
@@ -127,16 +125,13 @@ pub(crate) fn array_value_at(arr: &ArrayRef, row: usize) -> Result<Value, FnErro
                 .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int64 downcast"))?;
             Ok(Value::Int(a.value(row)))
         }
-        DataType::Int32 => arr
-            .as_primitive_opt::<Int64Type>()
-            .map(|a| Ok(Value::Int(a.value(row))))
-            .unwrap_or_else(|| {
-                let i32a = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int32Array>()
-                    .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int32 downcast"))?;
-                Ok(Value::Int(i64::from(i32a.value(row))))
-            }),
+        DataType::Int32 => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Int32 downcast"))?;
+            Ok(Value::Int(i64::from(a.value(row))))
+        }
         DataType::Float64 => {
             let a = arr
                 .as_any()
@@ -144,16 +139,13 @@ pub(crate) fn array_value_at(arr: &ArrayRef, row: usize) -> Result<Value, FnErro
                 .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float64 downcast"))?;
             Ok(Value::Float(a.value(row)))
         }
-        DataType::Float32 => arr
-            .as_primitive_opt::<Float64Type>()
-            .map(|a| Ok(Value::Float(a.value(row))))
-            .unwrap_or_else(|| {
-                let f32a = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float32 downcast"))?;
-                Ok(Value::Float(f64::from(f32a.value(row))))
-            }),
+        DataType::Float32 => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| FnError::new(FnError::CODE_TYPE_COERCION, "Float32 downcast"))?;
+            Ok(Value::Float(f64::from(a.value(row))))
+        }
         DataType::Boolean => {
             let a = arr
                 .as_any()

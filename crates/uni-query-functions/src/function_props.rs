@@ -73,6 +73,13 @@ static FUNCTION_SPECS: LazyLock<HashMap<&'static str, FunctionPropertySpec>> =
             ("ID", entity_arg_only),
             ("ELEMENTID", entity_arg_only),
             ("TYPE", entity_arg_only),
+            // Relationship endpoint accessors: need only the edge's
+            // `_src_vid` / `_dst_vid` metadata, never its property bag.
+            // Without these entries the unknown-function fallback marks the
+            // relationship as "*" (full materialization), pulling every
+            // column on the row and defeating projection. See issue #134.
+            ("STARTNODE", entity_arg_only),
+            ("ENDNODE", entity_arg_only),
             // Functions that take entity arg but don't need full entity
             ("COUNT", entity_arg_only),
             // Functions where properties are extracted from PropertyAccess
@@ -144,6 +151,21 @@ mod tests {
                 !spec.unwrap().needs_full_entity,
                 "Aggregate function {} should not need full entity",
                 func
+            );
+        }
+    }
+
+    #[test]
+    fn test_endpoint_accessors_registered() {
+        // startNode/endNode take a relationship arg but need only endpoint
+        // vids, not the property bag — must be entity_arg_only (issue #134).
+        for func in ["startNode", "endNode", "STARTNODE", "ENDNODE"] {
+            let spec =
+                get_function_spec(func).unwrap_or_else(|| panic!("{func} should be registered"));
+            assert_eq!(spec.entity_args, &[0], "{func} entity arg is position 0");
+            assert!(
+                !spec.needs_full_entity,
+                "{func} must not need full entity materialization"
             );
         }
     }

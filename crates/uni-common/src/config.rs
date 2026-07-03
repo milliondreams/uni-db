@@ -248,12 +248,13 @@ impl ServerConfig {
 
     /// Returns a security warning if the config is insecure.
     pub fn security_warning(&self) -> Option<&'static str> {
-        if self.allowed_origins.contains(&"*".to_string()) && self.api_key.is_none() {
+        let allows_all_origins = self.allowed_origins.iter().any(|o| o == "*");
+        if allows_all_origins && self.api_key.is_none() {
             Some(
                 "Server config has permissive CORS (allow all origins) and no API key. \
                  This is insecure for production deployments.",
             )
-        } else if self.allowed_origins.contains(&"*".to_string()) {
+        } else if allows_all_origins {
             Some(
                 "Server config has permissive CORS (allow all origins). \
                  Consider restricting to specific origins for production.",
@@ -547,6 +548,18 @@ pub struct UniConfig {
     /// memory growth. Default: 2.
     pub max_pending_flushes: usize,
 
+    /// Maximum wall-clock time an async L0→L1 stream phase may run before the
+    /// flush coordinator converts it into a data-safe flush *failure* (issue
+    /// #132). A stalled sparse/multi-vector Lance read-modify-write would
+    /// otherwise never submit its rotate-seq, wedging the finalizer's
+    /// consecutive-seq pipeline and — via back-pressure permit saturation —
+    /// parking every later commit forever on `flush_lock`. On timeout the old
+    /// L0 is retained in `pending_flush`, WAL data is NOT truncated, the
+    /// permit is released, and `expected` advances; recovery is via WAL replay
+    /// / a later retry. Only meaningful when `async_flush_enabled` is true.
+    /// Default: 60s. Override with `UNI_FLUSH_STREAM_TIMEOUT` (seconds).
+    pub flush_stream_timeout: Duration,
+
     /// Maximum time `drop_fork` will wait for pending async flushes on
     /// that fork before failing with `PendingFlushTimeout`. Only meaningful
     /// when `async_flush_enabled` is true. Default: 10s.
@@ -628,9 +641,7 @@ pub struct UniConfig {
 
 impl Default for UniConfig {
     fn default() -> Self {
-        let parallelism = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let parallelism = thread::available_parallelism().map_or(4, |n| n.get());
 
         Self {
             cache_size: 1024 * 1024 * 1024, // 1GB
@@ -667,14 +678,20 @@ impl Default for UniConfig {
             // suspected async-flush regressions and for the sync-only
             // benchmarks in `flush_pressure.rs`. Unset = default
             // behavior (true).
-            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH")
-                .ok()
-                .map(|v| {
-                    let v = v.to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "no")
-                })
-                .unwrap_or(true),
+            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH").map_or(true, |v| {
+                let v = v.to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "no")
+            }),
             max_pending_flushes: 2,
+            // Bound a stalled async flush stream so a lost-wakeup in the
+            // sparse/multivec Lance RMW can't permanently wedge the pipeline
+            // (issue #132). 60s ≈ 200× a healthy flush, so it never kills a
+            // legitimately-slow flush, yet recovers a true stall in a minute.
+            flush_stream_timeout: std::env::var("UNI_FLUSH_STREAM_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(60)),
             drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,
             fork_default_ttl: None,

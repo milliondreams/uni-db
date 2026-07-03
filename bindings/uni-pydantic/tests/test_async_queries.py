@@ -3,6 +3,8 @@
 
 """Async query builder tests for uni-pydantic."""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from uni_pydantic import (
@@ -184,3 +186,104 @@ class TestAsyncQueryBuilderImmutability:
         assert q._limit == 10
         assert q._skip == 5
         assert q._distinct is True
+
+
+class ScoredNode(UniNode):
+    """Minimal model for async search-score surfacing tests (no required email)."""
+
+    name: str
+
+
+def _async_search_session(rows: list[dict]) -> MagicMock:
+    """Mock async session returning ``rows``; ``query`` is awaitable (AsyncMock)."""
+    session = MagicMock()
+    result = []
+    for r in rows:
+        m = MagicMock()
+        m.to_dict.return_value = r
+        result.append(m)
+    # Async path awaits _db_session.query(...), unlike the sync builder.
+    session._db_session.query = AsyncMock(return_value=result)
+
+    def _to_model(node_data, model):
+        data = dict(node_data)
+        vid = data.pop("_vid", None)
+        data.pop("_label", None)
+        return model.from_properties(data, vid=vid)
+
+    session._result_to_model.side_effect = _to_model
+    return session
+
+
+class TestAsyncSearchScoreSurfacing:
+    """Async execution: search builders hydrate instances carrying .search_scores.
+
+    Covers the async ``all()`` reroute (``async_query.py``) via a mock session,
+    so no real DB is needed.
+    """
+
+    async def test_async_hybrid_scores(self):
+        rows = [
+            {
+                "_props": {"name": "Alice"},
+                "_vid": 1,
+                "_labels": ["ScoredNode"],
+                "score": 0.9,
+                "vector_score": 0.8,
+                "fts_score": 0.5,
+                "sparse_score": 0.3,
+            }
+        ]
+        results = await (
+            AsyncQueryBuilder(_async_search_session(rows), ScoredNode)
+            .hybrid_search(
+                vector=("embedding", [1.0]),
+                fts=("name", "a"),
+                sparse=("emb", {1: 1.0}),
+            )
+            .all()
+        )
+        assert len(results) == 1
+        s = results[0].search_scores
+        assert s is not None
+        assert s.score == 0.9
+        assert s.vector == 0.8
+        assert s.fts == 0.5
+        assert s.sparse == 0.3
+
+    async def test_async_vector_scores(self):
+        # Regression guard: the old `node AS n` RETURN would yield zero rows.
+        rows = [
+            {
+                "_props": {"name": "Bob"},
+                "_vid": 2,
+                "_labels": ["ScoredNode"],
+                "distance": 0.1,
+                "score": 0.95,
+            }
+        ]
+        results = await (
+            AsyncQueryBuilder(_async_search_session(rows), ScoredNode)
+            .vector_search("embedding", [1.0], k=5)
+            .all()
+        )
+        assert len(results) == 1
+        assert results[0].search_scores.score == 0.95
+        assert results[0].search_scores.distance == 0.1
+
+    async def test_async_sparse_scores(self):
+        rows = [
+            {
+                "_props": {"name": "Cara"},
+                "_vid": 3,
+                "_labels": ["ScoredNode"],
+                "score": 0.7,
+            }
+        ]
+        results = await (
+            AsyncQueryBuilder(_async_search_session(rows), ScoredNode)
+            .sparse_search("emb", {1: 1.0}, k=5)
+            .all()
+        )
+        assert len(results) == 1
+        assert results[0].search_scores.score == 0.7

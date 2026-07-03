@@ -512,15 +512,11 @@ impl TriggerRouter {
     /// materialization in [`MutationEvents::from_l0_with_probe`].
     #[must_use]
     pub fn properties_referenced(&self) -> HashSet<String> {
-        let mut out: HashSet<String> = HashSet::new();
-        for routes in &self.by_phase {
-            for entry in routes {
-                for p in &entry.properties_referenced {
-                    out.insert(p.clone());
-                }
-            }
-        }
-        out
+        self.by_phase
+            .iter()
+            .flatten()
+            .flat_map(|entry| entry.properties_referenced.iter().cloned())
+            .collect()
     }
 
     /// Fire `BeforeMutation` then `BeforeCommit` phases in order.
@@ -976,15 +972,12 @@ impl PreExistingProbe {
                         continue;
                     }
                 };
-                let vid_col = match batch
+                let Some(vid_col) = batch
                     .column_by_name("_vid")
                     .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
-                {
-                    Some(c) => c,
-                    None => {
-                        warn!(label = %label, "L1 probe returned batch without _vid column");
-                        continue;
-                    }
+                else {
+                    warn!(label = %label, "L1 probe returned batch without _vid column");
+                    continue;
                 };
                 // Cache (column_index, column_name) pairs for the
                 // per-row property assembly. Skip storage-internal
@@ -1375,28 +1368,24 @@ impl EventRowColumns {
         if self.kinds.is_empty() {
             return None;
         }
-        let kind_arr: Arc<dyn arrow_array::Array> = Arc::new(UInt8Array::from(self.kinds));
-        let id_arr: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(self.ids));
-        let label_arr: Arc<dyn arrow_array::Array> =
-            Arc::new(arrow_array::StringArray::from(self.labels));
-        let prop_arr: Arc<dyn arrow_array::Array> =
-            Arc::new(arrow_array::StringArray::from(self.properties));
-        let olds_iter: Vec<Option<&[u8]>> = self.olds.iter().map(|o| o.as_deref()).collect();
-        let news_iter: Vec<Option<&[u8]>> = self.news.iter().map(|o| o.as_deref()).collect();
-        let old_arr: Arc<dyn arrow_array::Array> = Arc::new(LargeBinaryArray::from(olds_iter));
-        let new_arr: Arc<dyn arrow_array::Array> = Arc::new(LargeBinaryArray::from(news_iter));
-        let pnew_iter: Vec<Option<&[u8]>> = self.props_new.iter().map(|o| o.as_deref()).collect();
-        let pold_iter: Vec<Option<&[u8]>> = self.props_old.iter().map(|o| o.as_deref()).collect();
-        let pnew_arr: Arc<dyn arrow_array::Array> = Arc::new(LargeBinaryArray::from(pnew_iter));
-        let pold_arr: Arc<dyn arrow_array::Array> = Arc::new(LargeBinaryArray::from(pold_iter));
+        // Build a nullable `LargeBinary` column from a `Vec<Option<Vec<u8>>>`.
+        let large_binary = |col: &[Option<Vec<u8>>]| -> Arc<dyn arrow_array::Array> {
+            let refs: Vec<Option<&[u8]>> = col.iter().map(|o| o.as_deref()).collect();
+            Arc::new(LargeBinaryArray::from(refs))
+        };
 
-        RecordBatch::try_new(
-            event_row_schema(),
-            vec![
-                kind_arr, id_arr, label_arr, prop_arr, old_arr, new_arr, pnew_arr, pold_arr,
-            ],
-        )
-        .ok()
+        let columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+            Arc::new(UInt8Array::from(self.kinds)),
+            Arc::new(Int64Array::from(self.ids)),
+            Arc::new(arrow_array::StringArray::from(self.labels)),
+            Arc::new(arrow_array::StringArray::from(self.properties)),
+            large_binary(&self.olds),
+            large_binary(&self.news),
+            large_binary(&self.props_new),
+            large_binary(&self.props_old),
+        ];
+
+        RecordBatch::try_new(event_row_schema(), columns).ok()
     }
 }
 
@@ -1426,12 +1415,9 @@ fn apply_predicate(predicate: &Arc<dyn PhysicalExpr>, batch: RecordBatch) -> Opt
             }
         },
     };
-    let bool_arr = match array.as_any().downcast_ref::<BooleanArray>() {
-        Some(b) => b,
-        None => {
-            warn!("trigger predicate must yield Boolean; dropping batch");
-            return None;
-        }
+    let Some(bool_arr) = array.as_any().downcast_ref::<BooleanArray>() else {
+        warn!("trigger predicate must yield Boolean; dropping batch");
+        return None;
     };
     filter_record_batch(&batch, bool_arr).ok()
 }

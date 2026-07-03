@@ -26,6 +26,9 @@ Thumbs.db
 # ML/Embedding caches
 .fastembed_cache/
 .uni_cache/
+# BGE_M3_DIR override target for bge_m3_real_onnx.rs (an old default also
+# stranded the hf-hub download here inside the source tree)
+bge-m3-onnx/
 
 # Coverage reports
 tarpaulin-report.html

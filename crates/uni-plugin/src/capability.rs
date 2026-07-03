@@ -277,20 +277,20 @@ fn variant_matches(a: &Capability, b: &Capability) -> bool {
 fn attenuate_to_host(guest: &Capability, host: &CapabilitySet) -> Capability {
     match guest {
         Capability::Network { allow } => Capability::Network {
-            allow: intersect_globs(allow, &host_lists(host, |c| network_allow(c))),
+            allow: intersect_globs(allow, &host_lists(host, network_allow)),
         },
         Capability::Filesystem { read, write } => Capability::Filesystem {
-            read: intersect_globs(read, &host_lists(host, |c| fs_read(c))),
-            write: intersect_globs(write, &host_lists(host, |c| fs_write(c))),
+            read: intersect_globs(read, &host_lists(host, fs_read)),
+            write: intersect_globs(write, &host_lists(host, fs_write)),
         },
         Capability::Kms { key_ids } => Capability::Kms {
-            key_ids: intersect_globs(key_ids, &host_lists(host, |c| kms_ids(c))),
+            key_ids: intersect_globs(key_ids, &host_lists(host, kms_ids)),
         },
         Capability::Secret { ids } => Capability::Secret {
-            ids: intersect_globs(ids, &host_lists(host, |c| secret_ids(c))),
+            ids: intersect_globs(ids, &host_lists(host, secret_ids)),
         },
         Capability::Config { keys } => Capability::Config {
-            keys: intersect_globs(keys, &host_lists(host, |c| config_keys(c))),
+            keys: intersect_globs(keys, &host_lists(host, config_keys)),
         },
         Capability::HostQuery { read_only, scopes } => {
             // `read_only` is restrictive-true: either side may force read-only.
@@ -305,7 +305,7 @@ fn attenuate_to_host(guest: &Capability, host: &CapabilitySet) -> Capability {
                     }
                 )
             });
-            let host_scopes = host_lists(host, |c| host_query_scopes(c));
+            let host_scopes = host_lists(host, host_query_scopes);
             let scopes = if scopes.is_empty() {
                 host_scopes
             } else if host_scopes.is_empty() {

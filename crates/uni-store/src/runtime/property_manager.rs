@@ -381,6 +381,13 @@ impl PropertyManager {
     ) -> Result<HashMap<Vid, Properties>> {
         let schema = self.schema_manager.schema();
         let mut result = HashMap::new();
+        // Tracks vids seen as a per-label deletion tombstone, so the schemaless
+        // main-table fallback below never resurrects a deleted vertex.
+        let mut tombstoned: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+        // `_all_props` is a wildcard sentinel meaning "every property" — used by
+        // schemaless projections that cannot enumerate names. It widens the
+        // per-label column set, overflow merge, and L0 overlay below.
+        let wants_all = properties.contains(&"_all_props");
         if vids.is_empty() {
             return Ok(result);
         }
@@ -409,16 +416,32 @@ impl PropertyManager {
 
         // 2. Fetch from storage - scan relevant label datasets
         for label_name in &labels_to_scan {
-            // Filter to properties that exist in this label's schema
+            // Filter to properties that exist in this label's schema. Under the
+            // `_all_props` wildcard, request every declared column for the label.
             let label_schema_props = schema.properties.get(label_name);
-            let valid_props: Vec<&str> = properties
-                .iter()
-                .cloned()
-                .filter(|p| label_schema_props.is_some_and(|props| props.contains_key(*p)))
-                .collect();
+            let valid_props: Vec<&str> = if wants_all {
+                label_schema_props
+                    .map(|props| props.keys().map(String::as_str).collect())
+                    .unwrap_or_default()
+            } else {
+                properties
+                    .iter()
+                    .cloned()
+                    .filter(|p| label_schema_props.is_some_and(|props| props.contains_key(*p)))
+                    .collect()
+            };
             // Note: don't skip when valid_props is empty; overflow_json may have the properties
 
-            let ds = self.storage.vertex_dataset(label_name)?;
+            // A label resolved from the VidLabelsIndex (or the schema fallback)
+            // may not have a per-label typed dataset — a schemaless label, or a
+            // label whose typed table isn't visible in this (e.g. fork-scoped)
+            // storage schema. Skip it gracefully rather than failing the whole
+            // batch fetch, mirroring the `table_exists` skip just below. Its
+            // properties, if any, come from the L0 overlay / main table instead.
+            let ds = match self.storage.vertex_dataset(label_name) {
+                Ok(ds) => ds,
+                Err(_) => continue,
+            };
             let backend = self.storage.backend();
             let vtable_name = ds.table_name();
 
@@ -482,6 +505,7 @@ impl PropertyManager {
 
                     if del_col.value(row) {
                         result.remove(&vid);
+                        tombstoned.insert(vid);
                         continue;
                     }
 
@@ -493,6 +517,17 @@ impl PropertyManager {
                 }
             }
         }
+
+        // 2b. Schemaless main-table fallback: any requested vid with no per-label
+        // row and no tombstone may store its properties in the main table's
+        // `props_json`. Insert before the L0 overlay below so uncommitted edits
+        // still take precedence.
+        let missing: Vec<Vid> = vids
+            .iter()
+            .copied()
+            .filter(|vid| !result.contains_key(vid) && !tombstoned.contains(vid))
+            .collect();
+        self.main_table_fallback(&missing, &mut result).await?;
 
         // 3. Overlay L0 buffers in age order: pending (oldest to newest) -> current -> transaction
         if let Some(ctx) = ctx {
@@ -528,6 +563,10 @@ impl PropertyManager {
         result: &mut HashMap<Vid, Properties>,
     ) {
         let schema = self.schema_manager.schema();
+        // `_all_props` is a wildcard sentinel: overlay every L0 property, not just
+        // the named ones. Schemaless projections (`RETURN n`) request it because
+        // they cannot enumerate property names up front.
+        let wants_all = properties.contains(&"_all_props");
         for &vid in vids {
             // If deleted in L0, remove from result
             if l0.vertex_tombstones.contains(&vid) {
@@ -551,7 +590,7 @@ impl PropertyManager {
                 let labels = l0.get_vertex_labels(vid);
 
                 for (k, v) in l0_props {
-                    if properties.contains(&k.as_str()) {
+                    if wants_all || properties.contains(&k.as_str()) {
                         // Check if property is CRDT by looking up in any of the vertex's labels
                         let is_crdt = labels
                             .and_then(|label_list| {
@@ -921,11 +960,35 @@ impl PropertyManager {
     /// Queries L0 layers in-memory, then fetches remaining VIDs from LanceDB in
     /// a single `_vid IN (...)` query on the label table. Much faster than
     /// per-vertex `get_all_vertex_props_with_ctx` when many vertices need loading.
+    ///
+    /// Fetches every columnar property. Callers that only need a subset (e.g. a
+    /// vector/search procedure materializing `RETURN node.<prop>`) should prefer
+    /// [`Self::get_batch_vertex_props_for_label_projected`] to avoid decoding
+    /// unread heavy columns such as `List(Vector)` (issue #134).
     pub async fn get_batch_vertex_props_for_label(
         &self,
         vids: &[Vid],
         label: &str,
         ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Vid, Properties>> {
+        self.get_batch_vertex_props_for_label_projected(vids, label, ctx, None)
+            .await
+    }
+
+    /// Like [`Self::get_batch_vertex_props_for_label`], but restricts the LanceDB
+    /// fetch to `requested_props` (plus the id/version/overflow bookkeeping
+    /// columns) when `Some`. Unread columnar properties — notably heavy
+    /// `List(Vector)` columns — are then never decoded (issue #134). `None`
+    /// fetches all columnar properties, identical to the unprojected method.
+    ///
+    /// Requested names that are not declared columnar properties are ignored
+    /// here; they are served from `overflow_json`, which is always fetched.
+    pub async fn get_batch_vertex_props_for_label_projected(
+        &self,
+        vids: &[Vid],
+        label: &str,
+        ctx: Option<&QueryContext>,
+        requested_props: Option<&[String]>,
     ) -> Result<HashMap<Vid, Properties>> {
         let mut result: HashMap<Vid, Properties> = HashMap::new();
         let mut need_storage: Vec<Vid> = Vec::new();
@@ -960,7 +1023,17 @@ impl PropertyManager {
 
         let mut prop_names: Vec<String> = Vec::new();
         if let Some(props) = label_props {
-            prop_names = props.keys().cloned().collect();
+            prop_names = match requested_props {
+                // Prune to the requested columnar props; any requested name that
+                // is not a declared column is served from overflow_json below, so
+                // dropping it here is safe and avoids decoding unread columns.
+                Some(reqs) => reqs
+                    .iter()
+                    .filter(|r| props.contains_key(r.as_str()))
+                    .cloned()
+                    .collect(),
+                None => props.keys().cloned().collect(),
+            };
         }
 
         let mut columns: Vec<String> = vec![
@@ -1072,8 +1145,18 @@ impl PropertyManager {
             }
         }
 
-        // Mark VIDs that had no data anywhere as absent (don't insert them).
-        // VIDs not in `result` simply won't appear in the output.
+        // Phase 2b: schemaless main-table fallback. A `need_storage` vid that
+        // produced no per-label verdict — neither a live row (present in `result`)
+        // nor a tombstone (present in `per_vid_best_version`) — may be a schemaless
+        // vertex whose properties live in the main table's `props_json` rather than
+        // this label's Lance table. Hydrate those here, mirroring the single-VID
+        // `MainVertexDataset::find_props_by_vid` fallback.
+        let missing: Vec<Vid> = need_storage
+            .iter()
+            .copied()
+            .filter(|vid| !result.contains_key(vid) && !per_vid_best_version.contains_key(vid))
+            .collect();
+        self.main_table_fallback(&missing, &mut result).await?;
 
         // Phase 3: Normalize CRDT properties.
         if ctx.is_some() {
@@ -1083,6 +1166,40 @@ impl PropertyManager {
         }
 
         Ok(result)
+    }
+
+    /// Hydrate `missing` vids from the main (schemaless) vertex table into `out`.
+    ///
+    /// Batch counterpart of the single-VID `MainVertexDataset::find_props_by_vid`
+    /// fallback used by `get_vertex_props`: vertices whose properties live in the
+    /// main table's `props_json` (a schemaless label, or a label with no visible
+    /// per-label typed dataset) have no row in any `vertices_<label>` table, so a
+    /// per-label scan returns nothing. Callers pass only vids with no per-label
+    /// verdict — neither a live row nor a tombstone — so a per-label deletion is
+    /// never resurrected by an older main-table row. Existing entries in `out` are
+    /// preserved (`or_insert`); the caller applies any L0 overlay afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the main-table scan or its `props_json` decode fails.
+    async fn main_table_fallback(
+        &self,
+        missing: &[Vid],
+        out: &mut HashMap<Vid, Properties>,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let main_props = MainVertexDataset::find_batch_props_by_vids(
+            self.storage.backend(),
+            missing,
+            self.storage.version_high_water_mark(),
+        )
+        .await?;
+        for (vid, props) in main_props {
+            out.entry(vid).or_insert(props);
+        }
+        Ok(())
     }
 
     /// Batch-fetch properties for multiple edges of a known type.
@@ -1401,10 +1518,12 @@ impl PropertyManager {
             props.insert("overflow_json".to_string(), Value::List(bytes_list));
         }
 
-        // Extract and merge individual overflow properties
+        // Extract and merge individual overflow properties. `_all_props` is a
+        // wildcard sentinel: merge every overflow property, not just named ones.
+        let wants_all = properties.contains(&"_all_props");
         if let Some(overflow_props) = Self::extract_overflow_properties(batch, row)? {
             for (k, v) in overflow_props {
-                if properties.contains(&k.as_str()) {
+                if wants_all || properties.contains(&k.as_str()) {
                     props.entry(k).or_insert(v);
                 }
             }

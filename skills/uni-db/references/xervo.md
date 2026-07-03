@@ -443,6 +443,7 @@ Automatic instrumentation (when metrics enabled):
 | **Max quality (remote)** | `remote/openai` | `text-embedding-3-large` | 3072 | Highest quality OpenAI embeddings |
 | **Privacy-focused (remote)** | `remote/voyageai` | `voyage-large-2` | 1536 | Strong retrieval, data not used for training |
 | **Multilingual (remote)** | `remote/cohere` | `embed-multilingual-v3.0` | 1024 | 100+ languages |
+| **Multi-head hybrid (local)** | `local/onnx` | `aapot/bge-m3-onnx` | 1024 | BGE-M3: dense + learned-sparse + multivector/ColBERT from ONE forward pass. Task `EmbedHybrid` (see §9). |
 
 ### Generation Models
 
@@ -554,6 +555,46 @@ let scored = db.xervo().rerank("rerank/minilm", "query text", &["doc1", "doc2"])
   }
 ]
 ```
+
+### BGE-M3 Multi-Head Hybrid (EmbedHybrid)
+
+A single catalog alias with task `EmbedHybrid` produces **dense + learned-sparse + multivector/ColBERT** from ONE forward pass.
+
+```json
+[
+  {
+    "alias": "embed/bge-m3",
+    "task": "EmbedHybrid",
+    "provider_id": "local/onnx",
+    "model_id": "aapot/bge-m3-onnx"
+  }
+]
+```
+
+**One-alias-many-indexes single-pass pattern:** reference the **same alias** + **same source property** from multiple vector index `embedding: {alias, source}` configs — a dense `Vector` index, a sparse `SparseVector` index, and a multivector `List<Vector>` index. The engine auto-detects these as one hybrid group and runs a single forward pass per document.
+
+**Head routing is inferred from the destination column's `DataType`** — there is **no** `head:` sub-key in the embedding config:
+
+| Destination column DataType | Head used |
+|---|---|
+| `Vector` | dense |
+| `SparseVector` | learned-sparse |
+| `List<Vector>` | multivector / ColBERT |
+
+```cypher
+-- All three indexes share alias 'embed/bge-m3' + source ['content']
+-- → one forward pass, head chosen by each property's column type.
+CREATE VECTOR INDEX doc_dense  FOR (d:Document) ON (d.dense)
+OPTIONS { embedding: { alias: 'embed/bge-m3', source: ['content'] } }
+
+CREATE VECTOR INDEX doc_sparse FOR (d:Document) ON (d.sparse)
+OPTIONS { type: 'sparse', embedding: { alias: 'embed/bge-m3', source: ['content'] } }
+
+CREATE VECTOR INDEX doc_multi  FOR (d:Document) ON (d.colbert)
+OPTIONS { embedding: { alias: 'embed/bge-m3', source: ['content'] } }
+```
+
+The `EmbeddingCfg` fields are `{alias, source_properties, batch_size, document_prefix, query_prefix}`.
 
 ### Azure Enterprise
 

@@ -28,22 +28,25 @@ permissions:
   contents: read
 
 # Runner targeting is indirected through the SAME repository variables as ci.yml
-# so the self-hosted pool can be cut over (and rolled back) for CI and Nightly
-# together, without editing either file. Each falls back to the self-hosted
-# aks-isolated-linux runner label (by core count) when its variable is unset, so
-# this file targets the self-hosted pool by default; set the variables in Settings
-# > Secrets and variables > Actions > Variables only to override:
-#   CI_RUNNER_XLARGE64 (default linux-64core)  — soak, fuzz, model-check,
-#                                                 metamorphic, tsan, bench
-#   CI_RUNNER_XLARGE32 (default linux-32core)  — cloud (LocalStack, matches ci.yml)
-# Set a single unique runner label string to redirect a tier; to roll back, clear
-# the variable. Both fallbacks now match ci.yml exactly (linux-64core /
-# linux-32core), since the CI_RUNNER_* variables are shared across the two files.
+# so the pool can be cut over (and rolled back) for CI and Nightly together,
+# without editing either file. The DEFAULT is GitHub-hosted: each falls back to
+# this workflow's original GitHub-hosted label when its variable is unset, so
+# this file is a behavioral no-op until you opt in. To move a tier onto the
+# self-hosted aks-isolated-linux pool, set the variable to the self-hosted label
+# (shown in parens) in Settings > Secrets and variables > Actions > Variables;
+# to roll back, clear the variable.
+#   CI_RUNNER_XLARGE64  default ubuntu-xlarge  → set to linux-64core  — soak, fuzz,
+#                                                 model-check, metamorphic, tsan, bench
+# Note XLARGE64's GitHub-hosted default is ubuntu-xlarge here vs ci.yml's
+# linux-xlarge-64 (preserving each workflow's pre-existing choice); the self-hosted
+# target you'd set it to (linux-64core) is shared. The cloud job is NOT indirected:
+# it is hardcoded to the GitHub-hosted linux-xlarge-32 (matches ci.yml) so its
+# LocalStack S3 tests always run on GitHub infra even after the self-hosted cutover.
 jobs:
   soak:
     if: github.repository == 'rustic-ai/uni-db'
     name: Soak & Stress (run-ignored)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +100,11 @@ jobs:
   cloud:
     if: github.repository == 'rustic-ai/uni-db'
     name: Cloud Integration (LocalStack)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE32 || 'linux-32core' }}
+    # Pinned to a GitHub-hosted runner (NOT the CI_RUNNER_* indirection): the
+    # LocalStack S3 integration must run on GitHub infra regardless of the
+    # self-hosted cutover, so setting CI_RUNNER_XLARGE32 to a self-hosted label
+    # never moves this job.
+    runs-on: linux-xlarge-32
     timeout-minutes: 60
     services:
       localstack:
@@ -156,7 +163,7 @@ jobs:
   fuzz:
     if: github.repository == 'rustic-ai/uni-db'
     name: Fuzz (parsers & codecs)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -213,7 +220,7 @@ jobs:
   model-check:
     if: github.repository == 'rustic-ai/uni-db'
     name: Concurrency Model Check (loom + shuttle)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -254,7 +261,7 @@ jobs:
   metamorphic:
     if: github.repository == 'rustic-ai/uni-db'
     name: Metamorphic Query Oracles (TLP + NoREC)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -299,7 +306,7 @@ jobs:
   tsan:
     if: github.repository == 'rustic-ai/uni-db'
     name: ThreadSanitizer (SSI commit path)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -369,7 +376,7 @@ jobs:
   bench:
     if: github.repository == 'rustic-ai/uni-db'
     name: Benchmarks (artifact upload)
-    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'linux-64core' }}
+    runs-on: ${{ vars.CI_RUNNER_XLARGE64 || 'ubuntu-xlarge' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

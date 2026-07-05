@@ -344,7 +344,6 @@ async fn issue_145_int_max_min_type_corruption() -> Result<()> {
 /// pushed into the body projection where `total` does not yet exist (FOLD runs
 /// later). Fixing this needs a dedicated post-fold YIELD projection stage, which
 /// is deferred to a follow-up (see the #145 fix plan, Layer 5). SUM=1.8 → 3.6.
-#[ignore = "expr-over-FOLD-output needs a post-fold YIELD projection stage — deferred follow-up (see #145 fix plan Layer 5)"]
 #[tokio::test]
 async fn issue_145_expr_over_fold_output() -> Result<()> {
     let db = events_db().await?;
@@ -358,6 +357,47 @@ async fn issue_145_expr_over_fold_output() -> Result<()> {
     .await;
     println!("expr over fold output -> {row:?}");
     assert_eq!(get(&row, "score"), Some(3.6), "expr over FOLD output wrong");
+    Ok(())
+}
+
+/// Expression over TWO fold outputs, with type coercion (Float64 / Int64).
+/// SUM(importance)=1.8, COUNT(*)=3 → avg_like = 0.6.
+#[tokio::test]
+async fn issue_145_expr_over_two_fold_outputs() -> Result<()> {
+    let db = events_db().await?;
+    let row = first_row(
+        &db,
+        "CREATE RULE r AS MATCH (e:Event) \
+         FOLD s = SUM(e.importance), c = COUNT(*) \
+         YIELD KEY e.action AS action, s / c AS avg_like \
+         QUERY r RETURN action, avg_like",
+    )
+    .await;
+    println!("two-fold expr -> {row:?}");
+    assert_eq!(
+        get(&row, "avg_like"),
+        Some(0.6),
+        "SUM/COUNT over fold outputs wrong"
+    );
+    Ok(())
+}
+
+/// A bare fold output and a computed expression over it coexist in one YIELD.
+/// total=1.8 → raw_total=1.8 (bare, from FoldExec), bumped=2.8 (post-fold expr).
+#[tokio::test]
+async fn issue_145_bare_and_computed_fold_output() -> Result<()> {
+    let db = events_db().await?;
+    let row = first_row(
+        &db,
+        "CREATE RULE r AS MATCH (e:Event) \
+         FOLD total = SUM(e.importance) \
+         YIELD KEY e.action AS action, total AS raw_total, total + 1.0 AS bumped \
+         QUERY r RETURN action, raw_total, bumped",
+    )
+    .await;
+    println!("bare+computed -> {row:?}");
+    assert_eq!(get(&row, "raw_total"), Some(1.8), "bare fold output wrong");
+    assert_eq!(get(&row, "bumped"), Some(2.8), "computed fold expr wrong");
     Ok(())
 }
 

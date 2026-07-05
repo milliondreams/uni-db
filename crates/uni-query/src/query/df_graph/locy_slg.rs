@@ -227,7 +227,7 @@ impl<'a> SLGResolver<'a> {
                 self.stats.queries_executed += 1;
 
                 // Apply YIELD projections to compute non-key columns.
-                let mut projected = apply_yield_projections(rows, clause);
+                let mut projected = apply_yield_projections(rows, clause)?;
 
                 // Multiply __prob_complement_* columns into the PROB column.
                 // This must happen AFTER yield projections because YIELD
@@ -267,7 +267,7 @@ impl<'a> SLGResolver<'a> {
                 let raw_rows = record_batches_to_locy_rows(&raw_batches);
 
                 // Apply YIELD projections to compute non-key columns.
-                let projected = apply_yield_projections(raw_rows, clause);
+                let projected = apply_yield_projections(raw_rows, clause)?;
                 all_answers.extend(projected);
             }
         }
@@ -374,10 +374,13 @@ fn locy_expr_to_cypher(locy: &LocyExpr) -> Option<Expr> {
 /// property accesses (`n.val AS v`), computed expressions (`1.0 - n.val AS sev`),
 /// or literal constants (`0.5 AS lit`).  This function evaluates each clause's
 /// YIELD items against the raw rows to produce the projected columns.
-fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> Vec<FactRow> {
+fn apply_yield_projections(
+    raw_rows: Vec<FactRow>,
+    clause: &CompiledClause,
+) -> Result<Vec<FactRow>, LocyError> {
     let yield_items = match &clause.output {
         RuleOutput::Yield(yc) => &yc.items,
-        _ => return raw_rows,
+        _ => return Ok(raw_rows),
     };
 
     // Projection is required when any YIELD item needs expression evaluation:
@@ -390,7 +393,7 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
         .iter()
         .any(|item| !item.is_key || !matches!(&item.expr, Expr::Variable(_)));
     if !needs_projection {
-        return raw_rows;
+        return Ok(raw_rows);
     }
 
     // De-collided output names, shared with the type checker and planner so the
@@ -399,7 +402,7 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
 
     raw_rows
         .into_iter()
-        .map(|raw_row| {
+        .map(|raw_row| -> Result<FactRow, LocyError> {
             let mut projected = FactRow::new();
             for (item, name) in yield_items.iter().zip(names.iter()) {
                 let name = name.clone();
@@ -418,25 +421,15 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                         // KEY variable might be the graph entity itself
                         projected.insert(name, val.clone());
                     } else {
-                        match eval_expr(&item.expr, &raw_row) {
-                            Ok(val) => {
-                                projected.insert(name, val);
-                            }
-                            Err(_) => {
-                                projected.insert(name, Value::Null);
-                            }
-                        }
+                        // A property-access or expression KEY. Propagate an
+                        // evaluation error rather than silently masking it as
+                        // Null (which previously hid unsupported expressions).
+                        projected.insert(name, eval_expr(&item.expr, &raw_row)?);
                     }
                 } else {
-                    // Non-key columns: evaluate the YIELD expression against the raw row
-                    match eval_expr(&item.expr, &raw_row) {
-                        Ok(val) => {
-                            projected.insert(name, val);
-                        }
-                        Err(_) => {
-                            projected.insert(name, Value::Null);
-                        }
-                    }
+                    // Non-key columns: evaluate the YIELD expression against the
+                    // raw row. Propagate errors (see KEY branch above).
+                    projected.insert(name, eval_expr(&item.expr, &raw_row)?);
                 }
             }
 
@@ -455,18 +448,11 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                 if !projected.contains_key(&along.name)
                     && let Some(cypher_expr) = locy_expr_to_cypher(&along.expr)
                 {
-                    match eval_expr(&cypher_expr, &raw_row) {
-                        Ok(val) => {
-                            projected.insert(along.name.clone(), val);
-                        }
-                        Err(_) => {
-                            projected.insert(along.name.clone(), Value::Null);
-                        }
-                    }
+                    projected.insert(along.name.clone(), eval_expr(&cypher_expr, &raw_row)?);
                 }
             }
 
-            projected
+            Ok(projected)
         })
         .collect()
 }

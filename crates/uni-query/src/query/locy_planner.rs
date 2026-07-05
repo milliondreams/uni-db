@@ -854,6 +854,54 @@ impl<'a> LocyPlanBuilder<'a> {
             })
             .collect();
 
+        // Post-fold YIELD projection specs.
+        //
+        // A YIELD expression that references a FOLD output but is not a bare
+        // fold-output variable (e.g. `total * 2.0 AS score`) cannot be produced
+        // in the pre-fold body — the aggregate does not exist there. Record the
+        // full yield-column projection so it can run POST-fold (`apply_post_fold_
+        // projection`). Only populated when at least one column is such a
+        // computed expression; otherwise the common path is unchanged (FoldExec
+        // output already matches `yield_schema`).
+        let yield_item_exprs: HashMap<String, &Expr> = match first_clause.map(|c| &c.output) {
+            Some(RuleOutput::Yield(yc)) => resolve_yield_column_names(&yc.items)
+                .into_iter()
+                .zip(yc.items.iter())
+                .map(|(name, item)| (name, &item.expr))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        let has_computed_fold_expr = yield_schema.iter().any(|yc| {
+            !yc.is_key
+                && yield_item_exprs.get(&yc.name).is_some_and(|e| {
+                    expr_references_fold_output(e, &fold_output_names)
+                        && !matches!(e, Expr::Variable(v) if fold_output_names.contains(v.as_str()))
+                })
+        });
+        let yield_projection: Vec<(String, Expr)> = if has_computed_fold_expr {
+            yield_schema
+                .iter()
+                .map(|yc| {
+                    // KEY and bare fold-output columns are already present in the
+                    // post-fold batch under their yield name — pass them through.
+                    // Computed expressions over fold outputs are evaluated, with
+                    // fold-var → alias substitution so references match the
+                    // post-fold column names (`FoldBinding.output_name`).
+                    let expr = if yc.is_key {
+                        Expr::Variable(yc.name.clone())
+                    } else {
+                        match yield_item_exprs.get(&yc.name) {
+                            Some(e) => substitute_fold_aliases((*e).clone(), &fold_alias_subs),
+                            None => Expr::Variable(yc.name.clone()),
+                        }
+                    };
+                    (yc.name.clone(), expr)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(LocyRulePlan {
             name: rule.name.clone(),
             clauses,
@@ -862,6 +910,7 @@ impl<'a> LocyPlanBuilder<'a> {
             fold_bindings,
             having,
             best_by_criteria,
+            yield_projection,
         })
     }
 
@@ -1296,10 +1345,13 @@ impl<'a> LocyPlanBuilder<'a> {
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
                 let e = (*orig_expr).clone();
                 let e = substitute_along_vars(e, &rewritten_along);
-                // If the resolved expression is a FOLD output variable (e.g.
-                // `n AS support` where n is from FOLD), skip it — FoldExec
-                // will produce this column after fixpoint iteration.
-                if matches!(&e, Expr::Variable(v) if fold_output_names.contains(v.as_str())) {
+                // A YIELD expression that references a FOLD output must NOT be
+                // projected in the pre-fold body: a bare fold-output variable
+                // (`n AS support`) is produced directly by FoldExec, and a
+                // computed expression over fold outputs (`total * 2.0 AS score`)
+                // is produced by the post-fold projection stage. Either way the
+                // aggregate does not exist here yet.
+                if expr_references_fold_output(&e, &fold_output_names) {
                     continue;
                 }
                 e
@@ -1917,6 +1969,23 @@ fn substitute_fold_aliases(expr: Expr, aliases: &HashMap<String, String>) -> Exp
     map_variables(expr, &|name| {
         aliases.get(name).map(|a| Expr::Variable(a.clone()))
     })
+}
+
+/// Return whether `expr` references any FOLD-output variable.
+///
+/// Reuses the exhaustive [`map_variables`] walk (the single source of truth for
+/// expression traversal) so every variant — including a variable nested inside
+/// `CASE`/`IN`/a list — is inspected. Used to decide that a YIELD expression
+/// must be produced POST-fold rather than in the pre-fold body.
+fn expr_references_fold_output(expr: &Expr, fold_output_names: &HashSet<&str>) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_variables(expr.clone(), &|name| {
+        if fold_output_names.contains(name) {
+            found.set(true);
+        }
+        None
+    });
+    found.get()
 }
 
 /// Map [`LocyBinaryOp`] to Cypher [`BinaryOp`].

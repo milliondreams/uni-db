@@ -82,6 +82,48 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
             }
             Ok(Value::Map(map))
         }
+        Expr::Case {
+            expr: operand,
+            when_then,
+            else_expr,
+        } => {
+            // Searched CASE (no operand): the first WHEN whose condition is
+            // truthy yields its THEN. Simple CASE (with operand): the first WHEN
+            // whose value equals the operand yields its THEN. Otherwise the ELSE
+            // branch, or Null when absent. Equality reuses `eval_binary_op` so
+            // null/type semantics match the rest of the engine.
+            let operand_val = match operand {
+                Some(o) => Some(eval_expr(o, bindings)?),
+                None => None,
+            };
+            for (when, then) in when_then {
+                let when_val = eval_expr(when, bindings)?;
+                let matched = match &operand_val {
+                    Some(o) => eval_binary_op(o, &BinaryOp::Eq, &when_val)?
+                        .as_bool()
+                        .unwrap_or(false),
+                    None => when_val.as_bool().unwrap_or(false),
+                };
+                if matched {
+                    return eval_expr(then, bindings);
+                }
+            }
+            match else_expr {
+                Some(e) => eval_expr(e, bindings),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::In { expr, list } => {
+            let needle = eval_expr(expr, bindings)?;
+            match eval_expr(list, bindings)? {
+                Value::List(items) => Ok(Value::Bool(
+                    items.iter().any(|item| values_equal(&needle, item)),
+                )),
+                other => Err(LocyError::EvaluationError {
+                    message: format!("IN expects a list on the right-hand side, got {other:?}"),
+                }),
+            }
+        }
         _ => Err(LocyError::EvaluationError {
             message: format!("unsupported expression in in-memory evaluation: {expr:?}"),
         }),

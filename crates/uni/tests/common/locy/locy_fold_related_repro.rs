@@ -249,3 +249,56 @@ async fn query_where_on_fold_rule_key_ignored() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// CASE / IN in the in-memory (SLG) evaluator — previously returned Null
+// because `eval_expr` had no arm for these variants and the error was
+// swallowed into Null by the YIELD projection.
+// ---------------------------------------------------------------------------
+
+/// A searched CASE in a YIELD column evaluates to its branch value, not Null.
+/// Nodes: a(w=1.0), b(w=2.0), c(w=3.0). `w > 1.5` → flag 1 for b,c and 0 for a.
+#[tokio::test]
+async fn case_in_yield_evaluates() -> Result<()> {
+    let db = graph().await?;
+    let ones = row_count(
+        &db,
+        "CREATE RULE r AS MATCH (a:N) \
+         YIELD KEY a.name AS name, CASE WHEN a.w > 1.5 THEN 1 ELSE 0 END AS flag \
+         QUERY r WHERE flag = 1 RETURN name, flag",
+    )
+    .await;
+    assert_eq!(
+        ones, 2,
+        "CASE should yield 1 for b and c (was Null before fix)"
+    );
+
+    let zeros = row_count(
+        &db,
+        "CREATE RULE r AS MATCH (a:N) \
+         YIELD KEY a.name AS name, CASE WHEN a.w > 1.5 THEN 1 ELSE 0 END AS flag \
+         QUERY r WHERE flag = 0 RETURN name, flag",
+    )
+    .await;
+    assert_eq!(zeros, 1, "CASE should yield 0 for a");
+    Ok(())
+}
+
+/// An IN predicate in a QUERY WHERE evaluates via the in-memory evaluator.
+/// `wv IN [2.0, 3.0]` keeps b and c.
+#[tokio::test]
+async fn in_predicate_evaluates() -> Result<()> {
+    let db = graph().await?;
+    let n = row_count(
+        &db,
+        "CREATE RULE r AS MATCH (a:N) \
+         YIELD KEY a.name AS name, a.w AS wv \
+         QUERY r WHERE wv IN [2.0, 3.0] RETURN name, wv",
+    )
+    .await;
+    assert_eq!(
+        n, 2,
+        "IN predicate should keep b and c (errored to false before fix)"
+    );
+    Ok(())
+}

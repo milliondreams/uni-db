@@ -1571,6 +1571,7 @@ fn convert_to_fixpoint_plans(
                 deterministic: deterministic_best_by,
                 prob_column_name,
                 non_linear,
+                yield_projection: rule.yield_projection.clone(),
             })
         })
         .collect()

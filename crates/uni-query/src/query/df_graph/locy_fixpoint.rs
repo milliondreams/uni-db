@@ -1170,6 +1170,13 @@ pub struct FixpointRulePlan {
     /// misses the Δ×F_old combinations, silently under-deriving. Covers
     /// both `p :- p, p` and `p :- p, q` (q in the same SCC) shapes.
     pub non_linear: bool,
+    /// Post-fold YIELD projection specs `(output_name, expr, target_type)`.
+    ///
+    /// Non-empty only for rules with a YIELD column that is a computed
+    /// expression over a FOLD output (`total * 2.0 AS score`). When present it
+    /// lists every yield column in schema order and the post-fixpoint chain
+    /// applies it after BEST BY to build the final output. Empty otherwise.
+    pub yield_projection: Vec<(String, Expr)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5006,6 +5013,104 @@ fn apply_having_filter(
     Ok(result)
 }
 
+/// Apply the post-fold YIELD projection to aggregated batches.
+///
+/// Evaluates each `(name, expr, target_type)` spec against the post-fold batch
+/// (KEY columns + FOLD outputs) and assembles the final output batch in yield
+/// order, coerced to the declared column types. Used for YIELD columns that are
+/// computed expressions over FOLD outputs (e.g. `total * 2.0 AS score`), which
+/// cannot be produced in the pre-fold body. Modeled on [`apply_having_filter`].
+fn apply_post_fold_projection(
+    batches: Vec<RecordBatch>,
+    specs: &[(String, Expr)],
+    schema: &SchemaRef,
+    task_ctx: &Arc<TaskContext>,
+) -> DFResult<Vec<RecordBatch>> {
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::logical_expr::execution_props::ExecutionProps;
+    use datafusion::optimizer::AnalyzerRule;
+    use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+    use datafusion::physical_expr::create_physical_expr;
+
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+
+    let df_schema = DFSchema::try_from(schema.as_ref().clone()).map_err(|e| {
+        datafusion::common::DataFusionError::Internal(format!(
+            "post-fold projection schema conversion: {e}"
+        ))
+    })?;
+    let config = (**task_ctx.session_config().options()).clone();
+    let props = ExecutionProps::new();
+
+    // Compile each projection expression to a PhysicalExpr against the post-fold
+    // schema. Type coercion (via a Projection plan) resolves mixed-type
+    // arithmetic such as `total / count` (Float64 / Int64), mirroring HAVING.
+    let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = specs
+        .iter()
+        .map(|(name, expr)| {
+            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
+                datafusion::common::DataFusionError::Internal(format!(
+                    "post-fold projection '{name}' conversion: {e}"
+                ))
+            })?;
+            let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(df_schema.clone()),
+                },
+            );
+            let proj_plan = LogicalPlanBuilder::from(empty)
+                .project(vec![df_expr.clone()])?
+                .build()?;
+            let coerced = match TypeCoercion::new().analyze(proj_plan, &config) {
+                Ok(datafusion::logical_expr::LogicalPlan::Projection(p)) => {
+                    p.expr.into_iter().next().unwrap_or(df_expr)
+                }
+                _ => df_expr,
+            };
+            create_physical_expr(&coerced, &df_schema, &props)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    // Build the output batches using each evaluated column's ACTUAL type — the
+    // declared yield-schema type may be wrong for a fold-output alias (see the
+    // schema-preference note in `apply_post_fixpoint_chain`), so forcing a cast
+    // to it would corrupt the value.
+    let mut result = Vec::new();
+    let mut out_schema: Option<SchemaRef> = None;
+    for batch in batches {
+        let mut columns: Vec<arrow_array::ArrayRef> = Vec::with_capacity(specs.len());
+        for phys_expr in &physical_exprs {
+            let value = phys_expr.evaluate(&batch)?;
+            columns.push(value.into_array(batch.num_rows())?);
+        }
+        let batch_schema = match &out_schema {
+            Some(s) => Arc::clone(s),
+            None => {
+                let fields: Vec<Arc<arrow_schema::Field>> = specs
+                    .iter()
+                    .zip(columns.iter())
+                    .map(|((name, _), arr)| {
+                        Arc::new(arrow_schema::Field::new(
+                            name,
+                            arr.data_type().clone(),
+                            true,
+                        ))
+                    })
+                    .collect();
+                let s: SchemaRef = Arc::new(arrow_schema::Schema::new(fields));
+                out_schema = Some(Arc::clone(&s));
+                s
+            }
+        };
+        result.push(RecordBatch::try_new(batch_schema, columns).map_err(arrow_err)?);
+    }
+    Ok(result)
+}
+
 /// Apply post-fixpoint operators (FOLD, HAVING, BEST BY, PRIORITY) to converged facts.
 #[allow(
     clippy::too_many_arguments,
@@ -5152,6 +5257,20 @@ pub(crate) async fn apply_post_fixpoint_chain(
     } else {
         current
     };
+
+    // Apply the post-fold YIELD projection LAST — so HAVING and BEST BY still
+    // see the raw FOLD outputs, and its output is the final yield-schema shape.
+    // Only present when a YIELD column is a computed expression over a FOLD
+    // output (`total * 2.0 AS score`); the common path skips it entirely.
+    if !rule.yield_projection.is_empty() {
+        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        return apply_post_fold_projection(
+            batches,
+            &rule.yield_projection,
+            &current.schema(),
+            task_ctx,
+        );
+    }
 
     collect_all_partitions(&current, Arc::clone(task_ctx)).await
 }
@@ -5589,6 +5708,7 @@ impl ExecutionPlan for FixpointExec {
                     deterministic: r.deterministic,
                     prob_column_name: r.prob_column_name.clone(),
                     non_linear: r.non_linear,
+                    yield_projection: r.yield_projection.clone(),
                 }
             })
             .collect();

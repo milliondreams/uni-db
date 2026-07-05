@@ -2528,7 +2528,22 @@ pub(crate) fn apply_exact_wmc(
         SemiringOp::Conjunction
     };
     let prob_col_idx = prob_fold.input_col_index;
-    let prob_col_name = rule.yield_schema.field(prob_col_idx).name().clone();
+    // Fail loud rather than panic if the PROB column index is out of range
+    // (the planner keeps it within the yield schema; a miss signals a bug).
+    let prob_col_name = rule
+        .yield_schema
+        .fields()
+        .get(prob_col_idx)
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "PROB aggregate '{}' column index {} out of range ({} yield columns)",
+                prob_fold.name,
+                prob_col_idx,
+                rule.yield_schema.fields().len(),
+            ))
+        })?
+        .name()
+        .clone();
 
     let key_indices = &rule.key_column_indices;
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();

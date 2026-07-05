@@ -450,21 +450,40 @@ impl ExecutionPlan for FoldExec {
                     // COUNTALL has no input column — the aggregate ignores it.
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
-                    // Resolve input column: prefer name-based lookup, fall back to index.
-                    let resolved_idx = binding
-                        .input_col_name
-                        .as_ref()
-                        .and_then(|name| batch.schema().index_of(name).ok())
-                        .unwrap_or(binding.input_col_index);
-                    if resolved_idx < batch.num_columns() {
-                        Arc::clone(batch.column(resolved_idx))
-                    } else {
-                        // Column not found — use zeros as fallback
-                        Arc::new(arrow_array::Float64Array::from(vec![
-                            0.0f64;
-                            batch.num_rows()
-                        ]))
-                    }
+                    // Resolve the aggregate input column. When the binding carries
+                    // a column name (the FOLD variable), the planner always projects
+                    // it into the body batch (`build_clause`'s FOLD-input pass), so a
+                    // name miss signals a real resolution bug — fail loud rather than
+                    // fabricating a zeros column that would silently corrupt the
+                    // aggregate (issue #145). `None` (test constructors / schema
+                    // reconciliation) falls back to the positional index.
+                    let resolved_idx = match &binding.input_col_name {
+                        Some(name) => batch.schema().index_of(name).map_err(|_| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "FOLD aggregate '{}' input column '{}' not found in \
+                                 body batch (columns: {:?})",
+                                binding.name,
+                                name,
+                                batch
+                                    .schema()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.name().clone())
+                                    .collect::<Vec<_>>(),
+                            ))
+                        })?,
+                        None => binding.input_col_index,
+                    };
+                    let column = batch.columns().get(resolved_idx).ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "FOLD aggregate '{}' input column index {} out of range \
+                             ({} columns)",
+                            binding.name,
+                            resolved_idx,
+                            batch.num_columns(),
+                        ))
+                    })?;
+                    Arc::clone(column)
                 };
                 let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. }) {
                     Some(TopKFoldCtx {

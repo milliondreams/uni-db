@@ -62,7 +62,11 @@ pub async fn evaluate_query(
     let is_fold_rule = rule.clauses.iter().any(|c| !c.fold.is_empty());
     if is_fold_rule && derived_store.contains_key(&rule_name) {
         let rows = derived_store[&rule_name].rows.clone();
-        return apply_return_clause(rows, &query.return_clause, &config.params);
+        // Apply the QUERY WHERE filter here too — the FOLD path does not fall
+        // through to the shared filter below, so omitting this silently ignored
+        // the predicate for FOLD rules (returning rows that fail it).
+        let filtered = filter_where(rows, query.where_expr.as_ref(), &config.params);
+        return apply_return_clause(filtered, &query.return_clause, &config.params);
     }
 
     // Use a fresh store rather than the pre-computed orch_store.
@@ -89,20 +93,7 @@ pub async fn evaluate_query(
     stats.mutations_executed += resolver.stats.mutations_executed;
 
     // Apply WHERE filter (SLG may return superset if goal bindings are partial).
-    // Params are injected into each row so $name references resolve correctly.
-    let filtered: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
-        results
-            .into_iter()
-            .filter(|row| {
-                let merged = merge_params(row, &config.params);
-                eval_expr(where_expr, &merged)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect()
-    } else {
-        results
-    };
+    let filtered = filter_where(results, query.where_expr.as_ref(), &config.params);
 
     // Apply RETURN clause if present
     apply_return_clause(filtered, &query.return_clause, &config.params)
@@ -194,6 +185,30 @@ pub(super) fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> Fa
     let mut merged: FactRow = params.clone();
     merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
+}
+
+/// Apply a QUERY `WHERE` predicate to result rows.
+///
+/// Params are injected per row so `$name` references resolve. A row is kept only
+/// when the predicate evaluates to a truthy value; an evaluation error or a
+/// non-boolean result drops the row. Used uniformly by both the FOLD-rule and
+/// non-FOLD result paths so the filter is never bypassed.
+pub(super) fn filter_where(
+    rows: Vec<FactRow>,
+    where_expr: Option<&Expr>,
+    params: &HashMap<String, Value>,
+) -> Vec<FactRow> {
+    let Some(expr) = where_expr else {
+        return rows;
+    };
+    rows.into_iter()
+        .filter(|row| {
+            let merged = merge_params(row, params);
+            eval_expr(expr, &merged)
+                .map(|v| v.as_bool().unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 /// Derive a column name from a RETURN expression when no alias is given.

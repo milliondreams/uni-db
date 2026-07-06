@@ -1567,6 +1567,13 @@ impl L0Buffer {
                     self.remove_vid_from_label_index(vid);
                     self.vertex_labels.insert(vid, labels.clone());
                     self.index_labels_for_vid(vid, &labels);
+                    // Mark this vid as a label overwrite, exactly like the live
+                    // `set_vertex_labels` path. Without this marker the M8
+                    // flush/merge overwrite pass skips the vid (a label-only
+                    // mutation leaves no `vertex_properties` entry), so a
+                    // WAL-durable SET/REMOVE label on a prior-window vertex
+                    // would be silently lost at the first post-recovery flush.
+                    self.vertex_label_overwrites.insert(vid);
                     self.mutation_count += 1;
                 }
                 Mutation::InsertEdge {

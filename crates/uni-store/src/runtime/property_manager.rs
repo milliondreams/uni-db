@@ -384,6 +384,11 @@ impl PropertyManager {
         // Tracks vids seen as a per-label deletion tombstone, so the schemaless
         // main-table fallback below never resurrects a deleted vertex.
         let mut tombstoned: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+        // MVCC: highest `_version` seen per vid across the storage scan. Rows are
+        // NOT guaranteed in version order, so we must rank — a stale older row
+        // arriving after a newer one must not overwrite it (finding [7], the
+        // batch analogue of the single-vid version-max fix).
+        let mut best_version: HashMap<Vid, u64> = HashMap::new();
         // `_all_props` is a wildcard sentinel meaning "every property" — used by
         // schemaless projections that cannot enumerate names. It widens the
         // per-label column set, overflow merge, and L0 overlay below.
@@ -499,9 +504,21 @@ impl PropertyManager {
                     Some(c) => c,
                     None => continue,
                 };
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
                 for row in 0..batch.num_rows() {
                     let vid = Vid::from(vid_col.value(row));
+                    let version = ver_col
+                        .map(|c| if c.is_null(row) { 0 } else { c.value(row) })
+                        .unwrap_or(0);
+
+                    // Skip rows older than the newest already applied for this vid.
+                    if best_version.get(&vid).is_some_and(|bv| version < *bv) {
+                        continue;
+                    }
+                    best_version.insert(vid, version);
 
                     if del_col.value(row) {
                         result.remove(&vid);
@@ -509,6 +526,8 @@ impl PropertyManager {
                         continue;
                     }
 
+                    // A newer live row un-tombstones the vid.
+                    tombstoned.remove(&vid);
                     let label_props = schema.properties.get(label_name);
                     let mut props =
                         Self::extract_row_properties(&batch, row, &valid_props, label_props)?;
@@ -643,6 +662,11 @@ impl PropertyManager {
         if eids.is_empty() {
             return Ok(result);
         }
+        // MVCC: highest `_version` seen per eid across the delta scan. Rows are
+        // not version-ordered, so a stale older row must not overwrite a newer
+        // one (finding [3]); without this, an out-of-order DELETE/live pair
+        // resurrected a deleted edge's props depending on scan order.
+        let mut best_version: HashMap<uni_common::core::id::Eid, u64> = HashMap::new();
 
         // In the new storage model, EIDs are pure auto-increment and don't embed type info.
         // We need to scan all edge type datasets to find the edges.
@@ -741,9 +765,21 @@ impl PropertyManager {
                     Some(c) => c,
                     None => continue,
                 };
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
                 for row in 0..batch.num_rows() {
                     let eid = uni_common::core::id::Eid::from(eid_col.value(row));
+                    let version = ver_col
+                        .map(|c| if c.is_null(row) { 0 } else { c.value(row) })
+                        .unwrap_or(0);
+
+                    // Skip rows older than the newest already applied for this eid.
+                    if best_version.get(&eid).is_some_and(|bv| version < *bv) {
+                        continue;
+                    }
+                    best_version.insert(eid, version);
 
                     // op=1 is Delete
                     if op_col.value(row) == 1 {

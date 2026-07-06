@@ -29,3 +29,8 @@ pub mod repro_17_merge_l0_vector_tombstone_resurrect;
 pub mod repro_17_overlay_tombstone_ungated;
 pub mod repro_18_merge_l0_fts_tombstone_resurrect;
 pub mod test_repro_compaction_empty_resurrect;
+
+// Correctness-scan Wave 1 repros (R4 MVCC batch version-ranking).
+pub mod repro_03_batch_edge_props_version_ignored;
+pub mod repro_07_batch_vertex_props_version_ignored;
+pub mod repro_18_main_vertex_batch_resurrect;

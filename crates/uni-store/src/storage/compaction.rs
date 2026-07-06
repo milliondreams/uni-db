@@ -127,6 +127,13 @@ impl Compactor {
             "Starting vertex compaction"
         );
 
+        // Serialize the whole read → merge → OVERWRITE against concurrent flushes.
+        // The flush path takes the same per-table lock in
+        // `merge_insert_batch_with_lance_conflict_retry`; without it, an unguarded
+        // `AddDataMode::Overwrite` below would silently discard rows a flush
+        // appended in the window between this scan and the overwrite commit.
+        let _write_guard = backend.lock_table_for_write(&table_name).await;
+
         use crate::backend::types::ScanRequest;
         let batches: Vec<RecordBatch> = backend.scan(ScanRequest::all(&table_name)).await?;
 

@@ -182,6 +182,11 @@ pub async fn merge_insert_batch_with_lance_conflict_retry(
     batch: arrow_array::RecordBatch,
     on: &[&str],
 ) -> anyhow::Result<()> {
+    // NOTE: `backend.merge_insert` already takes the per-table write lock
+    // internally (the same mutex `lock_table_for_write` exposes), so it is
+    // serialized against a compaction that holds that lock across its whole
+    // scan → overwrite. Do NOT take `lock_table_for_write` here as well — that
+    // would re-lock the same non-reentrant mutex and self-deadlock.
     retry_on_lance_conflict(|| async {
         let exists = backend.table_exists(table_name).await?;
         if !exists {

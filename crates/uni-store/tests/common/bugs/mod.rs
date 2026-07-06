@@ -41,3 +41,8 @@ pub mod repro_03_batch_constraints_skip_pending;
 
 // Correctness-scan Wave 1 repros (R17 arrow null-on-missing builders).
 pub mod repro_05_06_temporal_missing_not_null;
+
+// Correctness-scan Wave 2 repros (L7 compaction / durability races).
+pub mod repro_04_adjacency_incoming_shadow;
+pub mod repro_10_id_allocator_persist_fail;
+pub mod repro_16_compact_vertices_concurrent_flush;

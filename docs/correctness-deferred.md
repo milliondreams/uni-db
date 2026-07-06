@@ -1,16 +1,22 @@
-# Correctness Scan — Deferred Wave 0 Findings
+# Correctness Scan — Deferred Findings
 
 **Date:** 2026-07-06
-**Context:** Wave 0 of `docs/correctness_scan_2026-07-05.md` (see the triage in
-`docs/correctness_scan_triage_2026-07-05.md`). 18 of 22 Wave-0 findings were fixed and
-committed to `main` (16 commits, `6ec2c9963..b659ca0fa`, FF-merged, **not pushed**). This
-doc captures the deferred findings with enough analysis to resume without re-investigating.
+**Context:** deferrals from `docs/correctness_scan_2026-07-05.md` (see the triage in
+`docs/correctness_scan_triage_2026-07-05.md`). This doc captures the findings that were
+consciously *not* fixed in each remediation wave, with enough analysis to resume without
+re-investigating.
 
-**Update (2026-07-06):** the two data-correctness deferrals — **D2** (`uni[6]`) and **D4**
-(`uni-query[29]`) — have since been fixed on branch `fix/correctness-deferred-d2-d4` (D4
-`c393dfb87`, D2 `c9e80cff2`). **2 findings remain deferred: D1 (`uni[2]`, perf) and D3
-(`uni-fork[3]`, blocked on a UidIndex design decision).** The D2/D4 sections below are kept
-for the record and marked **DONE**.
+**Wave 0** (P0 stop-the-bleeding): 18 of 22 findings fixed and committed to `main`
+(16 commits, `6ec2c9963..b659ca0fa`, FF-merged, **not pushed**). Deferrals **D1–D4** below.
+**Update (2026-07-06):** **D2** (`uni[6]`) and **D4** (`uni-query[29]`) since fixed on branch
+`fix/correctness-deferred-d2-d4` (D4 `c393dfb87`, D2 `c9e80cff2`). **Still deferred: D1
+(`uni[2]`, perf) and D3 (`uni-fork[3]`, UidIndex design decision).**
+
+**Wave 1** (shared-helper clusters R7/R6/R4/R5/R10/R16/R17/R11): all 8 regions fixed on
+branch `fix/correctness-scan-wave1` (17 commits, base `88f0c52cd`, **not pushed**; see memory
+`correctness_scan_wave1_fixed_2026_07_06`). Two sub-findings deferred as design changes rather
+than mechanical fixes: **D5** (`uni-query-functions[2]`, sort-key int precision) and **D6**
+(part of R5, bulk UNIQUE vs. the main Writer's unflushed L0). Sections below.
 
 Each entry gives: the exact code locations, the root cause, what was tried (if anything),
 **why it was deferred**, the **concrete fix plan**, the **existing repro** to flip/un-ignore,
@@ -295,6 +301,125 @@ tests.
 
 ---
 
+# Wave 1 deferrals
+
+## D5 — `uni-query-functions[2]` ORDER BY sort-key collapses large i64 (precision)
+
+**Severity:** wrong ORDER BY / sort results — two distinct i64 values above 2^53 produce a
+**byte-identical** sort key, so they collapse to an arbitrary relative order (and can tie
+where they must not). Localized to the DataFusion sort-key encoder; no data loss.
+
+### Locations
+- `crates/uni-query-functions/src/df_udfs.rs:2964-2965` — `encode_sort_key_to_buf`, the
+  `Value::Int(i)` arm: `let f = *i as f64; buf.extend_from_slice(&encode_order_preserving_f64(f))`.
+  The `*i as f64` cast rounds any `|i| > 2^53` before encoding.
+- `crates/uni-query-functions/src/df_udfs.rs:2967-2968` — the `Value::Float(f)` arm encodes
+  via the **same** `encode_order_preserving_f64(*f)`.
+- `crates/uni-query-functions/src/df_udfs.rs:3007` — `sort_key_type_rank`: **both** `Int` and
+  (non-NaN) `Float` return rank byte **`0x08`** — they share one key space and must interleave.
+- `crates/uni-query-functions/src/df_udfs.rs:3231` — `encode_order_preserving_f64` (the f64
+  order-preserving byte codec, the only numeric encoder today).
+- Public entry: `encode_cypher_sort_key` (`:2908`); used wherever the CypherValue ORDER BY key
+  is materialized.
+
+### Root cause
+`Int` and `Float` share sort-rank `0x08`, so within that rank a key must order numerically
+across both types (Cypher `ORDER BY` interleaves `1` and `1.5`). The only encoder is
+`encode_order_preserving_f64`, so the `Int` arm is forced through `f64` — and `2^53` vs
+`2^53 + 1` both round to `2^53`, yielding identical bytes.
+
+### Why deferred (NOT a mechanical swap)
+The obvious "encode `Int` as an order-preserving i64 layout" **breaks cross-type ordering**:
+an `Int` key and a `Float` key would then compare by raw bytes in the same rank space, not by
+numeric value, so `Int(2)` could sort before `Float(1.5)`. Because the two types must
+interleave under one rank byte, a correct fix needs a **unified order-preserving numeric
+encoding** that is (a) exact for the full i64 range and (b) correctly ordered against f64 —
+a redesign of the rank-`0x08` key codec, with broad ORDER BY regression surface. That is a
+design change, not a checked-arithmetic sweep, so it was carved out of R10.
+
+### Fix plan
+Design a single order-preserving encoding for all rank-`0x08` numerics with ≥64 mantissa bits
+so i64 is exact while still ordering against f64. Candidate approaches:
+1. **Normalized big-decimal / sign-exponent-mantissa key.** Encode every number as
+   `sign · exponent · mantissa` with a 64-bit mantissa (holds any i64 exactly) in an
+   order-preserving byte layout; both `Int` and `Float` route through it. Most robust; most work.
+2. **f64 bucket + exact tie-break.** Keep `encode_order_preserving_f64` as the primary key, and
+   for an `Int` not exactly representable as f64 append a suffix that orders the exact integer
+   *within* its f64 bucket. Subtle: the suffix must also order correctly against neighbouring
+   floats that fall in the same bucket — needs careful proof.
+Do NOT give `Int`/`Float` distinct rank bytes (that would stop them interleaving — wrong for
+`ORDER BY` over mixed numeric columns).
+
+### Repro (flip)
+`crates/uni-query-functions/tests/repro_df_udfs_sync.rs:168` →
+`repro_finding_13_sort_key_int_collapse` currently pins the bug: `k_lo == k_hi` for
+`Int(2^53)` vs `Int(2^53 + 1)`. **After fix:** assert `k_lo != k_hi` **and** `k_lo < k_hi`
+(ordering, not just distinctness), plus a mixed Int/Float ordering case
+(e.g. `Int(2^53) < Float(2^53 + 0.5) < Int(2^53 + 1)` via key comparison).
+
+### Verify
+`RUSTC_WRAPPER="" cargo nextest run -p uni-query-functions -E 'test(repro_finding_13_sort_key_int_collapse)'`
+then full `-p uni-query-functions`, plus an end-to-end `-p uni-db` ORDER BY test over a column
+mixing large integers and floats.
+
+---
+
+## D6 — R5 bulk UNIQUE misses the main Writer's unflushed L0 (cross-channel)
+
+**Severity:** silent duplicate — a bulk load can twin a UNIQUE key that already exists on the
+**main write channel but is not yet flushed to Lance**. The common case (loading onto existing
+*flushed* data) IS now covered by the R5 storage probe; this is the residual cross-channel
+window.
+
+### Locations
+- `crates/uni-bulk/src/bulk.rs:501` `validate_vertex_batch_constraints` → the UNIQUE branch
+  calls `crates/uni-bulk/src/bulk.rs:689` `unique_key_exists_in_storage`, which probes only
+  committed Lance rows via `self.backend.storage.backend().count_rows(...)` (the R5 fix).
+- `crates/uni-store/src/storage/manager.rs` — `StorageManager` holds **no** `L0Manager`; the L0
+  buffers and the O(1) `constraint_index` live on the `Writer`, which the `BulkWriter` does not
+  hold. So the bulk path structurally cannot see the main channel's unflushed L0.
+- Contrast (full-horizon reference): `crates/uni-store/src/runtime/writer.rs:2437`
+  `check_unique_constraint_multi` consults current L0 + `get_pending_flush()` + tx L0 + storage;
+  `check_extid_globally_unique` (`writer.rs:2201`) likewise.
+
+### Root cause
+The bulk loader is a **separate write channel** that shares the `StorageManager` (Lance) but
+not the `Writer`'s L0 / constraint index. R5 closed the storage-visibility half (probe Lance),
+but a key committed via the regular path (`tx.commit()` merges into main L0) and not yet
+auto-flushed is invisible to the bulk validation — so a concurrent/interleaved bulk load twins
+it. The single-vertex path sees it because it runs *on the Writer* and checks L0.
+
+### Why deferred
+The triage's ideal — "one constraint-lookup surface consulting the full horizon; batch and
+bulk paths call it" — is a cross-boundary refactor. Either the `BulkWriter` must gain a handle
+to the `Writer`'s `L0Manager`/constraint index (widening the bulk↔writer boundary), or bulk
+UNIQUE checks must route through `Writer::check_unique_constraint_multi`. Both touch the
+constraint-check surface the whole engine relies on and are riskier than the localized storage
+probe shipped in R5.
+
+### Fix plan
+1. **Preferred:** expose a full-horizon constraint lookup as a shared service (consulting
+   current L0 + pending_flush + tx L0 + storage) that both `Writer::check_unique_constraint_multi`
+   and the bulk validation call. Give the `BulkWriter` the `Writer` handle (or its `L0Manager`)
+   so `unique_key_exists_in_storage` becomes `unique_key_exists_full_horizon`.
+2. **Narrower:** have the bulk load force-flush the main L0 to Lance before validation, so the
+   existing storage probe sees everything. Simpler but pessimistic (forces a flush per load).
+
+### Repro
+`crates/uni/tests/common/bugs/bug_bulk_unique_preexisting_repro.rs` →
+`bulk_unique_ignores_preexisting_committed_row` currently **flushes** the committed row
+(`db.flush().await?`) before the bulk insert, so the storage probe catches it (R5 regression,
+green). For D6, add a sibling that **omits the flush** (leaving the committed row in the main
+L0) and asserts the bulk UNIQUE check still rejects the duplicate — that variant fails today
+and should be `#[ignore]`d until the full-horizon surface lands. The file's doc comment already
+notes the cross-channel limitation.
+
+### Verify
+After the fix: the no-flush variant rejects the duplicate; `RUSTC_WRAPPER="" cargo nextest run
+-p uni-db -E 'test(~bulk)'` stays green (35 bulk tests).
+
+---
+
 ## Quick resume checklist
 - [x] **D4** (`uni-query[29]`) — DONE `c393dfb87` (label-column replace + candidate-set
       overwrite filter; repro un-ignored).
@@ -303,7 +428,12 @@ tests.
 - [ ] **D3** (`uni-fork[3]`) — decide `UidIndex`-on-update semantics first; canary test =
       `promote_default_is_insert_only_twin`.
 - [ ] **D1** (`uni[2]`) — perf-only; do last unless a fork-index plan-quality issue surfaces.
+- [ ] **D5** (`uni-query-functions[2]`) — Wave 1; needs a unified order-preserving numeric
+      sort-key codec (design change); repro `repro_finding_13_sort_key_int_collapse`.
+- [ ] **D6** (R5 bulk cross-channel) — Wave 1; needs a shared full-horizon constraint surface;
+      repro = a no-flush variant of `bulk_unique_ignores_preexisting_committed_row`.
 
-D3/D1 remain, each with an in-tree repro pinning current behavior. Branch
-`fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`
-(D4 + D2) is not yet merged. Nothing pushed.
+D3/D1 (Wave 0) and D5/D6 (Wave 1) remain, each with an in-tree repro pinning current behavior.
+Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`
+(D4 + D2) and `fix/correctness-scan-wave1` (all 8 Wave-1 regions) are not yet merged. Nothing
+pushed.

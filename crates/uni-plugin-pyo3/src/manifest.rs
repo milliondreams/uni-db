@@ -103,7 +103,10 @@ impl PyManifest {
         Self {
             id: SmolStr::new("py.live"),
             version: SmolStr::new("0.0.0"),
-            determinism: SmolStr::new("nondeterministic"),
+            // Manifest-wide default determinism for entries that do not declare
+            // their own (`determinism="inherit"`). "pure" preserves the historical
+            // per-entry default; `db.set_determinism(...)` overrides it.
+            determinism: SmolStr::new("pure"),
             scalar_fns: Vec::new(),
             aggregate_fns: Vec::new(),
             procedures: Vec::new(),

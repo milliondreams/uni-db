@@ -34,5 +34,8 @@ parking_lot = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
 
+[dev-dependencies]
+tokio = { workspace = true }
+
 [features]
 default = []

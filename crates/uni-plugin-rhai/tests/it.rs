@@ -2,6 +2,8 @@
 // binary instead of one-binary-per-file, cutting link steps.
 #![allow(dead_code, unused_imports)]
 
+#[path = "it/bug_repros.rs"]
+mod bug_repros;
 #[path = "it/host_services_e2e.rs"]
 mod host_services_e2e;
 #[path = "it/load_e2e.rs"]

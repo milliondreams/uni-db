@@ -211,6 +211,7 @@ impl PyPluginLoader {
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.scalar_fns,
+                &manifest.determinism,
             )?
         } else {
             Vec::new()
@@ -221,6 +222,7 @@ impl PyPluginLoader {
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.aggregate_fns,
+                &manifest.determinism,
             )?
         } else {
             Vec::new()
@@ -269,11 +271,25 @@ impl PyPluginLoader {
     }
 }
 
+/// Resolve an entry's effective determinism: a per-entry declaration wins, and
+/// the sentinel `"inherit"` (the decorator default) falls back to the
+/// manifest-wide value set via `db.set_determinism(...)`. This is what makes
+/// `set_determinism` observable — without it, entries always kept the decorator
+/// default and the manifest-wide setting was dead.
+fn effective_determinism<'a>(entry_determinism: &'a str, manifest_determinism: &'a str) -> &'a str {
+    if entry_determinism == "inherit" {
+        manifest_determinism
+    } else {
+        entry_determinism
+    }
+}
+
 fn register_scalars(
     registrar: &mut PluginRegistrar<'_>,
     runtime: Arc<PyPluginRuntime>,
     plugin_id: &PluginId,
     entries: &[PyScalarEntry],
+    manifest_determinism: &str,
 ) -> Result<Vec<String>, PyPluginError> {
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -283,10 +299,11 @@ fn register_scalars(
             .map(|t| type_name_to_argtype(t.as_str()))
             .collect::<Result<_, PyPluginError>>()?;
         let returns_type = type_name_to_argtype(entry.returns.as_str())?;
+        let determinism = effective_determinism(entry.determinism.as_str(), manifest_determinism);
         let sig = FnSignature {
             args: args_types,
             returns: returns_type,
-            volatility: determinism_to_volatility(entry.determinism.as_str()),
+            volatility: determinism_to_volatility(determinism),
             null_handling: NullHandling::PropagateNulls,
         };
 
@@ -316,10 +333,12 @@ fn register_aggregates(
     runtime: Arc<PyPluginRuntime>,
     plugin_id: &PluginId,
     entries: &[PyAggregateEntry],
+    manifest_determinism: &str,
 ) -> Result<Vec<String>, PyPluginError> {
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
-        let sig = build_py_agg_signature(&entry.args, &entry.returns, entry.determinism.as_str())
+        let determinism = effective_determinism(entry.determinism.as_str(), manifest_determinism);
+        let sig = build_py_agg_signature(&entry.args, &entry.returns, determinism)
             .map_err(|e| PyPluginError::ManifestInvalid(e.message))?;
         let local_name = entry.name.clone();
         let qname = QName::new(plugin_id.as_str(), local_name.clone());
@@ -540,8 +559,12 @@ impl PyDecoratorSink {
 
 #[pymethods]
 impl PyDecoratorSink {
-    /// `@db.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism='pure')`
-    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="pure"))]
+    /// `@db.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism='inherit')`
+    ///
+    /// The default `"inherit"` takes the manifest-wide determinism set via
+    /// `db.set_determinism(...)` (itself defaulting to `"pure"`); pass an explicit
+    /// spelling here to override it per entry.
+    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="inherit"))]
     fn scalar_fn(
         &self,
         py: Python<'_>,
@@ -566,7 +589,7 @@ impl PyDecoratorSink {
     /// — the wrapped object MUST be a `dict` with `init`/`accumulate`/
     /// `merge`/`finalize` keys, or a class with those attributes. The
     /// trampoline validates on call.
-    #[pyo3(signature = (name, args, returns, determinism="pure"))]
+    #[pyo3(signature = (name, args, returns, determinism="inherit"))]
     fn aggregate_fn(
         &self,
         py: Python<'_>,

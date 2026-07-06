@@ -886,9 +886,18 @@ impl LocyAggState for MprodState {
         self.has_value |= o.has_value;
         self.zero |= o.zero;
         self.min = self.min.min(o.min);
-        // Combine products in linear space (sufficient for the off-hot-path
-        // merge; the executor never calls merge).
-        self.product *= o.product * if o.use_log { o.log_sum.exp() } else { 1.0 };
+        // Each state's product value is `log_sum.exp()` once it has switched to
+        // log space, else `product`. The old code multiplied BOTH factors for a
+        // log-space `other` (`o.product * o.log_sum.exp()`), double-counting the
+        // pre-switch product that `log_sum` already contains (at the switch
+        // `log_sum = ln(product)`, plus later `ln` terms). Fold `other`'s single
+        // value into whichever representation self is currently using.
+        let other_product = if o.use_log { o.log_sum.exp() } else { o.product };
+        if self.use_log {
+            self.log_sum += other_product.ln();
+        } else {
+            self.product *= other_product;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {

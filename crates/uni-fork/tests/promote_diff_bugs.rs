@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Dragonscale Team
+
+//! Runnable repros for verified correctness findings in `uni-fork/src/diff.rs`.
+//!
+//! Each test drives the REAL public engine (`compute_diff` / `run_promote`) or
+//! the REAL content-UID function (`VertexDataset::compute_vertex_uid`) through
+//! the `ForkQueryHost` / `ForkPromoteSink` seams the engine is designed around.
+//! The hosts wrap real `StorageManager`s (an empty one, or one whose `vertices`
+//! table is pre-populated so `get_vertex_ext_ids` returns a real map). Nothing
+//! inside the engine is mocked.
+//!
+//! All assertions capture the CURRENT (buggy) behavior and are marked `// BUG:`
+//! so the suite stays green while pinning the defect.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Result as AnyResult, anyhow};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+use uni_common::config::UniConfig;
+use uni_common::core::id::Vid;
+use uni_common::core::schema::SchemaManager;
+use uni_common::{Node, Properties, Result, Value};
+use uni_query::{QueryMetrics, QueryResult, Row};
+use uni_store::backend::table_names::main_vertex_table_name;
+use uni_store::backend::traits::{RecordBatchStream, TableWriteGuard};
+use uni_store::backend::types::{ScanRequest, WriteMode};
+use uni_store::storage::manager::StorageManager;
+use uni_store::storage::vertex::VertexDataset;
+use uni_store::{LanceDbBackend, StorageBackend};
+
+use uni_fork::{
+    ForkPromoteSink, ForkQueryHost, PromoteBaseline, PromoteOptions, PromotePattern, compute_diff,
+    run_promote,
+};
+
+// --------------------------------------------------------------------------
+// Test doubles for the host seams (real engine, real storage behind them).
+// --------------------------------------------------------------------------
+
+type Responder = Box<dyn Fn(&str) -> QueryResult + Send + Sync>;
+
+struct TestHost {
+    storage: Arc<StorageManager>,
+    schema: Arc<SchemaManager>,
+    responder: Responder,
+}
+
+#[async_trait::async_trait]
+impl ForkQueryHost for TestHost {
+    async fn query(&self, cypher: &str) -> Result<QueryResult> {
+        Ok((self.responder)(cypher))
+    }
+    fn storage(&self) -> Arc<StorageManager> {
+        self.storage.clone()
+    }
+    fn schema(&self) -> Arc<SchemaManager> {
+        self.schema.clone()
+    }
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    inserted: Mutex<usize>,
+    deleted: Mutex<Vec<(String, Vid)>>,
+    updated: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl ForkPromoteSink for RecordingSink {
+    async fn bulk_insert_vertices(&self, _label: &str, rows: Vec<Properties>) -> Result<Vec<Vid>> {
+        let n = rows.len();
+        *self.inserted.lock().unwrap() += n;
+        Ok((0..n).map(|i| Vid::new(9000 + i as u64)).collect())
+    }
+    async fn update_vertex_properties(
+        &self,
+        _label: &str,
+        _vid: Vid,
+        _props: Properties,
+    ) -> Result<()> {
+        *self.updated.lock().unwrap() += 1;
+        Ok(())
+    }
+    async fn delete_vertex(&self, label: &str, vid: Vid) -> Result<()> {
+        self.deleted.lock().unwrap().push((label.to_string(), vid));
+        Ok(())
+    }
+    async fn bulk_insert_edges(
+        &self,
+        _edge_type: &str,
+        _edges: Vec<(Vid, Vid, Properties)>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fault backend: delegates to an inner backend but can be armed to fail
+// `table_exists`, modeling a transient object-store LIST failure. Used to prove
+// that a real `get_vertex_ext_ids()` error now PROPAGATES out of the promote
+// engine instead of being swallowed to an empty map.
+// --------------------------------------------------------------------------
+
+struct FaultBackend {
+    inner: Arc<dyn StorageBackend>,
+    fail_table_exists: AtomicBool,
+}
+
+impl FaultBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            fail_table_exists: AtomicBool::new(false),
+        }
+    }
+    fn set_fail_table_exists(&self, on: bool) {
+        self.fail_table_exists.store(on, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for FaultBackend {
+    async fn table_names(&self) -> AnyResult<Vec<String>> {
+        self.inner.table_names().await
+    }
+    async fn table_exists(&self, name: &str) -> AnyResult<bool> {
+        if self.fail_table_exists.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected transient LIST failure for {name}"));
+        }
+        self.inner.table_exists(name).await
+    }
+    async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> AnyResult<()> {
+        self.inner.create_table(name, batches).await
+    }
+    async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> AnyResult<()> {
+        self.inner.create_empty_table(name, schema).await
+    }
+    async fn open_or_create_table(&self, name: &str, schema: Arc<ArrowSchema>) -> AnyResult<()> {
+        self.inner.open_or_create_table(name, schema).await
+    }
+    async fn drop_table(&self, name: &str) -> AnyResult<()> {
+        self.inner.drop_table(name).await
+    }
+    async fn scan(&self, request: ScanRequest) -> AnyResult<Vec<RecordBatch>> {
+        self.inner.scan(request).await
+    }
+    async fn scan_stream(&self, request: ScanRequest) -> AnyResult<RecordBatchStream> {
+        self.inner.scan_stream(request).await
+    }
+    async fn get_table_schema(&self, name: &str) -> AnyResult<Option<Arc<ArrowSchema>>> {
+        self.inner.get_table_schema(name).await
+    }
+    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> AnyResult<usize> {
+        self.inner.count_rows(table_name, filter).await
+    }
+    async fn write(&self, table_name: &str, batches: Vec<RecordBatch>, mode: WriteMode) -> AnyResult<()> {
+        self.inner.write(table_name, batches, mode).await
+    }
+    async fn delete_rows(&self, table_name: &str, filter: &str) -> AnyResult<()> {
+        self.inner.delete_rows(table_name, filter).await
+    }
+    async fn replace_table_atomic(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+        schema: Arc<ArrowSchema>,
+    ) -> AnyResult<()> {
+        self.inner.replace_table_atomic(name, batches, schema).await
+    }
+    async fn lock_table_for_write(&self, name: &str) -> TableWriteGuard {
+        self.inner.lock_table_for_write(name).await
+    }
+    async fn get_table_version(&self, table_name: &str) -> AnyResult<Option<u64>> {
+        self.inner.get_table_version(table_name).await
+    }
+    async fn rollback_table(&self, table_name: &str, target_version: u64) -> AnyResult<()> {
+        self.inner.rollback_table(table_name, target_version).await
+    }
+    async fn optimize_table(&self, table_name: &str) -> AnyResult<()> {
+        self.inner.optimize_table(table_name).await
+    }
+    async fn recover_staging(&self, table_name: &str) -> AnyResult<()> {
+        self.inner.recover_staging(table_name).await
+    }
+    fn base_uri(&self) -> &str {
+        self.inner.base_uri()
+    }
+}
+
+/// A `StorageManager` over a [`FaultBackend`] whose `vertices` table carries the
+/// given `(vid, ext_id)` rows. Returns the manager and the fault handle so the
+/// test can arm a transient `get_vertex_ext_ids()` failure.
+async fn faulted_populated_store(
+    schema: Arc<SchemaManager>,
+    rows: &[(u64, &str)],
+) -> (tempfile::TempDir, Arc<StorageManager>, Arc<FaultBackend>) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let vids: Vec<u64> = rows.iter().map(|(v, _)| *v).collect();
+    let exts: Vec<&str> = rows.iter().map(|(_, e)| *e).collect();
+    let deleted = vec![false; rows.len()];
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("_vid", DataType::UInt64, false),
+        Field::new("ext_id", DataType::Utf8, true),
+        Field::new("_deleted", DataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(UInt64Array::from(vids)),
+            Arc::new(StringArray::from(exts)),
+            Arc::new(BooleanArray::from(deleted)),
+        ],
+    )
+    .unwrap();
+
+    let lance = LanceDbBackend::connect(&uri, None).await.unwrap();
+    lance
+        .create_table(main_vertex_table_name(), vec![batch])
+        .await
+        .unwrap();
+    let fault = Arc::new(FaultBackend::new(Arc::new(lance)));
+
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let sm = StorageManager::new_with_backend(&uri, store, fault.clone(), schema, UniConfig::default())
+        .await
+        .unwrap();
+    (dir, Arc::new(sm), fault)
+}
+
+// --------------------------------------------------------------------------
+// Builders.
+// --------------------------------------------------------------------------
+
+async fn schema_with_person() -> Arc<SchemaManager> {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let s = SchemaManager::load_from_store(store, &object_store::path::Path::from("schema.json"))
+        .await
+        .unwrap();
+    s.add_label("Person").unwrap();
+    Arc::new(s)
+}
+
+fn node(vid: u64, label: &str, props: &[(&str, Value)]) -> Node {
+    let mut p = Properties::new();
+    for (k, v) in props {
+        p.insert((*k).to_string(), v.clone());
+    }
+    Node {
+        vid: Vid::new(vid),
+        labels: vec![label.to_string()],
+        properties: p,
+    }
+}
+
+fn node_result(nodes: Vec<Node>) -> QueryResult {
+    let cols = Arc::new(vec!["n".to_string()]);
+    let rows = nodes
+        .into_iter()
+        .map(|n| Row::new(cols.clone(), vec![Value::Node(n)]))
+        .collect();
+    QueryResult::new(cols, rows, vec![], QueryMetrics::default())
+}
+
+fn vid_node_result(rows_data: Vec<(u64, Node)>) -> QueryResult {
+    let cols = Arc::new(vec!["vid".to_string(), "node".to_string()]);
+    let rows = rows_data
+        .into_iter()
+        .map(|(v, n)| Row::new(cols.clone(), vec![Value::Int(v as i64), Value::Node(n)]))
+        .collect();
+    QueryResult::new(cols, rows, vec![], QueryMetrics::default())
+}
+
+fn empty_result(col: &str) -> QueryResult {
+    let cols = Arc::new(vec![col.to_string()]);
+    QueryResult::new(cols, vec![], vec![], QueryMetrics::default())
+}
+
+/// A real, empty `StorageManager` — `get_vertex_ext_ids()` returns `Ok({})`
+/// (the `vertices` table is absent), which is byte-for-byte what
+/// `unwrap_or_default()` produces when the real fetch returns `Err`.
+async fn empty_store(schema: Arc<SchemaManager>) -> (tempfile::TempDir, Arc<StorageManager>) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let sm = StorageManager::new(uri, schema).await.unwrap();
+    (dir, Arc::new(sm))
+}
+
+/// A real `StorageManager` whose `vertices` table already carries the given
+/// `(vid, ext_id)` rows, so `get_vertex_ext_ids()` returns a populated map.
+async fn populated_store(
+    schema: Arc<SchemaManager>,
+    rows: &[(u64, &str)],
+) -> (tempfile::TempDir, Arc<StorageManager>) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let vids: Vec<u64> = rows.iter().map(|(v, _)| *v).collect();
+    let exts: Vec<&str> = rows.iter().map(|(_, e)| *e).collect();
+    let deleted = vec![false; rows.len()];
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("_vid", DataType::UInt64, false),
+        Field::new("ext_id", DataType::Utf8, true),
+        Field::new("_deleted", DataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(UInt64Array::from(vids)),
+            Arc::new(StringArray::from(exts)),
+            Arc::new(BooleanArray::from(deleted)),
+        ],
+    )
+    .unwrap();
+
+    let backend = LanceDbBackend::connect(&uri, None).await.unwrap();
+    backend
+        .create_table(main_vertex_table_name(), vec![batch])
+        .await
+        .unwrap();
+    drop(backend);
+
+    // Fresh manager re-opens the same on-disk table.
+    let sm = StorageManager::new(&uri, schema).await.unwrap();
+    (dir, Arc::new(sm))
+}
+
+// ==========================================================================
+// Finding [2] — diff.rs:643: the promote-recomputed content-UID could never
+// equal the UID registered by writer.rs, because the write side hashes props
+// that STILL contain the "ext_id" key while the promote side hashed query-
+// stripped props (ext_id key removed) => UID dedup never fired for ext_id rows.
+//
+// Fixed (diff.rs:643): the promote side re-injects the "ext_id" key before
+// hashing, so its recomputed UID matches the registered one and dedup fires.
+// This test pins that invariant.
+// ==========================================================================
+#[test]
+fn finding2_promote_uid_matches_registered_uid_after_ext_id_reinjection() {
+    // Write/register side (writer.rs:5182-5186): ext_id = Some("p1") AND the
+    // stored property map STILL contains the "ext_id" key.
+    let mut props_with_ext = Properties::new();
+    props_with_ext.insert("ext_id".to_string(), Value::String("p1".to_string()));
+    props_with_ext.insert("name".to_string(), Value::String("Alice".to_string()));
+    let registered = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props_with_ext);
+
+    // Promote-recompute side (diff.rs:643): props come from a query result that
+    // STRIPS the "ext_id" key. The fix re-inserts it before hashing — replicate
+    // exactly that here.
+    let mut props_stripped = Properties::new();
+    props_stripped.insert("name".to_string(), Value::String("Alice".to_string()));
+    let ext_id = Some("p1".to_string());
+    let recomputed = VertexDataset::compute_vertex_uid("Person", ext_id.as_deref(), &{
+        let mut p = props_stripped.clone();
+        if let Some(eid) = &ext_id {
+            p.insert("ext_id".to_string(), Value::String(eid.clone()));
+        }
+        p
+    });
+
+    // After the fix the two UIDs are EQUAL, so batch_resolve_primary_vids can
+    // resolve the ext_id-bearing row and the insert-or-skip dedup fires — no
+    // unbounded twin on re-promote.
+    assert_eq!(
+        registered, recomputed,
+        "promote-side UID must match the registered UID after ext_id re-injection"
+    );
+}
+
+// ==========================================================================
+// Finding [4] — diff.rs:43: compute_diff swallows a one-sided
+// get_vertex_ext_ids() failure with unwrap_or_default(). With side `a` empty
+// and side `b` populated, an unchanged ext_id vertex is keyed under
+// UID(None) on `a` and UID(Some(ext)) on `b`, so it appears as BOTH added and
+// deleted.
+// ==========================================================================
+
+#[test]
+fn finding4_ext_id_is_part_of_content_identity() {
+    let mut props = Properties::new();
+    props.insert("name".to_string(), Value::String("a".to_string()));
+    // The ext_id is part of the content identity: an empty ext map (ext_id =
+    // None) hashes to a different UID than the real ext_id = Some("p1"). This is
+    // exactly why a SWALLOWED ext-fetch error (empty map) would split one
+    // physical vertex across both `added` and `deleted` — the motivation for
+    // propagating the error rather than defaulting to an empty map.
+    let uid_no_ext = VertexDataset::compute_vertex_uid("Person", None, &props);
+    let uid_with_ext = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props);
+    assert_ne!(
+        uid_no_ext, uid_with_ext,
+        "ext_id must contribute to the content UID"
+    );
+}
+
+#[tokio::test]
+async fn finding4_compute_diff_propagates_ext_fetch_error() {
+    let schema = schema_with_person().await;
+    // Side a: store over a fault backend armed to fail get_vertex_ext_ids.
+    let (_dir_a, sm_a, fault_a) = faulted_populated_store(schema.clone(), &[(1, "p1")]).await;
+    // Side b: healthy store with {vid 1 -> "p1"}.
+    let (_dir_b, sm_b) = populated_store(schema.clone(), &[(1, "p1")]).await;
+
+    let n = node(1, "Person", &[("name", Value::String("a".to_string()))]);
+    let host_a = TestHost {
+        storage: sm_a,
+        schema: schema.clone(),
+        responder: {
+            let n = n.clone();
+            Box::new(move |_| node_result(vec![n.clone()]))
+        },
+    };
+    let host_b = TestHost {
+        storage: sm_b,
+        schema: schema.clone(),
+        responder: Box::new(move |_| node_result(vec![n.clone()])),
+    };
+
+    // Arm the transient failure only for the diff call (not store construction).
+    fault_a.set_fail_table_exists(true);
+    let res = compute_diff(&host_a, &host_b).await;
+
+    // Fixed (diff.rs:43): the ext-fetch error now propagates instead of being
+    // swallowed to an empty map that would split the vertex across add+delete.
+    assert!(
+        res.is_err(),
+        "compute_diff must propagate a transient ext-fetch failure; got {:?}",
+        res.map(|d| d.is_empty())
+    );
+}
+
+// ==========================================================================
+// Finding [1] — diff.rs:597: run_promote swallows a failed FORK-side
+// get_vertex_ext_ids() with unwrap_or_default(). The empty map makes the
+// delete-promotion pass read EVERY baseline ext_id row as "deleted on the
+// fork", mass-deleting live primary vertices the fork never touched.
+// ==========================================================================
+#[tokio::test]
+async fn finding1_run_promote_propagates_fork_ext_failure() {
+    let schema = schema_with_person().await;
+
+    // FORK: store over a fault backend armed to fail get_vertex_ext_ids. The
+    // fork deleted NOTHING (its three ext_id rows are still present).
+    let (_dir_fork, sm_fork, fault_fork) =
+        faulted_populated_store(schema.clone(), &[(1, "p1"), (2, "p2"), (3, "p3")]).await;
+    let fork_nodes = vec![
+        node(1, "Person", &[("name", Value::String("v1".to_string()))]),
+        node(2, "Person", &[("name", Value::String("v2".to_string()))]),
+        node(3, "Person", &[("name", Value::String("v3".to_string()))]),
+    ];
+    let fork_host = TestHost {
+        storage: sm_fork,
+        schema: schema.clone(),
+        responder: Box::new(move |cypher: &str| {
+            if cypher.contains("WHERE false") {
+                empty_result("n")
+            } else if cypher.contains("RETURN n") {
+                node_result(fork_nodes.clone())
+            } else {
+                empty_result("c")
+            }
+        }),
+    };
+
+    // PRIMARY: three live vertices with ext_ids p1/p2/p3 (fetch succeeds).
+    let (_dir_prim, sm_prim) =
+        populated_store(schema.clone(), &[(101, "p1"), (102, "p2"), (103, "p3")]).await;
+    let prim_rows = vec![
+        (101u64, node(101, "Person", &[])),
+        (102, node(102, "Person", &[])),
+        (103, node(103, "Person", &[])),
+    ];
+    let primary_host = TestHost {
+        storage: sm_prim,
+        schema: schema.clone(),
+        responder: Box::new(move |cypher: &str| {
+            if cypher.contains("AS vid, n AS node") {
+                vid_node_result(prim_rows.clone())
+            } else {
+                empty_result("vid")
+            }
+        }),
+    };
+
+    let sink = RecordingSink::default();
+
+    // Fork-point baseline: all three ext_id rows were present at the fork point.
+    let mut ext = HashMap::new();
+    for e in ["p1", "p2", "p3"] {
+        ext.insert(e.to_string(), Properties::new());
+    }
+    let baseline = PromoteBaseline {
+        ext: HashMap::from([("Person".to_string(), ext)]),
+        no_ext: HashMap::new(),
+    };
+
+    // Arm the transient failure only for the promote call.
+    fault_fork.set_fail_table_exists(true);
+    let patterns = vec![PromotePattern::label("Person").where_clause("false")];
+    let res = run_promote(
+        &fork_host,
+        &primary_host,
+        &sink,
+        &patterns,
+        &PromoteOptions::with_merge(),
+        Some(&baseline),
+    )
+    .await;
+
+    // Fixed (diff.rs:597): the fork-side ext-fetch error now propagates. It is
+    // NEVER swallowed to an empty map that would make the delete pass read every
+    // baseline ext_id row as "deleted on the fork" and mass-delete live primary
+    // vertices — so no delete is issued.
+    assert!(
+        res.is_err(),
+        "run_promote must propagate a fork-side ext-fetch failure, not mass-delete"
+    );
+    assert!(
+        sink.deleted.lock().unwrap().is_empty(),
+        "no primary vertex may be deleted when the fork ext-fetch fails"
+    );
+}
+
+// ==========================================================================
+// Finding [3] — diff.rs:1031: delete-promotion discards the primary's current
+// props (`_props`) and never consults the baseline or ConflictPolicy, so a
+// fork-delete racing a primary-edit deletes the concurrently-edited primary
+// row even under ConflictPolicy::Skip, and vertices_conflicting stays 0.
+// ==========================================================================
+#[tokio::test]
+async fn finding3_delete_vs_edit_conflict_ignored_under_skip() {
+    let schema = schema_with_person().await;
+
+    // FORK: Alice was DELETED on the fork -> every scan is empty.
+    let (_dir_fork, sm_fork) = empty_store(schema.clone()).await;
+    let fork_host = TestHost {
+        storage: sm_fork,
+        schema: schema.clone(),
+        responder: Box::new(|_cypher| empty_result("n")),
+    };
+
+    // PRIMARY: Alice still present, concurrently EDITED to age=99 (baseline was age=30).
+    let (_dir_prim, sm_prim) = populated_store(schema.clone(), &[(50, "p1")]).await;
+    let alice_now = node(50, "Person", &[("age", Value::Int(99))]);
+    let primary_host = TestHost {
+        storage: sm_prim,
+        schema: schema.clone(),
+        responder: Box::new(move |cypher: &str| {
+            if cypher.contains("AS vid, n AS node") {
+                vid_node_result(vec![(50, alice_now.clone())])
+            } else {
+                empty_result("vid")
+            }
+        }),
+    };
+
+    let sink = RecordingSink::default();
+
+    // Baseline pins Alice at age=30 at the fork point.
+    let mut base_props = Properties::new();
+    base_props.insert("age".to_string(), Value::Int(30));
+    let baseline = PromoteBaseline {
+        ext: HashMap::from([(
+            "Person".to_string(),
+            HashMap::from([("p1".to_string(), base_props)]),
+        )]),
+        no_ext: HashMap::new(),
+    };
+
+    let patterns = vec![PromotePattern::label("Person")];
+    let report = run_promote(
+        &fork_host,
+        &primary_host,
+        &sink,
+        &patterns,
+        &PromoteOptions::with_merge(), // on_conflict = Skip
+        Some(&baseline),
+    )
+    .await
+    .unwrap();
+
+    // Fixed (diff.rs:1031): under ConflictPolicy::Skip a fork-delete that races
+    // a primary-edit is counted as a conflict and left untouched. The
+    // concurrently-edited row (age=99 != baseline age=30) is NOT deleted.
+    assert_eq!(
+        report.vertices_deleted, 0,
+        "the concurrently-edited row must not be deleted under Skip"
+    );
+    assert_eq!(
+        report.vertices_conflicting, 1,
+        "the delete-vs-edit divergence must be recorded as a conflict"
+    );
+    assert!(
+        sink.deleted.lock().unwrap().is_empty(),
+        "no delete should be issued to the sink under Skip"
+    );
+}

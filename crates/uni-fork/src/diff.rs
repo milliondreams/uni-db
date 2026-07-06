@@ -39,9 +39,13 @@ pub async fn compute_diff<Q: ForkQueryHost + ?Sized>(a: &Q, b: &Q) -> Result<For
     let mut diff = ForkDiff::default();
 
     // vid → ext_id per side: ext_id is folded into the content UID but stripped
-    // from query results, so look it up from storage (review H4).
-    let ext_a = a.storage().get_vertex_ext_ids().await.unwrap_or_default();
-    let ext_b = b.storage().get_vertex_ext_ids().await.unwrap_or_default();
+    // from query results, so look it up from storage (review H4). Propagate any
+    // fetch error: `get_vertex_ext_ids` already returns an empty map when the
+    // vertices table is absent, so any `Err` here is a genuine scan/IO failure.
+    // Swallowing it (empty map) would make one side hash every ext_id-bearing
+    // vertex to a different identity, reporting unchanged rows as add+delete.
+    let ext_a = a.storage().get_vertex_ext_ids().await?;
+    let ext_b = b.storage().get_vertex_ext_ids().await?;
 
     let labels_a: HashSet<String> = a.schema().schema().labels.keys().cloned().collect();
     let labels_b: HashSet<String> = b.schema().schema().labels.keys().cloned().collect();
@@ -593,16 +597,13 @@ where
 
     let primary_storage = primary.storage();
     // vid → ext_id maps so promote keys candidates by the same ext_id-aware
-    // content UID, distinguishing ext_id-distinct rows (review H4).
-    let fork_ext_ids = fork
-        .storage()
-        .get_vertex_ext_ids()
-        .await
-        .unwrap_or_default();
-    let primary_ext_ids = primary_storage
-        .get_vertex_ext_ids()
-        .await
-        .unwrap_or_default();
+    // content UID, distinguishing ext_id-distinct rows (review H4). Propagate any
+    // fetch error: an empty map is only correct when the table is genuinely
+    // absent (the callee already handles that), so a swallowed transient failure
+    // would make the delete-promotion pass read every baseline ext_id row as
+    // "deleted on the fork" and mass-delete live primary vertices.
+    let fork_ext_ids = fork.storage().get_vertex_ext_ids().await?;
+    let primary_ext_ids = primary_storage.get_vertex_ext_ids().await?;
     let mut any_edge_pattern = false;
     // Cache of vertices just promoted inside this call. Edge patterns
     // check this before falling back to primary's UidIndex + Cypher
@@ -640,11 +641,20 @@ where
                         continue;
                     };
                     let ext_id = ext_id_for(&fork_ext_ids, node.vid).map(str::to_string);
-                    let uid = VertexDataset::compute_vertex_uid(
-                        label,
-                        ext_id.as_deref(),
-                        &node.properties,
-                    );
+                    // The registered content-UID (writer.rs) hashes the STORED
+                    // property map, which still contains the `ext_id` key,
+                    // whereas Cypher query results STRIP it. Re-insert it before
+                    // hashing so the recomputed UID equals the registered one —
+                    // otherwise the UID dedup can never fire for ext_id-bearing
+                    // rows and every re-promote inserts an unbounded twin.
+                    let uid =
+                        VertexDataset::compute_vertex_uid(label, ext_id.as_deref(), &{
+                            let mut p = node.properties.clone();
+                            if let Some(eid) = &ext_id {
+                                p.insert("ext_id".to_string(), Value::String(eid.clone()));
+                            }
+                            p
+                        });
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;
@@ -1028,7 +1038,22 @@ where
                         &deleted_ext,
                     )
                     .await;
-                    for (_eid, (pvid, _props)) in resolved {
+                    for (eid, (pvid, pprops)) in resolved {
+                        // A fork-delete racing a primary-edit: if primary's
+                        // current props diverged from the fork-point baseline,
+                        // honor ConflictPolicy. Under Skip (the with_merge
+                        // default) leave primary's concurrently-edited row
+                        // untouched and record the conflict; only Overwrite
+                        // proceeds with the delete. Mirrors the divergence check
+                        // in the upsert path above.
+                        let primary_diverged =
+                            base_ext.get(&eid).is_some_and(|b| *b != pprops);
+                        if primary_diverged
+                            && options.on_conflict != ConflictPolicy::Overwrite
+                        {
+                            report.vertices_conflicting += 1;
+                            continue;
+                        }
                         primary_tx.delete_vertex(label, pvid).await?;
                         report.vertices_deleted += 1;
                     }

@@ -1147,12 +1147,51 @@ impl Writer {
         self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
     ) -> Result<(u64, bool)> {
+        // No lock-acquisition timeout (tests and internal callers).
+        self.commit_transaction_l0_with_lock_timeout(tx_l0_arc, None)
+            .await
+    }
+
+    /// Like [`Self::commit_transaction_l0`] but bounds ONLY the `flush_lock`
+    /// acquisition by `lock_timeout` (contention with another in-progress
+    /// commit). Once the lock is held, the durable WAL flush, the main-L0 merge,
+    /// and the inline post-commit L0→L1 flush all run to completion UNCANCELLED.
+    ///
+    /// This is the load-bearing correctness property: a caller must NOT wrap the
+    /// whole future in `tokio::time::timeout`, because that would cancel past the
+    /// durable point (`flush_wal`) and return a retriable `CommitTimeout` for a
+    /// transaction that is already durable and visible — a retry would then
+    /// double-apply it. Bounding only the lock wait keeps the "another commit is
+    /// taking too long" signal without ever cancelling durable work.
+    ///
+    /// # Errors
+    /// Returns [`uni_common::api::error::UniError::CommitTimeout`] (with an empty
+    /// `tx_id` for the caller to fill in) if `flush_lock` cannot be acquired
+    /// within `lock_timeout`, plus any error from the commit itself.
+    pub async fn commit_transaction_l0_with_lock_timeout(
+        self: &Arc<Self>,
+        tx_l0_arc: Arc<RwLock<L0Buffer>>,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<(u64, bool)> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
         // `Arc<RwLock<Writer>>` already provides this exclusion, so the
         // acquisition is uncontended. Phase 4 drops the outer lock and
         // this becomes the load-bearing serialization point.
-        let _flush_lock_guard = self.flush_lock.lock().await;
+        let _flush_lock_guard = match lock_timeout {
+            Some(dur) => match tokio::time::timeout(dur, self.flush_lock.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err(uni_common::api::error::UniError::CommitTimeout {
+                        tx_id: String::new(),
+                        hint: "Another commit is in progress and taking longer than expected. \
+                               Your transaction is still active \u{2014} you can retry commit().",
+                    }
+                    .into());
+                }
+            },
+            None => self.flush_lock.lock().await,
+        };
 
         // Crash-recovery seam: simulate process death immediately after winning
         // the commit serialization point but before any durable work. No-op

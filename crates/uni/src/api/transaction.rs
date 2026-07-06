@@ -1068,29 +1068,31 @@ impl Transaction {
         // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
         self.snapshot.lock().take();
 
-        // Wrap the commit (which acquires `flush_lock` internally) in the
-        // same timeout that used to wrap the outer writer-RwLock acquisition.
-        // `flush_lock` is now the actual serialization point.
-        //
-        // commit_transaction_l0 takes `self: &Arc<Self>` so the async branch
-        // can pass `Arc<Writer>` into the spawned stream task. We pass the
-        // Arc directly (no deref to &Writer).
-        let (wal_lsn, _flush_pending) = tokio::time::timeout(
-            self.db.config.commit_timeout,
-            writer_lock.commit_transaction_l0(self.tx_l0.clone()),
-        )
-        .await
-        .map_err(|_| UniError::CommitTimeout {
-            tx_id: self.id.clone(),
-            hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
-        })?
-        // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
-        // `ConstraintConflict`) so callers can detect and retry them, instead
-        // of flattening every error into `Internal`.
-        .map_err(|e| match e.downcast::<UniError>() {
-            Ok(typed) => typed,
-            Err(other) => UniError::Internal(other),
-        })?;
+        // Bound ONLY the `flush_lock` acquisition (contention with another
+        // in-progress commit) by `commit_timeout` — passed INTO the writer rather
+        // than wrapping the whole future in `tokio::time::timeout`. Wrapping the
+        // whole future would cancel it past the durable point (WAL flush) — e.g.
+        // during the inline post-commit L0→L1 flush — and return a retriable
+        // `CommitTimeout` for a transaction that is already durable and visible,
+        // which a retry would double-apply. The writer surfaces `CommitTimeout`
+        // with an empty `tx_id` on a lock-acquisition timeout; we fill it in.
+        let (wal_lsn, _flush_pending) = writer_lock
+            .commit_transaction_l0_with_lock_timeout(
+                self.tx_l0.clone(),
+                Some(self.db.config.commit_timeout),
+            )
+            .await
+            // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
+            // `ConstraintConflict`) so callers can detect and retry them, instead
+            // of flattening every error into `Internal`.
+            .map_err(|e| match e.downcast::<UniError>() {
+                Ok(UniError::CommitTimeout { hint, .. }) => UniError::CommitTimeout {
+                    tx_id: self.id.clone(),
+                    hint,
+                },
+                Ok(typed) => typed,
+                Err(other) => UniError::Internal(other),
+            })?;
         // _flush_pending is true when async_flush_enabled and the coordinator
         // accepted a flush submission. Nothing to do here — the spawned stream
         // task drives the pipeline to completion independently.

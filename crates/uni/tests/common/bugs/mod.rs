@@ -65,6 +65,8 @@ pub mod repro_rule_registry_lost_update;
 // Correctness-scan Wave 2 repros (L6 security/authz).
 pub mod repro_authz_query_bypass;
 pub mod repro_config_path_plugin_registry;
+// Correctness-scan Wave 2 repros (L7 commit-timeout after durable point).
+pub mod repro_commit_timeout_after_durable;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

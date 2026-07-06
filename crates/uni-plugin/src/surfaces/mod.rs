@@ -1118,6 +1118,15 @@ pub(crate) trait DynPendingRegistration: Send + Sync {
     /// Short human-readable label (for error/debug messages). Diagnostic-only.
     #[allow(dead_code, reason = "Diagnostic surface for future error formatting.")]
     fn debug_label(&self) -> String;
+
+    /// The qname a UNIQUE registration claims (for intra-batch duplicate
+    /// detection), or `None` for repeatable (append) surfaces. Two pending
+    /// registrations claiming the same qname within one `register()` batch
+    /// collide even though neither yet exists in the live registry — `preflight`
+    /// alone (which only consults the live registry) would miss them.
+    fn dedup_key(&self) -> Option<QName> {
+        None
+    }
 }
 
 /// Heterogeneous-batch payload for a [`NamedUniqueOps`] registration.
@@ -1151,6 +1160,10 @@ where
     }
     fn debug_label(&self) -> String {
         format!("{:?}({})", S::KIND, self.q)
+    }
+    fn dedup_key(&self) -> Option<QName> {
+        // Name-unique surface: the qname must be unique across the batch.
+        Some(self.q.clone())
     }
 }
 

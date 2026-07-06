@@ -62,11 +62,23 @@ impl AbiRange {
     pub fn matches(&self, host_major: u64) -> bool {
         // `unwrap_or(STAR)` is defensive — the range was validated at parse.
         let req = VersionReq::parse(&self.0).unwrap_or(VersionReq::STAR);
-        // A very-high minor/patch ensures we hit any minor-tightened range
-        // (`^1.2`, `>=1.5.3`). Using u64::MAX / 2 leaves headroom for
-        // arithmetic in callers without overflow.
-        let probe = Version::new(host_major, u64::MAX / 2, u64::MAX / 2);
-        req.matches(&probe)
+        // The question is "does ANY version with major == host_major satisfy the
+        // requirement?". A single high `(major, MAX, MAX)` probe answers that only
+        // for caret / lower-bounded ranges — it wrongly fails an upper-bounded
+        // minor/patch range such as `~1.2` (`>=1.2.0, <1.3.0`) or `=1.2.3`, whose
+        // in-range points sit at the comparators' own coordinates. So probe those
+        // coordinates (and just above each, for `>x.y.z` lower bounds) plus the
+        // extremes, and accept if any candidate at this major satisfies the req.
+        let mut candidates: Vec<(u64, u64)> = vec![(0, 0), (u64::MAX / 2, u64::MAX / 2)];
+        for c in &req.comparators {
+            let minor = c.minor.unwrap_or(0);
+            let patch = c.patch.unwrap_or(0);
+            candidates.push((minor, patch));
+            candidates.push((minor, patch.saturating_add(1)));
+        }
+        candidates
+            .into_iter()
+            .any(|(minor, patch)| req.matches(&Version::new(host_major, minor, patch)))
     }
 
     /// Returns the underlying range string.

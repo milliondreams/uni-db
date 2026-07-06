@@ -342,6 +342,44 @@ pub(crate) struct PluginRecord {
     pub(crate) background_job_count: usize,
 }
 
+impl PluginRecord {
+    /// Merge another record's surfaces into this one: append every owned-key
+    /// vector and sum the count-only tallies.
+    ///
+    /// `apply_pending` must merge, not overwrite, when a plugin id commits more
+    /// than once (e.g. two `declareFunction` calls that each run their own
+    /// registrar under the same namespace id). Overwriting the record drops the
+    /// earlier commit's surfaces from the ownership map, so `remove_plugin` later
+    /// leaks them (they stay live in the registry slots but are untracked).
+    fn merge(&mut self, other: PluginRecord) {
+        self.scalars.extend(other.scalars);
+        self.aggregates.extend(other.aggregates);
+        self.windows.extend(other.windows);
+        self.procedures.extend(other.procedures);
+        self.locy_aggregates.extend(other.locy_aggregates);
+        self.locy_predicates.extend(other.locy_predicates);
+        self.operators.extend(other.operators);
+        self.algorithms.extend(other.algorithms);
+        self.pregels.extend(other.pregels);
+        self.index_kinds.extend(other.index_kinds);
+        self.storage_schemes.extend(other.storage_schemes);
+        self.label_storages.extend(other.label_storages);
+        self.crdt_kinds.extend(other.crdt_kinds);
+        self.logical_types.extend(other.logical_types);
+        self.collations.extend(other.collations);
+        self.cdc_outputs.extend(other.cdc_outputs);
+        self.catalogs.extend(other.catalogs);
+        self.hook_count += other.hook_count;
+        self.auth_count += other.auth_count;
+        self.authz_count += other.authz_count;
+        self.connector_count += other.connector_count;
+        self.trigger_count += other.trigger_count;
+        self.replacement_scan_count += other.replacement_scan_count;
+        self.optimizer_rule_count += other.optimizer_rule_count;
+        self.background_job_count += other.background_job_count;
+    }
+}
+
 /// A deep-clone snapshot of one plugin's registry footprint.
 ///
 /// Produced by [`PluginRegistry::iter_for_plugin`] and consumed by
@@ -899,8 +937,18 @@ impl PluginRegistry {
         plugin_id: &PluginId,
         pending: Vec<Box<dyn crate::surfaces::DynPendingRegistration>>,
     ) -> Result<(), PluginError> {
+        // Preflight against the live registry, and — because that only sees the
+        // live registry, not the rest of this batch — also reject duplicate
+        // unique keys WITHIN the batch (two entries for the same qname in one
+        // register() call would otherwise both pass and silently last-write-win).
+        let mut seen: std::collections::HashSet<QName> = std::collections::HashSet::new();
         for reg in &pending {
             reg.preflight(self)?;
+            if let Some(qname) = reg.dedup_key()
+                && !seen.insert(qname.clone())
+            {
+                return Err(PluginError::DuplicateRegistration(qname));
+            }
         }
 
         let mut record = PluginRecord::default();
@@ -908,7 +956,13 @@ impl PluginRegistry {
             reg.apply(self, plugin_id.clone(), &mut record);
         }
 
-        self.per_plugin.read().insert(plugin_id.clone(), record);
+        // Merge (do NOT overwrite) so a second commit under the same plugin id
+        // keeps the surfaces the earlier commit registered.
+        self.per_plugin
+            .read()
+            .entry(plugin_id.clone())
+            .or_default()
+            .merge(record);
 
         Ok(())
     }

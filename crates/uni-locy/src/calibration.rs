@@ -338,7 +338,16 @@ impl CalibratorFitter for IsotonicFitter {
                 let (sb, cb, xb) = blocks[n - 1];
                 let ma = sa / ca as f64;
                 let mb = sb / cb as f64;
-                if ma > mb {
+                // Merge when the previous block's mean exceeds this one's (the
+                // isotonicity violation PAV resolves), OR when the two blocks
+                // share the same x. Tied predictions MUST map to a single pooled
+                // value — a function cannot assign two outputs to one input.
+                // Without the `xa == xb` case, tied preds like [0.7,0.7,0.7,0.7]
+                // with labels [F,F,T,T] leave four knots at x=0.7 and `apply(0.7)`
+                // returns the first block's mean (0.0) instead of the pooled 0.5.
+                #[allow(clippy::float_cmp)]
+                let same_x = xa == xb;
+                if ma > mb || same_x {
                     // Merge into a single block.
                     blocks[n - 2] = (sa + sb, ca + cb, xa.max(xb));
                     blocks.pop();

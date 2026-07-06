@@ -144,12 +144,14 @@ impl Btic {
         self.meta
     }
 
-    /// Duration in milliseconds. `None` if either bound is infinite.
+    /// Duration in milliseconds. `None` if either bound is infinite, or if the
+    /// width would overflow `i64` (a valid interval can span more than
+    /// `i64::MAX` ms; `checked_sub` returns `None` rather than panicking/wrapping).
     pub fn duration_ms(&self) -> Option<i64> {
         if self.lo == NEG_INF || self.hi == POS_INF {
             None
         } else {
-            Some(self.hi - self.lo)
+            self.hi.checked_sub(self.lo)
         }
     }
 

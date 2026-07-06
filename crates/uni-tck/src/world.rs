@@ -167,8 +167,8 @@ impl UniWorld {
     /// Property counting is included for TCK compliance.
     pub async fn capture_state_before(&mut self) -> anyhow::Result<()> {
         // Collect node/edge ID sets for gross creation/deletion tracking.
-        self.side_effects.node_ids_before = self.collect_node_ids().await;
-        self.side_effects.edge_ids_before = self.collect_edge_ids().await;
+        self.side_effects.node_ids_before = self.collect_node_ids().await?;
+        self.side_effects.edge_ids_before = self.collect_edge_ids().await?;
         self.side_effects.nodes_before = self.side_effects.node_ids_before.len();
         self.side_effects.edges_before = self.side_effects.edge_ids_before.len();
         // Build a per-entity, per-key property snapshot for gross change counting.
@@ -185,8 +185,8 @@ impl UniWorld {
     /// Property counting is included for TCK compliance.
     pub async fn capture_state_after(&mut self) -> anyhow::Result<()> {
         // Collect node/edge ID sets and compute gross changes.
-        let node_ids_after = self.collect_node_ids().await;
-        let edge_ids_after = self.collect_edge_ids().await;
+        let node_ids_after = self.collect_node_ids().await?;
+        let edge_ids_after = self.collect_edge_ids().await?;
         self.side_effects.nodes_after = node_ids_after.len();
         self.side_effects.edges_after = edge_ids_after.len();
         self.side_effects.nodes_created = node_ids_after
@@ -304,27 +304,31 @@ impl UniWorld {
     }
 
     /// Collect all node IDs (VIDs) currently in the graph.
-    async fn collect_node_ids(&self) -> HashSet<u64> {
+    async fn collect_node_ids(&self) -> anyhow::Result<HashSet<u64>> {
         self.collect_ids("MATCH (n) RETURN id(n) AS id").await
     }
 
     /// Collect all edge IDs (EIDs) currently in the graph.
-    async fn collect_edge_ids(&self) -> HashSet<u64> {
+    async fn collect_edge_ids(&self) -> anyhow::Result<HashSet<u64>> {
         self.collect_ids("MATCH ()-[r]->() RETURN id(r) AS id")
             .await
     }
 
     /// Run an `id`-returning query and collect the integer IDs into a set.
-    async fn collect_ids(&self, query: &str) -> HashSet<u64> {
+    ///
+    /// # Errors
+    /// Propagates the snapshot query error. A swallowed error here would report
+    /// zero ids, silently corrupting the before/after side-effect diff (a failing
+    /// query is indistinguishable from an empty graph).
+    async fn collect_ids(&self, query: &str) -> anyhow::Result<HashSet<u64>> {
+        let result = self.db().session().query(query).await?;
         let mut ids = HashSet::new();
-        if let Ok(result) = self.db().session().query(query).await {
-            for row in result.rows() {
-                if let Some(Value::Int(id)) = row.values().first() {
-                    ids.insert(*id as u64);
-                }
+        for row in result.rows() {
+            if let Some(Value::Int(id)) = row.values().first() {
+                ids.insert(*id as u64);
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// Get labels present in data (not schema metadata) for side-effect tracking.

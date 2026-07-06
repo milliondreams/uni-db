@@ -88,18 +88,30 @@ fn strip_query_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Print a query execution error to stdout in the REPL's red error style.
 fn print_query_error(e: impl std::fmt::Display) {
-    println!("{}", format!("Error: {e}").red());
+    // Errors go to stderr so the one-shot `uni query` command's stdout stays
+    // clean for result piping and failures are visible to `2>` redirects.
+    eprintln!("{}", format!("Error: {e}").red());
 }
 
-pub async fn execute_query(db: &Uni, query: &str) {
+/// Execute a query and print its results, returning whether it succeeded.
+///
+/// The REPL loop ignores the return value (it keeps looping regardless), while
+/// the one-shot `uni query` command uses it to set a non-zero exit code so
+/// callers and scripts can detect failure. Errors are printed to stderr.
+pub async fn execute_query(db: &Uni, query: &str) -> bool {
     let start = Instant::now();
 
     if let Some(clean_query) = strip_query_keyword(query, "EXPLAIN") {
         match db.session().query_with(clean_query).explain().await {
-            Ok(output) => print_explain(output, start.elapsed()),
-            Err(e) => print_query_error(e),
+            Ok(output) => {
+                print_explain(output, start.elapsed());
+                return true;
+            }
+            Err(e) => {
+                print_query_error(e);
+                return false;
+            }
         }
-        return;
     }
 
     if let Some(clean_query) = strip_query_keyword(query, "PROFILE") {
@@ -108,18 +120,27 @@ pub async fn execute_query(db: &Uni, query: &str) {
                 print_results(results, start.elapsed());
                 println!();
                 print_profile(output);
+                return true;
             }
-            Err(e) => print_query_error(e),
+            Err(e) => {
+                print_query_error(e);
+                return false;
+            }
         }
-        return;
     }
 
     // `Session::run` auto-commits writes (CREATE/SET/MERGE/DELETE/DDL) and
     // forwards reads to `query`, so the REPL and one-shot `uni query` both
     // execute mutations instead of hitting the read-only `query` gate.
     match db.session().run(query).await {
-        Ok(results) => print_results(results, start.elapsed()),
-        Err(e) => print_query_error(e),
+        Ok(results) => {
+            print_results(results, start.elapsed());
+            true
+        }
+        Err(e) => {
+            print_query_error(e);
+            false
+        }
     }
 }
 

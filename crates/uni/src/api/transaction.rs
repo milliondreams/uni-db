@@ -1090,11 +1090,53 @@ impl Transaction {
                 self.session_rule_registry.write(),
             ) {
                 (Ok(tx_reg), Ok(mut session_reg)) => {
-                    let mut promoted = 0;
-                    for (name, rule) in &tx_reg.rules {
-                        if !session_reg.rules.contains_key(name) {
-                            session_reg.rules.insert(name.clone(), rule.clone());
-                            promoted += 1;
+                    let new_names: Vec<String> = tx_reg
+                        .rules
+                        .keys()
+                        .filter(|n| !session_reg.rules.contains_key(*n))
+                        .cloned()
+                        .collect();
+                    let promoted = new_names.len();
+                    if promoted > 0 {
+                        // Promote the SOURCES that own the new rules and rebuild
+                        // the session registry from the combined sources, so the
+                        // promoted rules get their STRATA too. Copying only the
+                        // rules map left them stratum-less, so they never
+                        // evaluated (and a later rebuild dropped them). Fall back
+                        // to a rules-only copy if any promoted rule lacks a
+                        // tracked source (rebuild would otherwise drop it).
+                        let mut combined = session_reg.sources.clone();
+                        for src in &tx_reg.sources {
+                            let owns_new =
+                                src.rule_names.iter().any(|r| new_names.contains(r));
+                            let already =
+                                combined.iter().any(|s| s.source == src.source);
+                            if owns_new && !already {
+                                combined.push(src.clone());
+                            }
+                        }
+                        let rebuilt =
+                            super::impl_locy::rebuild_registry_from_sources(&combined);
+                        let preserved_all = |r: &super::impl_locy::LocyRuleRegistry| {
+                            new_names.iter().all(|n| r.rules.contains_key(n))
+                                && session_reg.rules.keys().all(|n| r.rules.contains_key(n))
+                        };
+                        match rebuilt {
+                            Ok(r) if preserved_all(&r) => *session_reg = r,
+                            _ => {
+                                for (name, rule) in &tx_reg.rules {
+                                    session_reg
+                                        .rules
+                                        .entry(name.clone())
+                                        .or_insert_with(|| rule.clone());
+                                }
+                                rule_promotion_errors.push(RulePromotionError {
+                                    rule_text: "<promotion rebuild>".into(),
+                                    error: "promoted rules lacked tracked sources; \
+                                            strata not rebuilt"
+                                        .into(),
+                                });
+                            }
                         }
                     }
                     promoted

@@ -747,6 +747,16 @@ impl<'a> LocyPlanBuilder<'a> {
 
         // All clauses share the same schema; derive metadata from first clause
         let first_clause = rule.clauses.first();
+        // HAVING / BEST BY / FOLD-output metadata must come from the SAME clause
+        // that provides the FOLD (mirroring `fold_bindings` below), not clause 0:
+        // a base clause (no FOLD) followed by a recursive clause with
+        // `FOLD ... HAVING ... BEST BY` would otherwise silently lose its HAVING
+        // filter and BEST BY pruning. Falls back to clause 0 when no clause folds.
+        let fold_clause = rule
+            .clauses
+            .iter()
+            .find(|c| !c.fold.is_empty())
+            .or(first_clause);
 
         // Collect fold bindings from the first clause that has them.
         // A rule may have a base clause (no FOLD) plus recursive clauses (with FOLD);
@@ -795,7 +805,7 @@ impl<'a> LocyPlanBuilder<'a> {
             .map(|(name, alias, _)| (name.clone(), alias.clone()))
             .collect();
 
-        let having = first_clause
+        let having = fold_clause
             .map(|c| {
                 c.having
                     .iter()
@@ -803,7 +813,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let best_by_criteria = first_clause
+        let best_by_criteria = fold_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
                 bb.items
@@ -818,7 +828,7 @@ impl<'a> LocyPlanBuilder<'a> {
             })
             .unwrap_or_default();
 
-        let fold_output_names: HashSet<&str> = first_clause
+        let fold_output_names: HashSet<&str> = fold_clause
             .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
             .unwrap_or_default();
         let along_names: HashSet<&str> = first_clause

@@ -58,6 +58,10 @@ pub mod bug_bulk_index_skip_both_defer_false_repro;
 pub mod bug_bulk_unique_preexisting_repro;
 // Correctness-scan Wave 1 repros (R10 integer precision / lossy key).
 pub mod bug_bulk_unique_key_lossy_repro;
+// Correctness-scan Wave 1 repros (R11 Locy compile-context / registry).
+pub mod repro_locy_tx_neural_preview;
+pub mod repro_rule_promotion_strata;
+pub mod repro_rule_registry_lost_update;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

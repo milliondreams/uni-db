@@ -364,6 +364,15 @@ pub struct ForkPoint {
     /// `_version <= pin` read still sees inherited (base_paths) rows,
     /// while the fork's own writes get versions above it.
     pub version_hwm: u64,
+    /// `dataset_name` → parent **branch** version at the fork point, for a
+    /// nested fork (a fork of a fork). Empty when the parent is the primary DB.
+    ///
+    /// A nested fork must branch off its parent fork's Lance *branch* tip, which
+    /// advances independently of `main` (so `dataset_versions`, which tracks the
+    /// main-branch version, is not usable there). Captured under `flush_lock`
+    /// alongside `dataset_versions` so a concurrent parent commit+flush cannot
+    /// advance the tip between capture and branch creation.
+    pub parent_branch_versions: BTreeMap<String, u64>,
 }
 
 /// RAII latch on [`StorageManager::flush_in_progress`].
@@ -4153,6 +4162,7 @@ impl Writer {
     pub async fn flush_and_capture_fork_point(
         &self,
         candidate_dataset_names: &[String],
+        parent_branches: &BTreeMap<String, String>,
     ) -> Result<ForkPoint> {
         if let Some(coord) = self.flush_coordinator.as_ref() {
             let _ = coord.drain(self.config.drop_fork_drain_timeout).await;
@@ -4172,6 +4182,7 @@ impl Writer {
 
         let base = self.storage.base_uri();
         let mut dataset_versions = BTreeMap::new();
+        let mut parent_branch_versions = BTreeMap::new();
         for name in candidate_dataset_names {
             let uri = join_lance_uri(base, name);
             if !lance_path_exists(&uri) {
@@ -4179,6 +4190,19 @@ impl Writer {
             }
             let version = crate::backend::lance_branch::current_version(&uri).await?;
             dataset_versions.insert(name.clone(), version);
+
+            // For a nested fork, also capture the parent branch's tip under the
+            // lock — that is the version the child must branch from, and it
+            // advances independently of `main`. Reading it here (still holding
+            // `flush_lock`, after `flush_inline_under_lock`) is what makes the
+            // nested fork's branch point atomic w.r.t. a concurrent parent
+            // commit+flush (the D2 fix).
+            if let Some(parent_branch) = parent_branches.get(name) {
+                let branch_version =
+                    crate::backend::lance_branch::current_version_on_branch(&uri, parent_branch)
+                        .await?;
+                parent_branch_versions.insert(name.clone(), branch_version);
+            }
         }
 
         Ok(ForkPoint {
@@ -4186,6 +4210,7 @@ impl Writer {
             eid_hwm,
             dataset_versions,
             version_hwm,
+            parent_branch_versions,
         })
     }
 

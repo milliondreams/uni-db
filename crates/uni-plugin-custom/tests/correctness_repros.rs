@@ -471,11 +471,11 @@ fn repro7_null_and_false_is_null_not_false() {
         ColumnarValue::Scalar(_) => panic!("expected array"),
     };
     let b = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-    // BUG: expected Bool(false) (false dominates). apply_binary's Null
-    // guard returns Null before dispatching AND. (eval.rs:164)
+    // FIXED (eval.rs): `null AND false` == false (false dominates); apply_binary
+    // now resolves the dominating operand before propagating NULL.
     assert!(
-        b.is_null(0),
-        "repro for eval.rs:164: `null AND false` returns NULL, not false"
+        !b.is_null(0) && !b.value(0),
+        "`null AND false` must be false (false dominates)"
     );
 }
 
@@ -497,10 +497,10 @@ fn repro7_null_or_true_is_null_not_true() {
         ColumnarValue::Scalar(_) => panic!("expected array"),
     };
     let b = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-    // BUG: expected Bool(true) (true dominates). Returns Null. (eval.rs:164)
+    // FIXED (eval.rs): `null OR true` == true (true dominates).
     assert!(
-        b.is_null(0),
-        "repro for eval.rs:164: `null OR true` returns NULL, not true"
+        !b.is_null(0) && b.value(0),
+        "`null OR true` must be true (true dominates)"
     );
 }
 

@@ -162,7 +162,21 @@ fn type_name(v: &Value) -> &'static str {
 fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     use BinaryOp::*;
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
-        return Ok(Value::Null);
+        // Cypher three-valued logic: AND/OR still yield a definite result when
+        // one operand is NULL if the other operand dominates — `false AND null`
+        // = false, `true OR null` = true. Only when NULL cannot be dominated does
+        // the result stay NULL. Every other operator propagates NULL.
+        return match op {
+            And => match (&l, &r) {
+                (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
+                _ => Ok(Value::Null),
+            },
+            Or => match (&l, &r) {
+                (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
+                _ => Ok(Value::Null),
+            },
+            _ => Ok(Value::Null),
+        };
     }
     match op {
         Add => add_values(l, r),

@@ -16,5 +16,7 @@ pub mod test_issue_77_ghost_vertex_endpoints;
 // Correctness-scan Wave 0 repros (R3 tombstone resurrection).
 pub mod repro_01_replay_label_overwrite_marker;
 pub mod repro_11_compact_adjacency_empty_resurrect;
+pub mod repro_17_merge_l0_vector_tombstone_resurrect;
 pub mod repro_17_overlay_tombstone_ungated;
+pub mod repro_18_merge_l0_fts_tombstone_resurrect;
 pub mod test_repro_compaction_empty_resurrect;

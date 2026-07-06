@@ -2580,6 +2580,14 @@ fn merge_l0_into_vector_results(
 
     // Overwrite or append L0 candidates.
     for (vid, dist) in &l0_candidates {
+        // Skip a vid the precedence chain ultimately tombstoned: it can be a
+        // live candidate from an earlier buffer while a later buffer deleted it
+        // (that later buffer never revisits it in the label loop, so it stays
+        // in `l0_candidates`). Appending it here would resurrect a deleted
+        // vertex into vector-search results.
+        if tombstoned.contains(vid) {
+            continue;
+        }
         if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
             existing.1 = *dist;
         } else {
@@ -2735,6 +2743,12 @@ fn merge_l0_into_fts_results(
 
     // Overwrite or append L0 candidates.
     for (vid, score) in &l0_candidates {
+        // Skip a vid the precedence chain ultimately tombstoned (see the vector
+        // helper above): a later buffer's delete must not be resurrected into
+        // full-text-search results by an earlier buffer's live candidate.
+        if tombstoned.contains(vid) {
+            continue;
+        }
         if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
             existing.1 = *score;
         } else {

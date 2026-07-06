@@ -1573,9 +1573,11 @@ pub(crate) async fn run_hybrid_search(
         let qvec = if let Some(ref v) = query_vector {
             v.clone()
         } else {
-            auto_embed_text(host, &label, vec_prop, &query_text)
-                .await
-                .unwrap_or_default()
+            // Propagate an auto-embed failure instead of swallowing it to an
+            // empty vector. Swallowing left `qvec` empty, silently skipping the
+            // dense arm so hybrid search degraded to FTS-only with no error —
+            // inconsistent with the fts/sparse arms below, which use `?`.
+            auto_embed_text(host, &label, vec_prop, &query_text).await?
         };
 
         if !qvec.is_empty() {

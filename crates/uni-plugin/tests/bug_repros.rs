@@ -208,13 +208,10 @@ fn repro_unparseable_cron_dispatched_once() {
     );
 
     let due = s.tick_at(SystemTime::now());
-    // BUG: expected due.is_empty() (unparseable cron → job never due); actual:
-    // the None fire time falls through the `if let Some(fire_at)` gate and the
-    // job is dispatched + marked Running exactly once. (scheduler.rs:238)
-    assert_eq!(
-        due.len(),
-        1,
-        "buggy: unparseable-cron job dispatched instead of skipped"
+    // FIXED (scheduler.rs): a None fire time (unparseable cron) is treated as
+    // never-due, so the job is skipped rather than dispatched once.
+    assert!(
+        due.is_empty(),
+        "unparseable-cron job must be skipped (never due), got {due:?}"
     );
-    assert_eq!(due[0].local(), "bad_cron");
 }

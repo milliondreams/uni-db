@@ -483,13 +483,8 @@ async fn repro_39_sum_precision() {
         .await;
     let s = cell(&rows[0], "s");
     println!("[39] UNWIND sum(2^53, 1) = {s:?} (correct=Int(9007199254740993))");
-    // Observe: UNWIND-literal path may not route through Accumulator::Sum(f64).
-    if s == Value::Int(9007199254740992) {
-        println!("[39] REPRODUCED via UNWIND: f64 precision loss (core.rs:137)");
-    } else {
-        println!("[39] UNWIND path returned exact {s:?} (not the aggregate f64 path)");
-    }
-    assert!(s == Value::Int(9007199254740992) || s == Value::Int(9007199254740993));
+    // FIXED (core.rs): SUM keeps an exact i64 sum, so 2^53 + 1 is exact.
+    assert_eq!(s, Value::Int(9_007_199_254_740_993), "integer SUM must be exact");
 }
 
 // [39b] node-property sum routes through update_accumulators (read.rs:3818)
@@ -501,11 +496,8 @@ async fn repro_39b_sum_precision_nodes() {
     let rows = h.run_ok("MATCH (n:Big) RETURN sum(n.v) AS s").await;
     let s = cell(&rows[0], "s");
     println!("[39b] node sum(2^53,1) = {s:?} (correct=Int(9007199254740993))");
-    if s == Value::Int(9007199254740992) {
-        println!("[39b] REPRODUCED: f64 SUM accumulation precision loss (core.rs:137)");
-    }
-    // BUG: f64 accumulation rounds (2^53)+1 -> 2^53. Assert observed either way.
-    assert!(s == Value::Int(9007199254740992) || s == Value::Int(9007199254740993));
+    // FIXED (core.rs): the row-based Accumulator::Sum keeps an exact i64 sum.
+    assert_eq!(s, Value::Int(9_007_199_254_740_993), "node-property SUM must be exact");
 }
 
 // ===========================================================================

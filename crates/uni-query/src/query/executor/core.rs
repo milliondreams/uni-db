@@ -25,7 +25,14 @@ use super::procedure::ProcedureRegistry;
 #[derive(Debug)]
 pub(crate) enum Accumulator {
     Count(i64),
-    Sum(f64),
+    /// Running sum kept exact for integers: `int_sum` accumulates i64 values
+    /// while `all_ints` holds; `float_sum` mirrors every value as f64 for the
+    /// float/overflow fallback. Summing purely in f64 lost precision above 2^53.
+    Sum {
+        int_sum: i64,
+        float_sum: f64,
+        all_ints: bool,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Avg { sum: f64, count: i64 },
@@ -110,7 +117,11 @@ impl Accumulator {
         match op_upper.as_str() {
             "COUNT" if distinct => Accumulator::CountDistinct(HashSet::new()),
             "COUNT" => Accumulator::Count(0),
-            "SUM" => Accumulator::Sum(0.0),
+            "SUM" => Accumulator::Sum {
+                int_sum: 0,
+                float_sum: 0.0,
+                all_ints: true,
+            },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -134,11 +145,26 @@ impl Accumulator {
                     *c += 1;
                 }
             }
-            Accumulator::Sum(s) => {
-                if let Some(n) = val.as_f64() {
-                    *s += n;
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                all_ints,
+            } => match val {
+                Value::Int(i) => {
+                    *float_sum += *i as f64;
+                    // Exact while it fits; on i64 overflow fall back to the f64 sum.
+                    match int_sum.checked_add(*i) {
+                        Some(s) => *int_sum = s,
+                        None => *all_ints = false,
+                    }
                 }
-            }
+                _ => {
+                    if let Some(n) = val.as_f64() {
+                        *float_sum += n;
+                        *all_ints = false;
+                    }
+                }
+            },
             Accumulator::Min(current) => {
                 if !val.is_null() {
                     *current = Some(match current.take() {
@@ -185,7 +211,17 @@ impl Accumulator {
     pub(crate) fn finish(&self) -> Value {
         match self {
             Accumulator::Count(c) => Value::Int(*c),
-            Accumulator::Sum(s) => numeric_to_value(*s),
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                all_ints,
+            } => {
+                if *all_ints {
+                    Value::Int(*int_sum)
+                } else {
+                    numeric_to_value(*float_sum)
+                }
+            }
             Accumulator::Min(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Max(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Avg { sum, count } => {

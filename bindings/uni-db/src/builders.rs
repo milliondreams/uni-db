@@ -2190,8 +2190,14 @@ pub(crate) fn record_batch_from_pyarrow(
     let array_capsule = capsule_tuple.get_item(1)?;
 
     // Safety: the capsules are produced by the Arrow C Data Interface, which
-    // guarantees valid `arrow_schema` / `arrow_array` pointers; per that
-    // interface the consumer takes ownership, so we `ptr::read` them out.
+    // guarantees valid `arrow_schema` / `arrow_array` pointers. Per that
+    // interface the consumer takes ownership AND must mark the source structs
+    // as released so the producer (pyarrow's capsule destructor) does not free
+    // the same buffers. `FFI_Arrow{Schema,Array}::from_raw` does exactly this:
+    // it moves the value out and overwrites the source in place with an empty
+    // struct (`release == NULL`), leaving the capsule destructor a no-op. Using
+    // `ptr::read` here instead would leave `release` non-NULL and cause a
+    // double-free / use-after-free of the ingested buffers.
     let (ffi_schema, ffi_array) = unsafe {
         let schema_ptr =
             pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
@@ -2199,7 +2205,10 @@ pub(crate) fn record_batch_from_pyarrow(
         let array_ptr =
             pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
                 as *mut arrow_array::ffi::FFI_ArrowArray;
-        (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
+        (
+            arrow_array::ffi::FFI_ArrowSchema::from_raw(schema_ptr),
+            arrow_array::ffi::FFI_ArrowArray::from_raw(array_ptr),
+        )
     };
 
     // Safety: `ffi_array` / `ffi_schema` were just read from valid Arrow C Data

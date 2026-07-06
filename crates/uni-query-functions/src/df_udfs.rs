@@ -1431,13 +1431,21 @@ impl ScalarUDFImpl for RangeUdf {
                 let mut current = start;
                 while current <= end {
                     list_builder.values().append_value(current);
-                    current += step;
+                    // checked_add: a range ending at/near i64::MAX must stop, not
+                    // overflow (the interpreted path uses checked_add too).
+                    match current.checked_add(step) {
+                        Some(n) => current = n,
+                        None => break,
+                    }
                 }
             } else if step < 0 && start >= end {
                 let mut current = start;
                 while current >= end {
                     list_builder.values().append_value(current);
-                    current += step;
+                    match current.checked_add(step) {
+                        Some(n) => current = n,
+                        None => break,
+                    }
                 }
             }
             // Else: direction and step are inconsistent -> append an empty list row.
@@ -4189,6 +4197,21 @@ fn compare_cv_numeric(bytes: &[u8], rhs: f64, op: &BinaryOp) -> Option<bool> {
     compare_f64(lhs, rhs, op)
 }
 
+/// Compare a CypherValue-encoded LHS against an exact `i64` RHS.
+///
+/// The `compare_cv_numeric` int fast-path is exact only if the caller preserves
+/// the RHS integer; passing `rhs as f64` first rounds values above 2^53 before
+/// the compare. When the LHS is itself an int, compare `i64` vs `i64` directly;
+/// only a float LHS falls back to `f64` (where exact-int semantics don't apply).
+fn compare_cv_vs_i64(bytes: &[u8], rhs: i64, op: &BinaryOp) -> Option<bool> {
+    use uni_common::cypher_value_codec::{TAG_INT, TAG_NULL, decode_int, peek_tag};
+    match peek_tag(bytes) {
+        Some(TAG_NULL) => None,
+        Some(TAG_INT) => decode_int(bytes).map(|lhs| apply_comparison_op(lhs.cmp(&rhs), op)),
+        _ => compare_f64(cv_bytes_as_f64(bytes)?, rhs as f64, op),
+    }
+}
+
 /// Fast-path comparison for LargeBinary (CypherValue) vs native Arrow types.
 ///
 /// Returns `Some(ColumnarValue)` if fast path succeeded, `None` to fallback to slow path.
@@ -4223,7 +4246,9 @@ fn try_fast_compare(
                 if lb_arr.is_null(i) || int_arr.is_null(i) {
                     builder.append_null();
                 } else {
-                    match compare_cv_numeric(lb_arr.value(i), int_arr.value(i) as f64, op) {
+                    // Pass the exact i64 (not `as f64`) so an int-vs-int compare
+                    // above 2^53 stays exact. (finding uni-query-functions[14])
+                    match compare_cv_vs_i64(lb_arr.value(i), int_arr.value(i), op) {
                         Some(result) => builder.append_value(result),
                         None => builder.append_null(),
                     }
@@ -6956,7 +6981,12 @@ impl DfAccumulator for CypherSumAccumulator {
                         Some(TAG_INT) => {
                             if let Some(v) = decode_int(bytes) {
                                 self.sum += v as f64;
-                                self.int_sum = self.int_sum.wrapping_add(v);
+                                // On i64 overflow, drop the exact-int path so the
+                                // result is the f64 sum, not a silent wraparound.
+                                match self.int_sum.checked_add(v) {
+                                    Some(s) => self.int_sum = s,
+                                    None => self.all_ints = false,
+                                }
                                 self.has_value = true;
                             }
                         }
@@ -6974,7 +7004,10 @@ impl DfAccumulator for CypherSumAccumulator {
                     let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
                     let v = a.value(i);
                     self.sum += v as f64;
-                    self.int_sum = self.int_sum.wrapping_add(v);
+                    match self.int_sum.checked_add(v) {
+                        Some(s) => self.int_sum = s,
+                        None => self.all_ints = false,
+                    }
                     self.has_value = true;
                 }
                 DataType::Float64 => {
@@ -7019,7 +7052,10 @@ impl DfAccumulator for CypherSumAccumulator {
         for i in 0..sum_arr.len() {
             if !has_value_arr.is_null(i) && has_value_arr.value(i) {
                 self.sum += sum_arr.value(i);
-                self.int_sum = self.int_sum.wrapping_add(int_sum_arr.value(i));
+                match self.int_sum.checked_add(int_sum_arr.value(i)) {
+                    Some(s) => self.int_sum = s,
+                    None => self.all_ints = false,
+                }
                 if !all_ints_arr.value(i) {
                     self.all_ints = false;
                 }

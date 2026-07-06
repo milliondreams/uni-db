@@ -568,8 +568,22 @@ impl PropertyManager {
         // they cannot enumerate property names up front.
         let wants_all = properties.contains(&"_all_props");
         for &vid in vids {
-            // If deleted in L0, remove from result
+            // If deleted in L0, remove from result.
             if l0.vertex_tombstones.contains(&vid) {
+                // Version-gate the tombstone exactly like the property branch
+                // below: a deletion committed *after* the pinned snapshot (its
+                // version is beyond the high-water mark) must not remove a
+                // vertex that is still visible at the pinned version. Without
+                // this gate a beyond-pin tombstone wrongly deletes a live row
+                // under a version-pinned / time-travel read.
+                let tombstone_version = l0.vertex_versions.get(&vid).copied().unwrap_or(0);
+                if self
+                    .storage
+                    .version_high_water_mark()
+                    .is_some_and(|hwm| tombstone_version > hwm)
+                {
+                    continue;
+                }
                 result.remove(&vid);
                 continue;
             }

@@ -2110,6 +2110,11 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
+        // Validate the new name like declare_property/add_property do — otherwise
+        // a rename bypasses the reserved-storage-column guard and the leading-
+        // underscore rule, letting a user property collide with an internal Arrow
+        // column (e.g. `_vid`, `src_vid`, `overflow_json`).
+        validate_property_name(new_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let Some(props) = schema.properties.get_mut(label_or_type) else {

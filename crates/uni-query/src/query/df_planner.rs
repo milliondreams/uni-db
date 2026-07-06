@@ -5531,7 +5531,14 @@ impl HybridPhysicalPlanner {
 
         // Build translation context with variable kinds if we have a logical plan
         let tx_ctx = context_plan.map(|p| self.translation_context_for_plan(p));
-        let mut window_expr_list = Vec::new();
+        // Each window with its OWN required input ordering. Two windows with
+        // conflicting ORDER BY (e.g. one ASC, one DESC) cannot share a single
+        // SortExec — evaluating the second over the first's ordering silently
+        // produces wrong ranks. So we sort per window (see the chaining below).
+        let mut window_specs: Vec<(
+            std::sync::Arc<dyn datafusion::physical_expr::window::WindowExpr>,
+            Vec<datafusion::physical_expr::PhysicalSortExpr>,
+        )> = Vec::new();
 
         for expr in window_exprs {
             let Expr::FunctionCall {
@@ -5718,77 +5725,56 @@ impl HybridPhysicalPlanner {
                 None, // filter
             )?;
 
-            window_expr_list.push(window_expr);
-        }
-
-        // WindowAggExec requires input to be sorted by partition columns + order by columns.
-        // Create a SortExec to ensure proper ordering.
-        let mut sort_exprs = Vec::new();
-
-        // Add partition columns to sort (must be sorted by partition first)
-        for expr in window_exprs {
-            if let Expr::FunctionCall {
-                window_spec: Some(window_spec),
-                ..
-            } = expr
-            {
-                for partition_expr in &window_spec.partition_by {
-                    let df_expr = cypher_expr_to_df(partition_expr, tx_ctx.as_ref())?;
-                    let physical_expr =
-                        create_physical_expr(&df_expr, &df_schema, state.execution_props())?;
-
-                    // Only add if not already in sort list
-                    // Use display comparison as proxy for equality since PhysicalExpr doesn't implement Eq
-                    if !sort_exprs
-                        .iter()
-                        .any(|s: &datafusion::physical_expr::PhysicalSortExpr| {
-                            s.expr.to_string() == physical_expr.to_string()
-                        })
-                    {
-                        sort_exprs.push(datafusion::physical_expr::PhysicalSortExpr {
-                            expr: physical_expr,
-                            options: datafusion::arrow::compute::SortOptions {
-                                descending: false,
-                                nulls_first: false,
-                            },
-                        });
-                    }
-                }
-
-                // Then add order by columns
-                for sort_item in &window_spec.order_by {
-                    let df_expr = cypher_expr_to_df(&sort_item.expr, tx_ctx.as_ref())?;
-                    let physical_expr =
-                        create_physical_expr(&df_expr, &df_schema, state.execution_props())?;
-
-                    sort_exprs.push(datafusion::physical_expr::PhysicalSortExpr {
-                        expr: physical_expr,
-                        options: datafusion::arrow::compute::SortOptions {
-                            descending: !sort_item.ascending,
-                            nulls_first: !sort_item.ascending,
-                        },
-                    });
+            // This window's required input ordering: PARTITION BY columns first
+            // (as ascending sorts), then its ORDER BY. Captured per window so each
+            // gets its own SortExec below.
+            let mut required_ordering: Vec<datafusion::physical_expr::PhysicalSortExpr> =
+                Vec::new();
+            for p in &partition_by_physical {
+                required_ordering.push(datafusion::physical_expr::PhysicalSortExpr {
+                    expr: Arc::clone(p),
+                    options: datafusion::arrow::compute::SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                });
+            }
+            for ob in &order_by_physical {
+                if !required_ordering
+                    .iter()
+                    .any(|s| s.expr.to_string() == ob.expr.to_string())
+                {
+                    required_ordering.push(ob.clone());
                 }
             }
+
+            window_specs.push((window_expr, required_ordering));
         }
 
-        // Add SortExec before WindowAggExec if we have partition or order by columns
-        let sorted_input = if !sort_exprs.is_empty() {
-            let lex_ordering = LexOrdering::new(sort_exprs)
-                .ok_or_else(|| anyhow!("Failed to create LexOrdering for window function"))?;
-            Arc::new(SortExec::new(lex_ordering, input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
+        // Chain one SortExec + WindowAggExec per window, so each window is
+        // evaluated over ITS OWN required ordering. A prior version concatenated
+        // every window's PARTITION/ORDER BY into a single SortExec, which cannot
+        // satisfy two windows with conflicting ORDER BY — the second was silently
+        // computed over the first's ordering. (Grouping windows that share an
+        // ordering would be a perf optimization; correctness needs only per-window
+        // sorting, and each WindowAggExec preserves the columns the next sorts on.)
+        let mut plan = input;
+        for (window_expr, ordering) in window_specs {
+            let sorted_input = if ordering.is_empty() {
+                plan
+            } else {
+                let lex_ordering = LexOrdering::new(ordering)
+                    .ok_or_else(|| anyhow!("Failed to create LexOrdering for window function"))?;
+                Arc::new(SortExec::new(lex_ordering, plan)) as Arc<dyn ExecutionPlan>
+            };
+            plan = Arc::new(WindowAggExec::try_new(
+                vec![window_expr],
+                sorted_input,
+                false, // can_repartition - keep data on current partitions
+            )?);
+        }
 
-        // Create WindowAggExec
-        let window_agg_exec = WindowAggExec::try_new(
-            window_expr_list,
-            sorted_input,
-            false, // can_repartition - keep data on current partitions
-        )?;
-
-        Ok(Arc::new(window_agg_exec))
+        Ok(plan)
     }
 
     /// Plan an empty input that produces exactly one row.

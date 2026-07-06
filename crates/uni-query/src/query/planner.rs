@@ -3284,7 +3284,12 @@ impl QueryPlanner {
             };
         }
 
-        if return_clause.skip.is_some() || return_clause.limit.is_some() {
+        // SKIP/LIMIT are parsed here (so a bad expression errors early and the
+        // folded-param note is recorded) but the `Limit` node is added AFTER the
+        // Project/Distinct below: openCypher applies SKIP/LIMIT to the DISTINCT
+        // result, not to the pre-deduplication rows. Adding it here would `LIMIT`
+        // before `DISTINCT` and return too few (or wrong) rows.
+        let skip_limit = if return_clause.skip.is_some() || return_clause.limit.is_some() {
             let skip = return_clause
                 .skip
                 .as_ref()
@@ -3303,13 +3308,10 @@ impl QueryPlanner {
                 })
                 .transpose()?
                 .flatten();
-
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                skip,
-                fetch,
-            };
-        }
+            Some((skip, fetch))
+        } else {
+            None
+        };
 
         if !projections.is_empty() {
             // If we created an Aggregate or Window node, we need to adjust the final projections
@@ -3370,6 +3372,15 @@ impl QueryPlanner {
         if return_clause.distinct {
             plan = LogicalPlan::Distinct {
                 input: Box::new(plan),
+            };
+        }
+
+        // SKIP/LIMIT last — applied to the projected, deduplicated rows.
+        if let Some((skip, fetch)) = skip_limit {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                skip,
+                fetch,
             };
         }
 
@@ -4379,6 +4390,18 @@ impl QueryPlanner {
                 "shortestPath requires at least one relationship: (a)-[*]->(b)"
             ));
         }
+        // Only a single (source)-[rel]->(target) hop is planned below — the
+        // planner reads elements[0..3] and ignores any further hops. Reject a
+        // multi-hop shortestPath rather than SILENTLY dropping the extra
+        // relationship/node constraints (which would return wrong matches). This
+        // mirrors Neo4j, which rejects a multi-relationship shortestPath pattern.
+        if elements.len() > 3 {
+            return Err(anyhow!(
+                "shortestPath supports a single relationship pattern \
+                 (a)-[*]->(b); a multi-hop pattern with intermediate nodes is \
+                 not supported"
+            ));
+        }
 
         let source_node = match &elements[0] {
             PatternElement::Node(n) => n,
@@ -5135,6 +5158,15 @@ impl QueryPlanner {
 
                     // Skip the outer target node if we consumed it
                     if outer_target_node.is_some() {
+                        // This QPP consumed the following outer node as its target.
+                        // A subsequent consecutive QPP must anchor at THAT node, not
+                        // the stale earlier source — so advance last_outer_node_var
+                        // to the consumed target's variable (only the Node arm did
+                        // this before, so `(a)(qpp1)(b)(qpp2)(c)` wrongly anchored
+                        // qpp2 at `a`).
+                        if let Some(v) = target_node.variable.as_ref().filter(|v| !v.is_empty()) {
+                            last_outer_node_var = Some(v.clone());
+                        }
                         i += 2; // skip both Parenthesized and the following Node
                     } else {
                         i += 1;
@@ -7292,13 +7324,10 @@ impl QueryPlanner {
             .transpose()?
             .flatten();
 
-        if skip.is_some() || fetch.is_some() {
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                skip,
-                fetch,
-            };
-        }
+        // SKIP/LIMIT applied to the DISTINCT result — the `Limit` node is added
+        // AFTER the Distinct below, not here (openCypher applies it to the
+        // deduplicated rows, not the pre-distinct ones).
+        let skip_limit = (skip.is_some() || fetch.is_some()).then_some((skip, fetch));
 
         // Strip passthrough columns that were only needed by WHERE / ORDER BY.
         if needs_cleanup {
@@ -7315,6 +7344,15 @@ impl QueryPlanner {
         if with_clause.distinct {
             plan = LogicalPlan::Distinct {
                 input: Box::new(plan),
+            };
+        }
+
+        // SKIP/LIMIT last — applied to the projected, deduplicated rows.
+        if let Some((skip, fetch)) = skip_limit {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                skip,
+                fetch,
             };
         }
 

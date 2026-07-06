@@ -2457,10 +2457,16 @@ async fn build_edge_adjacency_map(
                     Arc::clone(&edge_type),
                     Arc::clone(&props),
                 ));
-                adjacency
-                    .entry(dst_vid)
-                    .or_default()
-                    .push((src_vid, eid, edge_type, props));
+                // A self-loop (src == dst) would otherwise be listed TWICE under
+                // the same source — once per orientation — and an undirected match
+                // `(a)-[:R]-(b)` over it would yield a duplicate row. It is a single
+                // relationship, so list it only once.
+                if dst_vid != src_vid {
+                    adjacency
+                        .entry(dst_vid)
+                        .or_default()
+                        .push((src_vid, eid, edge_type, props));
+                }
             }
         }
     }

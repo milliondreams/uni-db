@@ -132,8 +132,9 @@ async fn repro_02_call_write_dedup() {
     let rows = h.run_ok("MATCH (n:N) RETURN count(n) AS c").await;
     let c = as_int(&cell(&rows[0], "c"));
     println!("[2] node count after 3 identical CALL{{CREATE}} = {c} (correct=3)");
-    // BUG: expected 3, got 1 (rows 2,3 hit the params dedup cache)
-    assert_eq!(c, 1, "repro for apply.rs:823");
+    // FIXED (apply.rs): a WRITING subquery is never deduped by the params cache,
+    // so its side effect runs once per outer row — 3 identical rows create 3 nodes.
+    assert_eq!(c, 3, "a writing CALL subquery must execute per outer row");
 }
 
 // ===========================================================================
@@ -322,9 +323,10 @@ async fn repro_12_window_conflicting_orderby() {
     let r1 = as_int(&cell(row10, "r1"));
     let r2 = as_int(&cell(row10, "r2"));
     println!("[12] age=10 -> r1={r1} r2={r2} (correct r1=1 r2=3)");
-    // BUG: r2 == r1 because DESC window evaluated over ASC-sorted rows
+    // FIXED (df_planner.rs): each window has its own SortExec, so the DESC window
+    // ranks over DESC-sorted rows — age=10 is r1=1 (ASC) and r2=3 (DESC).
     assert_eq!(r1, 1);
-    assert_eq!(r2, 1, "repro for df_planner.rs:5766: r2 should be 3 but equals r1");
+    assert_eq!(r2, 3, "conflicting-ORDER-BY windows must each sort independently");
 }
 
 // ===========================================================================
@@ -376,9 +378,9 @@ async fn repro_18_distinct_limit_order() {
     h.run_ok("CREATE (:P {name:'bob'})").await;
     let rows = h.run_ok("MATCH (n:P) RETURN DISTINCT n.name LIMIT 2").await;
     println!("[18] DISTINCT name LIMIT 2 -> rows={}: {rows:?}", rows.len());
-    // correct (openCypher): DISTINCT first -> {alice,bob}, LIMIT 2 -> 2 rows.
-    // BUG: LIMIT first on 3 pre-distinct rows, then dedup -> 1 row.
-    assert_eq!(rows.len(), 1, "repro for planner.rs:3351: LIMIT before DISTINCT");
+    // FIXED (planner.rs): SKIP/LIMIT is applied AFTER DISTINCT — DISTINCT first
+    // yields {alice, bob}, then LIMIT 2 keeps both.
+    assert_eq!(rows.len(), 2, "LIMIT must apply to the DISTINCT result, not the pre-distinct rows");
 }
 
 // ===========================================================================
@@ -462,8 +464,9 @@ async fn repro_38_self_loop_both_dup() {
     h.run_ok("CREATE (a:N {id:1})-[:R]->(a)").await;
     let rows = h.run_ok("MATCH (a:N)-[r:R]-(b) RETURN a.id AS aid, b.id AS bid").await;
     println!("[38] undirected self-loop -> rows={}: {rows:?}", rows.len());
-    // correct: 1 row. BUG: self-loop double-inserted -> 2 rows.
-    assert_eq!(rows.len(), 2, "repro for traverse.rs:2049: self-loop dup under Both");
+    // FIXED (traverse.rs): a self-loop is listed once under its source, so an
+    // undirected match yields exactly one row.
+    assert_eq!(rows.len(), 1, "undirected self-loop must yield exactly one row");
 }
 
 // ===========================================================================
@@ -507,17 +510,13 @@ async fn repro_34_shortestpath_multihop() {
         .run("MATCH p = shortestPath((a:Person {name:'a'})-[:KNOWS]->(b:Person)-[:WORKS_AT]->(c:Company)) RETURN b.name AS bn")
         .await;
     println!("[34] multi-hop shortestPath -> {res:?}");
-    // Either an error (correct per Neo4j) or the WORKS_AT hop is honored.
-    // BUG: second hop dropped -> matches on KNOWS only, returns x/b regardless.
-    match res {
-        Ok(rows) => {
-            // if the WORKS_AT constraint were honored, only b (which has WORKS_AT->c)
-            // would qualify. If x appears, the second hop was dropped.
-            let names: Vec<Value> = rows.iter().map(|r| cell(r, "bn")).collect();
-            println!("[34] bn values: {names:?}");
-        }
-        Err(e) => println!("[34] Err (acceptable per Neo4j): {e}"),
-    }
+    // FIXED (planner.rs): a multi-hop shortestPath is REJECTED rather than
+    // silently dropping the second hop's constraint (which returned wrong matches).
+    // Matches Neo4j, which rejects a multi-relationship shortestPath.
+    assert!(
+        res.is_err(),
+        "multi-hop shortestPath must be rejected, not silently reduced to the first hop: {res:?}"
+    );
 }
 
 // ===========================================================================
@@ -663,15 +662,16 @@ async fn repro_21_consecutive_qpp() {
     let res = h
         .run("MATCH (a:V {id:1})((x)-[:R]->(y)){1,2}(b)((w)-[:S]->(z)){1,2}(c) RETURN a.id AS a, b.id AS b, c.id AS c")
         .await;
-    match res {
-        Ok(rows) => {
-            println!("[21] two-QPP chain -> rows={}: {rows:?}", rows.len());
-            // correct: connected chain a=1,b=3,c reachable via S from 3 (id 4 or 5).
-            // BUG: second QPP anchored at 'a'(=1) not 'b'(=3), so c from S-edges of 1
-            // (none) -> empty, or spurious rows.
-        }
-        Err(e) => println!("[21] errored (QPP parse/plan): {e}"),
-    }
+    let rows = res.expect("two-QPP chain should plan and execute");
+    println!("[21] two-QPP chain -> rows={}: {rows:?}", rows.len());
+    // FIXED (planner.rs): the second QPP anchors at `b` (the first QPP's target),
+    // not the stale source `a`. Only b=3 has S-edges, so the connected chain is
+    // a=1, b=3, c in {4,5}. Before the fix qpp2 anchored at a=1 (no S-edges) → empty.
+    assert!(!rows.is_empty(), "the connected two-QPP chain must yield rows");
+    assert!(
+        rows.iter().all(|r| as_int(&cell(r, "b")) == 3),
+        "the second QPP must anchor at b=3 (the first QPP's target): {rows:?}"
+    );
 }
 
 // ===========================================================================

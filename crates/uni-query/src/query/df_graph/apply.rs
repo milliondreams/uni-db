@@ -825,9 +825,17 @@ async fn run_apply(
             (merged, HashMap::new())
         };
 
-        // Check cache for identical row params
+        // Check cache for identical row params. NEVER dedup a subquery that
+        // WRITES: its side effects (e.g. `UNWIND [1,1,1] AS x CALL { CREATE (:N) }`)
+        // must run once per outer row, so a params-keyed cache hit would execute
+        // them only once. The cache is read-only-subquery-only.
         let params_key = canonical_params_key(row_params);
-        let sub_rows = if let Some(cached_rows) = subplan_cache.get(&params_key) {
+        let cached = if subquery_has_writes {
+            None
+        } else {
+            subplan_cache.get(&params_key)
+        };
+        let sub_rows = if let Some(cached_rows) = cached {
             // Cache hit: reuse previous results
             cache_hits += 1;
             tracing::debug!("run_apply: cache hit for row params, skipping execute_subplan");
@@ -857,7 +865,10 @@ async fn run_apply(
             );
 
             let rows = batches_to_row_maps(&sub_batches);
-            subplan_cache.insert(params_key, rows.clone());
+            // Only memoize read-only subqueries (see above).
+            if !subquery_has_writes {
+                subplan_cache.insert(params_key, rows.clone());
+            }
             rows
         };
 

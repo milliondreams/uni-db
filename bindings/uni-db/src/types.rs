@@ -1873,10 +1873,11 @@ impl PyPreparedLocy {
             .lock()
             .map(|g| {
                 let t = g.program_text();
-                if t.len() > 60 {
-                    format!("{}...", &t[..60])
-                } else {
-                    t.to_string()
+                // Truncate by CHARACTER, not byte index: `&t[..60]` panics when
+                // byte 60 falls inside a multibyte UTF-8 codepoint.
+                match t.char_indices().nth(60) {
+                    Some((byte_idx, _)) => format!("{}...", &t[..byte_idx]),
+                    None => t.to_string(),
                 }
             })
             .unwrap_or_else(|_| "<locked>".to_string());

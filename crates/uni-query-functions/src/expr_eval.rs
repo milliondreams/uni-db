@@ -1136,7 +1136,10 @@ fn eval_size(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(arr) => Ok(Value::Int(arr.len() as i64)),
         Value::Map(map) => Ok(Value::Int(map.len() as i64)),
-        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        // Character count, not byte length: Cypher size()/length() count
+        // codepoints (matching the DataFusion `cypher_size_scalar` path), so a
+        // non-ASCII string like "café" is 4, not 5.
+        Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("size() expects a List, Map, or String")),
     }
@@ -1192,7 +1195,10 @@ fn eval_last(arg: &Value) -> Result<Value> {
 fn eval_length(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(arr) => Ok(Value::Int(arr.len() as i64)),
-        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        // Character count, not byte length: Cypher size()/length() count
+        // codepoints (matching the DataFusion `cypher_size_scalar` path), so a
+        // non-ASCII string like "café" is 4, not 5.
+        Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Path(p) => Ok(Value::Int(p.edges.len() as i64)),
         Value::Map(map) => {
             // Path object encoded as map (legacy fallback)

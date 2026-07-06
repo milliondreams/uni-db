@@ -77,13 +77,27 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode lowercase/uppercase hex; errors on odd length or non-hex digits.
+///
+/// Operates on raw bytes (`chunks_exact(2)`), NOT `&s[i..i+2]` string slicing:
+/// the guest controls this string, and byte-index slicing panics on a multibyte
+/// UTF-8 codepoint that happens to make the byte length even. A non-ASCII byte
+/// simply fails the hex-digit test and returns `Err`.
 pub(crate) fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_owned());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+    fn nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex digit".to_owned()),
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 
@@ -230,6 +244,34 @@ mod tests {
     #[test]
     fn from_hex_rejects_odd_length() {
         assert!(from_hex("abc").is_err());
+    }
+
+    /// Repro for `crates/uni-plugin-extism/src/host_svc/mod.rs:86`.
+    ///
+    /// `from_hex` slices the guest-controlled string with BYTE indices
+    /// (`&s[i..i + 2]`) after only checking that the BYTE length is even. An
+    /// even-byte-length input containing a multibyte UTF-8 codepoint passes the
+    /// `len % 2` guard but the byte slice lands mid-codepoint, so `str` range
+    /// indexing PANICS ("byte index N is not a char boundary") instead of
+    /// returning the documented `Err`. Callers (kms/net `do_*`) wrap the result
+    /// in `.map_err(...)` expecting a recoverable `Result` — they cannot catch a
+    /// panic, so a guest can trigger a host-fn panic (DoS) with a crafted hex
+    /// field.
+    ///
+    /// Regression: `from_hex` decodes on raw bytes, so an even-byte-length input
+    /// containing a multibyte UTF-8 codepoint returns `Err` instead of panicking
+    /// on a non-char-boundary byte slice (a guest-triggerable host-fn DoS).
+    #[test]
+    fn from_hex_errors_on_even_byte_multibyte_input() {
+        // "aéb" = [0x61, 0xC3, 0xA9, 0x62] — 4 bytes (even, passes len%2), but
+        // 'é' occupies byte indices 1..=2, which byte-index slicing would split.
+        let input = "aéb";
+        assert_eq!(input.len(), 4, "precondition: even byte length");
+        let res = from_hex(input);
+        assert!(
+            res.is_err(),
+            "from_hex must return Err on non-hex multibyte input, not panic; got {res:?}"
+        );
     }
 
     #[test]

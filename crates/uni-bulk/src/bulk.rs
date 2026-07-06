@@ -651,14 +651,28 @@ impl BulkWriter {
 
     /// Compute a unique key string from properties for UNIQUE constraint checking.
     fn compute_unique_key(&self, unique_props: &[String], props: &Properties) -> Option<String> {
-        let mut parts = Vec::new();
+        // Build the key from length-prefixed, type-tagged codec bytes rather than
+        // a lossy `Display` join. `to_string()` collided distinct values —
+        // Int(1) vs Float(1.0) both render "1", ("x:y","z") vs ("x","y:z") both
+        // render "x:y:z", and equal-length Bytes rendered alike. The codec tags
+        // the type and the length prefix makes field boundaries unambiguous.
+        // (finding uni-bulk[3])
+        let mut buf: Vec<u8> = Vec::new();
         for prop in unique_props {
-            match props.get(prop) {
-                Some(v) if !v.is_null() => parts.push(v.to_string()),
+            let v = match props.get(prop) {
+                Some(v) if !v.is_null() => v,
                 _ => return None, // Missing property means can't enforce uniqueness
-            }
+            };
+            let enc = uni_common::cypher_value_codec::encode(v);
+            buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&enc);
         }
-        Some(parts.join(":"))
+        // Hex so the (binary) key stays a String for the dedup sets.
+        Some(buf.iter().fold(String::with_capacity(buf.len() * 2), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        }))
     }
 
     /// Whether a committed row (L1/L2) already holds this UNIQUE key.

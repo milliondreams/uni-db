@@ -56,6 +56,8 @@ pub mod repro_schema_edge_type_swallow;
 // Correctness-scan Wave 1 repros (R5 constraint visibility).
 pub mod bug_bulk_index_skip_both_defer_false_repro;
 pub mod bug_bulk_unique_preexisting_repro;
+// Correctness-scan Wave 1 repros (R10 integer precision / lossy key).
+pub mod bug_bulk_unique_key_lossy_repro;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

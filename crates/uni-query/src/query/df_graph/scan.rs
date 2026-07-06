@@ -1227,6 +1227,72 @@ fn filter_l0_tombstones(
     arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
+/// Drop rows for a known-label scan whose newest L0 label-overwrite no longer
+/// includes the scanned label(s).
+///
+/// A flushed vertex's stored `labels` array still lists a label after a
+/// `REMOVE n:Label` — the removal only updated L0. The label-scan candidate set
+/// unions that stale flushed row, and neither the `_deleted` nor the vid-tombstone
+/// filter drops it. When the newest L0 buffer carrying the vid flagged it in
+/// `vertex_label_overwrites` (a `SET`/`REMOVE` that resolved its full label set),
+/// that set is authoritative: keep the row only if it still contains every
+/// requested label. Otherwise the label was resurrected in `MATCH (n:Label)`.
+///
+/// `label` may be `"A:B"` (all required) or empty (bare `MATCH (n)` — nothing to
+/// filter). Mirrors the multi-label membership check in
+/// `build_l0_schemaless_vertex_batch`.
+///
+/// # Errors
+/// Returns an error if the `_vid` column is missing or the mask filter fails.
+fn filter_l0_label_overwrites(
+    batch: &RecordBatch,
+    label: &str,
+    l0_ctx: &crate::query::df_graph::L0Context,
+) -> DFResult<RecordBatch> {
+    if batch.num_rows() == 0 || label.is_empty() {
+        return Ok(batch.clone());
+    }
+    let required: Vec<&str> = label.split(':').collect();
+
+    // vid -> resolved label set from the NEWEST buffer that marked it as a full
+    // label overwrite. `iter_l0_buffers` yields oldest -> newest, so later writes
+    // win.
+    let mut overwritten: HashMap<u64, Vec<String>> = HashMap::new();
+    for l0 in l0_ctx.iter_l0_buffers() {
+        let guard = l0.read();
+        for vid in guard.vertex_label_overwrites.iter() {
+            let labels = guard.vertex_labels.get(vid).cloned().unwrap_or_default();
+            overwritten.insert(vid.as_u64(), labels);
+        }
+    }
+    if overwritten.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let vid_col = batch
+        .column_by_name("_vid")
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal("Missing _vid column".to_string())
+        })?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+
+    let keep: Vec<bool> = (0..vid_col.len())
+        .map(|i| match overwritten.get(&vid_col.value(i)) {
+            // The vid's newest overwrite resolved its full label set: keep only
+            // if that set still contains every requested label.
+            Some(resolved) => required
+                .iter()
+                .all(|lf| resolved.iter().any(|l| l == lf)),
+            // No overwrite for this vid: the stored (Lance or L0) labels stand.
+            None => true,
+        })
+        .collect();
+    let mask = arrow_array::BooleanArray::from(keep);
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
+}
+
 /// Filter out rows whose `eid` appears in L0 edge tombstones.
 fn filter_l0_edge_tombstones(
     batch: &RecordBatch,
@@ -1814,16 +1880,26 @@ fn build_labels_column_for_known_label(
             labels.push(label.to_string());
         }
 
-        // Merge additional labels from L0 buffers
+        // Merge additional labels from L0 buffers, honoring label-overwrite
+        // markers: a vid flagged in `vertex_label_overwrites` has its full label
+        // set resolved by a SET/REMOVE, which REPLACES the stored labels (newest
+        // buffer wins) — so a REMOVE of the scanned label is respected rather
+        // than resurrected by the union or the defensive push above.
+        let mut overwrite_labels: Option<Vec<String>> = None;
         for l0 in l0_ctx.iter_l0_buffers() {
             let guard = l0.read();
-            if let Some(l0_labels) = guard.vertex_labels.get(&vid) {
+            if guard.vertex_label_overwrites.contains(&vid) {
+                overwrite_labels = guard.vertex_labels.get(&vid).cloned();
+            } else if let Some(l0_labels) = guard.vertex_labels.get(&vid) {
                 for lbl in l0_labels {
                     if !labels.contains(lbl) {
                         labels.push(lbl.clone());
                     }
                 }
             }
+        }
+        if let Some(resolved) = overwrite_labels {
+            labels = resolved;
         }
 
         let values = labels_builder.values();
@@ -2265,6 +2341,11 @@ async fn columnar_scan_vertex_batch_static(
     // Filter L0 tombstones
     let filtered = filter_l0_tombstones(&merged, l0_ctx)?;
 
+    // Symmetric with the schemaless path: drop a flushed row whose scanned label
+    // was REMOVE'd in L0 (a no-op unless a vid carries a label-overwrite marker
+    // that no longer includes `label`).
+    let filtered = filter_l0_label_overwrites(&filtered, label, l0_ctx)?;
+
     if filtered.num_rows() == 0 {
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
@@ -2563,6 +2644,10 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     // Filter L0 tombstones
     let filtered = filter_l0_tombstones(&merged, l0_ctx)?;
 
+    // Drop stale flushed rows whose label was REMOVE'd in L0 (the flushed
+    // `labels` array still lists it, but the newest L0 overwrite doesn't).
+    let filtered = filter_l0_label_overwrites(&filtered, label, l0_ctx)?;
+
     if filtered.num_rows() == 0 {
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
@@ -2800,16 +2885,30 @@ fn map_to_schemaless_output_schema(
             }
         }
 
-        // Overlay L0 labels
+        // Overlay L0 labels, honoring label-overwrite markers.
+        //
+        // A vid flagged in `vertex_label_overwrites` had its FULL label set
+        // resolved by a `SET`/`REMOVE n:Label`; that buffer's labels REPLACE the
+        // stored batch labels (newest buffer wins; buffers iterate oldest →
+        // newest). A vid without the marker only contributes additive labels
+        // (union). Without the replace, a union-only overlay could never drop a
+        // label, so a `REMOVE n:Label` resurrected the removed label in
+        // `labels(n)`.
+        let mut overwrite_labels: Option<Vec<String>> = None;
         for l0 in l0_ctx.iter_l0_buffers() {
             let guard = l0.read();
-            if let Some(l0_labels) = guard.vertex_labels.get(&vid) {
+            if guard.vertex_label_overwrites.contains(&vid) {
+                overwrite_labels = guard.vertex_labels.get(&vid).cloned();
+            } else if let Some(l0_labels) = guard.vertex_labels.get(&vid) {
                 for lbl in l0_labels {
                     if !row_labels.contains(lbl) {
                         row_labels.push(lbl.clone());
                     }
                 }
             }
+        }
+        if let Some(resolved) = overwrite_labels {
+            row_labels = resolved;
         }
 
         let values = labels_builder.values();

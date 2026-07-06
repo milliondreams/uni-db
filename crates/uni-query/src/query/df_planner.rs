@@ -2791,6 +2791,7 @@ impl HybridPhysicalPlanner {
         target_label_id: u16,
         target_variable: &str,
         all_properties: &HashMap<String, HashSet<String>>,
+        optional: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::common::NullEquality;
         use datafusion::physical_expr::expressions::{Column, col as col_expr};
@@ -2840,12 +2841,21 @@ impl HybridPhysicalPlanner {
             Arc::new(Column::new(&vid_col_name, left_idx)),
             Arc::new(Column::new(&vid_col_name, right_idx)),
         )];
+        // An OPTIONAL traverse emits NULL-target rows (unmatched `{target}._vid`);
+        // a Left join preserves them (right side null-padded) instead of dropping
+        // them as an Inner join would, keeping OPTIONAL MATCH semantics intact for
+        // a plugin virtual target.
+        let join_type = if optional {
+            JoinType::Left
+        } else {
+            JoinType::Inner
+        };
         let join = HashJoinExec::try_new(
             traverse_plan,
             catalog_plan,
             on,
             None,
-            &JoinType::Inner,
+            &join_type,
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
@@ -3020,6 +3030,7 @@ impl HybridPhysicalPlanner {
                 target_label_id,
                 target_variable,
                 all_properties,
+                optional,
             )?
         } else {
             projected
@@ -3537,6 +3548,7 @@ impl HybridPhysicalPlanner {
                 target_label_id,
                 target_variable,
                 all_properties,
+                optional,
             )?;
         }
 
@@ -4327,12 +4339,17 @@ impl HybridPhysicalPlanner {
             compiled.swap(0, anchor_pair_idx);
         }
 
-        // 6. Translate join_type. RIGHT outer is rejected — we can't
-        // produce probe rows that don't match any build VID, since our
-        // probe scan only fetches rows whose `_vid` is in the build set.
-        let join_kind = match join_type {
-            JoinType::Inner => VidJoinKind::Inner,
-            JoinType::Left => VidJoinKind::Left,
+        // 6. Translate join_type. This operator is build-outer: it fully
+        // materializes the build side and fetches the probe *by* build VIDs, so
+        // it can only null-pad unmatched BUILD rows — never unmatched probe rows
+        // (those are never scanned). RIGHT outer is therefore rejected, and LEFT
+        // outer is correct only when the build side IS the left (outer) side, i.e.
+        // the probe is on the right. When the probe is on the left, emitting this
+        // fast-path would preserve the right side instead — inverting LEFT to
+        // RIGHT semantics — so bail and let the standard join handle it.
+        let join_kind = match (join_type, probe_side) {
+            (JoinType::Inner, _) => VidJoinKind::Inner,
+            (JoinType::Left, ProbeSide::Right) => VidJoinKind::Left,
             _ => return Ok(None),
         };
 

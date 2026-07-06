@@ -86,7 +86,7 @@ impl GraphExtIdLookupExec {
         let ext_id = ext_id.into();
 
         // Build output schema
-        let schema = Self::build_schema(&variable, &projected_properties);
+        let schema = Self::build_schema(&variable, &projected_properties, optional);
         let properties = compute_plan_properties(schema.clone());
 
         Self {
@@ -102,11 +102,17 @@ impl GraphExtIdLookupExec {
     }
 
     /// Build the output schema.
-    fn build_schema(variable: &str, properties: &[String]) -> SchemaRef {
+    ///
+    /// An OPTIONAL lookup with no match emits a null row (see `build_null_row`),
+    /// so the identity columns (`_vid`/`ext_id`/`_label`) must be declared
+    /// nullable in that case — otherwise `RecordBatch::try_new` rejects the null
+    /// row and the query errors instead of returning the required null row. A
+    /// non-optional lookup keeps them non-nullable (they are always populated).
+    fn build_schema(variable: &str, properties: &[String], optional: bool) -> SchemaRef {
         let mut fields = vec![
-            Field::new(format!("{}._vid", variable), DataType::UInt64, false),
-            Field::new(format!("{}.ext_id", variable), DataType::Utf8, false),
-            Field::new(format!("{}._label", variable), DataType::Utf8, false),
+            Field::new(format!("{}._vid", variable), DataType::UInt64, optional),
+            Field::new(format!("{}.ext_id", variable), DataType::Utf8, optional),
+            Field::new(format!("{}._label", variable), DataType::Utf8, optional),
         ];
 
         // Add property columns with variable prefix
@@ -463,8 +469,11 @@ mod tests {
 
     #[test]
     fn test_build_schema() {
-        let schema =
-            GraphExtIdLookupExec::build_schema("n", &["name".to_string(), "age".to_string()]);
+        let schema = GraphExtIdLookupExec::build_schema(
+            "n",
+            &["name".to_string(), "age".to_string()],
+            false,
+        );
 
         assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), "n._vid");
@@ -472,5 +481,12 @@ mod tests {
         assert_eq!(schema.field(2).name(), "n._label");
         assert_eq!(schema.field(3).name(), "n.name");
         assert_eq!(schema.field(4).name(), "n.age");
+
+        // Optional lookups declare the identity columns nullable so the null row
+        // (build_null_row) is accepted by RecordBatch::try_new.
+        let opt = GraphExtIdLookupExec::build_schema("n", &[], true);
+        assert!(opt.field(0).is_nullable(), "_vid must be nullable when optional");
+        assert!(opt.field(1).is_nullable(), "ext_id must be nullable when optional");
+        assert!(opt.field(2).is_nullable(), "_label must be nullable when optional");
     }
 }

@@ -1148,8 +1148,12 @@ fn build_optional_null_batch_for_rows(
 fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
     optional_vars.contains(col_name)
         || optional_vars.iter().any(|var| {
+            // `var.` property columns (e.g. `x.name`), and the exact internal
+            // edge-id column `__eid_to_<var>`. Match the edge-id column by full
+            // name, not a suffix: `ends_with(var)` wrongly claims `__eid_to_xx`
+            // for optional var `x`, so null-filling `x` would clobber `xx`.
             (col_name.starts_with(var.as_str()) && col_name[var.len()..].starts_with('.'))
-                || (col_name.starts_with("__eid_to_") && col_name.ends_with(var.as_str()))
+                || col_name == format!("__eid_to_{var}")
         })
 }
 

@@ -240,23 +240,15 @@ async fn repro_03_apply_startswith_input_filter() {
 #[tokio::test]
 async fn repro_04_optional_ext_id_null_row() {
     let h = Harness::new_schemaless().await;
-    let res = h.run("OPTIONAL MATCH (n {ext_id: 'does-not-exist'}) RETURN n").await;
-    match &res {
-        Ok(rows) => {
-            println!("[4] ext_id OPTIONAL no-match -> Ok rows={}", rows.len());
-            // correct behavior: exactly one null row
-            assert_eq!(rows.len(), 1, "expected 1 null row");
-        }
-        Err(e) => {
-            let msg = format!("{e}");
-            println!("[4] ext_id OPTIONAL no-match -> Err: {msg}");
-            // BUG: non-nullable column error instead of a null row
-            assert!(
-                msg.contains("non-nullable") || msg.contains("null"),
-                "repro for ext_id_lookup.rs:107: got error {msg}"
-            );
-        }
-    }
+    // FIXED (ext_id_lookup.rs): an OPTIONAL ext_id lookup declares the identity
+    // columns nullable, so the no-match null row is accepted (was a hard
+    // "non-nullable column" error from RecordBatch::try_new).
+    let rows = h
+        .run_ok("OPTIONAL MATCH (n {ext_id: 'does-not-exist'}) RETURN n")
+        .await;
+    // The key fix: the query no longer errors with a non-nullable-column failure;
+    // it returns exactly one recovery row for the unmatched OPTIONAL.
+    assert_eq!(rows.len(), 1, "OPTIONAL no-match must return exactly one null row");
 }
 
 // ===========================================================================
@@ -266,12 +258,20 @@ async fn repro_04_optional_ext_id_null_row() {
 async fn repro_09_pattern_exists_null_bound_target() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (:N)-[:R]->(:Other)").await;
+    // The `WITH n, m` promotes the pattern in the following WHERE to a genuine
+    // top-level filter (unlike `OPTIONAL MATCH ... WHERE ...`, where the WHERE is
+    // part of the optional match and the source row is preserved regardless). m
+    // is NULL (no :M nodes), so `(n)-[:R]->(m)` references a null node.
     let rows = h
-        .run_ok("MATCH (n:N) OPTIONAL MATCH (m:M {id:999}) WHERE (n)-[:R]->(m) RETURN n")
+        .run_ok(
+            "MATCH (n:N) OPTIONAL MATCH (n)-[:KNOWS]->(m:M) \
+             WITH n, m WHERE (n)-[:R]->(m) RETURN n",
+        )
         .await;
     println!("[9] pattern exists with NULL bound target -> rows={}", rows.len());
-    // BUG: m is NULL for every row, correct=0 rows; got 1 (any :R neighbor -> true)
-    assert_eq!(rows.len(), 1, "repro for pattern_exists.rs:410");
+    // FIXED (pattern_exists.rs): with m NULL, `(n)-[:R]->(m)` is NULL (not "n has
+    // any :R neighbor"), so the top-level WHERE filters the row out.
+    assert_eq!(rows.len(), 0, "NULL bound target must make the pattern NULL, filtering the row");
 }
 
 // ===========================================================================
@@ -286,29 +286,21 @@ async fn repro_11_vid_lookup_left_inverted() {
     let res = h
         .run("MATCH (a:Person) OPTIONAL MATCH (b:Employee) WHERE id(a) = id(b) RETURN a.name AS an, b.name AS bn ORDER BY an")
         .await;
-    match res {
-        Ok(rows) => {
-            println!("[11] LEFT-outer id join rows={}: {rows:?}", rows.len());
-            // correct: 2 rows {p1,NULL},{p2,NULL} (both Persons preserved).
-            let ans: Vec<Value> = rows.iter().map(|r| cell(r, "an")).collect();
-            let has_null_an = ans.iter().any(|v| matches!(v, Value::Null));
-            // BUG: inverted (RIGHT) semantics -> Person side null-padded / dropped.
-            assert!(
-                rows.len() != 2 || has_null_an,
-                "repro for vid_lookup_join.rs:463: expected inverted outer semantics, got {rows:?}"
-            );
-        }
-        Err(e) => {
-            // The inverted semantics null-pad the (declared non-nullable) Person
-            // side, so DataFusion raises a non-nullable-column error. Either the
-            // hard error or the inverted rows demonstrate the defect.
-            let msg = format!("{e}");
-            println!("[11] LEFT-outer id join errored: {msg}");
-            assert!(
-                msg.contains("_vid") || msg.contains("non-nullable"),
-                "repro for vid_lookup_join.rs:463: unexpected error {msg}"
-            );
-        }
+    let rows = res.expect("LEFT-outer id join must succeed (falls back to a standard join)");
+    println!("[11] LEFT-outer id join rows={}: {rows:?}", rows.len());
+    // FIXED: the build-outer vid-lookup fast-path bails when the outer (left)
+    // side would be the probe (which would invert LEFT to RIGHT); the standard
+    // join then preserves both Persons with a NULL Employee.
+    assert_eq!(rows.len(), 2, "both Persons must be preserved by LEFT outer");
+    for r in &rows {
+        assert!(
+            !matches!(cell(r, "an"), Value::Null),
+            "Person name (left/outer side) must be non-null: {r:?}"
+        );
+        assert!(
+            matches!(cell(r, "bn"), Value::Null),
+            "Employee (right/optional side) must be NULL (no match): {r:?}"
+        );
     }
 }
 
@@ -583,11 +575,10 @@ async fn repro_07_optional_filter_batches() {
         .run_ok("MATCH (a:A) OPTIONAL MATCH (b:B) WHERE b.y > 99999 RETURN a.x AS ax, b.y AS by")
         .await;
     println!("[7] all-fail OPTIONAL over 20000 B -> rows={} (correct=1)", rows.len());
-    // BUG: one null row per input batch (~3 for 20000 rows / 8192).
-    if rows.len() > 1 {
-        println!("[7] REPRODUCED: {} null rows instead of 1", rows.len());
-    }
-    assert!(rows.len() >= 1);
+    // FIXED (optional_filter.rs): NULL recovery rows are now buffered across
+    // batches and flushed once at end-of-stream, so an all-fail source group that
+    // spans several 8192-row batches yields exactly ONE null row, not one per batch.
+    assert_eq!(rows.len(), 1, "all-fail OPTIONAL over one source group must yield exactly one null row");
 }
 
 // ===========================================================================

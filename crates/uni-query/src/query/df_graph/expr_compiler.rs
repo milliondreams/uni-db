@@ -809,7 +809,15 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         for step in &steps {
             if let Some(var) = &step.target_variable {
                 let vid_col = format!("{}._vid", var);
-                if input_schema.column_with_name(&vid_col).is_some() {
+                // Bound when the target is materialized in the input: either a flat
+                // `{var}._vid` column, or the whole-node column `{var}` (a struct or
+                // CypherValue blob, e.g. from `OPTIONAL MATCH (m)` in schemaless
+                // mode). The exec resolves `{var}._vid` by stripping the suffix and
+                // extracting `_vid` from that node column, and treats a null node as
+                // a NULL bound target (pattern is NULL, not "any neighbor").
+                if input_schema.column_with_name(&vid_col).is_some()
+                    || input_schema.column_with_name(var).is_some()
+                {
                     bound_target_columns.push(Some(vid_col));
                 } else if self.outer_entity_vars.contains(var) {
                     // Named variable from outer scope — correlated, can't vectorize.

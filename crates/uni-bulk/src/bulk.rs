@@ -588,6 +588,23 @@ impl BulkWriter {
                                     k
                                 ));
                             }
+
+                            // Also consult committed storage (L1/L2). The
+                            // seen_unique_keys set only covers this writer's
+                            // lifetime, so a key that already exists as a
+                            // committed row was invisible and silently twinned.
+                            // Mirrors the single-vertex check_unique_constraint_multi
+                            // storage step. (finding uni-bulk[4])
+                            if self
+                                .unique_key_exists_in_storage(label, unique_props, props)
+                                .await?
+                            {
+                                return Err(anyhow!(
+                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with a committed row",
+                                    idx,
+                                    k
+                                ));
+                            }
                             batch_keys.push(k);
                         }
                     }
@@ -642,6 +659,52 @@ impl BulkWriter {
             }
         }
         Some(parts.join(":"))
+    }
+
+    /// Whether a committed row (L1/L2) already holds this UNIQUE key.
+    ///
+    /// Mirrors the storage step of the single-vertex
+    /// `Writer::check_unique_constraint_multi`: build a typed `prop = value`
+    /// filter over the unique properties and count live rows. Returns `false`
+    /// when any unique property is missing/null (can't enforce), or when the
+    /// label's vertex table isn't flushed yet.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend scan/count errors rather than failing open.
+    async fn unique_key_exists_in_storage(
+        &self,
+        label: &str,
+        unique_props: &[String],
+        props: &Properties,
+    ) -> Result<bool> {
+        let mut filters = Vec::with_capacity(unique_props.len());
+        for prop in unique_props {
+            let val = match props.get(prop) {
+                Some(v) if !v.is_null() => v,
+                _ => return Ok(false),
+            };
+            let val_str = match val {
+                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::Int(n) => n.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Bool(b) => b.to_string(),
+                // Non-scalar unique keys aren't representable as a scan filter;
+                // fall back to the in-load/L0 checks rather than error.
+                _ => return Ok(false),
+            };
+            filters.push(format!("{prop} = {val_str}"));
+        }
+
+        let mut filter = filters.join(" AND ");
+        filter.push_str(" AND _deleted = false");
+
+        let backend = self.backend.storage.backend();
+        let table = uni_store::backend::table_names::vertex_table_name(label);
+        if !backend.table_exists(&table).await? {
+            return Ok(false);
+        }
+        Ok(backend.count_rows(&table, Some(filter.as_str())).await? > 0)
     }
 
     /// Evaluate a simple CHECK constraint expression.
@@ -1112,11 +1175,20 @@ impl BulkWriter {
 
         let index_start = Instant::now();
 
-        // 3. Rebuild indexes for vertices
-        if self.config.defer_vector_indexes || self.config.defer_scalar_indexes {
+        // 3. Rebuild indexes for vertices.
+        //
+        // User-declared indexes are materialized ONLY here — the flush path only
+        // builds the fixed _vid/_uid/ext_id indexes. So this block must run
+        // regardless of the defer flags; gating it on `defer_* == true` meant a
+        // load with both flags false (build eagerly) silently built no user
+        // index at all. The defer flags only select the BACKGROUND (deferred)
+        // path; an eager load rebuilds synchronously at commit.
+        {
             let labels_to_rebuild: Vec<String> = self.touched_labels.iter().cloned().collect();
+            let use_async = self.config.async_indexes
+                && (self.config.defer_vector_indexes || self.config.defer_scalar_indexes);
 
-            if self.config.async_indexes && !labels_to_rebuild.is_empty() {
+            if use_async && !labels_to_rebuild.is_empty() {
                 // Async mode: mark affected indexes as Stale before scheduling
                 let schema = self.backend.schema.schema();
                 for label in &labels_to_rebuild {

@@ -1978,6 +1978,22 @@ impl Writer {
             );
         }
 
+        // Scan pending-flush buffers (rows rotated off `current` but not yet in
+        // Lance). The single-vertex paths (check_unique_constraint_multi,
+        // check_extid_globally_unique) consult these; skipping them here left the
+        // Bug #9A window open — a duplicate key/ext_id whose only prior copy sits
+        // on pending_flush would pass batch validation.
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            let pending_guard = pending_l0.read();
+            Self::collect_constraint_keys_from_properties(
+                pending_guard.vertex_properties.values(),
+                label,
+                &schema.constraints,
+                &mut existing_keys,
+                &mut existing_extids,
+            );
+        }
+
         // Scan transaction L0 if present
         if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
@@ -3235,9 +3251,47 @@ impl Writer {
 
             let properties_result = properties_batch.clone();
             {
+                let schema = self.schema_manager.schema();
                 let mut l0_guard = target_l0.write();
                 for (vid, props) in vids.iter().zip(properties_batch.iter()) {
                     l0_guard.insert_vertex_with_labels(*vid, props.clone(), &labels);
+
+                    // Populate the L0 constraint index so a later single insert
+                    // (or commit-time probe) sees this batch row's unique keys via
+                    // has_constraint_key. The single-vertex path does this; the
+                    // batch path formerly did not, silently twinning unique keys.
+                    for label in &labels {
+                        for constraint in &schema.constraints {
+                            if !constraint.enabled {
+                                continue;
+                            }
+                            let ConstraintTarget::Label(l) = &constraint.target else {
+                                continue;
+                            };
+                            if l != label {
+                                continue;
+                            }
+                            if let ConstraintType::Unique {
+                                properties: unique_props,
+                            } = &constraint.constraint_type
+                            {
+                                let mut key_values = Vec::new();
+                                let mut all_present = true;
+                                for prop in unique_props {
+                                    if let Some(val) = props.get(prop) {
+                                        key_values.push((prop.clone(), val.clone()));
+                                    } else {
+                                        all_present = false;
+                                        break;
+                                    }
+                                }
+                                if all_present {
+                                    let key = serialize_constraint_key(label, &key_values);
+                                    l0_guard.insert_constraint_key(key, *vid);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

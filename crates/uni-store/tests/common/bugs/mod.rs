@@ -34,3 +34,7 @@ pub mod test_repro_compaction_empty_resurrect;
 pub mod repro_03_batch_edge_props_version_ignored;
 pub mod repro_07_batch_vertex_props_version_ignored;
 pub mod repro_18_main_vertex_batch_resurrect;
+
+// Correctness-scan Wave 1 repros (R5 constraint visibility).
+pub mod repro_02_batch_insert_constraint_index;
+pub mod repro_03_batch_constraints_skip_pending;

@@ -197,6 +197,10 @@ impl<'a> SchemaBuilder<'a> {
                     to_labels,
                     description,
                 } => {
+                    // Keep the requested endpoint labels to compare against the
+                    // stored definition if the edge type already exists.
+                    let requested_from = from_labels.clone();
+                    let requested_to = to_labels.clone();
                     match manager.add_edge_type_with_desc(
                         &name,
                         from_labels,
@@ -204,7 +208,32 @@ impl<'a> SchemaBuilder<'a> {
                         description,
                     ) {
                         Ok(_) => {}
-                        Err(e) if e.to_string().contains("already exists") => {}
+                        Err(e) if e.to_string().contains("already exists") => {
+                            // `add_edge_type_with_desc` errors on NAME collision
+                            // and returns BEFORE updating the stored labels. A
+                            // re-declaration is idempotent only when the existing
+                            // endpoint labels match; a re-declaration with
+                            // different from/to labels is a real conflict that
+                            // must not be silently swallowed (which would leave
+                            // the stale definition). Mirror `declare_property`
+                            // and surface it.
+                            let existing_schema = manager.schema();
+                            let matches = existing_schema
+                                .get_edge_type_case_insensitive(&name)
+                                .is_some_and(|m| {
+                                    m.src_labels == requested_from
+                                        && m.dst_labels == requested_to
+                                });
+                            if !matches {
+                                return Err(UniError::Schema {
+                                    message: format!(
+                                        "edge type '{name}' already exists with different \
+                                         endpoint labels; drop it before re-declaring with \
+                                         from={requested_from:?} to={requested_to:?}"
+                                    ),
+                                });
+                            }
+                        }
                         Err(e) => {
                             return Err(UniError::Schema {
                                 message: e.to_string(),

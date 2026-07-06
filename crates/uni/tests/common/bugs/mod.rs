@@ -49,6 +49,8 @@ pub mod issue_68_type_mismatch;
 pub mod issue_93_bytes_round_trip;
 pub mod locy_is_not_complement_recursion;
 pub mod repro_edge_export;
+// Correctness-scan Wave 0 repros.
+pub mod repro_schema_edge_type_swallow;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

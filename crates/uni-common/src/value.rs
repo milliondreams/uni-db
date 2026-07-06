@@ -764,6 +764,28 @@ fn float_eq_normalized(a: f64, b: f64) -> bool {
         || (a.is_nan() && b.is_nan())
 }
 
+/// `f32` counterpart of [`float_eq_normalized`], used by the `Vector` and
+/// `SparseVector` equality arms.
+///
+/// Treats `0.0 == -0.0` and `NaN == NaN` so that vector-valued [`Value`]s
+/// uphold `Eq` reflexivity and stay consistent with [`hash_f32_normalized`]
+/// (which normalizes NaN in the `Hash` impl). Without this, a
+/// `Vector`/`SparseVector` containing NaN would not equal itself while still
+/// hashing identically — silently breaking `HashSet`/`HashMap` dedup.
+fn float_eq_normalized_f32(a: f32, b: f32) -> bool {
+    a.total_cmp(&b) == std::cmp::Ordering::Equal
+        || (a == 0.0 && b == 0.0)
+        || (a.is_nan() && b.is_nan())
+}
+
+/// Compares two `f32` slices element-wise using [`float_eq_normalized_f32`].
+///
+/// Length-checked, then per-element normalized comparison — the equality
+/// analogue of the normalized hashing done for `Vec<f32>` weights.
+fn slice_eq_normalized_f32(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| float_eq_normalized_f32(*x, *y))
+}
+
 impl PartialEq for Value {
     /// Structural equality, with the [`Value::Float`] arm normalized so that
     /// `0.0 == -0.0` and `NaN == NaN` (see `float_eq_normalized`).
@@ -786,7 +808,10 @@ impl PartialEq for Value {
             (Value::Node(a), Value::Node(b)) => a == b,
             (Value::Edge(a), Value::Edge(b)) => a == b,
             (Value::Path(a), Value::Path(b)) => a == b,
-            (Value::Vector(a), Value::Vector(b)) => a == b,
+            // `Vec<f32>` `==` uses IEEE-754 (`NaN != NaN`), which would break
+            // `Eq` reflexivity and disagree with the NaN-normalizing `Hash`
+            // impl; compare element-wise with the same normalization instead.
+            (Value::Vector(a), Value::Vector(b)) => slice_eq_normalized_f32(a, b),
             (
                 Value::SparseVector {
                     indices: i1,
@@ -796,7 +821,7 @@ impl PartialEq for Value {
                     indices: i2,
                     values: v2,
                 },
-            ) => i1 == i2 && v1 == v2,
+            ) => i1 == i2 && slice_eq_normalized_f32(v1, v2),
             (Value::Temporal(a), Value::Temporal(b)) => a == b,
             // Distinct variants are never equal.
             _ => false,

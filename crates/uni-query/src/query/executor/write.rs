@@ -1039,15 +1039,15 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Failed to downcast to UInt64Array"))?;
                 Ok(Value::Int(array.value(row_idx) as i64))
             }
-            _ => {
-                // For other types, try to convert to string
-                let array = column.as_any().downcast_ref::<arrow_array::StringArray>();
-                if let Some(arr) = array {
-                    Ok(Value::String(arr.value(row_idx).to_string()))
-                } else {
-                    Ok(Value::Null)
-                }
-            }
+            // Every other Arrow type (Timestamp, Date32/64, LargeUtf8, Utf8View,
+            // lists, decimals, ...) formerly fell through a StringArray downcast
+            // that failed and returned Null — so COPY FROM silently dropped those
+            // columns. Delegate to the shared, exhaustive arrow->Value decoder.
+            _ => Ok(uni_store::storage::arrow_convert::arrow_to_value(
+                column.as_ref(),
+                row_idx,
+                None,
+            )),
         }
     }
 

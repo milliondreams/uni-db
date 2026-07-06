@@ -1425,9 +1425,11 @@ impl<'a> PropertyExtractor<'a> {
         let mut values = Vec::with_capacity(len);
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
             let val = get_props(i);
-            let ts = if is_deleted || val.is_none() {
-                Some(0i64)
-            } else if let Some(Value::Temporal(tv)) = val {
+            // A missing property on a live row must be NULL, not epoch 0 — every
+            // sibling builder (int/string/datetime-struct) appends null here.
+            // Storing Some(0) rendered absent timestamps as 1970-01-01 and broke
+            // `IS NULL`. Only deleted rows get the 0 placeholder (below).
+            let ts = if let Some(Value::Temporal(tv)) = val {
                 match tv {
                     uni_common::TemporalValue::DateTime {
                         nanos_since_epoch, ..
@@ -1509,9 +1511,9 @@ impl<'a> PropertyExtractor<'a> {
 
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
             let val = get_props(i);
-            let days = if is_deleted || val.is_none() {
-                Some(0)
-            } else if let Some(Value::Temporal(uni_common::TemporalValue::Date {
+            // Missing property on a live row -> NULL (append_null below), not
+            // 1970-01-01. Only deleted rows get the 0 placeholder.
+            let days = if let Some(Value::Temporal(uni_common::TemporalValue::Date {
                 days_since_epoch,
             })) = val
             {

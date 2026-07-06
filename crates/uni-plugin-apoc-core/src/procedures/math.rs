@@ -161,8 +161,17 @@ impl MathProc {
             Self::Round => {
                 let value = f64_arg(0)?;
                 let precision = i64_arg(1)?;
-                let scale = 10f64.powi(precision as i32);
-                MathOutput::Float((value * scale).round() / scale)
+                // Clamp before `as i32` (which would wrap for |precision| >= 2^31)
+                // and guard non-finite scale/product: past f64's ~15-digit
+                // resolution a round is a no-op, so return the value rather than
+                // NaN (10f64.powi(400) = +inf -> inf/inf). (finding [3])
+                let scale = 10f64.powi(precision.clamp(-308, 308) as i32);
+                let scaled = value * scale;
+                if scale.is_finite() && scale != 0.0 && scaled.is_finite() {
+                    MathOutput::Float(scaled.round() / scale)
+                } else {
+                    MathOutput::Float(value)
+                }
             }
         };
         Ok(out)

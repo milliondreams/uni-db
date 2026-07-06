@@ -150,8 +150,14 @@ impl ProcedurePlugin for NumberProc {
                 nullable_float_result(parsed)
             }
             Self::ToString => {
-                let v = support::extract_f64(args, 0, "number")?;
-                string_result(format!("{v}"))
+                // Format an Int64 argument EXACTLY. Widening it through f64
+                // (extract_f64's `*v as f64`) corrupts integers above 2^53
+                // (finding [2]); only genuine floats take the f64 path.
+                let s = match support::extract_i64(args, 0, "number", support::FloatToInt::Reject, true) {
+                    Ok(i) => i.to_string(),
+                    Err(_) => format!("{}", support::extract_f64(args, 0, "number")?),
+                };
+                string_result(s)
             }
         };
         support::one_row_stream(schema, array, batch_err::NUMBER, "number")

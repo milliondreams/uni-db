@@ -827,12 +827,21 @@ impl PreExistingProbe {
             .chain(tx_l0.tombstones.keys().copied())
             .collect();
 
+        // Buffers are probed newest→oldest (current, then pending-flush). A
+        // tombstone in a newer buffer means the entity is DEAD as of that
+        // buffer — not merely "no info here". We record it in `dead_*` so an
+        // OLDER buffer's stale CREATE props can never resurrect it as
+        // pre-existing (which would mis-emit a later recreate as an UPDATE with
+        // stale `old_value` instead of a CREATE).
+        let mut dead_vids: HashSet<uni_common::Vid> = HashSet::new();
+        let mut dead_eids: HashSet<uni_common::Eid> = HashSet::new();
         let mut probe_buffer = |buf: &L0Buffer| {
             for vid in &candidate_vids {
-                if vertices.contains_key(vid) {
+                if vertices.contains_key(vid) || dead_vids.contains(vid) {
                     continue;
                 }
                 if buf.vertex_tombstones.contains(vid) {
+                    dead_vids.insert(*vid);
                     continue;
                 }
                 if let Some(props) = buf.vertex_properties.get(vid) {
@@ -840,10 +849,11 @@ impl PreExistingProbe {
                 }
             }
             for eid in &candidate_eids {
-                if edges.contains_key(eid) {
+                if edges.contains_key(eid) || dead_eids.contains(eid) {
                     continue;
                 }
                 if buf.tombstones.contains_key(eid) {
+                    dead_eids.insert(*eid);
                     continue;
                 }
                 if buf.edge_endpoints.contains_key(eid) {
@@ -853,12 +863,19 @@ impl PreExistingProbe {
             }
         };
 
+        // Probe newest → oldest so the first definitive state per entity wins:
+        // `current` is the newest buffer, then the pending-flush buffers from
+        // newest to oldest (`get_pending_flush` returns them oldest-first). This
+        // ordering is what makes the `dead_*` short-circuit correct — a newer
+        // tombstone is seen before an older buffer's stale CREATE props — and it
+        // also records the newest (not oldest) pre-image props for a vertex
+        // updated across flush windows.
         {
             let current = l0_manager.get_current();
             let g = current.read();
             probe_buffer(&g);
         }
-        for pending in l0_manager.get_pending_flush() {
+        for pending in l0_manager.get_pending_flush().iter().rev() {
             let g = pending.read();
             probe_buffer(&g);
         }

@@ -337,6 +337,17 @@ impl Transaction {
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn query_inner(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
+        // Authorization: `query_inner` is the execution choke point for BOTH
+        // reads and writes — `Session::run` routes writes here (via `tx.query`)
+        // to preserve trailing `RETURN` rows, and direct `tx.query` calls also
+        // land here. Only `tx.execute`/the parameterized builders authorized
+        // before, so a write run through `tx.query` bypassed the `AuthzPolicy`
+        // chain. Authorize here with a read-aware verb (a pure read must not be
+        // mis-classified as a write). Gated on a registered policy so the common
+        // no-policy path skips the extra parse.
+        if !self.db.plugin_registry.authz_policies().is_empty() {
+            self.authorize(cypher, self.authz_verb(cypher))?;
+        }
         if self.db.config.ssi_enabled {
             self.acquire_for_update_locks(cypher, &HashMap::new())
                 .await?;
@@ -494,6 +505,29 @@ impl Transaction {
     /// retroactively escalated by a session re-auth.
     fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
         crate::api::session::authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
+    }
+
+    /// Classify the authorization verb for a statement executed via
+    /// [`Self::query_inner`].
+    ///
+    /// A statement with no write/schema/dbms clause authorizes under `"read"`;
+    /// otherwise it uses [`classify_verb`]. Mirrors `Session::run`'s read-only
+    /// oracle (consulting the db-level plugin registry for procedure modes — a
+    /// transaction has no session-scoped registry) so a write executed through
+    /// `tx.query` is authorized under the correct verb rather than mis-denying a
+    /// read as a write.
+    fn authz_verb(&self, cypher: &str) -> &'static str {
+        let proc_is_write = |name: &str| {
+            use uni_plugin::traits::procedure::ProcedureMode;
+            uni_plugin::QName::parse(name)
+                .ok()
+                .and_then(|q| self.db.plugin_registry.procedure(&q))
+                .is_some_and(|e| !matches!(e.signature.mode, ProcedureMode::Read))
+        };
+        match uni_cypher::parse(cypher) {
+            Ok(ast) if uni_query::validate_read_only_with(&ast, &proc_is_write).is_ok() => "read",
+            _ => classify_verb(cypher),
+        }
     }
 
     /// Per-statement guards shared by the typed `execute`/`query` entry points

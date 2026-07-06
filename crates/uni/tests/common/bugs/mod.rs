@@ -62,6 +62,9 @@ pub mod bug_bulk_unique_key_lossy_repro;
 pub mod repro_locy_tx_neural_preview;
 pub mod repro_rule_promotion_strata;
 pub mod repro_rule_registry_lost_update;
+// Correctness-scan Wave 2 repros (L6 security/authz).
+pub mod repro_authz_query_bypass;
+pub mod repro_config_path_plugin_registry;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

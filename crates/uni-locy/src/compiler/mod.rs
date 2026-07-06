@@ -166,7 +166,7 @@ fn compile_with_context(
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
     let (compiled_rules, mut warnings) =
-        typecheck::check(&rule_groups, &strat, &model_catalog, is_monotonic)?;
+        typecheck::check(&rule_groups, &strat, &model_catalog, &module_ctx, is_monotonic)?;
     // Carry model-compilation warnings (e.g. G1-lite UncalibratedLLMLogprobs)
     // into the final program. Append after typecheck so source order is
     // preserved for `models -> rules` warning streams.
@@ -281,9 +281,18 @@ fn extract_commands(
                 )?;
                 extra_warnings.extend(body_extra_warnings);
 
-                // Compile body rules if any exist
+                // Compile body rules if any exist. Thread the outer context —
+                // the enclosing program's rule names (so the body can IS-ref
+                // them) and the neural-predicates-preview flag — instead of a
+                // bare `compile()` that drops both.
                 let body_compiled = if !body_rule_groups.is_empty() {
-                    compile(&body_program_ast)?
+                    compile_with_context(
+                        &body_program_ast,
+                        &HashMap::new(),
+                        defined_rules,
+                        neural_predicates_preview_flag,
+                        &default_monotonicity_oracle,
+                    )?
                 } else {
                     CompiledProgram {
                         strata: Vec::new(),

@@ -4884,38 +4884,34 @@ impl HybridPhysicalPlanner {
             let df_agg = match name_lower.as_str() {
                 "count" if args.is_empty() => count(datafusion::logical_expr::lit(1)),
                 "count" => {
-                    // For count(*) or count(variable) where variable is a node/edge
-                    // (not a property), translate to count(lit(1)) since the variable
-                    // itself has no column in the scan schema.
-                    // Exception: COUNT(DISTINCT variable) needs the actual column
-                    // reference so that null rows (from OPTIONAL MATCH) are excluded.
+                    // count(*) counts every row (including the all-null padding row
+                    // an unmatched OPTIONAL MATCH produces), so it maps to
+                    // count(lit(1)). count(variable), by contrast, is count over an
+                    // expression and must EXCLUDE nulls per Cypher semantics — so it
+                    // counts the entity's identity column (_vid/_eid), which is
+                    // non-null for matched rows and null for the OPTIONAL pad, letting
+                    // DataFusion's COUNT drop those rows. count(lit(1)) here would
+                    // over-count by one per unmatched group. The later `.distinct()`
+                    // pass turns this into COUNT(DISTINCT identity) when requested;
+                    // dedup by identity (not the full materialized struct) also avoids
+                    // reading every property column (issue #134 family). Scalar-bound
+                    // variables (not Node/Edge) count their own column, which likewise
+                    // excludes nulls.
                     if matches!(args.first(), Some(uni_cypher::ast::Expr::Wildcard)) {
                         count(datafusion::logical_expr::lit(1))
                     } else if let Some(uni_cypher::ast::Expr::Variable(var)) = args.first() {
-                        if *distinct {
-                            // COUNT(DISTINCT entity) dedups by identity (_vid/_eid),
-                            // NOT the full materialized struct — this avoids reading
-                            // every property column just to compute distinctness
-                            // (issue #134 family). The identity column is a
-                            // non-nullable base column always present in the scan,
-                            // and stays null for unmatched OPTIONAL MATCH rows so
-                            // they are excluded exactly as before. Scalar-bound
-                            // variables (not Node/Edge) keep their own column.
-                            let id_col = match ctx.variable_kinds.get(var) {
-                                Some(VariableKind::Node) => Some("_vid"),
-                                Some(VariableKind::Edge) => Some("_eid"),
-                                _ => None,
-                            };
-                            match id_col {
-                                Some(suffix) => {
-                                    count(DfExpr::Column(datafusion::common::Column::from_name(
-                                        format!("{var}.{suffix}"),
-                                    )))
-                                }
-                                None => count(get_arg()?),
+                        let id_col = match ctx.variable_kinds.get(var) {
+                            Some(VariableKind::Node) => Some("_vid"),
+                            Some(VariableKind::Edge) => Some("_eid"),
+                            _ => None,
+                        };
+                        match id_col {
+                            Some(suffix) => {
+                                count(DfExpr::Column(datafusion::common::Column::from_name(
+                                    format!("{var}.{suffix}"),
+                                )))
                             }
-                        } else {
-                            count(datafusion::logical_expr::lit(1))
+                            None => count(get_arg()?),
                         }
                     } else {
                         count(get_arg()?)

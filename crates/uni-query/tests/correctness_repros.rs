@@ -115,8 +115,10 @@ async fn repro_01_count_optional_null_row() {
         .await;
     let c = as_int(&cell(&rows[0], "c"));
     println!("[1] count(m) over unmatched OPTIONAL = {c} (correct=0)");
-    // BUG: expected c=0 (m is NULL for unmatched OPTIONAL row), got 1
-    assert_eq!(c, 1, "repro for df_planner.rs:4918");
+    // FIXED (df_planner.rs): count(entity) counts the identity column (_vid/_eid),
+    // which is NULL for the unmatched OPTIONAL row, so DataFusion's COUNT excludes
+    // it — was count(lit(1)) which counted the all-NULL pad row (off by one).
+    assert_eq!(c, 0, "count(m) must exclude the unmatched OPTIONAL null row");
 }
 
 // ===========================================================================

@@ -556,6 +556,13 @@ fn build_probe_vid_index(
 /// any column type Arrow can lift into a `ScalarValue` (which covers all
 /// types we currently materialize from Lance).
 fn values_equal(a_col: &ArrayRef, a_row: usize, b_col: &ArrayRef, b_row: usize) -> DFResult<bool> {
+    // Cypher comparison against NULL yields null (unknown), which for a join
+    // equi-pair means "not a match" — a null on either side must never join.
+    // `ScalarValue`'s `PartialEq` instead treats NULL == NULL as true, so guard
+    // the null case explicitly before the type-erased comparison.
+    if a_col.is_null(a_row) || b_col.is_null(b_row) {
+        return Ok(false);
+    }
     let a = ScalarValue::try_from_array(a_col, a_row)?;
     let b = ScalarValue::try_from_array(b_col, b_row)?;
     Ok(a == b)

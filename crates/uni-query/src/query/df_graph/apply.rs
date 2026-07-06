@@ -347,7 +347,14 @@ fn evaluate_comparison(op: &uni_cypher::ast::BinaryOp, left: &Value, right: &Val
             compare_values(left, right),
             Some(Ordering::Greater | Ordering::Equal)
         ),
-        _ => false,
+        // Any operator this fast-path evaluator does not implement (STARTS WITH,
+        // CONTAINS, IN, `=~`, arithmetic, ...) must be treated as "unknown", which
+        // for a pre-filter means KEEP the row — never silently drop it. Returning
+        // `false` here previously discarded matching rows. In production such
+        // shapes are not pushed into `input_filter` at all (the planner's
+        // `apply_input_filter_supported` gate keeps them as a residual Filter that
+        // evaluates the full grammar); this branch is the defensive backstop.
+        _ => true,
     }
 }
 

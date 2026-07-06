@@ -2509,6 +2509,25 @@ struct TraverseParams<'a> {
     optional_pattern_vars: HashSet<String>,
 }
 
+/// Which `plan_where_clause` rewriter a reachability check is standing in for.
+///
+/// Each predicate/label/KNN rewriter recurses through a fixed set of
+/// "transparent" plan nodes and its own base node, falling through
+/// `other => other` for everything else. [`QueryPlanner::rewrite_target_reachable`]
+/// mirrors exactly that per-rewriter descent so consumption of a predicate can be
+/// gated on whether the rewriter can actually apply it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteTarget {
+    /// `replace_scan_with_knn`: base `Scan(var)`; descends Filter/Project/Limit/CrossJoin.
+    Knn,
+    /// `push_predicate_to_scan`: base `Scan|ScanAll(var)`; descends Filter/Project/CrossJoin/Traverse.
+    Scan,
+    /// `replace_scan_all_with_label_union`: base `ScanAll(var)`; descends Filter/Project/CrossJoin/Traverse.
+    LabelUnion,
+    /// `push_predicate_to_traverse`: base `Traverse(target==var)`; descends Filter/Project/CrossJoin/Traverse.
+    TraverseTarget,
+}
+
 impl QueryPlanner {
     /// Create a new planner for the given schema.
     ///
@@ -6127,7 +6146,10 @@ impl QueryPlanner {
         // 1. Try to extract vector_similarity predicate for optimization
         if let Some(extraction) = extract_vector_similarity(&current_predicate) {
             let vs = &extraction.predicate;
-            if Self::find_scan_label_id(&plan, &vs.variable).is_some() {
+            // Only consume the vector predicate if the KNN rewriter can actually
+            // reach the Scan; otherwise leave it in `current_predicate` so it
+            // becomes a residual Filter instead of being silently dropped.
+            if Self::rewrite_target_reachable(&plan, &vs.variable, RewriteTarget::Knn) {
                 plan = Self::replace_scan_with_knn(
                     plan,
                     &vs.variable,
@@ -6162,7 +6184,11 @@ impl QueryPlanner {
                     continue;
                 }
                 // Node label disjunction → Union of label-scoped Scans.
-                if Self::is_scan_all_for(&plan, &var.name)
+                // Gate on reachability by the label-union rewriter (not the
+                // laxer `is_scan_all_for`), so a `ScanAll` sitting under a
+                // Sort/Limit/Aggregate/Apply/Union — which the rewriter can't
+                // rebuild — leaves the conjunct in `keep` as a residual Filter.
+                if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::LabelUnion)
                     && let Some(labels) = try_label_or_to_union(&conj, &var.name)
                 {
                     plan = self.replace_scan_all_with_label_union(plan, &var.name, &labels, false);
@@ -6207,8 +6233,12 @@ impl QueryPlanner {
                 continue;
             }
 
-            // Check if var is produced by a Scan
-            if Self::find_scan_label_id(&plan, &var.name).is_some() {
+            // Check if var is produced by a Scan the pushdown rewriter can reach.
+            // Gate on `rewrite_target_reachable` (not the laxer
+            // `find_scan_label_id`), so a scan under Sort/Limit/Aggregate/Apply —
+            // which `push_predicate_to_scan` can't rebuild — keeps its predicate
+            // in `current_predicate` as a residual Filter instead of dropping it.
+            if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::Scan) {
                 let (pushable, residual) =
                     Self::extract_variable_predicates(&current_predicate, &var.name);
 
@@ -6221,8 +6251,9 @@ impl QueryPlanner {
                 } else {
                     current_predicate = Expr::TRUE;
                 }
-            } else if Self::is_traverse_target(&plan, &var.name) {
-                // Push to Traverse
+            } else if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::TraverseTarget)
+            {
+                // Push to Traverse (same reachability discipline).
                 let (pushable, residual) =
                     Self::extract_variable_predicates(&current_predicate, &var.name);
 
@@ -7622,6 +7653,71 @@ impl QueryPlanner {
         }
     }
 
+    /// Whether the given rewriter can actually reach its target node for `variable`.
+    ///
+    /// The `plan_where_clause` gates (`find_scan_label_id` / `is_scan_all_for` /
+    /// `is_traverse_target`) descend Sort/Limit/Aggregate/Apply/Union, but the
+    /// sibling rewriters do NOT rebuild those nodes — they fall through
+    /// `other => other`. So a predicate whose target sits under one of those
+    /// nodes is marked "consumed" by the gate yet silently not applied, dropping
+    /// the WHERE/label/vector predicate. Consumption must instead be gated on
+    /// this check, which descends only the "transparent" nodes each rewriter
+    /// actually rebuilds — so an unreachable predicate stays in the residual and
+    /// becomes a correct (if unoptimized) `Filter`. Keep the descent arms here in
+    /// lockstep with the matching rewriter.
+    fn rewrite_target_reachable(
+        plan: &LogicalPlan,
+        variable: &str,
+        target: RewriteTarget,
+    ) -> bool {
+        // Base-node match (the node the rewriter actually rewrites).
+        match plan {
+            LogicalPlan::Scan { variable: var, .. } if var == variable => {
+                if matches!(target, RewriteTarget::Knn | RewriteTarget::Scan) {
+                    return true;
+                }
+            }
+            LogicalPlan::ScanAll { variable: var, .. } if var == variable => {
+                if matches!(target, RewriteTarget::Scan | RewriteTarget::LabelUnion) {
+                    return true;
+                }
+            }
+            LogicalPlan::Traverse {
+                target_variable, ..
+            } if target_variable == variable => {
+                if matches!(target, RewriteTarget::TraverseTarget) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        // Transparent descent — each rewriter's recursive arms, and no more.
+        match plan {
+            LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            // Only `replace_scan_with_knn` recurses through `Limit`.
+            LogicalPlan::Limit { input, .. } if matches!(target, RewriteTarget::Knn) => {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            // Scan/label-union/traverse-target rewriters recurse through `Traverse`;
+            // the KNN rewriter does not.
+            LogicalPlan::Traverse { input, .. }
+                if matches!(
+                    target,
+                    RewriteTarget::Scan | RewriteTarget::LabelUnion | RewriteTarget::TraverseTarget
+                ) =>
+            {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            LogicalPlan::CrossJoin { left, right } => {
+                Self::rewrite_target_reachable(left, variable, target)
+                    || Self::rewrite_target_reachable(right, variable, target)
+            }
+            _ => false,
+        }
+    }
+
     /// Push a predicate into a Scan's filter for the specified variable
     fn push_predicate_to_scan(plan: LogicalPlan, variable: &str, predicate: Expr) -> LogicalPlan {
         match plan {
@@ -8083,6 +8179,57 @@ impl QueryPlanner {
 
     /// Extract predicates that only reference variables from Apply's input.
     /// Returns (input_only_predicates, remaining_predicates).
+    /// Whether an operand is one the Apply `input_filter` evaluator can resolve.
+    ///
+    /// `df_graph::apply::resolve_expr_value` resolves only literals, bare
+    /// variables, and `var.key` properties; anything else resolves to `Null`.
+    fn apply_operand_supported(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(_) | Expr::Variable(_) => true,
+            Expr::Property(base, _) => matches!(base.as_ref(), Expr::Variable(_)),
+            _ => false,
+        }
+    }
+
+    /// Whether `expr` is a shape the Apply `input_filter` evaluator handles.
+    ///
+    /// `df_graph::apply::evaluate_filter` handles And/Or/Not over comparisons
+    /// (`Eq`/`NotEq`/`Lt`/`LtEq`/`Gt`/`GtEq`) whose operands pass
+    /// [`Self::apply_operand_supported`], plus a bare truth test on such an
+    /// operand. EVERY other operator or shape (STARTS WITH, CONTAINS, IN,
+    /// arithmetic, CASE, regex, function calls) silently evaluates to
+    /// `false`/`Null` there — and `NOT <unsupported>` inverts to `true`. Such
+    /// predicates must NOT be pushed into `input_filter`; they stay as a residual
+    /// `Filter` that evaluates them correctly. Keep in lockstep with
+    /// `df_graph/apply.rs`.
+    fn apply_input_filter_supported(expr: &Expr) -> bool {
+        use uni_cypher::ast::{BinaryOp, UnaryOp};
+        match expr {
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOp::And | BinaryOp::Or => {
+                    Self::apply_input_filter_supported(left)
+                        && Self::apply_input_filter_supported(right)
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => {
+                    Self::apply_operand_supported(left) && Self::apply_operand_supported(right)
+                }
+                _ => false,
+            },
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr,
+            } => Self::apply_input_filter_supported(expr),
+            // Bare truth test: the evaluator's catch-all resolves the value and
+            // reads `.as_bool()`, which is only meaningful for these operands.
+            other => Self::apply_operand_supported(other),
+        }
+    }
+
     fn extract_apply_input_predicates(
         predicate: &Expr,
         input_variables: &HashSet<String>,
@@ -8099,7 +8246,15 @@ impl QueryPlanner {
             let refs_input_only = vars.iter().all(|v| input_variables.contains(v));
             let refs_any_subquery = vars.iter().any(|v| subquery_new_variables.contains(v));
 
-            if refs_input_only && !refs_any_subquery && !vars.is_empty() {
+            // Only push shapes the input_filter evaluator can evaluate correctly;
+            // otherwise leave the conjunct as a residual Filter (which handles the
+            // full expression grammar) rather than have the evaluator silently
+            // mis-evaluate it to `false`.
+            if refs_input_only
+                && !refs_any_subquery
+                && !vars.is_empty()
+                && Self::apply_input_filter_supported(&conj)
+            {
                 input_preds.push(conj);
             } else {
                 remaining.push(conj);

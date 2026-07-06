@@ -155,8 +155,15 @@ async fn repro_02_call_write_dedup() {
 // downstream non-nullable a._vid error once all input rows are dropped).
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [22]: STARTS WITH in Apply.input_filter -> evaluate_comparison _=>false drops a row that a TRUE Eq keeps"]
 async fn repro_03_apply_startswith_input_filter() {
+    // [22] apply.rs input_filter evaluator soundness. The evaluator handles only
+    // Eq/ordering; every other operator formerly hit `_ => false`, silently
+    // DROPPING matching rows. A pre-filter must instead treat an operator it
+    // can't evaluate as "unknown" → KEEP the row (in production the planner's
+    // `apply_input_filter_supported` gate keeps such shapes as a residual Filter,
+    // so this branch is a defensive backstop). We inject STARTS WITH directly
+    // into Apply.input_filter (the enforcement point) and assert it behaves like
+    // a TRUE Eq control: the row survives.
     use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr as AstExpr};
     use uni_query::query::planner::LogicalPlan;
 
@@ -170,8 +177,6 @@ async fn repro_03_apply_startswith_input_filter() {
     h.run_ok("CREATE (:Person {name:'Alice'})").await;
     h.run_ok("CREATE (:Prefix {prefix:'Al'})").await;
 
-    // Real plan: Project(Apply { input=CrossJoin(Scan a, Scan b), subquery=proc,
-    // input_filter:None }). (Two scans so the plan executes cleanly.)
     fn set_apply_filter(plan: LogicalPlan, f: &AstExpr) -> LogicalPlan {
         match plan {
             LogicalPlan::Project { input, projections } => LogicalPlan::Project {
@@ -194,7 +199,7 @@ async fn repro_03_apply_startswith_input_filter() {
         let planner = QueryPlanner::new(h.schema_manager.schema());
         set_apply_filter(planner.plan(query).unwrap(), f)
     };
-    let name_eq = |op, rhs: &str| AstExpr::BinaryOp {
+    let name_pred = |op, rhs: &str| AstExpr::BinaryOp {
         left: Box::new(AstExpr::Property(
             Box::new(AstExpr::Variable("a".into())),
             "name".into(),
@@ -203,39 +208,28 @@ async fn repro_03_apply_startswith_input_filter() {
         right: Box::new(AstExpr::Literal(CypherLiteral::String(rhs.into()))),
     };
 
-    // CONTROL: `a.name = 'Alice'` is TRUE -> row kept -> 2 rows. Proves a
-    // supported comparison in input_filter is evaluated correctly.
+    // CONTROL: a supported comparison (Eq, TRUE) keeps the row.
     let ctrl_rows = h
         .executor
-        .execute(build_plan(&name_eq(BinaryOp::Eq, "Alice")), &h.prop_manager, &HashMap::new())
+        .execute(build_plan(&name_pred(BinaryOp::Eq, "Alice")), &h.prop_manager, &HashMap::new())
         .await
         .expect("[22] Eq control must execute");
-    println!("[22] control Eq('Alice')=true -> {} rows (expect 2)", ctrl_rows.len());
-    assert_eq!(ctrl_rows.len(), 2, "[22] control: TRUE Eq must keep the row (input_filter path works)");
+    println!("[22] control Eq('Alice')=true -> {} rows", ctrl_rows.len());
+    assert_eq!(ctrl_rows.len(), 2, "[22] control: TRUE Eq keeps the row");
 
-    // BUG: `a.name STARTS WITH 'Al'` is ALSO TRUE for 'Alice', so it must yield 2
-    // rows like the control — but evaluate_comparison's `_ => false` drops it.
-    let sw_res = h
+    // FIXED: STARTS WITH (an unsupported op) must no longer drop the row — the
+    // evaluator keeps it, matching the Eq control.
+    let sw_rows = h
         .executor
-        .execute(build_plan(&name_eq(BinaryOp::StartsWith, "Al")), &h.prop_manager, &HashMap::new())
-        .await;
-    println!("[22] StartsWith('Al')=true-but-dropped -> {sw_res:?}");
-    match sw_res {
-        Ok(rows) => assert_ne!(
-            rows.len(),
-            2,
-            "repro for apply.rs:350: TRUE StartsWith must keep the row like Eq did, but it was dropped"
-        ),
-        Err(e) => {
-            // Dropping all input rows surfaces as the non-nullable a._vid error —
-            // still proves the row was wrongly filtered out (vs the 2-row control).
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("_vid") || msg.contains("null"),
-                "repro for apply.rs:350: unexpected error {msg}"
-            );
-        }
-    }
+        .execute(build_plan(&name_pred(BinaryOp::StartsWith, "Al")), &h.prop_manager, &HashMap::new())
+        .await
+        .expect("[22] StartsWith must execute (row kept, not dropped)");
+    println!("[22] StartsWith('Al') kept -> {} rows", sw_rows.len());
+    assert_eq!(
+        sw_rows.len(),
+        2,
+        "apply.rs input_filter must KEEP a row under an unsupported operator, not drop it"
+    );
 }
 
 // ===========================================================================
@@ -355,7 +349,6 @@ async fn repro_12_window_conflicting_orderby() {
 // and a MATCH-level WHERE on the still-scan-bound variable.
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [36]: WHERE age>30 dropped past an intervening Sort (push_predicate_to_scan other=>other)"]
 async fn repro_17_where_dropped_below_limit() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (:Person {name:'young', age:20})").await;
@@ -367,12 +360,14 @@ async fn repro_17_where_dropped_below_limit() {
         .await;
     let names: Vec<Value> = rows.iter().map(|r| cell(r, "name")).collect();
     println!("[36] WHERE age>30 past Sort -> names={names:?} (correct=['old'])");
-    // Correct: only 'old' (young violates age>30).
-    // BUG: predicate dropped at the Sort -> both 'old' and 'young' survive.
-    assert_eq!(rows.len(), 2, "repro for planner.rs:6211/7739: filter dropped past Sort");
+    // Regression: the scan-pushdown gate now consumes the predicate only when
+    // the rewriter can reach the scan; with an intervening Sort it can't, so
+    // `n.age > 30` stays a residual Filter. Only 'old' (age 40) survives.
+    assert_eq!(rows.len(), 1, "planner.rs:6211/7739: filter must survive past Sort");
+    assert_eq!(names, vec![Value::String("old".into())]);
     assert!(
-        names.contains(&Value::String("young".into())),
-        "repro for [36]: 'young' (age 20) leaked because WHERE age>30 was dropped"
+        !names.contains(&Value::String("young".into())),
+        "'young' (age 20) must be excluded by WHERE age>30"
     );
 }
 
@@ -405,7 +400,6 @@ async fn repro_18_distinct_limit_order() {
 // WITH ... ORDER BY (Sort) above the ScanAll, triggers the drop.
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [39]: n:A OR n:B dropped past an intervening Sort (replace_scan_all_with_label_union other=>other)"]
 async fn repro_20_label_or_dropped_below_limit() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (:A {v:1})").await;
@@ -418,9 +412,11 @@ async fn repro_20_label_or_dropped_below_limit() {
         .await;
     println!("[39] n:A OR n:B past Sort -> rows={}: {rows:?} (correct=2)", rows.len());
     let has_c = rows.iter().any(|r| cell(r, "ls") == Value::List(vec![Value::String("C".into())]));
-    // Correct: only A/B nodes (2 rows). BUG: label predicate dropped -> all 3 incl C.
-    assert_eq!(rows.len(), 3, "repro for planner.rs:6168/6665: label OR dropped past Sort");
-    assert!(has_c, "repro for [39]: C leaked because n:A OR n:B was dropped");
+    // Regression: the label-union gate now consumes the conjunct only when the
+    // rewriter can reach the ScanAll; with an intervening Sort it can't, so
+    // `n:A OR n:B` stays a residual Filter. Only A and B survive (2 rows).
+    assert_eq!(rows.len(), 2, "planner.rs:6168/6665: label OR must survive past Sort");
+    assert!(!has_c, "C must be excluded by n:A OR n:B");
 }
 
 // ===========================================================================
@@ -1368,3 +1364,4 @@ async fn repro_find10_abduce_multihop_target_var() {
         Err(e) => println!("[10] ABDUCE program not planned in harness: {e}"),
     }
 }
+

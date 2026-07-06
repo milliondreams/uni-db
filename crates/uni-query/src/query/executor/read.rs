@@ -5060,12 +5060,13 @@ impl Executor {
         left_rows.append(&mut right_rows);
 
         if !all {
+            // Sorting keys fixes map order, but `format!("{:?}")` still renders
+            // each `Value` via `Debug`, and a `Value::Map`-valued cell nests a
+            // `HashMap` whose `Debug` order is instance-dependent — so equal
+            // rows could survive UNION dedup. `canonical_row_key` encodes both
+            // keys and values structurally and deterministically.
             let mut seen = HashSet::new();
-            left_rows.retain(|row| {
-                let sorted_row: std::collections::BTreeMap<_, _> = row.iter().collect();
-                let key = format!("{sorted_row:?}");
-                seen.insert(key)
-            });
+            left_rows.retain(|row| seen.insert(Self::canonical_row_key(row)));
         }
         Ok(left_rows)
     }

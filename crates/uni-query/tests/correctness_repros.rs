@@ -453,15 +453,14 @@ async fn repro_32_union_node_dedup() {
         max_rows = max_rows.max(rows.len());
     }
     println!("[32] UNION of single node, max rows over 64 runs = {max_rows} (correct=1)");
-    // Observation: if max_rows==2 the Debug-key dedup failed (bug reproduced);
-    // if it stays 1 the dedup happened to hold. Assert the observed value so the
-    // test documents whichever occurred without failing CI.
-    if max_rows == 2 {
-        println!("[32] REPRODUCED: duplicate survived UNION dedup (read.rs:5066)");
-    } else {
-        println!("[32] NOT reproduced this run: dedup held (max_rows={max_rows})");
-    }
-    assert!(max_rows == 1 || max_rows == 2);
+    // Regression: UNION (non-ALL) dedup now keys on `canonical_row_key` (a
+    // structural, order-stable encoding) instead of `format!("{:?}")` over a
+    // `HashMap`-backed row, so a single node UNION itself must always collapse
+    // to exactly one row regardless of per-instance HashMap iteration order.
+    assert_eq!(
+        max_rows, 1,
+        "UNION dedup must collapse identical nodes to 1 row on every run (read.rs:5066)"
+    );
 }
 
 // ===========================================================================
@@ -1069,13 +1068,12 @@ async fn repro_find14_recursive_cte_multicol_cycle() {
         Ok(rows) => {
             let c = as_int(&cell(&rows[0], "c"));
             println!("[14] reachable count = {c} (correct=2)");
-            if c > 2 {
-                println!("[14] REPRODUCED: cycle detection failed to dedup revisited multi-column rows");
-            }
-            // Correct: 2 distinct nodes (A,B). If the internal seen-set fails to
-            // dedup (format!("{val:?}") over multi-column Maps), the recursion
-            // over-iterates; the final node-dedup can still collapse it to 2.
-            assert!(c >= 2, "repro for [14]: recursive CTE must reach both nodes");
+            // Regression: cycle detection now keys the seen-set on `Value`
+            // (canonical Hash/Eq) rather than `format!("{val:?}")` over a
+            // multi-column `Value::Map(HashMap)`, so revisited rows are always
+            // recognized and the recursion converges on exactly the 2 reachable
+            // nodes (A, B) instead of over-iterating.
+            assert_eq!(c, 2, "repro for [14]: recursive CTE must reach exactly both nodes");
         }
         Err(e) => println!("[14] not runnable in harness: {e}"),
     }

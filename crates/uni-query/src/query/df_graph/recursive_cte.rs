@@ -255,11 +255,6 @@ fn batches_to_values(batches: &[RecordBatch]) -> Vec<Value> {
     values
 }
 
-/// Create a stable string key for a Value, used for cycle detection.
-fn value_key(val: &Value) -> String {
-    format!("{val:?}")
-}
-
 /// Extract the VID from a CTE result value.
 ///
 /// CTE result values can be:
@@ -311,8 +306,12 @@ async fn run_cte_loop(
     let mut working_values = batches_to_values(&anchor_batches);
     let mut result_values = working_values.clone();
 
-    // Track seen values for cycle detection
-    let mut seen: HashSet<String> = working_values.iter().map(value_key).collect();
+    // Track seen values for cycle detection. Key on `Value` directly rather
+    // than `format!("{val:?}")`: multi-column rows are `Value::Map(HashMap)`,
+    // whose `Debug` order is instance-dependent, so the same visited row could
+    // hash to different strings and defeat cycle detection (non-termination).
+    // `Value` has a canonical `Hash`/`Eq`, so content-equal rows dedup.
+    let mut seen: HashSet<Value> = working_values.iter().cloned().collect();
 
     // 2. Iterate
     for _iteration in 0..MAX_ITERATIONS {
@@ -354,8 +353,7 @@ async fn run_cte_loop(
         let new_values: Vec<Value> = next_values
             .into_iter()
             .filter(|val| {
-                let key = value_key(val);
-                seen.insert(key) // returns false if already present
+                seen.insert(val.clone()) // returns false if already present
             })
             .collect();
 

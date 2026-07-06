@@ -133,9 +133,15 @@ pub(super) fn apply_return_clause(
 
     // Distinct
     if rc.distinct {
+        // Key on a sorted `BTreeMap` rather than `format!("{row:?}")`: a
+        // `FactRow` is a `HashMap`, whose `Debug` order is instance-dependent,
+        // so byte-identical rows could render to different strings and survive
+        // DISTINCT. `Value` has a canonical `Hash`/`Eq`, so this dedups by
+        // content deterministically.
         let mut seen = std::collections::HashSet::new();
         projected.retain(|row| {
-            let key = format!("{row:?}");
+            let key: std::collections::BTreeMap<String, uni_common::Value> =
+                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             seen.insert(key)
         });
     }

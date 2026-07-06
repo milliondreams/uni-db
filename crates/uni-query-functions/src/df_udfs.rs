@@ -4036,8 +4036,14 @@ where
             // Helper to extract string from each row (handles Utf8, LargeUtf8, and LargeBinary/CypherValue)
             let extract_string_at = |arr: &dyn Array, idx: usize| -> Option<String> {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                    if str_arr.is_null(idx) {
+                        return None;
+                    }
                     str_arr.value(idx).to_string().into()
                 } else if let Some(str_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
+                    if str_arr.is_null(idx) {
+                        return None;
+                    }
                     str_arr.value(idx).to_string().into()
                 } else if let Some(bin_arr) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
                     if bin_arr.is_null(idx) {

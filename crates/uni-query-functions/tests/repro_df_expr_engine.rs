@@ -54,15 +54,16 @@ fn repro_finding_01_simple_case_when_becomes_literal_null() {
     assert!(generic.expr.is_none(), "operand should be folded into WHEN");
 
     let when_condition = &*generic.when_then_expr[0].0;
-    // BUG: the WHEN condition is a literal NULL, so `THEN 1` is unreachable and
-    // the CASE always returns the ELSE (0), even when op == w
-    // (repro for df_expr.rs:3368). A correct coercion keeps a real comparison.
+    // FIXED (df_expr.rs): a simple-CASE WHEN value is no longer wrapped in
+    // `_cv_to_bool`, so rewrite_simple_case_to_generic builds a real operand==value
+    // comparison instead of a literal-NULL condition — the `THEN` branch is
+    // reachable again when op == w.
     assert!(
-        matches!(
+        !matches!(
             when_condition,
             DfExpr::Literal(ScalarValue::Boolean(None), _)
         ),
-        "WHEN condition should be a real comparison but is a literal NULL: {when_condition:?}"
+        "WHEN condition must be a real comparison, not a literal NULL: {when_condition:?}"
     );
 }
 
@@ -97,15 +98,11 @@ async fn repro_finding_06_regex_null_collapses_to_false() {
     let column = out[0].column(0);
     let result = column.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-    // Correct Cypher 3VL: `null =~ 'foo'` must be NULL.
-    // BUG: expected NULL, got false (repro for df_expr.rs:1374).
+    // FIXED (df_expr.rs): `null =~ 'foo'` propagates NULL per Cypher three-valued
+    // logic instead of collapsing to a concrete false.
     assert!(
-        !result.is_null(0),
-        "null =~ pattern should yield NULL but yields a concrete boolean"
-    );
-    assert!(
-        !result.value(0),
-        "null =~ 'foo' wrongly evaluates to false instead of NULL"
+        result.is_null(0),
+        "null =~ pattern must yield NULL, not a concrete boolean"
     );
 }
 

@@ -117,16 +117,17 @@ fn repro_finding_03_string_op_array_null_becomes_empty() {
         other => panic!("unexpected output: {other:?}"),
     };
 
-    // Correct 3VL: `null CONTAINS 'h'` must be NULL.
-    // BUG: null slot decodes to "" so result[0] = Some(false), not NULL
-    // (repro for df_udfs.rs:4030).
+    // FIXED (df_udfs.rs): `extract_string_at` now null-checks String/LargeString
+    // arrays, so a null slot yields None and the result is NULL (three-valued
+    // logic) instead of decoding to "" and returning a concrete false.
     assert!(
-        !bools.is_null(0),
-        "null string slot should yield NULL but yields a concrete boolean"
+        bools.is_null(0),
+        "null CONTAINS 'h' must yield NULL, not a concrete boolean"
     );
+    // The non-null row still evaluates normally: "hi" CONTAINS "h" == true.
     assert!(
-        !bools.value(0),
-        "null CONTAINS 'h' wrongly evaluates to false (empty-string decode)"
+        !bools.is_null(1) && bools.value(1),
+        "'hi' CONTAINS 'h' must be true"
     );
 }
 

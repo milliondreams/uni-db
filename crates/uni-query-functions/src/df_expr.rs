@@ -1371,7 +1371,18 @@ fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfE
         BinaryOp::EndsWith => Ok(dummy_udf_expr("_cypher_ends_with", vec![left, right])),
 
         BinaryOp::Regex => {
-            Ok(datafusion::functions::expr_fn::regexp_match(left, right, None).is_not_null())
+            // Cypher `=~` is three-valued: `null =~ p` and `s =~ null` are null,
+            // not false. `regexp_match(s, p) IS NOT NULL` alone collapses a null
+            // operand to false (the match yields NULL both for "no match" and for
+            // a null input), so guard the null-operand case explicitly and let
+            // NULL keep propagating.
+            let is_match =
+                datafusion::functions::expr_fn::regexp_match(left.clone(), right.clone(), None)
+                    .is_not_null();
+            Ok(
+                datafusion::logical_expr::when(left.is_null().or(right.is_null()), lit(ScalarValue::Boolean(None)))
+                    .otherwise(is_match)?,
+            )
         }
 
         BinaryOp::ApproxEq => Err(anyhow!(
@@ -3359,14 +3370,26 @@ fn coerce_case_expr(
         .as_ref()
         .map(|e| apply_type_coercion(e, schema).map(Box::new))
         .transpose()?;
+    // A searched CASE (`CASE WHEN <bool> THEN ...`, no operand) has boolean WHEN
+    // conditions, so a schemaless LargeBinary CypherValue WHEN is coerced to bool.
+    // A simple CASE (`CASE <operand> WHEN <value> THEN ...`) instead compares the
+    // operand against each WHEN *value* — that value is NOT a boolean. Wrapping it
+    // in `_cv_to_bool` (whose UDF return type is Null) makes the comparison the
+    // generic rewrite builds collapse to a literal NULL, so the branch can never
+    // match; leave simple-CASE WHEN values untouched.
+    let is_searched_case = case.expr.is_none();
     let coerced_when_then = case
         .when_then_expr
         .iter()
         .map(|(w, t)| {
             let cw = apply_type_coercion(w, schema)?;
-            let cw = match cw.get_type(schema).ok() {
-                Some(DataType::LargeBinary) => dummy_udf_expr("_cv_to_bool", vec![cw]),
-                _ => cw,
+            let cw = if is_searched_case {
+                match cw.get_type(schema).ok() {
+                    Some(DataType::LargeBinary) => dummy_udf_expr("_cv_to_bool", vec![cw]),
+                    _ => cw,
+                }
+            } else {
+                cw
             };
             let ct = apply_type_coercion(t, schema)?;
             Ok((Box::new(cw), Box::new(ct)))

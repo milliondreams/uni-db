@@ -420,6 +420,50 @@ After the fix: the no-flush variant rejects the duplicate; `RUSTC_WRAPPER="" car
 
 ---
 
+# Wave 2 deferrals
+
+**Wave 2** (P1 correctness clusters R9/R8/L6/R14/L7/R12/R15/L2): all 8 regions fixed on branch
+`fix/correctness-scan-wave2` (base `595340a8f`, **not pushed**; see memory
+`correctness_scan_wave2_progress`). Two L2 sub-findings deferred as larger, non-gating
+planner changes:
+
+## D7 — `uni-query[27]` pattern-comprehension inner column order
+
+**Severity:** wrong results for a multi-hop pattern comprehension that references both an edge
+property on one step and a vertex property on a later step (e.g. `[(a)-[r1:X]->(b)-[r2:Y]->(c) |
+r1.w] WHERE c.name = ...`). Both columns are LargeBinary so `RecordBatch::try_new` succeeds, and
+the predicate/map read the wrong column.
+
+**Locations:** `crates/uni-query/src/query/df_graph/pattern_comprehension.rs:301` (evaluate —
+pushes per-step vertex-then-edge property columns, interleaved) vs
+`crates/uni-query/src/query/df_graph/expr_compiler.rs:1345` (`build_inner_schema` — declares all
+vertex props across steps, then all edge props).
+
+**Why deferred:** the two functions must agree on column order; re-aligning the materialization
+loop (or the schema) is a careful cross-function change that could misalign further if done
+hastily, and the in-tree repro (`repro_08_pattern_comprehension_colorder`) is non-gating (prints,
+doesn't assert). **Fix plan:** make evaluate() push property columns in the SAME order
+build_inner_schema declares (all vertex props across steps, then all edge props), or vice-versa;
+tighten the repro to assert `['WEIGHT']`.
+
+## D8 — `uni-query[32]` virtual-edge `Both` traverses only outgoing
+
+**Severity:** an undirected match over a **plugin-registered virtual edge type**
+(`MATCH (b)-[:VE]-(a)`) matches only the outgoing orientation — incoming matches are silently
+dropped. Plugin-only: no built-in virtual edge type exists, so unreachable via schemaless Cypher
+(the repro `repro_find32_virtual_edge_both_is_outgoing` is a native-edge control guard).
+
+**Location:** `crates/uni-query/src/query/df_planner.rs:2973` — `plan_traverse_virtual_edge`'s
+`AstDirection::Both` arm maps to `(edge_src_col, edge_dst_col)`, identical to `Outgoing`.
+
+**Why deferred:** a correct `Both` needs a UNION of two HashJoins (bound node = `_src_vid`
+producing target `_dst_vid`, UNION bound node = `_dst_vid` producing target `_src_vid`) — a
+substantial rewrite of the single-join path, for a plugin-only unreachable surface. **Fix plan:**
+build both orientation joins + projections and union them (mirroring how the native traverse Both
+handles both directions).
+
+---
+
 ## Quick resume checklist
 - [x] **D4** (`uni-query[29]`) — DONE `c393dfb87` (label-column replace + candidate-set
       overwrite filter; repro un-ignored).

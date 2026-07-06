@@ -144,12 +144,15 @@ fn coerce_for(target: &DataType, value: Dynamic) -> Result<Dynamic, FnError> {
         // pass everything else through unchanged.
         DataType::Float64 => Ok(value.as_int().map_or(value, |i| Dynamic::from(i as f64))),
         DataType::Int64 => Ok(match value.as_float() {
-            // Only coerce a finite, in-range float; NaN/±inf/out-of-range must
-            // NOT silently become 0 or saturate via `as i64`.
+            // Coerce a finite, in-range float (truncating). NaN/±inf/out-of-range
+            // must NOT silently become 0 or saturate via `as i64`; map them to
+            // NULL so the Int64 column gets a null rather than corrupt data.
             Ok(f) if f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 => {
                 Dynamic::from(f as i64)
             }
-            _ => value,
+            Ok(_) => Dynamic::UNIT,
+            // Not a float (e.g. already an Int) — pass through unchanged.
+            Err(_) => value,
         }),
         _ => Ok(value),
     }
@@ -210,13 +213,12 @@ mod tests {
         let ok = coerce_for(&DataType::Int64, Dynamic::from(3.9_f64)).unwrap();
         assert_eq!(ok.as_int().unwrap(), 3);
 
-        // NaN must NOT become 0 — it is passed through as the original float.
+        // NaN must NOT become 0 — it maps to UNIT (NULL).
         let nan = coerce_for(&DataType::Int64, Dynamic::from(f64::NAN)).unwrap();
-        assert!(nan.as_int().is_err(), "NaN must not silently coerce to 0");
-        assert!(nan.as_float().unwrap().is_nan());
+        assert!(nan.is_unit(), "NaN must map to NULL, not coerce to 0");
 
-        // +inf / out-of-range must NOT saturate to i64::MAX.
+        // +inf / out-of-range must NOT saturate to i64::MAX — also NULL.
         let inf = coerce_for(&DataType::Int64, Dynamic::from(f64::INFINITY)).unwrap();
-        assert!(inf.as_int().is_err(), "inf must not silently saturate");
+        assert!(inf.is_unit(), "inf must map to NULL, not saturate");
     }
 }

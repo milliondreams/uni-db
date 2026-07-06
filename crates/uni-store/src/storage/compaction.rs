@@ -5,7 +5,7 @@ use crate::storage::delta::{ENTRY_SIZE_ESTIMATE, L1Entry, Op};
 use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use arrow_array::Array;
-use arrow_array::builder::{ArrayBuilder, ListBuilder, UInt64Builder};
+use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
 use metrics;
 use std::collections::{HashMap, HashSet};
@@ -507,8 +507,13 @@ impl Compactor {
             );
         }
 
-        // Final Flush
-        if !src_vid_builder.is_empty() {
+        // Final Flush — always replace L2, even when the compacted output is
+        // empty. If every edge for this (edge_type, direction) was deleted the
+        // builders are empty; skipping the replace here would leave the stale
+        // pre-delete L2 rows intact while the tombstone-clear below erases the
+        // Delta L1 deletes, resurrecting the deleted edges on the next read.
+        // Writing the (possibly empty) batch overwrites L2 to match the deltas.
+        {
             let src_arr = Arc::new(src_vid_builder.finish());
             let neighbors_arr = Arc::new(neighbors_builder.finish());
             let edge_ids_arr = Arc::new(edge_ids_builder.finish());

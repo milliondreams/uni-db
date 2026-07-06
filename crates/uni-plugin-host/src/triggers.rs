@@ -348,6 +348,12 @@ fn phase_index(p: TriggerPhase) -> usize {
 struct RouteEntry {
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    /// Index of this trigger among all registered triggers that share the same
+    /// `name` (in registry order). Two triggers with identical docs derive the
+    /// same `subscription_name`, so the name alone cannot re-bind a persisted
+    /// deferral to the right plugin on restart; the (name, ordinal) pair does,
+    /// as long as registration order is deterministic (it is — same plugin code).
+    name_ordinal: usize,
     event_mask: u32,
     label_filter: Option<Vec<String>>,
     edge_type_filter: Option<Vec<String>>,
@@ -449,9 +455,20 @@ impl TriggerRouter {
         let triggers = reg.triggers();
         let mut by_phase: [Vec<RouteEntry>; PHASE_COUNT] =
             [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        // Running per-name counter (registry order) → each trigger's ordinal among
+        // its same-named siblings. Matched at reload (load_from_sidecar walks the
+        // same registry order), so a persisted deferral re-binds to the exact
+        // trigger that created it even when names collide.
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
         for plugin in triggers.iter() {
             let sub: &TriggerSubscription = plugin.subscription();
             let name = subscription_name(sub);
+            let name_ordinal = {
+                let c = name_counts.entry(name.clone()).or_insert(0);
+                let ordinal = *c;
+                *c += 1;
+                ordinal
+            };
             let (compiled_predicate, properties_referenced) = match sub.predicate_source.as_deref()
             {
                 Some(src) => {
@@ -474,6 +491,7 @@ impl TriggerRouter {
             let entry = RouteEntry {
                 plugin: Arc::clone(plugin),
                 name,
+                name_ordinal,
                 event_mask: sub.events.0,
                 label_filter: sub
                     .labels
@@ -535,6 +553,21 @@ impl TriggerRouter {
         ctx: TriggerContext<'_>,
         events: &MutationEvents,
     ) -> Result<(), UniError> {
+        // Deferrals are BUFFERED here and only committed to the queue once ALL
+        // synchronous before-triggers have run without a reject/error. If a later
+        // trigger rejects (returning `Err`), the transaction aborts and these
+        // buffered deferrals are dropped — otherwise a deferred item would later
+        // fire with the mutations of a transaction that never committed.
+        #[allow(clippy::type_complexity)]
+        let mut pending_deferrals: Vec<(
+            Arc<dyn TriggerPlugin>,
+            String,
+            usize,
+            MutationBatch,
+            String,
+            u64,
+            uni_plugin::traits::trigger::TriggerDeferral,
+        )> = Vec::new();
         for &phase in &[TriggerPhase::BeforeMutation, TriggerPhase::BeforeCommit] {
             let routes = &self.by_phase[phase_index(phase)];
             for entry in routes {
@@ -557,19 +590,20 @@ impl TriggerRouter {
                         });
                     }
                     Ok(TriggerOutcome::Defer { until }) => {
-                        // Memory-backed in-process deferral. FU-5 adds
-                        // an optional `delay` to `TriggerDeferral`;
-                        // `None` re-fires on the next queue tick,
+                        // Buffer the deferral (see the note above); it is committed
+                        // to the queue only after the whole before-dispatch
+                        // succeeds. FU-5 adds an optional `delay` to
+                        // `TriggerDeferral`; `None` re-fires on the next queue tick,
                         // `Some(d)` schedules at `now + d`.
-                        enqueue_deferral(
-                            &self.defer_queue,
+                        pending_deferrals.push((
                             Arc::clone(&entry.plugin),
                             entry.name.clone(),
+                            entry.name_ordinal,
                             mb.clone(),
                             ctx.session_id.to_owned(),
                             ctx.tx_id,
                             until,
-                        );
+                        ));
                     }
                     Ok(_) => {
                         // `TriggerOutcome` is `#[non_exhaustive]`; an
@@ -584,6 +618,20 @@ impl TriggerRouter {
                     }
                 }
             }
+        }
+        // All before-triggers passed (no reject) — the transaction is cleared to
+        // commit, so commit the buffered deferrals now.
+        for (plugin, name, name_ordinal, mb, session_id, tx_id, until) in pending_deferrals {
+            enqueue_deferral(
+                &self.defer_queue,
+                plugin,
+                name,
+                name_ordinal,
+                mb,
+                session_id,
+                tx_id,
+                until,
+            );
         }
         Ok(())
     }
@@ -620,6 +668,7 @@ impl TriggerRouter {
                     _ => {
                         let plugin = Arc::clone(&entry.plugin);
                         let name = entry.name.clone();
+                        let name_ordinal = entry.name_ordinal;
                         let session_id = ctx.session_id.to_owned();
                         let tx_id = ctx.tx_id;
                         let queue = self.defer_queue.clone();
@@ -634,6 +683,7 @@ impl TriggerRouter {
                                     &queue,
                                     Arc::clone(&plugin),
                                     name.clone(),
+                                    name_ordinal,
                                     mb_inner,
                                     session_id.clone(),
                                     tx_id,
@@ -655,10 +705,12 @@ impl TriggerRouter {
 ///
 /// The fire instant honors `until.delay` (FU-5); `None` collapses to
 /// "now" so the item fires on the next tick.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_deferral(
     queue: &Option<Arc<DeferralQueue>>,
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    name_ordinal: usize,
     mb: MutationBatch,
     session_id: String,
     tx_id: u64,
@@ -673,6 +725,7 @@ fn enqueue_deferral(
         DeferredItem {
             plugin,
             name,
+            name_ordinal,
             batch: mb,
             session_id,
             tx_id,
@@ -713,6 +766,7 @@ fn fire_caught(
 ) {
     let plugin = Arc::clone(&entry.plugin);
     let name = entry.name.clone();
+    let name_ordinal = entry.name_ordinal;
     let mb_clone = mb.clone();
     let session_id_owned = session_id.to_owned();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -723,6 +777,7 @@ fn fire_caught(
             defer_queue,
             plugin,
             name.clone(),
+            name_ordinal,
             mb_clone,
             session_id_owned,
             tx_id,
@@ -1469,6 +1524,9 @@ const DEFER_MAX_ATTEMPTS: u32 = 10;
 struct DeferredItem {
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    /// Index among same-named triggers (see [`RouteEntry::name_ordinal`]) —
+    /// persisted so a reload re-binds this item to the exact trigger.
+    name_ordinal: usize,
     batch: MutationBatch,
     session_id: String,
     tx_id: u64,
@@ -1566,14 +1624,20 @@ impl DeferralQueue {
         };
         let mut restored = 0usize;
         for row in rows {
+            // Re-bind by (name, ordinal): the Nth trigger with this name in
+            // registry order, matching the ordinal assigned in `from_registry`.
+            // `find` (first match) would misroute a deferral from a later trigger
+            // to an earlier same-named one.
             let Some(entry) = registry
                 .triggers()
                 .iter()
-                .find(|t| subscription_name(t.subscription()) == row.name)
+                .filter(|t| subscription_name(t.subscription()) == row.name)
+                .nth(row.name_ordinal)
                 .cloned()
             else {
                 tracing::warn!(
                     trigger = %row.name,
+                    ordinal = row.name_ordinal,
                     "DeferralQueue: dropping persisted item; trigger no longer registered"
                 );
                 continue;
@@ -1597,6 +1661,7 @@ impl DeferralQueue {
             let item = DeferredItem {
                 plugin: entry,
                 name: row.name,
+                name_ordinal: row.name_ordinal,
                 batch: MutationBatch {
                     events: Arc::new(batch),
                 },
@@ -1652,6 +1717,7 @@ impl DeferralQueue {
                 };
                 rows.push(PersistedDeferral {
                     name: item.name.clone(),
+                    name_ordinal: item.name_ordinal,
                     session_id: item.session_id.clone(),
                     tx_id: item.tx_id,
                     attempts: item.attempts,
@@ -1762,6 +1828,12 @@ pub fn tx_id_to_u64(tx_id: &str) -> u64 {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedDeferral {
     name: String,
+    /// Index among same-named triggers, used with `name` to re-bind to the exact
+    /// trigger on restart. `#[serde(default)]` keeps rows written before this
+    /// field readable (they resolve to the first same-named trigger, the prior
+    /// behavior).
+    #[serde(default)]
+    name_ordinal: usize,
     session_id: String,
     tx_id: u64,
     attempts: u32,

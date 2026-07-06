@@ -146,7 +146,22 @@ impl uni_plugin::scheduler::SchedulerControl for SchedulerHost {
     }
 
     fn cancel(&self, id: &QName) -> bool {
-        self.scheduler.cancel(id)
+        let cancelled = self.scheduler.cancel(id);
+        // Also delete the persisted sidecar row, otherwise the cancelled job
+        // resurrects on the next restart (the host replays persistence). Only
+        // attempt it when the in-memory job actually existed; a persistence
+        // failure is logged but does not un-cancel the live job.
+        if cancelled
+            && let Err(e) = self.persistence.cancel(id)
+        {
+            tracing::warn!(
+                qname = %id,
+                error = %e,
+                "SchedulerHost: persistence.cancel failed; job cancelled in memory but its \
+                 sidecar row survives and may resurrect on restart",
+            );
+        }
+        cancelled
     }
 
     fn list(&self) -> Vec<uni_plugin::scheduler::SchedulerJobRecord> {

@@ -14,11 +14,13 @@ pub mod test_issue_75_batch_frontier;
 pub mod test_issue_77_ghost_vertex_endpoints;
 
 // Correctness-scan Wave 0 fault-injection helpers (R2 error-swallowing).
+pub mod fault_backend;
 pub mod fault_store;
 
 // Correctness-scan Wave 0 repros (R2 error-swallowing).
 pub mod repro_12_fork_registry_orphan;
 pub mod repro_14_snapshot_named_wipe;
+pub mod repro_15_scan_table_exists_swallow;
 
 // Correctness-scan Wave 0 repros (R3 tombstone resurrection).
 pub mod repro_01_replay_label_overwrite_marker;

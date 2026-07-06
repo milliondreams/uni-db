@@ -834,7 +834,7 @@ impl StorageManager {
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
                 let tbl_name = table_names::delta_table_name(name, dir);
-                if !backend.table_exists(&tbl_name).await.unwrap_or(false) {
+                if !backend.table_exists(&tbl_name).await? {
                     continue;
                 }
                 let row_count = backend.count_rows(&tbl_name, None).await.unwrap_or(0);
@@ -1122,7 +1122,7 @@ impl StorageManager {
         let vtable = table_names::main_vertex_table_name();
 
         // Check if the table exists (fresh database)
-        if !backend.table_exists(vtable).await.unwrap_or(false) {
+        if !backend.table_exists(vtable).await? {
             self.vid_labels_index = Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new()));
             return Ok(());
         }
@@ -1292,7 +1292,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1362,7 +1362,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::delta_table_name(edge_type, direction);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1425,7 +1425,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::main_vertex_table_name();
 
-        if !backend.table_exists(table_name).await.unwrap_or(false) {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
@@ -1473,7 +1473,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::main_edge_table_name();
 
-        if !backend.table_exists(table_name).await.unwrap_or(false) {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
@@ -1498,7 +1498,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1528,7 +1528,7 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let vtable = table_names::main_vertex_table_name();
         let mut out = std::collections::HashMap::new();
-        if !backend.table_exists(vtable).await.unwrap_or(false) {
+        if !backend.table_exists(vtable).await? {
             return Ok(out);
         }
         let request = ScanRequest::all(vtable)
@@ -1585,7 +1585,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(Vec::new());
         }
 
@@ -1794,7 +1794,7 @@ impl StorageManager {
         let mut results = Vec::new();
 
         // Only search if the table exists
-        if backend.table_exists(&name).await.unwrap_or(false) {
+        if backend.table_exists(&name).await? {
             let backend_metric = match &metric {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
@@ -2139,7 +2139,7 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
 
-        let mut results = if backend.table_exists(&name).await.unwrap_or(false) {
+        let mut results = if backend.table_exists(&name).await? {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             if ctx.is_some()

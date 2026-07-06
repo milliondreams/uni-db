@@ -710,29 +710,39 @@ fn topk_dnf_disjunction(
     if proofs.is_empty() {
         return Ok(None);
     }
-    // When NO proof carries base_rvs (no IS-ref support visible —
-    // the rule's MNOR runs over plain columns, not derived facts),
-    // fall back to independence-mode noisy-OR. Going through
-    // `merge_top_k` here is wrong: it dedupes by dependency_key,
-    // collapsing all empty-base_rvs proofs into one max-weight
-    // proof. Plain noisy-OR over each row's weight preserves the
-    // pre-D-C0 AddMultProb behavior byte-identically.
-    if base_weights.is_empty() {
-        let mut complement = 1.0;
-        for p in &proofs {
-            complement *= 1.0 - p.weight;
-        }
-        return Ok(Some((1.0 - complement).clamp(0.0, 1.0)));
+    // Partition proofs by whether they carry IS-ref support (`base_rvs`). Only
+    // supported proofs are meaningful DNF clauses; an empty-base_rvs proof must
+    // NOT enter the DNF, because `DependencyDnf::weight` treats an empty clause as
+    // trivially true (prob 1.0) — so mixing a supported and an unsupported row in
+    // one group would collapse the whole group's probability to 1.0. Unsupported
+    // rows (the rule's MNOR running over plain columns, not derived facts) are
+    // instead folded in as INDEPENDENT noisy-OR factors, preserving the pre-D-C0
+    // AddMultProb behavior.
+    let (supported, unsupported): (Vec<_>, Vec<_>) =
+        proofs.into_iter().partition(|p| !p.base_rvs.is_empty());
+
+    // Complement of the independent (unsupported) contributions: ∏ (1 - weight).
+    let mut indep_complement = 1.0;
+    for p in &unsupported {
+        indep_complement *= 1.0 - p.weight;
     }
-    // At least one proof carries base_rvs — DNF inclusion-exclusion
-    // is meaningful. Merge top-K (which dedupes by dependency_key
-    // intentionally — shared bases ARE the same dependency) and
-    // compute exact (or top-K-approximated) probability via the
-    // DNF.
-    let k = if ctx.k == 0 { proofs.len() } else { ctx.k };
-    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), proofs, k);
+
+    if supported.is_empty() {
+        // No DNF terms at all — pure independence-mode noisy-OR.
+        return Ok(Some((1.0 - indep_complement).clamp(0.0, 1.0)));
+    }
+
+    // DNF inclusion-exclusion over the supported proofs. Merge top-K (which
+    // dedupes by dependency_key intentionally — shared bases ARE the same
+    // dependency).
+    let k = if ctx.k == 0 { supported.len() } else { ctx.k };
+    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), supported, k);
     let tag = uni_locy::TopKTag { proofs: kept };
-    Ok(Some(tag.to_dnf().weight(&base_weights)))
+    let dnf_prob = tag.to_dnf().weight(&base_weights);
+
+    // Combine the DNF probability with the independent unsupported rows by
+    // noisy-OR (they are independent events): 1 - (1 - dnf) · ∏ (1 - weight).
+    Ok(Some((1.0 - (1.0 - dnf_prob) * indep_complement).clamp(0.0, 1.0)))
 }
 
 // ---------------------------------------------------------------------------

@@ -2688,9 +2688,19 @@ pub(crate) fn apply_exact_wmc(
             .map(|&row_idx| overrides.get(&(batch_idx, row_idx)).copied())
             .collect();
 
-        if override_map.iter().any(|o| o.is_some()) && prob_col_idx < columns.len() {
+        // Resolve the PROB column position in THIS batch by name rather than by
+        // the yield-schema position `prob_col_idx`: the post-fixpoint fact batch
+        // may column-order differently from the yield schema, so a raw positional
+        // write would overwrite the wrong column. `columns` mirrors `batch`'s
+        // order (built from `batch.columns()`), and the result reuses
+        // `batch.schema()`, so the batch-local index is the correct target.
+        let batch_prob_idx = batch.schema().index_of(&prob_col_name).ok();
+        if override_map.iter().any(|o| o.is_some())
+            && let Some(bpi) = batch_prob_idx
+            && bpi < columns.len()
+        {
             // Rebuild the PROB column with overrides.
-            let existing_prob = columns[prob_col_idx]
+            let existing_prob = columns[bpi]
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>();
             let new_values: Vec<f64> = override_map
@@ -2701,7 +2711,7 @@ pub(crate) fn apply_exact_wmc(
                     None => existing_prob.map(|arr| arr.value(i)).unwrap_or(0.0),
                 })
                 .collect();
-            columns[prob_col_idx] = Arc::new(arrow::array::Float64Array::from(new_values));
+            columns[bpi] = Arc::new(arrow::array::Float64Array::from(new_values));
         }
 
         let result_batch = RecordBatch::try_new(batch.schema(), columns).map_err(arrow_err)?;

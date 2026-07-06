@@ -200,11 +200,26 @@ fn extract_edge_candidates(
     candidates: &mut Vec<Modification>,
 ) {
     let mut source_var = String::new();
+    // Index (into `candidates`) of the RemoveEdge awaiting its target node — the
+    // node that follows the relationship we just pushed. Using this per-hop index
+    // (not `candidates.last_mut()`) attributes each hop's target to ITS OWN edge,
+    // so a multi-hop path `(a)-[:R1]->(b)-[:R2]->(c)` yields (a,b),(b,c) instead of
+    // an empty first target and a (b,b) self-loop on the last edge.
+    let mut pending_target: Option<usize> = None;
     for element in &path.elements {
         match element {
             PatternElement::Node(node) => {
                 if let Some(var) = &node.variable {
+                    if let Some(idx) = pending_target.take()
+                        && let Some(Modification::RemoveEdge { target_var, .. }) =
+                            candidates.get_mut(idx)
+                        && target_var.is_empty()
+                    {
+                        *target_var = var.clone();
+                    }
                     source_var = var.clone();
+                } else {
+                    pending_target = None;
                 }
             }
             PatternElement::Relationship(rel) => {
@@ -221,27 +236,9 @@ fn extract_edge_candidates(
                     edge_type,
                     match_properties,
                 });
+                pending_target = Some(candidates.len() - 1);
             }
             _ => {}
-        }
-    }
-
-    // Fix up target_var
-    let mut prev_was_rel = false;
-    for element in &path.elements {
-        if prev_was_rel {
-            if let PatternElement::Node(node) = element
-                && let Some(var) = &node.variable
-                && let Some(c) = candidates.last_mut()
-                && let Modification::RemoveEdge { target_var, .. } = c
-                && target_var.is_empty()
-            {
-                *target_var = var.clone();
-            }
-            prev_was_rel = false;
-        }
-        if matches!(element, PatternElement::Relationship(_)) {
-            prev_was_rel = true;
         }
     }
 }
@@ -252,11 +249,23 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
     for clause in &rule.clauses {
         for path in &clause.match_pattern.paths {
             let mut source_var = String::new();
+            // Per-hop target index (see extract_edge_candidates) — attributes each
+            // edge's target to ITS OWN AddEdge, not `candidates.last_mut()`.
+            let mut pending_target: Option<usize> = None;
             for element in &path.elements {
                 match element {
                     PatternElement::Node(node) => {
                         if let Some(var) = &node.variable {
+                            if let Some(idx) = pending_target.take()
+                                && let Some(Modification::AddEdge { target_var, .. }) =
+                                    candidates.get_mut(idx)
+                                && target_var.is_empty()
+                            {
+                                *target_var = var.clone();
+                            }
                             source_var = var.clone();
+                        } else {
+                            pending_target = None;
                         }
                     }
                     PatternElement::Relationship(rel) => {
@@ -267,26 +276,9 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
                             edge_type,
                             properties: HashMap::new(),
                         });
+                        pending_target = Some(candidates.len() - 1);
                     }
                     _ => {}
-                }
-            }
-            // Fix target_var
-            let mut prev_was_rel = false;
-            for element in &path.elements {
-                if prev_was_rel {
-                    if let PatternElement::Node(node) = element
-                        && let Some(var) = &node.variable
-                        && let Some(c) = candidates.last_mut()
-                        && let Modification::AddEdge { target_var, .. } = c
-                        && target_var.is_empty()
-                    {
-                        *target_var = var.clone();
-                    }
-                    prev_was_rel = false;
-                }
-                if matches!(element, PatternElement::Relationship(_)) {
-                    prev_was_rel = true;
                 }
             }
         }

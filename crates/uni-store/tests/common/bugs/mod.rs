@@ -13,6 +13,12 @@ pub mod test_issue_62_recursive_decoder;
 pub mod test_issue_75_batch_frontier;
 pub mod test_issue_77_ghost_vertex_endpoints;
 
+// Correctness-scan Wave 0 fault-injection helpers (R2 error-swallowing).
+pub mod fault_store;
+
+// Correctness-scan Wave 0 repros (R2 error-swallowing).
+pub mod repro_12_fork_registry_orphan;
+
 // Correctness-scan Wave 0 repros (R3 tombstone resurrection).
 pub mod repro_01_replay_label_overwrite_marker;
 pub mod repro_11_compact_adjacency_empty_resurrect;

@@ -168,36 +168,23 @@ async fn repro1_redeclare_misclassified_as_native_shadow() {
     )
     .await;
 
-    // BUG: expected registered=true (re-declaration succeeds), got false.
-    // install_function_into_registry re-registers repro1.f while the old
-    // synthetic entry is still present -> DuplicateRegistration folded
-    // into NativeShadow -> new record stored active=false. (decode.rs:64)
-    assert!(
-        !reg2,
-        "repro for decode.rs:64: re-declare returns registered=false"
-    );
+    // FIXED (lib.rs/decode.rs): re-declaring your OWN qname first drops the prior
+    // entry, so re-registration succeeds instead of tripping DuplicateRegistration
+    // → NativeShadow.
+    assert!(reg2, "re-declaration of an owned qname must succeed (registered=true)");
 
-    // 3) The registry keeps executing the OLD body: f(1) still == 2,
-    // not 3. The new (correct) body $x + 2 is persisted-but-inactive.
+    // 3) The registry now executes the NEW body: f(1) == 3.
     let out2 = scalar_int_out(
         &*downcast_scalar(&registry, &qn),
         &[ColumnarValue::Scalar(ScalarValue::Int64(Some(1)))],
         1,
     );
-    // BUG: expected 3 (body $x + 2), got 2 (stale body $x + 1 still live).
-    assert_eq!(
-        out2,
-        Some(2),
-        "repro for decode.rs:64: stale body still executes after re-declare"
-    );
+    assert_eq!(out2, Some(3), "the new body $x + 2 must be live after re-declare");
 
-    // Confirm the store DID persist the new body but marked it inactive.
+    // The store holds the new body and it is active.
     let record = custom.store().get("repro1.f").expect("record present");
     assert_eq!(record.body, "$x + 2", "store holds the NEW body");
-    assert!(
-        !record.active,
-        "repro for decode.rs:64: new body downgraded to inactive"
-    );
+    assert!(record.active, "re-declared body must be active");
 }
 
 /// Look the registered synthetic scalar up and hand back a boxed
@@ -232,20 +219,17 @@ fn repro2_drop_removes_sibling_keeps_target() {
     assert!(registry.scalar_fn(&f1).is_some(), "f1 registered");
     assert!(registry.scalar_fn(&f2).is_some(), "f2 registered");
 
-    // dropDeclared('repro2ns.f1') maps to remove_plugin(PluginId("repro2ns")).
-    registry.remove_plugin(&PluginId::new("repro2ns"));
+    // FIXED (lib.rs): dropping f1 uses the targeted remove_named_unique scoped to
+    // the qname, so f1 is unregistered and the sibling f2 survives.
+    registry.remove_named_unique(&PluginId::new("repro2ns"), &f1);
 
-    // BUG: dropping f1 should unregister f1 and leave f2 live. Actual:
-    // apply_pending clobbered per_plugin["repro2ns"] to track only the
-    // last-registered f2, so remove_plugin drops f2 and leaves f1. The
-    // effect is inverted. (lib.rs:773)
     assert!(
-        registry.scalar_fn(&f1).is_some(),
-        "repro for lib.rs:773: DROPPED f1 is still invocable"
+        registry.scalar_fn(&f1).is_none(),
+        "dropped f1 must be unregistered"
     );
     assert!(
-        registry.scalar_fn(&f2).is_none(),
-        "repro for lib.rs:773: SIBLING f2 was unregistered by the drop"
+        registry.scalar_fn(&f2).is_some(),
+        "sibling f2 must survive dropping f1"
     );
 }
 
@@ -298,13 +282,12 @@ async fn repro3_drop_leaks_aggregate_hint() {
     assert!(removed, "dropDeclared reports removed=true");
     assert!(store.get("repro3agg.myagg").is_none(), "store dropped it");
 
-    // BUG: expected the hint to be cleared on drop; it is NOT (uni-cypher
-    // has no unregister_plugin_aggregate). The name leaks for the process
-    // lifetime and keeps routing `repro3agg.myagg(x)` through aggregate
-    // translation. (aggregate.rs:349)
+    // FIXED (aggregate.rs/uni-cypher): dropDeclared now calls
+    // unregister_plugin_aggregate, so the hint is cleared and the name no longer
+    // routes through aggregate translation.
     assert!(
-        uni_cypher::is_known_plugin_aggregate("repro3agg.myagg"),
-        "repro for aggregate.rs:349: hint still present after drop"
+        !uni_cypher::is_known_plugin_aggregate("repro3agg.myagg"),
+        "aggregate hint must be cleared after dropDeclared"
     );
 }
 

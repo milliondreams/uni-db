@@ -766,11 +766,18 @@ pub mod procedures {
                 .drop_declared(&qname)
                 .map_err(|e| FnError::new(0xB01, format!("dropDeclared: {e}")))?;
             if existed {
-                // Remove from registry — bound to the synthetic
-                // plugin id we registered under (the qname's
-                // namespace). `remove_plugin` is idempotent.
+                // Remove ONLY this declared surface from the registry, not the
+                // whole namespace plugin id — sibling declarations (e.g.
+                // `mycorp.f2` when dropping `mycorp.f1`) share that id and must
+                // survive. `remove_named_unique` is idempotent and scoped to the
+                // qname. Also clear uni-cypher's plugin-aggregate hint (idempotent
+                // for functions) so a dropped aggregate stops routing through
+                // aggregate translation.
                 let pid = PluginId::new(declared_plugin_id(&qname));
-                self.registry.remove_plugin(&pid);
+                if let Ok(qn) = QName::parse(&qname) {
+                    self.registry.remove_named_unique(&pid, &qn);
+                }
+                uni_cypher::unregister_plugin_aggregate(&qname);
                 self.persistence
                     .delete(&qname)
                     .map_err(|e| FnError::new(0xB01, format!("dropDeclared persist: {e}")))?;
@@ -845,9 +852,24 @@ pub mod procedures {
                 active: true,
             };
 
+            // A genuine re-declaration is one where THIS store already owned the
+            // qname (checked before we overwrite the store entry below). Only then
+            // do we drop the prior registry entry before re-installing, so
+            // re-registration is not misread as shadowing a native fn. A FIRST
+            // declaration that collides with a native fn sharing the namespace must
+            // NOT remove it — it correctly surfaces as NativeShadow below.
+            let is_redeclare = self.store.get(&qname).is_some();
+
             self.store
                 .declare(record.clone())
                 .map_err(custom_to_fn_err)?;
+
+            if is_redeclare {
+                let pid = uni_plugin::PluginId::new(declared_plugin_id(&qname));
+                if let Ok(qn) = QName::parse(&qname) {
+                    self.registry.remove_named_unique(&pid, &qn);
+                }
+            }
 
             match install_function_into_registry(&self.registry, &record) {
                 Ok(()) => {}

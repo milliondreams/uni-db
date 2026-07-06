@@ -1008,6 +1008,34 @@ impl PluginRegistry {
         guard.get(plugin).map(|r| PluginRecordSnapshot::from(&*r))
     }
 
+    /// Remove a single named-unique surface (scalar or aggregate) that `plugin`
+    /// registered under `qname`, leaving the plugin's other surfaces intact.
+    ///
+    /// [`Self::remove_plugin`] drops an entire plugin id at once; declared-function
+    /// stores pack many functions under one namespace id (e.g. `mycorp.f1`,
+    /// `mycorp.f2` both under `mycorp`), so dropping one must not unregister its
+    /// siblings. It is also used to drop the prior entry when a declared qname is
+    /// re-declared, so re-registration is not mistaken for shadowing a native fn.
+    ///
+    /// Returns whether anything was removed.
+    pub fn remove_named_unique(&self, plugin: &PluginId, qname: &QName) -> bool {
+        use crate::surfaces::{AggregateSurface, NamedUniqueOps, ScalarSurface};
+        let mut removed = false;
+        if let Some(mut rec) = self.per_plugin.read().get_mut(plugin) {
+            if let Some(pos) = rec.scalars.iter().position(|q| q == qname) {
+                rec.scalars.remove(pos);
+                <ScalarSurface as NamedUniqueOps>::remove(self, qname);
+                removed = true;
+            }
+            if let Some(pos) = rec.aggregates.iter().position(|q| q == qname) {
+                rec.aggregates.remove(pos);
+                <AggregateSurface as NamedUniqueOps>::remove(self, qname);
+                removed = true;
+            }
+        }
+        removed
+    }
+
     /// Remove all registrations for the given plugin.
     ///
     /// Used by `Uni::remove_plugin` and as part of hot reload's drain step.

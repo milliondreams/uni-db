@@ -333,44 +333,36 @@ async fn populated_store(
 }
 
 // ==========================================================================
-// Finding [2] — diff.rs:643: the promote-recomputed content-UID could never
-// equal the UID registered by writer.rs, because the write side hashes props
-// that STILL contain the "ext_id" key while the promote side hashed query-
-// stripped props (ext_id key removed) => UID dedup never fired for ext_id rows.
-//
-// Fixed (diff.rs:643): the promote side re-injects the "ext_id" key before
-// hashing, so its recomputed UID matches the registered one and dedup fires.
-// This test pins that invariant.
+// Finding [2] — diff.rs:643 (DEFERRED): the promote-recomputed content-UID can
+// never equal the UID registered by writer.rs, because the write side hashes
+// props that STILL contain the "ext_id" key while the promote side hashes
+// query-stripped props (ext_id key removed) => UID dedup never fires for ext_id
+// rows. Re-injecting the "ext_id" key on the promote side makes them match, but
+// that exposes a UidIndex-staleness interaction that breaks the insert-only-twin
+// contract under a diverging primary edit, so the fix is deferred until the
+// UidIndex-on-update semantics are resolved. This test pins the current
+// (mismatching) behavior.
 // ==========================================================================
 #[test]
-fn finding2_promote_uid_matches_registered_uid_after_ext_id_reinjection() {
+fn finding2_promote_uid_can_never_match_registered_uid() {
     // Write/register side (writer.rs:5182-5186): ext_id = Some("p1") AND the
-    // stored property map STILL contains the "ext_id" key.
+    // property map STILL contains the "ext_id" key.
     let mut props_with_ext = Properties::new();
     props_with_ext.insert("ext_id".to_string(), Value::String("p1".to_string()));
     props_with_ext.insert("name".to_string(), Value::String("Alice".to_string()));
     let registered = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props_with_ext);
 
-    // Promote-recompute side (diff.rs:643): props come from a query result that
-    // STRIPS the "ext_id" key. The fix re-inserts it before hashing — replicate
-    // exactly that here.
+    // Promote-recompute side (diff.rs:643): the props come from a query result
+    // which STRIPS the "ext_id" key.
     let mut props_stripped = Properties::new();
     props_stripped.insert("name".to_string(), Value::String("Alice".to_string()));
-    let ext_id = Some("p1".to_string());
-    let recomputed = VertexDataset::compute_vertex_uid("Person", ext_id.as_deref(), &{
-        let mut p = props_stripped.clone();
-        if let Some(eid) = &ext_id {
-            p.insert("ext_id".to_string(), Value::String(eid.clone()));
-        }
-        p
-    });
+    let recomputed = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props_stripped);
 
-    // After the fix the two UIDs are EQUAL, so batch_resolve_primary_vids can
-    // resolve the ext_id-bearing row and the insert-or-skip dedup fires — no
-    // unbounded twin on re-promote.
-    assert_eq!(
+    // They DIFFER by the extra `ext_id=p1` property term, so the ext_id-bearing
+    // row's UID dedup does not fire (DEFERRED — see the module comment above).
+    assert_ne!(
         registered, recomputed,
-        "promote-side UID must match the registered UID after ext_id re-injection"
+        "UIDs unexpectedly matched — the deferred dedup would fire"
     );
 }
 

@@ -641,20 +641,23 @@ where
                         continue;
                     };
                     let ext_id = ext_id_for(&fork_ext_ids, node.vid).map(str::to_string);
-                    // The registered content-UID (writer.rs) hashes the STORED
-                    // property map, which still contains the `ext_id` key,
-                    // whereas Cypher query results STRIP it. Re-insert it before
-                    // hashing so the recomputed UID equals the registered one —
-                    // otherwise the UID dedup can never fire for ext_id-bearing
-                    // rows and every re-promote inserts an unbounded twin.
-                    let uid =
-                        VertexDataset::compute_vertex_uid(label, ext_id.as_deref(), &{
-                            let mut p = node.properties.clone();
-                            if let Some(eid) = &ext_id {
-                                p.insert("ext_id".to_string(), Value::String(eid.clone()));
-                            }
-                            p
-                        });
+                    // NOTE (correctness-scan uni-fork[3], DEFERRED): the registered
+                    // content-UID (writer.rs) hashes the STORED property map, which
+                    // still contains the `ext_id` key, whereas Cypher results STRIP
+                    // it, so this recomputed UID never equals the registered one for
+                    // ext_id-bearing rows and the UID dedup does not fire. Re-
+                    // injecting the `ext_id` key to make them match is correct in
+                    // isolation but exposes a UidIndex-staleness interaction: a fork
+                    // vertex whose content diverged from a primary edit then dedups
+                    // against the STALE pre-edit UID and is wrongly skipped, breaking
+                    // the insert-only-twin contract (`promote_default_is_insert_only_
+                    // twin`). Left as-is until the UidIndex-on-update semantics are
+                    // resolved.
+                    let uid = VertexDataset::compute_vertex_uid(
+                        label,
+                        ext_id.as_deref(),
+                        &node.properties,
+                    );
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;

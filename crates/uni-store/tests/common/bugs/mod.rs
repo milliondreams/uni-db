@@ -18,6 +18,7 @@ pub mod fault_store;
 
 // Correctness-scan Wave 0 repros (R2 error-swallowing).
 pub mod repro_12_fork_registry_orphan;
+pub mod repro_14_snapshot_named_wipe;
 
 // Correctness-scan Wave 0 repros (R3 tombstone resurrection).
 pub mod repro_01_replay_label_overwrite_marker;

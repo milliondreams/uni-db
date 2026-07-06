@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::store_utils::{DEFAULT_TIMEOUT, get_with_timeout, list_with_timeout, put_with_timeout};
+use crate::store_utils::{
+    DEFAULT_TIMEOUT, get_with_timeout, is_not_found, list_with_timeout, put_with_timeout,
+};
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -149,7 +151,7 @@ impl SnapshotManager {
                 }
                 Ok(Some(self.load_snapshot(snapshot_id).await?))
             }
-            Err(e) if e.to_string().contains("not found") => Ok(None),
+            Err(e) if is_not_found(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -175,7 +177,13 @@ impl SnapshotManager {
                 let content = String::from_utf8(bytes.to_vec())?;
                 Ok(serde_json::from_str(&content)?)
             }
-            Err(_) => Ok(HashMap::new()),
+            // Only a genuine NotFound (no named-snapshots file yet) yields an
+            // empty map. A transient/IO error must propagate: `save_named_snapshot`
+            // does a read-modify-write over this map, so collapsing it to `{}`
+            // here would persist only the new entry and wipe every existing
+            // named snapshot.
+            Err(e) if is_not_found(&e) => Ok(HashMap::new()),
+            Err(e) => Err(e),
         }
     }
 

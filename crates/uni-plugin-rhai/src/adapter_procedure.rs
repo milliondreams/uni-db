@@ -143,7 +143,14 @@ fn coerce_for(target: &DataType, value: Dynamic) -> Result<Dynamic, FnError> {
         // for Int-declared fields); coerce the mismatched numeric type and
         // pass everything else through unchanged.
         DataType::Float64 => Ok(value.as_int().map_or(value, |i| Dynamic::from(i as f64))),
-        DataType::Int64 => Ok(value.as_float().map_or(value, |f| Dynamic::from(f as i64))),
+        DataType::Int64 => Ok(match value.as_float() {
+            // Only coerce a finite, in-range float; NaN/±inf/out-of-range must
+            // NOT silently become 0 or saturate via `as i64`.
+            Ok(f) if f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 => {
+                Dynamic::from(f as i64)
+            }
+            _ => value,
+        }),
         _ => Ok(value),
     }
 }
@@ -195,5 +202,21 @@ mod tests {
         let batch = stream.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn coerce_int64_guards_nonfinite_and_out_of_range_floats() {
+        // A finite, in-range float coerces (truncating) to Int64.
+        let ok = coerce_for(&DataType::Int64, Dynamic::from(3.9_f64)).unwrap();
+        assert_eq!(ok.as_int().unwrap(), 3);
+
+        // NaN must NOT become 0 — it is passed through as the original float.
+        let nan = coerce_for(&DataType::Int64, Dynamic::from(f64::NAN)).unwrap();
+        assert!(nan.as_int().is_err(), "NaN must not silently coerce to 0");
+        assert!(nan.as_float().unwrap().is_nan());
+
+        // +inf / out-of-range must NOT saturate to i64::MAX.
+        let inf = coerce_for(&DataType::Int64, Dynamic::from(f64::INFINITY)).unwrap();
+        assert!(inf.as_int().is_err(), "inf must not silently saturate");
     }
 }

@@ -392,14 +392,17 @@ impl ExtismLoader {
         // Pass 1: read the manifest export. A wasm module resolves *all* of
         // its imports at instantiate time, so a guest that imports a host fn
         // (e.g. `uni_http_get`) cannot even be instantiated to read its
-        // manifest unless that import is present in the linker. We don't yet
-        // know the guest's declared caps, so bootstrap with the host's
-        // *offered* grants: register the service fns whose capability variant
-        // the host offers. This is safe because pass 1 invokes only the pure
-        // `manifest` export — never a host-fn-calling `invoke` — and the live
-        // execution pool below is rebuilt with the real `declared ∩ grants`
-        // attenuation. A guest importing a host fn the host did *not* offer
-        // fails to instantiate here, which is the intended link-time gate.
+        // manifest unless that import is present in the linker. We therefore
+        // materialize the service fns whose capability variant the host offers
+        // (by NAME, for the linker) — but with an EMPTY effective grant set, so
+        // if the guest's `manifest` export actually *calls* one of them (nothing
+        // enforces manifest-export purity), the call is denied at the fn body's
+        // allow-list check instead of running with the host's full grants before
+        // `declared ∩ grants` intersection. Otherwise a zero-declaring plugin
+        // could exfiltrate/sign/read secrets during bootstrap. The live
+        // execution pool below is rebuilt with the real attenuation. A guest
+        // importing a host fn the host did *not* offer still fails to instantiate
+        // here, which is the intended link-time gate.
         let bootstrap_allowed = self.allowed_host_fn_names(host_grants);
         let bootstrap_prepared = PreparedExtismPlugin {
             manifest: ExtismPluginManifest {
@@ -413,7 +416,8 @@ impl ExtismLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective: host_grants.clone(),
+            // Empty, NOT host_grants: bootstrap host-fn bodies must grant nothing.
+            effective: uni_plugin::CapabilitySet::new(),
             allowed_host_fns: bootstrap_allowed,
             denied_capabilities: Vec::new(),
         };

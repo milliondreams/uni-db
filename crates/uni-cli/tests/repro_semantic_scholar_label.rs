@@ -36,10 +36,10 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
 fn parse_single_count(stdout: &str) -> Option<u64> {
     for line in stdout.lines() {
         let t = line.trim();
-        if let Some(inner) = t.strip_prefix('|').and_then(|s| s.strip_suffix('|')) {
-            if let Ok(n) = inner.trim().parse::<u64>() {
-                return Some(n);
-            }
+        if let Some(inner) = t.strip_prefix('|').and_then(|s| s.strip_suffix('|'))
+            && let Ok(n) = inner.trim().parse::<u64>()
+        {
+            return Some(n);
         }
     }
     None

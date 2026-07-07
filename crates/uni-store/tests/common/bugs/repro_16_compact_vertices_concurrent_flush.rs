@@ -38,14 +38,12 @@ async fn present_vids(storage: &StorageManager) -> HashSet<u64> {
         .scan_vertex_table("Person", &["_vid"], None)
         .await
         .unwrap()
-    {
-        if let Some(col) = batch
+        && let Some(col) = batch
             .column_by_name("_vid")
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-        {
-            for i in 0..col.len() {
-                out.insert(col.value(i));
-            }
+    {
+        for i in 0..col.len() {
+            out.insert(col.value(i));
         }
     }
     out

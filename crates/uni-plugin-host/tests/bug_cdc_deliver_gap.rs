@@ -137,21 +137,24 @@ async fn cdc_deliver_failure_creates_permanent_gap() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let rec = rec.lock();
+    // Scope the guard in a block so it is released before the later `await`
+    // (clippy::await_holding_lock does not credit an explicit `drop`).
+    {
+        let rec = rec.lock();
 
-    // FIXED: commit 100's deliver failed, so the stream is HALTED — commit 101 is
-    // then skipped (never delivered, never checkpointed). The gap is now DETECTABLE
-    // (a halted stream) instead of silently papered over by 101's checkpoint.
-    assert_eq!(
-        rec.deliver_calls, 1,
-        "only commit 100 is attempted; 101 is skipped once the stream halts"
-    );
-    assert!(
-        rec.delivered_lsns.is_empty(),
-        "nothing was successfully delivered, so no lsn should be recorded: {:?}",
-        rec.delivered_lsns
-    );
-    drop(rec);
+        // FIXED: commit 100's deliver failed, so the stream is HALTED — commit 101 is
+        // then skipped (never delivered, never checkpointed). The gap is now DETECTABLE
+        // (a halted stream) instead of silently papered over by 101's checkpoint.
+        assert_eq!(
+            rec.deliver_calls, 1,
+            "only commit 100 is attempted; 101 is skipped once the stream halts"
+        );
+        assert!(
+            rec.delivered_lsns.is_empty(),
+            "nothing was successfully delivered, so no lsn should be recorded: {:?}",
+            rec.delivered_lsns
+        );
+    }
 
     assert_eq!(
         runtime.halted_stream_count(),

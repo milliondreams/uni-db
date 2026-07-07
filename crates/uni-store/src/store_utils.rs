@@ -76,7 +76,7 @@ pub async fn get_with_timeout(
 ///
 /// Distinguishes "the object was never created" (empty result is correct) from
 /// a transient/IO failure (which must propagate). [`get_with_timeout`] preserves
-/// `object_store::Error::NotFound` through `anyhow` (see [`retry_with_timeout`]),
+/// `object_store::Error::NotFound` through `anyhow` (see `retry_with_timeout`),
 /// so a downcast that also matches the variant is reliable — transient errors
 /// are wrapped generically and never match.
 ///

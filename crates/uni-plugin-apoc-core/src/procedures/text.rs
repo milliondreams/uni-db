@@ -332,10 +332,10 @@ impl ProcedurePlugin for TextProc {
                 // output size and prevents OOM on pathological inputs. An empty
                 // base yields an empty string for any count, so it needs no cap.
                 let item_len = s.len();
-                let capped = if item_len == 0 {
-                    count as usize
-                } else {
-                    (count as usize).min(MAX_SYNTHESIZED_LEN / item_len)
+                let capped = match MAX_SYNTHESIZED_LEN.checked_div(item_len) {
+                    // Empty base: any count yields an empty string, so no cap.
+                    None => count as usize,
+                    Some(max_reps) => (count as usize).min(max_reps),
                 };
                 string_result(s.repeat(capped))
             }

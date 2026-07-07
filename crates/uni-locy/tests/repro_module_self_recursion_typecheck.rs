@@ -7,7 +7,6 @@
 
 use uni_cypher::parse_locy;
 use uni_locy::compile;
-use uni_locy::compiler::errors::LocyCompileError;
 
 // The exact program body below compiles cleanly WITHOUT a module (this is the
 // existing passing `phase_b_f1_suppressed_when_along_present` shape).

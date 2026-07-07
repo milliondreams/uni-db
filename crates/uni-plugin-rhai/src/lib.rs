@@ -91,7 +91,7 @@ pub use engine::{DEFAULT_MAX_CALL_LEVELS, build_engine};
 pub use loader::{LoadOutcome, RhaiLoader};
 #[cfg(feature = "rhai-runtime")]
 #[doc(inline)]
-pub use manifest::{AggregateEntry, ProcedureEntry, RhaiManifest, ScalarEntry};
+pub use manifest::{AggregateEntry, ProcedureEntry, RhaiManifest, ScalarEntry, YieldField};
 #[cfg(feature = "rhai-runtime")]
 #[doc(inline)]
 pub use runtime::RhaiPluginRuntime;

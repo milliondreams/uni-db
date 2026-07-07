@@ -71,12 +71,13 @@ fn agg_evaluate_ignores_declared_return_type_int_for_float() {
     acc.update_batch(&[xs]).unwrap();
     let result = acc.evaluate().unwrap();
 
-    // BUG: declared returns=Float64 → expected ScalarValue::Float64(Some(3.0));
-    // got ScalarValue::Int64(Some(3)) because dynamic_to_scalar_loose is
-    // value-directed (adapter_aggregate.rs:291).
+    // FIXED (adapter_aggregate.rs): evaluate() coerces the finalize result to
+    // the declared return type. A Rhai INT finalize under a Float64-declared
+    // aggregate becomes Float64(Some(3.0)), matching what the UDAF adapter
+    // advertised via return_type() — not value-directed Int64(3).
     match result {
-        ScalarValue::Int64(Some(3)) => { /* buggy path confirmed */ }
-        other => panic!("expected buggy Int64(3); got {other:?}"),
+        ScalarValue::Float64(Some(v)) => assert!((v - 3.0).abs() < 1e-9),
+        other => panic!("expected Float64(3.0); got {other:?}"),
     }
 }
 
@@ -102,11 +103,11 @@ fn agg_evaluate_unit_finalize_becomes_untyped_null() {
     acc.update_batch(&[xs]).unwrap();
     let result = acc.evaluate().unwrap();
 
-    // BUG: declared returns=Float64 → expected a typed Float64 null
-    // (ScalarValue::Float64(None)); got untyped ScalarValue::Null whose
-    // DataType is DataType::Null (adapter_aggregate.rs:292-294).
-    assert_eq!(result, ScalarValue::Null);
-    assert_eq!(result.data_type(), DataType::Null);
+    // FIXED (adapter_aggregate.rs): a unit finalize under a Float64-declared
+    // aggregate yields a *typed* Float64 null, not an untyped ScalarValue::Null
+    // whose DataType is DataType::Null.
+    assert_eq!(result, ScalarValue::Float64(None));
+    assert_eq!(result.data_type(), DataType::Float64);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +143,13 @@ fn agg_nan_partial_state_silently_lost_on_serialize_merge() {
         ScalarValue::LargeBinary(Some(b)) => b.clone(),
         other => panic!("expected LargeBinary state, got {other:?}"),
     };
-    // BUG: encode_state (serde_json::to_vec) emits the JSON token `null` for
-    // NaN — the float is gone. Expected: a representation preserving NaN (or
-    // an error), not b"null".
-    assert_eq!(
-        state_bytes, b"null",
-        "NaN state should not silently serialize to JSON null"
+    // FIXED (adapter_aggregate.rs): encode_state uses MessagePack, which
+    // preserves the NaN float's raw IEEE-754 bits. The serialized state is no
+    // longer the JSON token `null` that discarded the float.
+    assert_ne!(
+        state_bytes.as_slice(),
+        b"null".as_slice(),
+        "NaN state must not serialize to JSON null"
     );
 
     // Partition B: merge partition A's peer state, then finalize the type.
@@ -157,25 +159,27 @@ fn agg_nan_partial_state_silently_lost_on_serialize_merge() {
     b.merge_batch(&[peer_arr]).unwrap();
     let finalized = b.evaluate().unwrap();
 
-    // BUG: decode_state turned the peer NaN into Dynamic::UNIT, so the merged
-    // state's runtime type is unit `()` — not a float. Expected: "f64".
+    // FIXED: decode_state rehydrates the peer NaN as a float, so the merged
+    // state's runtime type is "f64". The finalize result is coerced to the
+    // declared LargeUtf8 return type.
     match finalized {
-        ScalarValue::Utf8(Some(ref t)) => assert_eq!(
-            t, "()",
-            "peer NaN should not decode to unit; got type {t}"
+        ScalarValue::LargeUtf8(Some(ref t)) => assert_eq!(
+            t, "f64",
+            "peer NaN should decode back to a float; got type {t}"
         ),
         other => panic!("unexpected finalize result: {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// [3] loader.rs:294 — loader fabricates yield field names col0..colN, so a
-// procedure returning natural-key row maps (id/name) yields all-NULL columns.
+// [3] loader.rs — a procedure returning natural-key row maps (id/name) can now
+// declare named yield columns (`"name:type"`), so the loader uses the declared
+// names instead of fabricating col0..colN, and the row-map keys align.
 //
 // Driven through the REAL loader + registry + invoke path.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn procedure_loader_fabricated_yield_names_drop_natural_keys() {
+async fn procedure_loader_named_yields_align_with_row_maps() {
     let script = r#"
         fn uni_manifest() {
             #{
@@ -183,7 +187,9 @@ async fn procedure_loader_fabricated_yield_names_drop_natural_keys() {
                 version: "0.1.0",
                 determinism: "pure",
                 procedures: [
-                    #{ name: "rows", args: [], yields: ["int","string"], mode: "read" },
+                    #{ name: "rows", args: [],
+                       yields: ["id:int", "name:string"],
+                       mode: "read" },
                 ],
             }
         }
@@ -206,10 +212,10 @@ async fn procedure_loader_fabricated_yield_names_drop_natural_keys() {
     let qname = QName::new("ai.example.rows", "rows");
     let entry = registry.procedure(&qname).expect("procedure registered");
 
-    // The loader named the yield columns positionally.
+    // FIXED (loader.rs): the loader uses the declared yield names, not col0/col1.
     let schema = &entry.signature.yields;
-    assert_eq!(schema[0].name(), "col0");
-    assert_eq!(schema[1].name(), "col1");
+    assert_eq!(schema[0].name(), "id");
+    assert_eq!(schema[1].name(), "name");
 
     let mut stream = entry
         .procedure
@@ -217,8 +223,6 @@ async fn procedure_loader_fabricated_yield_names_drop_natural_keys() {
         .expect("invoke");
     let batch = stream.next().await.unwrap().unwrap();
 
-    // 2 rows produced, but every value is NULL: dynamic_to_record_batch keyed
-    // on col0/col1, which the row maps (id/name) do not contain.
     assert_eq!(batch.num_rows(), 2);
     let id_col = batch
         .column(0)
@@ -231,10 +235,13 @@ async fn procedure_loader_fabricated_yield_names_drop_natural_keys() {
         .downcast_ref::<StringArray>()
         .expect("Utf8 col");
 
-    // BUG: expected id=[1,2], name=["alice","bob"]; got all-NULL because the
-    // fabricated col0/col1 names (loader.rs:294) don't match the map keys.
-    assert_eq!(id_col.null_count(), 2, "expected all id values NULL (bug)");
-    assert_eq!(name_col.null_count(), 2, "expected all name values NULL (bug)");
+    // FIXED: the declared names match the row-map keys, so real values survive.
+    assert_eq!(id_col.null_count(), 0, "id values must not be NULL");
+    assert_eq!(id_col.value(0), 1);
+    assert_eq!(id_col.value(1), 2);
+    assert_eq!(name_col.null_count(), 0, "name values must not be NULL");
+    assert_eq!(name_col.value(0), "alice");
+    assert_eq!(name_col.value(1), "bob");
 }
 
 // ---------------------------------------------------------------------------

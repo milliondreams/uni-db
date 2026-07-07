@@ -90,6 +90,7 @@ impl AggregatePluginFn for RhaiAggregateFn {
             name: self.name.clone(),
             state,
             input_types: self.signature.args.clone(),
+            return_type: self.signature.returns.clone(),
             init_error,
         })
     }
@@ -101,6 +102,10 @@ pub struct RhaiAccumulator {
     name: SmolStr,
     state: Dynamic,
     input_types: Vec<ArgType>,
+    /// Declared aggregate return type. `evaluate` coerces the finalize
+    /// result to this type so the emitted `ScalarValue` matches the
+    /// schema the UDAF adapter advertised via `return_type()`.
+    return_type: ArgType,
     /// Set when `${name}_init` failed at construction. Every trait
     /// method short-circuits with this error so the accumulator can't
     /// silently produce garbage state.
@@ -202,7 +207,7 @@ impl PluginAccumulator for RhaiAccumulator {
                 (self.state.clone(),),
             )
             .map_err(|e| FnError::new(0x722, format!("Rhai finalize: {e}")))?;
-        dynamic_to_scalar_loose(result)
+        dynamic_to_scalar_typed(result, &self.return_type)
     }
 
     fn size(&self) -> usize {
@@ -241,17 +246,30 @@ fn peer_state_bytes(arr: &ArrayRef, row: usize) -> Result<Vec<u8>, FnError> {
     ))
 }
 
+/// Serialize a Rhai aggregate's partial state for shipping to a peer.
+///
+/// Uses MessagePack rather than JSON: JSON has no token for non-finite
+/// floats and silently rewrites `NaN`/`+/-Inf` to `null`, which would erase
+/// a peer's partial state during a distributed merge. MessagePack encodes
+/// every `f64` as its raw IEEE-754 bit pattern, so non-finite values
+/// round-trip through [`decode_state`] intact.
+///
+/// # Errors
+/// Returns [`FnError`] if the `Dynamic` state cannot be serialized.
 fn encode_state(state: &Dynamic) -> Result<Vec<u8>, FnError> {
-    serde_json::to_vec(state).map_err(|e| FnError::new(0x13, format!("Rhai state encode: {e}")))
+    rmp_serde::to_vec(state).map_err(|e| FnError::new(0x13, format!("Rhai state encode: {e}")))
 }
 
+/// Rehydrate a peer partial state produced by [`encode_state`].
+///
+/// # Errors
+/// Returns [`FnError`] if the bytes are not a valid MessagePack `Dynamic`.
 fn decode_state(bytes: &[u8]) -> Result<Dynamic, FnError> {
     if bytes.is_empty() {
         return Ok(Dynamic::UNIT);
     }
-    let v: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| FnError::new(0x13, format!("Rhai state decode: {e}")))?;
-    serde_json_to_dynamic(&v).map_err(|e| FnError::new(0x13, format!("Rhai state value: {e}")))
+    rmp_serde::from_slice::<Dynamic>(bytes)
+        .map_err(|e| FnError::new(0x13, format!("Rhai state decode: {e}")))
 }
 
 /// Convert a `serde_json::Value` into a `rhai::Dynamic`. Used for
@@ -307,6 +325,93 @@ fn dynamic_to_scalar_loose(d: Dynamic) -> Result<ScalarValue, FnError> {
     // Fallback: encode as JSON LargeUtf8 for unsupported composite types.
     let bytes = serde_json::to_string(&d).map_err(|e| FnError::new(0x13, e.to_string()))?;
     Ok(ScalarValue::LargeUtf8(Some(bytes)))
+}
+
+/// Coerce a finalize result to the aggregate's declared return type.
+///
+/// The declared return type — not the runtime value — drives the output so
+/// the emitted `ScalarValue` matches the schema the UDAF adapter advertised
+/// via `return_type()`. A unit result becomes a typed null of the declared
+/// type (not an untyped `ScalarValue::Null`), and numeric results are
+/// widened/narrowed to the target primitive (e.g. an `INT` finalize under a
+/// `Float64` return becomes `Float64`). A non-primitive declared return
+/// falls back to the value-directed [`dynamic_to_scalar_loose`].
+///
+/// # Errors
+/// Returns [`FnError`] if the value cannot be coerced to the declared type.
+fn dynamic_to_scalar_typed(d: Dynamic, ret: &ArgType) -> Result<ScalarValue, FnError> {
+    let ArgType::Primitive(dt) = ret else {
+        return dynamic_to_scalar_loose(d);
+    };
+    coerce_dynamic_to_datatype(d, dt)
+}
+
+/// Build a `ScalarValue` of Arrow type `dt` from a Rhai `Dynamic`.
+///
+/// # Errors
+/// Returns [`FnError`] when a typed null cannot be constructed or the value
+/// cannot be coerced into the requested primitive type.
+fn coerce_dynamic_to_datatype(d: Dynamic, dt: &DataType) -> Result<ScalarValue, FnError> {
+    // A unit finalize maps to a typed null of the declared type rather than
+    // an untyped ScalarValue::Null (whose DataType is DataType::Null).
+    if d.is_unit() {
+        return ScalarValue::try_from(dt)
+            .map_err(|e| FnError::new(0x13, format!("Rhai aggregate null of {dt:?}: {e}")));
+    }
+    // Capture the runtime type name up front so the error builder does not
+    // borrow `d` (some match arms move it, e.g. `into_string`).
+    let got = d.type_name();
+    let type_err = move |want: &str| {
+        FnError::new(
+            0x13,
+            format!("Rhai aggregate finalize: cannot coerce {got} to declared {want}"),
+        )
+    };
+    match dt {
+        DataType::Boolean => d.as_bool().map(|b| ScalarValue::Boolean(Some(b))).map_err(|_| type_err("bool")),
+        DataType::Int64 => {
+            if let Ok(i) = d.as_int() {
+                Ok(ScalarValue::Int64(Some(i)))
+            } else if let Ok(f) = d.as_float() {
+                // Truncate a finite, in-range float; a non-finite or
+                // out-of-range float becomes a typed null rather than a
+                // silently-saturated `as i64` cast.
+                if f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    Ok(ScalarValue::Int64(Some(f as i64)))
+                } else {
+                    Ok(ScalarValue::Int64(None))
+                }
+            } else {
+                Err(type_err("int"))
+            }
+        }
+        DataType::Float64 => {
+            if let Ok(f) = d.as_float() {
+                Ok(ScalarValue::Float64(Some(f)))
+            } else if let Ok(i) = d.as_int() {
+                Ok(ScalarValue::Float64(Some(i as f64)))
+            } else {
+                Err(type_err("float"))
+            }
+        }
+        DataType::Utf8 => d
+            .into_string()
+            .map(|s| ScalarValue::Utf8(Some(s)))
+            .map_err(|_| type_err("string")),
+        DataType::LargeUtf8 => match d.clone().into_string() {
+            // A plain string returns verbatim; a composite value (map/array)
+            // is JSON-encoded, matching the aggregate "map"/"object"/"any"
+            // return convention in `build_agg_signature`.
+            Ok(s) => Ok(ScalarValue::LargeUtf8(Some(s))),
+            Err(_) => {
+                let bytes = serde_json::to_string(&d).map_err(|e| FnError::new(0x13, e.to_string()))?;
+                Ok(ScalarValue::LargeUtf8(Some(bytes)))
+            }
+        },
+        DataType::Null => Ok(ScalarValue::Null),
+        // Other declared types: best-effort value-directed conversion.
+        _ => dynamic_to_scalar_loose(d),
+    }
 }
 
 /// Build the standard state-field schema for a Rhai aggregate. v1

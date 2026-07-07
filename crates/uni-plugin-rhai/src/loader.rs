@@ -289,9 +289,18 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
         .yields
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            let dt = type_name_to_datatype(t)?;
-            Ok(Field::new(format!("col{i}"), dt, true))
+        .map(|(i, y)| {
+            let dt = type_name_to_datatype(&y.type_name)?;
+            // Prefer the declared column name so it aligns with the keys the
+            // procedure uses in its returned row maps. Only fall back to a
+            // positional `col{i}` name when the manifest declared none — a
+            // fabricated name would never match a natural-key row map and the
+            // column would silently read all-NULL.
+            let name = y
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("col{i}"));
+            Ok(Field::new(name, dt, true))
         })
         .collect::<Result<_, RhaiError>>()?;
 

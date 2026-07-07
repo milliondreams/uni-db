@@ -22,6 +22,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# MessagePack round-trips non-finite floats (NaN/Inf) as raw IEEE-754 bits,
+# which JSON cannot; used for aggregate partial-state envelopes.
+rmp-serde = "1.3"
 futures = { workspace = true }
 smol_str = "0.3"
 semver = "1"

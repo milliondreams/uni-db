@@ -33,10 +33,20 @@ Shared build/test conventions (from the fixed work):
 
 ---
 
-## D1 — `uni[2]` fork-local index kind collision (perf; NOT data-loss)
+## D1 — `uni[2]` fork-local index kind collision (perf; NOT data-loss) — ✅ DONE (`01fb4ca16`)
 
 **Severity:** perf/planner defect — retrieval stays correct (falls back to a plain scan);
 only the fused-index-scan *plan* is missed. This is why it was safe to defer.
+
+**Status:** fixed per the plan below. `ForkScope.fork_local_indexes` now holds a
+`HashSet<ForkLocalIndexKind>` per `(label, column)`; `register_fork_local_index` inserts into
+the set; `fork_local_index` → `has_fork_local_index(label, column, kind)`; `manager.rs`
+exposes `has_fork_index`; and every planner fusion site (`ForkIndexLookup::fork_index_has` /
+`_label_id`) probes for the exact kind it emits (equality Scan → VidUid then ScalarBtree;
+VectorKnn → Vector; InvertedIndexLookup → FullText; Sort → Sorted; procedure call → expected).
+The `fork_maintenance.rs` skip-check probes the specific kind, ending the rebuild ping-pong.
+Repro flipped to `two_fork_index_kinds_on_one_column_coexist` (BtreeUnion fusion survives a
+FullText build on the same column), wired into `mod.rs`; all 27 `fork_index`/repro tests green.
 
 ### Locations
 - **Storage (root):** `crates/uni-store/src/fork/scope.rs:125`
@@ -495,13 +505,16 @@ handles both directions).
       deterministic failpoint repro, negative-control proven).
 - [ ] **D3** (`uni-fork[3]`) — decide `UidIndex`-on-update semantics first; canary test =
       `promote_default_is_insert_only_twin`.
-- [ ] **D1** (`uni[2]`) — perf-only; do last unless a fork-index plan-quality issue surfaces.
+- [x] **D1** (`uni[2]`) — DONE `01fb4ca16` (per-kind set + kind-specific planner probes; repro
+      `two_fork_index_kinds_on_one_column_coexist` flipped and wired in).
 - [ ] **D5** (`uni-query-functions[2]`) — Wave 1; needs a unified order-preserving numeric
       sort-key codec (design change); repro `repro_finding_13_sort_key_int_collapse`.
 - [ ] **D6** (R5 bulk cross-channel) — Wave 1; needs a shared full-horizon constraint surface;
       repro = a no-flush variant of `bulk_unique_ignores_preexisting_committed_row`.
 
-D3/D1 (Wave 0) and D5/D6 (Wave 1) remain, each with an in-tree repro pinning current behavior.
+D3 (Wave 0) and D5/D6 (Wave 1) remain, each with an in-tree repro pinning current behavior.
+D1 (Wave 0) is now fixed on `main` (`01fb4ca16`), resolving the sole real correctness-scan
+Wave 4 (unverified) finding — the other 16 unverified findings were already fixed in Waves 2-3.
 Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`
 (D4 + D2) and `fix/correctness-scan-wave1` (all 8 Wave-1 regions) are not yet merged. Nothing
 pushed.

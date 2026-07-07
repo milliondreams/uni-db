@@ -887,6 +887,15 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             None
         };
 
+        // Resolve the source variable's label so metrics are looked up per
+        // `(label, property)` rather than by property name alone (which would
+        // let the first-declared index win across labels sharing a property).
+        let source_label = source_variable.as_ref().and_then(|var| {
+            self.translation_ctx
+                .and_then(|ctx| ctx.variable_labels.get(var))
+                .map(String::as_str)
+        });
+
         // Resolve per-source distance metrics from schema at compile time.
         let source_metrics: Vec<Option<DistanceMetric>> = source_property_names
             .iter()
@@ -894,7 +903,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 prop_name.as_ref().and_then(|prop| {
                     self.uni_schema
                         .as_ref()
-                        .and_then(|schema| resolve_metric_for_property(schema, prop))
+                        .and_then(|schema| {
+                            resolve_metric_for_property(schema, source_label, prop)
+                        })
                 })
             })
             .collect();
@@ -2655,10 +2666,30 @@ fn rewrite_expr_correlated(expr: &Expr, outer_vars: &HashSet<String>) -> Expr {
     }
 }
 
-/// Look up the `DistanceMetric` for a vector-indexed property across all labels.
+/// Look up the `DistanceMetric` for a vector-indexed property on a label.
+///
+/// When `label` is known, an index matching both `(label, property)` is
+/// preferred so distinct labels that reuse a property name (e.g. `emb`) resolve
+/// to their own metric instead of the first-declared index winning. When the
+/// label is unknown the search falls back to the first property-name match.
 ///
 /// Returns `None` if no vector index exists for the property.
-fn resolve_metric_for_property(schema: &UniSchema, property: &str) -> Option<DistanceMetric> {
+fn resolve_metric_for_property(
+    schema: &UniSchema,
+    label: Option<&str>,
+    property: &str,
+) -> Option<DistanceMetric> {
+    if let Some(label) = label {
+        for idx in &schema.indexes {
+            if let IndexDefinition::Vector(config) = idx
+                && config.label == label
+                && config.property == property
+            {
+                return Some(config.metric.clone());
+            }
+        }
+    }
+    // Fall back to a property-only match when the source label is unknown.
     for idx in &schema.indexes {
         if let IndexDefinition::Vector(config) = idx
             && config.property == property

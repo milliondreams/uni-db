@@ -331,7 +331,16 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
             }
             numeric_op(left, right, |a, b| a / b, |a, b| a / b)
         }
-        LocyBinaryOp::Mod => numeric_op(left, right, |a, b| a % b, |a, b| a % b),
+        LocyBinaryOp::Mod => {
+            // Guard against modulo by zero: an integer `a % 0` panics in Rust,
+            // so return a clean evaluation error instead of aborting the query.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "modulo by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
+        }
         LocyBinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
                 message: format!("pow requires numeric, got {left:?}"),
@@ -368,8 +377,24 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
         BinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        BinaryOp::Div => numeric_op(left, right, |a, b| a / b, |a, b| a / b),
-        BinaryOp::Mod => numeric_op(left, right, |a, b| a % b, |a, b| a % b),
+        BinaryOp::Div => {
+            // Guard against integer division by zero, which panics in Rust.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "division by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
+        }
+        BinaryOp::Mod => {
+            // Guard against integer modulo by zero, which panics in Rust.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "modulo by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
+        }
         BinaryOp::Pow => {
             let l = left.as_f64().unwrap_or(0.0);
             let r = right.as_f64().unwrap_or(0.0);
@@ -565,7 +590,100 @@ pub fn value_less_than(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Float(y)) => (*x as f64) < *y,
         (Value::Float(x), Value::Int(y)) => *x < (*y as f64),
         (Value::String(x), Value::String(y)) => x < y,
+        // `false` sorts before `true`, matching Cypher boolean ordering.
+        (Value::Bool(x), Value::Bool(y)) => !x & y,
+        (Value::Temporal(x), Value::Temporal(y)) => {
+            temporal_less_than(x, y) == std::cmp::Ordering::Less
+        }
         _ => false,
+    }
+}
+
+/// Order two temporal values, matching the executor's `ORDER BY` semantics.
+///
+/// Same-kind values compare by their canonical instant; mixed kinds fall back
+/// to a stable per-variant rank so the ordering is total and deterministic.
+fn temporal_less_than(
+    left: &uni_common::TemporalValue,
+    right: &uni_common::TemporalValue,
+) -> std::cmp::Ordering {
+    use uni_common::TemporalValue as T;
+    match (left, right) {
+        (
+            T::Date {
+                days_since_epoch: l,
+            },
+            T::Date {
+                days_since_epoch: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::LocalTime {
+                nanos_since_midnight: l,
+            },
+            T::LocalTime {
+                nanos_since_midnight: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::Time {
+                nanos_since_midnight: lm,
+                offset_seconds: lo,
+            },
+            T::Time {
+                nanos_since_midnight: rm,
+                offset_seconds: ro,
+            },
+        ) => {
+            let l_utc = *lm as i128 - (*lo as i128) * 1_000_000_000;
+            let r_utc = *rm as i128 - (*ro as i128) * 1_000_000_000;
+            l_utc.cmp(&r_utc)
+        }
+        (
+            T::LocalDateTime {
+                nanos_since_epoch: l,
+            },
+            T::LocalDateTime {
+                nanos_since_epoch: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::DateTime {
+                nanos_since_epoch: l,
+                ..
+            },
+            T::DateTime {
+                nanos_since_epoch: r,
+                ..
+            },
+        ) => l.cmp(r),
+        (
+            T::Duration {
+                months: lm,
+                days: ld,
+                nanos: ln,
+            },
+            T::Duration {
+                months: rm,
+                days: rd,
+                nanos: rn,
+            },
+        ) => (*lm, *ld, *ln).cmp(&(*rm, *rd, *rn)),
+        _ => temporal_variant_rank(left).cmp(&temporal_variant_rank(right)),
+    }
+}
+
+/// Stable ordering rank for mixed-kind temporal comparisons.
+fn temporal_variant_rank(v: &uni_common::TemporalValue) -> u8 {
+    use uni_common::TemporalValue as T;
+    match v {
+        T::Date { .. } => 0,
+        T::LocalTime { .. } => 1,
+        T::Time { .. } => 2,
+        T::LocalDateTime { .. } => 3,
+        T::DateTime { .. } => 4,
+        T::Duration { .. } => 5,
+        T::Btic { .. } => 6,
     }
 }
 

@@ -103,6 +103,12 @@ fn cypher_cross_type_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float(l), Value::Int(r)) => l.partial_cmp(&(*r as f64)).unwrap_or(Ordering::Equal),
         (Value::String(l), Value::String(r)) => l.cmp(r),
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
+        // Temporal and Bytes share `cypher_type_rank` 5, so a same-rank pair
+        // reaches this match. Without these arms `min`/`max` over dates or byte
+        // strings collapsed to `Ordering::Equal` and returned the first-seen
+        // value. Order them by their natural comparison instead.
+        (Value::Temporal(l), Value::Temporal(r)) => Executor::compare_temporal(l, r),
+        (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
         _ => Ordering::Equal,
     }
 }
@@ -1051,6 +1057,33 @@ mod tests {
         acc.update(&Value::Float(2.5), false);
         acc.update(&Value::Null, false); // null skipped
         assert_eq!(acc.finish(), Value::Float(12.5));
+    }
+
+    #[test]
+    fn test_accumulator_minmax_temporal() {
+        // Regression for the `cypher_cross_type_cmp` finding: temporal values
+        // shared `cypher_type_rank` 5 and fell through to `Ordering::Equal`, so
+        // MIN/MAX kept the first-encountered value instead of the true extreme.
+        let dt = |secs: i64| {
+            Value::Temporal(TemporalValue::DateTime {
+                nanos_since_epoch: secs * 1_000_000_000,
+                offset_seconds: 0,
+                timezone_name: None,
+            })
+        };
+        // 2020, then 2010, then 2030 (unsorted insertion order).
+        let y2020 = dt(1_577_836_800);
+        let y2010 = dt(1_262_304_000);
+        let y2030 = dt(1_893_456_000);
+
+        let mut min_acc = Accumulator::new("MIN", false);
+        let mut max_acc = Accumulator::new("MAX", false);
+        for v in [&y2020, &y2010, &y2030] {
+            min_acc.update(v, false);
+            max_acc.update(v, false);
+        }
+        assert_eq!(min_acc.finish(), y2010, "MIN over dates must return the earliest");
+        assert_eq!(max_acc.finish(), y2030, "MAX over dates must return the latest");
     }
 
     #[test]

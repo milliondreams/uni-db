@@ -176,11 +176,16 @@ pub(super) fn parse_reranker_options(
         .map(String::from)
         .or_else(|| default_text_property.map(String::from))
         .unwrap_or_default();
+    // Rerank at least `k` candidates and at most 1000, but never below `k`.
+    // `Ord::clamp` panics when `min > max`, so a search `k > 1000` would abort;
+    // compose `max`/`min` (with an upper bound that can never fall below `k`)
+    // to stay panic-free for every `k`.
+    let upper = k.max(1000);
     let reranker_k = map
         .get("reranker_k")
         .and_then(|v| v.as_u64())
-        .map(|v| (v as usize).clamp(k, 1000))
-        .unwrap_or((k * 3).min(1000));
+        .map(|v| (v as usize).max(k).min(upper))
+        .unwrap_or_else(|| k.saturating_mul(3).min(upper));
     let query_override = map
         .get("reranker_query")
         .and_then(|v| v.as_str())

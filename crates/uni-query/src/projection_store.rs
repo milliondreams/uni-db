@@ -19,7 +19,7 @@
 //! recomputing it requires a `drop` + `project` cycle.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::SystemTime;
 
 use uni_algo::algo::GraphProjection;
@@ -161,31 +161,48 @@ impl ProjectionStore {
     }
 }
 
+/// One process-global projection-registry row: a weak handle to a
+/// database's schema manager paired with its projection store.
+///
+/// The [`Weak`] lets dropped databases be pruned so a recycled heap
+/// address is never matched to a stale store.
+type ProjectionRegistryEntry = (Weak<uni_common::core::schema::SchemaManager>, Arc<ProjectionStore>);
+
 /// Look up (or create) the [`ProjectionStore`] for the given
-/// `StorageManager`. Uses the backing `Arc<SchemaManager>` pointer
-/// identity as the registry key — callers sharing the same
-/// `schema_manager` Arc (e.g. a pinned transaction and the live
+/// `StorageManager`. Identifies the owning database by the backing
+/// `Arc<SchemaManager>` *allocation identity* — callers sharing the
+/// same `schema_manager` Arc (e.g. a pinned transaction and the live
 /// session) see the same store, while a fork (which holds a distinct
 /// `schema_manager`) gets an isolated store.
 ///
-/// The registry leaks one entry per distinct `schema_manager` over
-/// the process lifetime, which is bounded (a typical embedded use
-/// constructs one or two `Uni` instances per process).
+/// The registry holds a [`Weak`] reference per database and compares
+/// entries with [`Arc::ptr_eq`] on the *live* upgraded Arc rather than
+/// a raw address. This makes stale reuse impossible: a dropped
+/// database's `Weak` can never upgrade to a live Arc, so a later
+/// database that happens to reuse a freed heap address is never
+/// matched to the dead database's store. Dead entries are pruned on
+/// each lookup, so the registry stays bounded.
 pub fn for_storage(storage: &Arc<StorageManager>) -> Arc<ProjectionStore> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<ProjectionStore>>>> = OnceLock::new();
-    // Key on the `schema_manager` Arc identity, not the `StorageManager` Arc:
-    // a pinned transaction and the live session clone the *same*
-    // `schema_manager` Arc (so they must share the projection store), while a
-    // fork holds a distinct one (so it stays isolated).
-    let key = Arc::as_ptr(storage.schema_manager_arc_ref()) as usize;
-    let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    static REGISTRY: OnceLock<Mutex<Vec<ProjectionRegistryEntry>>> = OnceLock::new();
+
+    let schema_arc = storage.schema_manager_arc_ref();
+    let reg = REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
     let mut g = match reg.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.entry(key)
-        .or_insert_with(|| Arc::new(ProjectionStore::new()))
-        .clone()
+    // Drop entries whose `SchemaManager` has been dropped so a freed heap
+    // address cannot be re-associated with a stale store.
+    g.retain(|(weak, _)| weak.strong_count() > 0);
+    if let Some((_, store)) = g
+        .iter()
+        .find(|(weak, _)| weak.upgrade().is_some_and(|s| Arc::ptr_eq(&s, schema_arc)))
+    {
+        return store.clone();
+    }
+    let store = Arc::new(ProjectionStore::new());
+    g.push((Arc::downgrade(schema_arc), store.clone()));
+    store
 }
 
 /// Best-effort byte-size estimate for a [`GraphProjection`]. Used by

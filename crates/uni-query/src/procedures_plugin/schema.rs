@@ -464,7 +464,9 @@ impl ProcedurePlugin for SchemaLabelInfoProc {
                     IndexDefinition::Inverted(inv) => {
                         inv.label == label_name && inv.property == *prop_name
                     }
-                    IndexDefinition::JsonFullText(j) => j.label == label_name,
+                    IndexDefinition::JsonFullText(j) => {
+                        j.label == label_name && j.column == *prop_name
+                    }
                     _ => false,
                 });
                 let unique = uni_schema.constraints.iter().any(|c| {

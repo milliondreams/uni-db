@@ -419,17 +419,57 @@ async fn repro_20_label_or_dropped_below_limit() {
 // [25] locy_eval.rs:371 — integer div/mod by zero panics (via Cypher)
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for locy_eval.rs:371: integer divide-by-zero panics instead of clean error"]
 async fn repro_25_int_div_by_zero() {
-    let h = Harness::new_schemaless().await;
-    let res = h.run("RETURN 10 / 0 AS q").await;
-    // If this path uses the guarded evaluator it returns Err; if it hits the
-    // unguarded numeric_op it panics ("attempt to divide by zero").
-    println!("[25] 10/0 -> {res:?}");
-    match res {
-        Ok(rows) => println!("[25] returned rows: {rows:?}"),
-        Err(e) => println!("[25] returned Err: {e}"),
-    }
+    // The finding lives in the Locy in-memory evaluator (`locy_eval::eval_expr`
+    // / `eval_locy_expr`), which powers DERIVE/ABDUCE/QUERY expression
+    // evaluation — not the DataFusion Cypher path. Exercise that evaluator
+    // directly so the guarded arms are actually hit.
+    use std::collections::HashMap;
+    use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
+    use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr};
+    use uni_query::query::df_graph::locy_eval::{eval_expr, eval_locy_expr};
+
+    let bindings: HashMap<String, Value> = HashMap::new();
+    let int_lit = |n: i64| Expr::Literal(CypherLiteral::Integer(n));
+
+    // Integer division by zero must return a clean error, not panic.
+    let div0 = Expr::BinaryOp {
+        left: Box::new(int_lit(10)),
+        op: BinaryOp::Div,
+        right: Box::new(int_lit(0)),
+    };
+    let div_res = eval_expr(&div0, &bindings);
+    println!("[25] eval_expr(10/0) -> {div_res:?}");
+    assert!(
+        div_res.is_err(),
+        "repro for locy_eval.rs: integer divide-by-zero must be a clean error"
+    );
+
+    // Integer modulo by zero must return a clean error, not panic.
+    let mod0 = Expr::BinaryOp {
+        left: Box::new(int_lit(10)),
+        op: BinaryOp::Mod,
+        right: Box::new(int_lit(0)),
+    };
+    let mod_res = eval_expr(&mod0, &bindings);
+    println!("[25] eval_expr(10%0) -> {mod_res:?}");
+    assert!(
+        mod_res.is_err(),
+        "repro for locy_eval.rs: integer modulo-by-zero must be a clean error"
+    );
+
+    // The `eval_locy_binary_op` Mod arm (prev-ref-aware evaluator) is guarded too.
+    let locy_mod0 = LocyExpr::BinaryOp {
+        left: Box::new(LocyExpr::Cypher(int_lit(10))),
+        op: LocyBinaryOp::Mod,
+        right: Box::new(LocyExpr::Cypher(int_lit(0))),
+    };
+    let locy_res = eval_locy_expr(&locy_mod0, &bindings, None);
+    println!("[25] eval_locy_expr(10%0) -> {locy_res:?}");
+    assert!(
+        locy_res.is_err(),
+        "repro for locy_eval.rs:334: Locy modulo-by-zero must be a clean error"
+    );
 }
 
 // ===========================================================================
@@ -531,9 +571,10 @@ async fn repro_26_value_less_than_temporal() {
     let lt = value_less_than(&earlier, &later);
     let gt = value_less_than(&later, &earlier);
     println!("[26] value_less_than(1990,2020)={lt} (correct=true); (2020,1990)={gt} (correct=false)");
-    // BUG: no Temporal arm -> both return false, so MIN/MAX/ORDER BY over dates break.
-    assert_eq!(lt, false, "repro for locy_eval.rs:561: temporal '<' always false");
-    assert_eq!(gt, false, "repro for locy_eval.rs:561: temporal '>' always false");
+    // FIXED (locy_eval.rs): temporal values now compare by their canonical
+    // instant, so 1990 < 2020 and NOT 2020 < 1990.
+    assert!(lt, "repro for locy_eval.rs:561: temporal '<' must order dates");
+    assert!(!gt, "repro for locy_eval.rs:561: temporal '>' must order dates");
 }
 
 // ===========================================================================
@@ -546,19 +587,20 @@ async fn repro_14_minmax_temporal() {
     h.run_ok("CREATE (:E {when: datetime('2020-01-01T00:00:00Z')})").await;
     h.run_ok("CREATE (:E {when: datetime('2010-01-01T00:00:00Z')})").await;
     h.run_ok("CREATE (:E {when: datetime('2030-01-01T00:00:00Z')})").await;
-    let res = h.run("MATCH (n:E) RETURN min(n.when) AS lo, max(n.when) AS hi").await;
-    match res {
-        Ok(rows) => {
-            let lo = cell(&rows[0], "lo");
-            let hi = cell(&rows[0], "hi");
-            println!("[14] min(when)={lo:?} max(when)={hi:?} (correct: lo=2010, hi=2030)");
-            // BUG: cypher_cross_type_cmp returns Equal for temporals -> lo==hi==first row.
-            if lo == hi {
-                println!("[14] REPRODUCED: min==max (first-encountered kept)");
-            }
-        }
-        Err(e) => println!("[14] errored (temporal aggregate path): {e}"),
-    }
+    let rows = h.run_ok("MATCH (n:E) RETURN min(n.when) AS lo, max(n.when) AS hi").await;
+    let lo = cell(&rows[0], "lo");
+    let hi = cell(&rows[0], "hi");
+    println!("[14] min(when)={lo:?} max(when)={hi:?} (correct: lo=2010, hi=2030)");
+    // The finding is `cypher_cross_type_cmp` (executor `Accumulator` MIN/MAX).
+    // That comparator is exercised only by the legacy `execute_subplan`
+    // aggregation path; a plain read `RETURN min(...)` routes through the
+    // DataFusion engine instead (see `Executor::execute`), so this schemaless
+    // query does not reach the fixed code. The comparator fix is pinned
+    // deterministically by the crate-internal unit test
+    // `query::executor::core::tests::test_accumulator_minmax_temporal`.
+    // Here we assert only the reachable invariant: the aggregate yields a
+    // single grouped row over the three inserted temporals.
+    assert_eq!(rows.len(), 1, "min/max aggregate must produce exactly one row");
 }
 
 // ===========================================================================
@@ -696,20 +738,30 @@ async fn repro_35_labelinfo_jsonfts() {
         .unwrap();
     })
     .await;
-    let res = h.run("CALL uni.schema.labelInfo('Doc') YIELD property, indexed RETURN property, indexed").await;
-    match res {
-        Ok(rows) => {
-            println!("[35] labelInfo rows: {rows:?}");
-            if let Some(r) = rows.iter().find(|r| cell(r, "property") == Value::String("title".into())) {
-                let idx = cell(r, "indexed");
-                println!("[35] title.indexed = {idx:?} (correct=false)");
-                if idx == Value::Bool(true) {
-                    println!("[35] REPRODUCED: unrelated 'title' reported indexed=true");
-                }
-            }
-        }
-        Err(e) => println!("[35] procedure not callable in harness: {e}"),
-    }
+    let rows = h
+        .run_ok("CALL uni.schema.labelInfo('Doc') YIELD property, indexed RETURN property, indexed")
+        .await;
+    println!("[35] labelInfo rows: {rows:?}");
+    let title = rows
+        .iter()
+        .find(|r| cell(r, "property") == Value::String("title".into()))
+        .expect("labelInfo must report the 'title' property");
+    let body = rows
+        .iter()
+        .find(|r| cell(r, "property") == Value::String("body".into()))
+        .expect("labelInfo must report the 'body' property");
+    // FIXED (schema.rs): the JsonFullText check now compares the property to
+    // `j.column`, so only 'body' (the indexed column) is reported indexed.
+    assert_eq!(
+        cell(title, "indexed"),
+        Value::Bool(false),
+        "unindexed 'title' must not be reported indexed just because 'body' has a JSON FTS index"
+    );
+    assert_eq!(
+        cell(body, "indexed"),
+        Value::Bool(true),
+        "the JSON-FTS-indexed 'body' column must be reported indexed"
+    );
 }
 
 // ===========================================================================
@@ -799,7 +851,6 @@ async fn repro_find04_hybrid_autoembed_swallowed() {
 // clamp asserts min<=max and PANICS.
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [15]: reranker_k clamp(k,1000) panics when search k>1000"]
 async fn repro_find15_reranker_clamp_panic() {
     let h = Harness::new_schemaless().await;
     // k = 1001 (> 1000) with a reranker options map that carries reranker_k.
@@ -813,56 +864,111 @@ async fn repro_find15_reranker_clamp_panic() {
 }
 
 // ===========================================================================
-// FINDING [8] projection_store.rs:180 — process-global projection registry is
-// keyed on Arc::as_ptr of the schema-manager Arc, without holding the Arc alive
-// or evicting. Two *distinct* StorageManager instances (two logical databases)
-// that happen to share a SchemaManager Arc collide on ONE global ProjectionStore
-// — a cross-instance leak.
+// FINDING [8] projection_store.rs:180 — the process-global projection registry
+// was keyed on the raw address of the schema-manager Arc (Arc::as_ptr as usize)
+// without holding the Arc alive or evicting, so a later database instance could
+// reuse a freed address and read a *stale* projection from a dropped database.
+//
+// The fix keys on the live Arc identity (Weak + ptr_eq) and prunes dead
+// entries, while still (a) sharing one store across callers that share a
+// schema Arc (pinned tx + live session) and (b) isolating distinct schema Arcs.
 // ===========================================================================
 #[tokio::test]
 async fn repro_find08_projection_store_ptr_key_collision() {
     use uni_algo::algo::GraphProjection;
-    use uni_query::projection_store::{
-        for_storage, ProjectionEntry, ProjectionSourceKind,
-    };
+    use uni_query::projection_store::{for_storage, ProjectionEntry, ProjectionSourceKind};
+
+    fn entry() -> ProjectionEntry {
+        ProjectionEntry {
+            projection: Arc::new(GraphProjection::from_rows(&[], &[], None, false).unwrap()),
+            node_count: 0,
+            edge_count: 0,
+            bytes: 0,
+            created_at: std::time::SystemTime::now(),
+            source_kind: ProjectionSourceKind::Native,
+        }
+    }
+
+    // ---- Part A: callers sharing ONE schema Arc share the store (intended). ----
     let dir_a = tempdir().unwrap();
     let dir_b = tempdir().unwrap();
-    // One shared SchemaManager Arc across two separate storage instances.
-    let sm = Arc::new(
-        SchemaManager::load(&dir_a.path().join("schema.json")).await.unwrap(),
-    );
+    let sm_shared = Arc::new(SchemaManager::load(&dir_a.path().join("schema.json")).await.unwrap());
     let a = Arc::new(
-        StorageManager::new(dir_a.path().join("st").to_str().unwrap(), sm.clone())
+        StorageManager::new(dir_a.path().join("st").to_str().unwrap(), sm_shared.clone())
             .await
             .unwrap(),
     );
     let b = Arc::new(
-        StorageManager::new(dir_b.path().join("st").to_str().unwrap(), sm.clone())
+        StorageManager::new(dir_b.path().join("st").to_str().unwrap(), sm_shared.clone())
             .await
             .unwrap(),
     );
     let sa = for_storage(&a);
     let sb = for_storage(&b);
-    // BUG: two distinct databases share the SAME global ProjectionStore because
-    // the key is Arc::as_ptr(schema_manager).
     assert!(
         Arc::ptr_eq(&sa, &sb),
-        "repro for [8]: separate storages sharing a schema Arc collide on one ProjectionStore"
+        "callers sharing a schema Arc (pinned tx + live session) must share one store"
     );
-    // Cross-instance leak: a projection registered against `a` is visible via `b`.
-    let entry = ProjectionEntry {
-        projection: Arc::new(GraphProjection::from_rows(&[], &[], None, false).unwrap()),
-        node_count: 0,
-        edge_count: 0,
-        bytes: 0,
-        created_at: std::time::SystemTime::now(),
-        source_kind: ProjectionSourceKind::Native,
-    };
-    sa.insert("g".into(), entry).unwrap();
+    sa.insert("g".into(), entry()).unwrap();
+    assert!(sb.contains("g"), "shared-schema callers must see the same projections");
+
+    // ---- Part B: distinct schema Arcs get ISOLATED stores (no cross leak). ----
+    let dir_c = tempdir().unwrap();
+    let sm_other = Arc::new(SchemaManager::load(&dir_c.path().join("schema.json")).await.unwrap());
+    let c = Arc::new(
+        StorageManager::new(dir_c.path().join("st").to_str().unwrap(), sm_other.clone())
+            .await
+            .unwrap(),
+    );
+    let sc = for_storage(&c);
     assert!(
-        sb.contains("g"),
-        "repro for [8]: projection registered on instance A leaks into instance B"
+        !Arc::ptr_eq(&sa, &sc),
+        "distinct schema Arcs must get isolated stores"
     );
+    assert!(
+        !sc.contains("g"),
+        "a projection on one database must not leak into a database with a distinct schema"
+    );
+
+    // ---- Part C: a dropped database must not leak into a later one that ----
+    // reuses its freed heap address. Register a projection on a schema, drop it,
+    // then hunt for a new SchemaManager allocated at the same address. Under the
+    // old address-keyed registry, such a reuse returned the dead database's
+    // store (contains "g"); the fix keys on live identity so it never does.
+    let dir_d = tempdir().unwrap();
+    let sm_d = Arc::new(SchemaManager::load(&dir_d.path().join("schema.json")).await.unwrap());
+    let d = Arc::new(
+        StorageManager::new(dir_d.path().join("st").to_str().unwrap(), sm_d.clone())
+            .await
+            .unwrap(),
+    );
+    let sd = for_storage(&d);
+    sd.insert("g".into(), entry()).unwrap();
+    let dead_addr = Arc::as_ptr(&sm_d) as usize;
+    drop(sd);
+    drop(d);
+    drop(sm_d);
+
+    let dir_e = tempdir().unwrap();
+    for _ in 0..256 {
+        let sm_new =
+            Arc::new(SchemaManager::load(&dir_e.path().join("schema.json")).await.unwrap());
+        if Arc::as_ptr(&sm_new) as usize == dead_addr {
+            // Address reused: a fresh database landed on the dead one's slot.
+            let e = Arc::new(
+                StorageManager::new(dir_e.path().join("st").to_str().unwrap(), sm_new.clone())
+                    .await
+                    .unwrap(),
+            );
+            let se = for_storage(&e);
+            assert!(
+                !se.contains("g"),
+                "repro for [8]: a new database reusing a freed schema address must not \
+                 inherit the dropped database's stale projection"
+            );
+            break;
+        }
+    }
 }
 
 // ===========================================================================
@@ -907,27 +1013,28 @@ async fn repro_find09_metric_by_property_ignores_label() {
         .unwrap();
     })
     .await;
-    // A non-unit vector so Cosine vs L2 scores differ numerically.
+    // Query is parallel to the stored vector (same direction, 2x magnitude):
+    // Cosine similarity is 1.0 (angle 0), while squared-L2 distance is
+    // (3-6)^2+(4-8)^2 = 25, giving an L2 score of 1/(1+25) = 1/26 ~= 0.0385.
+    // The two metrics therefore yield very different scores, so the resolved
+    // metric is observable.
     h.run_ok("CREATE (:LabelB {emb: [3.0, 4.0, 0.0]})").await;
-    let res = h
-        .run("MATCH (b:LabelB) RETURN similar_to(b.emb, [3.0, 4.0, 0.0]) AS s")
+    let rows = h
+        .run_ok("MATCH (b:LabelB) RETURN similar_to(b.emb, [6.0, 8.0, 0.0]) AS s")
         .await;
-    println!("[9] similar_to over LabelB (should use L2) -> {res:?}");
-    match res {
-        Ok(rows) => {
-            let s = cell(&rows[0], "s");
-            println!("[9] score = {s:?} (LabelB's declared metric is L2, not Cosine)");
-            // BUG: Cosine metric resolved for LabelB because LabelA's index is
-            // first in schema.indexes -> identical vectors score 1.0 (cosine).
-            // A label-aware lookup would use LabelB's L2 metric instead.
-            assert_eq!(
-                s,
-                Value::Float(1.0),
-                "repro for [9]: LabelB resolved to LabelA's Cosine metric (first-index-wins)"
-            );
-        }
-        Err(e) => println!("[9] similar_to not runnable in harness: {e}"),
-    }
+    let s = cell(&rows[0], "s");
+    println!("[9] score = {s:?} (LabelB's declared metric is L2, not Cosine)");
+    // FIXED (expr_compiler.rs): the metric is resolved by (label, property), so
+    // LabelB uses its declared L2 metric (~0.0385), not LabelA's Cosine (1.0).
+    let score = match s {
+        Value::Float(f) => f,
+        Value::Int(i) => i as f64,
+        other => panic!("[9] unexpected score value: {other:?}"),
+    };
+    assert!(
+        (score - 1.0 / 26.0).abs() < 1e-3,
+        "repro for [9]: LabelB must resolve to its own L2 metric (~0.0385), got {score}"
+    );
 }
 
 // ===========================================================================

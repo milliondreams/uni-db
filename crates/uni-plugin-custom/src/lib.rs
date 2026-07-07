@@ -1308,13 +1308,15 @@ pub mod procedures {
                     }
                     let dependencies = parse_deps(args, $field_count - 1)?;
                     let declared_by = principal_id(&ctx);
-                    // `body` mirrors the first positional arg after
-                    // `qname` (position 1), looked up by its signature
-                    // name.
-                    let body = sig_args
-                        .get(1)
-                        .map(|a| a.name.to_string())
-                        .and_then(|key| sig.get(&key))
+                    // `body` mirrors the declared signature's `body`
+                    // argument by NAME, not by a hardcoded position.
+                    // The Cypher body sits at position 1 for
+                    // `declareProcedure` but at position 2 for
+                    // `declareTrigger` (whose position 1 is
+                    // `event_filter`); keying off the name stores the
+                    // real Cypher body in every case.
+                    let body = sig
+                        .get("body")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_owned();
@@ -1514,26 +1516,30 @@ impl DeclaredPluginStore {
     /// [`CustomError::DependencyCycle`] if adding this plugin would
     /// introduce a cycle.
     pub fn declare(&self, plugin: DeclaredPlugin) -> Result<(), CustomError> {
-        {
-            let map = self.by_qname.read().expect("declared-plugin lock poisoned");
-            for dep in &plugin.dependencies {
-                if !map.contains_key(dep) {
-                    return Err(CustomError::DependencyMissing {
-                        dependent: plugin.qname.clone(),
-                        dep: dep.clone(),
-                    });
-                }
-            }
-            if would_introduce_cycle(&map, &plugin) {
-                return Err(CustomError::DependencyCycle(chain_starting_at(
-                    &map, &plugin,
-                )));
+        // Validate-and-insert atomically under a single write lock.
+        // Splitting validation (read lock) from insertion (separate
+        // write lock) opens a check-then-act (TOCTOU) window in which
+        // two concurrent declares can each pass validation and then both
+        // commit — persisting a dependency cycle the checks were meant
+        // to reject. Holding the write lock across both steps closes it.
+        let mut map = self
+            .by_qname
+            .write()
+            .expect("declared-plugin lock poisoned");
+        for dep in &plugin.dependencies {
+            if !map.contains_key(dep) {
+                return Err(CustomError::DependencyMissing {
+                    dependent: plugin.qname.clone(),
+                    dep: dep.clone(),
+                });
             }
         }
-        self.by_qname
-            .write()
-            .expect("declared-plugin lock poisoned")
-            .insert(plugin.qname.clone(), plugin);
+        if would_introduce_cycle(&map, &plugin) {
+            return Err(CustomError::DependencyCycle(chain_starting_at(
+                &map, &plugin,
+            )));
+        }
+        map.insert(plugin.qname.clone(), plugin);
         Ok(())
     }
 

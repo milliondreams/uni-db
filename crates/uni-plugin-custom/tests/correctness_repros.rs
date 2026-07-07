@@ -383,20 +383,25 @@ async fn repro5_trigger_body_is_event_filter() {
         .expect("declareTrigger invoke");
 
     let record = store.get("repro5.audit").expect("trigger recorded");
-    // BUG: expected the Cypher body (position 2) to be stored as `.body`.
-    // The shared macro reads sig_args[1] which for declareTrigger is
-    // `event_filter` -> `.body` == "Person". A synthesized trigger would
-    // execute "Person" as its Cypher query. (lib.rs:1292)
+    // FIXED (lib.rs): the macro keys `.body` off the signature arg named
+    // `body` (position 2 for declareTrigger), so the real Cypher body is
+    // stored — not the `event_filter` at position 1.
     assert_eq!(
-        record.body, "Person",
-        "repro for lib.rs:1292: trigger .body holds the event_filter, not the Cypher body"
+        record.body, "CREATE (:Log {msg: 'fired'})",
+        "trigger .body must hold the Cypher body, not the event_filter"
     );
-    // The true body survives (unused) under signature_json["body"].
+    // The event_filter and body both survive under signature_json,
+    // keyed by their signature-argument names.
     let sig: serde_json::Value = serde_json::from_str(&record.signature_json).unwrap();
+    assert_eq!(
+        sig.get("event_filter").and_then(|v| v.as_str()),
+        Some("Person"),
+        "event_filter captured under its named key"
+    );
     assert_eq!(
         sig.get("body").and_then(|v| v.as_str()),
         Some("CREATE (:Log {msg: 'fired'})"),
-        "true body captured in signature_json but never executed"
+        "body captured under its named key"
     );
 }
 
@@ -423,12 +428,13 @@ fn repro6_zero_rows_fabricates_one_row() {
         ColumnarValue::Array(a) => a,
         ColumnarValue::Scalar(_) => panic!("expected array"),
     };
-    // BUG: contract says "produce exactly `rows` values" -> length 0.
-    // rows.max(1) fabricates a length-1 column. (scalar.rs:94)
+    // FIXED (scalar.rs): the contract says "produce exactly `rows`
+    // values" -> length 0. No `rows.max(1)` fabrication of a length-1
+    // column from out-of-range (Null) input.
     assert_eq!(
         arr.len(),
-        1,
-        "repro for scalar.rs:94: 0-row invocation returns a length-1 column"
+        0,
+        "0-row invocation must return an empty column (produce exactly `rows` values)"
     );
 }
 
@@ -491,12 +497,15 @@ fn repro7_null_or_true_is_null_not_true() {
 // [8] lib.rs:1511 — DeclaredPluginStore::declare TOCTOU cycle race
 // --------------------------------------------------------------------
 
-/// Concurrency race: two declares validate (read lock) then insert
-/// (separate write lock). Marked #[ignore] because it is timing
-/// dependent; run explicitly with `--run-ignored=all` to observe.
+/// Concurrency invariant: two declares that would together close an
+/// `a <-> b` dependency cycle can never both commit. `declare` now
+/// validates and inserts atomically under a single write lock, so under
+/// any interleaving exactly one call wins and the other is rejected with
+/// [`CustomError::DependencyCycle`] — and no cycle is ever persisted.
 #[test]
-#[ignore = "repro for lib.rs:1511: check-then-act race, run explicitly with --run-ignored"]
-fn repro8_concurrent_declare_persists_cycle() {
+fn repro8_concurrent_declare_never_persists_cycle() {
+    use uni_plugin_custom::CustomError;
+
     fn rec(qname: &str, deps: &[&str]) -> DeclaredPlugin {
         DeclaredPlugin {
             qname: qname.to_owned(),
@@ -509,7 +518,7 @@ fn repro8_concurrent_declare_persists_cycle() {
         }
     }
 
-    let mut cycle_persisted = false;
+    // Stress many interleavings; the invariant must hold on every one.
     for _ in 0..2000 {
         let store = Arc::new(DeclaredPluginStore::new());
         // Seed both nodes with no deps (single-threaded).
@@ -532,23 +541,28 @@ fn repro8_concurrent_declare_persists_cycle() {
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 
+        // Exactly one declare wins; the other is rejected with a cycle
+        // error. Both succeeding (or both failing) would violate the
+        // contract.
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            oks, 1,
+            "exactly one of two cycle-closing declares must succeed"
+        );
+        let loser = if r1.is_err() { &r1 } else { &r2 };
+        assert!(
+            matches!(loser, Err(CustomError::DependencyCycle(_))),
+            "the rejected declare must fail with DependencyCycle, got {loser:?}"
+        );
+
+        // No a <-> b cycle may be persisted under any interleaving.
         let a_deps = store.get("a").map(|p| p.dependencies).unwrap_or_default();
         let b_deps = store.get("b").map(|p| p.dependencies).unwrap_or_default();
-        if a_deps == vec!["b".to_owned()] && b_deps == vec!["a".to_owned()] {
-            // Both inserts landed -> a<->b cycle now persisted, and both
-            // calls returned Ok (declare is contractually required to
-            // reject one with DependencyCycle).
-            assert!(r1.is_ok() && r2.is_ok(), "both declares returned Ok");
-            cycle_persisted = true;
-            break;
-        }
+        let cycle_persisted =
+            a_deps == vec!["b".to_owned()] && b_deps == vec!["a".to_owned()];
+        assert!(
+            !cycle_persisted,
+            "declare() must never persist an a<->b dependency cycle"
+        );
     }
-
-    // BUG: declare() must never persist a dependency cycle; the TOCTOU
-    // window between the read-lock validation and the write-lock insert
-    // lets two concurrent declares both pass and both commit. (lib.rs:1511)
-    assert!(
-        cycle_persisted,
-        "repro for lib.rs:1511: expected a persisted a<->b cycle under concurrency"
-    );
 }

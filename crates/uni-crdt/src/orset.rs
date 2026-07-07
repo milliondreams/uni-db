@@ -11,10 +11,6 @@ use uuid::Uuid;
 /// construction — a given actor never re-issues a counter.
 pub type Dot = (String, u64);
 
-/// Reserved actor id used when upgrading a legacy v1 (`{elements, tombstones}`)
-/// payload: each live v1 element is reassigned a synthetic dot under this actor.
-const LEGACY_ACTOR: &str = "__legacy__";
-
 /// Mint a fresh, globally-unique actor id for a replica.
 fn new_actor() -> String {
     Uuid::new_v4().to_string()
@@ -241,8 +237,19 @@ impl<T: Hash + Eq + Clone> From<ORSetWire<T>> for ORSet<T> {
         }
 
         // v1 → v2 upgrade: keep elements with at least one live tag, assigning
-        // each a synthetic dot under the legacy actor; discard tombstones.
+        // each a synthetic dot under a freshly-minted actor unique to this
+        // decode; discard tombstones.
+        //
+        // The upgrade actor MUST be per-decode and globally unique (never a
+        // shared constant). Two replicas that independently upgrade v1 payloads
+        // would otherwise mint colliding dots such as `(shared, 1)`, and each
+        // replica's version vector would falsely claim to have "observed" the
+        // other's synthetic dots. On merge those self-only dots fail the strict
+        // `> other.vv` survival test and the elements are silently dropped.
+        // A distinct actor per decode makes every upgraded dot genuinely
+        // unobserved by any other replica, preserving add-wins semantics.
         let tombstones = tombstones.unwrap_or_default();
+        let actor = new_actor();
         let mut new_dots: FxHashMap<T, FxHashSet<Dot>> = FxHashMap::default();
         let mut counter: u64 = 0;
         if let Some(elements) = elements {
@@ -250,19 +257,19 @@ impl<T: Hash + Eq + Clone> From<ORSetWire<T>> for ORSet<T> {
                 if tags.iter().any(|tag| !tombstones.contains(tag)) {
                     counter += 1;
                     let mut set = FxHashSet::default();
-                    set.insert((LEGACY_ACTOR.to_string(), counter));
+                    set.insert((actor.clone(), counter));
                     new_dots.insert(elem, set);
                 }
             }
         }
         let mut new_vv = FxHashMap::default();
         if counter > 0 {
-            new_vv.insert(LEGACY_ACTOR.to_string(), counter);
+            new_vv.insert(actor.clone(), counter);
         }
         ORSet {
             dots: new_dots,
             vv: new_vv,
-            actor: new_actor(),
+            actor,
         }
     }
 }

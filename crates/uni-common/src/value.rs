@@ -393,7 +393,17 @@ impl fmt::Display for TemporalValue {
         match self {
             TemporalValue::Date { days_since_epoch } => {
                 let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let date = epoch + chrono::Duration::days(*days_since_epoch as i64);
+                // Use a checked add (like `to_date`) so an out-of-range
+                // `days_since_epoch` degrades gracefully instead of panicking
+                // inside `Display`. On overflow, saturate to chrono's
+                // representable range so we still render a valid date string.
+                let date = epoch
+                    .checked_add_signed(chrono::Duration::days(*days_since_epoch as i64))
+                    .unwrap_or(if *days_since_epoch >= 0 {
+                        chrono::NaiveDate::MAX
+                    } else {
+                        chrono::NaiveDate::MIN
+                    });
                 write!(f, "{}", date.format("%Y-%m-%d"))
             }
             TemporalValue::LocalTime {

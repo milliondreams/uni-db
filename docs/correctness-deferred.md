@@ -513,6 +513,77 @@ handles both directions).
 
 ---
 
+# Wave 0 — findings that fell through (neither fixed nor deferred)
+
+These two `uni-bulk` findings from `docs/correctness_scan_2026-07-05.md` were **not** among
+Wave 0's 18 fixes **nor** its D1–D4 deferrals — they were simply missed. Both are **confirmed
+still OPEN on `main`** (2026-07-06) by their in-tree repros, now wired into
+`crates/uni/tests/common/bugs/mod.rs` with the bug-pinning test `#[ignore]`d. Recorded here so
+they are tracked, not lost.
+
+## D9 — `uni-bulk[2]` interrupted-bulk recovery abandons a table on rollback failure (High)
+
+**Severity:** durability / data-integrity — after a crash mid bulk-load, if a table's rollback
+fails during recovery the intent marker is deleted anyway, so the divergent table is **never
+reconciled again** (permanent per-label/main divergence).
+
+### Location
+- `crates/uni-bulk/src/flush_intent.rs:159-185` — `recover_interrupted_bulk_load`, `Active` arm.
+  On rollback error it does `failures += 1` + `tracing::warn!` (`:170-173`) but **`failures`
+  never gates control flow**; `clear(&store).await?` (`:184`) runs unconditionally and deletes
+  `catalog/bulk_flush_intent.json`.
+- Contrast: the `Committed` arm (`:145-158`) propagates `set_latest_snapshot` failure via `?`
+  **before** `clear`, preserving the marker for retry — the correct pattern not applied to `Active`.
+
+### Root cause
+The `Active` branch treats a failed rollback as a warning, not a control-flow error, then clears
+the marker regardless — so recovery reports `Ok(())` and the next reopen's `read()` returns `None`.
+
+### Fix plan
+Gate the clear on success: after the loop, if `failures > 0` return an error (or skip `clear`) so
+the marker survives for a subsequent recovery attempt — mirroring the `Committed` branch's
+`?`-propagation. Then flip the repro to assert the marker is **RETAINED** on rollback failure.
+
+### Repro
+`crates/uni/tests/common/bugs/bug_bulk_flush_intent_abandon_repro.rs` →
+`active_recovery_deletes_marker_even_when_rollback_fails` (`#[ignore]`d; drives the real
+`recover_interrupted_bulk_load` with an intent naming non-existent tables so rollback genuinely
+fails). Pins current behavior: marker deleted, recovery returns `Ok`.
+
+### Verify
+`RUSTC_WRAPPER="" cargo nextest run -p uni-db --run-ignored all -E 'test(active_recovery_deletes_marker_even_when_rollback_fails)'`
+(currently passes = bug present; after fix, un-ignore + flip to require the marker retained).
+
+## D10 — `uni-bulk[5]` bulk CHECK `=`/`!=` don't coerce Int/Float (Low)
+
+**Severity:** wrong constraint result — a numeric CHECK equality against a Float property
+(`(n.score = 5)` with stored `Float(5.0)`) spuriously **fails**, while the equivalent bounding
+form (`>= 5`) passes.
+
+### Location
+- `crates/uni-bulk/src/bulk.rs:781-783` — `evaluate_check_expression`: `=`/`==`/`!=`/`<>` use
+  `prop_val == &target_val` (Value's type-strict `PartialEq`), while `>`/`<`/`>=`/`<=` route
+  through `compare_values` (`:796-815`), which **does** coerce Int↔Float.
+- Root: `crates/uni-common/src/value.rs:802` `impl PartialEq for Value` has **no** `(Int, Float)`
+  arm, and the literal `5` parses to `Int` first (`bulk.rs:771`), so `Float(5.0) == Int(5)` = false.
+
+### Fix plan
+Route `=`/`!=` through numeric coercion: when both operands `is_number()`, compare via
+`compare_values(...).is_eq()`; otherwise fall back to `PartialEq`. Then flip the repro to assert
+the insert SUCCEEDS.
+
+### Repro
+`crates/uni/tests/common/bugs/bug_bulk_check_int_float_repro.rs` →
+`bulk_check_equality_float_vs_int_literal_false_reject` (`#[ignore]`d, pins the spurious
+violation) + `bulk_check_ge_float_vs_int_literal_passes_control` (active control: `>=` coerces
+and passes, isolating the defect to `=`).
+
+### Verify
+`RUSTC_WRAPPER="" cargo nextest run -p uni-db --run-ignored all -E 'test(~bulk_check_)'`
+(equality test currently passes = bug present; after fix, un-ignore + flip to `is_ok()`).
+
+---
+
 ## Quick resume checklist
 - [x] **D4** (`uni-query[29]`) — DONE `c393dfb87` (label-column replace + candidate-set
       overwrite filter; repro un-ignored).
@@ -527,8 +598,13 @@ handles both directions).
 - [x] **D6** (R5 bulk cross-channel) — DONE (shared `Writer::unique_key_exists_full_horizon`
       with `exclude_vid: Option<Vid>`; bulk delegates via `BulkBackend.writer`; repro
       `bulk_unique_ignores_preexisting_unflushed_l0_row` un-`#[ignore]`d/live).
+- [ ] **D9** (`uni-bulk[2]`, High) — OPEN, missed in Wave 0; gate `clear` on `failures == 0`
+      in `flush_intent.rs` `Active` recovery; repro `active_recovery_deletes_marker_even_when_rollback_fails`.
+- [ ] **D10** (`uni-bulk[5]`, Low) — OPEN, missed in Wave 0; coerce Int/Float in CHECK
+      `=`/`!=` (`bulk.rs` `evaluate_check_expression`); repro `bulk_check_equality_float_vs_int_literal_false_reject`.
 
-D3 (Wave 0) and D5 (Wave 1) remain, each with an in-tree repro pinning current behavior.
+D3 (Wave 0) and D5 (Wave 1) remain, each with an in-tree repro pinning current behavior;
+D9/D10 (Wave 0, missed) are newly tracked and OPEN.
 D1 (Wave 0) is now fixed on `main` (`01fb4ca16`), resolving the sole real correctness-scan
 Wave 4 (unverified) finding — the other 16 unverified findings were already fixed in Waves 2-3.
 Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`

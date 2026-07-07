@@ -56,6 +56,11 @@ pub mod repro_schema_edge_type_swallow;
 // Correctness-scan Wave 1 repros (R5 constraint visibility).
 pub mod bug_bulk_index_skip_both_defer_false_repro;
 pub mod bug_bulk_unique_preexisting_repro;
+// Correctness-scan Wave 0 findings that fell through — neither fixed nor
+// deferred; tracked as D9/D10 in docs/correctness-deferred.md (bug-pinning
+// tests are #[ignore]d until fixed).
+pub mod bug_bulk_check_int_float_repro; // uni-bulk[5] / D10
+pub mod bug_bulk_flush_intent_abandon_repro; // uni-bulk[2] / D9
 // Correctness-scan Wave 1 repros (R10 integer precision / lossy key).
 pub mod bug_bulk_unique_key_lossy_repro;
 // Correctness-scan Wave 1 repros (R11 Locy compile-context / registry).

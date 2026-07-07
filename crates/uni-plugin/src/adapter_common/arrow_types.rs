@@ -16,19 +16,23 @@
 
 // Rust guideline compliant
 
-use arrow_schema::DataType;
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field};
 
 use crate::traits::scalar::ArgType;
 
 /// Map an [`ArgType`] to the Arrow [`DataType`] used in the on-wire
 /// arg/state/yield schema.
 ///
-/// `Primitive` keeps its declared `DataType`. `Vector` carries the
-/// element type (the row-level Arrow column is a `FixedSizeList`, but
-/// the column-level builder code in the four adapter sites only needed
-/// the element type — preserved here for behavioral parity).
-/// `CypherValue` and `Variadic` collapse to `LargeBinary` since both
-/// surfaces transport opaque encoded payloads.
+/// `Primitive` keeps its declared `DataType`. `Vector` maps to a
+/// `FixedSizeList<element, len>`, matching the DataFusion UDAF bridge
+/// (`arg_type_to_arrow` in `df_udaf_plugin.rs`) so the on-wire arg /
+/// return / yield schema agrees with the type the query engine expects;
+/// collapsing to the bare element type would make a vector-returning
+/// aggregate a guaranteed type mismatch. `CypherValue` and `Variadic`
+/// collapse to `LargeBinary` since both surfaces transport opaque encoded
+/// payloads.
 ///
 /// # Examples
 ///
@@ -45,7 +49,12 @@ pub fn argtype_to_arrow(t: &ArgType) -> DataType {
     match t {
         ArgType::Primitive(d) => d.clone(),
         ArgType::CypherValue | ArgType::Variadic(_) => DataType::LargeBinary,
-        ArgType::Vector { element, .. } => element.clone(),
+        ArgType::Vector { len, element } => {
+            // A vector row is a `FixedSizeList`; clamp an absurd `len` to the
+            // Arrow-representable `i32` range rather than overflowing.
+            let list_len = i32::try_from(*len).unwrap_or(i32::MAX);
+            DataType::FixedSizeList(Arc::new(Field::new("item", element.clone(), true)), list_len)
+        }
     }
 }
 
@@ -119,12 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn argtype_vector_extracts_element() {
+    fn argtype_vector_maps_to_fixed_size_list() {
         let v = ArgType::Vector {
             len: 4,
             element: DataType::Float32,
         };
-        assert_eq!(argtype_to_arrow(&v), DataType::Float32);
+        assert_eq!(
+            argtype_to_arrow(&v),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4)
+        );
     }
 
     #[test]

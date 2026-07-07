@@ -319,8 +319,22 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+        // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53); NaN keeps
+        // the prior `partial_cmp`-None (unordered) result.
+        (Value::Int(a), Value::Float(b)) => {
+            if b.is_nan() {
+                None
+            } else {
+                Some(uni_common::cmp_i64_f64(*a, *b))
+            }
+        }
+        (Value::Float(a), Value::Int(b)) => {
+            if a.is_nan() {
+                None
+            } else {
+                Some(uni_common::cmp_i64_f64(*b, *a).reverse())
+            }
+        }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         _ => None,
     }
@@ -1219,5 +1233,19 @@ mod tests {
         assert_eq!(cache.get(&a), Some(&"row-1"));
         assert_eq!(cache.get(&b), Some(&"row-2"));
         assert_eq!(cache.len(), 2);
+    }
+
+    /// Regression (D5 mirror, apply.rs cross-type Int/Float arm) — FIXED. The
+    /// pushdown-filter comparator used to cast `i64 as f64`, collapsing an
+    /// integer just above 2^53 onto the float. It now compares exactly via
+    /// `cmp_i64_f64`, so `compare_values(Int(2^53+1), Float(2^53.0))` is
+    /// `Some(Greater)` and the reverse is `Some(Less)`.
+    #[test]
+    fn repro_compare_values_int_float_precision_collapse() {
+        use std::cmp::Ordering;
+        let big_int = Value::Int(9_007_199_254_740_993);
+        let float_2p53 = Value::Float(9_007_199_254_740_992.0);
+        assert_eq!(compare_values(&big_int, &float_2p53), Some(Ordering::Greater));
+        assert_eq!(compare_values(&float_2p53, &big_int), Some(Ordering::Less));
     }
 }

@@ -166,18 +166,37 @@ fn repro_finding_07_range_udf_overflow() {
     );
 }
 
-/// Finding [13] df_udfs.rs:2956 — `encode_sort_key_to_buf` casts `Value::Int`
-/// to f64 for the ORDER BY sort key, collapsing distinct i64 values above 2^53.
+/// Finding [13] df_udfs.rs — FIXED. `encode_sort_key_to_buf` used to cast
+/// `Value::Int` to f64, collapsing distinct i64 values above 2^53 to identical
+/// ORDER BY sort keys. The encoder now emits an f64 bucket + exact i64 tie-break,
+/// so distinct integers get distinct, correctly-ordered keys while Int and Float
+/// still interleave and equal numbers stay byte-identical (join-key equality).
 #[test]
 fn repro_finding_13_sort_key_int_collapse() {
-    // 2^53 and 2^53 + 1 differ by 1 but both round to the same f64.
+    // 2^53 and 2^53 + 1 differ by 1 and both round to the same f64.
     let k_lo = encode_cypher_sort_key(&Value::Int(9_007_199_254_740_992));
     let k_hi = encode_cypher_sort_key(&Value::Int(9_007_199_254_740_993));
 
-    // BUG: distinct integers produce byte-identical sort keys (repro for
-    // df_udfs.rs:2956); a correct encoder would make these differ.
+    // FIXED: distinct i64 above 2^53 now produce distinct, correctly-ordered keys.
+    assert_ne!(k_lo, k_hi, "distinct i64 above 2^53 must not collapse");
+    assert!(k_lo < k_hi, "2^53 must sort before 2^53 + 1");
+
+    // Cross-type interleaving still holds (Int and Float share one key space).
+    let f_1_5 = encode_cypher_sort_key(&Value::Float(1.5));
+    let i_1 = encode_cypher_sort_key(&Value::Int(1));
+    let i_2 = encode_cypher_sort_key(&Value::Int(2));
+    assert!(i_1 < f_1_5 && f_1_5 < i_2, "Int(1) < Float(1.5) < Int(2)");
+
+    // Near 2^53: Int(2^53) == Float(2^53.0) (equality preserved for joins), and
+    // Int(2^53 + 1) sorts strictly after the float bucket.
+    let f_2p53 = encode_cypher_sort_key(&Value::Float(9_007_199_254_740_992.0));
+    assert_eq!(k_lo, f_2p53, "Int(2^53) and Float(2^53.0) must be byte-identical");
+    assert!(f_2p53 < k_hi, "Float(2^53.0) must sort before Int(2^53 + 1)");
+
+    // Equality preservation for a small exactly-representable value.
     assert_eq!(
-        k_lo, k_hi,
-        "distinct i64 values above 2^53 collapse to the same sort key"
+        encode_cypher_sort_key(&Value::Int(2)),
+        encode_cypher_sort_key(&Value::Float(2.0)),
+        "Int(2) and Float(2.0) must produce identical keys"
     );
 }

@@ -2,7 +2,8 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use uni_db::Uni;
+use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType};
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
 async fn test_unique_constraint_enforcement() -> Result<()> {
@@ -119,6 +120,42 @@ async fn test_check_constraint_enforcement() -> Result<()> {
     assert!(
         result_boundary.is_err(),
         "Insert violating CHECK constraint (boundary) should have failed"
+    );
+
+    Ok(())
+}
+
+/// Regression (D5 mirror, writer.rs cross-type Int/Float arm) — FIXED. The
+/// single-writer CHECK comparator used to cast `i64 as f64`, so an integer just
+/// above 2^53 failed a `> <float>` bound it truly satisfies. It now compares
+/// exactly, so the valid row is accepted. (Passing also proves the integer
+/// literal survived Cypher parsing without f64 rounding.)
+#[tokio::test]
+async fn repro_check_constraint_int_float_precision_collapse() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("BigNum")
+        .property("val", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+    // Programmatic CHECK (writer's string-expression path): float bound 2^53; the
+    // int 2^53+1 is strictly greater and must satisfy `>`.
+    db.schema_manager().add_constraint(Constraint {
+        name: "BigNum_val_check".to_string(),
+        constraint_type: ConstraintType::Check {
+            expression: "(n.val > 9007199254740992.0)".to_string(),
+        },
+        target: ConstraintTarget::Label("BigNum".to_string()),
+        enabled: true,
+    })?;
+
+    let tx = db.session().tx().await?;
+    let result = tx.execute("CREATE (b:BigNum {val: 9007199254740993})").await;
+    // 9007199254740993 > 9007199254740992.0 is true; exact comparison accepts it.
+    assert!(
+        result.is_ok(),
+        "a valid `>` bound must be accepted after the exact fix; got {result:?}"
     );
 
     Ok(())

@@ -60,6 +60,7 @@ pub mod bug_bulk_unique_preexisting_repro;
 // deferred; tracked as D9/D10 in docs/correctness-deferred.md (bug-pinning
 // tests are #[ignore]d until fixed).
 pub mod bug_bulk_check_int_float_repro; // uni-bulk[5] / D10
+pub mod bug_bulk_check_large_int_repro; // uni-bulk compare_values i64->f64 (D5 mirror)
 pub mod bug_bulk_flush_intent_abandon_repro; // uni-bulk[2] / D9
 // Correctness-scan Wave 1 repros (R10 integer precision / lossy key).
 pub mod bug_bulk_unique_key_lossy_repro;

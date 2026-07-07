@@ -345,11 +345,44 @@ tests.
 
 # Wave 1 deferrals
 
-## D5 — `uni-query-functions[2]` ORDER BY sort-key collapses large i64 (precision)
+## D5 — `uni-query-functions[2]` ORDER BY sort-key collapses large i64 (precision) — ✅ DONE
 
 **Severity:** wrong ORDER BY / sort results — two distinct i64 values above 2^53 produce a
 **byte-identical** sort key, so they collapse to an arbitrary relative order (and can tie
 where they must not). Localized to the DataFusion sort-key encoder; no data loss.
+
+**Status:** fixed (uncommitted). The sort key is transient (per-query `LargeBinary`, never
+persisted → no migration), but it is *also* the join-key unifier, so the fix had to keep
+`Int(n)`/`Float(n.0)` **byte-identical** (Cypher `n = n.0`). Approach — **f64 bucket + exact i64
+tie-break**: the rank-`0x08` payload is now `encode_order_preserving_f64(primary)` ++
+`encode_order_preserving_i64(int_delta)` for **both** Int and Float (`encode_numeric_payload`,
+`df_udfs.rs`), where Int's `int_delta = i - (i as f64)` and Float's is `0`. Round-to-nearest is
+monotonic, so different buckets order by `primary`; within a shared bucket the delta orders by true
+value — exact across the full i64 range, still interleaving with floats, and any exactly-representable
+integer (delta 0) stays byte-identical to its float (joins keep matching; the constant-0 tie-break on
+Float prevents a prefix mismatch).
+
+The same `i64 as f64` cast was **mirrored in 4 `compare_values` copies** (cross-type Int/Float arm
+only; Int/Int was already exact). All now route through a shared exact `pub fn cmp_i64_f64` in
+`uni-common` (`value.rs`, re-exported at crate root), preserving each site's NaN handling:
+`crates/uni-query/src/query/executor/core.rs` (fallback ORDER BY/window/list/map),
+`crates/uni-store/src/runtime/writer.rs` (single-writer CHECK), `crates/uni-bulk/src/bulk.rs` (bulk
+CHECK), `crates/uni-query/src/query/df_graph/apply.rs` (correlated-subquery pushdown filter).
+
+Repros were written **first** to pin each bug, then flipped: encoder
+`repro_finding_13_sort_key_int_collapse` (`assert_ne!` + ordering + Int/Float equality); inline unit
+repros in `core.rs` and `apply.rs`; e2e `repro_check_constraint_int_float_precision_collapse`
+(writer CHECK) and `bug_bulk_check_large_int_repro.rs` (bulk CHECK, + control); plus a new e2e
+`test_order_by_large_integers_above_2p53`. Verified: `uni-common` (`cmp_i64_f64` units + doctest),
+`uni-query-functions`/`uni-query` full suites, `uni-store`/`uni-bulk` constraint tests, and
+`uni-db` (174 bulk/subquery/pushdown regressions + the flipped repros); clippy `-D warnings` clean.
+
+**Remaining follow-up (separate D10-family bug, NOT fixed here):** writer.rs (`:2450-2451`) and
+apply.rs `Eq`/`NotEq` (`:338-339`) still compare `=`/`!=` via strict `Value` `PartialEq` (no
+Int↔Float coercion), so cross-type numeric *equality* stays wrong there — the D10 defect (fixed only
+for bulk), a different root than this precision cast.
+
+### Original analysis (retained for context)
 
 ### Locations
 - `crates/uni-query-functions/src/df_udfs.rs:2964-2965` — `encode_sort_key_to_buf`, the
@@ -648,8 +681,9 @@ and passes, isolating the defect to `=`).
       `promote_default_is_insert_only_twin` stays green; new e2e idempotency test added.
 - [x] **D1** (`uni[2]`) — DONE `01fb4ca16` (per-kind set + kind-specific planner probes; repro
       `two_fork_index_kinds_on_one_column_coexist` flipped and wired in).
-- [ ] **D5** (`uni-query-functions[2]`) — Wave 1; needs a unified order-preserving numeric
-      sort-key codec (design change); repro `repro_finding_13_sort_key_int_collapse`.
+- [x] **D5** (`uni-query-functions[2]`) — DONE (uncommitted): f64 bucket + exact i64 tie-break in
+      the encoder (`encode_numeric_payload`), shared `cmp_i64_f64` for the 4 comparator mirrors;
+      repro `repro_finding_13_sort_key_int_collapse` flipped + 4 mirror repros + e2e ORDER BY.
 - [x] **D6** (R5 bulk cross-channel) — DONE (shared `Writer::unique_key_exists_full_horizon`
       with `exclude_vid: Option<Vid>`; bulk delegates via `BulkBackend.writer`; repro
       `bulk_unique_ignores_preexisting_unflushed_l0_row` un-`#[ignore]`d/live).
@@ -660,10 +694,11 @@ and passes, isolating the defect to `=`).
       `=`/`!=`; `bulk.rs` `evaluate_check_expression`; repro flipped to
       `bulk_check_equality_float_vs_int_literal_passes`).
 
-**D5 (Wave 1) is the sole finding still open** — it needs a unified order-preserving numeric
-sort-key codec (a design change), with an in-tree repro pinning current behavior. D3 (Wave 0)
-is now FIXED (uncommitted, promote-local content re-verify). D9/D10 (Wave 0, missed) are also
-FIXED (uncommitted).
+**All correctness-scan findings are now resolved.** D5 (Wave 1) is FIXED (uncommitted): f64 bucket +
+exact i64 tie-break in the sort-key encoder plus a shared `cmp_i64_f64` for the 4 comparator mirrors.
+D3 (Wave 0) is FIXED (uncommitted, promote-local content re-verify). D9/D10 (Wave 0, missed) are also
+FIXED (uncommitted). One narrow **follow-up** remains outside the scan: the writer/apply `=`/`!=`
+cross-type numeric equality gap (D10-family, fixed only for bulk) — see the D5 section.
 D1 (Wave 0) is now fixed on `main` (`01fb4ca16`), resolving the sole real correctness-scan
 Wave 4 (unverified) finding — the other 16 unverified findings were already fixed in Waves 2-3.
 Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`

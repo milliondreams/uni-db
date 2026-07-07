@@ -661,14 +661,15 @@ impl Executor {
                 if r.is_nan() {
                     Ordering::Less
                 } else {
-                    (*l as f64).partial_cmp(r).unwrap_or(Ordering::Equal)
+                    // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53).
+                    uni_common::cmp_i64_f64(*l, *r)
                 }
             }
             (Value::Float(l), Value::Int(r)) => {
                 if l.is_nan() {
                     Ordering::Greater
                 } else {
-                    l.partial_cmp(&(*r as f64)).unwrap_or(Ordering::Equal)
+                    uni_common::cmp_i64_f64(*r, *l).reverse()
                 }
             }
             (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
@@ -1187,6 +1188,19 @@ mod tests {
         let l1 = Value::List(vec![Value::Int(1), Value::Int(2)]);
         let l2 = Value::List(vec![Value::Int(1), Value::Int(3)]);
         assert!(Executor::compare_values(&l1, &l2).is_lt());
+    }
+
+    /// Regression (D5 mirror, core.rs cross-type Int/Float arm) — FIXED. The
+    /// comparator used to cast `i64 as f64`, collapsing an integer just above
+    /// 2^53 onto the float. It now compares exactly via `cmp_i64_f64`, so
+    /// `compare_values(Int(2^53+1), Float(2^53.0))` is `Greater`
+    /// (9007199254740993 > 9007199254740992), and the reverse is `Less`.
+    #[test]
+    fn repro_compare_values_int_float_precision_collapse() {
+        let big_int = Value::Int(9_007_199_254_740_993);
+        let float_2p53 = Value::Float(9_007_199_254_740_992.0);
+        assert!(Executor::compare_values(&big_int, &float_2p53).is_gt());
+        assert!(Executor::compare_values(&float_2p53, &big_int).is_lt());
     }
 
     /// COUNT(DISTINCT) must coerce numerically (1 vs 1.0 count once, matching

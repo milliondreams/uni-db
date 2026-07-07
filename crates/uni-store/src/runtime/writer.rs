@@ -2478,8 +2478,18 @@ impl Writer {
         match (a, b) {
             (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
             (Value::Float(f1), Value::Float(f2)) => Ok(cmp_f64(*f1, *f2)),
-            (Value::Int(n), Value::Float(f)) => Ok(cmp_f64(*n as f64, *f)),
-            (Value::Float(f), Value::Int(n)) => Ok(cmp_f64(*f, *n as f64)),
+            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
+            // preserve `cmp_f64`'s NaN-as-Equal behavior for the degenerate case.
+            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f)
+            }),
+            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f).reverse()
+            }),
             (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
             _ => Err(anyhow!(
                 "Cannot compare incompatible types: {:?} vs {:?}",

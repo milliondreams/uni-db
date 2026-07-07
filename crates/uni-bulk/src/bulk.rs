@@ -811,12 +811,18 @@ impl BulkWriter {
             (Value::Float(f1), Value::Float(f2)) => {
                 Ok(f1.partial_cmp(f2).unwrap_or(Ordering::Equal))
             }
-            (Value::Int(n), Value::Float(f)) => {
-                Ok((*n as f64).partial_cmp(f).unwrap_or(Ordering::Equal))
-            }
-            (Value::Float(f), Value::Int(n)) => {
-                Ok(f.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal))
-            }
+            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
+            // preserve the prior NaN-as-Equal behavior for the degenerate case.
+            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f)
+            }),
+            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f).reverse()
+            }),
             (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
             _ => Err(anyhow!(
                 "Cannot compare incompatible types: {:?} vs {:?}",

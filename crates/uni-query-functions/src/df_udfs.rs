@@ -2961,11 +2961,21 @@ fn encode_sort_key_to_buf(value: &Value, buf: &mut Vec<u8>) {
         Value::Float(f) if f.is_nan() => {} // rank byte 0x09 is sufficient
         Value::Bool(b) => buf.push(if *b { 0x01 } else { 0x00 }),
         Value::Int(i) => {
-            let f = *i as f64;
-            buf.extend_from_slice(&encode_order_preserving_f64(f));
+            // f64 bucket (coarse position, shared with Float so the two
+            // interleave) plus the exact offset of the true integer from that
+            // bucket, which distinguishes i64 values above 2^53 that a bare
+            // `i as f64` cast would collapse to identical bytes.
+            let primary = *i as f64;
+            let int_delta = (*i as i128 - primary as i128) as i64;
+            encode_numeric_payload(primary, int_delta, buf);
         }
         Value::Float(f) => {
-            buf.extend_from_slice(&encode_order_preserving_f64(*f));
+            // Delta 0: an integer exactly representable as this float (incl. all
+            // |i| < 2^53) also yields delta 0, so Int(n) and Float(n.0) produce
+            // byte-identical keys (Cypher `n = n.0`, load-bearing for join-key
+            // unification). The constant tie-break must be present so a Float key
+            // is never a byte-prefix of the matching Int key.
+            encode_numeric_payload(*f, 0, buf);
         }
         Value::String(s) => {
             byte_stuff_terminate(s.as_bytes(), buf);
@@ -3244,6 +3254,20 @@ fn encode_order_preserving_f64(f: f64) -> [u8; 8] {
 fn encode_order_preserving_i64(i: i64) -> [u8; 8] {
     // XOR with sign bit to flip ordering
     ((i as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+/// Appends the unified numeric sort-key payload for rank `0x08` (Int and Float).
+///
+/// Emits an 8-byte order-preserving `primary` f64 bucket followed by an 8-byte
+/// order-preserving `int_delta`. Because round-to-nearest is monotonic, values
+/// in different buckets order correctly by `primary`; within one shared bucket
+/// both operands measure `int_delta` from the same reference, so the tie-break
+/// orders by true value — making the full i64 range exact while Int and Float
+/// still interleave. Both arms MUST emit this identical 16-byte layout so that
+/// `Int(n)` and `Float(n.0)` stay byte-identical (join-key equality).
+fn encode_numeric_payload(primary: f64, int_delta: i64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&encode_order_preserving_f64(primary));
+    buf.extend_from_slice(&encode_order_preserving_i64(int_delta));
 }
 
 /// Order-preserving encoding of i32.

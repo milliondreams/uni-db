@@ -762,6 +762,48 @@ impl fmt::Display for Value {
 // PartialEq, Eq, and Hash implementations
 // ---------------------------------------------------------------------------
 
+/// Exact ordering of an `i64` against an `f64`, without precision loss.
+///
+/// Casting the integer to `f64` first (the naive approach) collapses distinct
+/// `i64` values above `2^53` onto the same float, so `2^53 + 1` would compare
+/// *equal* to `2^53.0`. This compares the integer against the float's exact real
+/// value instead, so the full `i64` range orders correctly against any finite
+/// float and integer/float ties resolve by true magnitude.
+///
+/// `f` is assumed non-`NaN`; callers that admit `NaN` must handle it beforehand.
+///
+/// # Examples
+/// ```
+/// use std::cmp::Ordering;
+/// use uni_common::cmp_i64_f64;
+/// assert_eq!(cmp_i64_f64(9_007_199_254_740_993, 9_007_199_254_740_992.0), Ordering::Greater);
+/// assert_eq!(cmp_i64_f64(2, 2.0), Ordering::Equal);
+/// assert_eq!(cmp_i64_f64(1, 1.5), Ordering::Less);
+/// ```
+pub fn cmp_i64_f64(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_infinite() {
+        return if f > 0.0 { Ordering::Less } else { Ordering::Greater };
+    }
+    let ff = f.floor();
+    // 2^63: every i64 is <= i64::MAX = 2^63 - 1 < 2^63 <= f, so the int is Less.
+    if ff >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    // -2^63 = i64::MIN: when floor(f) < -2^63 the int is >= i64::MIN > f.
+    if ff < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    // `ff` is integral and within [-2^63, 2^63), so this cast is exact.
+    let fi = ff as i64;
+    match i.cmp(&fi) {
+        // Integer parts equal; a positive fractional part makes `f` the larger.
+        Ordering::Equal if f > ff => Ordering::Less,
+        Ordering::Equal => Ordering::Equal,
+        other => other,
+    }
+}
+
 /// Normalized float equality used by [`Value`]'s `PartialEq`/`Hash`.
 ///
 /// Treats `0.0 == -0.0` and `NaN == NaN`, so that `Value` upholds the std
@@ -1743,6 +1785,46 @@ impl From<f32> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn cmp_i64_f64_exact_above_2p53() {
+        // 2^53 vs 2^53+1: the naive `as f64` cast collapses these to Equal.
+        let two_p53 = 9_007_199_254_740_992.0_f64;
+        assert_eq!(cmp_i64_f64(9_007_199_254_740_992, two_p53), Ordering::Equal);
+        assert_eq!(cmp_i64_f64(9_007_199_254_740_993, two_p53), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(9_007_199_254_740_991, two_p53), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_i64_f64_small_and_fractional() {
+        assert_eq!(cmp_i64_f64(2, 2.0), Ordering::Equal);
+        assert_eq!(cmp_i64_f64(1, 1.5), Ordering::Less);
+        assert_eq!(cmp_i64_f64(2, 1.5), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(-3, -2.5), Ordering::Less);
+        assert_eq!(cmp_i64_f64(-2, -2.5), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(0, -0.0), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_i64_f64_extremes_and_infinities() {
+        assert_eq!(cmp_i64_f64(i64::MAX, f64::INFINITY), Ordering::Less);
+        assert_eq!(cmp_i64_f64(i64::MIN, f64::NEG_INFINITY), Ordering::Greater);
+        // i64::MAX = 2^63 - 1; the f64 2^63 is strictly larger.
+        assert_eq!(
+            cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0),
+            Ordering::Less
+        );
+        // i64::MIN = -2^63, exactly representable as f64 -> Equal.
+        assert_eq!(
+            cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0),
+            Ordering::Equal
+        );
+        // A float below -2^63 is smaller than any i64.
+        assert_eq!(cmp_i64_f64(i64::MIN, -1e300), Ordering::Greater);
+        // A huge positive float dwarfs any i64.
+        assert_eq!(cmp_i64_f64(i64::MAX, 1e300), Ordering::Less);
+    }
 
     #[test]
     fn test_accessor_methods() {

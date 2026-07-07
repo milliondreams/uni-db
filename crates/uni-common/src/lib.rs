@@ -35,7 +35,7 @@ pub use graph::simple_graph::SimpleGraph;
 pub use uni_btic;
 pub use uni_sparse_vector;
 #[doc(inline)]
-pub use value::{Edge, FromValue, Node, Path, TemporalType, TemporalValue, Value};
+pub use value::{cmp_i64_f64, Edge, FromValue, Node, Path, TemporalType, TemporalValue, Value};
 
 /// String-keyed property map using [`Value`] for type-preserving storage.
 pub type Properties = std::collections::HashMap<String, Value>;

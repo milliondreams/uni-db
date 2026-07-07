@@ -5,9 +5,9 @@
 //! "r" against {"foo.r"} → false → `has_self_is=false` → `check_prev_in_base_case`
 //! fires, wrongly rejecting a legal self-recursive `prev` in ALONG.
 
+use uni_cypher::parse_locy;
 use uni_locy::compile;
 use uni_locy::compiler::errors::LocyCompileError;
-use uni_cypher::parse_locy;
 
 // The exact program body below compiles cleanly WITHOUT a module (this is the
 // existing passing `phase_b_f1_suppressed_when_along_present` shape).

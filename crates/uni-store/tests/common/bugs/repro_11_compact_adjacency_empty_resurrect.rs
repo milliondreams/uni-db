@@ -43,11 +43,19 @@ async fn repro_empty_output_compaction_resurrects_deleted_edge() {
     );
     let _label_id = schema_manager.add_label("Person").unwrap();
     let edge_type_id = schema_manager
-        .add_edge_type("KNOWS", vec!["Person".to_string()], vec!["Person".to_string()])
+        .add_edge_type(
+            "KNOWS",
+            vec!["Person".to_string()],
+            vec!["Person".to_string()],
+        )
         .unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
     let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
         .await
         .unwrap();
@@ -91,7 +99,11 @@ async fn repro_empty_output_compaction_resurrects_deleted_edge() {
         .unwrap();
 
     // 4. Re-warm from storage (L2 + Delta L1) and read A's outgoing edges.
-    let storage2 = Arc::new(StorageManager::new(path, schema_manager.clone()).await.unwrap());
+    let storage2 = Arc::new(
+        StorageManager::new(path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
     let am2 = storage2.adjacency_manager();
     am2.warm(&storage2, edge_type_id, Direction::Outgoing, None)
         .await

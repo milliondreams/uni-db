@@ -4,8 +4,8 @@
 //! fails with UndefinedRule, even though body COMMANDS (QUERY) validate that
 //! same outer rule fine via the threaded `all_rule_names`.
 
-use uni_locy::compile;
 use uni_cypher::parse_locy;
+use uni_locy::compile;
 
 #[test]
 fn assume_body_rule_referencing_outer_rule_wrongly_undefined() {

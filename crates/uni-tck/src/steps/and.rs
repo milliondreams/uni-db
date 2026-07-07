@@ -133,7 +133,12 @@ async fn side_effects_should_be(world: &mut UniWorld, step: &cucumber::gherkin::
         .rows
         .iter()
         .filter(|row| row.len() >= 2)
-        .map(|row| (row[0].trim().to_string(), row[1].trim().parse().unwrap_or(0)))
+        .map(|row| {
+            (
+                row[0].trim().to_string(),
+                row[1].trim().parse().unwrap_or(0),
+            )
+        })
         .collect();
 
     if let Err(message) = check_side_effects_should_be(world.side_effects(), &declared) {

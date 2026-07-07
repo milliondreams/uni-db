@@ -53,7 +53,8 @@ async fn repro_scan_vertex_table_swallows_transient_list_error() {
     // Wrap the backend so we can inject a transient `table_exists` failure.
     let fault = Arc::new(FaultBackend::new(Arc::new(lance)));
 
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let schema_manager = Arc::new(
         SchemaManager::load_from_store(store.clone(), &ObjectStorePath::from("schema.json"))
             .await
@@ -71,7 +72,10 @@ async fn repro_scan_vertex_table_swallows_transient_list_error() {
     .unwrap();
 
     // Control: healthy backend -> the table's rows are returned.
-    let ok = sm.scan_vertex_table("Person", &["_vid"], None).await.unwrap();
+    let ok = sm
+        .scan_vertex_table("Person", &["_vid"], None)
+        .await
+        .unwrap();
     assert!(
         ok.is_some_and(|b| b.num_rows() == 3),
         "control: healthy scan returns the 3 rows"

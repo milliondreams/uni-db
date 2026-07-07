@@ -151,9 +151,7 @@ impl uni_plugin::scheduler::SchedulerControl for SchedulerHost {
         // resurrects on the next restart (the host replays persistence). Only
         // attempt it when the in-memory job actually existed; a persistence
         // failure is logged but does not un-cancel the live job.
-        if cancelled
-            && let Err(e) = self.persistence.cancel(id)
-        {
+        if cancelled && let Err(e) = self.persistence.cancel(id) {
             tracing::warn!(
                 qname = %id,
                 error = %e,

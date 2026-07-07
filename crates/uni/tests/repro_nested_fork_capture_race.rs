@@ -80,9 +80,7 @@ async fn nested_fork_branches_at_captured_parent_tip() -> anyhow::Result<()> {
     // The child is snapshot-isolated at the fork point (k<=1): with the fix it
     // branches at the CAPTURED tip (pre-k=2). The old live-read code would branch
     // at the concurrently-advanced tip and leak k=2.
-    let rows = b
-        .query("MATCH (p:Person) RETURN max(p.k) AS mk")
-        .await?;
+    let rows = b.query("MATCH (p:Person) RETURN max(p.k) AS mk").await?;
     let child_max: i64 = rows.rows()[0].get("mk").unwrap_or(-1);
     assert_eq!(
         child_max, 1,

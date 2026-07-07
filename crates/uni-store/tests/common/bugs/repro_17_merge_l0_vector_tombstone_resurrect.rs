@@ -44,13 +44,19 @@ async fn repro_vector_search_resurrects_tombstoned_l0_vertex() {
     schema_manager.add_label("Person").unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
 
     let vid = Vid::new(1);
 
     // Earlier (pending-flush) buffer: V is live with a Person label + embedding.
     let mut earlier = L0Buffer::new(0, None);
-    earlier.vertex_labels.insert(vid, vec!["Person".to_string()]);
+    earlier
+        .vertex_labels
+        .insert(vid, vec!["Person".to_string()]);
     let mut props = HashMap::new();
     props.insert("embedding".to_string(), Value::Vector(vec![0.1, 0.2, 0.3]));
     earlier.vertex_properties.insert(vid, props);

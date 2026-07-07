@@ -9,12 +9,12 @@
 //!
 //! ADD PROPERTY rejects these names; RENAME PROPERTY silently accepts them.
 
+use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
-use object_store::ObjectStore;
 use std::sync::Arc;
-use uni_common::core::schema::SchemaManager;
 use uni_common::DataType;
+use uni_common::core::schema::SchemaManager;
 
 async fn new_manager() -> SchemaManager {
     let dir = tempfile::tempdir().unwrap();

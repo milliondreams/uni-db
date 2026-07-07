@@ -62,8 +62,12 @@ fn repro_apply_pending_overwrites_ownership_record() {
     // Commit #1: plugin `mycorp` registers `mycorp.f1` (its own registrar).
     {
         let mut r = PluginRegistrar::new(pid.clone(), &caps, &registry);
-        r.scalar_fn(QName::new("mycorp", "f1"), scalar_sig(), Arc::new(NoopScalar))
-            .unwrap();
+        r.scalar_fn(
+            QName::new("mycorp", "f1"),
+            scalar_sig(),
+            Arc::new(NoopScalar),
+        )
+        .unwrap();
         r.commit_to_registry().unwrap();
     }
     // Commit #2: same plugin id `mycorp` registers `mycorp.f2` (a fresh
@@ -71,8 +75,12 @@ fn repro_apply_pending_overwrites_ownership_record() {
     // scenario).
     {
         let mut r = PluginRegistrar::new(pid.clone(), &caps, &registry);
-        r.scalar_fn(QName::new("mycorp", "f2"), scalar_sig(), Arc::new(NoopScalar))
-            .unwrap();
+        r.scalar_fn(
+            QName::new("mycorp", "f2"),
+            scalar_sig(),
+            Arc::new(NoopScalar),
+        )
+        .unwrap();
         r.commit_to_registry().unwrap();
     }
 
@@ -163,10 +171,18 @@ fn repro_intra_batch_duplicate_bypasses_preflight() {
 
     let mut r = PluginRegistrar::new(pid.clone(), &caps, &registry);
     // Same qname registered TWICE in one register()/pending batch.
-    r.scalar_fn(QName::new("dupco", "myfn"), scalar_sig(), Arc::new(NoopScalar))
-        .unwrap();
-    r.scalar_fn(QName::new("dupco", "myfn"), scalar_sig(), Arc::new(NoopScalar))
-        .unwrap();
+    r.scalar_fn(
+        QName::new("dupco", "myfn"),
+        scalar_sig(),
+        Arc::new(NoopScalar),
+    )
+    .unwrap();
+    r.scalar_fn(
+        QName::new("dupco", "myfn"),
+        scalar_sig(),
+        Arc::new(NoopScalar),
+    )
+    .unwrap();
 
     // FIXED (registry.rs): apply_pending now rejects an intra-batch duplicate
     // unique qname up front — the batch preflight tracks qnames it has already

@@ -33,15 +33,20 @@ impl Harness {
     async fn new<F: FnOnce(&SchemaManager)>(setup: F) -> Self {
         let dir = tempdir().unwrap();
         let path = dir.path();
-        let schema_manager = SchemaManager::load(&path.join("schema.json")).await.unwrap();
+        let schema_manager = SchemaManager::load(&path.join("schema.json"))
+            .await
+            .unwrap();
         setup(&schema_manager);
         schema_manager.save().await.unwrap();
 
         let schema_manager = Arc::new(schema_manager);
         let storage = Arc::new(
-            StorageManager::new(path.join("storage").to_str().unwrap(), schema_manager.clone())
-                .await
-                .unwrap(),
+            StorageManager::new(
+                path.join("storage").to_str().unwrap(),
+                schema_manager.clone(),
+            )
+            .await
+            .unwrap(),
         );
         let writer = Arc::new(
             Writer::new(storage.clone(), schema_manager.clone(), 0)
@@ -118,7 +123,10 @@ async fn repro_01_count_optional_null_row() {
     // FIXED (df_planner.rs): count(entity) counts the identity column (_vid/_eid),
     // which is NULL for the unmatched OPTIONAL row, so DataFusion's COUNT excludes
     // it — was count(lit(1)) which counted the all-NULL pad row (off by one).
-    assert_eq!(c, 0, "count(m) must exclude the unmatched OPTIONAL null row");
+    assert_eq!(
+        c, 0,
+        "count(m) must exclude the unmatched OPTIONAL null row"
+    );
 }
 
 // ===========================================================================
@@ -172,9 +180,11 @@ async fn repro_03_apply_startswith_input_filter() {
 
     let h = Harness::new(|sm| {
         sm.add_label("Person").unwrap();
-        sm.add_property("Person", "name", DataType::String, true).unwrap();
+        sm.add_property("Person", "name", DataType::String, true)
+            .unwrap();
         sm.add_label("Prefix").unwrap();
-        sm.add_property("Prefix", "prefix", DataType::String, true).unwrap();
+        sm.add_property("Prefix", "prefix", DataType::String, true)
+            .unwrap();
     })
     .await;
     h.run_ok("CREATE (:Person {name:'Alice'})").await;
@@ -186,7 +196,9 @@ async fn repro_03_apply_startswith_input_filter() {
                 input: Box::new(set_apply_filter(*input, f)),
                 projections,
             },
-            LogicalPlan::Apply { input, subquery, .. } => LogicalPlan::Apply {
+            LogicalPlan::Apply {
+                input, subquery, ..
+            } => LogicalPlan::Apply {
                 input,
                 subquery,
                 input_filter: Some(f.clone()),
@@ -214,7 +226,11 @@ async fn repro_03_apply_startswith_input_filter() {
     // CONTROL: a supported comparison (Eq, TRUE) keeps the row.
     let ctrl_rows = h
         .executor
-        .execute(build_plan(&name_pred(BinaryOp::Eq, "Alice")), &h.prop_manager, &HashMap::new())
+        .execute(
+            build_plan(&name_pred(BinaryOp::Eq, "Alice")),
+            &h.prop_manager,
+            &HashMap::new(),
+        )
         .await
         .expect("[22] Eq control must execute");
     println!("[22] control Eq('Alice')=true -> {} rows", ctrl_rows.len());
@@ -224,7 +240,11 @@ async fn repro_03_apply_startswith_input_filter() {
     // evaluator keeps it, matching the Eq control.
     let sw_rows = h
         .executor
-        .execute(build_plan(&name_pred(BinaryOp::StartsWith, "Al")), &h.prop_manager, &HashMap::new())
+        .execute(
+            build_plan(&name_pred(BinaryOp::StartsWith, "Al")),
+            &h.prop_manager,
+            &HashMap::new(),
+        )
         .await
         .expect("[22] StartsWith must execute (row kept, not dropped)");
     println!("[22] StartsWith('Al') kept -> {} rows", sw_rows.len());
@@ -249,7 +269,11 @@ async fn repro_04_optional_ext_id_null_row() {
         .await;
     // The key fix: the query no longer errors with a non-nullable-column failure;
     // it returns exactly one recovery row for the unmatched OPTIONAL.
-    assert_eq!(rows.len(), 1, "OPTIONAL no-match must return exactly one null row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "OPTIONAL no-match must return exactly one null row"
+    );
 }
 
 // ===========================================================================
@@ -269,10 +293,17 @@ async fn repro_09_pattern_exists_null_bound_target() {
              WITH n, m WHERE (n)-[:R]->(m) RETURN n",
         )
         .await;
-    println!("[9] pattern exists with NULL bound target -> rows={}", rows.len());
+    println!(
+        "[9] pattern exists with NULL bound target -> rows={}",
+        rows.len()
+    );
     // FIXED (pattern_exists.rs): with m NULL, `(n)-[:R]->(m)` is NULL (not "n has
     // any :R neighbor"), so the top-level WHERE filters the row out.
-    assert_eq!(rows.len(), 0, "NULL bound target must make the pattern NULL, filtering the row");
+    assert_eq!(
+        rows.len(),
+        0,
+        "NULL bound target must make the pattern NULL, filtering the row"
+    );
 }
 
 // ===========================================================================
@@ -292,7 +323,11 @@ async fn repro_11_vid_lookup_left_inverted() {
     // FIXED: the build-outer vid-lookup fast-path bails when the outer (left)
     // side would be the probe (which would invert LEFT to RIGHT); the standard
     // join then preserves both Persons with a NULL Employee.
-    assert_eq!(rows.len(), 2, "both Persons must be preserved by LEFT outer");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both Persons must be preserved by LEFT outer"
+    );
     for r in &rows {
         assert!(
             !matches!(cell(r, "an"), Value::Null),
@@ -326,7 +361,10 @@ async fn repro_12_window_conflicting_orderby() {
     // FIXED (df_planner.rs): each window has its own SortExec, so the DESC window
     // ranks over DESC-sorted rows — age=10 is r1=1 (ASC) and r2=3 (DESC).
     assert_eq!(r1, 1);
-    assert_eq!(r2, 3, "conflicting-ORDER-BY windows must each sort independently");
+    assert_eq!(
+        r2, 3,
+        "conflicting-ORDER-BY windows must each sort independently"
+    );
 }
 
 // ===========================================================================
@@ -359,7 +397,11 @@ async fn repro_17_where_dropped_below_limit() {
     // Regression: the scan-pushdown gate now consumes the predicate only when
     // the rewriter can reach the scan; with an intervening Sort it can't, so
     // `n.age > 30` stays a residual Filter. Only 'old' (age 40) survives.
-    assert_eq!(rows.len(), 1, "planner.rs:6211/7739: filter must survive past Sort");
+    assert_eq!(
+        rows.len(),
+        1,
+        "planner.rs:6211/7739: filter must survive past Sort"
+    );
     assert_eq!(names, vec![Value::String("old".into())]);
     assert!(
         !names.contains(&Value::String("young".into())),
@@ -377,10 +419,17 @@ async fn repro_18_distinct_limit_order() {
     h.run_ok("CREATE (:P {name:'alice'})").await;
     h.run_ok("CREATE (:P {name:'bob'})").await;
     let rows = h.run_ok("MATCH (n:P) RETURN DISTINCT n.name LIMIT 2").await;
-    println!("[18] DISTINCT name LIMIT 2 -> rows={}: {rows:?}", rows.len());
+    println!(
+        "[18] DISTINCT name LIMIT 2 -> rows={}: {rows:?}",
+        rows.len()
+    );
     // FIXED (planner.rs): SKIP/LIMIT is applied AFTER DISTINCT — DISTINCT first
     // yields {alice, bob}, then LIMIT 2 keeps both.
-    assert_eq!(rows.len(), 2, "LIMIT must apply to the DISTINCT result, not the pre-distinct rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "LIMIT must apply to the DISTINCT result, not the pre-distinct rows"
+    );
 }
 
 // ===========================================================================
@@ -406,12 +455,21 @@ async fn repro_20_label_or_dropped_below_limit() {
     let rows = h
         .run_ok("MATCH (n) WITH n ORDER BY n.v MATCH (n) WHERE n:A OR n:B RETURN labels(n) AS ls")
         .await;
-    println!("[39] n:A OR n:B past Sort -> rows={}: {rows:?} (correct=2)", rows.len());
-    let has_c = rows.iter().any(|r| cell(r, "ls") == Value::List(vec![Value::String("C".into())]));
+    println!(
+        "[39] n:A OR n:B past Sort -> rows={}: {rows:?} (correct=2)",
+        rows.len()
+    );
+    let has_c = rows
+        .iter()
+        .any(|r| cell(r, "ls") == Value::List(vec![Value::String("C".into())]));
     // Regression: the label-union gate now consumes the conjunct only when the
     // rewriter can reach the ScanAll; with an intervening Sort it can't, so
     // `n:A OR n:B` stays a residual Filter. Only A and B survive (2 rows).
-    assert_eq!(rows.len(), 2, "planner.rs:6168/6665: label OR must survive past Sort");
+    assert_eq!(
+        rows.len(),
+        2,
+        "planner.rs:6168/6665: label OR must survive past Sort"
+    );
     assert!(!has_c, "C must be excluded by n:A OR n:B");
 }
 
@@ -478,10 +536,13 @@ async fn repro_25_int_div_by_zero() {
 #[tokio::test]
 async fn repro_32_union_node_dedup() {
     let h = Harness::new_schemaless().await;
-    h.run_ok("CREATE (:P {a:1, b:2, c:3, d:4, e:5, f:6, g:7})").await;
+    h.run_ok("CREATE (:P {a:1, b:2, c:3, d:4, e:5, f:6, g:7})")
+        .await;
     let mut max_rows = 0;
     for _ in 0..64 {
-        let rows = h.run_ok("MATCH (n:P) RETURN n UNION MATCH (n:P) RETURN n").await;
+        let rows = h
+            .run_ok("MATCH (n:P) RETURN n UNION MATCH (n:P) RETURN n")
+            .await;
         max_rows = max_rows.max(rows.len());
     }
     println!("[32] UNION of single node, max rows over 64 runs = {max_rows} (correct=1)");
@@ -502,11 +563,17 @@ async fn repro_32_union_node_dedup() {
 async fn repro_38_self_loop_both_dup() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (a:N {id:1})-[:R]->(a)").await;
-    let rows = h.run_ok("MATCH (a:N)-[r:R]-(b) RETURN a.id AS aid, b.id AS bid").await;
+    let rows = h
+        .run_ok("MATCH (a:N)-[r:R]-(b) RETURN a.id AS aid, b.id AS bid")
+        .await;
     println!("[38] undirected self-loop -> rows={}: {rows:?}", rows.len());
     // FIXED (traverse.rs): a self-loop is listed once under its source, so an
     // undirected match yields exactly one row.
-    assert_eq!(rows.len(), 1, "undirected self-loop must yield exactly one row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "undirected self-loop must yield exactly one row"
+    );
 }
 
 // ===========================================================================
@@ -521,7 +588,11 @@ async fn repro_39_sum_precision() {
     let s = cell(&rows[0], "s");
     println!("[39] UNWIND sum(2^53, 1) = {s:?} (correct=Int(9007199254740993))");
     // FIXED (core.rs): SUM keeps an exact i64 sum, so 2^53 + 1 is exact.
-    assert_eq!(s, Value::Int(9_007_199_254_740_993), "integer SUM must be exact");
+    assert_eq!(
+        s,
+        Value::Int(9_007_199_254_740_993),
+        "integer SUM must be exact"
+    );
 }
 
 // [39b] node-property sum routes through update_accumulators (read.rs:3818)
@@ -534,7 +605,11 @@ async fn repro_39b_sum_precision_nodes() {
     let s = cell(&rows[0], "s");
     println!("[39b] node sum(2^53,1) = {s:?} (correct=Int(9007199254740993))");
     // FIXED (core.rs): the row-based Accumulator::Sum keeps an exact i64 sum.
-    assert_eq!(s, Value::Int(9_007_199_254_740_993), "node-property SUM must be exact");
+    assert_eq!(
+        s,
+        Value::Int(9_007_199_254_740_993),
+        "node-property SUM must be exact"
+    );
 }
 
 // ===========================================================================
@@ -545,7 +620,8 @@ async fn repro_34_shortestpath_multihop() {
     let h = Harness::new_schemaless().await;
     // a-KNOWS->b-WORKS_AT->c ; and a-KNOWS->x (x has no WORKS_AT)
     h.run_ok("CREATE (a:Person {name:'a'})-[:KNOWS]->(b:Person {name:'b'})-[:WORKS_AT]->(c:Company {name:'c'})").await;
-    h.run_ok("MATCH (a:Person {name:'a'}) CREATE (a)-[:KNOWS]->(:Person {name:'x'})").await;
+    h.run_ok("MATCH (a:Person {name:'a'}) CREATE (a)-[:KNOWS]->(:Person {name:'x'})")
+        .await;
     let res = h
         .run("MATCH p = shortestPath((a:Person {name:'a'})-[:KNOWS]->(b:Person)-[:WORKS_AT]->(c:Company)) RETURN b.name AS bn")
         .await;
@@ -566,15 +642,27 @@ async fn repro_34_shortestpath_multihop() {
 async fn repro_26_value_less_than_temporal() {
     use uni_common::TemporalValue;
     use uni_query::query::df_graph::locy_eval::value_less_than;
-    let earlier = Value::Temporal(TemporalValue::Date { days_since_epoch: 7305 }); // 1990
-    let later = Value::Temporal(TemporalValue::Date { days_since_epoch: 18262 }); // 2020
+    let earlier = Value::Temporal(TemporalValue::Date {
+        days_since_epoch: 7305,
+    }); // 1990
+    let later = Value::Temporal(TemporalValue::Date {
+        days_since_epoch: 18262,
+    }); // 2020
     let lt = value_less_than(&earlier, &later);
     let gt = value_less_than(&later, &earlier);
-    println!("[26] value_less_than(1990,2020)={lt} (correct=true); (2020,1990)={gt} (correct=false)");
+    println!(
+        "[26] value_less_than(1990,2020)={lt} (correct=true); (2020,1990)={gt} (correct=false)"
+    );
     // FIXED (locy_eval.rs): temporal values now compare by their canonical
     // instant, so 1990 < 2020 and NOT 2020 < 1990.
-    assert!(lt, "repro for locy_eval.rs:561: temporal '<' must order dates");
-    assert!(!gt, "repro for locy_eval.rs:561: temporal '>' must order dates");
+    assert!(
+        lt,
+        "repro for locy_eval.rs:561: temporal '<' must order dates"
+    );
+    assert!(
+        !gt,
+        "repro for locy_eval.rs:561: temporal '>' must order dates"
+    );
 }
 
 // ===========================================================================
@@ -584,10 +672,15 @@ async fn repro_26_value_less_than_temporal() {
 async fn repro_14_minmax_temporal() {
     let h = Harness::new_schemaless().await;
     // Insert in unsorted order: 2020, 2010, 2030
-    h.run_ok("CREATE (:E {when: datetime('2020-01-01T00:00:00Z')})").await;
-    h.run_ok("CREATE (:E {when: datetime('2010-01-01T00:00:00Z')})").await;
-    h.run_ok("CREATE (:E {when: datetime('2030-01-01T00:00:00Z')})").await;
-    let rows = h.run_ok("MATCH (n:E) RETURN min(n.when) AS lo, max(n.when) AS hi").await;
+    h.run_ok("CREATE (:E {when: datetime('2020-01-01T00:00:00Z')})")
+        .await;
+    h.run_ok("CREATE (:E {when: datetime('2010-01-01T00:00:00Z')})")
+        .await;
+    h.run_ok("CREATE (:E {when: datetime('2030-01-01T00:00:00Z')})")
+        .await;
+    let rows = h
+        .run_ok("MATCH (n:E) RETURN min(n.when) AS lo, max(n.when) AS hi")
+        .await;
     let lo = cell(&rows[0], "lo");
     let hi = cell(&rows[0], "hi");
     println!("[14] min(when)={lo:?} max(when)={hi:?} (correct: lo=2010, hi=2030)");
@@ -600,7 +693,11 @@ async fn repro_14_minmax_temporal() {
     // `query::executor::core::tests::test_accumulator_minmax_temporal`.
     // Here we assert only the reachable invariant: the aggregate yields a
     // single grouped row over the three inserted temporals.
-    assert_eq!(rows.len(), 1, "min/max aggregate must produce exactly one row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "min/max aggregate must produce exactly one row"
+    );
 }
 
 // ===========================================================================
@@ -610,16 +707,24 @@ async fn repro_14_minmax_temporal() {
 async fn repro_07_optional_filter_batches() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (:A {x:0})").await;
-    h.run_ok("UNWIND range(1, 20000) AS i CREATE (:B {y:i})").await;
+    h.run_ok("UNWIND range(1, 20000) AS i CREATE (:B {y:i})")
+        .await;
     // WHERE b.y > 99999 : nothing matches -> exactly ONE null row expected.
     let rows = h
         .run_ok("MATCH (a:A) OPTIONAL MATCH (b:B) WHERE b.y > 99999 RETURN a.x AS ax, b.y AS by")
         .await;
-    println!("[7] all-fail OPTIONAL over 20000 B -> rows={} (correct=1)", rows.len());
+    println!(
+        "[7] all-fail OPTIONAL over 20000 B -> rows={} (correct=1)",
+        rows.len()
+    );
     // FIXED (optional_filter.rs): NULL recovery rows are now buffered across
     // batches and flushed once at end-of-stream, so an all-fail source group that
     // spans several 8192-row batches yields exactly ONE null row, not one per batch.
-    assert_eq!(rows.len(), 1, "all-fail OPTIONAL over one source group must yield exactly one null row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "all-fail OPTIONAL over one source group must yield exactly one null row"
+    );
 }
 
 // ===========================================================================
@@ -628,7 +733,8 @@ async fn repro_07_optional_filter_batches() {
 #[tokio::test]
 async fn repro_08_pattern_comprehension_colorder() {
     let h = Harness::new_schemaless().await;
-    h.run_ok("CREATE (a:A {id:1})-[:X {w:'WEIGHT'}]->(b:B {id:2})-[:Y]->(c:C {name:'target'})").await;
+    h.run_ok("CREATE (a:A {id:1})-[:X {w:'WEIGHT'}]->(b:B {id:2})-[:Y]->(c:C {name:'target'})")
+        .await;
     let res = h
         .run("MATCH (a:A) RETURN [(a)-[r1:X]->(b)-[r2:Y]->(c:C) WHERE c.name = 'target' | r1.w] AS out")
         .await;
@@ -671,7 +777,10 @@ async fn repro_10_label_remove_resurrect() {
     // `vertex_label_overwrites` marker and REPLACES the flushed labels, so
     // `REMOVE n:B` is respected instead of being resurrected by a union overlay.
     let rows_a = res_a.expect("labels(n) query should succeed");
-    let ls = cell(rows_a.get(0).expect("the A-labelled node is still present"), "ls");
+    let ls = cell(
+        rows_a.get(0).expect("the A-labelled node is still present"),
+        "ls",
+    );
     let Value::List(items) = &ls else {
         panic!("labels(n) must be a list, got {ls:?}");
     };
@@ -699,8 +808,10 @@ async fn repro_10_label_remove_resurrect() {
 #[tokio::test]
 async fn repro_21_consecutive_qpp() {
     let h = Harness::new_schemaless().await;
-    h.run_ok("CREATE (n1:V {id:1})-[:R]->(n2:V {id:2})-[:R]->(n3:V {id:3})").await;
-    h.run_ok("MATCH (n3:V {id:3}) CREATE (n3)-[:S]->(:V {id:4})-[:S]->(:V {id:5})").await;
+    h.run_ok("CREATE (n1:V {id:1})-[:R]->(n2:V {id:2})-[:R]->(n3:V {id:3})")
+        .await;
+    h.run_ok("MATCH (n3:V {id:3}) CREATE (n3)-[:S]->(:V {id:4})-[:S]->(:V {id:5})")
+        .await;
     let res = h
         .run("MATCH (a:V {id:1})((x)-[:R]->(y)){1,2}(b)((w)-[:S]->(z)){1,2}(c) RETURN a.id AS a, b.id AS b, c.id AS c")
         .await;
@@ -709,7 +820,10 @@ async fn repro_21_consecutive_qpp() {
     // FIXED (planner.rs): the second QPP anchors at `b` (the first QPP's target),
     // not the stale source `a`. Only b=3 has S-edges, so the connected chain is
     // a=1, b=3, c in {4,5}. Before the fix qpp2 anchored at a=1 (no S-edges) → empty.
-    assert!(!rows.is_empty(), "the connected two-QPP chain must yield rows");
+    assert!(
+        !rows.is_empty(),
+        "the connected two-QPP chain must yield rows"
+    );
     assert!(
         rows.iter().all(|r| as_int(&cell(r, "b")) == 3),
         "the second QPP must anchor at b=3 (the first QPP's target): {rows:?}"
@@ -724,8 +838,10 @@ async fn repro_35_labelinfo_jsonfts() {
     use uni_common::core::schema::{IndexDefinition, JsonFtsIndexConfig};
     let h = Harness::new(|sm| {
         sm.add_label("Doc").unwrap();
-        sm.add_property("Doc", "body", DataType::String, true).unwrap();
-        sm.add_property("Doc", "title", DataType::String, true).unwrap();
+        sm.add_property("Doc", "body", DataType::String, true)
+            .unwrap();
+        sm.add_property("Doc", "title", DataType::String, true)
+            .unwrap();
         // Add JSON FTS index on body only.
         sm.add_index(IndexDefinition::JsonFullText(JsonFtsIndexConfig {
             name: "doc_fts".into(),
@@ -771,7 +887,8 @@ async fn repro_35_labelinfo_jsonfts() {
 async fn repro_19_traverse_target_pred_dropped() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (a:X {id:1})-[:R]->(b:Y {p:1})").await;
-    h.run_ok("MATCH (a:X {id:1}) CREATE (a)-[:R]->(:Y {p:2})").await;
+    h.run_ok("MATCH (a:X {id:1}) CREATE (a)-[:R]->(:Y {p:2})")
+        .await;
     h.run_ok("CREATE (:Z {id:10})").await;
     h.run_ok("CREATE (:Z {id:11})").await;
     let res = h
@@ -780,7 +897,10 @@ async fn repro_19_traverse_target_pred_dropped() {
     match res {
         Ok(rows) => {
             let ps: Vec<Value> = rows.iter().map(|r| cell(r, "p")).collect();
-            println!("[19] traverse-target WHERE b.p=1 below SKIP -> rows={}, p vals={ps:?}", rows.len());
+            println!(
+                "[19] traverse-target WHERE b.p=1 below SKIP -> rows={}, p vals={ps:?}",
+                rows.len()
+            );
             let has_p2 = ps.iter().any(|v| v == &Value::Int(2));
             // BUG: filter dropped -> rows with b.p=2 also present.
             if has_p2 {
@@ -810,8 +930,10 @@ async fn repro_find04_hybrid_autoembed_swallowed() {
     };
     let h = Harness::new(|sm| {
         sm.add_label("Doc").unwrap();
-        sm.add_property("Doc", "emb", DataType::Vector { dimensions: 3 }, true).unwrap();
-        sm.add_property("Doc", "body", DataType::String, true).unwrap();
+        sm.add_property("Doc", "emb", DataType::Vector { dimensions: 3 }, true)
+            .unwrap();
+        sm.add_property("Doc", "body", DataType::String, true)
+            .unwrap();
         // Vector index WITHOUT embedding_config -> auto_embed_text will error.
         sm.add_index(IndexDefinition::Vector(VectorIndexConfig {
             name: "doc_emb".into(),
@@ -820,7 +942,10 @@ async fn repro_find04_hybrid_autoembed_swallowed() {
             index_type: VectorIndexType::Flat,
             metric: DistanceMetric::Cosine,
             embedding_config: None,
-            metadata: IndexMetadata { status: IndexStatus::Online, ..Default::default() },
+            metadata: IndexMetadata {
+                status: IndexStatus::Online,
+                ..Default::default()
+            },
         }))
         .unwrap();
         sm.add_index(IndexDefinition::JsonFullText(JsonFtsIndexConfig {
@@ -842,7 +967,10 @@ async fn repro_find04_hybrid_autoembed_swallowed() {
         .await;
     println!("[4] hybrid-search auto_embed-missing -> {res:?}");
     // BUG: Ok (FTS-only) instead of Err propagating the auto-embed failure.
-    assert!(res.is_err(), "repro for [4]: dense-arm auto_embed error must propagate");
+    assert!(
+        res.is_err(),
+        "repro for [4]: dense-arm auto_embed error must propagate"
+    );
 }
 
 // ===========================================================================
@@ -860,7 +988,10 @@ async fn repro_find15_reranker_clamp_panic() {
         .run("CALL uni.search('Doc', {vector:'emb'}, 'q', null, 1001, null, {reranker:'maxsim', reranker_k:5}) YIELD node RETURN node")
         .await;
     println!("[15] reranker clamp k=1001 -> {res:?}");
-    assert!(res.is_err(), "repro for [15]: k>1000 with reranker_k must not panic");
+    assert!(
+        res.is_err(),
+        "repro for [15]: k>1000 with reranker_k must not panic"
+    );
 }
 
 // ===========================================================================
@@ -876,7 +1007,7 @@ async fn repro_find15_reranker_clamp_panic() {
 #[tokio::test]
 async fn repro_find08_projection_store_ptr_key_collision() {
     use uni_algo::algo::GraphProjection;
-    use uni_query::projection_store::{for_storage, ProjectionEntry, ProjectionSourceKind};
+    use uni_query::projection_store::{ProjectionEntry, ProjectionSourceKind, for_storage};
 
     fn entry() -> ProjectionEntry {
         ProjectionEntry {
@@ -892,7 +1023,11 @@ async fn repro_find08_projection_store_ptr_key_collision() {
     // ---- Part A: callers sharing ONE schema Arc share the store (intended). ----
     let dir_a = tempdir().unwrap();
     let dir_b = tempdir().unwrap();
-    let sm_shared = Arc::new(SchemaManager::load(&dir_a.path().join("schema.json")).await.unwrap());
+    let sm_shared = Arc::new(
+        SchemaManager::load(&dir_a.path().join("schema.json"))
+            .await
+            .unwrap(),
+    );
     let a = Arc::new(
         StorageManager::new(dir_a.path().join("st").to_str().unwrap(), sm_shared.clone())
             .await
@@ -910,11 +1045,18 @@ async fn repro_find08_projection_store_ptr_key_collision() {
         "callers sharing a schema Arc (pinned tx + live session) must share one store"
     );
     sa.insert("g".into(), entry()).unwrap();
-    assert!(sb.contains("g"), "shared-schema callers must see the same projections");
+    assert!(
+        sb.contains("g"),
+        "shared-schema callers must see the same projections"
+    );
 
     // ---- Part B: distinct schema Arcs get ISOLATED stores (no cross leak). ----
     let dir_c = tempdir().unwrap();
-    let sm_other = Arc::new(SchemaManager::load(&dir_c.path().join("schema.json")).await.unwrap());
+    let sm_other = Arc::new(
+        SchemaManager::load(&dir_c.path().join("schema.json"))
+            .await
+            .unwrap(),
+    );
     let c = Arc::new(
         StorageManager::new(dir_c.path().join("st").to_str().unwrap(), sm_other.clone())
             .await
@@ -936,7 +1078,11 @@ async fn repro_find08_projection_store_ptr_key_collision() {
     // old address-keyed registry, such a reuse returned the dead database's
     // store (contains "g"); the fix keys on live identity so it never does.
     let dir_d = tempdir().unwrap();
-    let sm_d = Arc::new(SchemaManager::load(&dir_d.path().join("schema.json")).await.unwrap());
+    let sm_d = Arc::new(
+        SchemaManager::load(&dir_d.path().join("schema.json"))
+            .await
+            .unwrap(),
+    );
     let d = Arc::new(
         StorageManager::new(dir_d.path().join("st").to_str().unwrap(), sm_d.clone())
             .await
@@ -951,8 +1097,11 @@ async fn repro_find08_projection_store_ptr_key_collision() {
 
     let dir_e = tempdir().unwrap();
     for _ in 0..256 {
-        let sm_new =
-            Arc::new(SchemaManager::load(&dir_e.path().join("schema.json")).await.unwrap());
+        let sm_new = Arc::new(
+            SchemaManager::load(&dir_e.path().join("schema.json"))
+                .await
+                .unwrap(),
+        );
         if Arc::as_ptr(&sm_new) as usize == dead_addr {
             // Address reused: a fresh database landed on the dead one's slot.
             let e = Arc::new(
@@ -987,9 +1136,11 @@ async fn repro_find09_metric_by_property_ignores_label() {
     };
     let h = Harness::new(|sm| {
         sm.add_label("LabelA").unwrap();
-        sm.add_property("LabelA", "emb", DataType::Vector { dimensions: 3 }, true).unwrap();
+        sm.add_property("LabelA", "emb", DataType::Vector { dimensions: 3 }, true)
+            .unwrap();
         sm.add_label("LabelB").unwrap();
-        sm.add_property("LabelB", "emb", DataType::Vector { dimensions: 3 }, true).unwrap();
+        sm.add_property("LabelB", "emb", DataType::Vector { dimensions: 3 }, true)
+            .unwrap();
         // LabelA (Cosine) declared FIRST -> its metric wins for BOTH labels.
         sm.add_index(IndexDefinition::Vector(VectorIndexConfig {
             name: "a_emb".into(),
@@ -998,7 +1149,10 @@ async fn repro_find09_metric_by_property_ignores_label() {
             index_type: VectorIndexType::Flat,
             metric: DistanceMetric::Cosine,
             embedding_config: None,
-            metadata: IndexMetadata { status: IndexStatus::Online, ..Default::default() },
+            metadata: IndexMetadata {
+                status: IndexStatus::Online,
+                ..Default::default()
+            },
         }))
         .unwrap();
         sm.add_index(IndexDefinition::Vector(VectorIndexConfig {
@@ -1008,7 +1162,10 @@ async fn repro_find09_metric_by_property_ignores_label() {
             index_type: VectorIndexType::Flat,
             metric: DistanceMetric::L2,
             embedding_config: None,
-            metadata: IndexMetadata { status: IndexStatus::Online, ..Default::default() },
+            metadata: IndexMetadata {
+                status: IndexStatus::Online,
+                ..Default::default()
+            },
         }))
         .unwrap();
     })
@@ -1047,7 +1204,8 @@ async fn repro_find09_metric_by_property_ignores_label() {
 // note: repro for [5]: null-fill of optional var `x` clobbers matched relationship of `xx` (suffix match)
 async fn repro_find05_optional_var_suffix_eid() {
     let h = Harness::new_schemaless().await;
-    h.run_ok("CREATE (c:Person {name:'Charlie'})-[:LIKES]->(:Person {name:'Dana'})").await;
+    h.run_ok("CREATE (c:Person {name:'Charlie'})-[:LIKES]->(:Person {name:'Dana'})")
+        .await;
     // xx-binding OPTIONAL MATCH precedes the x one so __eid_to_xx is present when
     // x's null-fill runs. xx matches (LIKES->Dana); x does not (no KNOWS).
     let rows = h
@@ -1082,8 +1240,10 @@ async fn repro_find19_copy_from_drops_timestamp() {
 
     let h = Harness::new(|sm| {
         sm.add_label("Event").unwrap();
-        sm.add_property("Event", "ts", DataType::DateTime, true).unwrap();
-        sm.add_property("Event", "name", DataType::String, true).unwrap();
+        sm.add_property("Event", "ts", DataType::DateTime, true)
+            .unwrap();
+        sm.add_property("Event", "name", DataType::String, true)
+            .unwrap();
     })
     .await;
 
@@ -1094,7 +1254,9 @@ async fn repro_find19_copy_from_drops_timestamp() {
         Field::new("ts", ArrowDT::Timestamp(TimeUnit::Nanosecond, None), false),
         Field::new("name", ArrowDT::Utf8, false),
     ]));
-    let ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![1_600_000_000_000_000_000i64]));
+    let ts: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        1_600_000_000_000_000_000i64,
+    ]));
     let name: ArrayRef = Arc::new(StringArray::from(vec!["e1"]));
     let batch = RecordBatch::try_new(schema.clone(), vec![ts, name]).unwrap();
     {
@@ -1107,14 +1269,20 @@ async fn repro_find19_copy_from_drops_timestamp() {
     let copy = format!("COPY Event FROM '{}'", path.to_str().unwrap());
     let copy_res = h.run(&copy).await;
     println!("[19] COPY FROM parquet -> {copy_res:?}");
-    let res = h.run("MATCH (n:Event) RETURN n.ts AS ts, n.name AS name").await;
+    let res = h
+        .run("MATCH (n:Event) RETURN n.ts AS ts, n.name AS name")
+        .await;
     match res {
         Ok(rows) if !rows.is_empty() => {
             let ts = cell(&rows[0], "ts");
             let name = cell(&rows[0], "name");
             println!("[19] imported ts={ts:?} name={name:?}");
             // BUG: ts silently dropped (Null) while name is present.
-            assert_ne!(ts, Value::Null, "repro for [19]: Timestamp column dropped by COPY FROM");
+            assert_ne!(
+                ts,
+                Value::Null,
+                "repro for [19]: Timestamp column dropped by COPY FROM"
+            );
         }
         other => println!("[19] COPY/MATCH not observable in harness: {other:?}"),
     }
@@ -1136,7 +1304,8 @@ async fn repro_find14_recursive_cte_multicol_cycle() {
     let h = Harness::new_schemaless().await;
     h.run_ok("CREATE (a:N {name:'A'})").await;
     h.run_ok("CREATE (b:N {name:'B'})").await;
-    h.run_ok("MATCH (a:N {name:'A'}), (b:N {name:'B'}) CREATE (a)-[:E]->(b), (b)-[:E]->(a)").await;
+    h.run_ok("MATCH (a:N {name:'A'}), (b:N {name:'B'}) CREATE (a)-[:E]->(b), (b)-[:E]->(a)")
+        .await;
     // Multi-column recursive RETURN (many columns -> k! Debug orderings) so the
     // seen-set almost never recognizes a revisited row.
     // Multi-column recursive RETURN (node + extra columns) forces each CTE row to
@@ -1161,7 +1330,10 @@ async fn repro_find14_recursive_cte_multicol_cycle() {
             // multi-column `Value::Map(HashMap)`, so revisited rows are always
             // recognized and the recursion converges on exactly the 2 reachable
             // nodes (A, B) instead of over-iterating.
-            assert_eq!(c, 2, "repro for [14]: recursive CTE must reach exactly both nodes");
+            assert_eq!(
+                c, 2,
+                "repro for [14]: recursive CTE must reach exactly both nodes"
+            );
         }
         Err(e) => println!("[14] not runnable in harness: {e}"),
     }
@@ -1178,7 +1350,8 @@ async fn repro_find16_vid_lookup_null_eq_null() {
     let h = Harness::new_schemaless().await;
     // Neither node has property `p`. Bare `MATCH (b:T)` keeps the probe subtree a
     // plain GraphScan so the VidLookupJoin fast-path fires (anchor = id(b)=id(m)).
-    h.run_ok("CREATE (a:T {name:'a'})-[:R]->(m:T {name:'m'})").await;
+    h.run_ok("CREATE (a:T {name:'a'})-[:R]->(m:T {name:'m'})")
+        .await;
     let res = h
         .run(
             "MATCH (a:T)-[:R]->(m:T) MATCH (b:T) \
@@ -1191,7 +1364,11 @@ async fn repro_find16_vid_lookup_null_eq_null() {
         Ok(rows) => {
             // Correct: a.p = b.p is NULL = NULL -> NULL -> filtered -> 0 rows.
             // BUG: values_equal(NULL,NULL)=true -> 1 row.
-            assert_eq!(rows.len(), 0, "repro for [16]: NULL join key must not match");
+            assert_eq!(
+                rows.len(),
+                0,
+                "repro for [16]: NULL join key must not match"
+            );
         }
         Err(e) => println!("[16] not runnable in harness: {e}"),
     }
@@ -1207,9 +1384,12 @@ async fn repro_find16_vid_lookup_null_eq_null() {
 // note: repro for [35]: vector_similarity predicate under a Traverse is silently dropped (no KNN, filter lost)
 async fn repro_find35_vector_similarity_under_traverse() {
     let h = Harness::new_schemaless().await;
-    h.run_ok("CREATE (:Doc {name:'hit', embedding:[1.0, 0.0, 0.0]})").await;
-    h.run_ok("CREATE (:Doc {name:'miss', embedding:[0.0, 1.0, 0.0]})").await;
-    h.run_ok("MATCH (d:Doc) CREATE (d)-[:HAS]->(:Tag {t:'x'})").await;
+    h.run_ok("CREATE (:Doc {name:'hit', embedding:[1.0, 0.0, 0.0]})")
+        .await;
+    h.run_ok("CREATE (:Doc {name:'miss', embedding:[0.0, 1.0, 0.0]})")
+        .await;
+    h.run_ok("MATCH (d:Doc) CREATE (d)-[:HAS]->(:Tag {t:'x'})")
+        .await;
     // `d`'s Scan sits under the Traverse (d is the traverse source).
     let res = h
         .run(
@@ -1223,7 +1403,11 @@ async fn repro_find35_vector_similarity_under_traverse() {
         Ok(rows) => {
             // Correct: only 'hit' (cosine 1.0 > 0.99) -> 1 row.
             // BUG: predicate dropped -> both hit and miss -> 2 rows.
-            assert_eq!(rows.len(), 1, "repro for [35]: similarity filter must be honored under Traverse");
+            assert_eq!(
+                rows.len(),
+                1,
+                "repro for [35]: similarity filter must be honored under Traverse"
+            );
         }
         Err(e) => println!("[35] not runnable in harness: {e}"),
     }
@@ -1254,7 +1438,11 @@ async fn repro_find17_optional_virtual_target_inner_join() {
         .run_ok("MATCH (a:A) OPTIONAL MATCH (a)-[:VEDGE]->(b:VTarget) RETURN a.id AS aid, b AS b")
         .await;
     println!("[17] optional (native control for virtual-target) -> {rows:?}");
-    assert_eq!(rows.len(), 1, "OPTIONAL MATCH must keep the null-target row (virtual path drops it)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "OPTIONAL MATCH must keep the null-target row (virtual path drops it)"
+    );
     assert_eq!(cell(&rows[0], "b"), Value::Null);
 }
 
@@ -1277,7 +1465,9 @@ async fn repro_find32_virtual_edge_both_is_outgoing() {
     // Native-edge control: undirected match from y also reaches x (both
     // orientations). Over a virtual edge, Both is treated as Outgoing only, so
     // the reverse orientation (y->x) would be missing — finding [32].
-    let rows = h.run_ok("MATCH (y:V {id:2})-[:R]-(other) RETURN other.id AS oid").await;
+    let rows = h
+        .run_ok("MATCH (y:V {id:2})-[:R]-(other) RETURN other.id AS oid")
+        .await;
     println!("[32] undirected (native control for virtual-edge) -> {rows:?}");
     let oids: Vec<Value> = rows.iter().map(|r| cell(r, "oid")).collect();
     assert!(
@@ -1309,15 +1499,15 @@ fn build_locy_plan(
     builder
         .build_program_plan(
             &compiled,
-            1000,                                    // max_iterations
-            std::time::Duration::from_secs(300),     // timeout
-            256 * 1024 * 1024,                       // max_derived_bytes
-            true,                                    // deterministic_best_by
-            false,                                   // strict_probability_domain
-            1e-15,                                   // probability_epsilon
-            false,                                   // exact_probability
-            1000,                                    // max_bdd_variables
-            0,                                       // top_k_proofs
+            1000,                                // max_iterations
+            std::time::Duration::from_secs(300), // timeout
+            256 * 1024 * 1024,                   // max_derived_bytes
+            true,                                // deterministic_best_by
+            false,                               // strict_probability_domain
+            1e-15,                               // probability_epsilon
+            false,                               // exact_probability
+            1000,                                // max_bdd_variables
+            0,                                   // top_k_proofs
         )
         .map_err(|e| anyhow::anyhow!("build_program_plan: {e:?}"))
 }
@@ -1374,11 +1564,17 @@ async fn repro_find25_locy_distinct_hashmap_debug() {
     // Structural: the multi-column RETURN DISTINCT program plans. The dedup bug
     // (format!("{row:?}") over HashMap) manifests at Locy execution time, which
     // is only reachable through the uni-db session command dispatch.
-    println!("[25] planned DISTINCT program ok: {}", matches!(
+    println!(
+        "[25] planned DISTINCT program ok: {}",
+        matches!(
+            plan,
+            uni_query::query::planner::LogicalPlan::LocyProgram { .. }
+        )
+    );
+    assert!(matches!(
         plan,
         uni_query::query::planner::LogicalPlan::LocyProgram { .. }
     ));
-    assert!(matches!(plan, uni_query::query::planner::LogicalPlan::LocyProgram { .. }));
 }
 
 // ===========================================================================
@@ -1396,13 +1592,21 @@ async fn repro_find24_mnor_mixed_support_one() {
     let program = "CREATE RULE r AS MATCH (a:N)-[e:R]->(b:N) FOLD score = MNOR(e.w) YIELD KEY a.name AS name, score";
     match build_locy_plan(h.schema_manager.schema(), program) {
         Ok(plan) => {
-            println!("[24] planned MNOR fold ok: {}", matches!(
+            println!(
+                "[24] planned MNOR fold ok: {}",
+                matches!(
+                    plan,
+                    uni_query::query::planner::LogicalPlan::LocyProgram { .. }
+                )
+            );
+            assert!(matches!(
                 plan,
                 uni_query::query::planner::LogicalPlan::LocyProgram { .. }
             ));
-            assert!(matches!(plan, uni_query::query::planner::LogicalPlan::LocyProgram { .. }));
         }
-        Err(e) => println!("[24] MNOR program not planned in harness (aggregate registration): {e}"),
+        Err(e) => {
+            println!("[24] MNOR program not planned in harness (aggregate registration): {e}")
+        }
     }
 }
 
@@ -1419,11 +1623,17 @@ async fn repro_find13_exact_wmc_prob_positions() {
     let program = "CREATE RULE base AS MATCH (a:N)-[e:R]->(b:N) YIELD KEY a.name AS a, b.name AS b OUTPUT PROB e.w";
     match build_locy_plan(h.schema_manager.schema(), program) {
         Ok(plan) => {
-            println!("[13] planned OUTPUT PROB ok: {}", matches!(
+            println!(
+                "[13] planned OUTPUT PROB ok: {}",
+                matches!(
+                    plan,
+                    uni_query::query::planner::LogicalPlan::LocyProgram { .. }
+                )
+            );
+            assert!(matches!(
                 plan,
                 uni_query::query::planner::LogicalPlan::LocyProgram { .. }
             ));
-            assert!(matches!(plan, uni_query::query::planner::LogicalPlan::LocyProgram { .. }));
         }
         Err(e) => println!("[13] OUTPUT PROB program not planned in harness: {e}"),
     }
@@ -1447,13 +1657,18 @@ async fn repro_find10_abduce_multihop_target_var() {
                    ABDUCE r";
     match build_locy_plan(h.schema_manager.schema(), program) {
         Ok(plan) => {
-            println!("[10] planned multi-hop ABDUCE ok: {}", matches!(
+            println!(
+                "[10] planned multi-hop ABDUCE ok: {}",
+                matches!(
+                    plan,
+                    uni_query::query::planner::LogicalPlan::LocyProgram { .. }
+                )
+            );
+            assert!(matches!(
                 plan,
                 uni_query::query::planner::LogicalPlan::LocyProgram { .. }
             ));
-            assert!(matches!(plan, uni_query::query::planner::LogicalPlan::LocyProgram { .. }));
         }
         Err(e) => println!("[10] ABDUCE program not planned in harness: {e}"),
     }
 }
-

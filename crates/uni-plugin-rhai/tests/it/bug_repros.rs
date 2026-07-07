@@ -14,12 +14,12 @@ use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field};
 use datafusion::scalar::ScalarValue;
 
+use uni_plugin::capability::SideEffects;
 use uni_plugin::traits::aggregate::{AggSignature, AggregatePluginFn, PluginAccumulator};
 use uni_plugin::traits::procedure::{
     ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
-use uni_plugin::capability::SideEffects;
 use uni_plugin::{
     Capability, CapabilitySet, KmsProvider, PluginId, PluginRegistrar, PluginRegistry, QName,
 };
@@ -154,8 +154,9 @@ fn agg_nan_partial_state_silently_lost_on_serialize_merge() {
 
     // Partition B: merge partition A's peer state, then finalize the type.
     let mut b = agg.create_accumulator();
-    let peer_arr: arrow_array::ArrayRef =
-        Arc::new(arrow_array::LargeBinaryArray::from(vec![state_bytes.as_slice()]));
+    let peer_arr: arrow_array::ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![
+        state_bytes.as_slice(),
+    ]));
     b.merge_batch(&[peer_arr]).unwrap();
     let finalized = b.evaluate().unwrap();
 
@@ -287,7 +288,10 @@ async fn procedure_float_into_int64_silently_casts() {
     assert_eq!(col.value(1), 3, "3.9 truncates to 3");
     assert!(col.is_null(2), "1e30 must not saturate to i64::MAX");
     assert!(col.is_null(3), "-1e30 must not saturate to i64::MIN");
-    assert!(col.null_count() >= 3, "non-finite/out-of-range floats are nulled");
+    assert!(
+        col.null_count() >= 3,
+        "non-finite/out-of-range floats are nulled"
+    );
 }
 
 // ---------------------------------------------------------------------------

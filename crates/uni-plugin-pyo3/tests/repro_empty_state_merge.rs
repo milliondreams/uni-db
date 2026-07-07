@@ -26,9 +26,9 @@ use datafusion::scalar::ScalarValue;
 use pyo3::prelude::*;
 use smol_str::SmolStr;
 
-use uni_plugin::traits::aggregate::AggregatePluginFn;
 use uni_plugin::PluginId;
-use uni_plugin_pyo3::{build_py_agg_signature, PyAggregateFn, PyPluginRuntime};
+use uni_plugin::traits::aggregate::AggregatePluginFn;
+use uni_plugin_pyo3::{PyAggregateFn, PyPluginRuntime, build_py_agg_signature};
 
 /// Sum-of-floats aggregate spec whose state is the dict shape
 /// `{"sum": .., "n": ..}` — identical to the in-file tests at
@@ -78,8 +78,8 @@ fn runtime_with_agg(spec_src: &str) -> Arc<PyPluginRuntime> {
 fn empty_partition_state_is_noop_in_merge() {
     Python::initialize();
     let rt = runtime_with_agg(SUM_SPEC);
-    let sig =
-        build_py_agg_signature(&[SmolStr::new("float")], &SmolStr::new("float"), "pure").expect("sig");
+    let sig = build_py_agg_signature(&[SmolStr::new("float")], &SmolStr::new("float"), "pure")
+        .expect("sig");
     let agg = PyAggregateFn::new(Arc::clone(&rt), "sum_floats", sig);
 
     // Partition A: [1, 2, 3] -> proper JSON state.

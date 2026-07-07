@@ -121,7 +121,10 @@ async fn host_cancel_does_not_persist_cancellation() {
 
     // 2) Cancel via the host SchedulerControl path (same path
     // `uni.periodic.cancel` takes).
-    assert!(SchedulerControl::cancel(&*host, &id), "in-memory cancel succeeds");
+    assert!(
+        SchedulerControl::cancel(&*host, &id),
+        "in-memory cancel succeeds"
+    );
 
     // FIXED: host cancel now also invokes persistence.cancel, so the durable
     // sidecar row is deleted and cannot resurrect the job on restart.

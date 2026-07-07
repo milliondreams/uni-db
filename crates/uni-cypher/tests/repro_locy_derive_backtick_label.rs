@@ -20,10 +20,9 @@ use uni_cypher::parse_locy;
 // locy_walker.rs:1359,1386).
 #[test]
 fn derive_backtick_label_and_edge_strip_backticks() {
-    let program = parse_locy(
-        "CREATE RULE r AS MATCH (a) DERIVE (NEW x:`My Label`)-[:`HAS ITEM`]->(NEW y:B)",
-    )
-    .expect("parse_locy");
+    let program =
+        parse_locy("CREATE RULE r AS MATCH (a) DERIVE (NEW x:`My Label`)-[:`HAS ITEM`]->(NEW y:B)")
+            .expect("parse_locy");
 
     let rule = match &program.statements[0] {
         LocyStatement::Rule(r) => r,

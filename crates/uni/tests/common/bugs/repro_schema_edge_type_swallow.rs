@@ -64,10 +64,7 @@ async fn edge_type_relabel_silently_swallowed() -> anyhow::Result<()> {
     // mutation), so the original [Person] endpoint labels are intact — not
     // silently replaced or corrupted.
     let after = db.schema().current();
-    let meta_after = after
-        .edge_types
-        .get("KNOWS")
-        .expect("KNOWS still present");
+    let meta_after = after.edge_types.get("KNOWS").expect("KNOWS still present");
     assert_eq!(
         meta_after.src_labels,
         vec!["Person".to_string()],

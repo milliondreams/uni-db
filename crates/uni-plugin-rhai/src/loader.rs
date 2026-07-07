@@ -296,10 +296,7 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
             // positional `col{i}` name when the manifest declared none — a
             // fabricated name would never match a natural-key row map and the
             // column would silently read all-NULL.
-            let name = y
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("col{i}"));
+            let name = y.name.clone().unwrap_or_else(|| format!("col{i}"));
             Ok(Field::new(name, dt, true))
         })
         .collect::<Result<_, RhaiError>>()?;

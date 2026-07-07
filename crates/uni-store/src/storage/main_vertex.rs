@@ -640,17 +640,18 @@ impl MainVertexDataset {
         // main table (review C2), and last-row-wins with no `_version` ranking
         // returned stale props depending on physical scan order.
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter =
-            with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
+        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
 
         let results = backend
             .scan(
-                ScanRequest::all(table_name).with_filter(filter).with_columns(vec![
-                    "_vid".to_string(),
-                    "props_json".to_string(),
-                    "_version".to_string(),
-                    "_deleted".to_string(),
-                ]),
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "props_json".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
@@ -675,7 +676,11 @@ impl MainVertexDataset {
                         continue;
                     }
                     let vid = Vid::new(vid_arr.value(i));
-                    let version = if ver_arr.is_null(i) { 0 } else { ver_arr.value(i) };
+                    let version = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
 
                     // Keep the highest-version row for this vid (>= so a later
                     // equal-version row still wins, matching find_props_by_vid).
@@ -819,17 +824,18 @@ impl MainVertexDataset {
         // included (a deleted winner drops the vid). `_deleted = false` filtering
         // + last-row-wins previously resurrected deleted vertices' labels.
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter =
-            with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
+        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
 
         let results = backend
             .scan(
-                ScanRequest::all(table_name).with_filter(filter).with_columns(vec![
-                    "_vid".to_string(),
-                    "labels".to_string(),
-                    "_version".to_string(),
-                    "_deleted".to_string(),
-                ]),
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
@@ -854,7 +860,11 @@ impl MainVertexDataset {
                         continue;
                     }
                     let vid = Vid::new(vid_arr.value(i));
-                    let version = if ver_arr.is_null(i) { 0 } else { ver_arr.value(i) };
+                    let version = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
 
                     if best.get(&vid).is_some_and(|(bv, _, _)| version < *bv) {
                         continue;

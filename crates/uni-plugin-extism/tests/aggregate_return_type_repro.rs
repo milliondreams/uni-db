@@ -42,8 +42,10 @@ fn vector_return_type_collapses_to_bare_element_not_fixed_size_list() {
 
     // What the DataFusion bridge (df_udaf_plugin.rs:214) declares for the SAME
     // signature, and thus what the query planner expects downstream.
-    let datafusion_return_ty =
-        DataType::FixedSizeList(std::sync::Arc::new(Field::new("item", DataType::Float32, true)), 3);
+    let datafusion_return_ty = DataType::FixedSizeList(
+        std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
+        3,
+    );
 
     // FIXED (adapter_aggregate.rs:325): the Extism side now maps Vector to the
     // same FixedSizeList the DataFusion UDAF advertises, so the two agree on the
@@ -54,7 +56,10 @@ fn vector_return_type_collapses_to_bare_element_not_fixed_size_list() {
     );
     assert_eq!(
         extism_return_ty,
-        DataType::FixedSizeList(std::sync::Arc::new(Field::new("item", DataType::Float32, true)), 3),
+        DataType::FixedSizeList(
+            std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
+            3
+        ),
         "Extism build_returns_field should map Vector to FixedSizeList<Float32, 3>"
     );
 }

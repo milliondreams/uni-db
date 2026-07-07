@@ -158,7 +158,12 @@ impl StorageBackend for FaultBackend {
     async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> AnyResult<usize> {
         self.inner.count_rows(table_name, filter).await
     }
-    async fn write(&self, table_name: &str, batches: Vec<RecordBatch>, mode: WriteMode) -> AnyResult<()> {
+    async fn write(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+        mode: WriteMode,
+    ) -> AnyResult<()> {
         self.inner.write(table_name, batches, mode).await
     }
     async fn delete_rows(&self, table_name: &str, filter: &str) -> AnyResult<()> {
@@ -229,9 +234,10 @@ async fn faulted_populated_store(
 
     let store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    let sm = StorageManager::new_with_backend(&uri, store, fault.clone(), schema, UniConfig::default())
-        .await
-        .unwrap();
+    let sm =
+        StorageManager::new_with_backend(&uri, store, fault.clone(), schema, UniConfig::default())
+            .await
+            .unwrap();
     (dir, Arc::new(sm), fault)
 }
 

@@ -1143,16 +1143,13 @@ impl Transaction {
                         // tracked source (rebuild would otherwise drop it).
                         let mut combined = session_reg.sources.clone();
                         for src in &tx_reg.sources {
-                            let owns_new =
-                                src.rule_names.iter().any(|r| new_names.contains(r));
-                            let already =
-                                combined.iter().any(|s| s.source == src.source);
+                            let owns_new = src.rule_names.iter().any(|r| new_names.contains(r));
+                            let already = combined.iter().any(|s| s.source == src.source);
                             if owns_new && !already {
                                 combined.push(src.clone());
                             }
                         }
-                        let rebuilt =
-                            super::impl_locy::rebuild_registry_from_sources(&combined);
+                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(&combined);
                         let preserved_all = |r: &super::impl_locy::LocyRuleRegistry| {
                             new_names.iter().all(|n| r.rules.contains_key(n))
                                 && session_reg.rules.keys().all(|n| r.rules.contains_key(n))

@@ -160,7 +160,10 @@ fn repro_finding_07_range_udf_overflow() {
     // FIXED (df_udfs.rs): RangeUdf uses checked_add, so it terminates cleanly at
     // the i64 boundary instead of panicking (debug) / overflowing (release).
     let inner = result.expect("RangeUdf must not panic at the i64 boundary");
-    assert!(inner.is_ok(), "range at the i64 boundary must produce a terminating list");
+    assert!(
+        inner.is_ok(),
+        "range at the i64 boundary must produce a terminating list"
+    );
 }
 
 /// Finding [13] df_udfs.rs:2956 — `encode_sort_key_to_buf` casts `Value::Int`

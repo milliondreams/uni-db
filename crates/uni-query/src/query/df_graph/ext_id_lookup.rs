@@ -485,8 +485,17 @@ mod tests {
         // Optional lookups declare the identity columns nullable so the null row
         // (build_null_row) is accepted by RecordBatch::try_new.
         let opt = GraphExtIdLookupExec::build_schema("n", &[], true);
-        assert!(opt.field(0).is_nullable(), "_vid must be nullable when optional");
-        assert!(opt.field(1).is_nullable(), "ext_id must be nullable when optional");
-        assert!(opt.field(2).is_nullable(), "_label must be nullable when optional");
+        assert!(
+            opt.field(0).is_nullable(),
+            "_vid must be nullable when optional"
+        );
+        assert!(
+            opt.field(1).is_nullable(),
+            "ext_id must be nullable when optional"
+        );
+        assert!(
+            opt.field(2).is_nullable(),
+            "_label must be nullable when optional"
+        );
     }
 }

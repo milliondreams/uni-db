@@ -221,8 +221,7 @@ impl<'a> SchemaBuilder<'a> {
                             let matches = existing_schema
                                 .get_edge_type_case_insensitive(&name)
                                 .is_some_and(|m| {
-                                    m.src_labels == requested_from
-                                        && m.dst_labels == requested_to
+                                    m.src_labels == requested_from && m.dst_labels == requested_to
                                 });
                             if !matches {
                                 return Err(UniError::Schema {

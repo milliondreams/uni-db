@@ -5,9 +5,9 @@
 //! the stratifier adding the `rule -> source_rule` ordering edge — the model
 //! may then evaluate against incomplete/absent path-context data.
 
+use uni_cypher::parse_locy;
 use uni_locy::compile_with_config;
 use uni_locy::{CompiledProgram, LocyConfig};
-use uni_cypher::parse_locy;
 
 fn stratum_of<'a>(prog: &'a CompiledProgram, rule: &str) -> &'a uni_locy::types::Stratum {
     prog.strata

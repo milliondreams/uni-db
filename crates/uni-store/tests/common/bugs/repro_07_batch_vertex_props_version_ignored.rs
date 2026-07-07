@@ -53,7 +53,11 @@ async fn repro_batch_vertex_props_returns_stale_version() {
         .unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
 
     // Write two LIVE versions of Vid(1) into a single batch, NEWER row first so
     // the order-blind loop applies the stale v1 row last.

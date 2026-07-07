@@ -1379,10 +1379,11 @@ fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfE
             let is_match =
                 datafusion::functions::expr_fn::regexp_match(left.clone(), right.clone(), None)
                     .is_not_null();
-            Ok(
-                datafusion::logical_expr::when(left.is_null().or(right.is_null()), lit(ScalarValue::Boolean(None)))
-                    .otherwise(is_match)?,
+            Ok(datafusion::logical_expr::when(
+                left.is_null().or(right.is_null()),
+                lit(ScalarValue::Boolean(None)),
             )
+            .otherwise(is_match)?)
         }
 
         BinaryOp::ApproxEq => Err(anyhow!(

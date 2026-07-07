@@ -20,12 +20,12 @@ pub mod locy_profile;
 pub mod locy_program_persistence;
 pub mod repro_locy_runtime_distinct_debug_dedup;
 // Correctness-scan Wave 2 repros (R12 Locy probabilistic).
-pub mod repro_locy_runtime_abduce_target_var;
-pub mod repro_locy_runtime_topk_mnor_mixed_support;
-pub mod repro_locy_runtime_wmc_shared_lineage;
 pub mod locy_rule_durability;
 pub mod locy_snapshot_context_independence;
 pub mod locy_ssi_read_set;
 pub mod locy_timeout_partial;
 pub mod locy_type_projection_matrix;
+pub mod repro_locy_runtime_abduce_target_var;
+pub mod repro_locy_runtime_topk_mnor_mixed_support;
+pub mod repro_locy_runtime_wmc_shared_lineage;
 pub mod value_assert;

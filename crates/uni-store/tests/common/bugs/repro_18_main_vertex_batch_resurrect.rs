@@ -34,7 +34,13 @@ async fn repro_batch_readers_resurrect_deleted_vertex() {
 
     // v1: live row for Vid(1).
     let live = MainVertexDataset::build_record_batch(
-        &[(Vid::new(1), vec!["Person".to_string()], props.clone(), false, 1u64)],
+        &[(
+            Vid::new(1),
+            vec!["Person".to_string()],
+            props.clone(),
+            false,
+            1u64,
+        )],
         None,
         None,
     )

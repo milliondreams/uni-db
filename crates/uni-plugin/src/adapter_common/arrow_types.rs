@@ -53,7 +53,10 @@ pub fn argtype_to_arrow(t: &ArgType) -> DataType {
             // A vector row is a `FixedSizeList`; clamp an absurd `len` to the
             // Arrow-representable `i32` range rather than overflowing.
             let list_len = i32::try_from(*len).unwrap_or(i32::MAX);
-            DataType::FixedSizeList(Arc::new(Field::new("item", element.clone(), true)), list_len)
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", element.clone(), true)),
+                list_len,
+            )
         }
     }
 }

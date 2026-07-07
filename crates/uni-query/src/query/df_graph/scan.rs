@@ -1282,9 +1282,7 @@ fn filter_l0_label_overwrites(
         .map(|i| match overwritten.get(&vid_col.value(i)) {
             // The vid's newest overwrite resolved its full label set: keep only
             // if that set still contains every requested label.
-            Some(resolved) => required
-                .iter()
-                .all(|lf| resolved.iter().any(|l| l == lf)),
+            Some(resolved) => required.iter().all(|lf| resolved.iter().any(|l| l == lf)),
             // No overwrite for this vid: the stored (Lance or L0) labels stand.
             None => true,
         })

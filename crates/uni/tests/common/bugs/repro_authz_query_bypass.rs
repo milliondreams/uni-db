@@ -17,7 +17,9 @@
 use std::sync::Arc;
 
 use uni_db::{Uni, UniError};
-use uni_plugin::traits::connector::{Action, AuthzError, AuthzPolicy, Decision, Principal, Resource};
+use uni_plugin::traits::connector::{
+    Action, AuthzError, AuthzPolicy, Decision, Principal, Resource,
+};
 use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar};
 
 /// Denies every action whose verb appears in `deny_verbs`.

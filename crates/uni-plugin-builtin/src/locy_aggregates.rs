@@ -892,7 +892,11 @@ impl LocyAggState for MprodState {
         // pre-switch product that `log_sum` already contains (at the switch
         // `log_sum = ln(product)`, plus later `ln` terms). Fold `other`'s single
         // value into whichever representation self is currently using.
-        let other_product = if o.use_log { o.log_sum.exp() } else { o.product };
+        let other_product = if o.use_log {
+            o.log_sum.exp()
+        } else {
+            o.product
+        };
         if self.use_log {
             self.log_sum += other_product.ln();
         } else {

@@ -310,7 +310,11 @@ fn node_sort_key(n: &Node) -> String {
 
 /// Sort key for an edge: its type plus property map, excluding eid/src/dst.
 fn edge_sort_key(e: &Edge) -> String {
-    format!("type={};props={{{}}}", e.edge_type, map_sort_key(&e.properties))
+    format!(
+        "type={};props={{{}}}",
+        e.edge_type,
+        map_sort_key(&e.properties)
+    )
 }
 
 /// Sort key for a path: the ordered node and edge content keys.

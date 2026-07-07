@@ -81,7 +81,11 @@ async fn repro_number_tostring_int64_precision_loss() {
     // BUG: expected "9007199254740993", got "9007199254740992"
     // (repro for src/procedures/number.rs:153 via support.rs:231 `*v as f64`).
     // FIXED (number.rs): Int64 is formatted exactly, no f64 widening.
-    assert_eq!(out, n.to_string(), "integer must format exactly (got {out})");
+    assert_eq!(
+        out,
+        n.to_string(),
+        "integer must format exactly (got {out})"
+    );
 }
 
 /// [2] text.rs:331 — text.repeat caps the repeat COUNT at

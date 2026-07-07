@@ -368,7 +368,10 @@ fn coerce_dynamic_to_datatype(d: Dynamic, dt: &DataType) -> Result<ScalarValue, 
         )
     };
     match dt {
-        DataType::Boolean => d.as_bool().map(|b| ScalarValue::Boolean(Some(b))).map_err(|_| type_err("bool")),
+        DataType::Boolean => d
+            .as_bool()
+            .map(|b| ScalarValue::Boolean(Some(b)))
+            .map_err(|_| type_err("bool")),
         DataType::Int64 => {
             if let Ok(i) = d.as_int() {
                 Ok(ScalarValue::Int64(Some(i)))
@@ -404,7 +407,8 @@ fn coerce_dynamic_to_datatype(d: Dynamic, dt: &DataType) -> Result<ScalarValue, 
             // return convention in `build_agg_signature`.
             Ok(s) => Ok(ScalarValue::LargeUtf8(Some(s))),
             Err(_) => {
-                let bytes = serde_json::to_string(&d).map_err(|e| FnError::new(0x13, e.to_string()))?;
+                let bytes =
+                    serde_json::to_string(&d).map_err(|e| FnError::new(0x13, e.to_string()))?;
                 Ok(ScalarValue::LargeUtf8(Some(bytes)))
             }
         },

@@ -42,10 +42,7 @@ fn tombstone_in_newer_buffer_is_ignored_by_probe() {
     // Empty current L0; pending_flush = [B1 (old), B2 (new)] — oldest
     // first, exactly how the probe iterates get_pending_flush().
     let current = Arc::new(RwLock::new(L0Buffer::new(2, None)));
-    let pending = vec![
-        Arc::new(RwLock::new(b1)),
-        Arc::new(RwLock::new(b2)),
-    ];
+    let pending = vec![Arc::new(RwLock::new(b1)), Arc::new(RwLock::new(b2))];
     let mgr = L0Manager::from_snapshot(current, pending);
 
     // tx_l0: the recreate of V (references V so the probe considers it).

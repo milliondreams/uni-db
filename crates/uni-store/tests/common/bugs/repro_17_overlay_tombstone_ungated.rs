@@ -43,7 +43,11 @@ async fn repro_pinned_read_deleted_by_beyond_pin_tombstone() {
     schema_manager.add_label("Person").unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
     let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
         .await
         .unwrap();

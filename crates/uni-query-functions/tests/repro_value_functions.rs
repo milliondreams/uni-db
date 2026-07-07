@@ -108,7 +108,11 @@ fn repro_finding_12_epoch_seconds_truncation_pre_1970() {
     let secs = eval_temporal_accessor_value(&dt, "epochseconds").unwrap();
     // FIXED (datetime.rs): floor division rounds toward negative infinity, so
     // -500_000_000 ns yields -1 second.
-    assert_eq!(secs, Value::Int(-1), "epochSeconds must floor, not truncate");
+    assert_eq!(
+        secs,
+        Value::Int(-1),
+        "epochSeconds must floor, not truncate"
+    );
 
     // epochMillis at -500_500_000 ns: floor => -501, truncation => -500.
     let dt2 = Value::Temporal(TemporalValue::DateTime {
@@ -118,7 +122,11 @@ fn repro_finding_12_epoch_seconds_truncation_pre_1970() {
     });
     let millis = eval_temporal_accessor_value(&dt2, "epochmillis").unwrap();
     // FIXED (datetime.rs): floor division yields -501 millis, not -500.
-    assert_eq!(millis, Value::Int(-501), "epochMillis must floor, not truncate");
+    assert_eq!(
+        millis,
+        Value::Int(-501),
+        "epochMillis must floor, not truncate"
+    );
 }
 
 /// Finding [14] similar_to.rs:378 — `value_to_sparse` converts map indices with
@@ -215,7 +223,10 @@ fn repro_finding_16_point_nonnumeric_z_silently_ignored() {
         "non-numeric z must error like non-numeric x/y"
     );
     assert!(
-        result.unwrap_err().to_string().contains("z must be a number"),
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("z must be a number"),
         "error should identify the bad z coordinate"
     );
 

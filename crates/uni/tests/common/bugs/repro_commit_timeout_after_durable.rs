@@ -80,7 +80,10 @@ async fn commit_timeout_after_durable_point() -> anyhow::Result<()> {
             .query(&format!("MATCH (r:Row {{i: {base}}}) RETURN count(r) AS c"))
             .await?;
         let c: i64 = res.rows()[0].get("c")?;
-        assert_eq!(c, 1, "attempt {attempt}: committed marker row must be visible");
+        assert_eq!(
+            c, 1,
+            "attempt {attempt}: committed marker row must be visible"
+        );
     }
 
     Ok(())

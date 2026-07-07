@@ -51,8 +51,7 @@ async fn sweeper_self_terminates_after_first_productive_tick() -> anyhow::Result
 
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    let after_first: Vec<String> =
-        db.list_forks().await.into_iter().map(|f| f.name).collect();
+    let after_first: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         !after_first.iter().any(|n| n == "ephemeral_1"),
         "sanity: the first expired fork should be swept; remaining = {after_first:?}"
@@ -73,12 +72,17 @@ async fn sweeper_self_terminates_after_first_productive_tick() -> anyhow::Result
 
     // The database is still fully queryable (Arc alive), proving this is a
     // silent loss of background processing, not a real shutdown.
-    let alive = db.session().query("MATCH (p:Person) RETURN count(p) AS c").await?;
+    let alive = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
     let c: i64 = alive.rows()[0].get("c")?;
-    assert_eq!(c, 1, "db must keep answering queries after the errant broadcast");
+    assert_eq!(
+        c, 1,
+        "db must keep answering queries after the errant broadcast"
+    );
 
-    let after_second: Vec<String> =
-        db.list_forks().await.into_iter().map(|f| f.name).collect();
+    let after_second: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
 
     // Fixed (fork_maintenance.rs:61): the sweeper no longer broadcasts shutdown
     // when dropping a fork, so it stays alive and sweeps 'ephemeral_2' too.

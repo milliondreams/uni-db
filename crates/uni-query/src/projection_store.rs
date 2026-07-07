@@ -166,7 +166,10 @@ impl ProjectionStore {
 ///
 /// The [`Weak`] lets dropped databases be pruned so a recycled heap
 /// address is never matched to a stale store.
-type ProjectionRegistryEntry = (Weak<uni_common::core::schema::SchemaManager>, Arc<ProjectionStore>);
+type ProjectionRegistryEntry = (
+    Weak<uni_common::core::schema::SchemaManager>,
+    Arc<ProjectionStore>,
+);
 
 /// Look up (or create) the [`ProjectionStore`] for the given
 /// `StorageManager`. Identifies the owning database by the backing

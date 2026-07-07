@@ -38,7 +38,8 @@ impl<K: Hash + Eq + Clone, V: Clone> LWWMap<K, V> {
         match self.map.get_mut(&key) {
             Some(register) => register.set(Some(value), timestamp),
             None => {
-                self.map.insert(key, LWWRegister::new(Some(value), timestamp));
+                self.map
+                    .insert(key, LWWRegister::new(Some(value), timestamp));
             }
         }
     }

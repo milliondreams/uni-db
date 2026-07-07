@@ -359,18 +359,18 @@ async fn create_fork_2pc(
     )
     .await
     {
-            Ok(ds) => ds,
-            Err(e) => {
-                // Recovery on next boot will roll back the Pending entry
-                // and force-delete any partial branches. We also try a
-                // best-effort rollback here so the state is clean if the
-                // process keeps running.
-                if let Err(rb) = registry.rollback_create(&name).await {
-                    tracing::warn!("rollback after partial create_branch failed: {rb}");
-                }
-                return Err(e);
+        Ok(ds) => ds,
+        Err(e) => {
+            // Recovery on next boot will roll back the Pending entry
+            // and force-delete any partial branches. We also try a
+            // best-effort rollback here so the state is clean if the
+            // process keeps running.
+            if let Err(rb) = registry.rollback_create(&name).await {
+                tracing::warn!("rollback after partial create_branch failed: {rb}");
             }
-        };
+            return Err(e);
+        }
+    };
 
     // Step 4: promote to Active with the full datasets map.
     let active = registry.finish_create(&name, datasets).await?;

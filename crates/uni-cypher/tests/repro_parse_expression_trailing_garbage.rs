@@ -55,5 +55,8 @@ fn garbage_suffix_is_an_error() {
 #[test]
 fn well_formed_expression_still_parses() {
     let res = parse_expression("  n.age > 18 AND n.active  ");
-    assert!(res.is_ok(), "a complete expression must still parse. got={res:?}");
+    assert!(
+        res.is_ok(),
+        "a complete expression must still parse. got={res:?}"
+    );
 }

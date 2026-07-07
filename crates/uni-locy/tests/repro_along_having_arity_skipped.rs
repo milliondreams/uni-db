@@ -6,10 +6,10 @@
 //! Net effect: a wrong-arity model call that IS rejected in YIELD is silently
 //! accepted in ALONG.
 
+use uni_cypher::parse_locy;
+use uni_locy::LocyConfig;
 use uni_locy::compile_with_config;
 use uni_locy::compiler::errors::LocyCompileError;
-use uni_locy::LocyConfig;
-use uni_cypher::parse_locy;
 
 // `scorer` has arity 1 (INPUT (s)). Both rules below invoke it with 2 args.
 const MODEL: &str = "CREATE MODEL scorer AS INPUT (s) OUTPUT SCORE sc \
@@ -20,9 +20,8 @@ fn model_arity_validated_in_yield_but_not_along() {
     let cfg = LocyConfig::default();
 
     // Control: wrong-arity call in YIELD → ModelArityMismatch (validated).
-    let yield_src = format!(
-        "{MODEL} CREATE RULE ry AS MATCH (a)-[:E]->(b) YIELD a, b, scorer(a, b) AS s"
-    );
+    let yield_src =
+        format!("{MODEL} CREATE RULE ry AS MATCH (a)-[:E]->(b) YIELD a, b, scorer(a, b) AS s");
     let yield_res = compile_with_config(&parse_locy(&yield_src).unwrap(), &cfg);
     assert!(
         matches!(yield_res, Err(LocyCompileError::ModelArityMismatch { .. })),

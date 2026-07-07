@@ -124,8 +124,11 @@ impl Algorithm for AStar {
 
         let mut visited_count = 0;
 
-        while let Some(HeapEntry { f_score: f_current, slot: u }) = heap.pop() {
-
+        while let Some(HeapEntry {
+            f_score: f_current,
+            slot: u,
+        }) = heap.pop()
+        {
             // If we reached the target, we are done (if heuristic is consistent/monotone).
             // A* with consistent heuristic guarantees optimal path first time target is popped.
             if u == target_slot {

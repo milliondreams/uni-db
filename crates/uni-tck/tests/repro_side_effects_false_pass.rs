@@ -56,7 +56,10 @@ async fn property_overwrite_falsely_passes_no_side_effects() {
 
     // ...but a genuine mutation occurred: the SET overwrote p=1 -> p=2.
     assert_eq!(e.properties_added, 1, "property overwrite adds a value");
-    assert_eq!(e.properties_removed, 1, "property overwrite removes a value");
+    assert_eq!(
+        e.properties_removed, 1,
+        "property overwrite removes a value"
+    );
 
     // CORRECT behavior (post-fix): `no side effects` now inspects the gross
     // counters and rejects the property overwrite.

@@ -793,7 +793,10 @@ fn float_eq_normalized_f32(a: f32, b: f32) -> bool {
 /// Length-checked, then per-element normalized comparison — the equality
 /// analogue of the normalized hashing done for `Vec<f32>` weights.
 fn slice_eq_normalized_f32(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| float_eq_normalized_f32(*x, *y))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| float_eq_normalized_f32(*x, *y))
 }
 
 impl PartialEq for Value {

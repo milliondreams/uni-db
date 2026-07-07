@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::scalar::ScalarValue;
@@ -42,7 +43,6 @@ use uni_plugin_custom::{
     CustomPlugin, DeclaredPlugin, DeclaredPluginStore, DeclaredScalarFn, NullPersistence,
     Persistence,
 };
-use arrow_schema::DataType;
 
 // --------------------------------------------------------------------
 // shared helpers
@@ -103,8 +103,10 @@ fn scalar_float_out(f: &dyn ScalarPluginFn, args: &[ColumnarValue], rows: usize)
 fn scalar_fn(body: &str, args: &[(&str, DataType)], ret: DataType) -> DeclaredScalarFn {
     let expr = parse_expression(body).expect("parse body");
     let arg_names: Vec<String> = args.iter().map(|(n, _)| (*n).to_owned()).collect();
-    let sig_args: Vec<(String, DataType)> =
-        args.iter().map(|(n, t)| ((*n).to_owned(), t.clone())).collect();
+    let sig_args: Vec<(String, DataType)> = args
+        .iter()
+        .map(|(n, t)| ((*n).to_owned(), t.clone()))
+        .collect();
     let sig = DeclaredScalarFn::build_signature(ret, &sig_args);
     DeclaredScalarFn::new(expr, arg_names, sig)
 }
@@ -141,12 +143,10 @@ async fn repro1_redeclare_misclassified_as_native_shadow() {
     );
 
     // 1) First declaration of repro1.f as `$x + 1`.
-    let reg1 = drive_flag(
-        declare.invoke(
-            ProcedureContext::new(),
-            &utf8_args(&["repro1.f", "$x + 1", "int", r#"["x"]"#]),
-        ),
-    )
+    let reg1 = drive_flag(declare.invoke(
+        ProcedureContext::new(),
+        &utf8_args(&["repro1.f", "$x + 1", "int", r#"["x"]"#]),
+    ))
     .await;
     assert!(reg1, "first declaration should register");
 
@@ -160,18 +160,19 @@ async fn repro1_redeclare_misclassified_as_native_shadow() {
 
     // 2) Re-declare the SAME qname with a NEW body `$x + 2`. This is a
     // supported store op ("replace an existing declaration").
-    let reg2 = drive_flag(
-        declare.invoke(
-            ProcedureContext::new(),
-            &utf8_args(&["repro1.f", "$x + 2", "int", r#"["x"]"#]),
-        ),
-    )
+    let reg2 = drive_flag(declare.invoke(
+        ProcedureContext::new(),
+        &utf8_args(&["repro1.f", "$x + 2", "int", r#"["x"]"#]),
+    ))
     .await;
 
     // FIXED (lib.rs/decode.rs): re-declaring your OWN qname first drops the prior
     // entry, so re-registration succeeds instead of tripping DuplicateRegistration
     // → NativeShadow.
-    assert!(reg2, "re-declaration of an owned qname must succeed (registered=true)");
+    assert!(
+        reg2,
+        "re-declaration of an owned qname must succeed (registered=true)"
+    );
 
     // 3) The registry now executes the NEW body: f(1) == 3.
     let out2 = scalar_int_out(
@@ -179,7 +180,11 @@ async fn repro1_redeclare_misclassified_as_native_shadow() {
         &[ColumnarValue::Scalar(ScalarValue::Int64(Some(1)))],
         1,
     );
-    assert_eq!(out2, Some(3), "the new body $x + 2 must be live after re-declare");
+    assert_eq!(
+        out2,
+        Some(3),
+        "the new body $x + 2 must be live after re-declare"
+    );
 
     // The store holds the new body and it is active.
     let record = custom.store().get("repro1.f").expect("record present");
@@ -189,10 +194,7 @@ async fn repro1_redeclare_misclassified_as_native_shadow() {
 
 /// Look the registered synthetic scalar up and hand back a boxed
 /// `ScalarPluginFn` so the caller can invoke it directly.
-fn downcast_scalar(
-    registry: &Arc<PluginRegistry>,
-    qn: &QName,
-) -> Arc<dyn ScalarPluginFn> {
+fn downcast_scalar(registry: &Arc<PluginRegistry>, qn: &QName) -> Arc<dyn ScalarPluginFn> {
     registry
         .scalar_fn(qn)
         .expect("scalar registered")
@@ -249,19 +251,17 @@ async fn repro3_drop_leaks_aggregate_hint() {
         Arc::clone(&registry),
     );
     // qname unique to avoid collision with the process-global hint set.
-    let registered = drive_flag(
-        declare.invoke(
-            ProcedureContext::new(),
-            &utf8_args(&[
-                "repro3agg.myagg",
-                "0",
-                "$state + $x",
-                "$state",
-                "int",
-                r#"["x"]"#,
-            ]),
-        ),
-    )
+    let registered = drive_flag(declare.invoke(
+        ProcedureContext::new(),
+        &utf8_args(&[
+            "repro3agg.myagg",
+            "0",
+            "$state + $x",
+            "$state",
+            "int",
+            r#"["x"]"#,
+        ]),
+    ))
     .await;
     assert!(registered, "aggregate registered");
     assert!(
@@ -275,10 +275,8 @@ async fn repro3_drop_leaks_aggregate_hint() {
         Arc::clone(&persistence),
         Arc::clone(&registry),
     );
-    let removed = drive_flag(
-        drop.invoke(ProcedureContext::new(), &utf8_args(&["repro3agg.myagg"])),
-    )
-    .await;
+    let removed =
+        drive_flag(drop.invoke(ProcedureContext::new(), &utf8_args(&["repro3agg.myagg"]))).await;
     assert!(removed, "dropDeclared reports removed=true");
     assert!(store.get("repro3agg.myagg").is_none(), "store dropped it");
 
@@ -558,8 +556,7 @@ fn repro8_concurrent_declare_never_persists_cycle() {
         // No a <-> b cycle may be persisted under any interleaving.
         let a_deps = store.get("a").map(|p| p.dependencies).unwrap_or_default();
         let b_deps = store.get("b").map(|p| p.dependencies).unwrap_or_default();
-        let cycle_persisted =
-            a_deps == vec!["b".to_owned()] && b_deps == vec!["a".to_owned()];
+        let cycle_persisted = a_deps == vec!["b".to_owned()] && b_deps == vec!["a".to_owned()];
         assert!(
             !cycle_persisted,
             "declare() must never persist an a<->b dependency cycle"

@@ -22,9 +22,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::optimizer::{Optimizer, OptimizerContext};
 use datafusion::prelude::SessionContext;
-use uni_plugin::traits::pushdown::{
-    SortExpr, SupportsTopNPushdown, TopNApplication, TopNScope,
-};
+use uni_plugin::traits::pushdown::{SortExpr, SupportsTopNPushdown, TopNApplication, TopNScope};
 use uni_plugin_builtin::optimizer::pushdown_negotiation::{
     PushdownAwareTable, PushdownMarkers, PushdownNegotiationRule,
 };
@@ -67,7 +65,9 @@ fn build_table() -> Arc<PushdownAwareTable> {
 }
 
 /// Apply ONLY the pushdown-negotiation rule to an unoptimized plan.
-fn apply_rule(plan: datafusion::logical_expr::LogicalPlan) -> datafusion::logical_expr::LogicalPlan {
+fn apply_rule(
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> datafusion::logical_expr::LogicalPlan {
     let optimizer = Optimizer::with_rules(vec![Arc::new(PushdownNegotiationRule)]);
     let config = OptimizerContext::new();
     optimizer.optimize(plan, &config, |_, _| {}).unwrap()

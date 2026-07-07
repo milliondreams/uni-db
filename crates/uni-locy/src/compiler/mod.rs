@@ -165,8 +165,13 @@ fn compile_with_context(
     )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
-    let (compiled_rules, mut warnings) =
-        typecheck::check(&rule_groups, &strat, &model_catalog, &module_ctx, is_monotonic)?;
+    let (compiled_rules, mut warnings) = typecheck::check(
+        &rule_groups,
+        &strat,
+        &model_catalog,
+        &module_ctx,
+        is_monotonic,
+    )?;
     // Carry model-compilation warnings (e.g. G1-lite UncalibratedLLMLogprobs)
     // into the final program. Append after typecheck so source order is
     // preserved for `models -> rules` warning streams.

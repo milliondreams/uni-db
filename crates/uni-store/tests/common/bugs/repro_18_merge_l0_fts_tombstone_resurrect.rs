@@ -40,13 +40,19 @@ async fn repro_fts_search_resurrects_tombstoned_l0_vertex() {
     schema_manager.add_label("Person").unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
 
     let vid = Vid::new(1);
 
     // Earlier buffer: V is live with a Person label + matching text.
     let mut earlier = L0Buffer::new(0, None);
-    earlier.vertex_labels.insert(vid, vec!["Person".to_string()]);
+    earlier
+        .vertex_labels
+        .insert(vid, vec!["Person".to_string()]);
     let mut props = HashMap::new();
     props.insert("bio".to_string(), Value::String("hello world".to_string()));
     earlier.vertex_properties.insert(vid, props);

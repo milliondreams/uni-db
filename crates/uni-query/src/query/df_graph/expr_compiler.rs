@@ -903,9 +903,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 prop_name.as_ref().and_then(|prop| {
                     self.uni_schema
                         .as_ref()
-                        .and_then(|schema| {
-                            resolve_metric_for_property(schema, source_label, prop)
-                        })
+                        .and_then(|schema| resolve_metric_for_property(schema, source_label, prop))
                 })
             })
             .collect();

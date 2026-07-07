@@ -58,5 +58,8 @@ async fn repro_transient_get_failure_wipes_named_snapshots() {
         map.contains_key("prod") && map.contains_key("staging"),
         "prod & staging must survive the failed save"
     );
-    assert!(!map.contains_key("qa"), "the failed save must not persist qa");
+    assert!(
+        !map.contains_key("qa"),
+        "the failed save must not persist qa"
+    );
 }

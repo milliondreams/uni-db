@@ -37,7 +37,10 @@ fn duplicate_registration_creates_two_records_and_double_fires() {
     std::thread::sleep(Duration::from_millis(5));
     let due = s.tick();
     let dup_fires = due.iter().filter(|q| **q == id).count();
-    assert_eq!(dup_fires, 1, "the job must fire once per interval, not twice");
+    assert_eq!(
+        dup_fires, 1,
+        "the job must fire once per interval, not twice"
+    );
 }
 
 #[test]

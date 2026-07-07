@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use uni_algo::algo::GraphProjection;
 use uni_algo::algo::algorithms::{
     AStar, AStarConfig, Algorithm, AllPairsShortestPath, AllPairsShortestPathConfig, Betweenness,
-    BetweennessConfig, BidirectionalDijkstra, BidirectionalDijkstraConfig, Dijkstra, DijkstraConfig,
-    ElementaryCircuits, ElementaryCircuitsConfig, KCore, KCoreConfig, MinimumSpanningTree,
-    MstConfig,
+    BetweennessConfig, BidirectionalDijkstra, BidirectionalDijkstraConfig, Dijkstra,
+    DijkstraConfig, ElementaryCircuits, ElementaryCircuitsConfig, KCore, KCoreConfig,
+    MinimumSpanningTree, MstConfig,
 };
 use uni_common::Value;
 use uni_common::core::id::Vid;
@@ -144,7 +144,11 @@ fn repro_mst_drops_high_to_low_directed_edge() {
     // FIXED: edges are now normalized to (min, max) instead of dropping the
     // higher->lower direction, so the only edge is retained (fix for
     // crates/uni-algo/src/algo/algorithms/mst.rs).
-    assert_eq!(result.edges.len(), 1, "the single connecting edge must be kept");
+    assert_eq!(
+        result.edges.len(),
+        1,
+        "the single connecting edge must be kept"
+    );
     assert_eq!(result.total_weight, 5.0, "MST total weight must be 5.0");
 }
 
@@ -156,12 +160,7 @@ fn repro_astar_negative_heuristic_suboptimal() {
     // 0->1(1), 1->3(1): optimal path cost 2 via node 1.
     // 0->2(1), 2->3(5): worse path cost 6 via node 2.
     let nodes = [0u64, 1, 2, 3];
-    let edges = [
-        (0u64, 1u64, 1.0),
-        (1, 3, 1.0),
-        (0, 2, 1.0),
-        (2, 3, 5.0),
-    ];
+    let edges = [(0u64, 1u64, 1.0), (1, 3, 1.0), (0, 2, 1.0), (2, 3, 5.0)];
     let graph = build_projection(&nodes, &edges, true, false);
 
     let mut heuristic = HashMap::new();
@@ -214,7 +213,11 @@ fn repro_dijkstra_max_distance_returns_over_budget_node() {
         "over-budget node 1 (dist 3.0 > max 2.0) must be excluded"
     );
     // The source itself (distance 0.0 <= 2.0) is still reported.
-    assert_eq!(dist.get(&Vid::from(0)), Some(&0.0), "source must remain in output");
+    assert_eq!(
+        dist.get(&Vid::from(0)),
+        Some(&0.0),
+        "source must remain in output"
+    );
 }
 
 /// [6] elementary_circuits.rs:153 — depth truncation leaves a node
@@ -253,7 +256,11 @@ fn repro_elementary_circuits_depth_truncation_blocks_shorter_cycle() {
         "the in-budget cycle 0->2->3->0 must be found"
     );
     let cycle_slots: Vec<u64> = result.cycles[0].iter().map(|v| v.as_u64()).collect();
-    assert_eq!(cycle_slots, vec![0, 2, 3], "the found cycle must be [0, 2, 3]");
+    assert_eq!(
+        cycle_slots,
+        vec![0, 2, 3],
+        "the found cycle must be [0, 2, 3]"
+    );
 }
 
 /// [7] apsp.rs:51 — the weighted branch filters `dist > 0.0`, dropping a
@@ -296,12 +303,7 @@ fn repro_betweenness_sampling_missing_rescale() {
     // single-source contribution to the total is identical, so summing
     // any k sources yields exactly (k/n) of the exact total.
     let nodes = [0u64, 1, 2, 3];
-    let edges = [
-        (0u64, 1u64, 1.0),
-        (1, 2, 1.0),
-        (2, 3, 1.0),
-        (3, 0, 1.0),
-    ];
+    let edges = [(0u64, 1u64, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 0, 1.0)];
     let graph = build_projection(&nodes, &edges, false, false);
 
     let exact = Betweenness::run(

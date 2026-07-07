@@ -15,11 +15,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
-use uni_plugin::traits::cdc::{
-    CdcBatch, CdcLsn, CdcOutputProvider, CdcStartContext, CdcStream,
-};
-use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar, PluginRegistry};
 use uni_plugin::errors::FnError;
+use uni_plugin::traits::cdc::{CdcBatch, CdcLsn, CdcOutputProvider, CdcStartContext, CdcStream};
+use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar, PluginRegistry};
 
 use uni_plugin_host::cdc_runtime::CdcRuntime;
 use uni_plugin_host::notifications::CommitNotification;

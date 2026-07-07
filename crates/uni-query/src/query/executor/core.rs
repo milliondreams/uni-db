@@ -35,11 +35,20 @@ pub(crate) enum Accumulator {
     },
     Min(Option<Value>),
     Max(Option<Value>),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Collect(Vec<Value>),
     CountDistinct(HashSet<Value>),
-    PercentileDisc { values: Vec<f64>, percentile: f64 },
-    PercentileCont { values: Vec<f64>, percentile: f64 },
+    PercentileDisc {
+        values: Vec<f64>,
+        percentile: f64,
+    },
+    PercentileCont {
+        values: Vec<f64>,
+        percentile: f64,
+    },
 }
 
 /// Convert f64 to Value, preserving integer representation when possible.
@@ -1082,8 +1091,16 @@ mod tests {
             min_acc.update(v, false);
             max_acc.update(v, false);
         }
-        assert_eq!(min_acc.finish(), y2010, "MIN over dates must return the earliest");
-        assert_eq!(max_acc.finish(), y2030, "MAX over dates must return the latest");
+        assert_eq!(
+            min_acc.finish(),
+            y2010,
+            "MIN over dates must return the earliest"
+        );
+        assert_eq!(
+            max_acc.finish(),
+            y2030,
+            "MAX over dates must return the latest"
+        );
     }
 
     #[test]

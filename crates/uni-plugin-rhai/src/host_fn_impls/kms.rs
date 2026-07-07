@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn hex_round_trips() {
-        assert_eq!(from_hex(&to_hex(&[0x00, 0xAB, 0xff])).unwrap(), vec![0, 0xAB, 0xFF]);
+        assert_eq!(
+            from_hex(&to_hex(&[0x00, 0xAB, 0xff])).unwrap(),
+            vec![0, 0xAB, 0xFF]
+        );
     }
 
     #[test]

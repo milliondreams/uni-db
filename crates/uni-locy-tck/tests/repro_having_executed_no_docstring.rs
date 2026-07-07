@@ -96,7 +96,9 @@ fn run_scenario(feature_path: std::path::PathBuf, scenario_name: &'static str) -
             .with_writer(cucumber_writer)
             .with_default_cli()
             .max_concurrent_scenarios(Some(1))
-            .filter_run(feature_path, move |_feat, _rule, sc| sc.name == scenario_name)
+            .filter_run(feature_path, move |_feat, _rule, sc| {
+                sc.name == scenario_name
+            })
             .await;
 
         w.execution_has_failed()

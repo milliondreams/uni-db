@@ -1049,11 +1049,8 @@ where
                         // untouched and record the conflict; only Overwrite
                         // proceeds with the delete. Mirrors the divergence check
                         // in the upsert path above.
-                        let primary_diverged =
-                            base_ext.get(&eid).is_some_and(|b| *b != pprops);
-                        if primary_diverged
-                            && options.on_conflict != ConflictPolicy::Overwrite
-                        {
+                        let primary_diverged = base_ext.get(&eid).is_some_and(|b| *b != pprops);
+                        if primary_diverged && options.on_conflict != ConflictPolicy::Overwrite {
                             report.vertices_conflicting += 1;
                             continue;
                         }

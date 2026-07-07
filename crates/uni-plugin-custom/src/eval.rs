@@ -235,9 +235,9 @@ fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
             }
             _ => unreachable!("arith dispatched non-arith op"),
         };
-        return res.map(Value::Int).ok_or_else(|| {
-            EvalError::Arithmetic(format!("integer overflow in {op}"))
-        });
+        return res
+            .map(Value::Int)
+            .ok_or_else(|| EvalError::Arithmetic(format!("integer overflow in {op}")));
     }
 
     let (lf, rf, both_int) = match (&l, &r) {

@@ -742,7 +742,9 @@ fn topk_dnf_disjunction(
 
     // Combine the DNF probability with the independent unsupported rows by
     // noisy-OR (they are independent events): 1 - (1 - dnf) · ∏ (1 - weight).
-    Ok(Some((1.0 - (1.0 - dnf_prob) * indep_complement).clamp(0.0, 1.0)))
+    Ok(Some(
+        (1.0 - (1.0 - dnf_prob) * indep_complement).clamp(0.0, 1.0),
+    ))
 }
 
 // ---------------------------------------------------------------------------

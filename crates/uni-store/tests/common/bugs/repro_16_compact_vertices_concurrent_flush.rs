@@ -66,7 +66,11 @@ async fn repro_compact_vertices_drops_concurrently_flushed_vertex() {
     schema_manager.add_label("Person").unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
     let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await

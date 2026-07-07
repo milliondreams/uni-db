@@ -47,7 +47,11 @@ async fn repro_persist_failure_leaves_advance_and_reuses_vid() {
         .allocate_vid()
         .await
         .expect("retry re-attempts the durable reservation and succeeds");
-    assert_eq!(reserved, Vid::new(0), "retry hands out Vid(0), now durably reserved");
+    assert_eq!(
+        reserved,
+        Vid::new(0),
+        "retry hands out Vid(0), now durably reserved"
+    );
 
     // Reload from the REAL store: the batch [0,100) was durably reserved, so a
     // fresh allocator restarts at next_vid_batch (100) — Vid(0) is never reused.

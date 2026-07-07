@@ -4923,11 +4923,9 @@ impl HybridPhysicalPlanner {
                             _ => None,
                         };
                         match id_col {
-                            Some(suffix) => {
-                                count(DfExpr::Column(datafusion::common::Column::from_name(
-                                    format!("{var}.{suffix}"),
-                                )))
-                            }
+                            Some(suffix) => count(DfExpr::Column(
+                                datafusion::common::Column::from_name(format!("{var}.{suffix}")),
+                            )),
                             None => count(get_arg()?),
                         }
                     } else {

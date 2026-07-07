@@ -11,9 +11,9 @@
 // of the never-committed transaction. This contradicts the module's own
 // invariant that pre-commit work must not observe a tx that later aborts.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashMap;
 
 use uni_common::{Value, Vid};
 use uni_store::runtime::l0::L0Buffer;

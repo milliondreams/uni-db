@@ -129,8 +129,10 @@ pub fn check(
                     // The SCC set holds module-qualified names; the IS-ref name is
                     // raw, so qualify it first or self-recursion detection breaks
                     // inside a MODULE (e.g. "r" vs "foo.r").
-                    let qualified =
-                        super::modules::resolve_rule_name(module_ctx, &is_ref.rule_name.to_string());
+                    let qualified = super::modules::resolve_rule_name(
+                        module_ctx,
+                        &is_ref.rule_name.to_string(),
+                    );
                     scc_rules.contains(&qualified)
                 } else {
                     false

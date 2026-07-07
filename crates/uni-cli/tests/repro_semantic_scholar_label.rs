@@ -24,7 +24,10 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    p.push(format!("uni_cli_repro_{tag}_{}_{nanos}", std::process::id()));
+    p.push(format!(
+        "uni_cli_repro_{tag}_{}_{nanos}",
+        std::process::id()
+    ));
     p
 }
 

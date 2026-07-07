@@ -21,7 +21,10 @@ fn isotonic_tied_predictions_return_lowest_block_not_pooled_mean() {
 
     // FIXED (calibration.rs): PAV now pools equal-x blocks, so all four tied
     // points map to the single pooled mean 0.5, and there is no jump just above.
-    assert_eq!(at, 0.5, "tied-x apply must return the pooled mean 0.5, got {at}");
+    assert_eq!(
+        at, 0.5,
+        "tied-x apply must return the pooled mean 0.5, got {at}"
+    );
     assert_eq!(
         just_above, 0.5,
         "just above the tie must also be 0.5 (no phantom jump), got {just_above}"

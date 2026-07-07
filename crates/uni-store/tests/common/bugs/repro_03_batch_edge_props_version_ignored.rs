@@ -48,14 +48,22 @@ async fn repro_batch_edge_props_resurrects_deleted_edge() {
     );
     schema_manager.add_label("Person").unwrap();
     schema_manager
-        .add_edge_type("KNOWS", vec!["Person".to_string()], vec!["Person".to_string()])
+        .add_edge_type(
+            "KNOWS",
+            vec!["Person".to_string()],
+            vec!["Person".to_string()],
+        )
         .unwrap();
     schema_manager
         .add_property("KNOWS", "weight", DataType::Int64, true)
         .unwrap();
     schema_manager.save().await.unwrap();
 
-    let storage = Arc::new(StorageManager::new(&path, schema_manager.clone()).await.unwrap());
+    let storage = Arc::new(
+        StorageManager::new(&path, schema_manager.clone())
+            .await
+            .unwrap(),
+    );
 
     let src = Vid::new(1);
     let dst = Vid::new(2);

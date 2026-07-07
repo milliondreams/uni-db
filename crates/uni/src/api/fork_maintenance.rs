@@ -189,9 +189,10 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                 continue;
             }
             // Skip only when a fork-local index of the SAME kind already
-            // exists: a column can carry e.g. both a scalar and a vector
-            // index, and `fork_local_index` is keyed by `(label, column)`.
-            if scope.fork_local_index(label, column) == Some(*kind) {
+            // exists: a column can carry e.g. both a scalar and a
+            // full-text index, so `fork_local_indexes` holds a set of
+            // kinds per `(label, column)` and we probe for this one.
+            if scope.has_fork_local_index(label, column, *kind) {
                 continue;
             }
             match uni_store::fork::index_builder::build_fork_local_index(

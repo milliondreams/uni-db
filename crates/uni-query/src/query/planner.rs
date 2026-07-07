@@ -1845,8 +1845,8 @@ pub enum LogicalPlan {
     },
     /// Phase 5a-impl: fused scan over both primary's index and the
     /// forked session's fork-local index. Emitted by the planner only
-    /// when (a) the session is forked AND (b) `StorageManager::fork_index_exists`
-    /// returns `Some(_)` for the target column. Otherwise the planner
+    /// when (a) the session is forked AND (b) `StorageManager::has_fork_index`
+    /// returns `true` for the target column and fusion kind. Otherwise the planner
     /// keeps emitting `Scan` and Lance's `base_paths` chain transparently
     /// covers parent-inherited indexes.
     ///
@@ -6283,8 +6283,11 @@ impl QueryPlanner {
                 } else {
                     current_predicate = Expr::TRUE;
                 }
-            } else if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::TraverseTarget)
-            {
+            } else if Self::rewrite_target_reachable(
+                &plan,
+                &var.name,
+                RewriteTarget::TraverseTarget,
+            ) {
                 // Push to Traverse (same reachability discipline).
                 let (pushable, residual) =
                     Self::extract_variable_predicates(&current_predicate, &var.name);
@@ -7703,11 +7706,7 @@ impl QueryPlanner {
     /// actually rebuilds — so an unreachable predicate stays in the residual and
     /// becomes a correct (if unoptimized) `Filter`. Keep the descent arms here in
     /// lockstep with the matching rewriter.
-    fn rewrite_target_reachable(
-        plan: &LogicalPlan,
-        variable: &str,
-        target: RewriteTarget,
-    ) -> bool {
+    fn rewrite_target_reachable(plan: &LogicalPlan, variable: &str, target: RewriteTarget) -> bool {
         // Base-node match (the node the rewriter actually rewrites).
         match plan {
             LogicalPlan::Scan { variable: var, .. } if var == variable => {
@@ -10059,44 +10058,55 @@ fn analyze_function_property_requirements(
 /// callers don't need to depend on the fork module directly; tests
 /// can mock by implementing it on a `HashMap`.
 pub trait ForkIndexLookup {
-    fn fork_index_for(
+    /// Whether a fork-local index of `kind` exists for `(label,
+    /// column)`. A column can carry several kinds at once (e.g. a
+    /// `ScalarBtree` for equality plus a `FullText` for search), so
+    /// each fusion site probes for the exact kind it intends to emit
+    /// rather than reading a single stored value.
+    fn fork_index_has(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind>;
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool;
 
     /// Phase 5b followup: resolve a label id, then dispatch to
-    /// `fork_index_for`. Used by the rewrite when wrapping
+    /// `fork_index_has`. Used by the rewrite when wrapping
     /// `VectorKnn` and `InvertedIndexLookup` nodes which carry
     /// `label_id: u16` rather than the label name. Default returns
-    /// `None`; the `StorageManager` impl resolves via its
+    /// `false`; the `StorageManager` impl resolves via its
     /// `schema_manager`.
-    fn fork_index_for_label_id(
+    fn fork_index_has_label_id(
         &self,
         _label_id: u16,
         _column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
-        None
+        _kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
+        false
     }
 }
 
 impl ForkIndexLookup for uni_store::storage::StorageManager {
-    fn fork_index_for(
+    fn fork_index_has(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
-        self.fork_index_exists(label, column)
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
+        self.has_fork_index(label, column, kind)
     }
 
-    fn fork_index_for_label_id(
+    fn fork_index_has_label_id(
         &self,
         label_id: u16,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
         let schema = self.schema_manager().schema();
-        let label_name = schema.label_name_by_id(label_id)?;
-        self.fork_index_exists(label_name, column)
+        match schema.label_name_by_id(label_id) {
+            Some(label_name) => self.has_fork_index(label_name, column, kind),
+            None => false,
+        }
     }
 }
 
@@ -10375,9 +10385,20 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                 && let Some(col) = filter
                     .as_ref()
                     .and_then(|f| equality_target_column(f, &variable))
-                && let Some(idx_kind) = lookup.fork_index_for(&labels[0], &col)
             {
-                into_fusion_kind(idx_kind)
+                // Equality-scan fusion only applies to the scalar-equality
+                // kinds (uid-equality first, then btree). A column can carry
+                // several fork-local index kinds (e.g. `ScalarBtree` +
+                // `FullText`), so probe for the equality-appropriate one in a
+                // deterministic order rather than reading whichever value
+                // happened to be stored.
+                [
+                    uni_store::fork::ForkLocalIndexKind::VidUid,
+                    uni_store::fork::ForkLocalIndexKind::ScalarBtree,
+                ]
+                .into_iter()
+                .find(|k| lookup.fork_index_has(&labels[0], &col, *k))
+                .and_then(into_fusion_kind)
             } else {
                 None
             };
@@ -10438,8 +10459,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             k,
             threshold,
         } => {
-            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
-                && let Some(kind) = into_fusion_kind(idx_kind)
+            if lookup.fork_index_has_label_id(
+                label_id,
+                &property,
+                uni_store::fork::ForkLocalIndexKind::Vector,
+            ) && let Some(kind) = into_fusion_kind(uni_store::fork::ForkLocalIndexKind::Vector)
             {
                 LogicalPlan::FusedIndexScanWrapped {
                     inner: Box::new(LogicalPlan::VectorKnn {
@@ -10469,8 +10493,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             property,
             terms,
         } => {
-            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
-                && let Some(kind) = into_fusion_kind(idx_kind)
+            if lookup.fork_index_has_label_id(
+                label_id,
+                &property,
+                uni_store::fork::ForkLocalIndexKind::FullText,
+            ) && let Some(kind) = into_fusion_kind(uni_store::fork::ForkLocalIndexKind::FullText)
             {
                 LogicalPlan::FusedIndexScanWrapped {
                     inner: Box::new(LogicalPlan::InvertedIndexLookup {
@@ -10531,8 +10558,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                     [single_sort],
                 ) if labels.len() == 1
                     && let Some(col) = column_of_scan_variable(&single_sort.expr, &variable)
-                    && let Some(uni_store::fork::ForkLocalIndexKind::Sorted) =
-                        lookup.fork_index_for(&labels[0], &col) =>
+                    && lookup.fork_index_has(
+                        &labels[0],
+                        &col,
+                        uni_store::fork::ForkLocalIndexKind::Sorted,
+                    ) =>
                 {
                     LogicalPlan::FusedIndexScan {
                         label_id,
@@ -10618,11 +10648,10 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
         "uni.sparse.query" => uni_store::fork::ForkLocalIndexKind::Sparse,
         _ => return None,
     };
-    let registered = lookup.fork_index_for(label, column)?;
-    if registered != expected {
+    if !lookup.fork_index_has(label, column, expected) {
         return None;
     }
-    into_fusion_kind(registered)
+    into_fusion_kind(expected)
 }
 
 /// Map a fork-local index kind to its planner-side fusion variant.

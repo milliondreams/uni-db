@@ -598,25 +598,28 @@ impl StorageManager {
         self.fork_scope.as_ref()
     }
 
-    /// Phase 5a: query whether a fork-local index exists for the
-    /// `(label, column)` pair on the active fork scope. Returns
-    /// `None` outside a fork or when no fork-local build has
-    /// completed for that pair.
+    /// Phase 5a: query whether a fork-local index of `kind` exists
+    /// for the `(label, column)` pair on the active fork scope.
+    /// Returns `false` outside a fork or when no fork-local build of
+    /// that kind has completed for the pair.
     ///
-    /// The planner consults this to decide whether to emit
-    /// `FusedIndexScan` (returns `Some`) or fall back to the
-    /// inherited primary index via `base_paths` (returns `None`).
-    /// The lookup is a `DashMap::get` on `ForkScope` — O(1) and
-    /// safe to call per query without caching above this layer.
+    /// The planner consults this to decide whether to emit a specific
+    /// `FusedIndexScan` (returns `true`) or fall back to the inherited
+    /// primary index via `base_paths` (returns `false`). A column can
+    /// carry several kinds at once, so callers ask for the exact kind
+    /// they intend to fuse. The lookup is a `DashMap::get` on
+    /// `ForkScope` — O(1) and safe to call per query without caching
+    /// above this layer.
     #[must_use]
-    pub fn fork_index_exists(
+    pub fn has_fork_index(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<crate::fork::ForkLocalIndexKind> {
+        kind: crate::fork::ForkLocalIndexKind,
+    ) -> bool {
         self.fork_scope
             .as_ref()
-            .and_then(|s| s.fork_local_index(label, column))
+            .is_some_and(|s| s.has_fork_local_index(label, column, kind))
     }
 
     /// Base URI for this storage manager (the directory or remote

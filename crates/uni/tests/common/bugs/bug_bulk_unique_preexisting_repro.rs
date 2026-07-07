@@ -39,13 +39,11 @@ async fn setup_db_with_unique_email() -> Result<(Uni, tempfile::TempDir)> {
 }
 
 /// A pre-existing committed `User {email:'a@x.com'}` (flushed to storage) must
-/// be seen by the bulk UNIQUE check, which now probes committed storage.
+/// be seen by the bulk UNIQUE check, which probes committed storage.
 ///
-/// NOTE: the row is flushed to Lance below. A committed-but-still-in-L0 row on
-/// the main write channel remains invisible to the bulk path — the bulk writer
-/// holds a StorageManager (Lance) but not the main Writer's L0/constraint index.
-/// Closing that cross-channel window is the larger "unified constraint surface"
-/// refactor the triage flags (R5); this fix closes the storage-visibility gap.
+/// This is the storage-visibility half (R5). Its sibling
+/// `bulk_unique_ignores_preexisting_unflushed_l0_row` covers the cross-channel
+/// window (unflushed L0) that D6 closed via the shared full-horizon lookup.
 #[tokio::test]
 async fn bulk_unique_ignores_preexisting_committed_row() -> Result<()> {
     let (db, _temp) = setup_db_with_unique_email().await?;
@@ -62,7 +60,11 @@ async fn bulk_unique_ignores_preexisting_committed_row() -> Result<()> {
         .session()
         .query("MATCH (u:User {email: 'a@x.com'}) RETURN count(u) AS c")
         .await?;
-    assert_eq!(pre.rows()[0].get::<i64>("c")?, 1, "setup should have 1 User");
+    assert_eq!(
+        pre.rows()[0].get::<i64>("c")?,
+        1,
+        "setup should have 1 User"
+    );
 
     // 2) Fresh BulkWriter (default validate_constraints = true) inserts the
     //    SAME email. A correct impl would reject this as a UNIQUE violation.
@@ -89,6 +91,64 @@ async fn bulk_unique_ignores_preexisting_committed_row() -> Result<()> {
     assert_eq!(
         cnt, 1,
         "bulk.rs — UNIQUE must be enforced against committed rows (expected 1 User), got {cnt}"
+    );
+    Ok(())
+}
+
+/// D6: a committed-but-**unflushed** `User {email:'a@x.com'}` (still in the main
+/// Writer's L0, never flushed to Lance) must also be seen by the bulk UNIQUE
+/// check. This is the cross-channel window the storage-only probe (R5) missed:
+/// the bulk path now delegates to `Writer::unique_key_exists_full_horizon`,
+/// which consults the main channel's L0 + pending-flush buffers + storage.
+///
+/// Identical to `bulk_unique_ignores_preexisting_committed_row` except it does
+/// NOT call `db.flush()`, so the committed row stays in L0. Failed before D6.
+#[tokio::test]
+async fn bulk_unique_ignores_preexisting_unflushed_l0_row() -> Result<()> {
+    let (db, _temp) = setup_db_with_unique_email().await?;
+
+    // 1) Insert + COMMIT a User via the regular write path. Deliberately do NOT
+    //    flush — the row lives in the main Writer's current L0, invisible to a
+    //    storage-only (Lance count_rows) probe.
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {email: 'a@x.com'})").await?;
+    tx.commit().await?;
+    // (no db.flush() — this is the whole point of the D6 variant)
+
+    // Sanity: exactly one User exists (read consults L0).
+    let pre = db
+        .session()
+        .query("MATCH (u:User {email: 'a@x.com'}) RETURN count(u) AS c")
+        .await?;
+    assert_eq!(
+        pre.rows()[0].get::<i64>("c")?,
+        1,
+        "setup should have 1 User"
+    );
+
+    // 2) Fresh BulkWriter inserts the SAME email while the committed row is only
+    //    in L0. The full-horizon check must reject it as a UNIQUE violation.
+    let tx2 = db.session().tx().await?;
+    let mut bulk = tx2.bulk_writer().build()?;
+    let mut props: HashMap<String, Value> = HashMap::new();
+    props.insert("email".to_string(), Value::String("a@x.com".to_string()));
+
+    let insert_res = bulk.insert_vertices("User", vec![props]).await;
+    assert!(
+        insert_res.is_err(),
+        "bulk insert_vertices must reject a UNIQUE key committed but unflushed (in L0); got {insert_res:?}"
+    );
+    drop(tx2);
+
+    // 3) No duplicate was created.
+    let post = db
+        .session()
+        .query("MATCH (u:User {email: 'a@x.com'}) RETURN count(u) AS c")
+        .await?;
+    let cnt = post.rows()[0].get::<i64>("c")?;
+    assert_eq!(
+        cnt, 1,
+        "bulk.rs — UNIQUE must be enforced against unflushed-L0 rows (expected 1 User), got {cnt}"
     );
     Ok(())
 }

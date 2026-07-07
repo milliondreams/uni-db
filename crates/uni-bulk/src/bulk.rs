@@ -589,14 +589,16 @@ impl BulkWriter {
                                 ));
                             }
 
-                            // Also consult committed storage (L1/L2). The
-                            // seen_unique_keys set only covers this writer's
-                            // lifetime, so a key that already exists as a
-                            // committed row was invisible and silently twinned.
-                            // Mirrors the single-vertex check_unique_constraint_multi
-                            // storage step. (finding uni-bulk[4])
+                            // Also consult the main Writer's full write horizon
+                            // (current L0 + pending-flush buffers + committed
+                            // storage). The seen_unique_keys set only covers this
+                            // bulk writer's lifetime, so a key committed on the
+                            // main channel — flushed OR still in an unflushed L0
+                            // buffer — was invisible and silently twinned.
+                            // Delegates to the same lookup surface the
+                            // single-vertex path uses. (findings uni-bulk[4] / D6)
                             if self
-                                .unique_key_exists_in_storage(label, unique_props, props)
+                                .unique_key_exists_full_horizon(label, unique_props, props)
                                 .await?
                             {
                                 return Err(anyhow!(
@@ -668,11 +670,14 @@ impl BulkWriter {
             buf.extend_from_slice(&enc);
         }
         // Hex so the (binary) key stays a String for the dedup sets.
-        Some(buf.iter().fold(String::with_capacity(buf.len() * 2), |mut s, b| {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-            s
-        }))
+        Some(
+            buf.iter()
+                .fold(String::with_capacity(buf.len() * 2), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
+        )
     }
 
     /// Whether a committed row (L1/L2) already holds this UNIQUE key.
@@ -686,39 +691,53 @@ impl BulkWriter {
     /// # Errors
     ///
     /// Propagates backend scan/count errors rather than failing open.
-    async fn unique_key_exists_in_storage(
+    /// Reports whether a UNIQUE key already exists on the main write channel.
+    ///
+    /// Delegates to [`Writer::unique_key_exists_full_horizon`] so the bulk path
+    /// sees the same layers the single-vertex path does — the main Writer's
+    /// current L0, its pending-flush buffers, and committed storage — closing the
+    /// cross-channel window where a committed-but-unflushed key was invisible to
+    /// the bulk loader (finding D6).
+    ///
+    /// Non-scalar or null key values are not representable as a constraint key
+    /// here and return `false`, deferring to the in-load/L0 dedup checks rather
+    /// than erroring — matching the prior storage-probe behavior.
+    ///
+    /// # Errors
+    /// Returns an error if the Writer's horizon probe (e.g. a storage backend
+    /// query) fails.
+    async fn unique_key_exists_full_horizon(
         &self,
         label: &str,
         unique_props: &[String],
         props: &Properties,
     ) -> Result<bool> {
-        let mut filters = Vec::with_capacity(unique_props.len());
+        let mut key_values = Vec::with_capacity(unique_props.len());
         for prop in unique_props {
             let val = match props.get(prop) {
-                Some(v) if !v.is_null() => v,
+                // Non-scalar unique keys aren't representable as a constraint
+                // key; fall back to the in-load/L0 checks rather than error.
+                Some(v @ (Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_))) => {
+                    v.clone()
+                }
                 _ => return Ok(false),
             };
-            let val_str = match val {
-                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                Value::Int(n) => n.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Bool(b) => b.to_string(),
-                // Non-scalar unique keys aren't representable as a scan filter;
-                // fall back to the in-load/L0 checks rather than error.
-                _ => return Ok(false),
-            };
-            filters.push(format!("{prop} = {val_str}"));
+            key_values.push((prop.clone(), val));
         }
 
-        let mut filter = filters.join(" AND ");
-        filter.push_str(" AND _deleted = false");
-
-        let backend = self.backend.storage.backend();
-        let table = uni_store::backend::table_names::vertex_table_name(label);
-        if !backend.table_exists(&table).await? {
-            return Ok(false);
-        }
-        Ok(backend.count_rows(&table, Some(filter.as_str())).await? > 0)
+        // The bulk vertex has no allocated VID at validation time (VIDs are
+        // assigned later, in `insert_vertices`), so `exclude_vid = None` — there
+        // is no self to exclude, and every genuine hit counts as a violation.
+        // `tx_l0 = None`: a preexisting committed row lives in the main Writer's
+        // L0, not the bulk transaction's L0, which the bulk path bypasses.
+        let writer = self
+            .backend
+            .writer
+            .as_ref()
+            .expect("BulkWriter always holds a Writer (build() enforces it)");
+        writer
+            .unique_key_exists_full_horizon(label, &key_values, None, None)
+            .await
     }
 
     /// Evaluate a simple CHECK constraint expression.

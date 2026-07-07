@@ -374,12 +374,27 @@ mixing large integers and floats.
 
 ---
 
-## D6 — R5 bulk UNIQUE misses the main Writer's unflushed L0 (cross-channel)
+## D6 — R5 bulk UNIQUE misses the main Writer's unflushed L0 (cross-channel) — ✅ DONE
 
 **Severity:** silent duplicate — a bulk load can twin a UNIQUE key that already exists on the
 **main write channel but is not yet flushed to Lance**. The common case (loading onto existing
 *flushed* data) IS now covered by the R5 storage probe; this is the residual cross-channel
 window.
+
+**Status:** fixed per the "preferred" plan below. The boolean core of
+`Writer::check_unique_constraint_multi` is extracted into a public
+`Writer::unique_key_exists_full_horizon(label, key_values, exclude_vid: Option<Vid>, tx_l0)`
+(`writer.rs`) that probes current L0 + pending-flush + tx L0 + storage; the Writer's own check
+is now a thin wrapper passing `Some(current_vid)`. The bulk validation
+(`crates/uni-bulk/src/bulk.rs`, formerly `unique_key_exists_in_storage`, now
+`unique_key_exists_full_horizon`) delegates to it via the `Arc<Writer>` that `BulkBackend`
+already holds, passing `exclude_vid = None` (a brand-new bulk vertex has no VID to exclude). The
+`exclude_vid` was made `Option<Vid>` so the storage filter omits the `_vid != …` clause when
+there is no self — a `u64::MAX` sentinel would overflow the filter's i64 literal parsing (caught
+by `test_bulk_unique_constraint_spans_buffer_flushes`). Repro sibling
+`bulk_unique_ignores_preexisting_unflushed_l0_row` (no `db.flush()`) added as a live regression
+test (NOT `#[ignore]`d); the ext_id global-uniqueness gap in the bulk path is a separate, still-open
+follow-up (not part of D6). All 38 uni-db bulk tests + 10 uni-store constraint/unique tests green.
 
 ### Locations
 - `crates/uni-bulk/src/bulk.rs:501` `validate_vertex_batch_constraints` → the UNIQUE branch
@@ -509,10 +524,11 @@ handles both directions).
       `two_fork_index_kinds_on_one_column_coexist` flipped and wired in).
 - [ ] **D5** (`uni-query-functions[2]`) — Wave 1; needs a unified order-preserving numeric
       sort-key codec (design change); repro `repro_finding_13_sort_key_int_collapse`.
-- [ ] **D6** (R5 bulk cross-channel) — Wave 1; needs a shared full-horizon constraint surface;
-      repro = a no-flush variant of `bulk_unique_ignores_preexisting_committed_row`.
+- [x] **D6** (R5 bulk cross-channel) — DONE (shared `Writer::unique_key_exists_full_horizon`
+      with `exclude_vid: Option<Vid>`; bulk delegates via `BulkBackend.writer`; repro
+      `bulk_unique_ignores_preexisting_unflushed_l0_row` un-`#[ignore]`d/live).
 
-D3 (Wave 0) and D5/D6 (Wave 1) remain, each with an in-tree repro pinning current behavior.
+D3 (Wave 0) and D5 (Wave 1) remain, each with an in-tree repro pinning current behavior.
 D1 (Wave 0) is now fixed on `main` (`01fb4ca16`), resolving the sole real correctness-scan
 Wave 4 (unverified) finding — the other 16 unverified findings were already fixed in Waves 2-3.
 Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`

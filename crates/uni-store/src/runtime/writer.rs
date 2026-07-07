@@ -2496,18 +2496,54 @@ impl Writer {
         current_vid: Vid,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        if self
+            .unique_key_exists_full_horizon(label, key_values, Some(current_vid), tx_l0)
+            .await?
+        {
+            return Err(anyhow!(
+                "Constraint violation: Duplicate composite key for label '{}'",
+                label
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reports whether a UNIQUE composite key already exists across the full write horizon.
+    ///
+    /// Probes every layer a duplicate could hide in — the current L0 buffer, any
+    /// pending-flush buffers, an optional transaction-local L0, and committed
+    /// storage (L1/L2). `exclude_vid` is the vertex being checked so it never
+    /// conflicts with itself; pass `None` when the caller is inserting a
+    /// brand-new vertex that has no VID yet (e.g. the bulk loader), so nothing is
+    /// excluded. This is the single lookup surface shared by the Writer's own
+    /// `check_unique_constraint_multi` and the bulk loader's validation, so both
+    /// write channels observe committed-but-unflushed keys (finding uni-bulk D6).
+    ///
+    /// # Errors
+    /// Returns an error if a storage backend probe fails; the check fails closed
+    /// rather than silently treating the key as absent.
+    pub async fn unique_key_exists_full_horizon(
+        &self,
+        label: &str,
+        key_values: &[(String, Value)],
+        exclude_vid: Option<Vid>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<bool> {
         // Serialize constraint key once for O(1) lookups
         let key = serialize_constraint_key(label, key_values);
+
+        // Sentinel for the in-memory `has_constraint_key` comparisons when there
+        // is no self to exclude: u64::MAX is never an allocated VID, so any real
+        // key hit compares unequal and counts. (The storage probe below omits
+        // the `_vid !=` clause entirely rather than emit an out-of-range literal.)
+        let exclude = exclude_vid.unwrap_or_else(|| Vid::new(u64::MAX));
 
         // 1. Check L0 (in-memory) using O(1) constraint index
         {
             let l0 = self.l0_manager.get_current();
             let l0_guard = l0.read();
-            if l0_guard.has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}'",
-                    label
-                ));
+            if l0_guard.has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
@@ -2519,22 +2555,16 @@ impl Writer {
         // paths (e.g. `check_extid_globally_unique`, `get_vertex_labels`) that
         // already consult `pending_flush`.
         for pending_l0 in self.l0_manager.get_pending_flush() {
-            if pending_l0.read().has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in pending flush)",
-                    label
-                ));
+            if pending_l0.read().has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
         // Check Transaction L0
         if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
-            if tx_l0_guard.has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in tx)",
-                    label
-                ));
+            if tx_l0_guard.has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
@@ -2554,10 +2584,13 @@ impl Writer {
             .collect();
 
         let mut filter = filters.join(" AND ");
-        filter.push_str(&format!(
-            " AND _deleted = false AND _vid != {}",
-            current_vid.as_u64()
-        ));
+        filter.push_str(" AND _deleted = false");
+        // Exclude the vertex's own row only when it has a VID; a brand-new insert
+        // (bulk) has none, and emitting `_vid != u64::MAX` would overflow the
+        // filter's i64 literal parsing.
+        if let Some(vid) = exclude_vid {
+            filter.push_str(&format!(" AND _vid != {}", vid.as_u64()));
+        }
 
         // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
         // correct `.lance` path). Skip cleanly when the table is not yet
@@ -2569,16 +2602,12 @@ impl Writer {
             if backend.table_exists(&table).await? {
                 let count = backend.count_rows(&table, Some(filter.as_str())).await?;
                 if count > 0 {
-                    return Err(anyhow!(
-                        "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
-                        label,
-                        filter
-                    ));
+                    return Ok(true);
                 }
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn check_write_pressure(&self) -> Result<()> {

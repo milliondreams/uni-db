@@ -4,6 +4,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
@@ -36,11 +37,15 @@ pub async fn import_semantic_scholar(
     let _ = schema_manager.add_property("Paper", "title", DataType::String, false);
     let _ = schema_manager.add_property("Paper", "year", DataType::Int32, false);
     let _ = schema_manager.add_property("Paper", "citation_count", DataType::Int32, false);
+    // Embeddings are optional enrichment: the importer copies `embedding`
+    // only when the JSONL record carries it (see the property loop below),
+    // so the column must be nullable — otherwise attaching the `Paper` label
+    // to an embedding-less paper trips a non-null constraint on import.
     let _ = schema_manager.add_property(
         "Paper",
         "embedding",
         DataType::Vector { dimensions: 768 },
-        false,
+        true,
     );
     // Additional properties
     let _ = schema_manager.add_property("Paper", "venue", DataType::String, true);
@@ -85,7 +90,11 @@ pub async fn import_semantic_scholar(
             // Insert vertex — convert serde_json values to uni_common values.
             let uni_props: uni_common::Properties =
                 props.into_iter().map(|(k, v)| (k, v.into())).collect();
-            w.insert_vertex(vid, uni_props, None).await?;
+            // Attach the `Paper` label the demo schema registers; passing no
+            // labels would insert label-less vertices that `MATCH (p:Paper)`
+            // cannot find.
+            w.insert_vertex_with_labels(vid, uni_props, &["Paper".to_string()], None)
+                .await?;
             Ok(())
         })
     })
@@ -165,7 +174,11 @@ where
 
             count += 1;
             if count.is_multiple_of(1000) {
+                // `print!` writes through stdout's `LineWriter`, which only
+                // flushes on a newline. Flush explicitly so the carriage-return
+                // progress line is visible on a TTY during the loop.
                 print!("\rProcessed {count} {label}");
+                let _ = std::io::stdout().flush();
             }
         }
     }

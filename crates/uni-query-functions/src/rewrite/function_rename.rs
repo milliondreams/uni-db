@@ -164,8 +164,6 @@ where
                 .map(|item| rewrite_return_item(item, rename))
                 .collect::<Result<_>>()?,
         }),
-        // Clauses we don't traverse (no expressions, or not user-rewritable here).
-        other => other,
     })
 }
 

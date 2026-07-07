@@ -1366,7 +1366,18 @@ fn eval_sqrt(arg: &Value) -> Result<Value> {
 fn eval_sign(arg: &Value) -> Result<Value> {
     match arg {
         Value::Int(i) => Ok(Value::Int(i.signum())),
-        Value::Float(f) => Ok(Value::Int(f.signum() as i64)),
+        // `f64::signum` returns +/-1.0 for +/-0.0, but Cypher's `sign(0.0)` must
+        // be 0. Classify explicitly so both signed zeros map to 0.
+        Value::Float(f) => {
+            let s = if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            };
+            Ok(Value::Int(s))
+        }
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("sign() expects a number")),
     }

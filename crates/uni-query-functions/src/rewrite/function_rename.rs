@@ -142,6 +142,28 @@ where
             }
             Clause::Call(call)
         }
+        Clause::Merge(m) => Clause::Merge(uni_cypher::ast::MergeClause {
+            pattern: rewrite_pattern(m.pattern, rename)?,
+            on_match: m
+                .on_match
+                .into_iter()
+                .map(|item| rewrite_set_item(item, rename))
+                .collect::<Result<_>>()?,
+            on_create: m
+                .on_create
+                .into_iter()
+                .map(|item| rewrite_set_item(item, rename))
+                .collect::<Result<_>>()?,
+        }),
+        Clause::WithRecursive(wr) => Clause::WithRecursive(uni_cypher::ast::WithRecursiveClause {
+            name: wr.name,
+            query: Box::new(rewrite_function_calls_in_query(*wr.query, rename)?),
+            items: wr
+                .items
+                .into_iter()
+                .map(|item| rewrite_return_item(item, rename))
+                .collect::<Result<_>>()?,
+        }),
         // Clauses we don't traverse (no expressions, or not user-rewritable here).
         other => other,
     })

@@ -34,12 +34,11 @@ fn repro_finding_04_calculate_score_dot_sign_inverted() {
 
     let score = calculate_score(distance, &metric);
 
-    // Correct similarity for a Dot index is +8.0 (the actual dot product), as
-    // the sibling `score_vectors` computes by negating. Instead we observe:
-    // BUG: expected score == +8.0, got -8.0 (repro for similar_to.rs:288).
+    // FIXED (similar_to.rs): the Dot branch negates `compute_distance` (= -dot),
+    // recovering the true dot product +8.0 as the similarity.
     assert_eq!(
-        score, -8.0,
-        "calculate_score returns sign-inverted similarity for Dot metric"
+        score, 8.0,
+        "calculate_score must recover +dot as the Dot-metric similarity"
     );
 }
 
@@ -55,11 +54,12 @@ fn repro_finding_05_timezone_offset_negative_subhour_sign_lost() {
 
     let result = eval_temporal_accessor_value(&dt, "offset").unwrap();
 
-    // BUG: expected Value::String("-00:30"), got "+00:30" (repro for datetime.rs:1826).
+    // FIXED (datetime.rs): the sign is tracked separately from the magnitude, so
+    // a negative sub-hour offset renders as "-00:30".
     assert_eq!(
         result,
-        Value::String("+00:30".to_string()),
-        "negative sub-hour offset loses its sign"
+        Value::String("-00:30".to_string()),
+        "negative sub-hour offset must keep its sign"
     );
 }
 
@@ -69,16 +69,13 @@ fn repro_finding_05_timezone_offset_negative_subhour_sign_lost() {
 fn repro_finding_09_sign_of_float_zero() {
     let result = eval_scalar_function("sign", &[Value::Float(0.0)], None).unwrap();
 
-    // BUG: expected Value::Int(0), got Value::Int(1) (repro for expr_eval.rs:1363).
-    assert_eq!(
-        result,
-        Value::Int(1),
-        "sign(0.0) returns 1 because f64::signum(+0.0) == 1.0"
-    );
+    // FIXED (expr_eval.rs): signed zeros are classified explicitly, so sign(0.0)
+    // is 0 as Cypher requires (not 1 from `f64::signum`).
+    assert_eq!(result, Value::Int(0), "sign(0.0) must be 0");
 
-    // Negative zero yields -1 for the same reason.
+    // Negative zero is likewise 0, not -1.
     let neg = eval_scalar_function("sign", &[Value::Float(-0.0)], None).unwrap();
-    assert_eq!(neg, Value::Int(-1), "sign(-0.0) returns -1");
+    assert_eq!(neg, Value::Int(0), "sign(-0.0) must be 0");
 }
 
 /// Finding [10] expr_eval.rs:1139 — `eval_size`/`eval_length` return the UTF-8
@@ -109,8 +106,9 @@ fn repro_finding_12_epoch_seconds_truncation_pre_1970() {
     });
 
     let secs = eval_temporal_accessor_value(&dt, "epochseconds").unwrap();
-    // BUG: expected Value::Int(-1), got Value::Int(0) (repro for datetime.rs:877).
-    assert_eq!(secs, Value::Int(0), "epochSeconds truncates toward zero");
+    // FIXED (datetime.rs): floor division rounds toward negative infinity, so
+    // -500_000_000 ns yields -1 second.
+    assert_eq!(secs, Value::Int(-1), "epochSeconds must floor, not truncate");
 
     // epochMillis at -500_500_000 ns: floor => -501, truncation => -500.
     let dt2 = Value::Temporal(TemporalValue::DateTime {
@@ -119,8 +117,8 @@ fn repro_finding_12_epoch_seconds_truncation_pre_1970() {
         timezone_name: None,
     });
     let millis = eval_temporal_accessor_value(&dt2, "epochmillis").unwrap();
-    // BUG: expected Value::Int(-501), got Value::Int(-500) (repro for datetime.rs:891).
-    assert_eq!(millis, Value::Int(-500), "epochMillis truncates toward zero");
+    // FIXED (datetime.rs): floor division yields -501 millis, not -500.
+    assert_eq!(millis, Value::Int(-501), "epochMillis must floor, not truncate");
 }
 
 /// Finding [14] similar_to.rs:378 — `value_to_sparse` converts map indices with
@@ -154,18 +152,16 @@ fn repro_finding_14_sparse_index_negative_wraps() {
 
     let result = eval_sparse_similar_to_pure(&v1, &v2);
 
-    // Correct behavior: -1 is not a valid u32 term id, so this should ERROR.
-    // BUG: it succeeds because -1 wraps to 4294967295, colliding with v2's real
-    // term and producing a spurious dot contribution 1*2 + 1*1 = 3.0
-    // (repro for similar_to.rs:378).
+    // FIXED (similar_to.rs): a negative index is no longer wrapped to u32::MAX;
+    // it is rejected with an out-of-range error instead of colliding with v2's
+    // legitimate term 4294967295.
     assert!(
-        result.is_ok(),
-        "negative index should error but is silently accepted"
+        result.is_err(),
+        "negative sparse index must error, not wrap to an unrelated term"
     );
-    assert_eq!(
-        result.unwrap(),
-        Value::Float(3.0),
-        "wrapped index -1 -> 4294967295 collides, dot = 3.0 instead of the correct 1.0"
+    assert!(
+        result.unwrap_err().to_string().contains("out of range"),
+        "error should explain the index is out of range"
     );
 }
 
@@ -189,12 +185,13 @@ fn repro_finding_15_within_bbox_antimeridian() {
     let result =
         eval_spatial_function("POINT.WITHINBBOX", &[point, lower_left, upper_right]).unwrap();
 
-    // BUG: expected Value::Bool(true), got Value::Bool(false) because
-    // (170.0..=-170.0) is an empty inclusive range (repro for spatial.rs:189).
+    // FIXED (spatial.rs): an antimeridian-crossing box (min_lon > max_lon) is
+    // treated as the union of the two wrapped longitude intervals, so the
+    // interior point (0, 175) is correctly inside.
     assert_eq!(
         result,
-        Value::Bool(false),
-        "antimeridian-crossing bbox wrongly excludes interior point"
+        Value::Bool(true),
+        "antimeridian-crossing bbox must include its interior point"
     );
 }
 
@@ -211,25 +208,18 @@ fn repro_finding_16_point_nonnumeric_z_silently_ignored() {
 
     let result = eval_spatial_function("POINT", &[map]);
 
-    // Correct behavior (parity with x/y): a non-numeric z should error.
-    // BUG: it succeeds, returning a 2-D Cartesian point with z dropped to Null
-    // (repro for spatial.rs:60).
+    // FIXED (spatial.rs): a present-but-non-numeric z now errors, for parity with
+    // x/y, instead of being silently dropped and downgrading to a 2-D point.
     assert!(
-        result.is_ok(),
-        "non-numeric z should error but is silently ignored"
+        result.is_err(),
+        "non-numeric z must error like non-numeric x/y"
     );
-    let value = result.unwrap();
-    let Value::Map(out) = value else {
-        panic!("expected a Point map, got {value:?}");
-    };
-    assert_eq!(
-        out.get("crs"),
-        Some(&Value::String("Cartesian".to_string())),
-        "point downgraded to 2-D Cartesian instead of erroring on bad z"
+    assert!(
+        result.unwrap_err().to_string().contains("z must be a number"),
+        "error should identify the bad z coordinate"
     );
-    assert_eq!(out.get("z"), Some(&Value::Null), "bogus z silently dropped to Null");
 
-    // Contrast: a non-numeric x DOES error, proving the asymmetry.
+    // Contrast: a non-numeric x DOES error, proving the parity.
     let bad_x = Value::Map(HashMap::from([
         ("x".to_string(), Value::String("abc".to_string())),
         ("y".to_string(), Value::Float(2.0)),

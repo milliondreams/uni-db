@@ -871,12 +871,15 @@ pub fn eval_temporal_accessor_value(val: &Value, component: &str) -> Result<Valu
                     };
                 }
                 "epochseconds" => {
+                    // Use floor division (`div_euclid`) so pre-1970 sub-second
+                    // instants round toward negative infinity, matching Cypher's
+                    // epoch semantics, instead of truncating toward zero.
                     return match tv {
                         TemporalValue::DateTime {
                             nanos_since_epoch, ..
-                        } => Ok(Value::Int(nanos_since_epoch / 1_000_000_000)),
+                        } => Ok(Value::Int(nanos_since_epoch.div_euclid(1_000_000_000))),
                         TemporalValue::LocalDateTime { nanos_since_epoch } => {
-                            Ok(Value::Int(nanos_since_epoch / 1_000_000_000))
+                            Ok(Value::Int(nanos_since_epoch.div_euclid(1_000_000_000)))
                         }
                         TemporalValue::Date { days_since_epoch } => {
                             Ok(Value::Int(*days_since_epoch as i64 * 86400))
@@ -885,12 +888,14 @@ pub fn eval_temporal_accessor_value(val: &Value, component: &str) -> Result<Valu
                     };
                 }
                 "epochmillis" => {
+                    // Floor division so pre-1970 sub-millisecond instants round
+                    // toward negative infinity rather than truncating toward zero.
                     return match tv {
                         TemporalValue::DateTime {
                             nanos_since_epoch, ..
-                        } => Ok(Value::Int(nanos_since_epoch / 1_000_000)),
+                        } => Ok(Value::Int(nanos_since_epoch.div_euclid(1_000_000))),
                         TemporalValue::LocalDateTime { nanos_since_epoch } => {
-                            Ok(Value::Int(nanos_since_epoch / 1_000_000))
+                            Ok(Value::Int(nanos_since_epoch.div_euclid(1_000_000)))
                         }
                         TemporalValue::Date { days_since_epoch } => {
                             Ok(Value::Int(*days_since_epoch as i64 * 86400 * 1000))
@@ -1823,14 +1828,19 @@ fn format_timezone_offset(offset_secs: i32) -> String {
     if offset_secs == 0 {
         "Z".to_string()
     } else {
-        let hours = offset_secs / 3600;
-        let remaining = offset_secs.abs() % 3600;
+        // Track the sign separately from the magnitude: `hours` alone is 0 for a
+        // sub-hour offset like -1800s, and `{:+03}` would then render "+00",
+        // dropping the negative sign. Derive the sign from the raw seconds.
+        let sign = if offset_secs < 0 { '-' } else { '+' };
+        let total = offset_secs.unsigned_abs();
+        let hours = total / 3600;
+        let remaining = total % 3600;
         let mins = remaining / 60;
         let secs = remaining % 60;
         if secs != 0 {
-            format!("{:+03}:{:02}:{:02}", hours, mins, secs)
+            format!("{sign}{hours:02}:{mins:02}:{secs:02}")
         } else {
-            format!("{:+03}:{:02}", hours, mins)
+            format!("{sign}{hours:02}:{mins:02}")
         }
     }
 }

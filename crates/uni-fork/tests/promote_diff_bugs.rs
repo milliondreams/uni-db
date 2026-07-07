@@ -339,36 +339,40 @@ async fn populated_store(
 }
 
 // ==========================================================================
-// Finding [2] — diff.rs:643 (DEFERRED): the promote-recomputed content-UID can
-// never equal the UID registered by writer.rs, because the write side hashes
-// props that STILL contain the "ext_id" key while the promote side hashes
-// query-stripped props (ext_id key removed) => UID dedup never fires for ext_id
-// rows. Re-injecting the "ext_id" key on the promote side makes them match, but
-// that exposes a UidIndex-staleness interaction that breaks the insert-only-twin
-// contract under a diverging primary edit, so the fix is deferred until the
-// UidIndex-on-update semantics are resolved. This test pins the current
-// (mismatching) behavior.
+// Finding [2] — diff.rs (FIXED): the promote-recomputed content-UID now MATCHES
+// the UID registered by writer.rs. The write side hashes props that STILL
+// contain the "ext_id" key, so ext_id folds into the digest twice (once as the
+// dedicated arg, once as the "ext_id" property term), whereas raw Cypher results
+// STRIP that key. `content_uid_with_ext_id` re-injects the "ext_id" key on the
+// promote side before hashing, reproducing the registered digest exactly, so the
+// UID dedup fires for ext_id-bearing rows. A stale pre-edit UID that still
+// resolves to a live-but-edited primary vertex is rejected separately by the
+// live-content check in `batch_resolve_primary_vids`, so the fix no longer risks
+// the insert-only-twin regression that previously forced a deferral (see the
+// end-to-end `promote_default_is_insert_only_twin` and re-promote idempotency
+// tests in uni-db).
 // ==========================================================================
 #[test]
-fn finding2_promote_uid_can_never_match_registered_uid() {
-    // Write/register side (writer.rs:5182-5186): ext_id = Some("p1") AND the
+fn promote_uid_matches_registered_uid_via_ext_reinjection() {
+    // Write/register side (writer.rs flush finalize): ext_id = Some("p1") AND the
     // property map STILL contains the "ext_id" key.
     let mut props_with_ext = Properties::new();
     props_with_ext.insert("ext_id".to_string(), Value::String("p1".to_string()));
     props_with_ext.insert("name".to_string(), Value::String("Alice".to_string()));
     let registered = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props_with_ext);
 
-    // Promote-recompute side (diff.rs:643): the props come from a query result
-    // which STRIPS the "ext_id" key.
+    // Promote-recompute side: Cypher STRIPS the "ext_id" key, so the fix
+    // re-injects it (mirroring `content_uid_with_ext_id`) before hashing.
     let mut props_stripped = Properties::new();
     props_stripped.insert("name".to_string(), Value::String("Alice".to_string()));
+    props_stripped.insert("ext_id".to_string(), Value::String("p1".to_string()));
     let recomputed = VertexDataset::compute_vertex_uid("Person", Some("p1"), &props_stripped);
 
-    // They DIFFER by the extra `ext_id=p1` property term, so the ext_id-bearing
-    // row's UID dedup does not fire (DEFERRED — see the module comment above).
-    assert_ne!(
+    // With ext_id re-injected the two digests are identical, so the ext_id-
+    // bearing row's UID dedup now fires (FIXED).
+    assert_eq!(
         registered, recomputed,
-        "UIDs unexpectedly matched — the deferred dedup would fire"
+        "re-injecting ext_id must make the promote UID match the registered UID"
     );
 }
 

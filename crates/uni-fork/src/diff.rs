@@ -86,6 +86,32 @@ fn ext_id_for(map: &HashMap<Vid, String>, vid: Vid) -> Option<&str> {
     map.get(&vid).map(String::as_str)
 }
 
+/// Content UID for a query-stripped vertex, matching the registered UID.
+///
+/// The write path (`writer.rs` flush finalize) hashes the *stored* property
+/// map, which still carries the `ext_id` key, so `ext_id` folds into the digest
+/// twice: once via the dedicated argument and once via the `"ext_id"` property.
+/// Cypher results strip that key, so re-inject it here before hashing to
+/// reproduce the registered digest exactly — otherwise an `ext_id`-bearing
+/// row's content UID never matches and the promote dedup silently never fires.
+///
+/// When `ext_id` is `None` the props are hashed unchanged (a no-op re-injection).
+fn content_uid_with_ext_id(
+    label: &str,
+    ext_id: Option<&str>,
+    stripped_props: &Properties,
+) -> UniId {
+    use uni_store::storage::vertex::VertexDataset;
+    match ext_id {
+        Some(eid) => {
+            let mut props = stripped_props.clone();
+            props.insert("ext_id".to_string(), Value::String(eid.to_string()));
+            VertexDataset::compute_vertex_uid(label, Some(eid), &props)
+        }
+        None => VertexDataset::compute_vertex_uid(label, None, stripped_props),
+    }
+}
+
 /// One bucketed vertex row keyed by content UID.
 type VertexBucket = HashMap<UniId, VertexRow>;
 /// One bucketed edge row keyed by content-addressed edge UID
@@ -349,13 +375,23 @@ fn vid_in_list(vids: impl IntoIterator<Item = u64>) -> String {
 /// scan of `UidIndex`'s dataset (collecting **all** registered VIDs
 /// per UID — `UidIndex::resolve_uids` collapses to one VID per UID
 /// which loses fork/primary disambiguation), and one primary Cypher
-/// MATCH with an `id(n) IN [...]` predicate to confirm which
-/// candidates live on primary.
+/// MATCH with an `id(n) IN [...]` predicate returning each live node.
+///
+/// A candidate UID counts as present only when a resolved VID is both
+/// live on primary **and** whose current content still hashes to that
+/// exact UID. The shared `UidIndex` is append-only (`writer.rs` only
+/// appends), so it never drops a vertex's pre-edit content-UID; a stale
+/// mapping can therefore resolve to a still-live vid whose properties
+/// have since changed. The live-content check rejects those stale
+/// matches, so a fork row diverging from a primary edit is correctly
+/// treated as absent and inserted as a twin. `primary_ext_ids` supplies
+/// each primary vid's `ext_id` to recompute the same double-folded UID.
 async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     primary: &Q,
     primary_storage: &Arc<uni_store::storage::manager::StorageManager>,
     label: &str,
     uids: &[UniId],
+    primary_ext_ids: &HashMap<Vid, String>,
 ) -> (HashMap<UniId, Vid>, bool) {
     // NOTE: every error path below degrades to whatever has been
     // resolved so far (an empty or partial map) rather than
@@ -392,26 +428,38 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
         .values()
         .flat_map(|vs| vs.iter().map(|v| v.as_u64()))
         .collect();
+    // Return the live node (not just its id) so we can re-verify the resolved
+    // vertex's CURRENT content, not merely its liveness — the shared UidIndex
+    // never drops a pre-edit content-UID, so presence alone would let a fork row
+    // dedup against a stale UID pointing at a since-edited primary vertex.
     let cypher = format!(
-        "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN id(n) AS vid",
+        "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN n",
         escape_backticks(label),
         vid_in_list(vid_set)
     );
     let Ok(rs) = primary.query(&cypher).await else {
         return (out, true);
     };
-    let primary_vids: HashSet<u64> = rs
-        .rows()
-        .iter()
-        .filter_map(|row| row.get::<i64>("vid").ok())
-        .map(|v| v as u64)
-        .collect();
+    // vid → live content-UID for every present candidate vertex, recomputed from
+    // its current props with `ext_id` re-injected to mirror the registered UID.
+    let mut live_uid_by_vid: HashMap<u64, UniId> = HashMap::new();
+    for row in rs.rows() {
+        let Some(Value::Node(node)) = row.value("n") else {
+            continue;
+        };
+        let live_uid = content_uid_with_ext_id(
+            label,
+            ext_id_for(primary_ext_ids, node.vid),
+            &node.properties,
+        );
+        live_uid_by_vid.insert(node.vid.as_u64(), live_uid);
+    }
     for (uid, vids) in candidates_per_uid {
-        // If *any* candidate VID for this UID lives on primary, the
-        // UID exists on primary. Pick the first such VID.
+        // The UID is present on primary only if some candidate VID is both live
+        // AND still hashes to this exact UID — rejecting stale post-edit mappings.
         if let Some(vid) = vids
             .into_iter()
-            .find(|v| primary_vids.contains(&v.as_u64()))
+            .find(|v| live_uid_by_vid.get(&v.as_u64()) == Some(&uid))
         {
             out.insert(uid, vid);
         }
@@ -641,23 +689,14 @@ where
                         continue;
                     };
                     let ext_id = ext_id_for(&fork_ext_ids, node.vid).map(str::to_string);
-                    // NOTE (correctness-scan uni-fork[3], DEFERRED): the registered
-                    // content-UID (writer.rs) hashes the STORED property map, which
-                    // still contains the `ext_id` key, whereas Cypher results STRIP
-                    // it, so this recomputed UID never equals the registered one for
-                    // ext_id-bearing rows and the UID dedup does not fire. Re-
-                    // injecting the `ext_id` key to make them match is correct in
-                    // isolation but exposes a UidIndex-staleness interaction: a fork
-                    // vertex whose content diverged from a primary edit then dedups
-                    // against the STALE pre-edit UID and is wrongly skipped, breaking
-                    // the insert-only-twin contract (`promote_default_is_insert_only_
-                    // twin`). Left as-is until the UidIndex-on-update semantics are
-                    // resolved.
-                    let uid = VertexDataset::compute_vertex_uid(
-                        label,
-                        ext_id.as_deref(),
-                        &node.properties,
-                    );
+                    // Re-inject `ext_id` so this recomputed content UID matches the
+                    // one registered by writer.rs (which hashes stored props that
+                    // still carry the `ext_id` key). See `content_uid_with_ext_id`.
+                    // A stale pre-edit UID that still resolves to a live-but-edited
+                    // primary vertex is rejected by the live-content check in
+                    // `batch_resolve_primary_vids`, so this no longer risks the
+                    // insert-only-twin regression that previously forced a deferral.
+                    let uid = content_uid_with_ext_id(label, ext_id.as_deref(), &node.properties);
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;
@@ -745,9 +784,14 @@ where
                 // Cypher IN-clause verify) instead of 2N. `degraded` (M5)
                 // signals the resolve could not confirm presence.
                 let uids_to_check: Vec<UniId> = uid_candidates.iter().map(|(u, _)| *u).collect();
-                let (on_primary, degraded) =
-                    batch_resolve_primary_vids(primary, &primary_storage, label, &uids_to_check)
-                        .await;
+                let (on_primary, degraded) = batch_resolve_primary_vids(
+                    primary,
+                    &primary_storage,
+                    label,
+                    &uids_to_check,
+                    &primary_ext_ids,
+                )
+                .await;
 
                 let mut to_insert: Vec<Properties> = Vec::with_capacity(uid_candidates.len());
                 let mut insert_uids: Vec<UniId> = Vec::with_capacity(uid_candidates.len());
@@ -875,8 +919,14 @@ where
                 let mut endpoint_resolved: HashMap<(String, UniId), Vid> = HashMap::new();
                 for (lbl, uid_set) in to_resolve {
                     let uid_vec: Vec<UniId> = uid_set.into_iter().collect();
-                    let (resolved, _degraded) =
-                        batch_resolve_primary_vids(primary, &primary_storage, &lbl, &uid_vec).await;
+                    let (resolved, _degraded) = batch_resolve_primary_vids(
+                        primary,
+                        &primary_storage,
+                        &lbl,
+                        &uid_vec,
+                        &primary_ext_ids,
+                    )
+                    .await;
                     for (uid, vid) in resolved {
                         endpoint_resolved.insert((lbl.clone(), uid), vid);
                     }
@@ -1101,4 +1151,60 @@ where
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uni_store::storage::vertex::VertexDataset;
+
+    /// `content_uid_with_ext_id` reproduces the writer's double-folded UID.
+    ///
+    /// The write path hashes stored props that still carry the `ext_id` key, so
+    /// re-injecting it on the query-stripped promote side must yield the exact
+    /// same digest — otherwise the promote UID dedup can never fire.
+    #[test]
+    fn content_uid_with_ext_id_matches_registered_double_fold() {
+        // Registered side: ext_id folded twice (arg + "ext_id" property key).
+        let mut registered_props = Properties::new();
+        registered_props.insert("ext_id".to_string(), Value::String("p1".to_string()));
+        registered_props.insert("name".to_string(), Value::String("Alice".to_string()));
+        let registered = VertexDataset::compute_vertex_uid("Person", Some("p1"), &registered_props);
+
+        // Promote side: query-stripped props (no "ext_id" key) fed to the helper.
+        let mut stripped = Properties::new();
+        stripped.insert("name".to_string(), Value::String("Alice".to_string()));
+        let recomputed = content_uid_with_ext_id("Person", Some("p1"), &stripped);
+
+        assert_eq!(
+            registered, recomputed,
+            "re-injection must reproduce the registered double-folded UID"
+        );
+    }
+
+    /// Without an `ext_id` the helper is a pure pass-through (no re-injection).
+    #[test]
+    fn content_uid_with_ext_id_is_noop_without_ext_id() {
+        let mut props = Properties::new();
+        props.insert("name".to_string(), Value::String("Bob".to_string()));
+        let direct = VertexDataset::compute_vertex_uid("Person", None, &props);
+        let via_helper = content_uid_with_ext_id("Person", None, &props);
+        assert_eq!(direct, via_helper, "None ext_id must not alter the digest");
+    }
+
+    /// Differing content yields differing UIDs — the basis for the live-content
+    /// check that rejects a stale pre-edit UID against a since-edited vertex.
+    #[test]
+    fn content_uid_with_ext_id_distinguishes_diverged_content() {
+        let mut age_30 = Properties::new();
+        age_30.insert("age".to_string(), Value::Int(30));
+        let mut age_99 = Properties::new();
+        age_99.insert("age".to_string(), Value::Int(99));
+        let uid_30 = content_uid_with_ext_id("Person", Some("p1"), &age_30);
+        let uid_99 = content_uid_with_ext_id("Person", Some("p1"), &age_99);
+        assert_ne!(
+            uid_30, uid_99,
+            "the same ext_id with diverged content must hash differently"
+        );
+    }
 }

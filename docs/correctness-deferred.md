@@ -9,8 +9,9 @@ re-investigating.
 **Wave 0** (P0 stop-the-bleeding): 18 of 22 findings fixed and committed to `main`
 (16 commits, `6ec2c9963..b659ca0fa`, FF-merged, **not pushed**). Deferrals **D1–D4** below.
 **Update (2026-07-06):** **D2** (`uni[6]`) and **D4** (`uni-query[29]`) since fixed on branch
-`fix/correctness-deferred-d2-d4` (D4 `c393dfb87`, D2 `c9e80cff2`). **Still deferred: D1
-(`uni[2]`, perf) and D3 (`uni-fork[3]`, UidIndex design decision).**
+`fix/correctness-deferred-d2-d4` (D4 `c393dfb87`, D2 `c9e80cff2`). **D1 (`uni[2]`, perf) since
+fixed on `main` (`01fb4ca16`); D3 (`uni-fork[3]`) since fixed (uncommitted) via a promote-local
+content re-verify — no `UidIndex` design change was needed.** All Wave-0 findings are now resolved.
 
 **Wave 1** (shared-helper clusters R7/R6/R4/R5/R10/R16/R17/R11): all 8 regions fixed on
 branch `fix/correctness-scan-wave1` (17 commits, base `88f0c52cd`, **not pushed**; see memory
@@ -176,11 +177,42 @@ version used).
 
 ---
 
-## D3 — `uni-fork[3]` promote content-UID mismatch (applied → REVERTED)
+## D3 — `uni-fork[3]` promote content-UID mismatch — ✅ DONE
 
 **Severity:** non-idempotent promote (unbounded twins on re-promote for ext_id-bearing rows).
-**Status:** a fix was committed then **reverted** — commit `b659ca0fa` — because it exposed a
-deeper issue. The current tree keeps the *original* (mismatching) behavior with a NOTE comment.
+
+**Status:** fixed via a **promote-local content re-verify** (uncommitted), sidestepping the
+`UidIndex`-staleness coupling that forced the earlier revert (`b659ca0fa`) — the engine-wide
+append-only `UidIndex` is left untouched. Two coordinated changes, both in
+`crates/uni-fork/src/diff.rs`:
+1. **New helper** `content_uid_with_ext_id(label, ext_id, stripped_props)` re-injects the
+   `"ext_id"` key into the Cypher-stripped props before `compute_vertex_uid`, reproducing the
+   registered UID's **double-fold** (`ext_id` folded once via the arg + once via the property key)
+   exactly. `run_promote`'s candidate loop now uses it, so the content-UID dedup finally fires for
+   ext_id-bearing rows.
+2. **`batch_resolve_primary_vids` now verifies LIVE content, not just presence.** It takes a
+   `primary_ext_ids: &HashMap<Vid, String>`, changes its verify Cypher from `RETURN id(n)` to
+   `RETURN n`, recomputes each resolved vid's **current** content-UID (via the same helper), and
+   counts a UID as on-primary only when a resolved vid *still hashes to that exact UID*. This
+   rejects the stale pre-edit UID that the append-only index keeps — so a fork vertex whose content
+   diverged from a primary edit is correctly inserted as a **twin** (the insert-only-twin contract
+   holds by construction). This extends the re-verification `UidIndex`'s own doc-comment already
+   mandates (consumers re-verify resolved vids against live storage) from *liveness* to *content*.
+
+Tests: the pinning unit test flipped to `promote_uid_matches_registered_uid_via_ext_reinjection`
+(`assert_eq!` — re-injection reproduces the registered UID); 3 inline `diff::tests` unit tests cover
+the helper directly; a new end-to-end `promote_default_is_idempotent_for_unchanged_ext_id_row`
+(`crates/uni/tests/common/fork/fork_promote.rs`) promotes an unchanged fork **twice** and asserts one
+Alice / zero inserts; the canary `promote_default_is_insert_only_twin` stays green (still twins on
+divergence). Verified: `uni-fork` 12/12, `uni-db test(promote)` 18/18, full `uni-db test(fork)`
+175/175. **Scope note:** the edge path's *endpoint* content-UIDs remain single-fold (ext_id-bearing
+edge endpoints were already unresolved before this change — a separate latent issue, no regression;
+passing `primary_ext_ids` there is non-regressing since non-ext_id endpoints resolve identically).
+
+### Original analysis (retained for context)
+
+A fix was committed then **reverted** — commit `b659ca0fa` — because it exposed a
+deeper issue. The finding's own NOTE comment (now removed) captured the mismatching behavior.
 
 ### Locations
 - `crates/uni-fork/src/diff.rs:643` — `run_promote` recomputes the content-UID from
@@ -610,8 +642,10 @@ and passes, isolating the defect to `=`).
       overwrite filter; repro un-ignored).
 - [x] **D2** (`uni[6]`) — DONE `c9e80cff2` (parent-branch tip captured under `flush_lock`;
       deterministic failpoint repro, negative-control proven).
-- [ ] **D3** (`uni-fork[3]`) — decide `UidIndex`-on-update semantics first; canary test =
-      `promote_default_is_insert_only_twin`.
+- [x] **D3** (`uni-fork[3]`) — DONE (uncommitted): promote-local content re-verify — ext_id
+      re-injection (`content_uid_with_ext_id`) + live-content check in `batch_resolve_primary_vids`;
+      `UidIndex` left append-only, staleness filtered at read time. Canary
+      `promote_default_is_insert_only_twin` stays green; new e2e idempotency test added.
 - [x] **D1** (`uni[2]`) — DONE `01fb4ca16` (per-kind set + kind-specific planner probes; repro
       `two_fork_index_kinds_on_one_column_coexist` flipped and wired in).
 - [ ] **D5** (`uni-query-functions[2]`) — Wave 1; needs a unified order-preserving numeric
@@ -626,8 +660,10 @@ and passes, isolating the defect to `=`).
       `=`/`!=`; `bulk.rs` `evaluate_check_expression`; repro flipped to
       `bulk_check_equality_float_vs_int_literal_passes`).
 
-D3 (Wave 0) and D5 (Wave 1) remain, each with an in-tree repro pinning current behavior;
-D9/D10 (Wave 0, missed) are now FIXED (uncommitted).
+**D5 (Wave 1) is the sole finding still open** — it needs a unified order-preserving numeric
+sort-key codec (a design change), with an in-tree repro pinning current behavior. D3 (Wave 0)
+is now FIXED (uncommitted, promote-local content re-verify). D9/D10 (Wave 0, missed) are also
+FIXED (uncommitted).
 D1 (Wave 0) is now fixed on `main` (`01fb4ca16`), resolving the sole real correctness-scan
 Wave 4 (unverified) finding — the other 16 unverified findings were already fixed in Waves 2-3.
 Branch `fix/correctness-scan-wave0` is FF-merged into local `main`; `fix/correctness-deferred-d2-d4`

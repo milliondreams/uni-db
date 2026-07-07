@@ -327,8 +327,16 @@ impl ProcedurePlugin for TextProc {
                         "text.repeat: count must be non-negative",
                     ));
                 }
-                // Cap to a sane limit to prevent OOM on pathological cases.
-                let capped = (count as usize).min(MAX_SYNTHESIZED_LEN);
+                // Cap on the total synthesized *length* (`count * item_len`),
+                // not the raw count, so `MAX_SYNTHESIZED_LEN` actually bounds the
+                // output size and prevents OOM on pathological inputs. An empty
+                // base yields an empty string for any count, so it needs no cap.
+                let item_len = s.len();
+                let capped = if item_len == 0 {
+                    count as usize
+                } else {
+                    (count as usize).min(MAX_SYNTHESIZED_LEN / item_len)
+                };
                 string_result(s.repeat(capped))
             }
             Self::IndexOf => {

@@ -103,14 +103,13 @@ async fn repro_text_repeat_cap_ignores_total_length() {
     )
     .await;
 
-    // BUG: doc contract says total length is bounded to MAX_SYNTHESIZED_LEN
-    // (1_000_000), but the count (not the length) is what's capped, so the
-    // output is 100 * 1_000_000 = 100_000_000 bytes.
-    // (repro for src/procedures/text.rs:331).
+    // FIXED (text.rs): the cap now bounds the total synthesized length. A
+    // 100-byte base capped to MAX_SYNTHESIZED_LEN (1_000_000) yields 10_000
+    // repeats = exactly 1_000_000 bytes, honoring the documented bound.
     assert_eq!(
         out.len(),
-        100_000_000,
-        "observed unbounded total length; cap did not bound it to 1_000_000"
+        1_000_000,
+        "total length must be bounded to MAX_SYNTHESIZED_LEN"
     );
 }
 

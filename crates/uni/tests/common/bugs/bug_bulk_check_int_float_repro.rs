@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 //
-// Repro for crates/uni-bulk/src/bulk.rs:686 (finding [5], Low).
+// Regression test for crates/uni-bulk/src/bulk.rs `evaluate_check_expression`
+// (finding [5] / D10, Low) — now FIXED.
 //
-// In `evaluate_check_expression`, the '='/'!=' operators use Value's
-// type-strict PartialEq, which has NO Int/Float cross arm — so
-// Value::Float(5.0) != Value::Int(5). The literal `5` in a CHECK expression
-// parses to Int (i64 tried before f64). Meanwhile '<'/'>'/'>='/'<=' route
-// through `compare_values`, which DOES coerce Int<->Float. Result: a numeric
-// CHECK equality against a Float property spuriously fails, while the
-// equivalent bounding form would pass.
+// Previously, the '='/'!=' operators used Value's type-strict PartialEq, which
+// has NO Int/Float cross arm — so Value::Float(5.0) != Value::Int(5). The literal
+// `5` in a CHECK expression parses to Int (i64 tried before f64). Meanwhile
+// '<'/'>'/'>='/'<=' route through `compare_values`, which DOES coerce Int<->Float.
+// Result: a numeric CHECK equality against a Float property spuriously failed,
+// while the equivalent bounding form passed.
+//
+// The fix routes '='/'!=' through `compare_values` when both operands are numbers,
+// so Float(5.0) satisfies `= 5`.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -36,15 +39,11 @@ async fn setup(check_expr: &str) -> Result<(Uni, tempfile::TempDir)> {
     Ok((db, temp_dir))
 }
 
-/// `(n.score = 5)` against a stored Float(5.0) falsely fails the CHECK because
-/// Float(5.0) == Int(5) is false under Value's type-strict PartialEq.
-// Pins OPEN finding uni-bulk[5] (bulk.rs:782): CHECK `=`/`!=` use type-strict
-// PartialEq (no Int/Float arm) so Float(5.0) != Int(5), while the ordering ops
-// coerce via compare_values. Tracked in docs/correctness-deferred.md as D10.
-// When fixed, remove `#[ignore]` and flip to assert the insert SUCCEEDS.
+/// Regression for FIXED finding uni-bulk[5] / D10: `(n.score = 5)` against a
+/// stored Float(5.0) now SATISFIES the CHECK because `=` coerces Int<->Float via
+/// `compare_values`.
 #[tokio::test]
-#[ignore = "pins OPEN finding uni-bulk[5] (bulk.rs:782); tracked as D10 in docs/correctness-deferred.md"]
-async fn bulk_check_equality_float_vs_int_literal_false_reject() -> Result<()> {
+async fn bulk_check_equality_float_vs_int_literal_passes() -> Result<()> {
     let (db, _temp) = setup("(n.score = 5)").await?;
 
     let tx = db.session().tx().await?;
@@ -53,16 +52,13 @@ async fn bulk_check_equality_float_vs_int_literal_false_reject() -> Result<()> {
     props.insert("score".to_string(), Value::Float(5.0));
 
     let res = bulk.insert_vertices("Metric", vec![props]).await;
+    bulk.commit().await?;
+    drop(tx);
 
-    // BUG: expected Ok (5.0 equals 5), got Err "CHECK constraint ... violated"
-    // because Float(5.0) == Int(5) is false. (repro for bulk.rs:686)
-    let err = res.expect_err(
-        "OBSERVED-BUG PREMISE FAILED: Float(5.0) satisfied '= 5' CHECK (bug may be fixed)",
-    );
-    let msg = format!("{err}");
+    // 5.0 equals 5 now that '=' coerces numerically, so the CHECK passes.
     assert!(
-        msg.contains("CHECK constraint") && msg.contains("violated"),
-        "repro for bulk.rs:686 — expected spurious CHECK violation, got: {msg}"
+        res.is_ok(),
+        "expected Float(5.0) to satisfy '= 5' after Int/Float coercion, got: {res:?}"
     );
     Ok(())
 }

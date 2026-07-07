@@ -141,7 +141,9 @@ pub async fn recover_interrupted_bulk_load(storage: &StorageManager) -> Result<(
         return Ok(());
     };
 
-    match intent.phase {
+    // Number of tables that failed to reconcile; when non-zero we must NOT clear
+    // the intent marker, so a later reopen retries the reconciliation.
+    let failures = match intent.phase {
         BulkIntentPhase::Committed => {
             // The load committed (manifest written); finish the latest-pointer
             // flip idempotently so the committed data becomes visible.
@@ -155,6 +157,7 @@ pub async fn recover_interrupted_bulk_load(storage: &StorageManager) -> Result<(
                 tables = intent.tables.len(),
                 "Finalized a committed-but-unfinished bulk load on reopen"
             );
+            0usize
         }
         BulkIntentPhase::Active => {
             // Interrupted before commit: roll every touched table back to its
@@ -168,8 +171,22 @@ pub async fn recover_interrupted_bulk_load(storage: &StorageManager) -> Result<(
                     None => backend.drop_table(table).await,
                 };
                 if let Err(e) = result {
-                    failures += 1;
-                    tracing::warn!(table = %table, error = %e, "bulk recovery: table rollback failed");
+                    // A drop/rollback error is only a genuine reconciliation
+                    // failure if the table is not already in its desired state.
+                    // A table created during the load (pre_version `None`) that
+                    // was never actually committed — the load faulted before
+                    // writing it — is already absent, so its failed `drop_table`
+                    // is a benign no-op, not divergence. A `Some` pre-version
+                    // means the table existed before the load and must be
+                    // restored, so a rollback error there is always genuine.
+                    let benign =
+                        pre_version.is_none() && !backend.table_exists(table).await.unwrap_or(true);
+                    if benign {
+                        tracing::debug!(table = %table, "bulk recovery: table already absent; nothing to roll back");
+                    } else {
+                        failures += 1;
+                        tracing::warn!(table = %table, error = %e, "bulk recovery: table rollback failed");
+                    }
                 }
             }
             backend.clear_cache();
@@ -178,7 +195,18 @@ pub async fn recover_interrupted_bulk_load(storage: &StorageManager) -> Result<(
                 failures,
                 "Rolled back an interrupted bulk load on reopen"
             );
+            failures
         }
+    };
+
+    // Only clear the marker once reconciliation fully succeeded. If any table
+    // failed to roll back, retain the marker (mirroring the Committed branch's
+    // fail-before-clear contract) and surface the failure so the next reopen
+    // retries — otherwise a divergent table would be abandoned permanently.
+    if failures > 0 {
+        anyhow::bail!(
+            "bulk recovery: {failures} table rollback(s) failed; intent marker retained for retry"
+        );
     }
 
     clear(&store).await?;

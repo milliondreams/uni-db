@@ -779,8 +779,20 @@ impl BulkWriter {
         };
 
         match op {
-            "=" | "==" => Ok(prop_val == &target_val),
-            "!=" | "<>" => Ok(prop_val != &target_val),
+            // Route numeric equality through `compare_values` so Int/Float coerce
+            // (matching the ordering ops below); Value's `PartialEq` is type-strict
+            // and has no Int/Float arm, so `Float(5.0) == Int(5)` would be false.
+            // Non-numeric operands keep strict structural equality.
+            "=" | "==" => Ok(if prop_val.is_number() && target_val.is_number() {
+                self.compare_values(prop_val, &target_val)?.is_eq()
+            } else {
+                prop_val == &target_val
+            }),
+            "!=" | "<>" => Ok(if prop_val.is_number() && target_val.is_number() {
+                !self.compare_values(prop_val, &target_val)?.is_eq()
+            } else {
+                prop_val != &target_val
+            }),
             ">" => Ok(self.compare_values(prop_val, &target_val)?.is_gt()),
             "<" => Ok(self.compare_values(prop_val, &target_val)?.is_lt()),
             ">=" => Ok(self.compare_values(prop_val, &target_val)?.is_ge()),

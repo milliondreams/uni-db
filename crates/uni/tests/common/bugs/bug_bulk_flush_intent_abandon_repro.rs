@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 //
-// Repro for crates/uni-bulk/src/flush_intent.rs:184 (finding [2], High).
+// Regression test for crates/uni-bulk/src/flush_intent.rs `recover_interrupted_bulk_load`
+// (finding [2] / D9, High) — now FIXED.
 //
-// In `recover_interrupted_bulk_load`, the `Active` branch rolls every touched
-// table back. A rollback failure only does `failures += 1` + a warn!; the
-// error is swallowed and `failures` never gates control flow. Execution then
-// unconditionally reaches `clear(&store).await?` (line 184), which DELETES the
-// marker `catalog/bulk_flush_intent.json`. Once gone, the next reopen's read()
-// returns None and no further reconciliation ever runs — so a table that
-// failed to roll back is permanently abandoned in its divergent state.
+// Previously, the `Active` branch rolled every touched table back but a rollback
+// failure only did `failures += 1` + a warn!; the error was swallowed and
+// `failures` never gated control flow. Execution then unconditionally reached
+// `clear(&store).await?`, which DELETED the marker `catalog/bulk_flush_intent.json`.
+// Once gone, the next reopen's read() returned None and no further reconciliation
+// ever ran — a table that failed to roll back was permanently abandoned in its
+// divergent state.
 //
-// Contrast: the `Committed` branch propagates `set_latest_snapshot` failure via
-// `?` BEFORE clear(), preserving the marker for retry — the correct pattern
-// that was not applied to `Active`.
+// The fix threads the `Active` rollback `failures` count out of the match and,
+// when non-zero, returns an error WITHOUT clearing the marker — mirroring the
+// `Committed` branch's fail-before-clear contract. So the marker survives for a
+// later reopen to retry.
 //
 // This drives the REAL public `recover_interrupted_bulk_load` against a real
 // StorageManager. The rollback is made to fail (no mock) by pointing the intent
@@ -28,14 +30,11 @@ fn intent_path() -> ObjectStorePath {
     ObjectStorePath::from("catalog/bulk_flush_intent.json")
 }
 
-// Pins OPEN finding uni-bulk[2] (flush_intent.rs:184): the `Active` recovery
-// branch deletes the intent marker even when a table rollback failed, permanently
-// abandoning the divergent tables. Tracked in docs/correctness-deferred.md as D9.
-// When fixed, remove `#[ignore]` and flip the assertions to require the marker be
-// RETAINED (and recovery to surface the failure).
+// Regression for FIXED finding uni-bulk[2] / D9: the `Active` recovery branch now
+// RETAINS the intent marker and surfaces an error when a table rollback fails, so
+// the divergent tables are reconciled on a later reopen instead of being abandoned.
 #[tokio::test]
-#[ignore = "pins OPEN finding uni-bulk[2] (flush_intent.rs:184); tracked as D9 in docs/correctness-deferred.md"]
-async fn active_recovery_deletes_marker_even_when_rollback_fails() -> Result<()> {
+async fn active_recovery_retains_marker_when_rollback_fails() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let db = Uni::open(temp_dir.path().to_str().unwrap()).build().await?;
     let storage = db.storage();
@@ -68,30 +67,20 @@ async fn active_recovery_deletes_marker_even_when_rollback_fails() -> Result<()>
         "setup failed: intent marker should exist before recovery"
     );
 
-    // Run recovery. Despite BOTH table rollbacks failing, it returns Ok(()).
+    // Run recovery. Both table rollbacks fail, so recovery must surface an error
+    // rather than silently reporting success.
     let rec = uni_bulk::recover_interrupted_bulk_load(&storage).await;
-    // BUG: recovery swallows the rollback failures and reports success.
-    // (repro for flush_intent.rs:184)
     assert!(
-        rec.is_ok(),
-        "recovery unexpectedly propagated the failure (bug may be fixed): {rec:?}"
+        rec.is_err(),
+        "recovery should propagate the rollback failure so the marker is kept for retry, got: {rec:?}"
     );
 
-    // The marker is now GONE even though reconciliation did not succeed — so on
-    // the next reopen read() returns None and the divergent tables are never
-    // reconciled again: permanent abandonment.
-    let after = store.get(&intent_path()).await;
-    // BUG: expected the marker RETAINED for retry (as the Committed branch does
-    // on failure); observed it deleted.
+    // The marker is RETAINED because reconciliation did not succeed — so a later
+    // reopen's read() still returns it and the divergent tables get another
+    // reconciliation attempt instead of being abandoned.
     assert!(
-        after.is_err(),
-        "repro for flush_intent.rs:184 — expected marker to be DELETED despite \
-         failed rollback (proving abandonment); it still exists: {after:?}"
-    );
-    let msg = format!("{:?}", after.err().unwrap()).to_lowercase();
-    assert!(
-        msg.contains("not found") || msg.contains("notfound"),
-        "marker deletion should manifest as NotFound, got: {msg}"
+        store.get(&intent_path()).await.is_ok(),
+        "expected the intent marker to be RETAINED after a failed rollback (for retry); it was deleted"
     );
     Ok(())
 }

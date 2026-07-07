@@ -420,6 +420,30 @@ After the fix: the no-flush variant rejects the duplicate; `RUSTC_WRAPPER="" car
 
 ---
 
+# Wave 3 — no deferrals
+
+**Wave 3** (localized P2 + harness P3 regions R18/L1/L8/L9/L3/L4/L5/L10/L11): **all 52
+findings fixed** on branch `fix/correctness-scan-wave3` (base `d379cb88f`, **not pushed**;
+19 commits `72740e032..544d5a0d8`). Every repro was flipped from pinning the bug to
+asserting the fix, and each crate's suite is green. No finding was deferred.
+
+Two things surfaced during the work that are **out of Wave 3 scope**, recorded here so they
+are not mistaken for regressions:
+
+- **`uni-query[33]` has a second, distinct root.** The L4 fix corrects `cypher_cross_type_cmp`
+  for the legacy row-based `Accumulator` path (`executor/core.rs`), which is only reached via
+  `execute_subplan`. A plain read `RETURN min(<temporal>)` routes through the DataFusion
+  aggregate engine, which *also* returns the first-encountered value for MIN/MAX over a
+  temporal column — a separate bug with a different root, not touched. Repro
+  `repro_14_minmax_temporal` documents the routing and passes as a guard.
+- **Pre-existing `uni-locy-tck` gap (NOT introduced by Wave 3).** `combinations::
+  AssumeAbduceExtended::4d-1` ("ASSUME on empty graph with FOLD MNOR returns no rows")
+  fails identically on the base commit `d379cb88f` (verified in a throwaway worktree):
+  ASSUME/FOLD-MNOR yields 0 rows where 1 is expected. Docstring-independent, unrelated to
+  the L11 `having executed:` fix. Left for a future Locy semiring pass.
+
+---
+
 # Wave 2 deferrals
 
 **Wave 2** (P1 correctness clusters R9/R8/L6/R14/L7/R12/R15/L2): all 8 regions fixed on branch

@@ -44,8 +44,7 @@ def test_naive_datetime_preserves_wall_clock():
 
         # An equality query against the same wall-clock literal matches.
         match = s.query(
-            'MATCH (n:Ev) WHERE n.t = localdatetime("2026-07-04T12:00:00") '
-            "RETURN n"
+            'MATCH (n:Ev) WHERE n.t = localdatetime("2026-07-04T12:00:00") RETURN n'
         )
         assert len(match) == 1, len(match)
     finally:

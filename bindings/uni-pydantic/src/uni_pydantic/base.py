@@ -33,6 +33,37 @@ if TYPE_CHECKING:
     from .session import UniSession
 
 
+def _resolve_type_hints(cls: type) -> dict[str, Any]:
+    """Resolve a model's type hints, tolerating TYPE_CHECKING-only names.
+
+    ``UniNode``/``UniEdge`` annotate private attrs like ``_session: UniSession``
+    whose types are imported only under ``TYPE_CHECKING`` (to avoid a circular
+    import). At runtime ``get_type_hints`` would raise ``NameError`` on those
+    names and wipe out *all* hints — silently disabling per-field value
+    conversion (``Vector``/``Btic`` → db value), so those values reach the Rust
+    layer unconverted and are rejected. Supplying the TYPE_CHECKING names via
+    ``localns`` lets resolution succeed; a still-unresolvable model degrades to
+    ``{}`` exactly as before.
+    """
+    localns: dict[str, Any] = {}
+    try:
+        from .session import UniSession
+
+        localns["UniSession"] = UniSession
+    except Exception:
+        pass
+    try:
+        from .query import PropertyProxy
+
+        localns["PropertyProxy"] = PropertyProxy
+    except Exception:
+        pass
+    try:
+        return get_type_hints(cls, localns=localns)
+    except Exception:
+        return {}
+
+
 def _model_to_properties(
     model_instance: BaseModel,
     property_fields: dict[str, Any],
@@ -41,10 +72,7 @@ def _model_to_properties(
 
     Shared implementation for both UniNode.to_properties() and UniEdge.to_properties().
     """
-    try:
-        hints = get_type_hints(type(model_instance))
-    except Exception:
-        hints = {}
+    hints = _resolve_type_hints(type(model_instance))
 
     props: dict[str, Any] = {}
     for name in property_fields:
@@ -67,10 +95,7 @@ def _convert_db_values(
 
     Shared implementation for both UniNode.from_properties() and UniEdge.from_properties().
     """
-    try:
-        hints = get_type_hints(model_class)
-    except Exception:
-        hints = {}
+    hints = _resolve_type_hints(model_class)
 
     return {
         key: db_to_python_value(value, hints[key]) if key in hints else value

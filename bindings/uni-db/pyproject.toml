@@ -65,6 +65,11 @@ dev = [
     "pytest-asyncio>=0.25.0",
     "patchelf>=0.17",
     "pytest-xdist>=3.8.0",
+    # Required by tests/test_repro_arrow_double_free.py, a Critical Arrow-FFI
+    # double-free regression guard whose child process imports pyarrow. Declared
+    # here so `uv sync --group dev` (what CI runs) makes the guard executable
+    # rather than silently error on a missing import.
+    "pyarrow>=16",
 ]
 
 [tool.black]

@@ -2162,6 +2162,7 @@ dev = [
     { name = "maturin", specifier = ">=1.0,<2.0" },
     { name = "mypy", specifier = ">=1.0.0" },
     { name = "patchelf", specifier = ">=0.17" },
+    { name = "pyarrow", specifier = ">=16" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.25.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },

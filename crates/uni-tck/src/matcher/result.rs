@@ -247,7 +247,18 @@ fn floats_equal(a: f64, b: f64) -> bool {
     (a - b).abs() < FLOAT_EPSILON
 }
 
-/// Generate a sort key for a value to enable deterministic list ordering.
+/// Generate a content-distinguishing sort key for a value.
+///
+/// This key drives the order-independent list comparison in
+/// [`values_equal_inner`]: both lists are sorted by this key and then zipped
+/// element-wise, so two values that are equal under [`values_equal_inner`] MUST
+/// produce the same key (otherwise permuted-but-equal elements fail to align).
+///
+/// The key encodes structural content, not identity: node/edge/path keys omit
+/// vids, eids and label ordering (mirroring `nodes_equal`/`edges_equal`), and
+/// list/map keys are built order-independently so that permutations collapse to
+/// the same key — consistent with the recursive `ignore_list_order` policy under
+/// which this key is used.
 fn value_sort_key(v: &Value) -> String {
     match v {
         Value::Null => "0:null".to_string(),
@@ -256,15 +267,57 @@ fn value_sort_key(v: &Value) -> String {
         Value::Float(f) => format!("3:{:020.10}", f),
         Value::String(s) => format!("4:{}", s),
         Value::Bytes(b) => format!("5:{:?}", b),
-        Value::List(l) => format!("6:len={}", l.len()),
-        Value::Map(m) => format!("7:len={}", m.len()),
-        Value::Node(_) => "8:node".to_string(),
-        Value::Edge(_) => "9:edge".to_string(),
-        Value::Path(_) => "A:path".to_string(),
+        Value::List(l) => {
+            // Order-independent: sort child keys so permuted lists collapse.
+            let mut inner: Vec<String> = l.iter().map(value_sort_key).collect();
+            inner.sort();
+            format!("6:[{}]", inner.join("\u{1f}"))
+        }
+        Value::Map(m) => format!("7:{{{}}}", map_sort_key(m)),
+        Value::Node(n) => format!("8:{}", node_sort_key(n)),
+        Value::Edge(e) => format!("9:{}", edge_sort_key(e)),
+        Value::Path(p) => format!("A:{}", path_sort_key(p)),
         Value::Temporal(t) => format!("C:{}", t),
-        Value::Vector(v) => format!("B:len={}", v.len()),
+        Value::Vector(v) => {
+            // Vectors compare element-wise, so preserve element order.
+            let inner: Vec<String> = v.iter().map(|f| format!("{:020.10}", f)).collect();
+            format!("B:[{}]", inner.join("\u{1f}"))
+        }
         _ => "Z:unknown".to_string(),
     }
+}
+
+/// Order-independent sort key for a property map: sorted `key=value` entries.
+fn map_sort_key(m: &HashMap<String, Value>) -> String {
+    let mut entries: Vec<String> = m
+        .iter()
+        .map(|(k, val)| format!("{}={}", k, value_sort_key(val)))
+        .collect();
+    entries.sort();
+    entries.join("\u{1e}")
+}
+
+/// Sort key for a node: sorted labels plus its property map, excluding vid.
+fn node_sort_key(n: &Node) -> String {
+    let mut labels = n.labels.clone();
+    labels.sort();
+    format!(
+        "labels=[{}];props={{{}}}",
+        labels.join(","),
+        map_sort_key(&n.properties)
+    )
+}
+
+/// Sort key for an edge: its type plus property map, excluding eid/src/dst.
+fn edge_sort_key(e: &Edge) -> String {
+    format!("type={};props={{{}}}", e.edge_type, map_sort_key(&e.properties))
+}
+
+/// Sort key for a path: the ordered node and edge content keys.
+fn path_sort_key(p: &Path) -> String {
+    let nodes: Vec<String> = p.nodes.iter().map(node_sort_key).collect();
+    let edges: Vec<String> = p.edges.iter().map(edge_sort_key).collect();
+    format!("nodes=[{}];edges=[{}]", nodes.join("|"), edges.join("|"))
 }
 
 /// Compare two property maps for equality (order-agnostic), recursing with the

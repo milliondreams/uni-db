@@ -25,6 +25,31 @@ fn split_time_of_day(nanos_since_midnight: i64) -> (i64, i64, i64, i64) {
     (hour, minute, second, microsecond)
 }
 
+/// Wall-clock nanoseconds since the Unix epoch for a Python date/datetime.
+///
+/// Treats the object's naive calendar and clock components as if they were UTC,
+/// using exact integer arithmetic. This matches the Uni core's
+/// `LocalDateTime.nanos_since_epoch` semantics (wall-clock-as-if-UTC) and avoids
+/// both the local-timezone shift and the f64 precision loss of `.timestamp()`.
+///
+/// # Errors
+///
+/// Returns an error if any component attribute cannot be read from `dt`.
+fn wall_clock_nanos_since_epoch(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let ordinal: i64 = dt.call_method0("toordinal")?.extract()?;
+    let epoch_ordinal: i64 = 719163; // date(1970, 1, 1).toordinal()
+    let days = ordinal - epoch_ordinal;
+    let hour: i64 = dt.getattr("hour")?.extract()?;
+    let minute: i64 = dt.getattr("minute")?.extract()?;
+    let second: i64 = dt.getattr("second")?.extract()?;
+    let microsecond: i64 = dt.getattr("microsecond")?.extract()?;
+    Ok(days * 86_400_000_000_000
+        + hour * 3_600_000_000_000
+        + minute * 60_000_000_000
+        + second * 1_000_000_000
+        + microsecond * 1_000)
+}
+
 /// Build a Python `datetime.timezone` with the given UTC offset in seconds.
 fn fixed_timezone<'py>(
     py: Python<'py>,
@@ -147,13 +172,16 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                     Ok(result.into_py_any(py)?)
                 }
                 TemporalValue::LocalDateTime { nanos_since_epoch } => {
-                    let secs = nanos_since_epoch / 1_000_000_000;
-                    let micros = (nanos_since_epoch % 1_000_000_000) / 1_000;
+                    // Wall-clock-as-UTC: rebuild the naive datetime with exact
+                    // integer arithmetic (`epoch + timedelta(microseconds=..)`),
+                    // never `fromtimestamp`, which applies the host's local
+                    // timezone and loses precision through f64 scaling.
+                    let total_micros = nanos_since_epoch.div_euclid(1_000);
                     let dt_class = datetime_module.getattr("datetime")?;
-                    let result = dt_class.call_method1(
-                        "fromtimestamp",
-                        (secs as f64 + micros as f64 / 1_000_000.0,),
-                    )?;
+                    let td_class = datetime_module.getattr("timedelta")?;
+                    let epoch = dt_class.call1((1970, 1, 1))?;
+                    let delta = td_class.call1((0i64, 0i64, total_micros))?;
+                    let result = epoch.call_method1("__add__", (delta,))?;
                     Ok(result.into_py_any(py)?)
                 }
                 TemporalValue::DateTime {
@@ -161,14 +189,18 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                     offset_seconds,
                     ..
                 } => {
-                    let secs = nanos_since_epoch / 1_000_000_000;
-                    let micros = (nanos_since_epoch % 1_000_000_000) / 1_000;
+                    // True UTC instant: build the aware UTC datetime from the
+                    // exact microsecond offset, then convert into the stored
+                    // fixed offset for local rendering. Integer arithmetic only.
+                    let total_micros = nanos_since_epoch.div_euclid(1_000);
                     let tz = fixed_timezone(py, &datetime_module, *offset_seconds)?;
                     let dt_class = datetime_module.getattr("datetime")?;
-                    let result = dt_class.call_method1(
-                        "fromtimestamp",
-                        (secs as f64 + micros as f64 / 1_000_000.0, tz),
-                    )?;
+                    let td_class = datetime_module.getattr("timedelta")?;
+                    let utc_tz = datetime_module.getattr("timezone")?.getattr("utc")?;
+                    let epoch_utc = dt_class.call1((1970, 1, 1, 0, 0, 0, 0, utc_tz))?;
+                    let delta = td_class.call1((0i64, 0i64, total_micros))?;
+                    let instant_utc = epoch_utc.call_method1("__add__", (delta,))?;
+                    let result = instant_utc.call_method1("astimezone", (tz,))?;
                     Ok(result.into_py_any(py)?)
                 }
                 TemporalValue::Duration {
@@ -245,7 +277,12 @@ pub fn py_object_to_json(py: Python, obj: &Py<PyAny>) -> PyResult<serde_json::Va
         return Ok(serde_json::Value::Object(map));
     }
 
-    Ok(serde_json::Value::Null)
+    // Unrecognized Python types must NOT be silently coerced to JSON `null`
+    // (that would drop the caller's data without warning). Raise `TypeError`.
+    let type_name = bound.get_type().name()?;
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "cannot convert Python object of type '{type_name}' to JSON"
+    )))
 }
 
 /// Convert a serde_json::Value to a Python object.
@@ -296,21 +333,29 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
     let time_class = datetime_module.getattr("time")?;
 
     if bound.is_instance(&datetime_class)? {
-        let timestamp_secs: f64 = bound.call_method0("timestamp")?.extract()?;
-        let nanos = (timestamp_secs * 1_000_000_000.0) as i64;
+        // Wall-clock nanoseconds from the calendar/clock components, computed
+        // with exact integer arithmetic (never Python's local-timezone-dependent
+        // `.timestamp()`, which both shifts naive values by the host offset and
+        // loses microsecond precision through f64 scaling at modern epochs).
+        let wall_nanos = wall_clock_nanos_since_epoch(bound)?;
         let tzinfo = bound.getattr("tzinfo")?;
         if tzinfo.is_none() {
+            // Naive: the wall-clock reading is stored as-if-UTC, matching the
+            // core's `LocalDateTime.nanos_since_epoch` semantics.
             return Ok(Value::Temporal(TemporalValue::LocalDateTime {
-                nanos_since_epoch: nanos,
+                nanos_since_epoch: wall_nanos,
             }));
         } else {
+            // Aware: `DateTime.nanos_since_epoch` is the true UTC instant, i.e.
+            // the local wall-clock minus the UTC offset.
             let utcoffset = bound.call_method0("utcoffset")?;
             let offset_seconds: i32 =
                 utcoffset.call_method0("total_seconds")?.extract::<f64>()? as i32;
             let tz_name: Option<String> =
                 bound.call_method0("tzname")?.extract::<Option<String>>()?;
+            let instant_nanos = wall_nanos - (offset_seconds as i64) * 1_000_000_000;
             return Ok(Value::Temporal(TemporalValue::DateTime {
-                nanos_since_epoch: nanos,
+                nanos_since_epoch: instant_nanos,
                 offset_seconds,
                 timezone_name: tz_name,
             }));
@@ -342,7 +387,9 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
                 nanos_since_midnight: nanos,
             }));
         } else {
-            let utcoffset = bound.call_method1("utcoffset", (py.None(),))?;
+            // `datetime.time.utcoffset()` takes NO arguments (unlike
+            // `datetime.datetime.utcoffset()`); passing one raises `TypeError`.
+            let utcoffset = bound.call_method0("utcoffset")?;
             let offset_seconds: i32 =
                 utcoffset.call_method0("total_seconds")?.extract::<f64>()? as i32;
             return Ok(Value::Temporal(TemporalValue::Time {
@@ -413,7 +460,12 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
         return Ok(Value::Map(map));
     }
 
-    Ok(Value::Null)
+    // Unrecognized Python types must NOT be silently coerced to `Value::Null`
+    // (that would drop the caller's data without warning). Raise `TypeError`.
+    let type_name = bound.get_type().name()?;
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "cannot convert Python object of type '{type_name}' to a Uni value"
+    )))
 }
 
 /// Convert Python params dict to Rust params.

@@ -308,15 +308,23 @@ pub async fn xervo_generate_core(
 ) -> Result<::uni_db::api::xervo::GenerationResult, UniError> {
     use ::uni_db::api::xervo::{GenerationOptions, Message};
     let xervo = db.xervo();
+    // Map each role explicitly and reject anything unrecognized. Silently
+    // coercing an unknown role (a typo, or an unsupported role like "tool") to
+    // `user` would misattribute the turn and corrupt the conversation.
     let rust_messages: Vec<Message> = messages
         .into_iter()
         .map(|(role, content)| match role.as_str() {
-            "user" => Message::user(content),
-            "assistant" => Message::assistant(content),
-            "system" => Message::system(content),
-            _ => Message::user(content),
+            "user" => Ok(Message::user(content)),
+            "assistant" => Ok(Message::assistant(content)),
+            "system" => Ok(Message::system(content)),
+            _ => Err(UniError::InvalidArgument {
+                arg: "role".to_string(),
+                message: format!(
+                    "unknown message role '{role}'; expected 'user', 'assistant', or 'system'"
+                ),
+            }),
         })
-        .collect();
+        .collect::<Result<Vec<Message>, UniError>>()?;
     let opts = GenerationOptions {
         max_tokens,
         temperature,

@@ -47,8 +47,12 @@ impl Algorithm for AllPairsShortestPath {
                     dijkstra_distances(graph, s)
                         .into_iter()
                         .enumerate()
-                        // Skip the source itself (0.0) and unreachable (INF).
-                        .filter(|&(_, dist)| dist.is_finite() && dist > 0.0)
+                        // Skip the source itself (by slot index, NOT by a
+                        // `dist > 0.0` test) and any unreachable target (INF).
+                        // Filtering on `dist > 0.0` would also wrongly drop a
+                        // genuinely reachable target whose shortest-path weight
+                        // is exactly 0.0 (e.g. a zero-weight edge).
+                        .filter(|&(tgt, dist)| tgt as u32 != s && dist.is_finite())
                         .map(|(tgt, dist)| (src_vid, graph.to_vid(tgt as u32), dist))
                         .collect()
                 } else {

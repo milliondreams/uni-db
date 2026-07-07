@@ -9,9 +9,41 @@
 
 use crate::algo::GraphProjection;
 use crate::algo::algorithms::Algorithm;
-use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use uni_common::core::id::Vid;
+
+/// Min-heap entry keyed by A* f-score, ordered with a total float order.
+///
+/// A* heuristics may be negative, so the previous `f64::to_bits()` key
+/// mis-ordered negative f-scores (their sign bit sorts them as huge
+/// magnitudes). Ordering via [`f64::total_cmp`] instead gives the correct
+/// numeric priority across all finite (and non-finite) f-scores. The `cmp`
+/// is reversed so the [`BinaryHeap`] (a max-heap) pops the SMALLEST f-score
+/// first; ties break on slot for determinism.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeapEntry {
+    f_score: f64,
+    slot: u32,
+}
+
+impl Eq for HeapEntry {}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse the f-score comparison so the smallest f-score is treated as
+        // the greatest element and popped first by the max-heap.
+        other
+            .f_score
+            .total_cmp(&self.f_score)
+            .then_with(|| self.slot.cmp(&other.slot))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub struct AStar;
 
@@ -85,12 +117,14 @@ impl Algorithm for AStar {
         let h_source = config.heuristic.get(&config.source).copied().unwrap_or(0.0);
         let f_source = 0.0 + h_source;
 
-        heap.push(Reverse((f_source.to_bits(), source_slot)));
+        heap.push(HeapEntry {
+            f_score: f_source,
+            slot: source_slot,
+        });
 
         let mut visited_count = 0;
 
-        while let Some(Reverse((f_bits, u))) = heap.pop() {
-            let f_current = f64::from_bits(f_bits);
+        while let Some(HeapEntry { f_score: f_current, slot: u }) = heap.pop() {
 
             // If we reached the target, we are done (if heuristic is consistent/monotone).
             // A* with consistent heuristic guarantees optimal path first time target is popped.
@@ -151,7 +185,10 @@ impl Algorithm for AStar {
                         .unwrap_or(0.0);
                     let f_v = tentative_g + h_v;
 
-                    heap.push(Reverse((f_v.to_bits(), v)));
+                    heap.push(HeapEntry {
+                        f_score: f_v,
+                        slot: v,
+                    });
                 }
             }
         }

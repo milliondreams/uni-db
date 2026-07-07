@@ -46,6 +46,7 @@ impl Algorithm for Betweenness {
 
         // Determine source nodes (all or sample)
         let mut sources: Vec<u32> = (0..n as u32).collect();
+        let mut sampled = false;
         if let Some(size) = config.sampling_size
             && size < n
         {
@@ -53,6 +54,7 @@ impl Algorithm for Betweenness {
             let mut rng = rand::rng();
             sources.shuffle(&mut rng);
             sources.truncate(size);
+            sampled = true;
         }
 
         // Parallel execution of Brandes' algorithm
@@ -120,6 +122,21 @@ impl Algorithm for Betweenness {
                     a
                 },
             );
+
+        // Rescale sampled estimates by n/k (Brandes-Pich estimator). Summing
+        // per-source contributions over only k < n sampled sources yields an
+        // estimate biased low by k/n; multiplying by n/k makes it unbiased.
+        // This MUST happen before normalization so the normalizer scales the
+        // corrected totals.
+        if sampled {
+            let k = sources.len();
+            if k > 0 {
+                let scale = n as f64 / k as f64;
+                for score in cb.iter_mut() {
+                    *score *= scale;
+                }
+            }
+        }
 
         // Normalize
         if config.normalize && n > 2 {

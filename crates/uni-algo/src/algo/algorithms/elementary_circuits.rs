@@ -135,6 +135,13 @@ fn circuit(u: u32, start_node: u32, ctx: &mut CircuitCtx) -> bool {
     ctx.stack.push(vid);
     ctx.blocked.insert(u);
     let mut found = false;
+    // Tracks whether a valid neighbor went unexplored SOLELY because the
+    // `max_length` depth bound was hit. In depth-bounded Johnson's algorithm,
+    // a node reached only via a too-deep path has not been proven to lack an
+    // in-budget cycle, so it must not stay blocked — otherwise a shorter cycle
+    // reaching it via a different route is silently missed. Unblocking is always
+    // safe (it only costs extra work), whereas over-blocking loses cycles.
+    let mut truncated = false;
 
     // Neighbors in SCC
     for &v in ctx.graph.out_neighbors(u) {
@@ -149,15 +156,19 @@ fn circuit(u: u32, start_node: u32, ctx: &mut CircuitCtx) -> bool {
                 *ctx.count += 1;
                 found = true;
             }
-        } else if !ctx.blocked.contains(&v)
-            && ctx.stack.len() < ctx.config.max_length
-            && circuit(v, start_node, ctx)
-        {
-            found = true;
+        } else if !ctx.blocked.contains(&v) {
+            if ctx.stack.len() < ctx.config.max_length {
+                if circuit(v, start_node, ctx) {
+                    found = true;
+                }
+            } else {
+                // Could not descend into `v` only because of the depth bound.
+                truncated = true;
+            }
         }
     }
 
-    if found {
+    if found || truncated {
         unblock(u, ctx.blocked, ctx.block_map);
     } else {
         for &v in ctx.graph.out_neighbors(u) {

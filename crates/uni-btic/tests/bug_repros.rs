@@ -30,20 +30,14 @@ fn repro_hour_granularity_datetime_never_parses() {
         "minute-anchored literal should parse; got {minute:?}"
     );
 
-    // BUG: expected Ok(Granularity::Hour), got Err (repro for parse.rs:174).
-    assert!(
-        result.is_err(),
-        "hour-only literal currently fails to parse; observed {result:?}"
+    // FIXED (parse.rs): an hour-only literal parses, anchored to minute 0, and
+    // reports `Granularity::Hour`.
+    let b = result.expect("hour-only literal must parse");
+    assert_eq!(
+        b.lo_granularity(),
+        uni_btic::Granularity::Hour,
+        "hour-only literal must report Hour granularity"
     );
-    let err = format!("{:?}", result.unwrap_err());
-    assert!(
-        err.contains("cannot parse datetime"),
-        "expected 'cannot parse datetime' error, got: {err}"
-    );
-
-    // Correct behavior (uncomment once fixed):
-    // let b = result.unwrap();
-    // assert_eq!(b.lo_granularity(), uni_btic::Granularity::Hour);
 }
 
 /// Repro for crates/uni-btic/src/btic.rs:152

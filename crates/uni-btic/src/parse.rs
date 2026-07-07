@@ -175,7 +175,17 @@ fn parse_datetime_component(
     ];
 
     for (fmt, gran) in &formats_and_gran {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s_clean, fmt) {
+        // chrono's `NaiveDateTime::parse_from_str` cannot build a datetime from
+        // an hour-only pattern (`%Y-%m-%dT%H`): the minute field is required, so
+        // it returns `NOT_ENOUGH`. Anchor hour-granularity inputs to minute 0 by
+        // appending ":00" and parsing with the minute-precision format, while
+        // still reporting `Granularity::Hour`.
+        let (input, parse_fmt): (String, &str) = if *gran == Granularity::Hour {
+            (format!("{s_clean}:00"), "%Y-%m-%dT%H:%M")
+        } else {
+            (s_clean.to_owned(), fmt)
+        };
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(&input, parse_fmt) {
             let ms = datetime_to_ms(ndt) - (tz_offset_secs as i64) * 1_000;
             return Ok((ms, *gran, certainty));
         }

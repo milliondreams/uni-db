@@ -442,7 +442,10 @@ fn build_remove_item(pair: Pair<Rule>) -> Result<RemoveItem, ParseError> {
             let labels = labels_inner
                 .into_inner()
                 .filter(|t| matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword))
-                .map(|l| l.as_str().to_string())
+                // Strip backticks (consistent with the SET branch) so `REMOVE
+                // n:`Person`` targets the normalized label `Person` instead of a
+                // literal "`Person`" that never matches and silently no-ops.
+                .map(|l| normalize_identifier(l.as_str()))
                 .collect();
             Ok(RemoveItem::Labels {
                 variable: id,
@@ -1404,12 +1407,10 @@ fn build_map_literal(pair: Pair<Rule>) -> Result<Expr, ParseError> {
             let mut inner = p.into_inner();
             let key_pair = inner.next().unwrap();
             let key = match key_pair.as_rule() {
-                Rule::string => {
-                    // Strip quotes from string literals
-                    let s = key_pair.as_str();
-                    let content = &s[1..s.len() - 1];
-                    content.to_string()
-                }
+                // Decode escapes / doubled quotes exactly as the value path does,
+                // so `{ "a\nb": 1 }` keys on a real newline (not a literal
+                // backslash-n) and `{ 'it''s': 1 }` keys on `it's`.
+                Rule::string => build_string_literal(key_pair)?,
                 _ => key_pair.as_str().to_string(), // identifier_or_keyword
             };
             let val = build_expression(inner.next().unwrap())?;

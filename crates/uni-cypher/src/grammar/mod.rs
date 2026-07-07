@@ -111,7 +111,21 @@ fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
                     depth += 1;
                     max_depth = max_depth.max(depth);
                 } else if word.eq_ignore_ascii_case("end") {
-                    depth = (depth - 1).max(0);
+                    // `end` is a non-reserved keyword, so `end(...)` is a legal
+                    // recursive function call — NOT a `CASE` close. Treating it as
+                    // a close would cancel the following `(`'s increment, letting
+                    // `end(end(...))` recurse to native-stack exhaustion while the
+                    // counter stays near zero (under-counting the depth the parser
+                    // recurses into, which this guard must never do). Only decrement
+                    // when the word is not immediately followed (past whitespace) by
+                    // an opening paren; a real `CASE ... END` never is.
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) != Some(&b'(') {
+                        depth = (depth - 1).max(0);
+                    }
                 }
             }
             _ => i += 1,
@@ -137,10 +151,18 @@ pub fn parse(input: &str) -> Result<Query, ParseError> {
 
 pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
     check_nesting_depth(input)?;
-    let pairs =
-        CypherParser::parse(Rule::expression, input).map_err(|e| map_pest_error(input, e))?;
-
-    walker::build_expression(pairs.into_iter().next().unwrap())
+    // Parse via the SOI/EOI-anchored `standalone_expression` so the entire input
+    // must be a single complete expression; trailing garbage now errors instead
+    // of being silently dropped (callers include untrusted plugin trigger
+    // conditions and UDF bodies that rely on rejecting malformed source).
+    let pairs = CypherParser::parse(Rule::standalone_expression, input)
+        .map_err(|e| map_pest_error(input, e))?;
+    let standalone = pairs.into_iter().next().unwrap();
+    let expr = standalone
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::expression)
+        .expect("standalone_expression always wraps an expression");
+    walker::build_expression(expr)
 }
 
 pub fn parse_locy(input: &str) -> Result<LocyProgram, ParseError> {

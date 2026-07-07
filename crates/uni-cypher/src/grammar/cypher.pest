@@ -273,6 +273,11 @@ dot_dot     = { ".." }
 
 expression = { or_expression }
 
+// Anchored entry point for `parse_expression`: SOI/EOI force the whole input to
+// be a single complete expression, so trailing garbage (e.g. "n.age > 18 AND")
+// is a parse error instead of being silently discarded as an unconsumed suffix.
+standalone_expression = { SOI ~ expression ~ EOI }
+
 // OR has lowest precedence
 or_expression = { xor_expression ~ (OR ~ xor_expression)* }
 

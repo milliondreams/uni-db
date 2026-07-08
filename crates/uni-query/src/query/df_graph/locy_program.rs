@@ -1769,6 +1769,11 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(smol_str::SmolStr, String)> {
                 "COLLECT" => smol_str::SmolStr::new_static("COLLECT"),
                 "MNOR" => smol_str::SmolStr::new_static("MNOR"),
                 "MPROD" => smol_str::SmolStr::new_static("MPROD"),
+                // A dotted name is a plugin-namespaced custom aggregate
+                // (e.g. `myplugin.MYAGG`); pass it through raw (preserving
+                // case) so `resolve_locy_aggregate` resolves it by
+                // namespace. Bare unknown names remain errors (typos).
+                _ if name.contains('.') => smol_str::SmolStr::new(name.as_str()),
                 _ => {
                     return Err(datafusion::error::DataFusionError::Plan(format!(
                         "Unknown FOLD aggregate function: {}",

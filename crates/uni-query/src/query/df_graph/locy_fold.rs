@@ -88,7 +88,28 @@ pub fn resolve_locy_aggregate(
     {
         return Some(entry);
     }
-    registry.locy_aggregate(&qname)
+    if let Some(entry) = registry.locy_aggregate(&qname) {
+        return Some(entry);
+    }
+    // P0.2: plugin-namespaced custom aggregate (e.g. `myplugin.MYAGG`).
+    // The `builtin` lookup above only matches the reserved builtin
+    // namespace, so a third-party aggregate registered under its own
+    // plugin id was previously stored-but-unreachable. Resolve it the
+    // same convention-agnostic way scalars/procedures do: try each
+    // (namespace, local) split of the RAW name — not the builtin
+    // alias-canonicalized form — against session-local then instance
+    // registry, first hit wins.
+    for cand in uni_plugin::QName::candidate_splits(name) {
+        if let Some(session_pr) = crate::current_session_plugin_registry()
+            && let Some(entry) = session_pr.locy_aggregate(&cand)
+        {
+            return Some(entry);
+        }
+        if let Some(entry) = registry.locy_aggregate(&cand) {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 /// Returns a process-wide [`uni_plugin::PluginRegistry`] pre-populated with
@@ -2344,6 +2365,31 @@ mod tests {
 
         // Unknown name still returns None — the resolver does not fall back.
         assert!(resolve_locy_aggregate(&registry, "NOT_REGISTERED").is_none());
+    }
+
+    #[test]
+    fn resolve_locy_aggregate_finds_plugin_namespaced() {
+        // P0.2 regression: a third-party aggregate registered under its own
+        // plugin namespace (not `builtin`) must resolve via a dotted name.
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new("myplugin");
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+
+        let registered: Arc<dyn LocyAggregate> = Arc::new(IdentityAgg);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        r.locy_aggregate(uni_plugin::QName::new("myplugin", "MYAGG"), Arc::clone(&registered))
+            .expect("register");
+        r.commit_to_registry().expect("commit");
+
+        // Before P0.2 this returned None (builtin-only lookup); now the
+        // candidate-split fallback resolves `myplugin.MYAGG`.
+        let resolved = resolve_locy_aggregate(&registry, "myplugin.MYAGG")
+            .expect("plugin-namespaced aggregate should resolve via dotted name");
+        assert!(Arc::ptr_eq(&registered, &resolved.aggregate));
+
+        // A bare local name (no namespace) must NOT resolve — avoids
+        // cross-namespace ambiguity.
+        assert!(resolve_locy_aggregate(&registry, "MYAGG").is_none());
     }
 
     #[test]

@@ -37,9 +37,10 @@
 //! system label `_DeclaredPlugin`. Writing to that label from inside
 //! a procedure requires write-enabled
 //! [`uni_plugin::traits::procedure::ProcedureHost`] execution, which
-//! does not yet exist (the host's `execute_inner_query` is read-only
-//! and does not bind parameters — see
-//! `crates/uni-query/src/query/executor/procedure_host.rs`).
+//! now exists: `execute_inner_query` binds named parameters and runs
+//! in write mode when the host is constructed with a writer (see
+//! `crates/uni-query/src/query/executor/procedure_host.rs`). The
+//! system-label cutover is therefore unblocked but not yet wired.
 //!
 //! M9 ships persistence behind a [`persistence::Persistence`] trait
 //! with a JSON-sidecar implementation that preserves the exact

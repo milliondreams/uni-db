@@ -32,10 +32,11 @@
 //!   those keys into the per-row property bags — predicate-gated
 //!   cost, no work for property-free predicates.
 //! - `TriggerOutcome::Defer` enqueues the trigger fire into the
-//!   per-`Uni` [`DeferralQueue`] (in-memory, ticked at 50ms by the
-//!   background task spawned in `Uni::build`). Items re-fire on the
-//!   next tick; re-deferring is capped at `DEFER_MAX_ATTEMPTS`.
-//!   Restart-durable persistence lives with the M11 CDC scheduler.
+//!   per-`Uni` [`DeferralQueue`], ticked at 50ms by the background
+//!   task spawned in `Uni::build`. Items re-fire on the next tick;
+//!   re-deferring is capped at `DEFER_MAX_ATTEMPTS`. When built with
+//!   [`DeferralQueue::with_persistence`] the queue mirrors to a JSON
+//!   sidecar (FU-5) and reloads on restart via `load_from_sidecar`.
 //! - `NODE_CREATE` / `NODE_UPDATE` / `NODE_DELETE` (and the edge
 //!   analogs) are distinguished via a committed-state probe
 //!   ([`PreExistingProbe`]) passed to
@@ -1543,12 +1544,14 @@ struct DeferredItem {
 /// drained by a per-`Uni` background tick task spawned at DB build
 /// time; firing happens on the tokio runtime.
 ///
-/// **v1 limitations** (in-memory only):
-/// - Restart drops queued items. A persistent queue (system-table or
-///   WAL extension) is `TODO(M11-persist)`.
-/// - No transactional guarantee that a deferred item eventually fires
-///   — if the process exits before the scheduled instant, the item is
-///   lost.
+/// **Durability:**
+/// - By default the queue is in-memory and restart drops queued items.
+///   Built via [`DeferralQueue::with_persistence`] it mirrors every
+///   `push`/`drain_due` to a JSON sidecar (FU-5) and reloads on restart
+///   via [`DeferralQueue::load_from_sidecar`].
+/// - Even with persistence there is no transactional guarantee tying a
+///   deferred fire to the originating commit; a crash between commit and
+///   the next sidecar write can still lose an item.
 /// - Per-item retry is capped at `DEFER_MAX_ATTEMPTS` to prevent
 ///   runaway re-deferral loops.
 #[derive(Default)]

@@ -6500,6 +6500,11 @@ fn resolve_fold_bindings(
                             "COLLECT" => smol_str::SmolStr::new_static("COLLECT"),
                             "MNOR" => smol_str::SmolStr::new_static("MNOR"),
                             "MPROD" => smol_str::SmolStr::new_static("MPROD"),
+                            // Plugin-namespaced custom aggregate (dotted
+                            // name, e.g. `myplugin.MYAGG`): pass through raw
+                            // so `resolve_locy_aggregate` resolves it by
+                            // namespace. Bare unknown names remain errors.
+                            _ if name.contains('.') => smol_str::SmolStr::new(name.as_str()),
                             other => {
                                 return Err(anyhow::anyhow!(
                                     "Unsupported FOLD aggregate function: {}",

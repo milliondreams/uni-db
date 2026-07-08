@@ -494,6 +494,27 @@ mod locy_tests {
         }
     }
 
+    #[test]
+    fn test_locy_fold_plugin_namespaced_aggregate() {
+        // P0.2: a plugin-namespaced (dotted) aggregate must parse in FOLD
+        // position, carried through as a dotted FunctionCall name so the
+        // resolver can dispatch it by namespace.
+        let program = parse_locy(
+            "CREATE RULE test AS MATCH (a)-[:E]->(b) FOLD total = myplugin.MYAGG(s) YIELD a, total",
+        )
+        .unwrap();
+        if let locy_ast::LocyStatement::Rule(rule) = &program.statements[0] {
+            assert_eq!(rule.fold.len(), 1);
+            if let ast::Expr::FunctionCall { name, .. } = &rule.fold[0].aggregate {
+                assert_eq!(name, "myplugin.MYAGG", "dotted aggregate name preserved");
+            } else {
+                panic!("Expected dotted FunctionCall, got: {:?}", rule.fold[0].aggregate);
+            }
+        } else {
+            panic!("Expected Rule");
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // Step 11: BEST BY
     // ══════════════════════════════════════════════════════════════════════

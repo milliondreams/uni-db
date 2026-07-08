@@ -26,13 +26,15 @@
 //! - On shutdown the runtime calls `shutdown()` on each stream and
 //!   exits.
 //!
-//! ## v1 limitations
+//! ## Mutation delivery
 //!
-//! `CdcBatch::mutations` ships as an empty single-row `RecordBatch`
-//! today — the LSN advancement, ordering, and checkpoint round-trip
-//! are the parts under test. Filling the batch with the actual
-//! mutation rows uses the same machinery as
-//! `crate::triggers::MutationEvents` and is tracked as a follow-up.
+//! `CdcBatch::mutations` carries the actual committed mutation rows:
+//! the broadcaster pre-materializes the RecordBatch on `CommitNotification`
+//! when at least one `CdcOutputProvider` is registered (FU-4), using the
+//! same machinery as `crate::triggers::MutationEvents`. An empty batch
+//! (matching the canonical event-row schema) is delivered only as a
+//! fallback when a commit carried zero rows or a provider registered
+//! mid-commit (picked up on the next commit).
 
 // Rust guideline compliant
 

@@ -25,7 +25,7 @@ use uni_plugin::traits::trigger::{
 };
 use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar, PluginRegistry};
 
-use uni_plugin_host::triggers::{DeferralQueue, MutationEvents, TriggerRouter};
+use uni_plugin_host::triggers::{DeferralQueue, EcQueue, MutationEvents, TriggerRouter};
 
 /// Configurable test trigger. `fire` returns the configured outcome;
 /// `on_deferred` records that the deferred item actually fired (proving
@@ -110,8 +110,14 @@ fn deferred_trigger_fires_for_aborted_transaction() {
     r.commit_to_registry().unwrap();
 
     let queue = DeferralQueue::new();
+    let ec_queue = EcQueue::new(
+        Some(Arc::clone(&queue)),
+        std::time::Duration::from_secs(1),
+        10_000,
+    );
     let router =
-        TriggerRouter::from_registry_with_queue(&registry, Some(Arc::clone(&queue))).unwrap();
+        TriggerRouter::from_registry_with_queue(&registry, Some(Arc::clone(&queue)), ec_queue)
+            .unwrap();
 
     // Build a mutation-event log with one vertex write (→ NODE_UPDATE).
     let mut l0 = L0Buffer::new(0, None);

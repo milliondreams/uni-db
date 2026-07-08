@@ -25,7 +25,7 @@ use uni_plugin::traits::trigger::{
 };
 use uni_plugin::{Capability, CapabilitySet, PluginId, PluginRegistrar, PluginRegistry};
 
-use uni_plugin_host::triggers::{DeferralQueue, MutationEvents, TriggerRouter};
+use uni_plugin_host::triggers::{DeferralQueue, EcQueue, MutationEvents, TriggerRouter};
 
 struct TestTrigger {
     sub: TriggerSubscription,
@@ -110,8 +110,14 @@ fn persisted_deferral_misroutes_to_first_colliding_trigger() {
     // writes a sidecar row with name = subscription_name(B) = "shared".
     {
         let queue = DeferralQueue::with_persistence(data_path.clone());
+        let ec_queue = EcQueue::new(
+            Some(Arc::clone(&queue)),
+            std::time::Duration::from_secs(1),
+            10_000,
+        );
         let router =
-            TriggerRouter::from_registry_with_queue(&registry, Some(Arc::clone(&queue))).unwrap();
+            TriggerRouter::from_registry_with_queue(&registry, Some(Arc::clone(&queue)), ec_queue)
+                .unwrap();
 
         let mut l0 = L0Buffer::new(0, None);
         let mut props = HashMap::new();

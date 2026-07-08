@@ -968,6 +968,7 @@ impl Transaction {
         let trigger_router = TriggerRouter::from_registry_with_queue(
             &self.db.plugin_registry,
             Some(Arc::clone(&self.db.defer_queue)),
+            Arc::clone(&self.db.ec_queue),
         )?;
 
         // M11 FU-4: CDC subscribers also need per-row mutation events,

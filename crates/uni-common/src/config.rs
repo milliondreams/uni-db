@@ -637,6 +637,21 @@ pub struct UniConfig {
     /// Defaults to `true` because silent lost updates are a correctness hazard
     /// for any concurrent-writer workload.
     pub ssi_enabled: bool,
+
+    /// Max wall-clock time an `EventualConsistency` trigger's coalescing
+    /// bucket may accumulate before it is flushed as a single batched fire
+    /// (default: 1s). The per-`Uni` deferral tick drains buckets whose
+    /// oldest pending batch is older than this. Lower = fresher fires,
+    /// higher = more coalescing per fire. See [`FireMode::EventualConsistency`].
+    pub ec_flush_interval: Duration,
+
+    /// Row count at which an `EventualConsistency` trigger's coalescing
+    /// bucket flushes early, before `ec_flush_interval` elapses (default:
+    /// 10_000). A bucket whose accumulated rows reach this threshold is
+    /// drained on the next tick regardless of age; a bucket that overshoots
+    /// `4 ×` this cap is force-drained inline at enqueue time (back-pressure)
+    /// so an in-flight commit's coalescing buffer can never grow unbounded.
+    pub ec_flush_threshold: usize,
 }
 
 impl Default for UniConfig {
@@ -705,6 +720,11 @@ impl Default for UniConfig {
             // writers now observe aborts instead of silent lost updates;
             // wrap them in `Session::transact_with_retry`).
             ssi_enabled: true,
+            // EventualConsistency coalescing (WS-E): default to a 1s window
+            // and a 10k-row early-flush threshold, mirroring the L0
+            // auto-flush knobs so operators reason about them together.
+            ec_flush_interval: Duration::from_secs(1),
+            ec_flush_threshold: 10_000,
         }
     }
 }

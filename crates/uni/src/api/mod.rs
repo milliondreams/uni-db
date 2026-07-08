@@ -532,6 +532,13 @@ pub struct UniInner {
     /// task spawned in `Uni::build` drives this queue; the trigger
     /// router pushes to it on `Defer`.
     pub(crate) defer_queue: Arc<crate::api::triggers::DeferralQueue>,
+    /// WS-E: per-`Uni` EventualConsistency coalescing queue. Buffers
+    /// `FireMode::EventualConsistency` after-phase fires into per-trigger
+    /// buckets and flushes a single coalesced `DeferredItem` per bucket on
+    /// the shared deferral tick. Shared by `Arc` into each commit's
+    /// (ephemeral) `TriggerRouter`, exactly like `defer_queue`; coalesced
+    /// work rides `defer_queue`'s durability, so this needs no sidecar.
+    pub(crate) ec_queue: Arc<crate::api::triggers::EcQueue>,
     /// M11 background-job scheduler host. Owns the
     /// [`uni_plugin::scheduler::Scheduler`] primitive that the
     /// `uni.periodic.*` procedures register jobs against. Driver task
@@ -821,6 +828,7 @@ impl UniInner {
             plugin_registry: self.plugin_registry.clone(),
             plugins: self.plugins.clone(),
             defer_queue: self.defer_queue.clone(),
+            ec_queue: self.ec_queue.clone(),
             scheduler_host: Arc::clone(&self.scheduler_host),
             shutdown_handle: Arc::new(ShutdownHandle::new(Duration::from_secs(30))),
             locy_rule_registry,
@@ -3809,6 +3817,17 @@ impl UniBuilder {
         // `add_plugin`s above this point.
         let _restored = defer_queue.load_from_sidecar(&plugin_registry);
 
+        // WS-E: per-`Uni` EventualConsistency coalescing queue. Wired to
+        // the shared `defer_queue` (coalesced fires + back-pressure drains
+        // push there) and configured from the flush knobs. Buckets survive
+        // across per-commit router rebuilds because this `Arc` lives on
+        // `UniInner`.
+        let ec_queue = crate::api::triggers::EcQueue::new(
+            Some(Arc::clone(&defer_queue)),
+            self.config.ec_flush_interval,
+            self.config.ec_flush_threshold,
+        );
+
         // FU-4: spawn the CDC runtime. Snapshots registered CDC
         // providers, resumes each from its last persisted LSN, and
         // forwards every commit notification as a `CdcBatch`.
@@ -3820,12 +3839,18 @@ impl UniBuilder {
         );
         {
             let queue = Arc::clone(&defer_queue);
+            // WS-E: reuse the one 50ms deferral timer to also flush due
+            // EventualConsistency coalescing buckets — no second task.
+            let ec = Arc::clone(&ec_queue);
             let mut shutdown_rx = shutdown_handle.subscribe();
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => { queue.tick(); }
+                        _ = ticker.tick() => {
+                            ec.flush_due(std::time::Instant::now());
+                            queue.tick();
+                        }
                         _ = shutdown_rx.recv() => { break; }
                     }
                 }
@@ -3932,6 +3957,7 @@ impl UniBuilder {
                 plugin_registry,
                 plugins: Arc::new(parking_lot::RwLock::new(HashMap::new())),
                 defer_queue,
+                ec_queue,
                 scheduler_host: Arc::clone(&scheduler_host),
                 shutdown_handle,
                 locy_rule_registry: Arc::new(std::sync::RwLock::new(loaded_locy_registry)),

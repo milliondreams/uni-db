@@ -1517,11 +1517,54 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             .iter()
             .map(|(k, v)| (k.clone(), v.rows.clone()))
             .collect();
+
+        // Enrichment resolves each vid by running `MATCH (n) WHERE id(n) IN [...]`.
+        // It MUST read through the same hypothetical `locy_l0` overlay the fixpoint
+        // just used — otherwise a node created only inside this ASSUME/ABDUCE block
+        // (which lives in the forked overlay, not base storage) is not found, the
+        // vid stays a bare `Value::Int`, and any predicate reading its properties
+        // (e.g. `QUERY ... WHERE b.name = 'B'`) evaluates `Int.name` → NULL and
+        // silently drops the row. Rebuild an overlay-aware context mirroring the
+        // command-dispatch path (`dispatch`/`execute_pattern`).
+        let enrich_storage = self.effective_storage();
+        let enrich_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext> = {
+            let tx_l0_for_ctx = self
+                .locy_l0
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| self.tx_l0_override.clone());
+            if (tx_l0_for_ctx.is_some() || self.read_snapshot.is_some())
+                && let Some(writer) = self.db.writer.as_ref()
+            {
+                let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
+                    Some(snap) => (snap.main.clone(), snap.extra.clone()),
+                    None => (
+                        writer.l0_manager.get_current(),
+                        writer.l0_manager.get_pending_flush(),
+                    ),
+                };
+                let l0_ctx = uni_query::query::df_graph::L0Context {
+                    current_l0: Some(current_l0),
+                    transaction_l0: tx_l0_for_ctx,
+                    pending_flush_l0s,
+                };
+                Arc::new(
+                    uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                        enrich_storage.clone(),
+                        l0_ctx,
+                        self.graph_ctx.property_manager().clone(),
+                    ),
+                )
+            } else {
+                self.graph_ctx.clone()
+            }
+        };
         let enriched = enrich_vids_with_nodes(
             self.db,
             &native_store,
             store_rows,
-            &self.graph_ctx,
+            &enrich_ctx,
             &self.session_ctx,
         )
         .await;

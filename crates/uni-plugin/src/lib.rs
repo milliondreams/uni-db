@@ -2,9 +2,9 @@
 //!
 //! `uni-plugin` defines the trait surface, registry, manifest, and capability
 //! model that every uni-db extension — scalar function, aggregate, procedure,
-//! storage backend, index kind, graph algorithm, CRDT, hook, trigger, background
-//! job, logical type, auth provider, authz policy, connector, collation, CDC
-//! output, catalog, replacement scan, Pregel program — registers through.
+//! per-label storage, index kind, graph algorithm, CRDT, hook, trigger, background
+//! job, logical type, auth provider, authz policy, collation, CDC
+//! output, catalog, replacement scan — registers through.
 //!
 //! The crate intentionally has **no host integration**: it does not depend on
 //! `uni-query`, `uni-store`, `uni-crdt`, `uni-algo`, or `uni`. Those crates

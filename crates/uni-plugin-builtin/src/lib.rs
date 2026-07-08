@@ -122,7 +122,6 @@ impl BuiltinPlugin {
             Capability::Authz,
             Capability::Collation,
             Capability::Catalog,
-            Capability::Connector,
             Capability::Cdc,
         ])
     }
@@ -145,7 +144,6 @@ impl Plugin for BuiltinPlugin {
         scalar_fns::register_into(r)?;
         locy_aggregates::register_into(r)?;
         procedures::register_into(r)?;
-        storage::register_into(r)?;
         crdts::register_into(r)?;
         collations::register_into(r)?;
         hooks::register_into(r)?;

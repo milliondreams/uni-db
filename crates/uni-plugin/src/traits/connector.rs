@@ -1,38 +1,4 @@
-//! Wire-protocol connector plugins.
-
-use crate::errors::FnError;
-
-/// Free-form connector configuration (JSON-encoded).
-#[derive(Clone, Debug, Default)]
-pub struct ConnectorConfig {
-    /// JSON config payload.
-    pub config_json: String,
-}
-
-/// Opaque handle returned by [`Connector::start`].
-#[derive(Clone, Copy, Debug)]
-pub struct ConnectorHandle(pub u64);
-
-/// A wire-protocol connector — Bolt, GraphQL, REST, etc.
-pub trait Connector: Send + Sync {
-    /// Protocol name (`"bolt"`, `"graphql"`, …).
-    fn protocol(&self) -> &str;
-
-    /// Start the connector with the given configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] if the connector cannot start (bind failure,
-    /// missing dependency).
-    fn start(&self, cfg: ConnectorConfig) -> Result<ConnectorHandle, FnError>;
-
-    /// Stop the connector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] if the shutdown fails.
-    fn stop(&self, handle: ConnectorHandle) -> Result<(), FnError>;
-}
+//! Authentication and authorization plugins.
 
 /// Authentication credentials presented to an `AuthProvider`.
 #[derive(Clone, Debug)]

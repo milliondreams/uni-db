@@ -1,77 +1,28 @@
 //! Built-in reference impls for the remaining M5 surface traits:
-//! `Connector`, `CdcOutputProvider`, `CatalogProvider`,
-//! `ReplacementScanProvider`. Each is a minimal-but-real
-//! implementation suitable for tests, the conformance suite, and as
-//! the authoring template user plugins follow.
+//! `CdcOutputProvider`, `CatalogProvider`, `ReplacementScanProvider`.
+//! Each is a minimal-but-real implementation suitable for tests, the
+//! conformance suite, and as the authoring template user plugins follow.
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use uni_plugin::traits::catalog::{
     CatalogEdgeType, CatalogLabel, CatalogProvider, CatalogTable, Replacement, ReplacementRequest,
     ReplacementScanProvider,
 };
 use uni_plugin::traits::cdc::{CdcBatch, CdcLsn, CdcOutputProvider, CdcStartContext, CdcStream};
-use uni_plugin::traits::connector::{Connector, ConnectorConfig, ConnectorHandle};
 use uni_plugin::{FnError, PluginError, PluginRegistrar};
 
-/// Register the reference impls for `connector`, `cdc-output`,
-/// `catalog`, `replacement-scan` surfaces.
+/// Register the reference impls for `cdc-output`, `catalog`,
+/// `replacement-scan` surfaces.
 ///
 /// # Errors
 ///
 /// Returns [`PluginError`] on registration failure.
 pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
-    r.connector(Arc::new(NoopConnector::new()))?;
     r.cdc_output(Arc::new(MemoryCdcOutputProvider))?;
     r.catalog(Arc::new(EmptyCatalog::new("builtin")))?;
     r.replacement_scan(Arc::new(NeverReplacementScan))?;
     Ok(())
-}
-
-// =========================================================================
-// Connector — noop reference impl
-// =========================================================================
-
-/// `Connector` reference impl — no-op connector with a `noop` protocol.
-///
-/// Useful as a registration test fixture and as the authoring template
-/// for real connectors (Bolt, GraphQL, etc.). Real connectors spawn a
-/// server task in `start()` and signal it to drain in `stop()`.
-#[derive(Debug)]
-pub struct NoopConnector {
-    next_id: Mutex<u64>,
-}
-
-impl Default for NoopConnector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NoopConnector {
-    /// Construct.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            next_id: Mutex::new(1),
-        }
-    }
-}
-
-impl Connector for NoopConnector {
-    fn protocol(&self) -> &str {
-        "noop"
-    }
-    fn start(&self, _cfg: ConnectorConfig) -> Result<ConnectorHandle, FnError> {
-        let mut id = self.next_id.lock();
-        let h = *id;
-        *id = id.saturating_add(1);
-        Ok(ConnectorHandle(h))
-    }
-    fn stop(&self, _handle: ConnectorHandle) -> Result<(), FnError> {
-        Ok(())
-    }
 }
 
 // =========================================================================
@@ -187,23 +138,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
     use std::time::SystemTime;
-
-    #[test]
-    fn noop_connector_protocol_is_noop() {
-        let c = NoopConnector::new();
-        assert_eq!(c.protocol(), "noop");
-    }
-
-    #[test]
-    fn noop_connector_start_returns_monotonic_handles() {
-        let c = NoopConnector::new();
-        let cfg = ConnectorConfig::default();
-        let h1 = c.start(cfg.clone()).unwrap();
-        let h2 = c.start(cfg.clone()).unwrap();
-        assert!(h2.0 > h1.0);
-        c.stop(h1).unwrap();
-        c.stop(h2).unwrap();
-    }
 
     fn make_cdc_batch(start: u64, end: u64) -> CdcBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(

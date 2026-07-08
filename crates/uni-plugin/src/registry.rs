@@ -17,20 +17,19 @@ use crate::errors::PluginError;
 use crate::plugin::PluginId;
 use crate::qname::QName;
 use crate::traits::aggregate::{AggSignature, AggregatePluginFn};
-use crate::traits::algorithm::{AlgorithmProvider, PregelProgramProvider};
+use crate::traits::algorithm::AlgorithmProvider;
 use crate::traits::background::BackgroundJobProvider;
 use crate::traits::catalog::{CatalogProvider, ReplacementScanProvider};
 use crate::traits::cdc::CdcOutputProvider;
 use crate::traits::collation::CollationProvider;
-use crate::traits::connector::{AuthProvider, AuthzPolicy, Connector};
+use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::{CrdtKind, CrdtKindProvider};
 use crate::traits::hook::SessionHook;
 use crate::traits::index::{IndexHandle, IndexKind, IndexKindProvider};
 use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
-use crate::traits::operator::{OperatorProvider, OptimizerRuleProvider};
+use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
-use crate::traits::storage::StorageBackend;
 use crate::traits::trigger::TriggerPlugin;
 use crate::traits::types::LogicalTypeProvider;
 use crate::traits::window::{WindowPluginFn, WindowSignature};
@@ -315,11 +314,8 @@ pub(crate) struct PluginRecord {
     pub(crate) procedures: Vec<(QName, usize)>,
     pub(crate) locy_aggregates: Vec<QName>,
     pub(crate) locy_predicates: Vec<QName>,
-    pub(crate) operators: Vec<QName>,
     pub(crate) algorithms: Vec<QName>,
-    pub(crate) pregels: Vec<QName>,
     pub(crate) index_kinds: Vec<IndexKind>,
-    pub(crate) storage_schemes: Vec<SmolStr>,
     pub(crate) label_storages: Vec<SmolStr>,
     pub(crate) crdt_kinds: Vec<CrdtKind>,
     /// Logical-type extension names this plugin registered. Tracked
@@ -335,7 +331,6 @@ pub(crate) struct PluginRecord {
     pub(crate) hook_count: usize,
     pub(crate) auth_count: usize,
     pub(crate) authz_count: usize,
-    pub(crate) connector_count: usize,
     pub(crate) trigger_count: usize,
     pub(crate) replacement_scan_count: usize,
     pub(crate) optimizer_rule_count: usize,
@@ -358,11 +353,8 @@ impl PluginRecord {
         self.procedures.extend(other.procedures);
         self.locy_aggregates.extend(other.locy_aggregates);
         self.locy_predicates.extend(other.locy_predicates);
-        self.operators.extend(other.operators);
         self.algorithms.extend(other.algorithms);
-        self.pregels.extend(other.pregels);
         self.index_kinds.extend(other.index_kinds);
-        self.storage_schemes.extend(other.storage_schemes);
         self.label_storages.extend(other.label_storages);
         self.crdt_kinds.extend(other.crdt_kinds);
         self.logical_types.extend(other.logical_types);
@@ -372,7 +364,6 @@ impl PluginRecord {
         self.hook_count += other.hook_count;
         self.auth_count += other.auth_count;
         self.authz_count += other.authz_count;
-        self.connector_count += other.connector_count;
         self.trigger_count += other.trigger_count;
         self.replacement_scan_count += other.replacement_scan_count;
         self.optimizer_rule_count += other.optimizer_rule_count;
@@ -400,16 +391,10 @@ pub struct PluginRecordSnapshot {
     pub locy_aggregates: Vec<QName>,
     /// Locy predicates this plugin registered.
     pub locy_predicates: Vec<QName>,
-    /// Physical operators this plugin registered.
-    pub operators: Vec<QName>,
     /// Algorithms this plugin registered.
     pub algorithms: Vec<QName>,
-    /// Pregel programs this plugin registered.
-    pub pregels: Vec<QName>,
     /// Index kinds this plugin registered.
     pub index_kinds: Vec<IndexKind>,
-    /// Storage URI schemes this plugin registered.
-    pub storage_schemes: Vec<SmolStr>,
     /// Label storages this plugin registered.
     pub label_storages: Vec<SmolStr>,
     /// CRDT kinds this plugin registered.
@@ -428,8 +413,6 @@ pub struct PluginRecordSnapshot {
     pub auth_count: usize,
     /// Number of `AuthzPolicy`s this plugin registered.
     pub authz_count: usize,
-    /// Number of `Connector`s this plugin registered.
-    pub connector_count: usize,
     /// Number of `TriggerPlugin`s this plugin registered.
     pub trigger_count: usize,
     /// Number of `ReplacementScanProvider`s this plugin registered.
@@ -452,11 +435,8 @@ impl From<&PluginRecord> for PluginRecordSnapshot {
             procedures: r.procedures.clone(),
             locy_aggregates: r.locy_aggregates.clone(),
             locy_predicates: r.locy_predicates.clone(),
-            operators: r.operators.clone(),
             algorithms: r.algorithms.clone(),
-            pregels: r.pregels.clone(),
             index_kinds: r.index_kinds.clone(),
-            storage_schemes: r.storage_schemes.clone(),
             label_storages: r.label_storages.clone(),
             crdt_kinds: r.crdt_kinds.clone(),
             logical_types: r.logical_types.clone(),
@@ -466,7 +446,6 @@ impl From<&PluginRecord> for PluginRecordSnapshot {
             hook_count: r.hook_count,
             auth_count: r.auth_count,
             authz_count: r.authz_count,
-            connector_count: r.connector_count,
             trigger_count: r.trigger_count,
             replacement_scan_count: r.replacement_scan_count,
             optimizer_rule_count: r.optimizer_rule_count,
@@ -494,18 +473,13 @@ pub struct PluginRegistry {
     pub(crate) procedures: DashMap<QName, Vec<Arc<ProcedureEntry>>>,
     pub(crate) locy_aggregates: DashMap<QName, Arc<LocyAggregateEntry>>,
     pub(crate) locy_predicates: DashMap<QName, Arc<LocyPredicateEntry>>,
-    pub(crate) operators: DashMap<QName, Arc<dyn OperatorProvider>>,
     pub(crate) optimizer_rules:
         ArcSwap<Vec<crate::surfaces::AppendEntry<dyn OptimizerRuleProvider>>>,
     pub(crate) algorithms: DashMap<QName, Arc<dyn AlgorithmProvider>>,
-    pub(crate) pregels: DashMap<QName, Arc<dyn PregelProgramProvider>>,
     pub(crate) index_kinds: DashMap<IndexKind, Arc<dyn IndexKindProvider>>,
     index_handles: DashMap<SmolStr, IndexHandleEntry>,
-    pub(crate) storage_backends: DashMap<SmolStr, Arc<dyn StorageBackend>>,
-    /// Per-label plugin storage (M5h.2). Distinct from
-    /// `storage_backends` — the latter is keyed by URI *scheme* and
-    /// opens new `Storage` instances; this map is keyed by *label name*
-    /// and resolves to an already-open `Storage`. The host's
+    /// Per-label plugin storage (M5h.2). Keyed by *label name* and
+    /// resolves to an already-open `Storage`. The host's
     /// `StorageManager::scan_vertex_table` consults this map before
     /// falling through to the native backend so a third-party plugin
     /// can serve a native-schema label from its own storage.
@@ -515,7 +489,6 @@ pub struct PluginRegistry {
     pub(crate) logical_types: DashMap<SmolStr, Arc<dyn LogicalTypeProvider>>,
     pub(crate) auth_providers: ArcSwap<Vec<crate::surfaces::AppendEntry<dyn AuthProvider>>>,
     pub(crate) authz_policies: ArcSwap<Vec<crate::surfaces::AppendEntry<dyn AuthzPolicy>>>,
-    pub(crate) connectors: ArcSwap<Vec<crate::surfaces::AppendEntry<dyn Connector>>>,
     pub(crate) triggers: ArcSwap<Vec<crate::surfaces::AppendEntry<dyn TriggerPlugin>>>,
     pub(crate) collations: DashMap<SmolStr, Arc<dyn CollationProvider>>,
     pub(crate) cdc_outputs: DashMap<SmolStr, Arc<dyn CdcOutputProvider>>,
@@ -545,7 +518,6 @@ impl std::fmt::Debug for PluginRegistry {
             .field("procedures", &self.procedures.len())
             .field("locy_aggregates", &self.locy_aggregates.len())
             .field("algorithms", &self.algorithms.len())
-            .field("storage_backends", &self.storage_backends.len())
             .field("index_kinds", &self.index_kinds.len())
             .field("hooks", &self.hooks.load().len())
             .field("plugins", &self.per_plugin.read().len())
@@ -711,14 +683,6 @@ impl PluginRegistry {
     #[must_use]
     pub fn locy_predicate(&self, q: &QName) -> Option<Arc<LocyPredicateEntry>> {
         self.locy_predicates.get(q).map(|e| Arc::clone(e.value()))
-    }
-
-    /// Look up a registered storage backend by scheme.
-    #[must_use]
-    pub fn storage_backend(&self, scheme: &str) -> Option<Arc<dyn StorageBackend>> {
-        self.storage_backends
-            .get(&SmolStr::new(scheme))
-            .map(|e| Arc::clone(e.value()))
     }
 
     /// Look up the plugin `Storage` (if any) registered to serve the
@@ -906,12 +870,6 @@ impl PluginRegistry {
         Self::project_append(&self.authz_policies)
     }
 
-    /// Snapshot the registered wire-protocol connectors (M5i).
-    #[must_use]
-    pub fn connectors(&self) -> Arc<Vec<Arc<dyn Connector>>> {
-        Self::project_append(&self.connectors)
-    }
-
     /// Snapshot the registered replacement-scan providers.
     #[must_use]
     pub fn replacement_scans(&self) -> Arc<Vec<Arc<dyn ReplacementScanProvider>>> {
@@ -1046,11 +1004,11 @@ impl PluginRegistry {
     pub fn remove_plugin(&self, plugin: &PluginId) {
         use crate::surfaces::{
             AggregateSurface, AlgorithmSurface, AppendOps, AuthSurface, AuthzSurface,
-            BackgroundJobSurface, CatalogSurface, CdcSurface, CollationSurface, ConnectorSurface,
+            BackgroundJobSurface, CatalogSurface, CdcSurface, CollationSurface,
             CrdtSurface, Discriminator, HookSurface, IndexKindSurface, KeyedUniqueOps,
             LabelStorageSurface, LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface,
-            NamedUniqueOps, OperatorSurface, OptimizerRuleSurface, PregelSurface, ProcedureSurface,
-            ReplacementScanSurface, ScalarSurface, StorageBackendSurface, TriggerSurface,
+            NamedUniqueOps, OptimizerRuleSurface, ProcedureSurface,
+            ReplacementScanSurface, ScalarSurface, TriggerSurface,
             VersionedOps, WindowSurface,
         };
 
@@ -1075,20 +1033,11 @@ impl PluginRegistry {
         for q in record.locy_predicates {
             <LocyPredicateSurface as NamedUniqueOps>::remove(self, &q);
         }
-        for q in record.operators {
-            <OperatorSurface as NamedUniqueOps>::remove(self, &q);
-        }
         for q in record.algorithms {
             <AlgorithmSurface as NamedUniqueOps>::remove(self, &q);
         }
-        for q in record.pregels {
-            <PregelSurface as NamedUniqueOps>::remove(self, &q);
-        }
         for k in record.index_kinds {
             <IndexKindSurface as KeyedUniqueOps>::remove(self, &k);
-        }
-        for s in record.storage_schemes {
-            <StorageBackendSurface as KeyedUniqueOps>::remove(self, &s);
         }
         for l in record.label_storages {
             <LabelStorageSurface as KeyedUniqueOps>::remove(self, &l);
@@ -1113,7 +1062,6 @@ impl PluginRegistry {
         <HookSurface as AppendOps>::remove_plugin(self, plugin);
         <AuthSurface as AppendOps>::remove_plugin(self, plugin);
         <AuthzSurface as AppendOps>::remove_plugin(self, plugin);
-        <ConnectorSurface as AppendOps>::remove_plugin(self, plugin);
         <TriggerSurface as AppendOps>::remove_plugin(self, plugin);
         <ReplacementScanSurface as AppendOps>::remove_plugin(self, plugin);
         <BackgroundJobSurface as AppendOps>::remove_plugin(self, plugin);

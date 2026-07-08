@@ -128,8 +128,6 @@ pub enum Capability {
     Auth,
     /// Register authorization policies.
     Authz,
-    /// Register wire / connector protocols.
-    Connector,
     /// Register collations (sort orders).
     Collation,
     /// Register CDC output sinks.

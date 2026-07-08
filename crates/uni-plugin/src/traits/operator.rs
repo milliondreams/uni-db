@@ -1,52 +1,9 @@
-//! Physical operator + optimizer-rule plugins.
+//! Optimizer-rule plugins.
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
-
-use crate::errors::FnError;
-
-/// Per-planner-invocation context for [`OperatorProvider::plan`].
-#[non_exhaustive]
-pub struct PlannerArgs<'a> {
-    /// Reference to the executing DataFusion `SessionContext`.
-    pub session_ctx: &'a SessionContext,
-    /// Input physical plans the operator should consume.
-    pub input_plans: &'a [Arc<dyn ExecutionPlan>],
-    /// Free-form JSON configuration.
-    pub config_json: &'a str,
-    /// Optional schema hint for the operator's output.
-    pub schema_hint: Option<SchemaRef>,
-}
-
-impl std::fmt::Debug for PlannerArgs<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlannerArgs")
-            .field("session_ctx", &"<SessionContext>")
-            .field("input_plans.len", &self.input_plans.len())
-            .field("config_json", &self.config_json)
-            .field("schema_hint", &self.schema_hint)
-            .finish()
-    }
-}
-
-/// A custom physical operator factory.
-pub trait OperatorProvider: Send + Sync {
-    /// The logical name of this operator (`"hash_join_geo"`, …).
-    fn logical_name(&self) -> &str;
-
-    /// Construct an `ExecutionPlan` for an instance of this operator.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] on planning failure (incompatible inputs, bad
-    /// configuration).
-    fn plan(&self, args: PlannerArgs<'_>) -> Result<Arc<dyn ExecutionPlan>, FnError>;
-}
 
 /// Phase at which an `OptimizerRule` runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

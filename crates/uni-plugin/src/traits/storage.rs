@@ -1,11 +1,9 @@
-//! Storage backend plugins — `MATCH` / `CREATE` against pluggable stores.
+//! Per-label plugin storage — `MATCH` / `CREATE` against a pluggable store.
 //!
-//! M5a (2026-05-24): traits are `#[async_trait]`. Real backends such as the
-//! `lance://` adapter in `uni-plugin-builtin` need to drive async I/O
-//! through `uni-store`; the plugin surface mirrors that shape so adapters
-//! don't have to fabricate a blocking runtime per call.
-
-use std::sync::Arc;
+//! M5a (2026-05-24): the [`Storage`] trait is `#[async_trait]`. A plugin
+//! registers a [`Storage`] instance for a native label via
+//! [`crate::PluginRegistrar::label_storage`]; native-schema scans for that
+//! label are routed through the plugin's store instead of the host backend.
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -14,13 +12,6 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::Expr;
 
 use crate::errors::FnError;
-
-/// Options passed at backend open time.
-#[derive(Clone, Debug, Default)]
-pub struct StorageOptions {
-    /// Free-form JSON configuration.
-    pub config_json: String,
-}
 
 /// Opaque write handle returned by [`Storage::write_batch`].
 #[derive(Clone, Debug)]
@@ -42,21 +33,6 @@ pub struct BranchMetadata {
     pub parent_version: u64,
     /// Branch identifier as registered on the backend.
     pub branch_name: String,
-}
-
-/// A storage backend identified by URI scheme.
-#[async_trait]
-pub trait StorageBackend: Send + Sync {
-    /// URI scheme this backend handles (`"lance"`, `"s3"`, `"memory"`).
-    fn scheme(&self) -> &'static str;
-
-    /// Open the backend at `uri`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] if the URI is malformed or the backend cannot
-    /// be opened (auth failure, network error).
-    async fn open(&self, uri: &str, options: &StorageOptions) -> Result<Arc<dyn Storage>, FnError>;
 }
 
 /// Per-instance storage interface.

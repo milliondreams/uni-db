@@ -3,12 +3,12 @@
 //! This module is filled during Phase 4 of the §1.1 consolidation pass. It
 //! introduces the [`SurfaceKind`] enum and four family traits
 //! ([`NamedUniqueSurface`], [`VersionedSurface`], [`KeyedUniqueSurface`],
-//! [`AppendSurface`]) that collapse the 25 surfaces in [`crate::registry`]
+//! [`AppendSurface`]) that collapse the 21 surfaces in [`crate::registry`]
 //! to a handful of generic patterns.
 //!
 //! # Phase 4 status
 //!
-//! Phase 4 is complete: the 25 surfaces dispatch through the family-ops
+//! Phase 4 is complete: the 21 surfaces dispatch through the family-ops
 //! traits in this module. [`crate::registrar::PluginRegistrar`] enqueues
 //! `Box<dyn DynPendingRegistration>` payloads; `PluginRegistry::apply_pending`
 //! calls `preflight` then `apply` per payload; [`PluginRegistry::remove_plugin`]
@@ -22,7 +22,7 @@
 //! |-----------------|--------------------------------------------|----------------------------------|
 //! | Named-unique    | `DashMap<QName, Arc<Entry<K, Sig, P>>>`    | Scalar, Aggregate, Window, …     |
 //! | Versioned       | `DashMap<QName, Vec<Arc<Entry<…>>>>`       | Procedure (arity overload)       |
-//! | Keyed-unique    | `DashMap<K, Arc<dyn Provider>>`            | IndexKind, StorageBackend, …     |
+//! | Keyed-unique    | `DashMap<K, Arc<dyn Provider>>`            | IndexKind, LabelStorage, …       |
 //! | Append          | `ArcSwap<Vec<Arc<dyn Provider>>>`          | Hook, OptimizerRule, …           |
 //!
 //! Append- and keyed-unique-family providers carry their key inside the
@@ -61,7 +61,7 @@ pub enum Discriminator {
     Arity(usize),
 }
 
-/// Enumeration of the 25 plugin surfaces.
+/// Enumeration of the 21 plugin surfaces.
 ///
 /// Used by [`crate::registry::PluginRecordSnapshot`] accessors to filter the
 /// per-plugin footprint by surface.
@@ -80,18 +80,12 @@ pub enum SurfaceKind {
     LocyAggregate,
     /// `Capability::LocyPredicate` — Locy predicate.
     LocyPredicate,
-    /// `Capability::Operator` — physical operator.
-    Operator,
     /// `Capability::Operator` — DataFusion optimizer rule.
     OptimizerRule,
     /// `Capability::Algorithm` — graph algorithm.
     Algorithm,
-    /// `Capability::Algorithm` — Pregel program.
-    Pregel,
     /// `Capability::Index` — index kind provider.
     IndexKind,
-    /// `Capability::Storage` — storage backend by URI scheme.
-    StorageBackend,
     /// `Capability::Storage` — per-label plugin storage (M5h.2).
     LabelStorage,
     /// `Capability::Crdt` — CRDT kind provider.
@@ -104,8 +98,6 @@ pub enum SurfaceKind {
     Auth,
     /// `Capability::Authz` — authorization policy.
     Authz,
-    /// `Capability::Connector` — wire-protocol connector.
-    Connector,
     /// `Capability::Trigger` — fine-grained trigger.
     Trigger,
     /// `Capability::Collation` — collation provider.
@@ -126,7 +118,7 @@ pub enum SurfaceKind {
 ///
 /// One registration per qname; preflight rejects duplicates with
 /// [`PluginError::DuplicateRegistration`]. Members: Scalar, Aggregate,
-/// Window, LocyAggregate, LocyPredicate, Operator, Algorithm, Pregel.
+/// Window, LocyAggregate, LocyPredicate, Algorithm.
 pub trait NamedUniqueSurface: 'static {
     /// The registered signature (e.g. `FnSignature`, `AggSignature`); unit
     /// when the surface carries no signature (e.g. `LocyAggregate`).
@@ -163,7 +155,7 @@ pub trait VersionedSurface: 'static {
 /// The provider trait often exposes the key (e.g.
 /// [`crate::traits::collation::CollationProvider::name`]).
 ///
-/// Members: IndexKind, StorageBackend, LabelStorage, Crdt, LogicalType,
+/// Members: IndexKind, LabelStorage, Crdt, LogicalType,
 /// Collation, Cdc, Catalog.
 pub trait KeyedUniqueSurface: 'static {
     /// The key type the `DashMap` is keyed by.
@@ -178,8 +170,7 @@ pub trait KeyedUniqueSurface: 'static {
     ///
     /// Default implementation returns a generic
     /// [`PluginError::Internal`] message; surfaces that need a typed
-    /// error (e.g. `StorageBackend` returns
-    /// [`PluginError::StorageSchemeConflict`]) override this.
+    /// error may override this.
     ///
     /// # Errors
     ///
@@ -211,7 +202,7 @@ pub trait KeyedUniqueSurface: 'static {
 /// No preflight de-duplication — every registration is appended. Removal
 /// is by plugin id (the append-family blanket impl filters the vector by
 /// plugin ownership). Members: OptimizerRule, Hook, Auth, Authz,
-/// Connector, Trigger, ReplacementScan, BackgroundJob.
+/// Trigger, ReplacementScan, BackgroundJob.
 pub trait AppendSurface: 'static {
     /// The trait-object provider.
     type Provider: ?Sized + Send + Sync + 'static;
@@ -250,26 +241,26 @@ impl<P: ?Sized> Debug for AppendEntry<P> {
     }
 }
 
-// ── Marker types for the 25 surfaces ──────────────────────────────────
+// ── Marker types for the 21 surfaces ──────────────────────────────────
 //
 // Each marker is zero-sized; they exist only so `Surface` trait impls can
 // dispatch via the type system. Sub-phases 4b-4e add the per-marker impls.
 
 use crate::traits::aggregate::{AggSignature, AggregatePluginFn};
-use crate::traits::algorithm::{AlgorithmProvider, PregelProgramProvider};
+use crate::traits::algorithm::AlgorithmProvider;
 use crate::traits::background::BackgroundJobProvider;
 use crate::traits::catalog::{CatalogProvider, ReplacementScanProvider};
 use crate::traits::cdc::CdcOutputProvider;
 use crate::traits::collation::CollationProvider;
-use crate::traits::connector::{AuthProvider, AuthzPolicy, Connector};
+use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::CrdtKindProvider;
 use crate::traits::hook::SessionHook;
 use crate::traits::index::IndexKindProvider;
 use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
-use crate::traits::operator::{OperatorProvider, OptimizerRuleProvider};
+use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
-use crate::traits::storage::{Storage, StorageBackend};
+use crate::traits::storage::Storage;
 use crate::traits::trigger::TriggerPlugin;
 use crate::traits::types::LogicalTypeProvider;
 use crate::traits::window::{WindowPluginFn, WindowSignature};
@@ -282,7 +273,7 @@ macro_rules! marker {
     };
 }
 
-// Named-unique markers (7).
+// Named-unique markers (6).
 marker!(/// Marker for the Scalar surface. See [`NamedUniqueSurface`].
 ScalarSurface);
 marker!(/// Marker for the Aggregate surface. See [`NamedUniqueSurface`].
@@ -293,22 +284,16 @@ marker!(/// Marker for the LocyAggregate surface. See [`NamedUniqueSurface`].
 LocyAggregateSurface);
 marker!(/// Marker for the LocyPredicate surface. See [`NamedUniqueSurface`].
 LocyPredicateSurface);
-marker!(/// Marker for the Operator surface. See [`NamedUniqueSurface`].
-OperatorSurface);
 marker!(/// Marker for the Algorithm surface. See [`NamedUniqueSurface`].
 AlgorithmSurface);
-marker!(/// Marker for the Pregel surface. See [`NamedUniqueSurface`].
-PregelSurface);
 
 // Versioned markers (1).
 marker!(/// Marker for the Procedure surface. See [`VersionedSurface`].
 ProcedureSurface);
 
-// Keyed-unique markers (8).
+// Keyed-unique markers (7).
 marker!(/// Marker for the IndexKind surface. See [`KeyedUniqueSurface`].
 IndexKindSurface);
-marker!(/// Marker for the StorageBackend surface. See [`KeyedUniqueSurface`].
-StorageBackendSurface);
 marker!(/// Marker for the LabelStorage surface. See [`KeyedUniqueSurface`].
 LabelStorageSurface);
 marker!(/// Marker for the Crdt surface. See [`KeyedUniqueSurface`].
@@ -322,7 +307,7 @@ CdcSurface);
 marker!(/// Marker for the Catalog surface. See [`KeyedUniqueSurface`].
 CatalogSurface);
 
-// Append markers (8).
+// Append markers (7).
 marker!(/// Marker for the OptimizerRule surface. See [`AppendSurface`].
 OptimizerRuleSurface);
 marker!(/// Marker for the Hook surface. See [`AppendSurface`].
@@ -331,8 +316,6 @@ marker!(/// Marker for the Auth surface. See [`AppendSurface`].
 AuthSurface);
 marker!(/// Marker for the Authz surface. See [`AppendSurface`].
 AuthzSurface);
-marker!(/// Marker for the Connector surface. See [`AppendSurface`].
-ConnectorSurface);
 marker!(/// Marker for the Trigger surface. See [`AppendSurface`].
 TriggerSurface);
 marker!(/// Marker for the ReplacementScan surface. See [`AppendSurface`].
@@ -372,22 +355,10 @@ impl NamedUniqueSurface for LocyPredicateSurface {
     const KIND: SurfaceKind = SurfaceKind::LocyPredicate;
 }
 
-impl NamedUniqueSurface for OperatorSurface {
-    type Sig = ();
-    type Provider = dyn OperatorProvider;
-    const KIND: SurfaceKind = SurfaceKind::Operator;
-}
-
 impl NamedUniqueSurface for AlgorithmSurface {
     type Sig = ();
     type Provider = dyn AlgorithmProvider;
     const KIND: SurfaceKind = SurfaceKind::Algorithm;
-}
-
-impl NamedUniqueSurface for PregelSurface {
-    type Sig = ();
-    type Provider = dyn PregelProgramProvider;
-    const KIND: SurfaceKind = SurfaceKind::Pregel;
 }
 
 // ── Versioned impls ───────────────────────────────────────────────────
@@ -411,20 +382,6 @@ impl KeyedUniqueSurface for IndexKindSurface {
 
     fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
         Some(provider.kind())
-    }
-}
-
-impl KeyedUniqueSurface for StorageBackendSurface {
-    type Key = SmolStr;
-    type Provider = dyn StorageBackend;
-    const KIND: SurfaceKind = SurfaceKind::StorageBackend;
-
-    fn duplicate_error(key: &Self::Key) -> PluginError {
-        PluginError::StorageSchemeConflict(key.to_string())
-    }
-
-    fn key_of(provider: &Self::Provider) -> Option<Self::Key> {
-        Some(SmolStr::new(provider.scheme()))
     }
 }
 
@@ -517,11 +474,6 @@ impl AppendSurface for AuthzSurface {
     const KIND: SurfaceKind = SurfaceKind::Authz;
 }
 
-impl AppendSurface for ConnectorSurface {
-    type Provider = dyn Connector;
-    const KIND: SurfaceKind = SurfaceKind::Connector;
-}
-
 impl AppendSurface for TriggerSurface {
     type Provider = dyn TriggerPlugin;
     const KIND: SurfaceKind = SurfaceKind::Trigger;
@@ -551,10 +503,10 @@ impl AppendSurface for BackgroundJobSurface {
 /// One impl per [`NamedUniqueSurface`] marker. The associated `Stored`
 /// type captures whether the surface wraps its provider in a typed
 /// `Entry` struct (Scalar/Aggregate/Window/LocyAggregate/LocyPredicate)
-/// or stores `Arc<dyn Provider>` directly (Operator/Algorithm/Pregel).
+/// or stores `Arc<dyn Provider>` directly (Algorithm).
 pub(crate) trait NamedUniqueOps: NamedUniqueSurface {
     /// The value stored in the `DashMap` slot (e.g. `Arc<ScalarEntry>`
-    /// or `Arc<dyn OperatorProvider>`).
+    /// or `Arc<dyn AlgorithmProvider>`).
     type Stored: Clone + Send + Sync + 'static;
 
     /// Build the stored value from the registration triple.
@@ -879,19 +831,6 @@ impl NamedUniqueOps for LocyPredicateSurface {
     }
 }
 
-impl NamedUniqueOps for OperatorSurface {
-    type Stored = Arc<dyn OperatorProvider>;
-    fn make_stored(_p: PluginId, _s: Self::Sig, provider: Arc<Self::Provider>) -> Self::Stored {
-        provider
-    }
-    fn slot(r: &PluginRegistry) -> &DashMap<QName, Self::Stored> {
-        &r.operators
-    }
-    fn record_slot(rec: &mut PluginRecord) -> &mut Vec<QName> {
-        &mut rec.operators
-    }
-}
-
 impl NamedUniqueOps for AlgorithmSurface {
     type Stored = Arc<dyn AlgorithmProvider>;
     fn make_stored(_p: PluginId, _s: Self::Sig, provider: Arc<Self::Provider>) -> Self::Stored {
@@ -902,19 +841,6 @@ impl NamedUniqueOps for AlgorithmSurface {
     }
     fn record_slot(rec: &mut PluginRecord) -> &mut Vec<QName> {
         &mut rec.algorithms
-    }
-}
-
-impl NamedUniqueOps for PregelSurface {
-    type Stored = Arc<dyn PregelProgramProvider>;
-    fn make_stored(_p: PluginId, _s: Self::Sig, provider: Arc<Self::Provider>) -> Self::Stored {
-        provider
-    }
-    fn slot(r: &PluginRegistry) -> &DashMap<QName, Self::Stored> {
-        &r.pregels
-    }
-    fn record_slot(rec: &mut PluginRecord) -> &mut Vec<QName> {
-        &mut rec.pregels
     }
 }
 
@@ -952,15 +878,6 @@ impl KeyedUniqueOps for IndexKindSurface {
     }
     fn record_register(rec: &mut PluginRecord, key: &Self::Key) {
         rec.index_kinds.push(key.clone());
-    }
-}
-
-impl KeyedUniqueOps for StorageBackendSurface {
-    fn slot(r: &PluginRegistry) -> &DashMap<Self::Key, Arc<Self::Provider>> {
-        &r.storage_backends
-    }
-    fn record_register(rec: &mut PluginRecord, key: &Self::Key) {
-        rec.storage_schemes.push(key.clone());
     }
 }
 
@@ -1050,14 +967,6 @@ impl AppendOps for AuthzSurface {
     }
     fn record_register(rec: &mut PluginRecord) {
         rec.authz_count += 1;
-    }
-}
-impl AppendOps for ConnectorSurface {
-    fn slot(r: &PluginRegistry) -> &ArcSwap<Vec<AppendEntry<Self::Provider>>> {
-        &r.connectors
-    }
-    fn record_register(rec: &mut PluginRecord) {
-        rec.connector_count += 1;
     }
 }
 impl AppendOps for TriggerSurface {
@@ -1315,12 +1224,9 @@ mod tests {
             <WindowSurface as NamedUniqueSurface>::KIND,
             <LocyAggregateSurface as NamedUniqueSurface>::KIND,
             <LocyPredicateSurface as NamedUniqueSurface>::KIND,
-            <OperatorSurface as NamedUniqueSurface>::KIND,
             <AlgorithmSurface as NamedUniqueSurface>::KIND,
-            <PregelSurface as NamedUniqueSurface>::KIND,
             <ProcedureSurface as VersionedSurface>::KIND,
             <IndexKindSurface as KeyedUniqueSurface>::KIND,
-            <StorageBackendSurface as KeyedUniqueSurface>::KIND,
             <LabelStorageSurface as KeyedUniqueSurface>::KIND,
             <CrdtSurface as KeyedUniqueSurface>::KIND,
             <LogicalTypeSurface as KeyedUniqueSurface>::KIND,
@@ -1331,31 +1237,21 @@ mod tests {
             <HookSurface as AppendSurface>::KIND,
             <AuthSurface as AppendSurface>::KIND,
             <AuthzSurface as AppendSurface>::KIND,
-            <ConnectorSurface as AppendSurface>::KIND,
             <TriggerSurface as AppendSurface>::KIND,
             <ReplacementScanSurface as AppendSurface>::KIND,
             <BackgroundJobSurface as AppendSurface>::KIND,
         ];
-        // 25 surfaces enumerated above (Scalar+Aggregate+Window+Procedure
-        // +LocyAggregate+LocyPredicate+Operator+OptimizerRule+Algorithm
-        // +Pregel+IndexKind+StorageBackend+LabelStorage+Crdt+Hook
-        // +LogicalType+Auth+Authz+Connector+Trigger+Collation+Cdc
-        // +Catalog+ReplacementScan+BackgroundJob = 25 visible markers).
-        // The original task lists 26 because OptimizerRule appeared twice
-        // in the per-family table; we count one canonical entry per
-        // marker.
-        assert_eq!(kinds.len(), 25);
+        // 21 surfaces enumerated above (Scalar+Aggregate+Window+Procedure
+        // +LocyAggregate+LocyPredicate+OptimizerRule+Algorithm+IndexKind
+        // +LabelStorage+Crdt+Hook+LogicalType+Auth+Authz+Trigger+Collation
+        // +Cdc+Catalog+ReplacementScan+BackgroundJob = 21 visible markers).
+        // The 3.0 breaking change removed the four dead registrable surfaces
+        // Operator, Pregel, StorageBackend, and Connector.
+        assert_eq!(kinds.len(), 21);
         let mut sorted: Vec<_> = kinds.iter().collect();
         sorted.sort_by_key(|k| format!("{k:?}"));
         sorted.dedup();
-        assert_eq!(sorted.len(), 25, "duplicate SurfaceKind in markers");
-    }
-
-    #[test]
-    fn keyed_unique_storage_backend_duplicate_error_is_typed() {
-        let err =
-            <StorageBackendSurface as KeyedUniqueSurface>::duplicate_error(&SmolStr::new("s3"));
-        assert!(matches!(err, PluginError::StorageSchemeConflict(_)));
+        assert_eq!(sorted.len(), 21, "duplicate SurfaceKind in markers");
     }
 
     #[test]

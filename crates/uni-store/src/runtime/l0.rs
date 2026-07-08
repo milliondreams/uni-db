@@ -241,6 +241,15 @@ pub struct L0Buffer {
     /// records observed ids here and commit checks them for antidependencies.
     /// `None` for the main L0 and read-only / SSI-disabled paths.
     pub occ_read_set: Option<Arc<parking_lot::Mutex<OccReadSet>>>,
+    /// Optional plugin registry for registry-dispatched CRDT merges at
+    /// commit-time property merge ([`Self::merge_crdt_properties`]).
+    ///
+    /// Behavior-preserving when absent: falls back to native
+    /// [`uni_crdt::Crdt::try_merge`] bit-for-bit when no provider is
+    /// registered. Stamped onto every live buffer by the owning `L0Manager`.
+    /// Not part of buffer identity — cloned buffers (forked ASSUME/ABDUCE L0s)
+    /// inherit it, but it is never serialized or flushed.
+    pub plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -295,6 +304,9 @@ impl Clone for L0Buffer {
             occ_read_seq: self.occ_read_seq,
             // Forked L0s (ASSUME/ABDUCE) do not participate in OCC tracking.
             occ_read_set: None,
+            // Inherit the registry so forked buffers merge custom CRDTs the
+            // same way the parent does.
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 }
@@ -386,7 +398,11 @@ impl L0Buffer {
     ///
     /// Logs a warning when a CRDT value is overwritten by a non-CRDT scalar
     /// (limitation R1).
-    fn merge_crdt_properties(entry: &mut Properties, properties: Properties) {
+    fn merge_crdt_properties(
+        entry: &mut Properties,
+        properties: Properties,
+        registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    ) {
         // Fast path: new vertex with no existing properties — skip JSON round-trip
         if entry.is_empty() {
             *entry = properties;
@@ -401,10 +417,15 @@ impl L0Buffer {
                 && let Some(existing_v) = entry.get(&k)
                 && let Ok(existing_crdt) = serde_json::from_value::<Crdt>(existing_v.clone().into())
             {
-                // Use try_merge to avoid panic on type mismatch.
-                if new_crdt.try_merge(&existing_crdt).is_ok()
-                    && let Ok(merged_json) = serde_json::to_value(new_crdt)
-                {
+                // Use a fallible merge to avoid panic on type mismatch.
+                // Operand order: self=new (new_crdt), other=existing
+                // (existing_crdt) — existing-into-new. Preserve — a custom
+                // provider's merge may be non-commutative.
+                let merged = match registry {
+                    Some(reg) => new_crdt.merge_via_registry(&existing_crdt, reg).is_ok(),
+                    None => new_crdt.try_merge(&existing_crdt).is_ok(),
+                };
+                if merged && let Ok(merged_json) = serde_json::to_value(new_crdt) {
                     entry.insert(k, uni_common::Value::from(merged_json));
                     continue;
                 }
@@ -527,7 +548,18 @@ impl L0Buffer {
             pending_embeddings: HashMap::new(),
             occ_read_seq: 0,
             occ_read_set: None,
+            plugin_registry: None,
         }
+    }
+
+    /// Install the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Stamped by the owning `L0Manager` onto every buffer it mints so the
+    /// commit-time merge ([`Self::merge_crdt_properties`]) can route custom
+    /// CRDT kinds through a registered provider. Absent registry preserves
+    /// native [`uni_crdt::Crdt::try_merge`] behavior.
+    pub fn set_plugin_registry(&mut self, registry: Arc<uni_plugin::PluginRegistry>) {
+        self.plugin_registry = Some(registry);
     }
 
     pub fn insert_vertex(&mut self, vid: Vid, properties: Properties) {
@@ -583,7 +615,7 @@ impl L0Buffer {
         } else {
             None
         };
-        Self::merge_crdt_properties(entry, properties);
+        Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         if tracks_extid {
             let new_extid =
                 Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
@@ -727,7 +759,7 @@ impl L0Buffer {
         } else {
             None
         };
-        Self::merge_crdt_properties(entry, properties);
+        Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         if tracks_extid {
             let new_extid =
                 Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
@@ -1053,7 +1085,7 @@ impl L0Buffer {
         let props_count = properties.len();
         if !properties.is_empty() {
             let entry = self.edge_properties.entry(eid).or_default();
-            Self::merge_crdt_properties(entry, properties);
+            Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         }
 
         self.edge_versions.insert(eid, version);
@@ -1522,7 +1554,7 @@ impl L0Buffer {
                     } else {
                         None
                     };
-                    Self::merge_crdt_properties(entry, properties);
+                    Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
                     if tracks_extid {
                         let new_extid = Self::extid_of(
                             self.vertex_properties.get(&vid).expect("just inserted"),

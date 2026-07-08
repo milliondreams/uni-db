@@ -3290,7 +3290,7 @@ impl UniBuilder {
             .as_ref()
             .map(Self::cloud_config_to_lancedb_storage_options);
 
-        let storage = if is_hybrid || is_remote_uri {
+        let mut storage = if is_hybrid || is_remote_uri {
             // Preserve explicit cloud settings (endpoint, credentials, path style)
             // by reusing the constructed remote store.
             StorageManager::new_with_store_and_storage_options(
@@ -3313,22 +3313,17 @@ impl UniBuilder {
             .map_err(UniError::Internal)?
         };
 
-        let storage = Arc::new(storage);
-
-        // Create shutdown handle
-        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
-
-        // Start background compaction with shutdown signal
-        let compaction_handle = storage
-            .clone()
-            .start_background_compaction(shutdown_handle.subscribe());
-        shutdown_handle.track_task(compaction_handle);
-
         // Plugin registry is built early so `PropertyManager` can
         // share it for registry-dispatched CRDT merges. Built-ins are
         // registered against this same Arc below; the registry is
         // shared by-reference, so the registrations are visible to
         // every later consumer.
+        //
+        // Built BEFORE the StorageManager is wrapped in `Arc` so the same
+        // registry can be stamped onto it via `set_plugin_registry`, wiring
+        // the durable CRDT merge paths (compaction, L0 flush) to the same
+        // provider set that governs `PropertyManager`. Behavior-preserving
+        // when no `CrdtKindProvider` is registered (native `try_merge`).
         let plugin_registry = Arc::new(uni_plugin::PluginRegistry::new());
         // M11 A.2: pass the data directory so `SystemLabelPersistence`
         // can be wired as the meta-plugin persistence backend. Remote /
@@ -3344,6 +3339,22 @@ impl UniBuilder {
             register_builtin_plugins(&plugin_registry, persistence_data_path.as_deref()).expect(
                 "BuiltinPlugin / ApocCorePlugin registration must succeed against fresh registry",
             );
+
+        // Stamp the registry onto the owned StorageManager (before it is
+        // shared) so compaction and L0 flush route custom CRDT merges through
+        // it, matching the `PropertyManager` wiring below.
+        storage.set_plugin_registry(Arc::clone(&plugin_registry));
+
+        let storage = Arc::new(storage);
+
+        // Create shutdown handle
+        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
+
+        // Start background compaction with shutdown signal
+        let compaction_handle = storage
+            .clone()
+            .start_background_compaction(shutdown_handle.subscribe());
+        shutdown_handle.track_task(compaction_handle);
 
         // Initialize property manager
         let prop_cache_capacity = self.config.cache_size / 1024;

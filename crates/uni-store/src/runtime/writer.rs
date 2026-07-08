@@ -582,6 +582,11 @@ impl Writer {
         };
 
         let l0_manager = Arc::new(L0Manager::new(start_version, wal));
+        // Route commit-time CRDT merges through the DB's plugin registry (if
+        // installed on the StorageManager). Behavior-preserving when absent.
+        if let Some(registry) = storage.plugin_registry() {
+            l0_manager.set_plugin_registry(Arc::clone(registry));
+        }
 
         let property_manager = Some(Arc::new(PropertyManager::new(
             storage.clone(),

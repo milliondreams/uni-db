@@ -100,6 +100,16 @@ pub struct StorageManager {
     /// have aged out of L0 into Lance storage — notably on forks, whose data
     /// is flushed to Lance before branching.
     vid_labels_index: Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>,
+    /// Optional plugin registry for registry-dispatched CRDT merges on the
+    /// durable paths (compaction, L0 flush).
+    ///
+    /// Behavior-preserving when absent: the durable merge helpers fall back to
+    /// [`uni_crdt::Crdt::try_merge`] bit-for-bit when no
+    /// [`uni_plugin::traits::crdt::CrdtKindProvider`] is registered. Threaded
+    /// down to the writer's `L0Manager` (and hence each `L0Buffer`) and read by
+    /// the [`crate::storage::compaction::Compactor`] via
+    /// [`Self::plugin_registry`].
+    plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
 }
 
 /// RAII counter increment for `StorageManager.flush_in_progress`.
@@ -306,6 +316,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 crate::storage::vid_labels::VidLabelsIndex::new(),
             )),
+            plugin_registry: None,
         };
 
         // Rebuild VidLabelsIndex from persisted vertices. A failure leaves the
@@ -478,6 +489,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 
@@ -521,6 +533,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 
@@ -590,7 +603,25 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
+    }
+
+    /// Borrow the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Returns `None` when no registry has been installed, in which case the
+    /// durable merge paths fall back to native [`uni_crdt::Crdt::try_merge`].
+    pub fn plugin_registry(&self) -> Option<&Arc<uni_plugin::PluginRegistry>> {
+        self.plugin_registry.as_ref()
+    }
+
+    /// Install the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Called once at DB construction (before the manager is shared) so the
+    /// same registry that backs `PropertyManager` also governs the compaction
+    /// and L0-flush durable merge paths.
+    pub fn set_plugin_registry(&mut self, registry: Arc<uni_plugin::PluginRegistry>) {
+        self.plugin_registry = Some(registry);
     }
 
     /// Borrow the active fork scope, if any.

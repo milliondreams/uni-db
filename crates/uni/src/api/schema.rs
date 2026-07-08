@@ -4,8 +4,9 @@
 use crate::api::Uni;
 use std::path::Path;
 use uni_common::core::schema::{
-    DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
-    ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig, VectorIndexType,
+    AnalyzerConfig, DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig,
+    IndexDefinition, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
+    VectorIndexType,
 };
 use uni_common::{Result, UniError};
 
@@ -339,6 +340,16 @@ impl<'a> LabelBuilder<'a> {
                 with_positions: true,
                 metadata: Default::default(),
             }),
+            IndexType::FullTextWithAnalyzer(analyzer) => {
+                IndexDefinition::FullText(FullTextIndexConfig {
+                    name: format!("fts_{}_{}", self.name, property),
+                    label: self.name.clone(),
+                    properties: vec![property.to_string()],
+                    tokenizer: TokenizerConfig::Analyzer(analyzer),
+                    with_positions: true,
+                    metadata: Default::default(),
+                })
+            }
             IndexType::Scalar(stype) => IndexDefinition::Scalar(ScalarIndexConfig {
                 name: format!("idx_{}_{}", self.name, property),
                 label: self.name.clone(),
@@ -530,7 +541,11 @@ pub struct ConstraintInfo {
 #[non_exhaustive]
 pub enum IndexType {
     Vector(VectorIndexCfg),
+    /// Full-text index using the default (standard) analyzer.
     FullText,
+    /// Full-text index with an explicit analyzer pipeline (tokenizer, language,
+    /// stemming, stop words, ...). Construct via [`IndexType::full_text_with_analyzer`].
+    FullTextWithAnalyzer(AnalyzerConfig),
     Scalar(ScalarType),
     Inverted(uni_common::core::schema::InvertedIndexConfig),
     /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
@@ -545,6 +560,26 @@ pub enum IndexType {
 }
 
 impl IndexType {
+    /// A full-text index with an explicit analyzer pipeline.
+    ///
+    /// Use this to configure the base tokenizer, language, stemming, stop-word
+    /// removal, ASCII folding and token-length limits. Plain
+    /// [`IndexType::FullText`] keeps the default (standard) analyzer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use uni_common::core::schema::{AnalyzerConfig, FtsLanguage};
+    /// let idx = IndexType::full_text_with_analyzer(AnalyzerConfig {
+    ///     language: FtsLanguage::French,
+    ///     ..AnalyzerConfig::default()
+    /// });
+    /// ```
+    #[must_use]
+    pub fn full_text_with_analyzer(analyzer: AnalyzerConfig) -> Self {
+        Self::FullTextWithAnalyzer(analyzer)
+    }
+
     /// A sparse-vector index over a `dimensions`-wide term space with 8-bit
     /// weight quantization enabled (the default; use the [`IndexType::Sparse`]
     /// struct variant directly to disable it or to set auto-embedding).

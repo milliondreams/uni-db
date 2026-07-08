@@ -11,6 +11,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use futures::Stream;
+use uni_common::core::schema::TokenizerConfig;
 
 use super::types::*;
 
@@ -305,15 +306,19 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Create a full-text search index over one or more columns.
     ///
     /// `name` is the index name (`None` lets the backend choose a default).
-    /// `with_positions` enables phrase/position postings.
+    /// `tokenizer` selects the analyzer pipeline (tokenizer, stemming,
+    /// stop words, ...). `with_positions` enables phrase/position postings
+    /// (it is ignored for tokenizers that cannot store positions, e.g. N-gram).
     ///
     /// # Errors
-    /// Returns an error if the backend does not support FTS or the build fails.
+    /// Returns an error if the backend does not support FTS, the tokenizer
+    /// configuration is invalid, or the build fails.
     async fn create_fts_index(
         &self,
         _table: &str,
         _columns: &[&str],
         _name: Option<&str>,
+        _tokenizer: &TokenizerConfig,
         _with_positions: bool,
     ) -> Result<()> {
         anyhow::bail!("FTS indexing not supported by this backend")

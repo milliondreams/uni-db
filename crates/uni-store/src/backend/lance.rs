@@ -17,6 +17,8 @@ use lancedb::Table;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
+use uni_common::core::schema::TokenizerConfig;
+
 use super::lance_branch;
 use super::traits::{RecordBatchStream, StorageBackend};
 use super::types::*;
@@ -1040,23 +1042,47 @@ impl StorageBackend for LanceDbBackend {
         table: &str,
         columns: &[&str],
         name: Option<&str>,
+        tokenizer: &TokenizerConfig,
         with_positions: bool,
     ) -> Result<()> {
         let tbl = self.get_or_open_table(table).await?;
-        let fts_params = lancedb::index::Index::FTS(
-            lancedb::index::scalar::FtsIndexBuilder::default().with_position(with_positions),
-        );
+        // Translate the requested analyzer pipeline into Lance params. A
+        // config error (bad ngram bounds, unsupported stop-word language) is
+        // surfaced here before we touch the table.
+        let params = super::fts_analyzer::to_inverted_params(tokenizer, with_positions)
+            .map_err(|e| anyhow!("invalid FTS tokenizer config for '{}.{:?}': {}", table, columns, e))?;
+        let fts_params = lancedb::index::Index::FTS(params);
         let mut builder = tbl.create_index(columns, fts_params).replace(true);
         if let Some(n) = name {
             builder = builder.name(n.to_string());
         }
         builder.execute().await.map_err(|e| {
-            anyhow!(
-                "Failed to create FTS index on '{}.{:?}': {}",
-                table,
-                columns,
-                e
-            )
+            // Custom tokenizers (`lindera/*`, `jieba/*`) need dictionary files
+            // under `LANCE_LANGUAGE_MODEL_HOME`; make that failure legible.
+            if matches!(tokenizer, TokenizerConfig::Custom { .. })
+                || matches!(
+                    tokenizer,
+                    TokenizerConfig::Analyzer(a)
+                        if matches!(&a.base, uni_common::core::schema::BaseTokenizer::Custom(_))
+                )
+            {
+                anyhow!(
+                    "Failed to create FTS index on '{}.{:?}' with custom tokenizer {:?}: {}. \
+                     CJK/custom tokenizers require dictionary files under the directory named by \
+                     the LANCE_LANGUAGE_MODEL_HOME environment variable (uni does not ship them).",
+                    table,
+                    columns,
+                    tokenizer,
+                    e
+                )
+            } else {
+                anyhow!(
+                    "Failed to create FTS index on '{}.{:?}': {}",
+                    table,
+                    columns,
+                    e
+                )
+            }
         })
     }
 

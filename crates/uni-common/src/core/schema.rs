@@ -1321,6 +1321,140 @@ pub enum TokenizerConfig {
     Whitespace,
     Ngram { min: u8, max: u8 },
     Custom { name: String },
+    /// Fully specified analyzer pipeline (base tokenizer + language + filters).
+    ///
+    /// Carries stemming, stop-word, lowercasing, ASCII-folding and token-length
+    /// configuration so full-text indexes honor the requested analysis instead
+    /// of falling back to the hardcoded standard tokenizer.
+    Analyzer(AnalyzerConfig),
+}
+
+/// Full analyzer pipeline configuration for a full-text index.
+///
+/// This is a backend-agnostic, plainly serializable description of the token
+/// analysis chain. The `uni-store` Lance backend maps it onto the underlying
+/// `InvertedIndexParams`; this crate stays free of any Lance dependency.
+///
+/// Every field carries `#[serde(default)]` so schemas persisted before a field
+/// existed still deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnalyzerConfig {
+    /// Base tokenizer that splits raw text into tokens.
+    #[serde(default)]
+    pub base: BaseTokenizer,
+    /// Language used for stemming and built-in stop-word lists.
+    #[serde(default)]
+    pub language: FtsLanguage,
+    /// Whether to lowercase tokens.
+    #[serde(default = "default_true")]
+    pub lower_case: bool,
+    /// Whether to apply language-specific stemming.
+    #[serde(default = "default_true")]
+    pub stem: bool,
+    /// Whether to drop stop words (built-in list, or `custom_stop_words`).
+    #[serde(default = "default_true")]
+    pub remove_stop_words: bool,
+    /// Explicit stop-word list overriding the language's built-in list.
+    #[serde(default)]
+    pub custom_stop_words: Option<Vec<String>>,
+    /// Whether to fold accented characters to ASCII (é → e).
+    #[serde(default = "default_true")]
+    pub ascii_folding: bool,
+    /// Drop tokens longer than this many bytes (`None` keeps the backend default).
+    #[serde(default)]
+    pub max_token_length: Option<u32>,
+}
+
+impl Default for AnalyzerConfig {
+    fn default() -> Self {
+        Self {
+            base: BaseTokenizer::default(),
+            language: FtsLanguage::default(),
+            lower_case: true,
+            stem: true,
+            remove_stop_words: true,
+            custom_stop_words: None,
+            ascii_folding: true,
+            max_token_length: None,
+        }
+    }
+}
+
+/// Base tokenizer that produces the initial token stream.
+///
+/// `Custom` is a passthrough for backend-native tokenizers such as
+/// `"lindera/*"` or `"jieba/*"` (which require external dictionaries).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum BaseTokenizer {
+    /// Split on whitespace and punctuation (recommended default).
+    #[default]
+    Simple,
+    /// Split on whitespace only.
+    Whitespace,
+    /// No tokenization; the whole field is one token.
+    Raw,
+    /// Character N-gram tokenizer with inclusive `[min, max]` gram lengths.
+    Ngram {
+        /// Minimum gram length (must be `>= 1` and `<= max`).
+        min: u32,
+        /// Maximum gram length.
+        max: u32,
+    },
+    /// Backend-native tokenizer name, passed through verbatim (e.g. `"jieba/default"`).
+    Custom(String),
+}
+
+/// Language used for stemming and built-in stop-word removal.
+///
+/// Mirrors the 18 languages the Lance tokenizer supports. Note that not every
+/// language ships a built-in stop-word list; the backend mapper handles those
+/// cases (see `uni-store`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FtsLanguage {
+    /// Arabic.
+    Arabic,
+    /// Danish.
+    Danish,
+    /// Dutch.
+    Dutch,
+    /// English (default).
+    #[default]
+    English,
+    /// Finnish.
+    Finnish,
+    /// French.
+    French,
+    /// German.
+    German,
+    /// Greek.
+    Greek,
+    /// Hungarian.
+    Hungarian,
+    /// Italian.
+    Italian,
+    /// Norwegian.
+    Norwegian,
+    /// Portuguese.
+    Portuguese,
+    /// Romanian.
+    Romanian,
+    /// Russian.
+    Russian,
+    /// Spanish.
+    Spanish,
+    /// Swedish.
+    Swedish,
+    /// Tamil.
+    Tamil,
+    /// Turkish.
+    Turkish,
+}
+
+/// Serde default helper: boolean fields that default to `true`.
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

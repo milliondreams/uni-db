@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{
-    EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig,
-    ScalarIndexType, Schema, SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
+    AnalyzerConfig, BaseTokenizer, EmbeddingConfig, FtsLanguage, FullTextIndexConfig,
+    IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig, ScalarIndexType, Schema,
+    SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
 };
 use uni_cypher::ast::{
     AlterEdgeType, AlterLabel, BinaryOp, CallKind, Clause, CreateConstraint, CreateEdgeType,
@@ -8888,17 +8889,20 @@ impl QueryPlanner {
                     if_not_exists: c.if_not_exists,
                 })
             }
-            SchemaCommand::CreateFullTextIndex(cfg) => Ok(LogicalPlan::CreateFullTextIndex {
-                config: FullTextIndexConfig {
-                    name: cfg.name,
-                    label: cfg.label,
-                    properties: cfg.properties,
-                    tokenizer: TokenizerConfig::Standard,
-                    with_positions: true,
-                    metadata: Default::default(),
-                },
-                if_not_exists: cfg.if_not_exists,
-            }),
+            SchemaCommand::CreateFullTextIndex(cfg) => {
+                let tokenizer = Self::parse_tokenizer_options(&cfg.options)?;
+                Ok(LogicalPlan::CreateFullTextIndex {
+                    config: FullTextIndexConfig {
+                        name: cfg.name,
+                        label: cfg.label,
+                        properties: cfg.properties,
+                        tokenizer,
+                        with_positions: true,
+                        metadata: Default::default(),
+                    },
+                    if_not_exists: cfg.if_not_exists,
+                })
+            }
             SchemaCommand::CreateScalarIndex(cfg) => {
                 // Convert expressions to storage strings (strip variable prefix)
                 let properties: Vec<String> = cfg
@@ -8973,6 +8977,165 @@ impl QueryPlanner {
                 options: cmd.options,
             }),
         }
+    }
+
+    /// Parse `CREATE FULLTEXT INDEX ... OPTIONS { ... }` into a [`TokenizerConfig`].
+    ///
+    /// With no analyzer-related options the result is [`TokenizerConfig::Standard`]
+    /// (the unchanged default). Recognized keys:
+    /// `analyzer`/`tokenizer` (base tokenizer name), `language`, `stemmer`/`stem`,
+    /// `stopwords` (bool or explicit list), `ascii_folding`, `lower_case`,
+    /// `max_token_length`, `ngram_min`/`ngram_max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown `language`, an unusable `ngram_min`/`ngram_max`
+    /// range, or an option value of the wrong type.
+    fn parse_tokenizer_options(
+        options: &std::collections::HashMap<String, Value>,
+    ) -> Result<TokenizerConfig> {
+        // Keys that, when present, opt into the richer analyzer pipeline.
+        const ANALYZER_KEYS: [&str; 11] = [
+            "analyzer",
+            "tokenizer",
+            "language",
+            "stemmer",
+            "stem",
+            "stopwords",
+            "stop_words",
+            "ascii_folding",
+            "lower_case",
+            "max_token_length",
+            "ngram_min",
+        ];
+        let has_ngram_max = options.contains_key("ngram_max");
+        if !has_ngram_max && !ANALYZER_KEYS.iter().any(|k| options.contains_key(*k)) {
+            // No FTS analyzer options → keep the historical default.
+            return Ok(TokenizerConfig::Standard);
+        }
+
+        let base_raw = options
+            .get("analyzer")
+            .or_else(|| options.get("tokenizer"))
+            .and_then(|v| v.as_str());
+        let ngram_min = options.get("ngram_min").and_then(|v| v.as_i64());
+        let ngram_max = options.get("ngram_max").and_then(|v| v.as_i64());
+
+        let base = match base_raw.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("standard") | Some("simple") | None => BaseTokenizer::Simple,
+            Some("whitespace") => BaseTokenizer::Whitespace,
+            Some("raw") | Some("keyword") => BaseTokenizer::Raw,
+            Some("ngram") => {
+                let min = ngram_min.unwrap_or(3);
+                let max = ngram_max.unwrap_or_else(|| min.max(3));
+                if min < 1 || min > max {
+                    return Err(anyhow!(
+                        "invalid ngram options: ngram_min ({min}) must be >= 1 and <= ngram_max ({max})"
+                    ));
+                }
+                BaseTokenizer::Ngram {
+                    min: min as u32,
+                    max: max as u32,
+                }
+            }
+            // Passthrough for backend-native tokenizers (e.g. "jieba/default",
+            // "lindera/ipadic"); preserve the original casing.
+            Some(_) => BaseTokenizer::Custom(base_raw.unwrap().to_string()),
+        };
+
+        let language = match options.get("language").and_then(|v| v.as_str()) {
+            None => FtsLanguage::English,
+            Some(s) => Self::parse_fts_language(s)?,
+        };
+
+        // Filters default to the analyzer's own defaults (all enabled).
+        let defaults = AnalyzerConfig::default();
+        let lower_case = options
+            .get("lower_case")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.lower_case);
+        let stem = options
+            .get("stemmer")
+            .or_else(|| options.get("stem"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.stem);
+        let ascii_folding = options
+            .get("ascii_folding")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.ascii_folding);
+        let max_token_length = options
+            .get("max_token_length")
+            .and_then(|v| v.as_i64())
+            .map(|n| n.max(0) as u32);
+
+        // `stopwords`/`stop_words` accepts either a bool toggle or an explicit
+        // list of stop words (which also enables removal).
+        let stopwords_val = options.get("stopwords").or_else(|| options.get("stop_words"));
+        let (remove_stop_words, custom_stop_words) = match stopwords_val {
+            None => (defaults.remove_stop_words, None),
+            Some(v) => {
+                if let Some(arr) = v.as_array() {
+                    let words: Vec<String> = arr
+                        .iter()
+                        .filter_map(|w| w.as_str().map(|s| s.to_string()))
+                        .collect();
+                    (true, Some(words))
+                } else if let Some(b) = v.as_bool() {
+                    (b, None)
+                } else {
+                    return Err(anyhow!(
+                        "invalid `stopwords` option: expected a boolean or a list of strings"
+                    ));
+                }
+            }
+        };
+
+        Ok(TokenizerConfig::Analyzer(AnalyzerConfig {
+            base,
+            language,
+            lower_case,
+            stem,
+            remove_stop_words,
+            custom_stop_words,
+            ascii_folding,
+            max_token_length,
+        }))
+    }
+
+    /// Map a language name (case-insensitive) onto an [`FtsLanguage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unrecognized language name.
+    fn parse_fts_language(s: &str) -> Result<FtsLanguage> {
+        let lang = match s.to_ascii_lowercase().as_str() {
+            "arabic" => FtsLanguage::Arabic,
+            "danish" => FtsLanguage::Danish,
+            "dutch" => FtsLanguage::Dutch,
+            "english" => FtsLanguage::English,
+            "finnish" => FtsLanguage::Finnish,
+            "french" => FtsLanguage::French,
+            "german" => FtsLanguage::German,
+            "greek" => FtsLanguage::Greek,
+            "hungarian" => FtsLanguage::Hungarian,
+            "italian" => FtsLanguage::Italian,
+            "norwegian" => FtsLanguage::Norwegian,
+            "portuguese" => FtsLanguage::Portuguese,
+            "romanian" => FtsLanguage::Romanian,
+            "russian" => FtsLanguage::Russian,
+            "spanish" => FtsLanguage::Spanish,
+            "swedish" => FtsLanguage::Swedish,
+            "tamil" => FtsLanguage::Tamil,
+            "turkish" => FtsLanguage::Turkish,
+            other => {
+                return Err(anyhow!(
+                    "unknown FTS language '{other}' (expected one of: arabic, danish, dutch, \
+                     english, finnish, french, german, greek, hungarian, italian, norwegian, \
+                     portuguese, romanian, russian, spanish, swedish, tamil, turkish)"
+                ));
+            }
+        };
+        Ok(lang)
     }
 
     fn parse_embedding_config(emb_val: &Value) -> Result<Option<EmbeddingConfig>> {
@@ -11095,5 +11258,125 @@ mod pushdown_tests {
         let n_props = properties.get("n").expect("n should need embedding");
         assert!(n_props.contains("embedding"));
         assert_eq!(n_props.len(), 1, "only embedding should be projected");
+    }
+}
+
+#[cfg(test)]
+mod fts_tokenizer_option_tests {
+    use super::*;
+    use uni_common::Value;
+    use uni_common::core::schema::{BaseTokenizer, FtsLanguage, TokenizerConfig};
+
+    fn opts(pairs: &[(&str, Value)]) -> std::collections::HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn no_options_yields_standard() {
+        let cfg = QueryPlanner::parse_tokenizer_options(&opts(&[])).unwrap();
+        assert_eq!(cfg, TokenizerConfig::Standard);
+    }
+
+    #[test]
+    fn analyzer_language_stemmer_stopwords_roundtrip() {
+        let o = opts(&[
+            ("analyzer", Value::String("standard".into())),
+            ("language", Value::String("english".into())),
+            ("stemmer", Value::Bool(true)),
+            (
+                "stopwords",
+                Value::List(vec![Value::String("the".into()), Value::String("a".into())]),
+            ),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Simple);
+                assert_eq!(a.language, FtsLanguage::English);
+                assert!(a.stem);
+                assert!(a.remove_stop_words);
+                assert_eq!(
+                    a.custom_stop_words,
+                    Some(vec!["the".to_string(), "a".to_string()])
+                );
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_analyzer_maps_base() {
+        let o = opts(&[("tokenizer", Value::String("whitespace".into()))]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => assert_eq!(a.base, BaseTokenizer::Whitespace),
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ngram_options_map_bounds() {
+        let o = opts(&[
+            ("analyzer", Value::String("ngram".into())),
+            ("ngram_min", Value::Int(2)),
+            ("ngram_max", Value::Int(4)),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Ngram { min: 2, max: 4 })
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ngram_bad_bounds_rejected() {
+        let o = opts(&[
+            ("analyzer", Value::String("ngram".into())),
+            ("ngram_min", Value::Int(5)),
+            ("ngram_max", Value::Int(2)),
+        ]);
+        assert!(QueryPlanner::parse_tokenizer_options(&o).is_err());
+    }
+
+    #[test]
+    fn unknown_language_rejected() {
+        let o = opts(&[("language", Value::String("klingon".into()))]);
+        let err = QueryPlanner::parse_tokenizer_options(&o)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown FTS language"), "{err}");
+    }
+
+    #[test]
+    fn custom_tokenizer_passthrough() {
+        let o = opts(&[("analyzer", Value::String("jieba/default".into()))]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Custom("jieba/default".into()))
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopwords_bool_false_disables() {
+        let o = opts(&[
+            ("analyzer", Value::String("standard".into())),
+            ("stopwords", Value::Bool(false)),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert!(!a.remove_stop_words);
+                assert_eq!(a.custom_stop_words, None);
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
     }
 }

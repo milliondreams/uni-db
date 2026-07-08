@@ -648,8 +648,27 @@ impl IndexManager {
                     "Building physical FTS index '{}' on '{}'",
                     config.name, table
                 );
+                // Validate the tokenizer config up front so an invalid analyzer
+                // is surfaced as a hard error rather than being swallowed by the
+                // "table may be empty" downgrade below.
+                if let Err(e) = crate::backend::fts_analyzer::to_inverted_params(
+                    &config.tokenizer,
+                    config.with_positions,
+                ) {
+                    return Err(anyhow!(
+                        "Invalid tokenizer/analyzer config for FTS index '{}': {}",
+                        config.name,
+                        e
+                    ));
+                }
                 if let Err(e) = backend
-                    .create_fts_index(&table, &columns, Some(&config.name), config.with_positions)
+                    .create_fts_index(
+                        &table,
+                        &columns,
+                        Some(&config.name),
+                        &config.tokenizer,
+                        config.with_positions,
+                    )
                     .await
                 {
                     warn!(
@@ -711,6 +730,9 @@ impl IndexManager {
                         &table,
                         &[column.as_str()],
                         Some(&config.name),
+                        // JSON FTS uses the default (standard) analyzer; the
+                        // JSON-specific tokenizer wiring is out of scope here.
+                        &uni_common::core::schema::TokenizerConfig::Standard,
                         config.with_positions,
                     )
                     .await

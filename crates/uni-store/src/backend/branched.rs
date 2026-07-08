@@ -599,6 +599,7 @@ impl StorageBackend for BranchedBackend {
         _table: &str,
         _columns: &[&str],
         _name: Option<&str>,
+        _tokenizer: &uni_common::core::schema::TokenizerConfig,
         _with_positions: bool,
     ) -> Result<()> {
         anyhow::bail!("create_fts_index on a forked backend is not supported")

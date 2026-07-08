@@ -86,9 +86,29 @@ pub struct QueryProcedureHost {
     /// [`Self::execute_inner_query`]; when `None`, write-mode inner
     /// queries fail with a clear "no writer available" error.
     writer: Option<Arc<Writer>>,
+    /// Re-entrancy depth for declared-trigger action bodies (WS-A R1).
+    ///
+    /// A host built for a normal query / procedure invocation carries
+    /// `0`. When a declared trigger fires, the host it runs its action
+    /// body against carries `1`; if that action writes rows that
+    /// re-fire a declared trigger, the next host carries `2`, and so on.
+    /// The synthetic-trigger plugin refuses to fire once this exceeds
+    /// [`Self::MAX_TRIGGER_DEPTH`], collapsing an otherwise-unbounded
+    /// self-referential write storm to a bounded chain. Propagated
+    /// through [`Self::execute_inner_query`] so the commit the action
+    /// produces stamps the incremented depth onto the host it builds for
+    /// its own triggers.
+    trigger_depth: u32,
 }
 
 impl QueryProcedureHost {
+    /// Maximum declared-trigger action re-entrancy depth (WS-A R1).
+    ///
+    /// A depth of `1` is the trigger's own action body; deeper values
+    /// mean the action re-fired another declared trigger. Firing is
+    /// refused past this cap so a self-referential trigger terminates
+    /// instead of driving an unbounded async write storm.
+    pub const MAX_TRIGGER_DEPTH: u32 = 4;
     /// Snapshot the host-shaped components of `graph_ctx`. The
     /// per-request fields start empty; use
     /// [`Self::from_graph_ctx_with_request`] when the surrounding query
@@ -125,6 +145,7 @@ impl QueryProcedureHost {
             expected_schema,
             transient_counter: Arc::new(AtomicU64::new(0)),
             writer: None,
+            trigger_depth: 0,
         }
     }
 
@@ -151,7 +172,57 @@ impl QueryProcedureHost {
             expected_schema: None,
             transient_counter: Arc::new(AtomicU64::new(0)),
             writer: None,
+            trigger_depth: 0,
         }
+    }
+
+    /// Construct a write-enabled host from the transaction commit path
+    /// (WS-A), so a declared trigger's after-commit Cypher action can run
+    /// against the same storage / property-manager / L0 snapshot the
+    /// commit just produced.
+    ///
+    /// `l0_context` should carry `current_l0 =
+    /// writer.l0_manager.get_current()` (the just-committed main L0),
+    /// the pending-flush L0s, and — for read-your-writes fidelity — the
+    /// committing transaction's private `tx_l0` as `transaction_l0`.
+    /// Attach the writer via [`Self::with_writer`] to enable write-mode
+    /// action bodies. `trigger_depth` is the re-entrancy depth this host
+    /// runs at (see [`Self::MAX_TRIGGER_DEPTH`]); the commit path passes
+    /// the depth carried by the host that produced this commit, or `0`
+    /// for a top-level commit.
+    #[must_use]
+    pub fn from_commit_parts(
+        storage: Arc<StorageManager>,
+        property_manager: Arc<PropertyManager>,
+        procedure_registry: Option<Arc<ProcedureRegistry>>,
+        xervo_runtime: Option<Arc<ModelRuntime>>,
+        l0_context: L0Context,
+        trigger_depth: u32,
+    ) -> Self {
+        Self {
+            storage,
+            algo_registry: None,
+            procedure_registry,
+            xervo_runtime,
+            property_manager: Some(property_manager),
+            l0_context,
+            deadline: None,
+            cancellation_token: None,
+            target_properties: HashMap::new(),
+            yield_items: Vec::new(),
+            expected_schema: None,
+            transient_counter: Arc::new(AtomicU64::new(0)),
+            writer: None,
+            trigger_depth,
+        }
+    }
+
+    /// Re-entrancy depth this host runs its action body at (WS-A R1).
+    /// `0` for a normal query / procedure host; `>= 1` inside a declared
+    /// trigger's action.
+    #[must_use]
+    pub fn trigger_depth(&self) -> u32 {
+        self.trigger_depth
     }
 
     /// Attach the outer transaction's writer handle to this host.

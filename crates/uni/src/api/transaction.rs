@@ -1287,7 +1287,42 @@ impl Transaction {
         // on the tokio runtime so the commit returns immediately.
         if let Some(events) = trigger_events {
             let tx_id_u64 = tx_id_to_u64(&self.id);
-            let ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            let mut ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            // WS-A — attach a write-enabled host so a declared
+            // (synthesized) trigger's after-commit Cypher action can run
+            // against the just-committed graph state. Built ONCE per
+            // commit and only when triggers are registered. The L0
+            // context uses the writer's post-commit `current` buffer so
+            // the action sees the data this transaction just committed;
+            // `execute_inner_query(Write)` writes land directly in main
+            // L0 + WAL (durable, immediately visible) rather than through
+            // a nested transaction, so no re-entrant commit is produced.
+            if !trigger_router.is_empty()
+                && let Some(writer_arc) = self.db.writer.as_ref()
+            {
+                let l0_ctx = uni_query::query::df_graph::L0Context {
+                    current_l0: Some(writer_arc.l0_manager.get_current()),
+                    // Data is now in main L0; the tx's private buffer is
+                    // excluded to avoid double-vision on read.
+                    transaction_l0: None,
+                    pending_flush_l0s: writer_arc.l0_manager.get_pending_flush(),
+                };
+                let host: Arc<dyn uni_plugin::traits::procedure::ProcedureHost> = Arc::new(
+                    uni_query::query::executor::procedure_host::QueryProcedureHost::from_commit_parts(
+                        Arc::clone(&self.db.storage),
+                        Arc::clone(&self.db.properties),
+                        Some(Arc::clone(&self.db.procedure_registry)),
+                        self.db.xervo_runtime.clone(),
+                        l0_ctx,
+                        // Top-level commit runs declared-trigger actions
+                        // at depth 0; the synthetic-trigger re-entrancy
+                        // guard caps the chain.
+                        0,
+                    )
+                    .with_writer(Arc::clone(writer_arc)),
+                );
+                ctx = ctx.with_host(host);
+            }
             let runtime = tokio::runtime::Handle::current();
             trigger_router.dispatch_after(ctx, &events, &runtime);
         }

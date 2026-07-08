@@ -6,6 +6,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use smol_str::SmolStr;
 
 use crate::errors::FnError;
+use crate::traits::procedure::ProcedureHost;
 
 /// A fine-grained mutation trigger.
 pub trait TriggerPlugin: Send + Sync {
@@ -229,23 +230,68 @@ impl TriggerDeferral {
 }
 
 /// Per-fire context.
-#[derive(Debug)]
+///
+/// # ABI note (3.0 breaking change)
+///
+/// Carries an **owned** optional [`ProcedureHost`] handle so a declared
+/// (synthesized) trigger can reach the host's write-enabled inner-query
+/// primitive from inside `fire`. The handle is owned (not borrowed)
+/// because the after-commit async dispatch path moves the context into a
+/// `'static` spawned task and rebuilds it there — a borrow could not
+/// outlive the commit stack frame. Native trigger plugins that never
+/// touch `host()` are unaffected (the field defaults to `None`).
 #[non_exhaustive]
 pub struct TriggerContext<'a> {
     /// Session identifier.
     pub session_id: &'a str,
     /// Transaction identifier.
     pub tx_id: u64,
+    /// Owned host handle, threaded through the commit path so a
+    /// declared trigger's Cypher action body can run against the same
+    /// storage / writer the outer commit saw. `None` for native
+    /// trigger plugins and for contexts built without a host.
+    host: Option<Arc<dyn ProcedureHost>>,
+}
+
+impl std::fmt::Debug for TriggerContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TriggerContext")
+            .field("session_id", &self.session_id)
+            .field("tx_id", &self.tx_id)
+            .field("host", &self.host.as_ref().map(|_| "<ProcedureHost>"))
+            .finish()
+    }
 }
 
 impl<'a> TriggerContext<'a> {
-    /// Construct a fresh context. The struct is `#[non_exhaustive]` so
-    /// external callers can't use struct-literal syntax; this
-    /// constructor is the supported path. Future fields ship via
-    /// `with_*` builder methods to preserve API compatibility.
+    /// Construct a fresh context with no host handle. The struct is
+    /// `#[non_exhaustive]` so external callers can't use struct-literal
+    /// syntax; this constructor is the supported path. Future fields
+    /// ship via `with_*` builder methods to preserve API compatibility.
     #[must_use]
     pub fn new(session_id: &'a str, tx_id: u64) -> Self {
-        Self { session_id, tx_id }
+        Self {
+            session_id,
+            tx_id,
+            host: None,
+        }
+    }
+
+    /// Attach an owned host handle to this context.
+    ///
+    /// The commit-path dispatcher threads a write-enabled host through so
+    /// a declared trigger's `fire` can downcast it (via
+    /// [`ProcedureHost::as_any`]) and run its stored Cypher action body.
+    #[must_use]
+    pub fn with_host(mut self, host: Arc<dyn ProcedureHost>) -> Self {
+        self.host = Some(host);
+        self
+    }
+
+    /// Borrow the attached host handle, when one was threaded in.
+    #[must_use]
+    pub fn host(&self) -> Option<&Arc<dyn ProcedureHost>> {
+        self.host.as_ref()
     }
 }
 

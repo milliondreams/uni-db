@@ -66,6 +66,7 @@ use tracing::warn;
 use uni_common::cypher_value_codec;
 use uni_common::{Properties, UniError, Value};
 use uni_plugin::PluginRegistry;
+use uni_plugin::traits::procedure::ProcedureHost;
 use uni_plugin::traits::trigger::{
     FireMode, MutationBatch, TriggerContext, TriggerEventMask, TriggerOutcome, TriggerPhase,
     TriggerPlugin, TriggerSubscription,
@@ -568,6 +569,12 @@ impl TriggerRouter {
         ctx: TriggerContext<'_>,
         events: &MutationEvents,
     ) -> Result<(), UniError> {
+        // Owned host handle (WS-A), cloned into each per-fire context so
+        // a declared trigger's action body can reach the write-enabled
+        // host. `None` for native-only setups. (Declared triggers are
+        // AfterCommit + Async and never actually fire in the before
+        // phase, but thread the host through for uniformity.)
+        let host = ctx.host().cloned();
         // Deferrals are BUFFERED here and only committed to the queue once ALL
         // synchronous before-triggers have run without a reject/error. If a later
         // trigger rejects (returning `Err`), the transaction aborts and these
@@ -595,7 +602,10 @@ impl TriggerRouter {
                 let mb = MutationBatch {
                     events: Arc::new(batch),
                 };
-                let ctx_ref = TriggerContext::new(ctx.session_id, ctx.tx_id);
+                let mut ctx_ref = TriggerContext::new(ctx.session_id, ctx.tx_id);
+                if let Some(h) = host.as_ref() {
+                    ctx_ref = ctx_ref.with_host(Arc::clone(h));
+                }
                 match entry.plugin.fire(ctx_ref, &mb) {
                     Ok(TriggerOutcome::Continue) => {}
                     Ok(TriggerOutcome::Reject { reason }) => {
@@ -664,6 +674,10 @@ impl TriggerRouter {
         events: &MutationEvents,
         runtime: &Handle,
     ) {
+        // Owned host handle (WS-A). Cloned into the async spawn closure so
+        // a declared trigger's after-commit action body reaches the
+        // write-enabled host after the commit stack frame is gone.
+        let host = ctx.host().cloned();
         for &phase in &[TriggerPhase::AfterMutation, TriggerPhase::AfterCommit] {
             let routes = &self.by_phase[phase_index(phase)];
             for entry in routes {
@@ -675,7 +689,14 @@ impl TriggerRouter {
                 };
                 match entry.fire_mode {
                     FireMode::Synchronous => {
-                        fire_caught(entry, ctx.session_id, ctx.tx_id, &mb, &self.defer_queue);
+                        fire_caught(
+                            entry,
+                            ctx.session_id,
+                            ctx.tx_id,
+                            &mb,
+                            &self.defer_queue,
+                            host.as_ref(),
+                        );
                     }
                     // WS-E: EventualConsistency buffers into the per-`Uni`
                     // coalescing queue instead of spawning per-commit. Due
@@ -700,11 +721,16 @@ impl TriggerRouter {
                         let session_id = ctx.session_id.to_owned();
                         let tx_id = ctx.tx_id;
                         let queue = self.defer_queue.clone();
+                        let host = host.clone();
                         runtime.spawn(async move {
                             let mb_inner = mb;
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    plugin.fire(TriggerContext::new(&session_id, tx_id), &mb_inner)
+                                    let mut c = TriggerContext::new(&session_id, tx_id);
+                                    if let Some(h) = host.as_ref() {
+                                        c = c.with_host(Arc::clone(h));
+                                    }
+                                    plugin.fire(c, &mb_inner)
                                 }));
                             handle_fire_outcome(result, &name, "async trigger", |until| {
                                 enqueue_deferral(
@@ -791,14 +817,20 @@ fn fire_caught(
     tx_id: u64,
     mb: &MutationBatch,
     defer_queue: &Option<Arc<DeferralQueue>>,
+    host: Option<&Arc<dyn ProcedureHost>>,
 ) {
     let plugin = Arc::clone(&entry.plugin);
     let name = entry.name.clone();
     let name_ordinal = entry.name_ordinal;
     let mb_clone = mb.clone();
     let session_id_owned = session_id.to_owned();
+    let host = host.cloned();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin.fire(TriggerContext::new(&session_id_owned, tx_id), &mb_clone)
+        let mut c = TriggerContext::new(&session_id_owned, tx_id);
+        if let Some(h) = host.as_ref() {
+            c = c.with_host(Arc::clone(h));
+        }
+        plugin.fire(c, &mb_clone)
     }));
     handle_fire_outcome(result, &name, "after-phase trigger", |until| {
         enqueue_deferral(

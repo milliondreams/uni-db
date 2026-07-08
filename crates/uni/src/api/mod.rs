@@ -246,9 +246,14 @@ fn register_builtin_plugins(
     {
         let synthesizer: Arc<dyn uni_plugin_custom::ProcedureBodySynthesizer> =
             Arc::new(crate::synthetic_procedure::CypherProcedureSynthesizer::new());
+        // WS-A — trigger synthesizer so `declareTrigger` installs a real
+        // `TriggerPlugin` that fires on the commit path.
+        let trigger_synthesizer: Arc<dyn uni_plugin_custom::TriggerBodySynthesizer> =
+            Arc::new(crate::synthetic_trigger::CypherTriggerSynthesizer::new());
         let plugin = uni_plugin_custom::CustomPlugin::new(Arc::clone(registry), persistence)
             .map_err(|e| uni_plugin::PluginError::internal(format!("uni-plugin-custom: {e}")))?
-            .with_procedure_synthesizer(synthesizer);
+            .with_procedure_synthesizer(synthesizer)
+            .with_trigger_synthesizer(trigger_synthesizer);
         plugin.reactivate_into_registry().map_err(|e| {
             uni_plugin::PluginError::internal(format!("uni-plugin-custom reactivate: {e}"))
         })?;

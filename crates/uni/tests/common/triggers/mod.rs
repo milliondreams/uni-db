@@ -1,3 +1,4 @@
+pub mod trigger_declared;
 pub mod trigger_defer;
 pub mod trigger_dispatch;
 pub mod trigger_predicate;

@@ -508,7 +508,10 @@ mod locy_tests {
             if let ast::Expr::FunctionCall { name, .. } = &rule.fold[0].aggregate {
                 assert_eq!(name, "myplugin.MYAGG", "dotted aggregate name preserved");
             } else {
-                panic!("Expected dotted FunctionCall, got: {:?}", rule.fold[0].aggregate);
+                panic!(
+                    "Expected dotted FunctionCall, got: {:?}",
+                    rule.fold[0].aggregate
+                );
             }
         } else {
             panic!("Expected Rule");

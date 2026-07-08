@@ -1049,8 +1049,15 @@ impl StorageBackend for LanceDbBackend {
         // Translate the requested analyzer pipeline into Lance params. A
         // config error (bad ngram bounds, unsupported stop-word language) is
         // surfaced here before we touch the table.
-        let params = super::fts_analyzer::to_inverted_params(tokenizer, with_positions)
-            .map_err(|e| anyhow!("invalid FTS tokenizer config for '{}.{:?}': {}", table, columns, e))?;
+        let params =
+            super::fts_analyzer::to_inverted_params(tokenizer, with_positions).map_err(|e| {
+                anyhow!(
+                    "invalid FTS tokenizer config for '{}.{:?}': {}",
+                    table,
+                    columns,
+                    e
+                )
+            })?;
         let fts_params = lancedb::index::Index::FTS(params);
         let mut builder = tbl.create_index(columns, fts_params).replace(true);
         if let Some(n) = name {

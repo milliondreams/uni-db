@@ -304,7 +304,9 @@ impl Compactor {
             Some(reg) => crdt_a
                 .merge_via_registry(&crdt_b, reg)
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
-            None => crdt_a.try_merge(&crdt_b).map_err(|e| anyhow::anyhow!("{e}"))?,
+            None => crdt_a
+                .try_merge(&crdt_b)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
         }
         Ok(Value::from(serde_json::to_value(crdt_a)?))
     }
@@ -682,9 +684,7 @@ mod ws_d_crdt_tests {
 
     use uni_common::Value;
     use uni_crdt::{Crdt, GCounter};
-    use uni_plugin::traits::crdt::{
-        CrdtKind, CrdtKindProvider, CrdtOp, CrdtState, ScalarValue,
-    };
+    use uni_plugin::traits::crdt::{CrdtKind, CrdtKindProvider, CrdtOp, CrdtState, ScalarValue};
     use uni_plugin::{
         Capability, CapabilitySet, FnError, PluginId, PluginRegistrar, PluginRegistry,
     };
@@ -704,8 +704,8 @@ mod ws_d_crdt_tests {
         }
         fn from_persisted(&self, bytes: &[u8]) -> Result<Box<dyn CrdtState>, FnError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let inner = Crdt::from_msgpack(bytes)
-                .map_err(|e| FnError::new(0xA01, format!("{e}")))?;
+            let inner =
+                Crdt::from_msgpack(bytes).map_err(|e| FnError::new(0xA01, format!("{e}")))?;
             Ok(Box::new(St { inner }))
         }
     }

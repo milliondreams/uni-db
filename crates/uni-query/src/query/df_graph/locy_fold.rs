@@ -2377,8 +2377,11 @@ mod tests {
 
         let registered: Arc<dyn LocyAggregate> = Arc::new(IdentityAgg);
         let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
-        r.locy_aggregate(uni_plugin::QName::new("myplugin", "MYAGG"), Arc::clone(&registered))
-            .expect("register");
+        r.locy_aggregate(
+            uni_plugin::QName::new("myplugin", "MYAGG"),
+            Arc::clone(&registered),
+        )
+        .expect("register");
         r.commit_to_registry().expect("commit");
 
         // Before P0.2 this returned None (builtin-only lookup); now the

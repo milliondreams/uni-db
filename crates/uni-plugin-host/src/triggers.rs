@@ -1711,13 +1711,7 @@ impl EcQueue {
     ///
     /// Module-private because it takes the module-private [`RouteEntry`];
     /// the only caller is [`TriggerRouter::dispatch_after`] (same module).
-    fn enqueue(
-        &self,
-        entry: &RouteEntry,
-        session_id: &str,
-        tx_id: u64,
-        batch: Arc<RecordBatch>,
-    ) {
+    fn enqueue(&self, entry: &RouteEntry, session_id: &str, tx_id: u64, batch: Arc<RecordBatch>) {
         let key = (entry.name.clone(), entry.name_ordinal);
         // Back-pressure cap: 4× the early-flush threshold.
         let cap = self.flush_threshold.saturating_mul(4);

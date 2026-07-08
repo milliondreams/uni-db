@@ -9070,7 +9070,9 @@ impl QueryPlanner {
 
         // `stopwords`/`stop_words` accepts either a bool toggle or an explicit
         // list of stop words (which also enables removal).
-        let stopwords_val = options.get("stopwords").or_else(|| options.get("stop_words"));
+        let stopwords_val = options
+            .get("stopwords")
+            .or_else(|| options.get("stop_words"));
         let (remove_stop_words, custom_stop_words) = match stopwords_val {
             None => (defaults.remove_stop_words, None),
             Some(v) => {

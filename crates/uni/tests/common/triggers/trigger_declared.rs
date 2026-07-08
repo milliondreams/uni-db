@@ -202,7 +202,8 @@ async fn declared_trigger_when_predicate_filters() -> Result<()> {
 
     // Above threshold — must fire.
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Person {name:'grown', age:40})").await?;
+    tx.execute("CREATE (:Person {name:'grown', age:40})")
+        .await?;
     tx.commit().await?;
 
     let n = wait_for_count(&db, "AdultLog", 1, Duration::from_secs(5)).await;
@@ -258,6 +259,9 @@ async fn declared_trigger_survives_restart() -> Result<()> {
     tx.commit().await?;
 
     let n = wait_for_count(&db, "AuditLog", 1, Duration::from_secs(5)).await;
-    assert!(n >= 1, "restored declared trigger did not fire after restart");
+    assert!(
+        n >= 1,
+        "restored declared trigger did not fire after restart"
+    );
     Ok(())
 }

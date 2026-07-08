@@ -83,9 +83,7 @@ pub fn to_inverted_params(
         TokenizerConfig::Whitespace => Ok(InvertedIndexParams::default()
             .base_tokenizer("whitespace".to_string())
             .with_position(with_positions)),
-        TokenizerConfig::Ngram { min, max } => {
-            build_ngram(u32::from(*min), u32::from(*max))
-        }
+        TokenizerConfig::Ngram { min, max } => build_ngram(u32::from(*min), u32::from(*max)),
         TokenizerConfig::Custom { name } => Ok(InvertedIndexParams::default()
             .base_tokenizer(name.clone())
             .with_position(with_positions)),

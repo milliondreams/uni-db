@@ -16,11 +16,11 @@ use crate::qname::QName;
 use crate::registry::PluginRegistry;
 use crate::surfaces::{
     AggregateSurface, AlgorithmSurface, AppendReg, AuthSurface, AuthzSurface, BackgroundJobSurface,
-    CatalogSurface, CdcSurface, CollationSurface, CrdtSurface,
-    DynPendingRegistration, HookSurface, IndexKindSurface, KeyedUniqueReg, LabelStorageSurface,
-    LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg,
-    OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface,
-    ScalarSurface, TriggerSurface, VersionedReg, WindowSurface,
+    CatalogSurface, CdcSurface, CollationSurface, CrdtSurface, DynPendingRegistration, HookSurface,
+    IndexKindSurface, KeyedUniqueReg, LabelStorageSurface, LocyAggregateSurface,
+    LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg, OptimizerRuleSurface,
+    ProcedureSurface, ReplacementScanSurface, ScalarSurface, TriggerSurface, VersionedReg,
+    WindowSurface,
 };
 use crate::traits::aggregate::{AggSignature, AggregatePluginFn};
 use crate::traits::algorithm::AlgorithmProvider;

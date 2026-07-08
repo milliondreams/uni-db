@@ -1319,8 +1319,13 @@ pub struct FullTextIndexConfig {
 pub enum TokenizerConfig {
     Standard,
     Whitespace,
-    Ngram { min: u8, max: u8 },
-    Custom { name: String },
+    Ngram {
+        min: u8,
+        max: u8,
+    },
+    Custom {
+        name: String,
+    },
     /// Fully specified analyzer pipeline (base tokenizer + language + filters).
     ///
     /// Carries stemming, stop-word, lowercasing, ASCII-folding and token-length

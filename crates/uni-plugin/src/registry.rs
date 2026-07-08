@@ -1004,12 +1004,11 @@ impl PluginRegistry {
     pub fn remove_plugin(&self, plugin: &PluginId) {
         use crate::surfaces::{
             AggregateSurface, AlgorithmSurface, AppendOps, AuthSurface, AuthzSurface,
-            BackgroundJobSurface, CatalogSurface, CdcSurface, CollationSurface,
-            CrdtSurface, Discriminator, HookSurface, IndexKindSurface, KeyedUniqueOps,
-            LabelStorageSurface, LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface,
-            NamedUniqueOps, OptimizerRuleSurface, ProcedureSurface,
-            ReplacementScanSurface, ScalarSurface, TriggerSurface,
-            VersionedOps, WindowSurface,
+            BackgroundJobSurface, CatalogSurface, CdcSurface, CollationSurface, CrdtSurface,
+            Discriminator, HookSurface, IndexKindSurface, KeyedUniqueOps, LabelStorageSurface,
+            LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueOps,
+            OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface, ScalarSurface,
+            TriggerSurface, VersionedOps, WindowSurface,
         };
 
         let record = self.per_plugin.read().remove(plugin).map(|(_, r)| r);

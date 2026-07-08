@@ -230,9 +230,7 @@ impl TriggerPlugin for SyntheticTriggerPlugin {
                         .await
                 })
             })
-            .map_err(|e| {
-                FnError::new(0xD12, format!("declared trigger `{qname}` action: {e}"))
-            })?;
+            .map_err(|e| FnError::new(0xD12, format!("declared trigger `{qname}` action: {e}")))?;
         }
 
         Ok(TriggerOutcome::Continue)
@@ -355,18 +353,9 @@ fn parse_event_filter(raw: &str, qname: &str) -> Result<ParsedFilter, String> {
     for verb in verbs_part.split('|') {
         let v = verb.trim().to_ascii_uppercase();
         let (node_bit, edge_bit) = match v.as_str() {
-            "CREATE" | "INSERT" => (
-                TriggerEventMask::NODE_CREATE,
-                TriggerEventMask::EDGE_CREATE,
-            ),
-            "UPDATE" | "SET" => (
-                TriggerEventMask::NODE_UPDATE,
-                TriggerEventMask::EDGE_UPDATE,
-            ),
-            "DELETE" | "REMOVE" => (
-                TriggerEventMask::NODE_DELETE,
-                TriggerEventMask::EDGE_DELETE,
-            ),
+            "CREATE" | "INSERT" => (TriggerEventMask::NODE_CREATE, TriggerEventMask::EDGE_CREATE),
+            "UPDATE" | "SET" => (TriggerEventMask::NODE_UPDATE, TriggerEventMask::EDGE_UPDATE),
+            "DELETE" | "REMOVE" => (TriggerEventMask::NODE_DELETE, TriggerEventMask::EDGE_DELETE),
             _ => continue,
         };
         recognized = true;

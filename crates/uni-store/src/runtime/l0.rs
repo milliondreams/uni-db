@@ -242,7 +242,7 @@ pub struct L0Buffer {
     /// `None` for the main L0 and read-only / SSI-disabled paths.
     pub occ_read_set: Option<Arc<parking_lot::Mutex<OccReadSet>>>,
     /// Optional plugin registry for registry-dispatched CRDT merges at
-    /// commit-time property merge ([`Self::merge_crdt_properties`]).
+    /// commit-time property merge (`merge_crdt_properties`).
     ///
     /// Behavior-preserving when absent: falls back to native
     /// [`uni_crdt::Crdt::try_merge`] bit-for-bit when no provider is
@@ -555,7 +555,7 @@ impl L0Buffer {
     /// Install the plugin registry used for registry-dispatched CRDT merges.
     ///
     /// Stamped by the owning `L0Manager` onto every buffer it mints so the
-    /// commit-time merge ([`Self::merge_crdt_properties`]) can route custom
+    /// commit-time merge (`merge_crdt_properties`) can route custom
     /// CRDT kinds through a registered provider. Absent registry preserves
     /// native [`uni_crdt::Crdt::try_merge`] behavior.
     pub fn set_plugin_registry(&mut self, registry: Arc<uni_plugin::PluginRegistry>) {

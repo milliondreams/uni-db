@@ -642,7 +642,7 @@ pub struct UniConfig {
     /// bucket may accumulate before it is flushed as a single batched fire
     /// (default: 1s). The per-`Uni` deferral tick drains buckets whose
     /// oldest pending batch is older than this. Lower = fresher fires,
-    /// higher = more coalescing per fire. See [`FireMode::EventualConsistency`].
+    /// higher = more coalescing per fire. See `FireMode::EventualConsistency`.
     pub ec_flush_interval: Duration,
 
     /// Row count at which an `EventualConsistency` trigger's coalescing

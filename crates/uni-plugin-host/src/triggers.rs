@@ -667,7 +667,7 @@ impl TriggerRouter {
     /// logged). `Async` triggers are spawned on `runtime`.
     /// `EventualConsistency` triggers buffer into the per-`Uni`
     /// [`EcQueue`], which coalesces batches across commits and flushes a
-    /// single [`DeferredItem`] per bucket on the deferral tick (WS-E).
+    /// single `DeferredItem` per bucket on the deferral tick (WS-E).
     pub fn dispatch_after(
         &self,
         ctx: TriggerContext<'_>,
@@ -1602,7 +1602,7 @@ struct DeferredItem {
 ///
 /// Accumulates the projected event `RecordBatch`es for a single
 /// `EventualConsistency` trigger across commits, then flushes them as
-/// ONE concatenated [`DeferredItem`] into the shared [`DeferralQueue`]
+/// ONE concatenated `DeferredItem` into the shared [`DeferralQueue`]
 /// once the bucket is due (age >= interval or rows >= threshold).
 struct EcBucket {
     plugin: Arc<dyn TriggerPlugin>,
@@ -1633,11 +1633,11 @@ struct EcBucket {
 ///
 /// Where [`FireMode::Async`] spawns one task per matching commit,
 /// EventualConsistency triggers buffer their projected event batches into
-/// per-trigger [`EcBucket`]s and flush a SINGLE coalesced fire once a
+/// per-trigger `EcBucket`s and flush a SINGLE coalesced fire once a
 /// bucket is due. Coalesced work rides the existing [`DeferralQueue`]
 /// durability + fire ladder — there is no separate sidecar or fire path:
 /// a due bucket concatenates its pending batches into one
-/// [`MutationBatch`] and pushes one [`DeferredItem`].
+/// [`MutationBatch`] and pushes one `DeferredItem`.
 ///
 /// **Lifetime:** unlike [`TriggerRouter`] (rebuilt every commit), the
 /// `EcQueue` is a per-`Uni` `Arc` living in `UniInner`, `Arc`-cloned into
@@ -1741,7 +1741,7 @@ impl EcQueue {
 
     /// Flush every bucket that is due as of `now`: age (oldest pending
     /// batch older than `flush_interval`) OR size (`rows >= flush_threshold`).
-    /// Each due bucket becomes ONE coalesced [`DeferredItem`]. Called from
+    /// Each due bucket becomes ONE coalesced `DeferredItem`. Called from
     /// the per-`Uni` 50ms deferral tick alongside `DeferralQueue::tick`.
     pub fn flush_due(&self, now: StdInstant) {
         let Some(defer_queue) = self.defer_queue.as_ref() else {
@@ -1764,7 +1764,7 @@ impl EcQueue {
     }
 
     /// Concatenate a bucket's pending batches (in FIFO order) into one
-    /// coalesced [`DeferredItem`] and push it into `defer_queue` with
+    /// coalesced `DeferredItem` and push it into `defer_queue` with
     /// `fire_at = now`. On concat failure (schema drift) each pending batch
     /// is pushed individually so data is never lost.
     fn drain_bucket(bucket: EcBucket, defer_queue: &DeferralQueue, now: StdInstant) {

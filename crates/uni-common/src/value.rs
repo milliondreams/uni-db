@@ -783,7 +783,11 @@ impl fmt::Display for Value {
 pub fn cmp_i64_f64(i: i64, f: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if f.is_infinite() {
-        return if f > 0.0 { Ordering::Less } else { Ordering::Greater };
+        return if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
     }
     let ff = f.floor();
     // 2^63: every i64 is <= i64::MAX = 2^63 - 1 < 2^63 <= f, so the int is Less.
@@ -1792,7 +1796,10 @@ mod tests {
         // 2^53 vs 2^53+1: the naive `as f64` cast collapses these to Equal.
         let two_p53 = 9_007_199_254_740_992.0_f64;
         assert_eq!(cmp_i64_f64(9_007_199_254_740_992, two_p53), Ordering::Equal);
-        assert_eq!(cmp_i64_f64(9_007_199_254_740_993, two_p53), Ordering::Greater);
+        assert_eq!(
+            cmp_i64_f64(9_007_199_254_740_993, two_p53),
+            Ordering::Greater
+        );
         assert_eq!(cmp_i64_f64(9_007_199_254_740_991, two_p53), Ordering::Less);
     }
 

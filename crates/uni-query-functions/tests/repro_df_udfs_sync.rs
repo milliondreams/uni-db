@@ -190,8 +190,14 @@ fn repro_finding_13_sort_key_int_collapse() {
     // Near 2^53: Int(2^53) == Float(2^53.0) (equality preserved for joins), and
     // Int(2^53 + 1) sorts strictly after the float bucket.
     let f_2p53 = encode_cypher_sort_key(&Value::Float(9_007_199_254_740_992.0));
-    assert_eq!(k_lo, f_2p53, "Int(2^53) and Float(2^53.0) must be byte-identical");
-    assert!(f_2p53 < k_hi, "Float(2^53.0) must sort before Int(2^53 + 1)");
+    assert_eq!(
+        k_lo, f_2p53,
+        "Int(2^53) and Float(2^53.0) must be byte-identical"
+    );
+    assert!(
+        f_2p53 < k_hi,
+        "Float(2^53.0) must sort before Int(2^53 + 1)"
+    );
 
     // Equality preservation for a small exactly-representable value.
     assert_eq!(

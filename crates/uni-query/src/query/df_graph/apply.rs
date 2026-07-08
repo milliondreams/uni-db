@@ -1245,7 +1245,10 @@ mod tests {
         use std::cmp::Ordering;
         let big_int = Value::Int(9_007_199_254_740_993);
         let float_2p53 = Value::Float(9_007_199_254_740_992.0);
-        assert_eq!(compare_values(&big_int, &float_2p53), Some(Ordering::Greater));
+        assert_eq!(
+            compare_values(&big_int, &float_2p53),
+            Some(Ordering::Greater)
+        );
         assert_eq!(compare_values(&float_2p53, &big_int), Some(Ordering::Less));
     }
 }

@@ -151,7 +151,9 @@ async fn repro_check_constraint_int_float_precision_collapse() -> Result<()> {
     })?;
 
     let tx = db.session().tx().await?;
-    let result = tx.execute("CREATE (b:BigNum {val: 9007199254740993})").await;
+    let result = tx
+        .execute("CREATE (b:BigNum {val: 9007199254740993})")
+        .await;
     // 9007199254740993 > 9007199254740992.0 is true; exact comparison accepts it.
     assert!(
         result.is_ok(),

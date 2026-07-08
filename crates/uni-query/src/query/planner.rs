@@ -3592,6 +3592,22 @@ impl QueryPlanner {
                                     input_filter: None,
                                 };
                             }
+
+                            // Apply a post-YIELD WHERE predicate. The grammar nests
+                            // `WHERE <expr>` inside `yield_clause` (cypher.pest), so
+                            // `CALL ... YIELD ... WHERE ...` stores the predicate on
+                            // the CALL node rather than as a standalone clause. Without
+                            // consuming it here it was silently dropped, returning
+                            // unfiltered rows. Mirrors the MATCH-WHERE (plan_where_clause)
+                            // and WITH-WHERE handling. YIELD vars are already in scope.
+                            if let Some(predicate) = &call_clause.where_clause {
+                                plan = self.plan_where_clause(
+                                    predicate,
+                                    plan,
+                                    &vars_in_scope,
+                                    HashSet::new(),
+                                )?;
+                            }
                         }
                         CallKind::Subquery(query) => {
                             let subquery_plan =

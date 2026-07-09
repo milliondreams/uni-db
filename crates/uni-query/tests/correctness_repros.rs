@@ -709,7 +709,14 @@ async fn repro_07_optional_filter_batches() {
     h.run_ok("CREATE (:A {x:0})").await;
     h.run_ok("UNWIND range(1, 20000) AS i CREATE (:B {y:i})")
         .await;
-    // WHERE b.y > 99999 : nothing matches -> exactly ONE null row expected.
+
+    // FIXED (optional_filter.rs): NULL recovery rows are now buffered across
+    // batches and flushed once at end-of-stream, so a single source group whose
+    // rows span several 8192-row batches never produces a per-batch NULL. Both
+    // cross-batch paths are guarded below.
+
+    // Case A — all-fail: `b.y > 99999` matches nothing, so the lone `a` group
+    // fails in every batch and must yield exactly ONE recovered NULL row.
     let rows = h
         .run_ok("MATCH (a:A) OPTIONAL MATCH (b:B) WHERE b.y > 99999 RETURN a.x AS ax, b.y AS by")
         .await;
@@ -717,13 +724,38 @@ async fn repro_07_optional_filter_batches() {
         "[7] all-fail OPTIONAL over 20000 B -> rows={} (correct=1)",
         rows.len()
     );
-    // FIXED (optional_filter.rs): NULL recovery rows are now buffered across
-    // batches and flushed once at end-of-stream, so an all-fail source group that
-    // spans several 8192-row batches yields exactly ONE null row, not one per batch.
     assert_eq!(
         rows.len(),
         1,
         "all-fail OPTIONAL over one source group must yield exactly one null row"
+    );
+    assert!(
+        matches!(cell(&rows[0], "by"), Value::Null),
+        "all-fail recovery row must have NULL optional column: {:?}",
+        rows[0]
+    );
+
+    // Case B — one-late-pass: `b.y > 19999` passes only for b.y=20000, which lands
+    // in a LATER batch than the earlier all-fail batches. The deferred NULL buffered
+    // for the `a` group must be cancelled once that late row passes, so the result
+    // is exactly ONE non-NULL row (by=20000) with NO recovered NULL.
+    let rows = h
+        .run_ok("MATCH (a:A) OPTIONAL MATCH (b:B) WHERE b.y > 19999 RETURN a.x AS ax, b.y AS by")
+        .await;
+    println!(
+        "[7] one-late-pass OPTIONAL over 20000 B -> rows={} (correct=1, no null)",
+        rows.len()
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "a late-passing row must cancel the buffered NULL: exactly one row expected"
+    );
+    assert_eq!(
+        cell(&rows[0], "by"),
+        Value::Int(20000),
+        "late-pass row must carry the passing value, not a recovered NULL: {:?}",
+        rows[0]
     );
 }
 

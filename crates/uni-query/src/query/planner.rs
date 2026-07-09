@@ -10923,6 +10923,113 @@ mod pushdown_tests {
         assert_eq!(properties.get("e").unwrap(), &e_props);
     }
 
+    // R6 / uni-query[22]: the Apply input_filter gate must admit ONLY the shapes
+    // the df_graph::apply fast-path evaluator can resolve, and reject every other
+    // operator/shape (which stays as a residual Filter). This is the load-bearing
+    // invariant that keeps the two files in lockstep; guard it directly.
+    #[test]
+    fn apply_input_filter_gate_accepts_only_supported_shapes() {
+        use uni_cypher::ast::{BinaryOp, UnaryOp};
+
+        fn prop(var: &str, key: &str) -> Expr {
+            Expr::Property(Box::new(Expr::Variable(var.into())), key.into())
+        }
+        fn lit_s(s: &str) -> Expr {
+            Expr::Literal(CypherLiteral::String(s.into()))
+        }
+        fn lit_i(i: i64) -> Expr {
+            Expr::Literal(CypherLiteral::Integer(i))
+        }
+        let cmp = |op: BinaryOp, l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op,
+            right: Box::new(r),
+        };
+
+        // ACCEPTED: comparisons over literal/variable/var.key operands, And/Or/Not,
+        // and a bare property truth test.
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Eq,
+            prop("a", "name"),
+            lit_s("Alice")
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Gt,
+            prop("a", "x"),
+            lit_i(10)
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::And,
+            cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Alice")),
+            cmp(BinaryOp::Gt, prop("a", "x"), lit_i(1)),
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: Box::new(cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Bob"))),
+        }));
+        assert!(QueryPlanner::apply_input_filter_supported(&prop(
+            "a", "active"
+        )));
+
+        // REJECTED: string operators, regex, arithmetic operand, IN, CASE,
+        // function calls, and NOT/OR wrapping an unsupported shape.
+        for op in [
+            BinaryOp::StartsWith,
+            BinaryOp::EndsWith,
+            BinaryOp::Contains,
+            BinaryOp::Regex,
+        ] {
+            assert!(
+                !QueryPlanner::apply_input_filter_supported(&cmp(
+                    op,
+                    prop("a", "name"),
+                    lit_s("x")
+                )),
+                "string/regex operator must be rejected: {op:?}"
+            );
+        }
+        // Arithmetic operand under a supported comparison.
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Gt,
+            cmp(BinaryOp::Add, prop("a", "x"), lit_i(1)),
+            lit_i(100),
+        )));
+        // IN — dedicated Expr variant.
+        assert!(!QueryPlanner::apply_input_filter_supported(&Expr::In {
+            expr: Box::new(prop("a", "name")),
+            list: Box::new(Expr::List(vec![lit_s("Zed")])),
+        }));
+        // CASE — dedicated Expr variant.
+        assert!(!QueryPlanner::apply_input_filter_supported(&Expr::Case {
+            expr: None,
+            when_then: vec![(lit_s("x"), lit_s("y"))],
+            else_expr: None,
+        }));
+        // Function call as an operand.
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Eq,
+            Expr::FunctionCall {
+                name: "toUpper".into(),
+                args: vec![prop("a", "name")],
+                distinct: false,
+                window_spec: None,
+            },
+            lit_s("ALICE"),
+        )));
+        // NOT / OR wrapping an unsupported shape must not sneak through.
+        assert!(!QueryPlanner::apply_input_filter_supported(
+            &Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr: Box::new(cmp(BinaryOp::Contains, prop("a", "name"), lit_s("li"))),
+            }
+        ));
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Or,
+            cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Alice")),
+            cmp(BinaryOp::Contains, prop("a", "name"), lit_s("li")),
+        )));
+    }
+
     #[test]
     fn test_keys_requires_wildcard() {
         // keys(n) → n: {*}

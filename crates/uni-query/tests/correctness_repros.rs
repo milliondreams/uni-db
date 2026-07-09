@@ -253,6 +253,71 @@ async fn repro_03_apply_startswith_input_filter() {
         2,
         "apply.rs input_filter must KEEP a row under an unsupported operator, not drop it"
     );
+
+    // Broaden the operator backstop beyond StartsWith: CONTAINS / ENDS WITH are
+    // also unimplemented BinaryOps and must KEEP the row.
+    for (op, rhs, label) in [
+        (BinaryOp::Contains, "lic", "CONTAINS"),
+        (BinaryOp::EndsWith, "ice", "ENDS WITH"),
+    ] {
+        let rows = h
+            .executor
+            .execute(
+                build_plan(&name_pred(op, rhs)),
+                &h.prop_manager,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[22] {label} must execute: {e}"));
+        assert_eq!(
+            rows.len(),
+            2,
+            "[22] unimplemented operator {label} must KEEP the row, not drop it"
+        );
+    }
+
+    // Non-BinaryOp shapes bypass the operator backstop entirely and hit the
+    // top-level evaluate_filter arm. `Expr::In` and `Expr::Case` are unevaluable
+    // by the fast-path and must KEEP the row (the symmetric keep-on-unknown fix),
+    // not resolve to NULL → false → drop.
+    let in_pred = AstExpr::In {
+        expr: Box::new(AstExpr::Property(
+            Box::new(AstExpr::Variable("a".into())),
+            "name".into(),
+        )),
+        list: Box::new(AstExpr::List(vec![AstExpr::Literal(
+            CypherLiteral::String("Alice".into()),
+        )])),
+    };
+    let in_rows = h
+        .executor
+        .execute(build_plan(&in_pred), &h.prop_manager, &HashMap::new())
+        .await
+        .expect("[22] IN must execute (row kept, not dropped)");
+    assert_eq!(
+        in_rows.len(),
+        2,
+        "[22] unevaluable IN shape in input_filter must KEEP the row"
+    );
+
+    let case_pred = AstExpr::Case {
+        expr: None,
+        when_then: vec![(
+            AstExpr::Literal(CypherLiteral::Bool(true)),
+            AstExpr::Literal(CypherLiteral::Bool(true)),
+        )],
+        else_expr: None,
+    };
+    let case_rows = h
+        .executor
+        .execute(build_plan(&case_pred), &h.prop_manager, &HashMap::new())
+        .await
+        .expect("[22] CASE must execute (row kept, not dropped)");
+    assert_eq!(
+        case_rows.len(),
+        2,
+        "[22] unevaluable CASE shape in input_filter must KEEP the row"
+    );
 }
 
 // ===========================================================================

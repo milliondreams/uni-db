@@ -500,23 +500,45 @@ coverage); this triage does not change any test.
 
 # Appendix — untracked repro artifacts & status (reviewed 2026-07-08)
 
-The files below are **untracked** (not yet `git add`ed) repro/verification artifacts left
-over from the audit. Each maps to a region/finding above. Two idioms recur: *assert-the-
-symptom* repros stay green while the bug lives and **flip red once the fix lands** (a
-built-in fix-detector, but they must then be converted into forward regression guards);
-*diagnostic* harnesses print a verdict and assert nothing.
+The files below are repro/verification artifacts left over from the audit (originally
+untracked; the surviving ones are now committed to `main` as of `4e343576f`, 2026-07-08).
+Each maps to a region/finding above. Two idioms recur: *assert-the-symptom* repros stay
+green while the bug lives and **flip red once the fix lands** (a built-in fix-detector, but
+they must then be converted into forward regression guards); *diagnostic* harnesses print a
+verdict and assert nothing.
 
 | File | Region · finding | Status | Notes |
 |---|---|---|---|
 | `bindings/uni-db/tests/test_repro_gil_mutex_deadlocks.py` | **R13** · `uni-db-bindings[10]` (`types.rs`), `[7]` (`sync_api.rs`), `[11]` (`types.rs`) | **FIXED 2026-07-08** | 3 GIL/std::Mutex ABBA deadlocks, all eliminated at the root (no lock held across `py.detach(block_on)`): `[10]` prepared `execute` — redundant outer `Mutex`→`Arc` (4 sites); `[7]` `QueryCursor::next_row` — cursor taken out by value for the await, written back (mirrors `fetch_all`); `[11]` `PyCommitStream` — stream taken out for the await + interruptible `close()` via `AtomicBool`+`Notify`. Repro **converted** to forward regression guards (assert `DONE_NO_DEADLOCK`, 12 s timeout kept as hang backstop); all 3 pass in ~4 s + full cursor/prepared/watch suites green. |
 | `bindings/uni-db/tests/test_repro_prepared_locy_repr_panic.py` | **R16** · `uni-db-bindings[3]` (`types.rs:1877`) | **FIXED (`1ea719890`)** | `PyPreparedLocy.__repr__` byte-slice `&t[..60]` → replaced with char-boundary-safe `char_indices().nth(60)` in the Wave-1 R16 char-safe sweep. Repro **converted 2026-07-08** from assert-the-panic into a forward regression guard (asserts clean truncation + the multibyte `é` survives the old byte-60 cut). |
-| `crates/uni-tck/tests/repro_collect_ids_swallows_error.rs` | **R2** · `uni-tck[2]` (`world.rs:320`) | **CONFIRMED · OPEN (blocked)** | Error-swallow in test oracle. `#[ignore]` empty placeholder — private fns + non-failing queries give no injection seam. Fix needs a `#[cfg(test)]` unit test in `world.rs` or a signature change to `Result<…>`. |
+| `crates/uni-tck/tests/repro_collect_ids_swallows_error.rs` | **R2** · `uni-tck[2]` (`world.rs:320`) | **FIXED 2026-07-09** | Error-swallow in test oracle, fixed at the root for both siblings: `collect_ids` propagated first (`121a40748`); `collect_property_snapshot` now also returns `anyhow::Result<..>` and `?`-propagates the node + edge introspection queries, with the two `capture_state_*` call sites updated to `.await?`. No `if let Ok(result) = …query()` swallow site remains. The runtime repro stays a blocked `#[ignore]` placeholder by design (private fns + hard-coded queries that never fail on a healthy in-memory DB give no injection seam); the fix's mitigation is fail-loud propagation so a future real failure aborts the TCK step instead of corrupting the diff. |
 | `crates/uni/tests/repro_nested_fork_capture_race.rs` (top-level) | **R1** · `uni[6]` (`fork.rs`) | **BUG FIXED (`c9e80cff2`) · GUARD IN PLACE (`1899e7184`)** | Nested-fork capture/branch race, fixed 2026-07-06: the parent-branch tip is now captured under `flush_lock` (`writer.rs` `flush_and_capture_fork_point` → `ForkPoint.parent_branch_versions`) and the nested arm branches at that captured version (`fork.rs`), mirroring the primary/M1 arm; the old live `current_version_on_branch` read is now a should-never-fire fallback. A **deterministic** regression guard already exists as a standalone `#![cfg(feature = "failpoints")]` binary that drives the `nested_fork_before_branch` failpoint (pause after capture → advance parent on another task → resume → assert child branched at the captured tip). Run: `cargo nextest run -p uni-db --features failpoints -E 'test(nested_fork)'`. The old stale `common/bugs/…` stress-loop duplicate (asserted bug-present) was **deleted 2026-07-08**. |
-| `crates/uni/examples/optional_batch_repro.rs` | **R8** · `uni-query[26]` (`optional_filter.rs:370`) | **Diagnostic** | `#[tokio::main]` example (not a test); prints `OK`/`MISMATCH` for OPTIONAL MATCH NULL-recovery across batch boundaries. Run manually; no in-file verdict. |
-| `crates/uni/tests/tmp_verify_apply_filter.rs` | **R6** · `uni-query[22]` (`apply.rs:350`) | **DELETED 2026-07-08** | Throwaway `tmp_` scratch verifying the Apply `input_filter` predicate drop; superseded by the CALL … YIELD + WHERE fix in `2399fe6fa` and its permanent `bug_call_yield_where_dropped` module in `mod.rs`. (Note: R6 `uni-query[22]`'s broader unsupported-operator arm — STARTS WITH / IN / arithmetic / CASE → `false` — is not necessarily fully covered by that commit and remains open.) |
+| `crates/uni/examples/optional_batch_repro.rs` | **R8** · `uni-query[26]` (`optional_filter.rs:370`) | **FIXED 2026-07-09 · removed** | Production fixed in `b7b4424e4` (2026-07-06): `OptionalFilterExec` now buffers NULL recovery rows across batches (`passed_keys`/`pending_null`/`pending_order`) and flushes once at end-of-stream, so a source group spanning batches never emits a per-batch NULL, and a late-passing row cancels the buffered NULL. Verified: the diagnostic printed `OK` for both Q1 (late-pass → 1 row, no null) and Q2 (all-fail → 1 null row). The asserting guard `repro_07_optional_filter_batches` (`crates/uni-query/tests/correctness_repros.rs`) was **strengthened** to cover both the all-fail and the previously-unguarded late-pass cross-batch paths; the redundant `#[tokio::main]` diagnostic (asserted nothing) was **deleted**. |
+| `crates/uni/tests/tmp_verify_apply_filter.rs` | **R6** · `uni-query[22]` (`apply.rs:350`) | **DELETED 2026-07-08 · finding FIXED 2026-07-09** | Throwaway `tmp_` scratch (deleted); the CALL … YIELD + WHERE fix `2399fe6fa` + its `bug_call_yield_where_dropped` module covered one facet. The broader unsupported-operator/shape arm is now fully hardened: the Apply `input_filter` fast-path evaluator (`apply.rs`) was made symmetric — `resolve_expr_value` returns `Option<Value>` (`None` = unevaluable shape), so unknown operators, unknown shapes (`IN`/`CASE`/function calls), and unresolvable operands (arithmetic) all default to KEEP the row instead of a silent drop, while a genuinely-resolved NULL still truth-tests per 3VL. Guarded on both load-bearing mechanisms: `apply.rs` evaluator unit tests (IN/CASE/arithmetic/unknown-op → keep; Eq/NULL 3VL), a `planner.rs` gate unit test (`apply_input_filter_supported` accepts only supported shapes, rejects CONTAINS/ENDS WITH/`=~`/IN/CASE/arithmetic/function-call/NOT-/OR-unsupported), and extended `repro_03` (injects IN/CASE/CONTAINS/ENDS WITH into `input_filter` → row kept). Verified: production behavior unchanged (both pushdown integration tests still green). |
 | `crates/uni-locy-tck/tck/features/semiring/ZZRepro720.feature` | **R12** · `uni-query[24]` (`locy_fold.rs:720`) | **DELETED 2026-07-08** | `ZZ`-prefixed "temporary" TopKProofs MNOR verification feature with a stale assertion (R2 prose "expects 0.76" vs `Then` asserting `p = 1.0`); no unique coverage over R12. |
 
-**Actionable, still genuinely open:** the 3 PyO3 deadlocks (R13) and the `__repr__` panic
-(R16) are confirmed and reproduce; the `__repr__` fix is one line. **Integration debt:**
-`repro_nested_fork_capture_race.rs` is not wired into `mod.rs`; `tmp_verify_apply_filter.rs`
-and `ZZRepro720.feature` are superseded/stale scratch (delete candidates).
+**Resolved 2026-07-08:** R13 (3 PyO3 GIL/Mutex deadlocks) and R16 (`__repr__` panic) are
+fixed with converted regression guards; R1 `uni[6]` (nested-fork capture race) is fixed with
+a deterministic failpoint guard already in place; the two stale scratch files
+(`tmp_verify_apply_filter.rs`, `ZZRepro720.feature`) and the stale nested-fork stress-loop
+duplicate were deleted.
+
+**Resolved 2026-07-09:** R2 `uni-tck[2]` is closed — the sibling `collect_property_snapshot`
+(the half of the finding the earlier `collect_ids` fix `121a40748` left behind) now
+`?`-propagates its introspection queries, so no error-swallow site remains in the TCK
+side-effect oracle. Runtime repro remains a documented blocked placeholder by design.
+R8 `uni-query[26]` is also closed — the batch-boundary NULL-recovery defect was already
+fixed in `b7b4424e4` (the triage's "open" status was stale); confirmed by running the
+diagnostic (both cross-batch cases print `OK`). The asserting guard
+`repro_07_optional_filter_batches` was strengthened to cover the previously-unguarded
+late-pass path, and the redundant `#[tokio::main]` diagnostic example was deleted.
+R6 `uni-query[22]` is also closed — the finding was inert in production (the airtight
+`apply_input_filter_supported` gate keeps every unsupported shape out of `input_filter`), but
+the Apply fast-path evaluator's keep-on-unknown backstop was asymmetric (unknown *operator* =
+keep, unknown *shape*/operand = drop). The evaluator was made uniformly keep-on-unknown
+(`resolve_expr_value → Option<Value>`), and both the evaluator and the gate now have dedicated
+unit-test guards plus an extended `repro_03`. See the appendix row for details.
+
+**Still genuinely open:** none. All confirmed findings across R1–R18 and the L1–L11 long tail
+are now resolved or design-deferred (the only remaining deferrals are the explicitly
+design-scoped items noted in the waves above, not correctness gaps).

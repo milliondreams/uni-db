@@ -172,7 +172,7 @@ impl UniWorld {
         self.side_effects.nodes_before = self.side_effects.node_ids_before.len();
         self.side_effects.edges_before = self.side_effects.edge_ids_before.len();
         // Build a per-entity, per-key property snapshot for gross change counting.
-        let snapshot = self.collect_property_snapshot().await;
+        let snapshot = self.collect_property_snapshot().await?;
         self.side_effects.properties_before = snapshot.len();
         self.side_effects.prop_snapshot_before = snapshot;
         self.side_effects.labels_before = self.get_labels().await?;
@@ -206,7 +206,7 @@ impl UniWorld {
             .difference(&edge_ids_after)
             .count();
         // Build after snapshot and compute gross change counts.
-        let snapshot = self.collect_property_snapshot().await;
+        let snapshot = self.collect_property_snapshot().await?;
         self.side_effects.properties_after = snapshot.len();
         self.side_effects.prop_snapshot_after = snapshot;
 
@@ -241,28 +241,36 @@ impl UniWorld {
     /// relationships.  Only non-null values are included.
     ///
     /// Key format: `"n:<vid>:<prop>"` for vertices, `"r:<eid>:<prop>"` for edges.
-    async fn collect_property_snapshot(&self) -> HashMap<String, Value> {
+    ///
+    /// # Errors
+    /// Propagates the snapshot query error. A swallowed error here would report a
+    /// partial/empty snapshot, silently corrupting the before/after side-effect
+    /// diff (a failing query is indistinguishable from a graph with no
+    /// properties), mirroring the sibling `collect_ids`.
+    async fn collect_property_snapshot(&self) -> anyhow::Result<HashMap<String, Value>> {
         let mut snapshot = HashMap::new();
 
         // Node properties
-        if let Ok(result) = self.db().session().query("MATCH (n) RETURN n").await {
-            for row in result.rows() {
-                if let Some(node_val) = row.values().first() {
-                    self.add_entity_to_snapshot(&mut snapshot, "n", node_val);
-                }
+        let result = self.db().session().query("MATCH (n) RETURN n").await?;
+        for row in result.rows() {
+            if let Some(node_val) = row.values().first() {
+                self.add_entity_to_snapshot(&mut snapshot, "n", node_val);
             }
         }
 
         // Relationship properties
-        if let Ok(result) = self.db().session().query("MATCH ()-[r]->() RETURN r").await {
-            for row in result.rows() {
-                if let Some(rel_val) = row.values().first() {
-                    self.add_entity_to_snapshot(&mut snapshot, "r", rel_val);
-                }
+        let result = self
+            .db()
+            .session()
+            .query("MATCH ()-[r]->() RETURN r")
+            .await?;
+        for row in result.rows() {
+            if let Some(rel_val) = row.values().first() {
+                self.add_entity_to_snapshot(&mut snapshot, "r", rel_val);
             }
         }
 
-        snapshot
+        Ok(snapshot)
     }
 
     /// Adds (entity_id::prop_key -> value) entries from a single entity value

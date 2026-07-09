@@ -1,13 +1,21 @@
-//! Repro (BLOCKED) for crates/uni-tck/src/world.rs:320 (collect_ids).
+//! Repro (BLOCKED) for crates/uni-tck/src/world.rs (collect_ids /
+//! collect_property_snapshot). **The production defect is now FIXED**; this file
+//! documents the resolved static finding and remains a blocked runtime placeholder.
 //!
-//! `collect_ids` and `collect_property_snapshot` guard the introspection query
-//! with `if let Ok(result) = self.db().session().query(query).await` and, on the
-//! `Err` branch, silently return the empty set/map initialized at the top of the
-//! function instead of propagating the error. Their callers
+//! Both `collect_ids` and `collect_property_snapshot` used to guard the
+//! introspection query with `if let Ok(result) = self.db().session().query(query)
+//! .await` and, on the `Err` branch, silently return the empty set/map initialized
+//! at the top of the function instead of propagating the error. Their callers
 //! (`capture_state_before` / `capture_state_after`) already return
 //! `anyhow::Result<()>`, and the sibling `get_labels` propagates with `?`, so
 //! propagation was clearly intended. A swallowed before-capture error yields an
 //! empty baseline, making every surviving entity look newly created.
+//!
+//! FIX: `collect_ids` was fixed first (commit `121a40748`); its sibling
+//! `collect_property_snapshot` now also returns `anyhow::Result<..>` and
+//! `?`-propagates both the node and edge introspection queries, with the two
+//! `capture_state_*` call sites updated to `.await?`. Neither helper swallows a
+//! query error any longer.
 //!
 //! Why this is BLOCKED as a runtime repro:
 //!   * `collect_ids` / `collect_property_snapshot` are PRIVATE (not `pub`), so

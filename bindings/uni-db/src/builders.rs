@@ -1032,7 +1032,7 @@ impl Session {
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedQuery {
-            inner: std::sync::Mutex::new(prepared),
+            inner: std::sync::Arc::new(prepared),
         })
     }
 
@@ -1301,7 +1301,7 @@ impl Session {
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedLocy {
-            inner: std::sync::Mutex::new(prepared),
+            inner: std::sync::Arc::new(prepared),
         })
     }
 
@@ -1310,6 +1310,8 @@ impl Session {
         let stream = self.inner.watch();
         crate::types::PyCommitStream {
             inner: std::sync::Mutex::new(Some(stream)),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            close_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 

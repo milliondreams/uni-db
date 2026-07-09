@@ -1425,7 +1425,7 @@ impl AsyncTransaction {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedQuery {
-                inner: std::sync::Mutex::new(prepared),
+                inner: std::sync::Arc::new(prepared),
             })
         })
     }
@@ -1441,7 +1441,7 @@ impl AsyncTransaction {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedLocy {
-                inner: std::sync::Mutex::new(prepared),
+                inner: std::sync::Arc::new(prepared),
             })
         })
     }
@@ -2507,7 +2507,7 @@ impl AsyncSession {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedQuery {
-                inner: std::sync::Mutex::new(prepared),
+                inner: std::sync::Arc::new(prepared),
             })
         })
     }
@@ -2625,7 +2625,7 @@ impl AsyncSession {
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedLocy {
-                inner: std::sync::Mutex::new(prepared),
+                inner: std::sync::Arc::new(prepared),
             })
         })
     }

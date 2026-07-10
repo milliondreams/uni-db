@@ -28,6 +28,7 @@ use uni_common::DataType;
 use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema;
+use uni_common::core::schema::PointType;
 use uni_crdt::Crdt;
 
 /// Build a timestamp column from a map of ID -> timestamp (nanoseconds).
@@ -285,6 +286,77 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                         offset_seconds: 0,
                     });
                 }
+            }
+            DataType::Point(pt) => {
+                // Reconstruct the `Value::Map` shape produced by `point(...)`
+                // (`spatial.rs`) from the declared struct layout. A Point-typed
+                // column can only hold points, so anything not reconstructable
+                // (non-struct, missing fields) is `Null` — never a bare scalar and
+                // never a panic. Returns unconditionally rather than falling
+                // through to the generic handler.
+                if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
+                    let f64_at = |name: &str| -> Option<f64> {
+                        struct_arr
+                            .column_by_name(name)
+                            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                            .filter(|a| !a.is_null(row))
+                            .map(|a| a.value(row))
+                    };
+                    let crs = struct_arr
+                        .column_by_name("crs")
+                        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                        .filter(|a| !a.is_null(row))
+                        .map(|a| a.value(row).to_string());
+
+                    match pt {
+                        PointType::Geographic => {
+                            if let (Some(lat), Some(lon)) =
+                                (f64_at("latitude"), f64_at("longitude"))
+                            {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "WGS84".into())),
+                                    ),
+                                    ("latitude".to_string(), Value::Float(lat)),
+                                    ("longitude".to_string(), Value::Float(lon)),
+                                ]));
+                            }
+                        }
+                        PointType::Cartesian2D => {
+                            if let (Some(x), Some(y)) = (f64_at("x"), f64_at("y")) {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "cartesian".into())),
+                                    ),
+                                    ("x".to_string(), Value::Float(x)),
+                                    ("y".to_string(), Value::Float(y)),
+                                ]));
+                            }
+                        }
+                        PointType::Cartesian3D => {
+                            if let (Some(x), Some(y), Some(z)) =
+                                (f64_at("x"), f64_at("y"), f64_at("z"))
+                            {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "cartesian-3d".into())),
+                                    ),
+                                    ("x".to_string(), Value::Float(x)),
+                                    ("y".to_string(), Value::Float(y)),
+                                    ("z".to_string(), Value::Float(z)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+                // Point-typed but not a reconstructable point → Null.
+                return Value::Null;
             }
             DataType::Bytes => {
                 let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() else {
@@ -999,6 +1071,85 @@ fn values_to_time_struct_array(values: &[Value]) -> ArrayRef {
     Arc::new(struct_arr)
 }
 
+/// Build a Point struct array from `Value::Map` points.
+///
+/// The Arrow layout is selected by the column's declared [`PointType`], matching
+/// [`schema::DataType::to_arrow`]: Geographic → `{latitude, longitude, crs}`,
+/// Cartesian2D → `{x, y, crs}`, Cartesian3D → `{x, y, z, crs}`. All child fields
+/// are non-nullable, so a missing/mismatched row marks the struct slot null while
+/// writing placeholder `0.0`/`""` into the children (a null struct slot's child
+/// values are never observed).
+pub(crate) fn values_to_point_struct_array(values: &[Value], point_type: PointType) -> ArrayRef {
+    use arrow_array::builder::Float64Builder;
+
+    let n = values.len();
+    let fields = match schema::DataType::Point(point_type).to_arrow() {
+        ArrowDataType::Struct(f) => f,
+        // `DataType::Point` always maps to a struct; anything else is a bug.
+        _ => unreachable!("Point maps to an Arrow struct"),
+    };
+
+    // Read an f64 coordinate from a point map, or None if absent/non-numeric.
+    let coord = |v: &Value, key: &str| -> Option<f64> {
+        v.as_object()
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_f64)
+    };
+    let crs_of = |v: &Value, default: &str| -> String {
+        v.as_object()
+            .and_then(|m| m.get("crs"))
+            .and_then(|c| c.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+
+    let mut null_buffer = BooleanBufferBuilder::new(n);
+    let mut crs_b = StringBuilder::with_capacity(n, n * 8);
+
+    // Ordered coordinate builders + the key/default-crs metadata for this layout.
+    let (keys, default_crs): (&[&str], &str) = match point_type {
+        PointType::Geographic => (&["latitude", "longitude"], "WGS84"),
+        PointType::Cartesian2D => (&["x", "y"], "cartesian"),
+        PointType::Cartesian3D => (&["x", "y", "z"], "cartesian-3d"),
+    };
+    let mut coord_builders: Vec<Float64Builder> = keys
+        .iter()
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for v in values {
+        let coords: Option<Vec<f64>> = keys.iter().map(|k| coord(v, k)).collect();
+        match coords {
+            Some(cs) => {
+                for (b, c) in coord_builders.iter_mut().zip(cs) {
+                    b.append_value(c);
+                }
+                crs_b.append_value(crs_of(v, default_crs));
+                null_buffer.append(true);
+            }
+            None => {
+                for b in &mut coord_builders {
+                    b.append_value(0.0);
+                }
+                crs_b.append_value(default_crs);
+                null_buffer.append(false);
+            }
+        }
+    }
+
+    let mut columns: Vec<ArrayRef> = coord_builders
+        .into_iter()
+        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+        .collect();
+    columns.push(Arc::new(crs_b.finish()) as ArrayRef);
+
+    Arc::new(StructArray::new(
+        fields,
+        columns,
+        Some(null_buffer.finish().into()),
+    ))
+}
+
 fn values_to_large_binary_array(values: &[Value]) -> ArrayRef {
     let mut builder =
         arrow_array::builder::LargeBinaryBuilder::with_capacity(values.len(), values.len() * 64);
@@ -1348,6 +1499,7 @@ impl<'a> PropertyExtractor<'a> {
             DataType::Timestamp => self.build_timestamp_column(len, deleted, get_props),
             DataType::Date => self.build_date32_column(len, deleted, get_props),
             DataType::Time => self.build_time_struct_column(len, deleted, get_props),
+            DataType::Point(pt) => self.build_point_struct_column(len, deleted, get_props, *pt),
             DataType::Duration => self.build_duration_column(len, deleted, get_props),
             DataType::Btic => self.build_btic_column(len, deleted, get_props),
             _ => Err(anyhow!(
@@ -1481,6 +1633,20 @@ impl<'a> PropertyExtractor<'a> {
     {
         let values = self.collect_values_or_null(len, deleted, &get_props);
         Ok(values_to_time_struct_array(&values))
+    }
+
+    fn build_point_struct_column<F>(
+        &self,
+        len: usize,
+        deleted: &[bool],
+        get_props: F,
+        point_type: PointType,
+    ) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let values = self.collect_values_or_null(len, deleted, &get_props);
+        Ok(values_to_point_struct_array(&values, point_type))
     }
 
     /// Collect property values into a Vec, substituting `Value::Null` for deleted or missing entries.

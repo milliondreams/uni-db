@@ -401,6 +401,14 @@ fn value_from_column_inner(
             };
             Ok(Value::String(tv.to_string()))
         }
+        // Point decodes as a `serde_json` object mirroring the `Value::Map` shape
+        // `point(...)` produces, so the legacy `value_from_column` path (e.g.
+        // `delta.rs`) does not silently read `Null`. The rich
+        // `decode_column_value` path reconstructs a native `Value::Map` instead.
+        DataType::Point(_) => {
+            let v = super::arrow_convert::arrow_to_value(col, row, Some(data_type));
+            Ok(serde_json::to_value(&v).unwrap_or(Value::Null))
+        }
         _ => Ok(Value::Null),
     }
 }
@@ -427,6 +435,10 @@ pub fn decode_column_value(
         // `arrow_to_value`; the `value_from_column` serde_json path would lose
         // the type (an object would round-trip back as a `Map`).
         | DataType::SparseVector { .. }
+        // Point columns decode to the `Value::Map` shape `point(...)` produces via
+        // the struct reconstruction in `arrow_to_value`; the `value_from_column`
+        // scalar path has no Point arm and would return `Value::Null`.
+        | DataType::Point(_)
         // Maps decode natively (full fidelity, CV-aware) via the unified
         // `try_reconstruct_map` path inside `arrow_to_value`, which handles typed scalar
         // value children, raw-`Bytes` (uni_raw_bytes-marked) children, and CV-encoded
@@ -672,19 +684,64 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_unknown_type_returns_null() {
-        // Using a String array but decoding with an unhandled type should return Null
+    fn test_decode_column_value_non_struct_point_is_null() {
+        // A physically-wrong column (String) declared as Point must reconstruct to
+        // Null rather than panic — the struct downcast fails and falls through.
+        use uni_common::core::schema::PointType;
         let mut builder = StringBuilder::new();
         builder.append_value("test");
         let array = builder.finish();
 
-        let val = value_from_column(
+        let val = decode_column_value(
             &array,
-            &DataType::Point(uni_common::core::schema::PointType::Geographic),
+            &DataType::Point(PointType::Geographic),
             0,
             CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(val, uni_common::Value::Null);
+    }
+
+    #[test]
+    fn test_point_struct_roundtrip() {
+        // A geographic Point encoded via the storage builder must decode back to
+        // the `Value::Map` shape `point(...)` produces (previously it errored on
+        // write and decoded to Null).
+        use std::collections::HashMap;
+        use uni_common::core::schema::PointType;
+
+        let point = uni_common::Value::Map(HashMap::from([
+            (
+                "type".to_string(),
+                uni_common::Value::String("Point".into()),
+            ),
+            ("crs".to_string(), uni_common::Value::String("WGS84".into())),
+            ("latitude".to_string(), uni_common::Value::Float(51.5)),
+            ("longitude".to_string(), uni_common::Value::Float(-0.12)),
+        ]));
+
+        let arr = crate::storage::arrow_convert::values_to_point_struct_array(
+            &[point.clone(), uni_common::Value::Null],
+            PointType::Geographic,
         );
-        // Point type falls through to the _ => Ok(Value::Null) arm
-        assert_eq!(val.unwrap(), Value::Null);
+
+        let decoded = decode_column_value(
+            &arr,
+            &DataType::Point(PointType::Geographic),
+            0,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(decoded, point);
+
+        // Row 1 was Null → the struct slot is null → decodes back to Null.
+        let decoded_null = decode_column_value(
+            &arr,
+            &DataType::Point(PointType::Geographic),
+            1,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(decoded_null, uni_common::Value::Null);
     }
 }

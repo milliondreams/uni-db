@@ -1664,6 +1664,32 @@ pub(crate) async fn run_hybrid_search(
                 ])
             }
         }
+        // Relative-score fusion (Weaviate `relativeScore`): per-source min-max
+        // normalize to [0, 1] then weighted-sum across all sources. Distinct from
+        // `weighted` in that it always min-max normalizes every source uniformly
+        // (never the two-way `alpha` shim). `rsf` is an accepted alias.
+        "relative_score" | "rsf" => {
+            let weights = parse_three_weights(options_map);
+            use crate::query::fusion::NormKind;
+            crate::query::fusion::fuse_weighted_sources(&[
+                (&vector_results, weights[0], NormKind::DistanceToSim),
+                (&fts_results, weights[1], NormKind::ScoreByMax),
+                (&sparse_results, weights[2], NormKind::ScoreByMax),
+            ])
+        }
+        // Distribution-Based Score Fusion (Qdrant DBSF): per-source z-score
+        // normalize (robust to a single outlier stretching one list) then sum.
+        // Weights default to equal thirds; equal weights make it a plain z-sum
+        // (uniform scaling is rank-invariant).
+        "dbsf" => {
+            let weights = parse_three_weights(options_map);
+            use crate::query::fusion::NormKind;
+            crate::query::fusion::fuse_dbsf(&[
+                (&vector_results, weights[0], NormKind::DistanceToSim),
+                (&fts_results, weights[1], NormKind::ScoreByMax),
+                (&sparse_results, weights[2], NormKind::ScoreByMax),
+            ])
+        }
         _ => crate::query::fusion::fuse_rrf_multi(
             &[&vector_results, &fts_results, &sparse_results],
             rrf_k,

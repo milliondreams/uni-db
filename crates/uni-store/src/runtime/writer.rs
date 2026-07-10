@@ -909,10 +909,8 @@ impl Writer {
                     if l != label {
                         continue;
                     }
-                    let ConstraintType::Unique {
-                        properties: unique_props,
-                    } = &constraint.constraint_type
-                    else {
+                    // Rebuild keys for both Unique and NodeKey (uniqueness half).
+                    let Some(unique_props) = constraint.constraint_type.unique_properties() else {
                         continue;
                     };
                     let mut key_values = Vec::new();
@@ -1833,6 +1831,34 @@ impl Writer {
                             ));
                         }
                     }
+                    ConstraintType::NodeKey {
+                        properties: key_props,
+                    } => {
+                        // Node key = composite uniqueness + NOT NULL on every key
+                        // property. Unlike `Unique` (which skips enforcement when a
+                        // key property is absent), a missing/null key property is
+                        // itself a violation.
+                        if !key_props.is_empty() {
+                            let mut key_values = Vec::with_capacity(key_props.len());
+                            for prop in key_props {
+                                match properties.get(prop) {
+                                    Some(val) if !val.is_null() => {
+                                        key_values.push((prop.clone(), val.clone()));
+                                    }
+                                    _ => {
+                                        return Err(anyhow!(
+                                            "Node key constraint '{}' violated: property '{}' must exist and be non-null for label '{}'",
+                                            constraint.name,
+                                            prop,
+                                            label
+                                        ));
+                                    }
+                                }
+                            }
+                            self.check_unique_constraint_multi(label, &key_values, vid, tx_l0)
+                                .await?;
+                        }
+                    }
                     _ => {
                         return Err(anyhow!("Unsupported constraint type"));
                     }
@@ -1924,10 +1950,8 @@ impl Writer {
                     continue;
                 }
 
-                if let ConstraintType::Unique {
-                    properties: unique_props,
-                } = &constraint.constraint_type
-                {
+                // Collect keys for both Unique and NodeKey (uniqueness half).
+                if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                     let mut key_parts = Vec::new();
                     let mut all_present = true;
                     for prop in unique_props {
@@ -2165,6 +2189,51 @@ impl Writer {
                             constraint.name
                         ));
                     }
+                    ConstraintType::NodeKey {
+                        properties: key_props,
+                    } => {
+                        // NOT-NULL half: every key property must be present and
+                        // non-null (a missing key is a violation, unlike Unique).
+                        // Uniqueness half: same in-batch + L0 dedup as Unique.
+                        let mut key_parts = Vec::with_capacity(key_props.len());
+                        for prop in key_props {
+                            match properties.get(prop) {
+                                Some(val) if !val.is_null() => {
+                                    key_parts.push(format!("{}:{}", prop, val));
+                                }
+                                _ => {
+                                    return Err(anyhow!(
+                                        "Constraint violation at index {}: node key '{}' requires property '{}' to exist and be non-null",
+                                        idx,
+                                        constraint.name,
+                                        prop
+                                    ));
+                                }
+                            }
+                        }
+                        let key = key_parts.join("|");
+                        if let Some(keys) = existing_keys.get(&constraint.name)
+                            && keys.contains(&key)
+                        {
+                            return Err(anyhow!(
+                                "Constraint violation at index {}: Duplicate composite key for label '{}' (constraint '{}')",
+                                idx,
+                                label,
+                                constraint.name
+                            ));
+                        }
+                        let batch_constraint_keys =
+                            batch_keys.entry(constraint.name.clone()).or_default();
+                        if let Some(first_idx) = batch_constraint_keys.get(&key) {
+                            return Err(anyhow!(
+                                "Constraint violation: Duplicate key '{}' in batch at indices {} and {}",
+                                key,
+                                first_idx,
+                                idx
+                            ));
+                        }
+                        batch_constraint_keys.insert(key, idx);
+                    }
                     _ => {}
                 }
             }
@@ -2183,10 +2252,8 @@ impl Writer {
                 continue;
             }
 
-            if let ConstraintType::Unique {
-                properties: unique_props,
-            } = &constraint.constraint_type
-            {
+            // Probe flushed storage for both Unique and NodeKey (uniqueness half).
+            if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                 // Build compound OR filter for all batch vertices
                 let mut or_filters = Vec::new();
                 for properties in properties_batch.iter() {
@@ -2969,10 +3036,9 @@ impl Writer {
                         continue;
                     }
 
-                    if let ConstraintType::Unique {
-                        properties: unique_props,
-                    } = &constraint.constraint_type
-                    {
+                    // Index keys for both Unique and NodeKey (uniqueness half), so
+                    // the full-horizon probe sees prior NodeKey rows too.
+                    if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                         let mut key_values = Vec::new();
                         let mut all_present = true;
                         for prop in unique_props {
@@ -3354,9 +3420,9 @@ impl Writer {
                             if l != label {
                                 continue;
                             }
-                            if let ConstraintType::Unique {
-                                properties: unique_props,
-                            } = &constraint.constraint_type
+                            // Index keys for both Unique and NodeKey.
+                            if let Some(unique_props) =
+                                constraint.constraint_type.unique_properties()
                             {
                                 let mut key_values = Vec::new();
                                 let mut all_present = true;

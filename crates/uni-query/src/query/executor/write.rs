@@ -1461,7 +1461,12 @@ impl Executor {
         let sm = self.storage.schema_manager_arc();
         let target = ConstraintTarget::Label(clause.label);
         let c_type = match clause.constraint_type {
-            AstConstraintType::Unique | AstConstraintType::NodeKey => ConstraintType::Unique {
+            AstConstraintType::Unique => ConstraintType::Unique {
+                properties: clause.properties,
+            },
+            // NodeKey keeps its own variant so the write path can enforce the
+            // NOT-NULL half of node-key semantics, not just uniqueness.
+            AstConstraintType::NodeKey => ConstraintType::NodeKey {
                 properties: clause.properties,
             },
             AstConstraintType::Exists => {

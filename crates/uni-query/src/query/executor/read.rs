@@ -4997,6 +4997,7 @@ impl Executor {
                 ConstraintType::Unique { .. } => "UNIQUE",
                 ConstraintType::Exists { .. } => "EXISTS",
                 ConstraintType::Check { .. } => "CHECK",
+                ConstraintType::NodeKey { .. } => "NODE KEY",
                 _ => "UNKNOWN",
             };
             row.insert("type".to_string(), Value::String(type_str.to_string()));

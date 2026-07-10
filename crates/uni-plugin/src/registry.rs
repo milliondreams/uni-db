@@ -609,6 +609,15 @@ impl PluginRegistry {
             .collect()
     }
 
+    /// Iterate every registered Locy predicate — `(QName, LocyPredicateEntry)`.
+    #[must_use]
+    pub fn iter_locy_predicates(&self) -> Vec<(QName, Arc<LocyPredicateEntry>)> {
+        self.locy_predicates
+            .iter()
+            .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
+            .collect()
+    }
+
     /// Iterate every registered algorithm — `(QName, AlgorithmProvider)`.
     #[must_use]
     pub fn iter_algorithms(&self) -> Vec<(QName, Arc<dyn AlgorithmProvider>)> {

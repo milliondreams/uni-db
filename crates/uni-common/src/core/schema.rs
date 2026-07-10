@@ -672,9 +672,38 @@ pub struct EdgeTypeMeta {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub enum ConstraintType {
-    Unique { properties: Vec<String> },
-    Exists { property: String },
-    Check { expression: String },
+    Unique {
+        properties: Vec<String>,
+    },
+    Exists {
+        property: String,
+    },
+    Check {
+        expression: String,
+    },
+    /// Composite node key: the property tuple must be unique AND every listed
+    /// property must be present (non-null). Equivalent to `Unique` over the tuple
+    /// plus `Exists` on each member, enforced together at write time.
+    NodeKey {
+        properties: Vec<String>,
+    },
+}
+
+impl ConstraintType {
+    /// The property tuple whose combination must be unique.
+    ///
+    /// Returns `Some` for the uniqueness-enforcing kinds — `Unique` and `NodeKey`
+    /// (a node key is a unique tuple plus NOT-NULL) — and `None` otherwise. Lets
+    /// the write path share one key-collection/probe path across both kinds.
+    #[must_use]
+    pub fn unique_properties(&self) -> Option<&[String]> {
+        match self {
+            ConstraintType::Unique { properties } | ConstraintType::NodeKey { properties } => {
+                Some(properties)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

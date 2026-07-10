@@ -5589,7 +5589,25 @@ impl HybridPhysicalPlanner {
                     false,
                 ),
                 "nth_value" => (WindowFunctionDefinition::WindowUDF(nth_value_udwf()), false),
-                other => return Err(anyhow!("Unsupported window function: {}", other)),
+                other => {
+                    // Fall through to a registered plugin window function.
+                    // Resolve the (possibly dotted) name against the registry via
+                    // every namespace/local split, mirroring the aggregate path.
+                    let resolved = uni_plugin::QName::candidate_splits(other)
+                        .find_map(|q| self.plugin_registry.window(&q).map(|e| (q, e)));
+                    match resolved {
+                        Some((qname, entry)) => {
+                            let udwf = datafusion::logical_expr::WindowUDF::from(
+                                crate::query::df_udwf_plugin::PluginWindowUdwf::new(
+                                    qname.to_string(),
+                                    &entry,
+                                ),
+                            );
+                            (WindowFunctionDefinition::WindowUDF(Arc::new(udwf)), false)
+                        }
+                        None => return Err(anyhow!("Unsupported window function: {}", other)),
+                    }
+                }
             };
 
             // Translate argument expressions to physical expressions

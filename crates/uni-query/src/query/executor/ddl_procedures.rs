@@ -480,6 +480,11 @@ async fn create_constraint_internal(
         "UNIQUE" => ConstraintType::Unique {
             properties: config.properties.clone(),
         },
+        // Accept "NODE_KEY", "NODEKEY", and "NODE KEY" spellings for parity with
+        // the Cypher `IS NODE KEY` form.
+        "NODE_KEY" | "NODEKEY" | "NODE KEY" => ConstraintType::NodeKey {
+            properties: config.properties.clone(),
+        },
         "EXISTS" => {
             if config.properties.len() != 1 {
                 return Err(UniError::InvalidArgument {

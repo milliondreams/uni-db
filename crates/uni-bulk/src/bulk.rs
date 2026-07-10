@@ -550,10 +550,32 @@ impl BulkWriter {
                 _ => continue,
             }
 
+            // Unique and NodeKey share the uniqueness machinery; NodeKey adds a
+            // NOT-NULL pre-check on every key property (a missing/null key is a
+            // violation, whereas Unique simply skips enforcement for that row).
             match &constraint.constraint_type {
-                uni_common::core::schema::ConstraintType::Unique {
-                    properties: unique_props,
-                } => {
+                ct if ct.unique_properties().is_some() => {
+                    let unique_props = ct.unique_properties().expect("guarded by is_some");
+                    let is_node_key =
+                        matches!(ct, uni_common::core::schema::ConstraintType::NodeKey { .. });
+                    let kind = if is_node_key { "NODE KEY" } else { "UNIQUE" };
+
+                    // NodeKey NOT-NULL half.
+                    if is_node_key {
+                        for (idx, props) in vertices.iter().enumerate() {
+                            for prop in unique_props {
+                                if props.get(prop).is_none_or(|v| v.is_null()) {
+                                    return Err(anyhow!(
+                                        "NODE KEY constraint '{}' violated at row {}: property '{}' must exist and be non-null",
+                                        constraint.name,
+                                        idx,
+                                        prop
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // Check for duplicates within the batch
                     let mut seen_keys: HashSet<String> = HashSet::new();
                     for (idx, props) in vertices.iter().enumerate() {
@@ -562,7 +584,8 @@ impl BulkWriter {
                             && !seen_keys.insert(k.clone())
                         {
                             return Err(anyhow!(
-                                "UNIQUE constraint violation at row {}: duplicate key '{}' in batch",
+                                "{} constraint violation at row {}: duplicate key '{}' in batch",
+                                kind,
                                 idx,
                                 k
                             ));
@@ -583,7 +606,8 @@ impl BulkWriter {
                                 .is_some_and(|seen| seen.contains(&k))
                             {
                                 return Err(anyhow!(
-                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    "{} constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    kind,
                                     idx,
                                     k
                                 ));
@@ -602,7 +626,8 @@ impl BulkWriter {
                                 .await?
                             {
                                 return Err(anyhow!(
-                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with a committed row",
+                                    "{} constraint violation at row {}: key '{}' conflicts with a committed row",
+                                    kind,
                                     idx,
                                     k
                                 ));

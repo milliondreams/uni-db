@@ -15,6 +15,7 @@ pub mod locy_issue_94_key_property_repro;
 pub mod locy_native_integration;
 pub mod locy_non_send_repro;
 pub mod locy_nonlinear_recursion;
+pub mod locy_predicate_plugin;
 pub mod locy_prefix_to_grouped_recursion;
 pub mod locy_profile;
 pub mod locy_program_persistence;

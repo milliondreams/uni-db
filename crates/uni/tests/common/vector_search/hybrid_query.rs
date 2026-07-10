@@ -399,3 +399,37 @@ async fn hybrid_two_way_weighted_favors_vector() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn hybrid_two_way_dbsf_ranks_dual_relevant_first() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    setup_two_way(&db).await?;
+
+    // Distribution-Based Score Fusion: target is the dual maximizer, so it has
+    // the highest z-score in both the (sign-flipped) vector and the fts arm.
+    let results = run_two_way(&db, "{method: 'dbsf'}").await?;
+    assert!(!results.is_empty(), "hybrid returned no rows");
+    assert_eq!(
+        results[0].0, "target",
+        "target should rank first under DBSF: {results:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hybrid_two_way_relative_score_ranks_dual_relevant_first() -> anyhow::Result<()> {
+    let db = Uni::temporary().build().await?;
+    setup_two_way(&db).await?;
+
+    // Weaviate-style relative-score fusion (min-max per source, weighted sum).
+    // The `rsf` alias must resolve to the same path.
+    for method in ["relative_score", "rsf"] {
+        let results = run_two_way(&db, &format!("{{method: '{method}'}}")).await?;
+        assert!(!results.is_empty(), "hybrid returned no rows for {method}");
+        assert_eq!(
+            results[0].0, "target",
+            "target should rank first under {method}: {results:?}"
+        );
+    }
+    Ok(())
+}

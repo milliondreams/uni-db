@@ -20,15 +20,17 @@ async fn all_algorithms_registered_in_plugin_registry() {
 
     // The plugin registry contains every algorithm from the static
     // `uni-algo` registry (each registered as both a procedure adapter
-    // and a provider) PLUS the first-party `uni.algo.reachability`
-    // provider, which is authored directly against `AlgorithmProvider` /
-    // `GraphView` and is deliberately absent from the static registry.
+    // and a provider) PLUS three first-party providers authored directly
+    // against `AlgorithmProvider` / `GraphView` and deliberately absent
+    // from the static registry: `uni.algo.reachability`, `uni.algo.pagerank`,
+    // and `uni.algo.sssp` (the latter two are Pregel programs).
+    const FIRST_PARTY_PROVIDERS: usize = 3;
     let static_registry = uni_algo::algo::AlgorithmRegistry::new();
-    let expected_count = static_registry.list().len() + 1;
+    let expected_count = static_registry.list().len() + FIRST_PARTY_PROVIDERS;
     assert_eq!(
         listed.len(),
         expected_count,
-        "registry must contain the {} static algorithms plus reachability; got {}: {listed:?}",
+        "registry must contain the {} static algorithms plus {FIRST_PARTY_PROVIDERS} first-party providers; got {}: {listed:?}",
         static_registry.list().len(),
         listed.len()
     );
@@ -42,13 +44,13 @@ async fn all_algorithms_registered_in_plugin_registry() {
         );
     }
 
-    // The provider-only reachability algorithm resolves too.
-    assert!(
-        registry
-            .algorithm(&QName::new("uni", "algo.reachability"))
-            .is_some(),
-        "the first-party uni.algo.reachability provider must be registered"
-    );
+    // The provider-only first-party algorithms resolve too.
+    for local in ["algo.reachability", "algo.pagerank", "algo.sssp"] {
+        assert!(
+            registry.algorithm(&QName::new("uni", local)).is_some(),
+            "the first-party uni.{local} provider must be registered"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

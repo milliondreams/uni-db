@@ -535,16 +535,101 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                 }
             })
         }
-        // Delegate to the full Cypher scalar function evaluator so that every
-        // function available in Cypher (temporal, math, string, spatial, …) is
-        // automatically available in Locy. Both sides use uni_common::Value, so
-        // no type conversion is needed.
-        _ => crate::query::expr_eval::eval_scalar_function(name, args, None).map_err(|e| {
-            LocyError::EvaluationError {
-                message: e.to_string(),
+        // A registered third-party Locy predicate (filter/fuzzy) takes priority
+        // over the generic scalar path — otherwise a plugin predicate name would
+        // die as an "unknown function". This single interception serves every
+        // in-memory eval path (SLG, DERIVE, delta, QUERY) since they all route
+        // through `eval_expr`/`eval_function`.
+        _ => {
+            if let Some(result) = try_dispatch_locy_predicate(name, args) {
+                return result;
             }
-        }),
+            // Delegate to the full Cypher scalar function evaluator so that every
+            // function available in Cypher (temporal, math, string, spatial, …) is
+            // automatically available in Locy. Both sides use uni_common::Value, so
+            // no type conversion is needed.
+            crate::query::expr_eval::eval_scalar_function(name, args, None).map_err(|e| {
+                LocyError::EvaluationError {
+                    message: e.to_string(),
+                }
+            })
+        }
     }
+}
+
+/// Resolve `name` to a registered [`LocyPredicate`] and evaluate it over the
+/// single-row `args`, or return `None` when no predicate is registered.
+///
+/// Resolution uses the same convention-agnostic `candidate_splits` lookup as
+/// Locy aggregates and scalars, against the session-local plugin registry. This
+/// is what makes the otherwise-dead `LocyPredicate` trait reachable from Locy.
+fn try_dispatch_locy_predicate(name: &str, args: &[Value]) -> Option<Result<Value, LocyError>> {
+    let session_pr = crate::query::df_udfs_plugin::current_session_plugin_registry()?;
+    let entry = uni_plugin::QName::candidate_splits(name)
+        .find_map(|cand| session_pr.locy_predicate(&cand))?;
+    Some(invoke_locy_predicate(&entry, name, args))
+}
+
+/// Bridge Locy `Value` args into a one-row Arrow batch, invoke the predicate,
+/// and read the single result cell back as a `Value` (bool, or float for a
+/// fuzzy predicate participating in PROB chains).
+fn invoke_locy_predicate(
+    entry: &uni_plugin::registry::LocyPredicateEntry,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, LocyError> {
+    use arrow_array::Array;
+
+    let columnar: Vec<datafusion::logical_expr::ColumnarValue> =
+        args.iter().map(value_to_single_row_columnar).collect();
+
+    let err = |e: uni_plugin::FnError| LocyError::EvaluationError {
+        message: format!("{name}: {e}"),
+    };
+
+    // Fuzzy predicates return a per-row score; plain filters a boolean.
+    if entry.signature.supports_fuzzy
+        && let Some(res) = entry.predicate.evaluate_fuzzy(&columnar, 1)
+    {
+        let arr = res.map_err(err)?;
+        return Ok(if arr.is_null(0) {
+            Value::Null
+        } else {
+            Value::Float(arr.value(0))
+        });
+    }
+
+    let arr = entry.predicate.evaluate(&columnar, 1).map_err(err)?;
+    Ok(if arr.is_null(0) {
+        Value::Null
+    } else {
+        Value::Bool(arr.value(0))
+    })
+}
+
+/// Encode one Locy `Value` as a length-1 Arrow column for predicate input.
+///
+/// Scalars map to their natural Arrow type; a plain `Null` becomes a null
+/// `Int64` cell, and any composite value is carried as a CypherValue-encoded
+/// `LargeBinary` cell (which a predicate can decode).
+fn value_to_single_row_columnar(v: &Value) -> datafusion::logical_expr::ColumnarValue {
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
+    };
+    use std::sync::Arc;
+
+    let arr: ArrayRef = match v {
+        Value::Bool(b) => Arc::new(BooleanArray::from(vec![*b])),
+        Value::Int(i) => Arc::new(Int64Array::from(vec![*i])),
+        Value::Float(f) => Arc::new(Float64Array::from(vec![*f])),
+        Value::String(s) => Arc::new(StringArray::from(vec![s.as_str()])),
+        Value::Null => Arc::new(Int64Array::from(vec![None::<i64>])),
+        other => {
+            let bytes = uni_common::cypher_value_codec::encode(other);
+            Arc::new(LargeBinaryArray::from(vec![Some(bytes.as_slice())]))
+        }
+    };
+    datafusion::logical_expr::ColumnarValue::Array(arr)
 }
 
 /// Compare two values for equality (Cypher semantics).
@@ -882,4 +967,82 @@ fn extract_properties_from_map(map: &HashMap<String, Value>) -> HashMap<String, 
     }
 
     properties
+}
+
+#[cfg(test)]
+mod predicate_dispatch_tests {
+    use super::*;
+    use arrow_array::{Array, BooleanArray, Float64Array};
+    use datafusion::logical_expr::{ColumnarValue, Volatility};
+    use std::sync::Arc;
+    use uni_plugin::FnError;
+    use uni_plugin::traits::locy::{BatchHint, LocyPredicate, PredSignature};
+    use uni_plugin::traits::scalar::ArgType;
+
+    /// Test predicate: `is_positive(f64) -> bool`.
+    #[derive(Debug)]
+    struct IsPositive {
+        sig: PredSignature,
+    }
+
+    impl IsPositive {
+        fn new() -> Self {
+            Self {
+                sig: PredSignature {
+                    args: vec![ArgType::Primitive(arrow_schema::DataType::Float64)],
+                    volatility: Volatility::Immutable,
+                    supports_fuzzy: false,
+                    batch_hint: BatchHint::Small,
+                },
+            }
+        }
+    }
+
+    impl LocyPredicate for IsPositive {
+        fn signature(&self) -> &PredSignature {
+            &self.sig
+        }
+        fn evaluate(&self, args: &[ColumnarValue], rows: usize) -> Result<BooleanArray, FnError> {
+            let ColumnarValue::Array(a) = &args[0] else {
+                return Err(FnError::new(0, "expected array arg"));
+            };
+            let f = a
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| FnError::new(0, "expected Float64Array"))?;
+            Ok((0..rows).map(|i| Some(f.value(i) > 0.0)).collect())
+        }
+    }
+
+    fn entry() -> uni_plugin::registry::LocyPredicateEntry {
+        uni_plugin::registry::LocyPredicateEntry {
+            plugin: uni_plugin::PluginId::new("test"),
+            signature: IsPositive::new().sig,
+            predicate: Arc::new(IsPositive::new()),
+        }
+    }
+
+    #[test]
+    fn invoke_bridges_value_to_bool() {
+        let e = entry();
+        assert_eq!(
+            invoke_locy_predicate(&e, "is_positive", &[Value::Float(2.0)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            invoke_locy_predicate(&e, "is_positive", &[Value::Float(-1.0)]).unwrap(),
+            Value::Bool(false)
+        );
+        // Int coerces through the natural-type bridge only for Float here; an
+        // int arg would arrive as Int64Array and the predicate would reject it,
+        // surfacing a clean evaluation error rather than a silent wrong answer.
+        assert!(invoke_locy_predicate(&e, "is_positive", &[Value::Int(5)]).is_err());
+    }
+
+    #[test]
+    fn dispatch_returns_none_without_session_registry() {
+        // Outside a session scope there is no registry, so dispatch declines and
+        // the caller falls back to the scalar path.
+        assert!(try_dispatch_locy_predicate("anything.at_all", &[Value::Int(1)]).is_none());
+    }
 }

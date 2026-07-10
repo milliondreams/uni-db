@@ -371,6 +371,7 @@ fn constraint_infos_for(
             ConstraintType::Unique { properties } => ("UNIQUE", properties.clone()),
             ConstraintType::Exists { property } => ("EXISTS", vec![property.clone()]),
             ConstraintType::Check { expression } => ("CHECK", vec![expression.clone()]),
+            ConstraintType::NodeKey { properties } => ("NODE KEY", properties.clone()),
             _ => ("UNKNOWN", vec![]),
         };
         constraints.push(crate::api::schema::ConstraintInfo {

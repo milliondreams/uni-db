@@ -19,9 +19,11 @@
 use uni_plugin::{PluginError, PluginRegistrar};
 
 pub mod bridge;
+pub mod pregel;
 pub mod reachability;
 
 pub use bridge::{AlgoProviderBridge, AlgorithmHostBridge};
+pub use pregel::{PageRankProvider, SsspProvider};
 pub use reachability::ReachabilityProvider;
 
 /// Register every built-in `uni.algo.*` algorithm into `r` as an
@@ -63,6 +65,16 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
     r.algorithm(
         QName::new("uni", "algo.reachability"),
         Arc::new(ReachabilityProvider::new()),
+    )?;
+
+    // Pregel programs authored on top of the public `GraphView` (M5c follow-up).
+    r.algorithm(
+        QName::new("uni", "algo.pagerank"),
+        Arc::new(PageRankProvider::new()),
+    )?;
+    r.algorithm(
+        QName::new("uni", "algo.sssp"),
+        Arc::new(SsspProvider::new()),
     )?;
 
     Ok(())

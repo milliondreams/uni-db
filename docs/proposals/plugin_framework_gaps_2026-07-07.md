@@ -1,8 +1,38 @@
 # uni-db Plugin Framework — Gaps Review (2026-07-07)
 
-**Status:** Findings. Adversarial, code-only audit.
+**Status:** Findings. Adversarial, code-only audit. **Superseded in part by the §0 status update (2026-07-09) — the entire P0 remediation and the P1 subtractive tier have landed on `main`.**
 **Method:** 10 parallel code-reading auditors, one per extension domain, each required to verify every claim against three things — the **trait**, its **registrar** method, and its **runtime dispatch/call-site**. Docs, memory, and prior gaps files were explicitly excluded as sources. A surface counts as "delivered" only if the engine actually invokes a registered plugin of that kind at runtime.
-**Motivating question:** Can a third party build a BFS/DFS reachability function as a plugin? (Answer: **no** — see §7.)
+**Motivating question:** Can a third party build a BFS/DFS reachability function as a plugin? (Answer at time of writing: **no** — see §7. **As of 2026-07-09: yes**, through the front door via `AlgorithmProvider` + `GraphView` — see §0.)
+
+---
+
+## 0. Status update — 2026-07-09 re-audit (HEAD `fe64b48f5`, v3.0.0)
+
+The original findings below were re-verified against the current tree by 6 parallel auditors using the same discipline (trait + registrar + **runtime call-site**, not just registry presence). **Every P0 item and the entire P1 subtractive tier from §9 have shipped** in a 2.5.0 → **3.0.0** breaking release. The remaining gaps are, without exception, the P2/P3/legitimately-closed items in this doc's own demand-calibrated roadmap (§8c/§9).
+
+### What shipped (verified on-path, not just registrable)
+
+| §9 item | Verdict | Evidence (current tree) |
+|---|---|---|
+| **P0.1 — `GraphView` + wire `AlgorithmProvider::run`** | ✅ **Done** | Trait `GraphView` (slot-indexed neighbors/degree/weight/vid↔slot) `uni-plugin/src/traits/algorithm.rs:145-195`; `AlgorithmHost::project()` `algorithm.rs:99`; host impl `uni-plugin-builtin/src/algorithms/bridge.rs:127-170`; `run()` invoked on **both** CALL paths (planner `df_graph/procedure_call.rs:651-709`, executor `executor/procedure.rs:636-810`) via `run_algorithm_provider` `procedures_plugin/algo.rs:594-609`; miss-only fallthrough (built-ins never regress); L0 snapshot for read-your-writes. First-party dogfood `ReachabilityProvider` (BFS) `algorithms/reachability.rs`, authored purely against the public surface (no host downcast). Reachability flagship (§7) now achievable **as a plugin**. |
+| **P0.1b — `HostQuery` capability made real** | ✅ **Done (graph-access facet)** | `Capability::HostQuery{read_only,scopes}` now enforced: `project()` returns `FnError 0x804` unless granted `bridge.rs:131-146`; built-in `uni` granted at `api/mod.rs:220-223`; negative capability-gate test present. (Broader Cypher/Locy re-entrancy facet still unimplemented — only topology projection is wired.) |
+| **P0.2 — FTS analyzer/tokenizer/stemmer config** | ✅ **Done** | New backend-agnostic mapping layer `uni-store/src/backend/fts_analyzer.rs` translates every `TokenizerConfig` arm (incl. `Custom{name}` pass-through `:87-89`) into Lance `InvertedIndexParams`; stemmer/stop-word/lowercase/ascii-fold/language/token-length all wired `:128-191`; forwarded through `index_manager.rs:654-671` → `backend/lance.rs:1040-1061`; DDL `OPTIONS` parsed `planner.rs:9012-9120`; 10 mapping tests. |
+| **P0.3 — honesty hazards (the 5 named)** | ✅ **Done** | (1) `declareTrigger` installs a real firing `TriggerPlugin` via `CypherTriggerSynthesizer` `plugin-custom/src/lib.rs:357-370` + `synthetic_trigger.rs:125`; (2) `FireMode::EventualConsistency` is a real coalescing `EcQueue` `triggers.rs:706-713,1599-1770`; (3) custom-ns Locy aggregates resolve via `candidate_splits` `df_graph/locy_fold.rs:102-113`; (4) CRDT merges route through registry on compaction `compaction.rs:303-308` **and** L0 `runtime/l0.rs:424-425`; (5) `TokenizerConfig::Custom` honored (P0.2). |
+| **P1 — subtract 4 legitimately-closed traits** | ✅ **Done** | `OperatorProvider`, `PregelProgramProvider`, durable-write `StorageBackend` plugin, and `Connector` **removed** (`surfaces/mod.rs:1258-1260`); `NoopConnector` gone; no `storage_backend(scheme)` getter. Matches the §9 P1 recommendation exactly. |
+
+### What remains open (all P2/P3/legitimately-closed — nothing new, nothing regressed)
+
+- **§6 #6 — guest loaders never self-verify signatures** — STILL TRUE; verification centralized in the top-level `uni` API (`api/mod.rs:3777`), skippable by direct loader use. Tracked as the P0.7 **security** milestone.
+- **Still Trait-only/dead** (unchanged): `window_fn`, `locy_predicate`, `logical_type`, `collation`, and `index_kind` build/open/finalize (probe-only remains partial). All are P2/nice-to-have.
+- **Guest authoring still 3/23** — the new `Algorithm` kind is native-Rust-authorable only; no guest loader parses it (§8 gap #2, §9 P3).
+- **Closed enums unchanged** — `DistanceMetric`, `FusionMethod`, `ConstraintType` (schema layer; a parse-only `NodeKey` was added to the Cypher AST but does not reach enforcement), `VectorIndexKind`, semirings. All are §8c "enum-growth / built-in-add" or "legitimately-closed" — none were P0. **BM25 `k1`/`b` params** still unexposed (§8c should-open).
+- **§8 #3/#5/#6** — plugin distribution (CLI still `Install`-only, non-local schemes bail `M12`), hot-path panic isolation (only triggers/hooks `catch_unwind`-wrapped, not scalar/agg/proc), and dead observability (`record_invocation` still uncalled) — all remain, all P3.
+
+### Recalibrated bottom line
+
+The doc's §10 thesis — *"the framework over-modeled the surface and under-wired the two things with universal precedent"* — has been acted on. The two genuine must-fixes (`GraphView`, FTS analyzer config) are wired, the named honesty hazards are closed, and the subtractive work (deleting registrable-but-unhonorable traits) is done. **The advertised plugin API now materially matches what the engine can honor.** What's left is the deliberately-deferred tier: the P0.7 signature-verification security hardening, and the P2/P3 "ship-as-config/built-in" conveniences.
+
+Row-level verdicts in §2–§9 below are annotated inline with `→ 2026-07-09:` where the state changed; unannotated rows were re-confirmed unchanged.
 
 ---
 
@@ -35,27 +65,27 @@ A GraphDB + Datalog logic engine + vector/document/columnar store has a far wide
 | 8 | catalog | **Delivered** | planner consults `query/planner.rs:2636,2693` |
 | 9 | replacement_scan | **Delivered** (opt-in, default off) | `query/planner.rs:2713`; gate `api/session.rs:261` |
 | 10 | background_job | **Delivered** | driver loop `plugin-host/src/scheduler.rs:359,395,460`; persisted `scheduler_persistence.rs:64` |
-| 11 | locy_aggregate | **Partial** | wired `df_graph/locy_fixpoint.rs:258`; but resolver only looks up `builtin` ns → custom-ns aggregates never dispatch `locy_fold.rs:80` |
+| 11 | locy_aggregate | **Partial** → **Delivered (2026-07-09)** | wired `df_graph/locy_fixpoint.rs:258`; ~~resolver only looks up `builtin` ns → custom-ns aggregates never dispatch~~ **fixed: resolver now iterates `candidate_splits` over session+instance registries `locy_fold.rs:102-113`** |
 | 12 | index_kind | **Partial** | probe wired via `register_index_handle` (no engine caller) `df_planner.rs:2056`; build/open/finalize unwired — DDL rejects unknown kinds `ddl_procedures.rs:403` |
 | 13 | crdt_kind | **Partial** | merge dispatch wired `crdt/src/registry_dispatch.rs:102`, `store/.../property_manager.rs:2091`; **bypassed** on compaction `storage/compaction.rs:297` and L0 `runtime/l0.rs:405`; builtin kind-strings mismatch native enum |
 | 14 | auth_provider | **Partial** | wired `api/mod.rs:1198`; shallow (no conn/cert metadata, no re-auth) and bypassed by default `session()` |
 | 15 | authz_policy | **Partial** | wired `api/session.rs:1828`; "resource" = raw Cypher string `session.rs:1846` → RBAC/ABAC not expressible |
 | 16 | window_fn | **Trait-only (dead)** | no dispatch; planner hardcodes builtins `df_planner.rs:5555`; registry lookup `registry.rs:652` has zero callers |
-| 17 | algorithm (AlgorithmProvider) | **Trait-only (dead)** | `run()` never invoked; CALL uses legacy adapter over static registry `procedures_plugin/algo.rs:587`; `bridge.rs` host never bound |
-| 18 | pregel | **Trait-only (stub)** | trait has no init/compute/combine `traits/algorithm.rs:146`; no executor; no `iter_pregels()` |
+| 17 | algorithm (AlgorithmProvider) | ~~**Trait-only (dead)**~~ → **Delivered (2026-07-09)** | ~~`run()` never invoked~~ **`run()` now invoked on both CALL paths (`procedure_call.rs:651-709`, `executor/procedure.rs:636-810`) via `run_algorithm_provider` `procedures_plugin/algo.rs:594-609`; `GraphView` host-access + `HostQuery` gate wired; first-party `uni.algo.reachability` dogfoods it** |
+| 18 | pregel | ~~**Trait-only (stub)**~~ → **Removed in 3.0 (2026-07-09)** | trait deleted (`surfaces/mod.rs:1258-1260`); no executor ever built — deferred until GraphView proved out, per §9 P1 |
 | 19 | locy_predicate | **Trait-only (dead)** | NOT WIRED — no resolver, zero consumers `traits/locy.rs:275` |
-| 20 | operator (OperatorProvider) | **Trait-only (dead)** | no registry getter, no ExtensionPlanner, zero consumers `registry.rs:497` |
-| 21 | storage_backend (plugin) | **Trait-only (dead)** | the **plugin** `uni_plugin::…StorageBackend` (`traits/storage.rs:49`) is never consulted — zero engine callers of `registry.storage_backend(scheme)`. NOTE: a *second, same-named* **internal** trait `uni_store::backend::StorageBackend` (`store/src/backend/traits.rs:69`) is the REAL, live durable abstraction the engine dispatches through (`StorageManager::backend()` `manager.rs:1113`); `LanceDbBackend` is its only real impl (`BranchedBackend` = fork wrapper). Lance is hardwired at the top (`api/mod.rs:3296`, no backend-selection config), but a `pub` injection seam `StorageManager::new_with_backend` (`manager.rs:276`) exists and is unused by the high-level API. So "replace LanceDB" is not a plugin capability, but the internal swap seam is ~90% built. |
+| 20 | operator (OperatorProvider) | ~~**Trait-only (dead)**~~ → **Removed in 3.0 (2026-07-09)** | trait deleted (`surfaces/mod.rs:1258-1260`), per §9 P1 — no comparable engine opens physical operators. (Distinct from #4 `optimizer_rule`, which stays Delivered `read.rs:459,485-510`.) |
+| 21 | storage_backend (plugin) | ~~**Trait-only (dead)**~~ → **Removed in 3.0 (2026-07-09)** | the durable-write **plugin** trait was deleted (`surfaces/mod.rs:1259`); no `storage_backend(scheme)` getter remains. The internal `StorageManager::new_with_backend` injection seam still exists (`manager.rs:286`) but is not yet config-exposed for third-party backend selection (§9 P2 "cheap should-open" remains open). Original finding: the **plugin** `uni_plugin::…StorageBackend` (`traits/storage.rs:49`) was never consulted — zero engine callers of `registry.storage_backend(scheme)`. NOTE: a *second, same-named* **internal** trait `uni_store::backend::StorageBackend` (`store/src/backend/traits.rs:69`) is the REAL, live durable abstraction the engine dispatches through (`StorageManager::backend()` `manager.rs:1113`); `LanceDbBackend` is its only real impl (`BranchedBackend` = fork wrapper). Lance is hardwired at the top (`api/mod.rs:3296`, no backend-selection config), but a `pub` injection seam `StorageManager::new_with_backend` (`manager.rs:276`) exists and is unused by the high-level API. So "replace LanceDB" is not a plugin capability, but the internal swap seam is ~90% built. |
 | 22 | logical_type | **Trait-only (shell)** | no storage/literal/cast path calls it; builtins are placeholders `plugin-builtin/src/logical_types.rs:3` |
 | 23 | collation | **Trait-only (dead)** | no `COLLATE` grammar; `compare`/`normalize` never invoked `plugin-builtin/src/collations.rs:3` |
-| 24 | connector | **Trait-only (inert)** | lifecycle-only (start/stop), no scan/data-fetch; never consulted at query time `traits/connector.rs:17`; only `NoopConnector` exists |
+| 24 | connector | ~~**Trait-only (inert)**~~ → **Removed in 3.0 (2026-07-09)** | data `Connector` trait deleted; `NoopConnector` gone; `traits/connector.rs` now holds only `AuthProvider`/`AuthzPolicy`, per §9 P1 (contradicts the embedded model). Original: lifecycle-only stub, never consulted at query time |
 | 25 | label_storage | **Delivered** (correction) | per-label storage IS wired — consumed at `query/df_graph/scan.rs:2214` (M5h); distinct from the dead URI-scheme `storage_backend` |
 
 ### Surfaces with no plugin trait at all (a complete framework would have these)
 
 | Surface | Verdict | Evidence |
 |---|---|---|
-| Custom path-expander / traversal (BFS/DFS/reachability) | **Missing — NO TRAIT** | `MATCH (a)-[*]->(b)` hardcoded in `df_graph/nfa.rs`, `traverse.rs`; zero plugin hook |
+| Custom path-expander / traversal (BFS/DFS/reachability) | **Missing — NO TRAIT** → **Partially resolved (2026-07-09)** | The Cypher variable-length planner hook `MATCH (a)-[*]->(b)` remains hardcoded core (`df_graph/nfa.rs`, `traverse.rs`) — **and stays closed by design** (§8c legitimately-closed). **But the flagship reachability use case is now authorable as a plugin** via `AlgorithmProvider` + `GraphView` (see §0 / §2 #17), which is the front-door path §7 said was missing. |
 | Custom graph projection | **Missing — NO TRAIT** | built-in `uni.graph.project` only `procedures_plugin/graph.rs` |
 | Pattern/relationship operator | **Missing — NO TRAIT** | `traits/operator.rs` is a DataFusion op, not a graph pattern hook |
 | Custom vector-index algorithm | **Missing — closed enum** | `uni-common/src/vector_index_opts.rs:44-102` |
@@ -94,7 +124,7 @@ The original proposal's claim (`plans/plugin_framework_implementation.md:36`, si
 | Locy / logic engine | ~35% | FOLD aggregates the lone wired surface (custom-ns unreachable); LocyPredicate dead; semirings closed; neural via config field. |
 | Connectivity / security | ~35% | Auth/authz wired but shallow; connector an inert lifecycle stub. |
 | Types / values / CRDT | ~30% | CRDT partial; logical types a shell; collations trait-only, no `COLLATE` grammar. |
-| **Graph / topology** | **~15%** | **The flagship domain. Reachability impossible as a plugin. AlgorithmProvider dead; Pregel a non-functional stub; no path-expander hook; no host graph access.** |
+| **Graph / topology** | **~15%** → **materially raised (2026-07-09)** | **Flagship domain. As of 3.0.0: reachability IS a plugin (`AlgorithmProvider`+`GraphView` wired, dogfooded); Pregel removed (deferred); Cypher variable-length planner hook remains closed by design.** Original: reachability impossible; AlgorithmProvider dead; Pregel a stub; no host graph access. |
 
 ---
 
@@ -110,15 +140,15 @@ Verified dead-on-arrival surfaces: `window_fn`, `algorithm` (AlgorithmProvider),
 
 ## 6. Honesty / correctness hazards (beyond "missing")
 
-These are worse than gaps — they mislead a user into thinking something works:
+These are worse than gaps — they mislead a user into thinking something works. **(2026-07-09: hazards 1–4 and 7 are FIXED; only 5 (partly) and 6 remain — see §0.)**
 
-1. **`declareTrigger` is a fraud vector.** `uni.plugin.declareTrigger` installs a `SyntheticProcedurePlugin` (a `ProcedurePlugin`), **not** a `TriggerPlugin` — so a "declared trigger" becomes a callable procedure that **never fires on mutations**. `plugin-custom/src/lib.rs:299`; synthetic type `plugin-host/src/synthetic_procedure.rs:114`.
-2. **`FireMode::EventualConsistency` is a lie** — collapses onto Async with no batched queue. `plugin-host/src/triggers.rs:666`.
-3. **Custom-namespace Locy aggregates silently never dispatch** — resolver only queries the reserved `builtin` namespace, so a third party's registered aggregate is stored yet unreachable. `df_graph/locy_fold.rs:80`.
-4. **CRDT registry bypassed on compaction/L0** — a custom CRDT merges correctly on the property path but is silently ignored during compaction and L0 flush. `storage/compaction.rs:297`, `runtime/l0.rs:405`.
-5. **Stale comments in both directions** — some claim things unwired that now work (`execute_inner_query` read-only note `plugin-custom/src/lib.rs:40`; CDC "empty batch" `cdc_runtime.rs:29`); others imply completeness that isn't there. The docs and code disagree.
-6. **Guest loaders never self-verify signatures** — manifest/hash verification lives only in the top-level `uni` API path (`api/mod.rs:3900`); the four loaders never call `verify.rs`. Trust depends on the entry path.
-7. **`TokenizerConfig::Custom{name}` is a dead config arm** — the FTS schema accepts a custom tokenizer (`uni-common/src/core/schema.rs:1317`), but `create_fts_index` drops the `tokenizer` field entirely and builds Lance's default (`store/src/storage/index_manager.rs:630`, `backend/lance.rs:1038`). A user who sets a custom analyzer gets silently ignored default tokenization.
+1. ~~**`declareTrigger` is a fraud vector.**~~ **FIXED (2026-07-09, WS-A):** now installs a real firing `TriggerPlugin` via `CypherTriggerSynthesizer` (`plugin-custom/src/lib.rs:357-370`, `synthetic_trigger.rs:125`). Original finding: `uni.plugin.declareTrigger` installs a `SyntheticProcedurePlugin` (a `ProcedurePlugin`), **not** a `TriggerPlugin` — so a "declared trigger" becomes a callable procedure that **never fires on mutations**. `plugin-custom/src/lib.rs:299`; synthetic type `plugin-host/src/synthetic_procedure.rs:114`.
+2. ~~**`FireMode::EventualConsistency` is a lie**~~ **FIXED (2026-07-09, WS-E):** real coalescing `EcQueue` (`triggers.rs:706-713,1599-1770`). Original: collapsed onto Async with no batched queue.
+3. ~~**Custom-namespace Locy aggregates silently never dispatch**~~ **FIXED (2026-07-09):** resolver now iterates `candidate_splits` over session + instance registries (`df_graph/locy_fold.rs:102-113`). Original: resolver only queried the reserved `builtin` namespace.
+4. ~~**CRDT registry bypassed on compaction/L0**~~ **FIXED (2026-07-09, WS-D):** merges route through the registry on compaction (`compaction.rs:303-308`) and L0 (`runtime/l0.rs:424-425`); registry installed at init (`api/mod.rs:3219`). Original: silently ignored during compaction and L0 flush.
+5. **Stale comments in both directions** — partially addressed (`930c9904e`); some remain. Original: some claim things unwired that now work; others imply completeness that isn't there.
+6. **Guest loaders never self-verify signatures** — **STILL TRUE (2026-07-09).** Manifest/hash verification lives only in the top-level `uni` API path (`api/mod.rs:3777`); the four loaders never call `verify.rs`. Trust depends on the entry path. **Tracked as the P0.7 security milestone.**
+7. ~~**`TokenizerConfig::Custom{name}` is a dead config arm**~~ **FIXED (2026-07-09, WS-F):** honored via `fts_analyzer.rs` — see §0 P0.2. Original: — the FTS schema accepts a custom tokenizer (`uni-common/src/core/schema.rs:1317`), but `create_fts_index` drops the `tokenizer` field entirely and builds Lance's default (`store/src/storage/index_manager.rs:630`, `backend/lance.rs:1038`). A user who sets a custom analyzer gets silently ignored default tokenization.
 
 ---
 
@@ -233,13 +263,15 @@ The raw audit read as "the framework is ~40% done and broken." The calibrated re
 
 Priorities follow §8c demand, not §2 completeness. Three of these are **subtractive** — the highest-value move for a "complete plugin API" claim is often to *stop advertising* a surface that shouldn't exist.
 
-**P0 — the two genuine must-fixes + stop the lies**
-1. **Build `GraphView`** — a stable read-only topology API (neighbor/degree/weight iteration + slot↔vid; `GraphProjection` already has the internals) passed via `AlgorithmContext`, and wire `AlgorithmProvider::run` into CALL dispatch. This is the *only* precedented MUST-OPEN with high demand, and it satisfies the reachability flagship through the front door (write BFS as a first-class `AlgorithmProvider`). Do it as the coherent host-access layer.
-2. **FTS analyzer/tokenizer/stemmer config** — honor `TokenizerConfig` (currently dead-dropped) and expose language-analyzer + stop-word + stemmer selection on the FTS index. Unblocks CJK/multilingual, which is entirely broken today. Config surface, not an arbitrary-code plugin.
-3. **Fix the honesty hazards** (cheap, high-trust): `declareTrigger` must register a real `TriggerPlugin` or reject; custom-namespace Locy aggregates must resolve; `EventualConsistency` real-or-removed; route CRDT merges through the registry on compaction/L0; honor or drop `TokenizerConfig::Custom`.
+> **2026-07-09: P0 (all three) and P1 are DONE** — shipped in v3.0.0 (HEAD `fe64b48f5`). See §0 for on-path evidence. P2/P3 remain as written below.
 
-**P1 — subtract: retire the "registrable but legitimately-closed" traits**
-4. **Remove the trait + registrar** for surfaces that no comparable engine opens and the embedded model makes low-value: `OperatorProvider` (physical operators), the durable-write `StorageBackend` plugin path, wire-protocol `Connector`, and the `PregelProgramProvider` stub *until* GraphView lands. Also stop advertising pattern-operator/semiring extensibility. A registrable-but-dead trait is an extension contract you can't honor — deleting it makes the framework *more* complete, not less.
+**P0 — the two genuine must-fixes + stop the lies** — ✅ **DONE (2026-07-09)**
+1. ✅ **Build `GraphView`** — a stable read-only topology API (neighbor/degree/weight iteration + slot↔vid; `GraphProjection` already has the internals) passed via `AlgorithmContext`, and wire `AlgorithmProvider::run` into CALL dispatch. This is the *only* precedented MUST-OPEN with high demand, and it satisfies the reachability flagship through the front door (write BFS as a first-class `AlgorithmProvider`). Do it as the coherent host-access layer.
+2. ✅ **FTS analyzer/tokenizer/stemmer config** — honor `TokenizerConfig` (currently dead-dropped) and expose language-analyzer + stop-word + stemmer selection on the FTS index. Unblocks CJK/multilingual, which is entirely broken today. Config surface, not an arbitrary-code plugin.
+3. ✅ **Fix the honesty hazards** (cheap, high-trust): `declareTrigger` must register a real `TriggerPlugin` or reject; custom-namespace Locy aggregates must resolve; `EventualConsistency` real-or-removed; route CRDT merges through the registry on compaction/L0; honor or drop `TokenizerConfig::Custom`. **All 5 done.** (The related §6 #6 signature-self-verify hazard is NOT part of this item — it lands in the P0.7 security milestone.)
+
+**P1 — subtract: retire the "registrable but legitimately-closed" traits** — ✅ **DONE (2026-07-09)**
+4. ✅ **Remove the trait + registrar** for surfaces that no comparable engine opens and the embedded model makes low-value: `OperatorProvider` (physical operators), the durable-write `StorageBackend` plugin path, wire-protocol `Connector`, and the `PregelProgramProvider` stub *until* GraphView lands — **all four removed** in the 3.0.0 breaking release (`surfaces/mod.rs:1258-1260`). A registrable-but-dead trait is an extension contract you can't honor — deleting it makes the framework *more* complete, not less.
 
 **P2 — the focused Should-open tier (built-in/config first, plugin only where precedented)**
 5. **Ship as built-in/config, not plugins:** BM25 `k1`/`b` params; vector-metric enum growth (L1, Hamming/Jaccard for binary); a fusion addition (DBSF/relative-score); declarative cardinality/relationship constraints (DDL); an APOC-style config-driven path-expander built-in; a first-party geo type.
@@ -261,3 +293,5 @@ Two readings, both true:
 - **Against calibrated demand** (§8c): the *genuine* deficit is small and focused. Most dead/missing surfaces are things no comparable engine opens, or that the embedded (app-owns-the-data) model makes low-value. The real, precedented must-fix list is **two items** — `GraphView` and FTS analyzer config — plus a focused Should-open tier that is mostly "ship as built-in/config," not "add a plugin trait."
 
 The honest conclusion is not "the framework is 40% broken" but "**the framework over-modeled the surface and under-wired the two things that actually have universal precedent.**" The single highest-value investment is **`GraphView`** (unblocks every topology-touching algorithm *and* the reachability flagship in one stroke). The second-highest-value work is **subtractive** — deleting the registrable-but-legitimately-closed traits so the advertised API matches what the engine can actually honor. A "complete plugin API" is defined as much by what it credibly refuses to open as by what it opens.
+
+> **2026-07-09 postscript.** Both of those highest-value investments have shipped (v3.0.0, HEAD `fe64b48f5`): `GraphView` + `AlgorithmProvider::run` are wired and dogfooded, and the four registrable-but-closed traits (Operator, Pregel, StorageBackend, Connector) are deleted. Together with the FTS analyzer config and the five named honesty-hazard fixes, **the entire P0 and the P1 subtractive tier are done** — the advertised plugin API now materially matches what the engine can honor. Remaining work is the deliberately-deferred tier: the P0.7 signature-verification security hardening (§6 #6), and P2/P3 "ship-as-config/built-in" conveniences. See §0 for the full verified delta.

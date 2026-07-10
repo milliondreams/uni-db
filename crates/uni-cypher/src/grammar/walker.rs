@@ -2256,15 +2256,11 @@ fn build_constraint_assertion(
             props.retain(|p| seen.insert(p.clone()));
             Ok((ConstraintType::Check, props, Some(expr)))
         }
-        _ => {
-            // Fallback to old syntax: (props) IS [NODE|RELATIONSHIP] [UNIQUE|KEY]
-            inner.next(); // Skip (
-            let prop_list = inner.next().unwrap();
-            let properties = prop_list
-                .into_inner()
-                .map(|p| p.as_str().to_string())
-                .collect();
-            inner.next(); // )
+        Rule::identifier_list => {
+            // Composite form `(a, b) IS [NODE|RELATIONSHIP] [UNIQUE|KEY]`. The
+            // parentheses are silent literals, so `first` IS the identifier_list;
+            // its inner pairs are the bare property names.
+            let properties = first.into_inner().map(|p| p.as_str().to_string()).collect();
             inner.next(); // IS
 
             let mut next = inner.next().unwrap();
@@ -2280,6 +2276,9 @@ fn build_constraint_assertion(
 
             Ok((ctype, properties, None))
         }
+        other => Err(ParseError::new(format!(
+            "Unexpected constraint assertion form: {other:?}"
+        ))),
     }
 }
 

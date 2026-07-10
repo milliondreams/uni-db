@@ -6,3 +6,4 @@ pub mod plugin_procedure_dispatch_test;
 pub mod plugin_replacement_scan_dispatch;
 pub mod plugin_storage_catalog;
 pub mod plugin_virtual_label_dispatch;
+pub mod window_fn_dispatch;

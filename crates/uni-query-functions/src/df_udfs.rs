@@ -147,6 +147,11 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
         ctx.register_udf(create_temporal_udf(name));
     }
 
+    // Spatial UDFs: point constructor, distance, and bounding-box containment.
+    for name in &["point", "distance", "point.withinbbox"] {
+        ctx.register_udf(create_spatial_udf(name));
+    }
+
     // Duration and temporal property accessor UDFs
     ctx.register_udf(create_duration_property_udf());
     ctx.register_udf(create_temporal_property_udf());
@@ -1807,6 +1812,70 @@ impl ScalarUDFImpl for TemporalUdf {
         let output_type = self.return_type(&[])?;
         invoke_cypher_udf(args, &output_type, |val_args| {
             crate::datetime::eval_datetime_function(&func_name, val_args).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
+            })
+        })
+    }
+}
+
+/// Create a UDF for a Cypher spatial function, delegating to the interpreter.
+///
+/// Handles `point`, `distance`, and `point.withinBBox` by forwarding to
+/// [`eval_spatial_function`](crate::spatial::eval_spatial_function). Registering
+/// these as DataFusion UDFs lets spatial calls run inside DataFusion-planned
+/// queries (e.g. `RETURN distance(a.loc, b.loc)`), not only the row-at-a-time
+/// interpreter path.
+fn create_spatial_udf(name: &str) -> ScalarUDF {
+    ScalarUDF::new_from_impl(SpatialUdf::new(name.to_string()))
+}
+
+#[derive(Debug)]
+struct SpatialUdf {
+    name: String,
+    signature: Signature,
+}
+
+impl SpatialUdf {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(SpatialUdf);
+
+impl ScalarUDFImpl for SpatialUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        match self.name.to_lowercase().as_str() {
+            // distance() returns meters (geographic) or Euclidean units (cartesian).
+            "distance" => Ok(DataType::Float64),
+            // point.withinBBox() is a containment predicate.
+            "point.withinbbox" => Ok(DataType::Boolean),
+            // point() yields a point map, carried through DataFusion via the
+            // CypherValue codec exactly like the temporal constructors.
+            _ => Ok(DataType::LargeBinary),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let func_name = self.name.to_uppercase();
+        let output_type = self.return_type(&[])?;
+        invoke_cypher_udf(args, &output_type, |val_args| {
+            crate::spatial::eval_spatial_function(&func_name, val_args).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
             })
         })

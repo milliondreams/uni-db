@@ -19,10 +19,12 @@
 use uni_plugin::{PluginError, PluginRegistrar};
 
 pub mod bridge;
+pub mod expand;
 pub mod pregel;
 pub mod reachability;
 
 pub use bridge::{AlgoProviderBridge, AlgorithmHostBridge};
+pub use expand::ExpandProvider;
 pub use pregel::{PageRankProvider, SsspProvider};
 pub use reachability::ReachabilityProvider;
 
@@ -75,6 +77,12 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
     r.algorithm(
         QName::new("uni", "algo.sssp"),
         Arc::new(SsspProvider::new()),
+    )?;
+
+    // APOC-style bounded path expansion (config-driven BFS).
+    r.algorithm(
+        QName::new("uni", "path.expand"),
+        Arc::new(ExpandProvider::new()),
     )?;
 
     Ok(())

@@ -1838,6 +1838,11 @@ impl StorageManager {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
                 DistanceMetric::Dot => BackendMetric::Dot,
+                // L1 has no ANN backend metric (its column is never ANN-indexed);
+                // candidates are fetched by L2 over the FULL table (`fetch_k`
+                // below) then re-scored with exact L1, so this L2 ordering does
+                // not affect the final result.
+                DistanceMetric::L1 => BackendMetric::L2,
                 _ => BackendMetric::L2,
             };
 
@@ -1850,12 +1855,21 @@ impl StorageManager {
             }
             let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
+            // L1/Manhattan is served exact/brute-force: fetch every candidate
+            // (limit = full row count) and rank by the exact L1 re-score below.
+            // O(N) — the inherent cost of exact L1, which cannot use an ANN index.
+            let fetch_k = if matches!(metric, DistanceMetric::L1) {
+                backend.count_rows(&name, None).await.unwrap_or(k).max(k)
+            } else {
+                k
+            };
+
             let batches = backend
                 .vector_search(
                     &name,
                     property,
                     query,
-                    k,
+                    fetch_k,
                     backend_metric,
                     combined_filter,
                     opts,
@@ -1881,6 +1895,13 @@ impl StorageManager {
         if let Some(qctx) = ctx {
             merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric);
         }
+
+        // Exact top-k. The L1 over-fetch (and the no-L0-activity early return in
+        // the merge) can leave more than `k` candidates; rank by distance
+        // ascending and truncate. Idempotent for the ANN paths, which already
+        // return `k` sorted.
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
 
         Ok(results)
     }

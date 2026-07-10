@@ -74,10 +74,24 @@ pub struct Action {
 }
 
 /// Authorization resource under check.
-#[derive(Clone, Debug)]
+///
+/// `path` is the raw query text (retained for backward compatibility); the
+/// structured fields are extracted from the parsed query so a policy can gate on
+/// vertex labels, relationship types, touched properties, and operations rather
+/// than string-matching the Cypher. Empty structured fields mean "none found" or
+/// "not extracted" — a policy should treat empties conservatively.
+#[derive(Clone, Debug, Default)]
 pub struct Resource {
-    /// Resource path / identifier.
+    /// Raw query text / resource identifier.
     pub path: String,
+    /// Vertex labels the query references.
+    pub labels: Vec<String>,
+    /// Relationship types the query references.
+    pub rel_types: Vec<String>,
+    /// Property keys the query reads or writes.
+    pub properties: Vec<String>,
+    /// Operations the query performs (`"read"`, `"write"`, `"delete"`, …).
+    pub operations: Vec<String>,
 }
 
 /// Authorization decision.

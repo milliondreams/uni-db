@@ -783,3 +783,55 @@ async fn test_ddl_procedure_default_algorithm_is_ivf_pq() -> Result<()> {
 
     Ok(())
 }
+
+/// L1/Manhattan vector search picks a different nearest neighbor than L2 would,
+/// proving the L1 metric is actually applied (exact/brute-force, no ANN index).
+#[tokio::test]
+async fn test_l1_metric_nearest_differs_from_l2() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+
+    // Declare an L1 vector column. The `Flat` algorithm builds no physical ANN
+    // index for L1 — the config only records the metric; search is brute-force.
+    db.schema()
+        .label("Doc")
+        .property("id", DataType::Int64)
+        .property("embedding", DataType::Vector { dimensions: 2 })
+        .index(
+            "embedding",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::Flat,
+                metric: VectorMetric::L1,
+                embedding: None,
+            }),
+        )
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    // Query point is [0, 0]. Distances to the query:
+    //   A=[1,1]   → L1 = 2.0,  L2 = 1.41
+    //   B=[1.5,0] → L1 = 1.5,  L2 = 1.5
+    // Under L1, B is nearest (1.5 < 2.0). Under L2, A would be nearest. So a
+    // nearest-of B proves L1 (not L2) ordering.
+    tx.execute("CREATE (:Doc {id: 1, embedding: [1.0, 1.0]})")
+        .await?;
+    tx.execute("CREATE (:Doc {id: 2, embedding: [1.5, 0.0]})")
+        .await?;
+    tx.execute("CREATE (:Doc {id: 3, embedding: [0.0, 3.0]})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let nearest = db
+        .session()
+        .query_with("MATCH (d:Doc) WHERE d.embedding ~= $q RETURN d.id LIMIT 1")
+        .param("q", vec![0.0_f32, 0.0])
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        nearest.rows()[0].get::<i64>("d.id")?,
+        2,
+        "L1 nearest to [0,0] is [1.5,0] (id 2); L2 would pick [1,1] (id 1)"
+    );
+    Ok(())
+}

@@ -1,6 +1,6 @@
 # uni-db Plugin Framework — Gaps Review (2026-07-07)
 
-**Status:** Findings. Adversarial, code-only audit. **Superseded in part by the §0 status update (2026-07-09) — the entire P0 remediation and the P1 subtractive tier have landed on `main`.**
+**Status:** Findings. Adversarial, code-only audit. **Superseded by §0 (2026-07-09, P0 + P1 subtractive tier), §0.1 (2026-07-10, P2 quick-wins + compute-surface opens, v3.1.0), and §0.2 (2026-07-10, P2 M-tier completion, v3.2.0). P0/P1 fully shipped; P2 fully addressed (built or resolved-with-rationale).**
 **Method:** 10 parallel code-reading auditors, one per extension domain, each required to verify every claim against three things — the **trait**, its **registrar** method, and its **runtime dispatch/call-site**. Docs, memory, and prior gaps files were explicitly excluded as sources. A surface counts as "delivered" only if the engine actually invokes a registered plugin of that kind at runtime.
 **Motivating question:** Can a third party build a BFS/DFS reachability function as a plugin? (Answer at time of writing: **no** — see §7. **As of 2026-07-09: yes**, through the front door via `AlgorithmProvider` + `GraphView` — see §0.)
 
@@ -23,9 +23,9 @@ The original findings below were re-verified against the current tree by 6 paral
 ### What remains open (all P2/P3/legitimately-closed — nothing new, nothing regressed)
 
 - **§6 #6 — guest loaders never self-verify signatures** — STILL TRUE; verification centralized in the top-level `uni` API (`api/mod.rs:3777`), skippable by direct loader use. Tracked as the P0.7 **security** milestone.
-- **Still Trait-only/dead** (unchanged): `window_fn`, `locy_predicate`, `logical_type`, `collation`, and `index_kind` build/open/finalize (probe-only remains partial). All are P2/nice-to-have.
+- **Still Trait-only/dead** (as of 2026-07-09): `window_fn`, `locy_predicate`, `logical_type`, `collation`, and `index_kind` build/open/finalize (probe-only remains partial). **→ §0.1: `window_fn` and `locy_predicate` are now Delivered (P2, 2026-07-10); `logical_type`/`collation`/`index_kind` remain.**
 - **Guest authoring still 3/23** — the new `Algorithm` kind is native-Rust-authorable only; no guest loader parses it (§8 gap #2, §9 P3).
-- **Closed enums unchanged** — `DistanceMetric`, `FusionMethod`, `ConstraintType` (schema layer; a parse-only `NodeKey` was added to the Cypher AST but does not reach enforcement), `VectorIndexKind`, semirings. All are §8c "enum-growth / built-in-add" or "legitimately-closed" — none were P0. **BM25 `k1`/`b` params** still unexposed (§8c should-open).
+- **Closed enums (as of 2026-07-09)** — `DistanceMetric`, `FusionMethod`, `ConstraintType`, `VectorIndexKind`, semirings. **→ §0.1: `FusionMethod` grew `dbsf`/`relative_score`, the constraint surface grew an enforced `NodeKey`, and a first-party `DataType::Point` shipped (P2, 2026-07-10). `DistanceMetric`/`VectorIndexKind`/semirings unchanged; BM25 `k1`/`b` stays backend-blocked.**
 - **§8 #3/#5/#6** — plugin distribution (CLI still `Install`-only, non-local schemes bail `M12`), hot-path panic isolation (only triggers/hooks `catch_unwind`-wrapped, not scalar/agg/proc), and dead observability (`record_invocation` still uncalled) — all remain, all P3.
 
 ### Recalibrated bottom line
@@ -33,6 +33,113 @@ The original findings below were re-verified against the current tree by 6 paral
 The doc's §10 thesis — *"the framework over-modeled the surface and under-wired the two things with universal precedent"* — has been acted on. The two genuine must-fixes (`GraphView`, FTS analyzer config) are wired, the named honesty hazards are closed, and the subtractive work (deleting registrable-but-unhonorable traits) is done. **The advertised plugin API now materially matches what the engine can honor.** What's left is the deliberately-deferred tier: the P0.7 signature-verification security hardening, and the P2/P3 "ship-as-config/built-in" conveniences.
 
 Row-level verdicts in §2–§9 below are annotated inline with `→ 2026-07-09:` where the state changed; unannotated rows were re-confirmed unchanged.
+
+---
+
+## 0.1. Status update — 2026-07-10 (P2 tranche, HEAD `78da69c8d`, v3.1.0)
+
+The **P2 config/built-in quick-wins and compute-surface opens** from §9 have shipped in an additive
+`3.0.0 → 3.1.0` release (commit `78da69c8d`, branch `feat/plugin-p2-quickwins-compute` FF-merged to
+`main`). Six items, each verified end-to-end (21 new integration tests + unit/doc tests, clippy- and
+fmt-clean). This does **not** touch the deferred P2 heavier-should-opens or the P3/legitimately-closed
+tiers. The user opted into two of the four P2 tranches (quick-wins + compute surfaces); the heavier
+should-opens and the APOC path-expander were deferred by choice.
+
+### What shipped (P2)
+
+| §9 P2 item | Verdict | Evidence (current tree) |
+|---|---|---|
+| **Fusion: DBSF / relative-score** | ✅ **Done** | `fuse_dbsf` (per-source z-score, sign-flip distances) `query-functions/src/fusion.rs`; `"dbsf"` + `"relative_score"`/`"rsf"` arms in `uni.search` `df_graph/search_procedures.rs`. `uni.search`-only (per-list distribution needed); `similar_to()` unchanged by design. |
+| **First-party geo `Point` type** | ✅ **Done** | Finished the dead `DataType::Point` storage path — Arrow struct encode/decode `store/src/storage/arrow_convert.rs`, decode routing `value_codec.rs`, and a `SpatialUdf` DataFusion adapter (`point`/`distance`/`point.withinBBox`) `query-functions/src/df_udfs.rs` so spatial calls run in DF-planned queries. A declared Point column previously **errored on write** and decoded to `Null`. (Path A: value stays `Value::Map`.) |
+| **`NodeKey` constraint (composite key DDL)** | ✅ **Done** | New `ConstraintType::NodeKey` + a `unique_properties()` helper threaded through single/batch/index-population(×3)/bulk/introspection sites `schema.rs`, `writer.rs`, `bulk.rs`; Cypher `IS NODE KEY` + `IS KEY` map to it (`write.rs`, `ddl_procedures.rs`). Also fixed a **pre-existing walker crash** on composite `(a, b) IS UNIQUE`/`IS NODE KEY` DDL `uni-cypher/src/grammar/walker.rs`. (Relationship-cardinality constraints remain deferred.) |
+| **Window-function dispatch** | ✅ **Done** — surface #16 no longer dead | New `PluginWindowUdwf` (`WindowUDFImpl` + `PartitionEvaluator`) `uni-query/src/query/df_udwf_plugin.rs`, resolved from the planner fallthrough `df_planner.rs` via `candidate_splits`. A plugin window fn dispatches through `OVER (PARTITION BY …)`. v1 evaluates over the whole partition (no ROWS/RANGE narrowing yet). |
+| **Pregel executor** | ✅ **Done** | New vertex-centric library `uni-plugin-builtin/src/algorithms/pregel.rs` (`VertexProgram` + `run_pregel`, message combiner, vote-to-halt) atop the public `GraphView`; first-party `uni.algo.pagerank` + `uni.algo.sssp` authored purely against `AlgorithmProvider`/`GraphView`, registered in `algorithms/mod.rs`. Shipped as a **library atop `AlgorithmProvider`**, not a revived surface kind (per §9 P1). |
+| **Locy filter-predicate wake** | ✅ **Done** — surface #19 no longer dead | Both eval paths dispatch a registered `LocyPredicate`: an `eval_function` interception (in-memory: SLG/DERIVE/QUERY projection) `df_graph/locy_eval.rs`, **plus** a boolean `PluginPredicateUdf` + `iter_locy_predicates()` registered alongside plugin scalars `df_udfs_plugin.rs` (rule-body `WHERE` / DataFusion). Filter-only; the 1:N *generator* variant remains deferred. |
+
+### What remains open in P2 (deferred by scope or backend-blocked — nothing regressed)
+
+- **BM25 `k1`/`b` params** — **backend-blocked, will not ship as-is.** Lance hardcodes `K1=1.2`/`B=0.75`
+  as compile-time constants (`lance-index/.../scorer.rs`); uni-side plumbing would be inert. Needs an
+  upstream/vendored Lance change.
+- **Vector-metric enum growth** — L1/Manhattan (scalar-only, no Lance ANN) and Hamming/Jaccard (need a
+  new binary-vector schema type; Jaccard unsupported by Lance) not built.
+- **Relationship-cardinality / relationship-uniqueness constraints** — the greenfield edge-constraint
+  path (needs a full-horizon degree probe + commit-time race guard) is deferred; only `NodeKey` (node
+  composite key) shipped.
+- **APOC-style config-driven path-expander built-in** — deferred (blocked on extending `GraphView` to a
+  typed/labeled multigraph — no per-edge type/label today).
+- **Structured authz `Resource`** and **read/attach remote object-store** — the two heavier "genuine
+  plugin should-opens" (§9 P2 item 6) not started (breaking ABI / touches all scan seams).
+- **Locy *generator* predicates** — only the filter-predicate wake shipped; the 1:N binding variant
+  (new termination/safety analysis) is deferred.
+
+### Net effect on the master tables
+
+Of the §2 "Trait-only/dead" surfaces, **two are now Delivered** — `window_fn` (#16) and `locy_predicate`
+(#19). The still-dead set narrows to `logical_type` (#22), `collation` (#23), and `index_kind`
+build/open/finalize (#12 partial). Two closed enums grew a member each without opening a plugin path:
+`FusionMethod` (+`dbsf`/`relative_score`) and the constraint surface (+`NodeKey`, enforced). A
+first-party geospatial `DataType::Point` is now a real persisted type. The genuine remaining P2 deficit
+is small: relationship-cardinality constraints, the APOC path-expander, authz depth, and remote-attach —
+plus the two backend-blocked items documented above.
+
+---
+
+## 0.2. Status update — 2026-07-10 (P2 M-tier completion, v3.2.0)
+
+The **P2 M-tier** (the tractable remainder of §9 P2) was addressed: three items **built** end-to-end,
+one **reclassified** to deferred-L after implementation revealed it balloons past M, one **found already
+open** via an existing public seam, and four documented as **deferred/closed** (below). This closes out
+P2 — every line is now built or has a resolved, rationale-backed status.
+
+### Built (P2 M-tier)
+
+| Item | Verdict | Evidence |
+|---|---|---|
+| **L1 / Manhattan vector metric** | ✅ **Done** | `DistanceMetric::L1` (`schema.rs`) + `compute_distance` + `parse_vector_metric` + the string-keyed `VECTOR_DISTANCE` path (`expr_eval.rs`). L1 has no Lance ANN, so an L1 vector index builds **no physical index** (`index_manager.rs` `build_physical_vector_index` early-return) and search is **exact/brute-force** — the query path fetches the full row count and re-scores by exact L1 (`manager.rs vector_search`). E2e: L1 picks a different nearest neighbor than L2 would. |
+| **APOC-style path-expander** | ✅ **Done** | First-party `uni.path.expand` `AlgorithmProvider` (`uni-plugin-builtin/src/algorithms/expand.rs`) — bounded BFS over a projected subgraph with `nodeLabels`/`edgeTypes`/`direction`/`minLevel`/`maxLevel` + `NODE_GLOBAL` uniqueness, reusing the shipped `GraphView` (label/type filtering at projection-build time, **no** typed-multigraph extension). Authored against the public surface like reachability/Pregel. (APOC's per-type directional `relationshipFilter` DSL + label terminate/end modes are follow-ups.) |
+| **Structured authz `Resource`** | ✅ **Done** | `Resource` gains `{labels, rel_types, properties, operations}` **additively** (`path` retained → no break for external policies; authz has no wasm/extism ABI). `authorize_query` parses the query (only when policies are active) and populates the structured fields via an AST walk — **at the single existing chokepoint**, not relocated across the 6 call sites (lower risk; the bypass-closure regressions still pass). E2e: a label-gating policy allows `Doc` and denies `Other`. |
+
+### Reclassified / found-open (during implementation)
+
+- **Edge-property uniqueness constraint — RECLASSIFIED to deferred-L.** The vertex uniqueness machinery
+  does *not* cleanly mirror to edges: committed edges live in a single `MainEdgeDataset` keyed by
+  src/dst/type with **properties packed** (not per-property queryable columns like vertices), so the
+  committed-edge uniqueness probe is new code, not a reuse — plus a new edge L0 index, a commit-time SSI
+  guard, and grammar. That is L, not M. Shipping only L0-horizon enforcement would be a flush-leaky
+  "unique" (duplicates slip through after a flush) — a correctness lie, so it was **not** shipped. Moved
+  to the deferred D-list.
+- **Read/attach remote object-store — the capability is already open.** The per-label plugin-`Storage`
+  seam (`scan.rs:2213`, `lookup_label_storage`) already lets a user register a read-only `Storage`
+  backed by `object_store` for a label; `object_store` is a direct workspace dep and
+  `cloud_config_to_lancedb_storage_options` supplies S3/GCS/Azure credentials. The genuine remaining gap
+  is only a *bundled first-party remote-Lance adapter + `UniBuilder::attach_label` sugar*, deferred as a
+  nice-to-have (marginal over the existing public seam; the v1 seam is vertex-scan-only regardless).
+
+### Deferred / closed (documented, not built)
+
+- **D1 — Hamming/Jaccard metrics — DEFERRED (L).** Needs a new binary/uint8 vector `DataType` + `Value`
+  first (cross-crate: Arrow lowering, WAL/serde, cypher literals, index config); the metric arms are the
+  last 10%. Lance ANN support for binary metrics is also uncertain at the pinned version.
+- **D2 — Relationship cardinality constraint — DEFERRED (L).** New full-horizon out-degree probe across
+  overlay + CSR + **tx-local L0** (the tx-local adjacency gap makes it new code, not a `get_neighbors`
+  call), a brand-new commit-time degree-conflict SSI guard, and super-node O(degree) perf mitigation.
+  (Same edge-write surface as the reclassified edge-uniqueness.)
+- **D3 — Locy generator predicates — DEFERRED (L).** No non-invasive path: a `LocyPredicate` trait
+  redesign (table-valued output + `PredSignature` output-vars/cardinality), a grammar/AST binding
+  production, a new flat-map/explode exec operator (none exists — `locy_fixpoint` hard-assumes a fixed,
+  pre-inferred column set), and a new range-restriction/termination safety analysis. Its own multi-stage
+  project. (The 1:1 **filter** predicate already shipped in v3.1.0.)
+- **D4 — BM25 `k1`/`b` — CLOSED (backend-blocked).** Lance hardcodes `K1=1.2`/`B=0.75` as compile-time
+  constants; uni-side plumbing would be inert. Reopen only on an upstream/vendored Lance change.
+
+### Net effect
+
+P2 is now fully addressed. Vector metrics gained L1 (exact); a first-party `uni.path.expand` covers the
+common APOC expansion; authz can gate on structured label/type/property/operation. The remaining deficit
+is four clearly-scoped L/blocked items (D1–D4) plus the edge-constraint family (edge-uniqueness +
+cardinality share the same edge-write + SSI surface, best done together as one L effort) and the
+remote-attach first-party sugar — none of which any comparable embedded engine treats as table-stakes.
 
 ---
 
@@ -70,10 +177,10 @@ A GraphDB + Datalog logic engine + vector/document/columnar store has a far wide
 | 13 | crdt_kind | **Partial** | merge dispatch wired `crdt/src/registry_dispatch.rs:102`, `store/.../property_manager.rs:2091`; **bypassed** on compaction `storage/compaction.rs:297` and L0 `runtime/l0.rs:405`; builtin kind-strings mismatch native enum |
 | 14 | auth_provider | **Partial** | wired `api/mod.rs:1198`; shallow (no conn/cert metadata, no re-auth) and bypassed by default `session()` |
 | 15 | authz_policy | **Partial** | wired `api/session.rs:1828`; "resource" = raw Cypher string `session.rs:1846` → RBAC/ABAC not expressible |
-| 16 | window_fn | **Trait-only (dead)** | no dispatch; planner hardcodes builtins `df_planner.rs:5555`; registry lookup `registry.rs:652` has zero callers |
+| 16 | window_fn | ~~**Trait-only (dead)**~~ → **Delivered (2026-07-10)** | ~~no dispatch; planner hardcodes builtins~~ **plugin window fns now dispatch via `PluginWindowUdwf` (`WindowUDFImpl`+`PartitionEvaluator`) `df_udwf_plugin.rs`, resolved from the planner fallthrough `df_planner.rs` via `candidate_splits`; usable in `OVER (PARTITION BY …)`. v1 whole-partition frame.** |
 | 17 | algorithm (AlgorithmProvider) | ~~**Trait-only (dead)**~~ → **Delivered (2026-07-09)** | ~~`run()` never invoked~~ **`run()` now invoked on both CALL paths (`procedure_call.rs:651-709`, `executor/procedure.rs:636-810`) via `run_algorithm_provider` `procedures_plugin/algo.rs:594-609`; `GraphView` host-access + `HostQuery` gate wired; first-party `uni.algo.reachability` dogfoods it** |
 | 18 | pregel | ~~**Trait-only (stub)**~~ → **Removed in 3.0 (2026-07-09)** | trait deleted (`surfaces/mod.rs:1258-1260`); no executor ever built — deferred until GraphView proved out, per §9 P1 |
-| 19 | locy_predicate | **Trait-only (dead)** | NOT WIRED — no resolver, zero consumers `traits/locy.rs:275` |
+| 19 | locy_predicate | ~~**Trait-only (dead)**~~ → **Delivered (filter) (2026-07-10)** | ~~NOT WIRED — no resolver, zero consumers~~ **filter/fuzzy predicates now dispatch on both eval paths: `eval_function` interception (in-memory: SLG/DERIVE/QUERY) `df_graph/locy_eval.rs` + boolean `PluginPredicateUdf` registered alongside plugin scalars `df_udfs_plugin.rs` (rule-body `WHERE`/DataFusion). The 1:N *generator* variant remains deferred (§9 P2).** |
 | 20 | operator (OperatorProvider) | ~~**Trait-only (dead)**~~ → **Removed in 3.0 (2026-07-09)** | trait deleted (`surfaces/mod.rs:1258-1260`), per §9 P1 — no comparable engine opens physical operators. (Distinct from #4 `optimizer_rule`, which stays Delivered `read.rs:459,485-510`.) |
 | 21 | storage_backend (plugin) | ~~**Trait-only (dead)**~~ → **Removed in 3.0 (2026-07-09)** | the durable-write **plugin** trait was deleted (`surfaces/mod.rs:1259`); no `storage_backend(scheme)` getter remains. The internal `StorageManager::new_with_backend` injection seam still exists (`manager.rs:286`) but is not yet config-exposed for third-party backend selection (§9 P2 "cheap should-open" remains open). Original finding: the **plugin** `uni_plugin::…StorageBackend` (`traits/storage.rs:49`) was never consulted — zero engine callers of `registry.storage_backend(scheme)`. NOTE: a *second, same-named* **internal** trait `uni_store::backend::StorageBackend` (`store/src/backend/traits.rs:69`) is the REAL, live durable abstraction the engine dispatches through (`StorageManager::backend()` `manager.rs:1113`); `LanceDbBackend` is its only real impl (`BranchedBackend` = fork wrapper). Lance is hardwired at the top (`api/mod.rs:3296`, no backend-selection config), but a `pub` injection seam `StorageManager::new_with_backend` (`manager.rs:276`) exists and is unused by the high-level API. So "replace LanceDB" is not a plugin capability, but the internal swap seam is ~90% built. |
 | 22 | logical_type | **Trait-only (shell)** | no storage/literal/cast path calls it; builtins are placeholders `plugin-builtin/src/logical_types.rs:3` |
@@ -215,6 +322,11 @@ Two structural findings cut across everything:
 
 ### Consolidated verdict matrix
 
+> **Note (2026-07-10):** the "Current state" column is the 2026-07-07 snapshot. Since shipped (see §0/§0.1):
+> `GraphView` (MUST-OPEN) ✅; FTS analyzers ✅; **Fusion DBSF/relative-score** ✅; **Window functions** ✅;
+> **Pregel** ✅; **Locy filter predicates** ✅ (generator still open); **first-party geo type** ✅;
+> **declarative constraints** ✅ node-key (relationship-cardinality still open). The "Demand verdict" column is unchanged.
+
 | Extension point | Current state | Demand verdict | Precedent / rationale |
 |---|---|---|---|
 | **`GraphView` — real topology access for `AlgorithmProvider`** | Trait exists, GraphView unbuilt | **MUST-OPEN** | Neo4j GDS, TigerGraph, Oracle PGX, Souffle all open it. Unblocks the reachability flagship "through the front door." |
@@ -273,9 +385,9 @@ Priorities follow §8c demand, not §2 completeness. Three of these are **subtra
 **P1 — subtract: retire the "registrable but legitimately-closed" traits** — ✅ **DONE (2026-07-09)**
 4. ✅ **Remove the trait + registrar** for surfaces that no comparable engine opens and the embedded model makes low-value: `OperatorProvider` (physical operators), the durable-write `StorageBackend` plugin path, wire-protocol `Connector`, and the `PregelProgramProvider` stub *until* GraphView lands — **all four removed** in the 3.0.0 breaking release (`surfaces/mod.rs:1258-1260`). A registrable-but-dead trait is an extension contract you can't honor — deleting it makes the framework *more* complete, not less.
 
-**P2 — the focused Should-open tier (built-in/config first, plugin only where precedented)**
-5. **Ship as built-in/config, not plugins:** BM25 `k1`/`b` params; vector-metric enum growth (L1, Hamming/Jaccard for binary); a fusion addition (DBSF/relative-score); declarative cardinality/relationship constraints (DDL); an APOC-style config-driven path-expander built-in; a first-party geo type.
-6. **Genuine plugin Should-opens:** deepen the authz `Resource` to a structured (label/rel-type/property) model — the raw-Cypher-string form is close to a bug; a read/attach remote-object-store path (DuckDB-httpfs-style, read-only, durable-write stays closed); Locy *generator* predicates; window-function dispatch; Pregel (after GraphView).
+**P2 — the focused Should-open tier (built-in/config first, plugin only where precedented)** — **partially DONE (2026-07-10, v3.1.0); see §0.1**
+5. **Ship as built-in/config, not plugins:** ~~fusion (DBSF/relative-score)~~ ✅; ~~first-party geo type~~ ✅ (`DataType::Point`); ~~declarative constraints (DDL)~~ ✅ **partial** — `NodeKey` done, edge-uniqueness + relationship-cardinality deferred-L (§0.2 D2); ~~vector-metric enum growth — L1~~ ✅ **done** (exact/brute-force; §0.2); **Hamming/Jaccard** ⬜ deferred-L (need a binary-vector type, §0.2 D1); ~~APOC-style config-driven path-expander built-in~~ ✅ **done** (`uni.path.expand` via `GraphView`, §0.2); **BM25 `k1`/`b`** ❌ backend-blocked (§0.2 D4).
+6. **Genuine plugin Should-opens:** ~~window-function dispatch~~ ✅; ~~Pregel~~ ✅ (`uni.algo.pagerank`/`sssp`); ~~Locy *generator* predicates~~ — filter half ✅ (v3.1.0), 1:N generator deferred-L (§0.2 D3); ~~deepen the authz `Resource`~~ ✅ **done** (structured labels/rel-types/properties/operations, additive — not ABI-breaking after all; §0.2); ~~read/attach remote-object-store path~~ ✅ **already open** via the public per-label plugin-`Storage` seam; first-party sugar deferred (§0.2).
 
 **P3 — gated / niche (do only when a trigger arrives)**
 7. Guest hooks/triggers/algorithms (pure-compute breadth only — never guest storage/index); plugin distribution (OCI + `list`/`remove`) once a real plugin ecosystem exists; governance masking/RLS (regulated-edge niche, gated behind the authz-depth work in P2); hot-path panic isolation and the plugin observability API.

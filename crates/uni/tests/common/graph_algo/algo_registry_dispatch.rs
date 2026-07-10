@@ -20,11 +20,11 @@ async fn all_algorithms_registered_in_plugin_registry() {
 
     // The plugin registry contains every algorithm from the static
     // `uni-algo` registry (each registered as both a procedure adapter
-    // and a provider) PLUS three first-party providers authored directly
+    // and a provider) PLUS four first-party providers authored directly
     // against `AlgorithmProvider` / `GraphView` and deliberately absent
     // from the static registry: `uni.algo.reachability`, `uni.algo.pagerank`,
-    // and `uni.algo.sssp` (the latter two are Pregel programs).
-    const FIRST_PARTY_PROVIDERS: usize = 3;
+    // `uni.algo.sssp` (Pregel), and `uni.path.expand`.
+    const FIRST_PARTY_PROVIDERS: usize = 4;
     let static_registry = uni_algo::algo::AlgorithmRegistry::new();
     let expected_count = static_registry.list().len() + FIRST_PARTY_PROVIDERS;
     assert_eq!(

@@ -1299,6 +1299,9 @@ pub enum DistanceMetric {
     Cosine,
     L2,
     Dot,
+    /// L1 / Manhattan distance (`Σ|xᵢ − yᵢ|`). Exact/brute-force only — Lance
+    /// ANN indexes do not support it, so an L1 column cannot build an ANN index.
+    L1,
 }
 
 impl DistanceMetric {
@@ -1309,6 +1312,7 @@ impl DistanceMetric {
     /// - **L2**: squared Euclidean distance.
     /// - **Cosine**: `1.0 - cosine_similarity` (range \[0, 2\]).
     /// - **Dot**: negative dot product.
+    /// - **L1**: Manhattan distance (`Σ|xᵢ − yᵢ|`).
     ///
     /// # Panics
     ///
@@ -1317,6 +1321,7 @@ impl DistanceMetric {
         assert_eq!(a.len(), b.len(), "vector dimension mismatch");
         match self {
             DistanceMetric::L2 => a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum(),
+            DistanceMetric::L1 => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
             DistanceMetric::Cosine => {
                 let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
                 let norm_a: f32 = a.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();

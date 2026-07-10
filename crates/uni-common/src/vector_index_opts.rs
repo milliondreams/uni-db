@@ -109,9 +109,10 @@ pub fn parse_vector_metric(s: Option<&str>) -> Result<DistanceMetric> {
     match s.map(|m| m.to_ascii_lowercase()).as_deref() {
         Some("l2" | "euclidean") => Ok(DistanceMetric::L2),
         Some("dot") => Ok(DistanceMetric::Dot),
+        Some("l1" | "manhattan") => Ok(DistanceMetric::L1),
         Some("cosine") | None => Ok(DistanceMetric::Cosine),
         Some(other) => Err(anyhow::anyhow!(
-            "Unknown vector index metric '{other}' (expected cosine, l2, or dot)"
+            "Unknown vector index metric '{other}' (expected cosine, l2, dot, or l1)"
         )),
     }
 }

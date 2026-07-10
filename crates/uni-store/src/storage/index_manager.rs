@@ -98,6 +98,14 @@ fn to_backend_vector_params(
         DistanceMetric::L2 => crate::backend::types::DistanceMetric::L2,
         DistanceMetric::Cosine => crate::backend::types::DistanceMetric::Cosine,
         DistanceMetric::Dot => crate::backend::types::DistanceMetric::Dot,
+        // L1 has no ANN backend; L1 columns are searched exact/brute-force.
+        DistanceMetric::L1 => {
+            return Err(anyhow!(
+                "L1/Manhattan distance does not support an ANN vector index — L1 columns \
+                 are searched exact/brute-force. Declare the column without a vector index \
+                 (or use cosine/l2/dot if you need ANN)."
+            ));
+        }
         other => return Err(anyhow!("Unsupported vector index metric: {:?}", other)),
     };
     let kind = match index_type {
@@ -481,6 +489,19 @@ impl IndexManager {
         let schema = self.schema_manager.schema();
         if !schema.labels.contains_key(label) {
             return Err(anyhow!("Label '{}' not found", label));
+        }
+
+        // L1/Manhattan has no ANN backend metric — an L1 column is searched
+        // exact/brute-force. Skip the physical index build entirely; the caller
+        // still persists the config so `vector_search` reads the L1 metric. The
+        // declared ANN algorithm is intentionally ignored for L1.
+        if matches!(config.metric, DistanceMetric::L1) {
+            info!(
+                "Vector index '{}' uses L1/Manhattan — no physical ANN index; \
+                 searched exact/brute-force",
+                config.name
+            );
+            return Ok(());
         }
 
         // Fail fast on an invalid PQ configuration before touching Lance (which

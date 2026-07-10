@@ -2125,6 +2125,14 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
             }
             Ok(Value::Float(1.0 - dot))
         }
+        "l1" | "manhattan" => {
+            // Manhattan distance = Σ|xᵢ − yᵢ|.
+            let mut sum_abs_diff = 0.0;
+            for (f1, f2) in pairs() {
+                sum_abs_diff += (f1 - f2).abs();
+            }
+            Ok(Value::Float(sum_abs_diff))
+        }
         _ => Err(anyhow!("Unknown metric: {}", metric)),
     }
 }
@@ -2542,6 +2550,24 @@ mod tests {
     /// Helper to create int values in tests (replaces json!(i))
     fn i(v: i64) -> Value {
         Value::Int(v)
+    }
+
+    #[test]
+    fn test_vector_distance_l1() {
+        let a = Value::List(vec![Value::Float(0.0), Value::Float(0.0)]);
+        let b = Value::List(vec![Value::Float(3.0), Value::Float(4.0)]);
+        // Manhattan: |0-3| + |0-4| = 7 (vs. 5 under l2).
+        let d = eval_vector_distance(&a, &b, "l1")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((d - 7.0).abs() < 1e-9, "l1 distance = 7, got {d}");
+        // `manhattan` is an accepted alias.
+        let d2 = eval_vector_distance(&a, &b, "manhattan")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((d2 - 7.0).abs() < 1e-9);
     }
 
     #[test]

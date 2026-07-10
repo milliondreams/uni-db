@@ -118,3 +118,71 @@ async fn sssp_computes_hop_distances_from_source() -> anyhow::Result<()> {
     assert!(dist(vid_d).is_infinite(), "D unreachable from A");
     Ok(())
 }
+
+#[tokio::test]
+async fn expand_respects_depth_direction_and_min_level() -> anyhow::Result<()> {
+    // Edges: A→B, A→C, B→C, C→B, D→C.
+    let db = Uni::in_memory().build().await?;
+    let [vid_a, _b, _c, vid_d] = build_graph(&db).await?;
+    let session = db.session();
+
+    // Outbound, maxLevel 1: reach A@0, B@1, C@1 (D is not reachable outbound).
+    let res = session
+        .query(&format!(
+            "CALL uni.path.expand({vid_a}, \
+             {{edgeTypes: ['LINK'], direction: 'out', maxLevel: 1}}) \
+             YIELD nodeId, level RETURN nodeId, level"
+        ))
+        .await?;
+    assert_eq!(
+        res.rows().len(),
+        3,
+        "A reaches {{A@0, B@1, C@1}} within depth 1"
+    );
+    assert!(
+        res.rows()
+            .iter()
+            .all(|r| r.get::<i64>("level").unwrap() <= 1),
+        "no row exceeds maxLevel 1"
+    );
+    assert!(
+        !res.rows()
+            .iter()
+            .any(|r| r.get::<i64>("nodeId").unwrap() == vid_d),
+        "D is unreachable outbound from A"
+    );
+
+    // minLevel 1 excludes the source (level 0).
+    let res_min = session
+        .query(&format!(
+            "CALL uni.path.expand({vid_a}, \
+             {{edgeTypes: ['LINK'], direction: 'out', minLevel: 1, maxLevel: 1}}) \
+             YIELD nodeId, level RETURN nodeId, level"
+        ))
+        .await?;
+    assert_eq!(res_min.rows().len(), 2, "minLevel 1 drops the source A@0");
+    assert!(
+        res_min
+            .rows()
+            .iter()
+            .all(|r| r.get::<i64>("level").unwrap() == 1),
+        "only level-1 rows remain"
+    );
+
+    // Both directions, depth 2: reaches D via C's inbound edge (D→C).
+    let res_both = session
+        .query(&format!(
+            "CALL uni.path.expand({vid_a}, \
+             {{edgeTypes: ['LINK'], direction: 'both', maxLevel: 2}}) \
+             YIELD nodeId, level RETURN nodeId, level"
+        ))
+        .await?;
+    assert!(
+        res_both
+            .rows()
+            .iter()
+            .any(|r| r.get::<i64>("nodeId").unwrap() == vid_d),
+        "both-direction expansion reaches D through C's inbound edge"
+    );
+    Ok(())
+}

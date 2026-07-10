@@ -274,6 +274,7 @@ mod tests {
         };
         let resource = Resource {
             path: "/sensitive".into(),
+            ..Default::default()
         };
         let decision = policy.check(&principal, &action, &resource).unwrap();
         assert!(matches!(decision, Decision::Allow));
@@ -295,6 +296,7 @@ mod tests {
                 },
                 &Resource {
                     path: "/anything".into(),
+                    ..Default::default()
                 },
             )
             .unwrap();

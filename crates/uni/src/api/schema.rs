@@ -771,6 +771,9 @@ pub enum VectorMetric {
     Cosine,
     L2,
     Dot,
+    /// L1 / Manhattan distance. Searched exact/brute-force — L1 columns cannot
+    /// build an ANN vector index.
+    L1,
 }
 
 impl VectorMetric {
@@ -779,6 +782,7 @@ impl VectorMetric {
             VectorMetric::Cosine => DistanceMetric::Cosine,
             VectorMetric::L2 => DistanceMetric::L2,
             VectorMetric::Dot => DistanceMetric::Dot,
+            VectorMetric::L1 => DistanceMetric::L1,
         }
     }
 }

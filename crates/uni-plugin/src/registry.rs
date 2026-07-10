@@ -27,7 +27,9 @@ use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::{CrdtKind, CrdtKindProvider};
 use crate::traits::hook::SessionHook;
 use crate::traits::index::{IndexHandle, IndexKind, IndexKindProvider};
-use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
+use crate::traits::locy::{
+    GenSignature, LocyAggregate, LocyGenerator, LocyPredicate, PredSignature,
+};
 use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
@@ -163,6 +165,25 @@ pub struct LocyPredicateEntry {
 impl std::fmt::Debug for LocyPredicateEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocyPredicateEntry")
+            .field("plugin", &self.plugin)
+            .field("signature", &self.signature)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A Locy generator-predicate entry.
+pub struct LocyGeneratorEntry {
+    /// Owning plugin id.
+    pub plugin: PluginId,
+    /// Generator signature.
+    pub signature: GenSignature,
+    /// The registered generator.
+    pub generator: Arc<dyn LocyGenerator>,
+}
+
+impl std::fmt::Debug for LocyGeneratorEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocyGeneratorEntry")
             .field("plugin", &self.plugin)
             .field("signature", &self.signature)
             .finish_non_exhaustive()
@@ -338,6 +359,7 @@ pub(crate) struct PluginRecord {
     pub(crate) procedures: Vec<(QName, usize)>,
     pub(crate) locy_aggregates: Vec<QName>,
     pub(crate) locy_predicates: Vec<QName>,
+    pub(crate) locy_generators: Vec<QName>,
     pub(crate) algorithms: Vec<QName>,
     pub(crate) index_kinds: Vec<IndexKind>,
     pub(crate) label_storages: Vec<SmolStr>,
@@ -377,6 +399,7 @@ impl PluginRecord {
         self.procedures.extend(other.procedures);
         self.locy_aggregates.extend(other.locy_aggregates);
         self.locy_predicates.extend(other.locy_predicates);
+        self.locy_generators.extend(other.locy_generators);
         self.algorithms.extend(other.algorithms);
         self.index_kinds.extend(other.index_kinds);
         self.label_storages.extend(other.label_storages);
@@ -415,6 +438,8 @@ pub struct PluginRecordSnapshot {
     pub locy_aggregates: Vec<QName>,
     /// Locy predicates this plugin registered.
     pub locy_predicates: Vec<QName>,
+    /// Locy generator predicates this plugin registered.
+    pub locy_generators: Vec<QName>,
     /// Algorithms this plugin registered.
     pub algorithms: Vec<QName>,
     /// Index kinds this plugin registered.
@@ -459,6 +484,7 @@ impl From<&PluginRecord> for PluginRecordSnapshot {
             procedures: r.procedures.clone(),
             locy_aggregates: r.locy_aggregates.clone(),
             locy_predicates: r.locy_predicates.clone(),
+            locy_generators: r.locy_generators.clone(),
             algorithms: r.algorithms.clone(),
             index_kinds: r.index_kinds.clone(),
             label_storages: r.label_storages.clone(),
@@ -497,6 +523,7 @@ pub struct PluginRegistry {
     pub(crate) procedures: DashMap<QName, Vec<Arc<ProcedureEntry>>>,
     pub(crate) locy_aggregates: DashMap<QName, Arc<LocyAggregateEntry>>,
     pub(crate) locy_predicates: DashMap<QName, Arc<LocyPredicateEntry>>,
+    pub(crate) locy_generators: DashMap<QName, Arc<LocyGeneratorEntry>>,
     pub(crate) optimizer_rules:
         ArcSwap<Vec<crate::surfaces::AppendEntry<dyn OptimizerRuleProvider>>>,
     pub(crate) algorithms: DashMap<QName, Arc<AlgorithmEntry>>,
@@ -618,6 +645,15 @@ impl PluginRegistry {
             .collect()
     }
 
+    /// Iterate every registered Locy generator — `(QName, LocyGeneratorEntry)`.
+    #[must_use]
+    pub fn iter_locy_generators(&self) -> Vec<(QName, Arc<LocyGeneratorEntry>)> {
+        self.locy_generators
+            .iter()
+            .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
+            .collect()
+    }
+
     /// Iterate every registered algorithm — `(QName, AlgorithmProvider)`.
     #[must_use]
     pub fn iter_algorithms(&self) -> Vec<(QName, Arc<dyn AlgorithmProvider>)> {
@@ -716,6 +752,12 @@ impl PluginRegistry {
     #[must_use]
     pub fn locy_predicate(&self, q: &QName) -> Option<Arc<LocyPredicateEntry>> {
         self.locy_predicates.get(q).map(|e| Arc::clone(e.value()))
+    }
+
+    /// Look up a registered Locy generator by qname.
+    #[must_use]
+    pub fn locy_generator(&self, q: &QName) -> Option<Arc<LocyGeneratorEntry>> {
+        self.locy_generators.get(q).map(|e| Arc::clone(e.value()))
     }
 
     /// Look up the plugin `Storage` (if any) registered to serve the
@@ -1051,9 +1093,9 @@ impl PluginRegistry {
             AggregateSurface, AlgorithmSurface, AppendOps, AuthSurface, AuthzSurface,
             BackgroundJobSurface, CatalogSurface, CdcSurface, CollationSurface, CrdtSurface,
             Discriminator, HookSurface, IndexKindSurface, KeyedUniqueOps, LabelStorageSurface,
-            LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueOps,
-            OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface, ScalarSurface,
-            TriggerSurface, VersionedOps, WindowSurface,
+            LocyAggregateSurface, LocyGeneratorSurface, LocyPredicateSurface, LogicalTypeSurface,
+            NamedUniqueOps, OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface,
+            ScalarSurface, TriggerSurface, VersionedOps, WindowSurface,
         };
 
         let record = self.per_plugin.read().remove(plugin).map(|(_, r)| r);
@@ -1076,6 +1118,9 @@ impl PluginRegistry {
         }
         for q in record.locy_predicates {
             <LocyPredicateSurface as NamedUniqueOps>::remove(self, &q);
+        }
+        for q in record.locy_generators {
+            <LocyGeneratorSurface as NamedUniqueOps>::remove(self, &q);
         }
         for q in record.algorithms {
             <AlgorithmSurface as NamedUniqueOps>::remove(self, &q);

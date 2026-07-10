@@ -18,9 +18,9 @@ use crate::surfaces::{
     AggregateSurface, AlgorithmSurface, AppendReg, AuthSurface, AuthzSurface, BackgroundJobSurface,
     CatalogSurface, CdcSurface, CollationSurface, CrdtSurface, DynPendingRegistration, HookSurface,
     IndexKindSurface, KeyedUniqueReg, LabelStorageSurface, LocyAggregateSurface,
-    LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg, OptimizerRuleSurface,
-    ProcedureSurface, ReplacementScanSurface, ScalarSurface, TriggerSurface, VersionedReg,
-    WindowSurface,
+    LocyGeneratorSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg,
+    OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface, ScalarSurface, TriggerSurface,
+    VersionedReg, WindowSurface,
 };
 use crate::traits::aggregate::{AggSignature, AggregatePluginFn};
 use crate::traits::algorithm::AlgorithmProvider;
@@ -32,7 +32,9 @@ use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::{CrdtKind, CrdtKindProvider};
 use crate::traits::hook::SessionHook;
 use crate::traits::index::{IndexKind, IndexKindProvider};
-use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
+use crate::traits::locy::{
+    GenSignature, LocyAggregate, LocyGenerator, LocyPredicate, PredSignature,
+};
 use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
@@ -271,6 +273,28 @@ impl<'a> PluginRegistrar<'a> {
         self.validate_qname(&qname)?;
         self.pending
             .push(Box::new(NamedUniqueReg::<LocyPredicateSurface> {
+                q: qname,
+                sig,
+                provider: p,
+            }));
+        Ok(self)
+    }
+
+    /// Register a Locy generator predicate (table-valued, binds 1:N variables).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::LocyGenerator`] is absent.
+    pub fn locy_generator(
+        &mut self,
+        qname: QName,
+        sig: GenSignature,
+        p: Arc<dyn LocyGenerator>,
+    ) -> Result<&mut Self, PluginError> {
+        self.require(&Capability::LocyGenerator)?;
+        self.validate_qname(&qname)?;
+        self.pending
+            .push(Box::new(NamedUniqueReg::<LocyGeneratorSurface> {
                 q: qname,
                 sig,
                 provider: p,

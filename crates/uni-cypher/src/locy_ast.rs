@@ -93,6 +93,20 @@ pub enum RuleCondition {
     IsReference(IsReference),
     /// A standard Cypher expression used as a boolean condition.
     Expression(Expr),
+    /// `name(args) -> (out1, out2)` — a table-valued generator predicate that
+    /// binds the fixed output variables (1:N).
+    Generator(GeneratorRef),
+}
+
+/// A generator-predicate reference `name(args) -> (out1, out2)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratorRef {
+    /// Generator name (dotted form for a namespaced plugin generator).
+    pub name: String,
+    /// Input argument expressions.
+    pub args: Vec<Expr>,
+    /// The output variables this generator binds (fixed arity).
+    pub outputs: Vec<String>,
 }
 
 /// An IS rule reference in various forms.

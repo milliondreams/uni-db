@@ -45,8 +45,8 @@ use crate::errors::PluginError;
 use crate::plugin::PluginId;
 use crate::qname::QName;
 use crate::registry::{
-    AggregateEntry, AlgorithmEntry, LocyAggregateEntry, LocyPredicateEntry, PluginRecord,
-    PluginRegistry, ProcedureEntry, ScalarEntry, WindowEntry,
+    AggregateEntry, AlgorithmEntry, LocyAggregateEntry, LocyGeneratorEntry, LocyPredicateEntry,
+    PluginRecord, PluginRegistry, ProcedureEntry, ScalarEntry, WindowEntry,
 };
 use crate::traits::crdt::CrdtKind;
 use crate::traits::index::IndexKind;
@@ -62,7 +62,7 @@ pub enum Discriminator {
     Arity(usize),
 }
 
-/// Enumeration of the 21 plugin surfaces.
+/// Enumeration of the 22 plugin surfaces.
 ///
 /// Used by [`crate::registry::PluginRecordSnapshot`] accessors to filter the
 /// per-plugin footprint by surface.
@@ -81,6 +81,8 @@ pub enum SurfaceKind {
     LocyAggregate,
     /// `Capability::LocyPredicate` — Locy predicate.
     LocyPredicate,
+    /// `Capability::LocyGenerator` — Locy generator predicate (table-valued).
+    LocyGenerator,
     /// `Capability::Operator` — DataFusion optimizer rule.
     OptimizerRule,
     /// `Capability::Algorithm` — graph algorithm.
@@ -119,7 +121,7 @@ pub enum SurfaceKind {
 ///
 /// One registration per qname; preflight rejects duplicates with
 /// [`PluginError::DuplicateRegistration`]. Members: Scalar, Aggregate,
-/// Window, LocyAggregate, LocyPredicate, Algorithm.
+/// Window, LocyAggregate, LocyPredicate, LocyGenerator, Algorithm.
 pub trait NamedUniqueSurface: 'static {
     /// The registered signature (e.g. `FnSignature`, `AggSignature`); unit
     /// when the surface carries no signature (e.g. `LocyAggregate`).
@@ -257,7 +259,9 @@ use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::CrdtKindProvider;
 use crate::traits::hook::SessionHook;
 use crate::traits::index::IndexKindProvider;
-use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
+use crate::traits::locy::{
+    GenSignature, LocyAggregate, LocyGenerator, LocyPredicate, PredSignature,
+};
 use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
@@ -274,7 +278,7 @@ macro_rules! marker {
     };
 }
 
-// Named-unique markers (6).
+// Named-unique markers (7).
 marker!(/// Marker for the Scalar surface. See [`NamedUniqueSurface`].
 ScalarSurface);
 marker!(/// Marker for the Aggregate surface. See [`NamedUniqueSurface`].
@@ -285,6 +289,8 @@ marker!(/// Marker for the LocyAggregate surface. See [`NamedUniqueSurface`].
 LocyAggregateSurface);
 marker!(/// Marker for the LocyPredicate surface. See [`NamedUniqueSurface`].
 LocyPredicateSurface);
+marker!(/// Marker for the LocyGenerator surface. See [`NamedUniqueSurface`].
+LocyGeneratorSurface);
 marker!(/// Marker for the Algorithm surface. See [`NamedUniqueSurface`].
 AlgorithmSurface);
 
@@ -354,6 +360,12 @@ impl NamedUniqueSurface for LocyPredicateSurface {
     type Sig = PredSignature;
     type Provider = dyn LocyPredicate;
     const KIND: SurfaceKind = SurfaceKind::LocyPredicate;
+}
+
+impl NamedUniqueSurface for LocyGeneratorSurface {
+    type Sig = GenSignature;
+    type Provider = dyn LocyGenerator;
+    const KIND: SurfaceKind = SurfaceKind::LocyGenerator;
 }
 
 impl NamedUniqueSurface for AlgorithmSurface {
@@ -834,6 +846,27 @@ impl NamedUniqueOps for LocyPredicateSurface {
     }
 }
 
+impl NamedUniqueOps for LocyGeneratorSurface {
+    type Stored = Arc<LocyGeneratorEntry>;
+    fn make_stored(
+        plugin: PluginId,
+        sig: Self::Sig,
+        provider: Arc<Self::Provider>,
+    ) -> Self::Stored {
+        Arc::new(LocyGeneratorEntry {
+            plugin,
+            signature: sig,
+            generator: provider,
+        })
+    }
+    fn slot(r: &PluginRegistry) -> &DashMap<QName, Self::Stored> {
+        &r.locy_generators
+    }
+    fn record_slot(rec: &mut PluginRecord) -> &mut Vec<QName> {
+        &mut rec.locy_generators
+    }
+}
+
 impl NamedUniqueOps for AlgorithmSurface {
     type Stored = Arc<AlgorithmEntry>;
     fn make_stored(
@@ -1235,6 +1268,7 @@ mod tests {
             <WindowSurface as NamedUniqueSurface>::KIND,
             <LocyAggregateSurface as NamedUniqueSurface>::KIND,
             <LocyPredicateSurface as NamedUniqueSurface>::KIND,
+            <LocyGeneratorSurface as NamedUniqueSurface>::KIND,
             <AlgorithmSurface as NamedUniqueSurface>::KIND,
             <ProcedureSurface as VersionedSurface>::KIND,
             <IndexKindSurface as KeyedUniqueSurface>::KIND,
@@ -1252,17 +1286,17 @@ mod tests {
             <ReplacementScanSurface as AppendSurface>::KIND,
             <BackgroundJobSurface as AppendSurface>::KIND,
         ];
-        // 21 surfaces enumerated above (Scalar+Aggregate+Window+Procedure
-        // +LocyAggregate+LocyPredicate+OptimizerRule+Algorithm+IndexKind
-        // +LabelStorage+Crdt+Hook+LogicalType+Auth+Authz+Trigger+Collation
-        // +Cdc+Catalog+ReplacementScan+BackgroundJob = 21 visible markers).
+        // 22 surfaces enumerated above (Scalar+Aggregate+Window+Procedure
+        // +LocyAggregate+LocyPredicate+LocyGenerator+OptimizerRule+Algorithm
+        // +IndexKind+LabelStorage+Crdt+Hook+LogicalType+Auth+Authz+Trigger
+        // +Collation+Cdc+Catalog+ReplacementScan+BackgroundJob = 22 visible markers).
         // The 3.0 breaking change removed the four dead registrable surfaces
         // Operator, Pregel, StorageBackend, and Connector.
-        assert_eq!(kinds.len(), 21);
+        assert_eq!(kinds.len(), 22);
         let mut sorted: Vec<_> = kinds.iter().collect();
         sorted.sort_by_key(|k| format!("{k:?}"));
         sorted.dedup();
-        assert_eq!(sorted.len(), 21, "duplicate SurfaceKind in markers");
+        assert_eq!(sorted.len(), 22, "duplicate SurfaceKind in markers");
     }
 
     #[test]

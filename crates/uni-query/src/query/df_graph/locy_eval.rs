@@ -607,6 +607,53 @@ fn invoke_locy_predicate(
     })
 }
 
+/// Resolve `name` to a registered [`LocyGenerator`] and evaluate it over the
+/// single-row `args`, returning the emitted output tuples (one inner `Vec` per
+/// generated row, each of length `signature().outputs.len()`). Returns `None`
+/// when no generator with that name is registered.
+///
+/// Mirrors [`try_dispatch_locy_predicate`] — same `candidate_splits` lookup
+/// against the session-local plugin registry — but is table-valued (1:N).
+pub(crate) fn dispatch_locy_generator(
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Vec<Vec<Value>>, LocyError>> {
+    let session_pr = crate::query::df_udfs_plugin::current_session_plugin_registry()?;
+    let entry = uni_plugin::QName::candidate_splits(name)
+        .find_map(|cand| session_pr.locy_generator(&cand))?;
+    Some(invoke_locy_generator(&entry, name, args))
+}
+
+/// Bridge Locy `Value` args into a one-row Arrow batch, invoke the generator,
+/// and read its table-valued output back as `Vec<Vec<Value>>` (one inner `Vec`
+/// per emitted tuple, columns in `signature().outputs` order).
+fn invoke_locy_generator(
+    entry: &uni_plugin::registry::LocyGeneratorEntry,
+    name: &str,
+    args: &[Value],
+) -> Result<Vec<Vec<Value>>, LocyError> {
+    let columnar: Vec<datafusion::logical_expr::ColumnarValue> =
+        args.iter().map(value_to_single_row_columnar).collect();
+
+    let err = |e: uni_plugin::FnError| LocyError::EvaluationError {
+        message: format!("{name}: {e}"),
+    };
+
+    let out = entry.generator.generate(&columnar, 1).map_err(err)?;
+    let emitted = out.row_map.len();
+    let mut tuples = Vec::with_capacity(emitted);
+    for i in 0..emitted {
+        let mut tuple = Vec::with_capacity(out.columns.len());
+        for col in &out.columns {
+            tuple.push(uni_store::storage::arrow_convert::arrow_to_value(
+                col, i, None,
+            ));
+        }
+        tuples.push(tuple);
+    }
+    Ok(tuples)
+}
+
 /// Encode one Locy `Value` as a length-1 Arrow column for predicate input.
 ///
 /// Scalars map to their natural Arrow type; a plain `Null` becomes a null

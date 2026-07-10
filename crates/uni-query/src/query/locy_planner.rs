@@ -697,6 +697,21 @@ impl<'a> LocyPlanBuilder<'a> {
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
+            // Generator predicates (`name(args) -> (outs)`) bind new variables
+            // 1:N and are resolved by the in-memory SLG engine
+            // (`locy_slg::apply_generators`), not the columnar fixpoint — which has
+            // no row-explosion operator. Skip such rules here so the fixpoint never
+            // plans their generator-bound yield columns (which are not produced by
+            // the MATCH body); QUERY resolution re-derives them through SLG, and
+            // the non-FOLD columnar output would be discarded regardless.
+            let has_generator = rule.clauses.iter().any(|c| {
+                c.where_conditions
+                    .iter()
+                    .any(|cond| matches!(cond, RuleCondition::Generator(_)))
+            });
+            if has_generator {
+                continue;
+            }
             rules.push(self.build_rule(
                 rule,
                 stratum.is_recursive,

@@ -103,6 +103,8 @@ pub enum Capability {
     LocyAggregate,
     /// Register Locy predicates (including neural).
     LocyPredicate,
+    /// Register Locy generator predicates (table-valued, 1:N).
+    LocyGenerator,
     /// Register physical operators / optimizer rules.
     Operator,
     /// Register index kinds.

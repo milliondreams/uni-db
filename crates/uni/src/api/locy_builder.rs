@@ -193,11 +193,25 @@ impl<'a> LocyBuilder<'a> {
 
     /// Evaluate the program and return the full [`LocyResult`].
     pub async fn run(self) -> Result<LocyResult> {
-        crate::api::impl_locy::evaluate_with_db_and_config(
-            &self.session.db,
-            &self.program,
-            &self.config,
-            self.session.rule_registry(),
+        // Expose a plugin registry (and principal) as task-locals so in-memory
+        // Locy dispatch — e.g. `LocyGenerator` / `LocyPredicate` via
+        // `eval_function` on the SLG path — can resolve registered plugins.
+        // `add_plugin` registers into the instance registry, so scope that (the
+        // Cypher query path reaches instance plugins through its UDF-registration
+        // step; the SLG eval path reads only this task-local). Without it the SLG
+        // resolver sees no registry and a registered generator/predicate is
+        // reported "not registered".
+        let session_pr = std::sync::Arc::clone(self.session.instance_plugin_registry());
+        let principal = self.session.principal.clone();
+        uni_query::scoped_with_session_context(
+            session_pr,
+            principal,
+            crate::api::impl_locy::evaluate_with_db_and_config(
+                &self.session.db,
+                &self.program,
+                &self.config,
+                self.session.rule_registry(),
+            ),
         )
         .await
     }

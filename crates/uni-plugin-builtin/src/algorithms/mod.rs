@@ -19,8 +19,10 @@
 use uni_plugin::{PluginError, PluginRegistrar};
 
 pub mod bridge;
+pub mod reachability;
 
 pub use bridge::{AlgoProviderBridge, AlgorithmHostBridge};
+pub use reachability::ReachabilityProvider;
 
 /// Register every built-in `uni.algo.*` algorithm into `r` as an
 /// `uni_plugin::traits::algorithm::AlgorithmProvider`.
@@ -52,5 +54,16 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
         let provider = Arc::new(AlgoProviderBridge::new(proc));
         r.algorithm(qname, provider)?;
     }
+
+    // First-party algorithm authored purely against the public
+    // `AlgorithmProvider` + `GraphView` surface. Registered ONLY as a
+    // provider (absent from the static `uni_algo` registry), so a
+    // `CALL uni.algo.reachability(...)` routes through the provider
+    // dispatch path rather than the M4 procedure adapter.
+    r.algorithm(
+        QName::new("uni", "algo.reachability"),
+        Arc::new(ReachabilityProvider::new()),
+    )?;
+
     Ok(())
 }

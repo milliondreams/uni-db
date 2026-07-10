@@ -320,6 +320,24 @@ impl GraphProcedureCallExec {
                 fields.push(field);
             }
         } else if let Some(registry) = graph_ctx.procedure_registry()
+            && let Some(entry) = registry.resolve_user_algorithm(procedure_name)
+        {
+            // Algorithm-provider path: types come from the provider's
+            // declared output fields, matched to YIELD names. Providers
+            // are registered without a procedure signature, so without
+            // this branch a `YIELD nodeId` would default to Utf8 and
+            // clash with an Int64-producing algorithm at execution time.
+            let output_fields = &entry.provider.signature().output_fields;
+            for (name, alias) in yield_items {
+                let col_name = alias.as_ref().unwrap_or(name);
+                let field = output_fields
+                    .iter()
+                    .find(|f| f.name() == name.as_str())
+                    .map(|f| Field::new(col_name, f.data_type().clone(), f.is_nullable()))
+                    .unwrap_or_else(|| Field::new(col_name, DataType::Utf8, true));
+                fields.push(field);
+            }
+        } else if let Some(registry) = graph_ctx.procedure_registry()
             && let Some(proc_def) = registry.get(procedure_name)
         {
             for (name, alias) in yield_items {
@@ -624,7 +642,81 @@ async fn execute_procedure(
         .await;
     }
 
+    // Algorithm-provider fallthrough (procedure-miss only). Catches
+    // `uni.algo.*`-namespaced providers registered purely via
+    // `PluginRegistrar::algorithm` (the built-in `uni.algo.*` set is
+    // registered as procedures and resolves above). Third-party
+    // providers under their own namespace are DF-ineligible and land on
+    // the simple-executor path instead.
+    if let Some(registry) = graph_ctx.procedure_registry()
+        && let Some(entry) = registry.resolve_user_algorithm(procedure_name)
+    {
+        return execute_algorithm_provider(
+            graph_ctx,
+            procedure_name,
+            &entry,
+            args,
+            yield_items,
+            schema,
+        )
+        .await;
+    }
+
     execute_registered_procedure(graph_ctx, procedure_name, args, yield_items, schema).await
+}
+
+/// Execute a graph algorithm registered as an [`AlgorithmProvider`].
+///
+/// Serializes `args` into the provider's positional JSON `config_json`
+/// contract, builds a host bridge over `graph_ctx`'s storage and L0
+/// snapshot (so the algorithm observes read-your-writes state), runs the
+/// provider, and finalizes the stream through
+/// [`finalize_procedure_stream`].
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` if the provider cannot start (e.g. the
+/// owning plugin lacks `HostQuery`) or its output stream fails.
+async fn execute_algorithm_provider(
+    graph_ctx: &GraphExecutionContext,
+    procedure_name: &str,
+    entry: &uni_plugin::registry::AlgorithmEntry,
+    args: &[Value],
+    yield_items: &[(String, Option<String>)],
+    schema: &SchemaRef,
+) -> DFResult<Option<RecordBatch>> {
+    // Positional JSON array — the provider `config_json` contract.
+    let json_args: Vec<serde_json::Value> = args
+        .iter()
+        .map(|v| serde_json::Value::from(v.clone()))
+        .collect();
+    let config_json = serde_json::Value::Array(json_args).to_string();
+
+    // L0 snapshot for read-your-writes visibility, mirroring the
+    // `uni.algo.*` procedure adapter's host L0 construction.
+    let l0_ctx = graph_ctx.l0_context();
+    let l0_mgr = l0_ctx.current_l0.as_ref().map(|current| {
+        let mut pending = l0_ctx.pending_flush_l0s.clone();
+        if let Some(tx_l0) = &l0_ctx.transaction_l0 {
+            pending.push(tx_l0.clone());
+        }
+        Arc::new(uni_store::runtime::l0_manager::L0Manager::from_snapshot(
+            current.clone(),
+            pending,
+        ))
+    });
+
+    let stream = crate::procedures_plugin::algo::run_algorithm_provider(
+        entry,
+        Arc::clone(graph_ctx.storage()),
+        l0_mgr,
+        &config_json,
+    )
+    .map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!("Algorithm '{procedure_name}': {e}"))
+    })?;
+
+    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
 }
 
 /// Execute a procedure via the plugin framework.
@@ -646,7 +738,6 @@ async fn execute_plugin_procedure(
     schema: &SchemaRef,
 ) -> DFResult<Option<RecordBatch>> {
     use datafusion::logical_expr::ColumnarValue;
-    use futures::StreamExt;
 
     // Convert Cypher values into ColumnarValue scalars per the plugin's
     // declared signature. Currently a straightforward 1:1 mapping over
@@ -684,9 +775,34 @@ async fn execute_plugin_procedure(
     // consolidated in `uni_plugin::host::build_procedure_context`.
     let principal = crate::current_principal();
     let ctx = uni_plugin::host::build_procedure_context(&host, principal.as_deref());
-    let mut stream = entry.procedure.invoke(ctx, &columnar_args).map_err(|e| {
+    let stream = entry.procedure.invoke(ctx, &columnar_args).map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Procedure '{procedure_name}': {e}"))
     })?;
+
+    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
+}
+
+/// Drain a plugin's result stream into a single, yield-projected batch.
+///
+/// Concatenates every batch the stream yields, passes it through when it
+/// already matches the planner-expected `schema` (or the requested
+/// `yield_items` order), and otherwise reprojects onto the requested
+/// columns. An empty stream yields an empty batch carrying `schema` so
+/// downstream operators stay schema-coherent. Shared by the procedure and
+/// algorithm-provider CALL branches, whose upstream stream construction
+/// differs but whose output handling is identical.
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` on a stream error, a concat failure, or a
+/// `YIELD` column absent from the plugin's output schema.
+async fn finalize_procedure_stream(
+    mut stream: SendableRecordBatchStream,
+    procedure_name: &str,
+    yield_items: &[(String, Option<String>)],
+    schema: &SchemaRef,
+) -> DFResult<Option<RecordBatch>> {
+    use futures::StreamExt;
 
     // Collect every batch the plugin yields. For most procedures the
     // stream produces a single batch; this works for multi-batch streams

@@ -215,6 +215,15 @@ fn register_builtin_plugins(
         // plugin owns both procedure registrations (`uni.algo.*`
         // adapters) and the AlgorithmProvider chain.
         caps.insert(Capability::Algorithm);
+        // GraphView (P0): the first-party `uni.algo.reachability`
+        // provider reaches topology through `AlgorithmHost::project`,
+        // which is gated on `HostQuery`. Grant it read-only, unscoped so
+        // the built-in provider passes its own gate; third-party plugins
+        // must declare `HostQuery` in their manifest to earn the same.
+        caps.insert(Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        });
         let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
         let algo_registry: Arc<uni_algo::algo::AlgorithmRegistry> =
             Arc::new(uni_algo::algo::AlgorithmRegistry::new());

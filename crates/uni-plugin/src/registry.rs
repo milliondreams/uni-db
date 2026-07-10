@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 
+use crate::capability::CapabilitySet;
 use crate::errors::PluginError;
 use crate::plugin::PluginId;
 use crate::qname::QName;
@@ -87,6 +88,29 @@ impl std::fmt::Debug for WindowEntry {
         f.debug_struct("WindowEntry")
             .field("plugin", &self.plugin)
             .field("signature", &self.signature)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A single graph-algorithm registry entry.
+///
+/// Carries the owning plugin's effective capability set so the CALL
+/// dispatcher can enforce host-access grants (e.g. `HostQuery`) when
+/// building the algorithm host at invocation time.
+pub struct AlgorithmEntry {
+    /// Owning plugin id.
+    pub plugin: PluginId,
+    /// Effective capabilities granted to the owning plugin.
+    pub effective_caps: CapabilitySet,
+    /// The registered algorithm provider.
+    pub provider: Arc<dyn AlgorithmProvider>,
+}
+
+impl std::fmt::Debug for AlgorithmEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlgorithmEntry")
+            .field("plugin", &self.plugin)
+            .field("effective_caps", &self.effective_caps)
             .finish_non_exhaustive()
     }
 }
@@ -475,7 +499,7 @@ pub struct PluginRegistry {
     pub(crate) locy_predicates: DashMap<QName, Arc<LocyPredicateEntry>>,
     pub(crate) optimizer_rules:
         ArcSwap<Vec<crate::surfaces::AppendEntry<dyn OptimizerRuleProvider>>>,
-    pub(crate) algorithms: DashMap<QName, Arc<dyn AlgorithmProvider>>,
+    pub(crate) algorithms: DashMap<QName, Arc<AlgorithmEntry>>,
     pub(crate) index_kinds: DashMap<IndexKind, Arc<dyn IndexKindProvider>>,
     index_handles: DashMap<SmolStr, IndexHandleEntry>,
     /// Per-label plugin storage (M5h.2). Keyed by *label name* and
@@ -590,7 +614,7 @@ impl PluginRegistry {
     pub fn iter_algorithms(&self) -> Vec<(QName, Arc<dyn AlgorithmProvider>)> {
         self.algorithms
             .iter()
-            .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
+            .map(|kv| (kv.key().clone(), Arc::clone(&kv.value().provider)))
             .collect()
     }
 
@@ -800,9 +824,21 @@ impl PluginRegistry {
         self.virtual_edge_types.lock().id_to_entry.get(&id).cloned()
     }
 
-    /// Look up a registered algorithm by qname.
+    /// Look up a registered algorithm provider by qname.
     #[must_use]
     pub fn algorithm(&self, q: &QName) -> Option<Arc<dyn AlgorithmProvider>> {
+        self.algorithms
+            .get(q)
+            .map(|e| Arc::clone(&e.value().provider))
+    }
+
+    /// Look up a registered algorithm's full entry by qname.
+    ///
+    /// Unlike [`Self::algorithm`], the returned [`AlgorithmEntry`] also
+    /// carries the owning plugin's effective capabilities, which the CALL
+    /// dispatcher needs to gate host graph access.
+    #[must_use]
+    pub fn algorithm_entry(&self, q: &QName) -> Option<Arc<AlgorithmEntry>> {
         self.algorithms.get(q).map(|e| Arc::clone(e.value()))
     }
 

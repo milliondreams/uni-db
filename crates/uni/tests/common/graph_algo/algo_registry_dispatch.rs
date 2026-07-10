@@ -18,14 +18,18 @@ async fn all_algorithms_registered_in_plugin_registry() {
         .map(|(q, _)| q)
         .collect();
 
-    // Compare against the static registry which is the source of truth
-    // for the 36 algorithms shipped with `uni-algo`.
+    // The plugin registry contains every algorithm from the static
+    // `uni-algo` registry (each registered as both a procedure adapter
+    // and a provider) PLUS the first-party `uni.algo.reachability`
+    // provider, which is authored directly against `AlgorithmProvider` /
+    // `GraphView` and is deliberately absent from the static registry.
     let static_registry = uni_algo::algo::AlgorithmRegistry::new();
-    let expected_count = static_registry.list().len();
+    let expected_count = static_registry.list().len() + 1;
     assert_eq!(
         listed.len(),
         expected_count,
-        "registry must contain exactly {expected_count} algorithms; got {}: {listed:?}",
+        "registry must contain the {} static algorithms plus reachability; got {}: {listed:?}",
+        static_registry.list().len(),
         listed.len()
     );
 
@@ -37,6 +41,14 @@ async fn all_algorithms_registered_in_plugin_registry() {
             "algorithm {name} (qname {qname:?}) must be registered"
         );
     }
+
+    // The provider-only reachability algorithm resolves too.
+    assert!(
+        registry
+            .algorithm(&QName::new("uni", "algo.reachability"))
+            .is_some(),
+        "the first-party uni.algo.reachability provider must be registered"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

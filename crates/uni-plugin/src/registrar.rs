@@ -347,10 +347,13 @@ impl<'a> PluginRegistrar<'a> {
     ) -> Result<&mut Self, PluginError> {
         self.require(&Capability::Algorithm)?;
         self.validate_qname(&qname)?;
+        // Snapshot the effective caps so the stored entry can gate host
+        // graph access (e.g. `HostQuery`) at CALL time.
+        let effective_caps = self.effective_caps.clone();
         self.pending
             .push(Box::new(NamedUniqueReg::<AlgorithmSurface> {
                 q: qname,
-                sig: (),
+                sig: effective_caps,
                 provider: p,
             }));
         Ok(self)

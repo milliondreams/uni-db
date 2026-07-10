@@ -40,12 +40,13 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use smol_str::SmolStr;
 
+use crate::capability::CapabilitySet;
 use crate::errors::PluginError;
 use crate::plugin::PluginId;
 use crate::qname::QName;
 use crate::registry::{
-    AggregateEntry, LocyAggregateEntry, LocyPredicateEntry, PluginRecord, PluginRegistry,
-    ProcedureEntry, ScalarEntry, WindowEntry,
+    AggregateEntry, AlgorithmEntry, LocyAggregateEntry, LocyPredicateEntry, PluginRecord,
+    PluginRegistry, ProcedureEntry, ScalarEntry, WindowEntry,
 };
 use crate::traits::crdt::CrdtKind;
 use crate::traits::index::IndexKind;
@@ -356,7 +357,9 @@ impl NamedUniqueSurface for LocyPredicateSurface {
 }
 
 impl NamedUniqueSurface for AlgorithmSurface {
-    type Sig = ();
+    // The signature slot carries the registering plugin's effective
+    // capabilities so the stored entry can gate host graph access.
+    type Sig = CapabilitySet;
     type Provider = dyn AlgorithmProvider;
     const KIND: SurfaceKind = SurfaceKind::Algorithm;
 }
@@ -832,9 +835,17 @@ impl NamedUniqueOps for LocyPredicateSurface {
 }
 
 impl NamedUniqueOps for AlgorithmSurface {
-    type Stored = Arc<dyn AlgorithmProvider>;
-    fn make_stored(_p: PluginId, _s: Self::Sig, provider: Arc<Self::Provider>) -> Self::Stored {
-        provider
+    type Stored = Arc<AlgorithmEntry>;
+    fn make_stored(
+        plugin: PluginId,
+        sig: Self::Sig,
+        provider: Arc<Self::Provider>,
+    ) -> Self::Stored {
+        Arc::new(AlgorithmEntry {
+            plugin,
+            effective_caps: sig,
+            provider,
+        })
     }
     fn slot(r: &PluginRegistry) -> &DashMap<QName, Self::Stored> {
         &r.algorithms

@@ -701,8 +701,16 @@ drop_index = { DROP_KW ~ INDEX ~ if_exists? ~ identifier }
 
 create_constraint = {
     CREATE ~ CONSTRAINT ~ if_not_exists? ~ identifier?
-    ~ ON ~ "(" ~ identifier ~ ":" ~ identifier_or_keyword ~ ")"
+    ~ ON ~ (constraint_rel_pattern | constraint_node_pattern)
     ~ ASSERT ~ constraint_assertion
+}
+// `ON (n:Label)` — node constraint. Inner tokens: [var, label].
+constraint_node_pattern = { "(" ~ identifier ~ ":" ~ identifier_or_keyword ~ ")" }
+// `ON ()-[r:TYPE]-()` (or `->`/`<-`) — relationship constraint. Direction uses
+// bare string literals so they are not captured; inner tokens: [var, edge_type].
+constraint_rel_pattern = {
+    "(" ~ ")" ~ ("<-" | "-") ~ "[" ~ identifier ~ ":" ~ identifier_or_keyword ~ "]"
+    ~ ("->" | "-") ~ "(" ~ ")"
 }
 constraint_assertion = {
     EXISTS ~ "(" ~ property_expr ~ ")"                        // EXISTS(n.prop)

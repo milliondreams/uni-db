@@ -372,6 +372,99 @@ impl PropertyManager {
         Ok(None)
     }
 
+    /// Reports whether a *live* flushed edge of `edge_type` already carries the
+    /// given unique-key values, excluding `exclude_eid`.
+    ///
+    /// The committed-storage half of the edge-uniqueness full-horizon probe (the
+    /// in-memory L0 layers are checked separately via `has_edge_constraint_key`).
+    /// The per-type delta table is an LSM log — multiple versions per eid, later
+    /// `op = 0` writes overwrite properties, `op = 1` deletes — so a naive
+    /// `prop = val AND op = 0` count would wrongly flag an edge that was later
+    /// deleted or updated away from `val`. Instead this narrows to candidate eids
+    /// on ONE key property (guaranteed present in some `op = 0` row iff the edge
+    /// currently holds that value), then resolves each candidate's *current
+    /// merged* properties via [`Self::fetch_all_edge_props_from_storage_with_hint`]
+    /// and confirms the full key still matches on a live edge. Correct — never
+    /// leaks a duplicate — without an O(edges) full scan.
+    ///
+    /// # Errors
+    /// Propagates backend scan errors — fails closed rather than treating a
+    /// conflict as absent.
+    pub async fn flushed_edge_key_conflict(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        exclude_eid: Option<Eid>,
+    ) -> Result<bool> {
+        if key_values.is_empty() {
+            return Ok(false);
+        }
+        use crate::backend::table_names;
+        use crate::backend::types::ScanRequest;
+
+        let table_name = table_names::delta_table_name(edge_type, "fwd");
+        let backend = self.storage.backend();
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(false);
+        }
+
+        // Narrow to candidate eids via the first key property. Any live edge whose
+        // current value of this property equals `probe_val` must have set it in an
+        // `op = 0` row, so this filter catches every genuine conflict; a candidate
+        // that was since deleted or updated is discarded by the per-eid resolution
+        // below.
+        let (probe_prop, probe_val) = &key_values[0];
+        let val_sql = match probe_val {
+            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            // A NULL/unsupported key value can't satisfy a UNIQUE key — nothing to
+            // probe (NodeKey's NOT-NULL half is enforced separately at the call site).
+            _ => return Ok(false),
+        };
+        let base_filter = format!("{probe_prop} = {val_sql} AND op = 0");
+        let filter_expr = self.storage.apply_version_filter(base_filter);
+
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+            .await?;
+
+        // Distinct candidate eids from the narrowed scan.
+        let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for batch in &batches {
+            let Some(eid_col) = batch
+                .column_by_name("eid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                if !eid_col.is_null(row) {
+                    candidates.insert(eid_col.value(row));
+                }
+            }
+        }
+
+        let exclude = exclude_eid.map(|e| e.as_u64());
+        for raw in candidates {
+            if Some(raw) == exclude {
+                continue;
+            }
+            let Some(props) = self
+                .fetch_all_edge_props_from_storage_with_hint(Eid::new(raw), Some(edge_type))
+                .await?
+            else {
+                continue; // deleted / not live
+            };
+            // The candidate's *current* value of every key property must match.
+            if key_values.iter().all(|(p, v)| props.get(p) == Some(v)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Batch load properties for multiple vertices
     pub async fn get_batch_vertex_props(
         &self,

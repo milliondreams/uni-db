@@ -1466,7 +1466,13 @@ impl Executor {
 
     pub(crate) async fn execute_create_constraint(&self, clause: CreateConstraint) -> Result<()> {
         let sm = self.storage.schema_manager_arc();
-        let target = ConstraintTarget::Label(clause.label);
+        // A relationship pattern (`ON ()-[r:TYPE]-()`) targets an edge type; a
+        // node pattern targets a label.
+        let target = if clause.on_relationship {
+            ConstraintTarget::EdgeType(clause.label)
+        } else {
+            ConstraintTarget::Label(clause.label)
+        };
         let c_type = match clause.constraint_type {
             AstConstraintType::Unique => ConstraintType::Unique {
                 properties: clause.properties,

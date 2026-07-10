@@ -2192,9 +2192,14 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError
         }
     };
 
-    // Note: parentheses and colon are not separate tokens in the parse tree
-    let var = inner.next().unwrap().as_str().to_string();
-    let label = normalize_identifier(inner.next().unwrap().as_str());
+    // The target is a node pattern `(n:Label)` or a relationship pattern
+    // `()-[r:TYPE]-()`. Parens/colon/arrows are string literals (not tokens); the
+    // pattern rule's inner tokens are [var, label-or-edge-type].
+    let pattern = inner.next().unwrap();
+    let on_relationship = matches!(pattern.as_rule(), Rule::constraint_rel_pattern);
+    let mut pat_inner = pattern.into_inner();
+    let var = pat_inner.next().unwrap().as_str().to_string();
+    let label = normalize_identifier(pat_inner.next().unwrap().as_str());
     inner.next(); // ASSERT
 
     let assertion = inner.next().unwrap();
@@ -2206,6 +2211,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError
         label,
         properties,
         expression,
+        on_relationship,
     }))
 }
 

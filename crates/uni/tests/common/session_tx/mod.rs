@@ -1,6 +1,7 @@
 pub mod constraint_enforcement_test;
 pub mod ddl_execution_test;
 pub mod ddl_test;
+pub mod edge_constraint_enforcement_test;
 pub mod repl_autocommit_test;
 pub mod reserved_property_names_test;
 pub mod schema_apply_idempotency;

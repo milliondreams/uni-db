@@ -932,6 +932,52 @@ impl Writer {
         for (key, vid) in keys {
             l0_guard.insert_constraint_key(key, vid);
         }
+
+        // Same rebuild for edge unique/nodekey keys: `replay_mutations` restores
+        // edge properties/types but never repopulates `edge_constraint_index`, so
+        // a WAL-committed-but-unflushed unique edge key would otherwise be invisible
+        // to the edge full-horizon probe after recovery (edge counterpart of Bug #9
+        // Mechanism B).
+        let mut edge_keys: Vec<(Vec<u8>, Eid)> = Vec::new();
+        for (&eid, props) in &l0_guard.edge_properties {
+            if l0_guard.tombstones.contains_key(&eid) {
+                continue;
+            }
+            let Some(edge_type) = l0_guard.edge_types.get(&eid) else {
+                continue;
+            };
+            for constraint in &schema.constraints {
+                if !constraint.enabled {
+                    continue;
+                }
+                let ConstraintTarget::EdgeType(t) = &constraint.target else {
+                    continue;
+                };
+                if t != edge_type {
+                    continue;
+                }
+                let Some(unique_props) = constraint.constraint_type.unique_properties() else {
+                    continue;
+                };
+                let mut key_values = Vec::new();
+                let mut all_present = true;
+                for prop in unique_props {
+                    match props.get(prop) {
+                        Some(val) if !val.is_null() => key_values.push((prop.clone(), val.clone())),
+                        _ => {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                }
+                if all_present && !key_values.is_empty() {
+                    edge_keys.push((serialize_constraint_key(edge_type, &key_values), eid));
+                }
+            }
+        }
+        for (key, eid) in edge_keys {
+            l0_guard.insert_edge_constraint_key(key, eid);
+        }
     }
 
     /// Allocates the next VID (pure auto-increment).
@@ -1274,6 +1320,25 @@ impl Writer {
                         return Err(anyhow::Error::new(
                             uni_common::UniError::ConstraintConflict {
                                 message: "unique key already committed by a concurrent \
+                                          transaction"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                }
+
+                // Same serializable guard for edge unique/nodekey keys: abort if a
+                // concurrent transaction committed an edge with one of this
+                // transaction's edge unique keys. (Empty index → no iterations.)
+                for (key, eid) in &tx_l0.edge_constraint_index {
+                    if overlay
+                        .iter()
+                        .any(|b| b.read().has_edge_constraint_key(key, *eid))
+                    {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: "unique edge key already committed by a concurrent \
                                           transaction"
                                     .to_string(),
                             },
@@ -2692,6 +2757,222 @@ impl Writer {
         Ok(false)
     }
 
+    /// Edge counterpart of [`validate_vertex_constraints`](Self::validate_vertex_constraints):
+    /// enforces declared `Unique` / `NodeKey` constraints on an edge type before
+    /// the write. `NodeKey` additionally requires every key property present and
+    /// non-null; `Unique` skips enforcement when a key property is absent.
+    ///
+    /// # Errors
+    /// Returns an error if a key property collides with another live edge, or (for
+    /// `NodeKey`) if a key property is missing/null.
+    async fn validate_edge_constraints(
+        &self,
+        eid: Eid,
+        edge_type_name: &str,
+        properties: &Properties,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let schema = self.schema_manager.schema();
+        for constraint in &schema.constraints {
+            if !constraint.enabled {
+                continue;
+            }
+            match &constraint.target {
+                ConstraintTarget::EdgeType(t) if t == edge_type_name => {}
+                _ => continue,
+            }
+            match &constraint.constraint_type {
+                ConstraintType::Unique {
+                    properties: unique_props,
+                } => {
+                    if unique_props.is_empty() {
+                        continue;
+                    }
+                    let mut key_values = Vec::with_capacity(unique_props.len());
+                    let mut missing = false;
+                    for prop in unique_props {
+                        match properties.get(prop) {
+                            Some(val) => key_values.push((prop.clone(), val.clone())),
+                            None => {
+                                missing = true; // Unique skips enforcement on a missing key.
+                                break;
+                            }
+                        }
+                    }
+                    if !missing {
+                        self.check_unique_edge_constraint_multi(
+                            edge_type_name,
+                            &key_values,
+                            eid,
+                            tx_l0,
+                        )
+                        .await?;
+                    }
+                }
+                ConstraintType::NodeKey {
+                    properties: key_props,
+                } => {
+                    if key_props.is_empty() {
+                        continue;
+                    }
+                    let mut key_values = Vec::with_capacity(key_props.len());
+                    for prop in key_props {
+                        match properties.get(prop) {
+                            Some(val) if !val.is_null() => {
+                                key_values.push((prop.clone(), val.clone()))
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Relationship key constraint '{}' violated: property '{}' must exist and be non-null for edge type '{}'",
+                                    constraint.name,
+                                    prop,
+                                    edge_type_name
+                                ));
+                            }
+                        }
+                    }
+                    self.check_unique_edge_constraint_multi(
+                        edge_type_name,
+                        &key_values,
+                        eid,
+                        tx_l0,
+                    )
+                    .await?;
+                }
+                // Edge `Exists`/`Check` are out of scope for the uniqueness family.
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Registers an edge's declared `Unique`/`NodeKey` key values into the L0 edge
+    /// constraint index, the edge analogue of the vertex index-population inside
+    /// `insert_vertex_with_labels`. A key with a missing/null member is not
+    /// registered (it cannot participate in a satisfied unique key).
+    fn populate_edge_constraint_index(
+        &self,
+        eid: Eid,
+        edge_type_name: &str,
+        properties: &Properties,
+        l0: &Arc<RwLock<L0Buffer>>,
+    ) {
+        let schema = self.schema_manager.schema();
+        let mut guard = l0.write();
+        for constraint in &schema.constraints {
+            if !constraint.enabled {
+                continue;
+            }
+            match &constraint.target {
+                ConstraintTarget::EdgeType(t) if t == edge_type_name => {}
+                _ => continue,
+            }
+            let Some(key_props) = constraint.constraint_type.unique_properties() else {
+                continue;
+            };
+            let mut key_values = Vec::with_capacity(key_props.len());
+            let mut all_present = true;
+            for prop in key_props {
+                match properties.get(prop) {
+                    Some(val) if !val.is_null() => key_values.push((prop.clone(), val.clone())),
+                    _ => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if all_present && !key_values.is_empty() {
+                let key = serialize_constraint_key(edge_type_name, &key_values);
+                guard.insert_edge_constraint_key(key, eid);
+            }
+        }
+    }
+
+    /// Edge analogue of [`check_unique_constraint_multi`](Self::check_unique_constraint_multi):
+    /// errors if `key_values` collide with another live edge of `edge_type`.
+    async fn check_unique_edge_constraint_multi(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        current_eid: Eid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        if self
+            .unique_edge_key_exists_full_horizon(edge_type, key_values, Some(current_eid), tx_l0)
+            .await?
+        {
+            return Err(anyhow!(
+                "Constraint violation: Duplicate composite key for edge type '{}'",
+                edge_type
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reports whether a UNIQUE composite key already exists across the full write
+    /// horizon for an *edge type* — the edge counterpart of
+    /// [`unique_key_exists_full_horizon`](Self::unique_key_exists_full_horizon).
+    ///
+    /// Probes the same layers (current L0, pending-flush buffers, optional
+    /// transaction L0, then committed storage), keyed to an `Eid`. `exclude_eid`
+    /// is the edge being checked so it never conflicts with itself; pass `None`
+    /// for a brand-new edge with no self to exclude. The committed-storage half is
+    /// delegated to [`PropertyManager::flushed_edge_key_conflict`], which resolves
+    /// the LSM delta table's latest-version-per-eid liveness correctly.
+    ///
+    /// # Errors
+    /// Returns an error if a storage probe fails — fails closed rather than
+    /// silently treating the key as absent.
+    pub async fn unique_edge_key_exists_full_horizon(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        exclude_eid: Option<Eid>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<bool> {
+        let key = serialize_constraint_key(edge_type, key_values);
+        // Sentinel: u64::MAX is never an allocated EID, so with no self to exclude
+        // any real key hit compares unequal and counts.
+        let exclude = exclude_eid.unwrap_or_else(|| Eid::new(u64::MAX));
+
+        // 1. Current in-memory L0 index.
+        if self
+            .l0_manager
+            .get_current()
+            .read()
+            .has_edge_constraint_key(&key, exclude)
+        {
+            return Ok(true);
+        }
+
+        // 1b. Pending-flush buffers (closes the flush-window leak, mirroring the
+        // vertex probe's Bug #9A handling).
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            if pending_l0.read().has_edge_constraint_key(&key, exclude) {
+                return Ok(true);
+            }
+        }
+
+        // 1c. Transaction-local L0.
+        if let Some(tx_l0) = tx_l0
+            && tx_l0.read().has_edge_constraint_key(&key, exclude)
+        {
+            return Ok(true);
+        }
+
+        // 2. Committed storage (LSM delta), resolved for latest-version liveness.
+        #[cfg(feature = "lance-backend")]
+        if let Some(pm) = &self.property_manager
+            && pm
+                .flushed_edge_key_conflict(edge_type, key_values, exclude_eid)
+                .await?
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     async fn check_write_pressure(&self) -> Result<()> {
         let status = self
             .storage
@@ -3672,7 +3953,20 @@ impl Writer {
         let mut props = props;
         self.prepare_edge_upsert(eid, &mut props, tx_l0).await?;
 
+        // Enforce declared edge-type UNIQUE / NODE KEY constraints whose key
+        // properties are all present in this (possibly partial) write, then
+        // register them. A partial write touching only part of a composite key
+        // does not carry the full key, so like the vertex partial path it enforces
+        // only fully-present keys.
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.validate_edge_constraints(eid, type_name, &props, tx_l0)
+                .await?;
+        }
+
         let l0 = self.resolve_l0(tx_l0);
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.populate_edge_constraint_index(eid, type_name, &props, &l0);
+        }
         l0.write().insert_edge_partial_full(
             src_vid,
             dst_vid,
@@ -3722,7 +4016,19 @@ impl Writer {
         self.prepare_edge_upsert(eid, &mut properties, tx_l0)
             .await?;
 
+        // Enforce declared edge-type UNIQUE / NODE KEY constraints across the full
+        // write horizon before the edge lands, then register its keys so later
+        // writes (this tx and concurrent ones) observe it. Schemaless edges (no
+        // type name) carry no declared constraints and are skipped.
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.validate_edge_constraints(eid, type_name, &properties, tx_l0)
+                .await?;
+        }
+
         let l0 = self.resolve_l0(tx_l0);
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.populate_edge_constraint_index(eid, type_name, &properties, &l0);
+        }
         l0.write()
             .insert_edge(src_vid, dst_vid, edge_type, eid, properties, edge_type_name)?;
 

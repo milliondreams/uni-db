@@ -204,6 +204,13 @@ pub struct L0Buffer {
     /// registers a key). Tombstoned with the owning vid; transient (not rebuilt
     /// on recovery).
     pub merge_guard_index: HashMap<Vec<u8>, Vid>,
+    /// Per-edge-constraint index for O(1) unique edge-key checks. Mirrors
+    /// [`constraint_index`](Self::constraint_index) but keyed to a live edge's
+    /// `Eid` (built by [`serialize_constraint_key`] with the edge-type name as the
+    /// discriminator). Populated by the edge-insert path for declared edge-type
+    /// `Unique`/`NodeKey` constraints, tombstoned in `apply_edge_deletion`, and
+    /// rebuilt from live edge properties on recovery.
+    pub edge_constraint_index: HashMap<Vec<u8>, Eid>,
     /// Reverse index `ext_id` → owning vid for O(1) global ext_id uniqueness
     /// checks (`Writer::check_extid_globally_unique` previously scanned every
     /// `vertex_properties` map per insert — O(n²) ingest). Maintained by the
@@ -296,6 +303,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            edge_constraint_index: self.edge_constraint_index.clone(),
             merge_guard_index: self.merge_guard_index.clone(),
             extid_index: self.extid_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
@@ -541,6 +549,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            edge_constraint_index: HashMap::new(),
             merge_guard_index: HashMap::new(),
             extid_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
@@ -1162,6 +1171,9 @@ impl L0Buffer {
         // Deletion supersedes any pending partial-update state for this
         // EID (Round 12 §A).
         self.edge_partial_keys.remove(&eid);
+        // Drop any unique-constraint keys this edge owned so a later edge may
+        // reuse the value (mirrors `apply_vertex_deletion`).
+        self.edge_constraint_index.retain(|_, e| *e != eid);
         self.graph.remove_edge(eid);
         self.mutation_count += 1;
         self.mutation_stats.relationships_deleted += 1;
@@ -1305,6 +1317,21 @@ impl L0Buffer {
         self.constraint_index
             .get(key)
             .is_some_and(|&v| v != exclude_vid)
+    }
+
+    /// Insert an edge unique-constraint key into the index (edge analogue of
+    /// [`insert_constraint_key`](Self::insert_constraint_key)).
+    pub fn insert_edge_constraint_key(&mut self, key: Vec<u8>, eid: Eid) {
+        self.edge_constraint_index.insert(key, eid);
+    }
+
+    /// Check if an edge unique-constraint key exists, owned by an edge other than
+    /// `exclude_eid`. Edge analogue of
+    /// [`has_constraint_key`](Self::has_constraint_key).
+    pub fn has_edge_constraint_key(&self, key: &[u8], exclude_eid: Eid) -> bool {
+        self.edge_constraint_index
+            .get(key)
+            .is_some_and(|&e| e != exclude_eid)
     }
 
     /// Register a MERGE-create's key into the implicit phantom guard.
@@ -1515,6 +1542,11 @@ impl L0Buffer {
         // visible to a concurrent transaction's commit-time re-probe.
         for (key, vid) in &other.merge_guard_index {
             self.merge_guard_index.insert(key.clone(), *vid);
+        }
+
+        // Merge the edge unique-constraint index (parallel to `constraint_index`).
+        for (key, eid) in &other.edge_constraint_index {
+            self.edge_constraint_index.insert(key.clone(), *eid);
         }
 
         // Carry deferred-embedding markers from the tx L0 into the main L0 so the

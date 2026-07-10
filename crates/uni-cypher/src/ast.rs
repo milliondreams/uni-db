@@ -206,9 +206,16 @@ pub struct DropIndex {
 pub struct CreateConstraint {
     pub name: Option<String>,
     pub constraint_type: ConstraintType,
+    /// The node label or, when [`on_relationship`](Self::on_relationship) is set,
+    /// the relationship type the constraint targets.
     pub label: String,
     pub properties: Vec<String>,
     pub expression: Option<Expr>,
+    /// `true` when the constraint was declared on a relationship pattern
+    /// (`ON ()-[r:TYPE]-()`); `label` then holds the edge-type name and the
+    /// executor builds a `ConstraintTarget::EdgeType`.
+    #[serde(default)]
+    pub on_relationship: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

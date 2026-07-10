@@ -1205,6 +1205,13 @@ impl Executor {
                     .map_err(|_| anyhow!("Invalid vector dimensions: {}", dims_str))?;
                 Ok(DataType::Vector { dimensions })
             }
+            s if s.starts_with("binary_vector(") && s.ends_with(')') => {
+                let dims_str = &s["binary_vector(".len()..s.len() - 1];
+                let dimensions = dims_str
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("Invalid binary_vector dimensions: {}", dims_str))?;
+                Ok(DataType::BinaryVector { dimensions })
+            }
             s if s.starts_with("list<") && s.ends_with('>') => {
                 let inner_type_str = &s[5..s.len() - 1];
                 let inner_type = Self::parse_data_type(inner_type_str)?;

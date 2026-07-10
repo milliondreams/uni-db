@@ -573,6 +573,12 @@ pub enum Value {
         values: Vec<f32>,
     },
 
+    /// Binary/bit vector for Hamming/Jaccard similarity: a packed byte buffer
+    /// where each `u8` is one lane of 8 bits. Persistence goes through the
+    /// explicit `FixedSizeList<UInt8>` column and codec paths, never untagged
+    /// serde (which would shadow it as a `List`/`Bytes`).
+    BinaryVector(Vec<u8>),
+
     // Temporal
     /// Typed temporal value (date, time, datetime, duration).
     Temporal(TemporalValue),
@@ -753,6 +759,7 @@ impl fmt::Display for Value {
             Value::SparseVector { indices, .. } => {
                 write!(f, "<sparse vector: {} nnz>", indices.len())
             }
+            Value::BinaryVector(bytes) => write!(f, "<binary vector: {} lanes>", bytes.len()),
             Value::Temporal(t) => write!(f, "{t}"),
         }
     }
@@ -881,6 +888,9 @@ impl PartialEq for Value {
                     values: v2,
                 },
             ) => i1 == i2 && slice_eq_normalized_f32(v1, v2),
+            // Exact byte buffers — native `Vec<u8>` equality (no float
+            // normalization); parallel to the `Bytes` arm.
+            (Value::BinaryVector(a), Value::BinaryVector(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a == b,
             // Distinct variants are never equal.
             _ => false,
@@ -959,6 +969,9 @@ impl Hash for Value {
                     hash_f32_normalized(*f, state);
                 }
             }
+            // Exact byte buffer — native `Vec<u8>` hashing, consistent with the
+            // native-equality arm above.
+            Value::BinaryVector(b) => b.hash(state),
             Value::Temporal(t) => t.hash(state),
         }
     }
@@ -1698,6 +1711,14 @@ impl From<Value> for serde_json::Value {
                 map.insert("values".to_string(), vals);
                 serde_json::Value::Object(map)
             }
+            // Byte lanes as a JSON array of `0..=255` integers (parallel to the
+            // dense `Vector` arm).
+            Value::BinaryVector(bytes) => serde_json::Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|b| serde_json::Value::Number(serde_json::Number::from(b)))
+                    .collect(),
+            ),
             Value::Temporal(t) => serde_json::Value::String(t.to_string()),
         }
     }

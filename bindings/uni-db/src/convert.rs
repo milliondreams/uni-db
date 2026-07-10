@@ -235,6 +235,12 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                 })?;
             Ok(Py::new(py, crate::sparse::PySparseVector { inner })?.into_any())
         }
+        // Binary vector → Python list of lane ints (`0..=255`). Without this arm it
+        // would fall through to `py.None()`, silently dropping the property.
+        Value::BinaryVector(bytes) => {
+            let lanes: Vec<i64> = bytes.iter().map(|&b| i64::from(b)).collect();
+            Ok(lanes.into_py_any(py)?)
+        }
         _ => Ok(py.None()),
     }
 }

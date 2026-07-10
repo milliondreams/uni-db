@@ -2784,6 +2784,12 @@ impl PyValue {
             inner: ::uni_db::Value::Vector(v),
         }
     }
+    #[staticmethod]
+    fn binary_vector(v: Vec<u8>) -> Self {
+        Self {
+            inner: ::uni_db::Value::BinaryVector(v),
+        }
+    }
 
     /// Create a BTIC temporal interval from a string literal.
     #[staticmethod]
@@ -2816,6 +2822,7 @@ impl PyValue {
             ::uni_db::Value::Edge(_) => "edge",
             ::uni_db::Value::Path(_) => "path",
             ::uni_db::Value::Vector(_) => "vector",
+            ::uni_db::Value::BinaryVector(_) => "binary_vector",
             ::uni_db::Value::Temporal(uni_common::value::TemporalValue::Btic { .. }) => "btic",
             ::uni_db::Value::Temporal(_) => "temporal",
             _ => "unknown",

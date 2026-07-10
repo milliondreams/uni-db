@@ -3203,6 +3203,42 @@ pub(crate) fn build_property_column_static(
             }
             Ok(Arc::new(list_builder.finish()))
         }
+        DataType::FixedSizeList(inner, dim) if *inner.data_type() == DataType::UInt8 => {
+            // Binary-vector properties: FixedSizeList(UInt8, N). Accepts a native
+            // `BinaryVector` or a `List` of byte-ints (the literal input form).
+            let values_builder = arrow_array::builder::UInt8Builder::new();
+            let mut list_builder = FixedSizeListBuilder::new(values_builder, *dim);
+            for vid in vids {
+                match get_property_value(vid, props_map, prop_name) {
+                    Some(Value::BinaryVector(b)) if b.len() == *dim as usize => {
+                        for byte in b {
+                            list_builder.values().append_value(byte);
+                        }
+                        list_builder.append(true);
+                    }
+                    Some(Value::List(arr)) if arr.len() == *dim as usize => {
+                        let mut ok = true;
+                        for v in &arr {
+                            match v.as_i64() {
+                                Some(n @ 0..=255) => list_builder.values().append_value(n as u8),
+                                _ => {
+                                    list_builder.values().append_value(0);
+                                    ok = false;
+                                }
+                            }
+                        }
+                        list_builder.append(ok);
+                    }
+                    _ => {
+                        for _ in 0..*dim {
+                            list_builder.values().append_null();
+                        }
+                        list_builder.append(false);
+                    }
+                }
+            }
+            Ok(Arc::new(list_builder.finish()))
+        }
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             // Timestamp properties stored as Value::Temporal, ISO 8601 strings, or i64 nanoseconds
             let mut builder = TimestampNanosecondBuilder::new().with_timezone("UTC");

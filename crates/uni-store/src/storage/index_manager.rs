@@ -106,6 +106,16 @@ fn to_backend_vector_params(
                  (or use cosine/l2/dot if you need ANN)."
             ));
         }
+        // Binary metrics apply to `BinaryVector` columns and have no ANN backend
+        // here; compute exact distance with `VECTOR_DISTANCE(a, b, 'hamming'|'jaccard')`.
+        DistanceMetric::Hamming | DistanceMetric::Jaccard => {
+            return Err(anyhow!(
+                "{metric:?} distance does not support a vector index — it applies to \
+                 BinaryVector columns and is computed exactly via \
+                 VECTOR_DISTANCE(a, b, 'hamming'|'jaccard'). Declare the column without a \
+                 vector index."
+            ));
+        }
         other => return Err(anyhow!("Unsupported vector index metric: {:?}", other)),
     };
     let kind = match index_type {

@@ -13,13 +13,13 @@ use arrow_array::builder::{
     FixedSizeBinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
     Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
     StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt32Builder, UInt64Builder,
+    UInt8Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
     IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -462,6 +462,11 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         let inner = list.value(row);
         if let Some(floats) = inner.as_any().downcast_ref::<Float32Array>() {
             return Value::Vector((0..floats.len()).map(|i| floats.value(i)).collect());
+        }
+        // A `UInt8` child is a binary vector — round-trip as `Value::BinaryVector`
+        // to preserve type identity (parity with the `Float32` dense-vector arm).
+        if let Some(bytes) = inner.as_any().downcast_ref::<UInt8Array>() {
+            return Value::BinaryVector((0..bytes.len()).map(|i| bytes.value(i)).collect());
         }
         let elem_hint = list_child_bytes_hint(list.data_type());
         return Value::List(array_to_value_list(&inner, elem_hint));
@@ -928,6 +933,63 @@ pub fn extract_vector_f32_values_strict(
         uni_common::core::schema::check_dense_vector_value(v, dimensions)?;
     }
     Ok(extract_vector_f32_values(val, is_deleted, dimensions))
+}
+
+/// Extract `u8` lane values from a Value for a `BinaryVector(dimensions)` column.
+///
+/// The binary-vector analogue of [`extract_vector_f32_values`]: always returns
+/// exactly `dimensions` bytes (zeros for null/invalid), plus a validity flag, so
+/// the Arrow `FixedSizeList<UInt8>` stride invariant holds. Accepts a
+/// [`Value::BinaryVector`] or a [`Value::List`] of byte-valued integers.
+///
+/// # Returns
+/// `(lane bytes, validity)` — validity is `true` for a valid vector or a deleted
+/// entry, `false` for a null/wrong-shape value.
+pub fn extract_binary_vector_values(
+    val: Option<&Value>,
+    is_deleted: bool,
+    dimensions: usize,
+) -> (Vec<u8>, bool) {
+    let zeros = || vec![0_u8; dimensions];
+
+    if is_deleted {
+        return (zeros(), true);
+    }
+
+    match val {
+        Some(Value::BinaryVector(b)) if b.len() == dimensions => (b.clone(), true),
+        Some(Value::BinaryVector(_)) => (zeros(), false), // Wrong lane count
+        Some(Value::List(arr)) if arr.len() == dimensions => {
+            let mut bytes = Vec::with_capacity(dimensions);
+            for v in arr {
+                match v.as_i64() {
+                    Some(n @ 0..=255) => bytes.push(n as u8),
+                    _ => return (zeros(), false), // Non-byte element
+                }
+            }
+            (bytes, true)
+        }
+        Some(Value::List(_)) => (zeros(), false), // Wrong lane count
+        _ => (zeros(), false),                    // Missing or unsupported value
+    }
+}
+
+/// Fail-closed sibling of [`extract_binary_vector_values`] for declared-schema
+/// columns, mirroring [`extract_vector_f32_values_strict`].
+///
+/// # Errors
+/// Returns the underlying [`VectorDimError`](uni_common::core::schema::VectorDimError)
+/// when a present, non-null value has the wrong lane count, a non-byte element,
+/// or is not a binary vector at all.
+pub fn extract_binary_vector_values_strict(
+    val: Option<&Value>,
+    is_deleted: bool,
+    dimensions: usize,
+) -> Result<(Vec<u8>, bool)> {
+    if !is_deleted && let Some(v) = val {
+        uni_common::core::schema::check_binary_vector_value(v, dimensions)?;
+    }
+    Ok(extract_binary_vector_values(val, is_deleted, dimensions))
 }
 
 fn values_to_fixed_size_list_f32_array(values: &[Value], size: i32) -> ArrayRef {
@@ -1490,6 +1552,9 @@ impl<'a> PropertyExtractor<'a> {
             DataType::SparseVector { .. } => {
                 self.build_sparse_vector_column(len, deleted, get_props)
             }
+            DataType::BinaryVector { dimensions } => {
+                self.build_binary_vector_column(len, deleted, get_props, *dimensions)
+            }
             DataType::CypherValue => self.build_json_column(len, deleted, get_props),
             DataType::Bytes => self.build_bytes_column(len, deleted, get_props),
             DataType::List(inner) => self.build_list_column(len, deleted, get_props, inner),
@@ -1852,6 +1917,46 @@ impl<'a> PropertyExtractor<'a> {
                         "flush: property '{}' row {}: {}; wrong-dimension vectors are rejected \
                          at write time as of issue #137 — this value was likely written by an \
                          older version",
+                        self.name,
+                        i,
+                        e
+                    )
+                })?;
+            for v in values {
+                builder.values().append_value(v);
+            }
+            builder.append(valid);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    /// Build a binary-vector column as `FixedSizeList<UInt8, dimensions>`.
+    ///
+    /// The `u8`-lane analogue of [`Self::build_vector_column`]: each row yields
+    /// exactly `dimensions` bytes (via [`extract_binary_vector_values_strict`]),
+    /// preserving the FixedSizeList stride. Fails closed on a present, wrong-shape
+    /// value — the write path validates lane counts (`check_vector_dims`), so
+    /// reaching one here means a bypass or an older-version WAL value.
+    fn build_binary_vector_column<F>(
+        &self,
+        len: usize,
+        deleted: &[bool],
+        get_props: F,
+        dimensions: usize,
+    ) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let mut builder = FixedSizeListBuilder::new(UInt8Builder::new(), dimensions as i32);
+
+        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+            let val = get_props(i);
+            let (values, valid) = extract_binary_vector_values_strict(val, is_deleted, dimensions)
+                .map_err(|e| {
+                    anyhow!(
+                        "flush: property '{}' row {}: {}; wrong-shape binary vectors are \
+                         rejected at write time — this value was likely written by an older \
+                         version",
                         self.name,
                         i,
                         e
@@ -3252,6 +3357,72 @@ mod tests {
         assert_eq!(child.value(3), 4.0);
         assert_eq!(child.value(4), 5.0);
         assert_eq!(child.value(5), 6.0);
+    }
+
+    #[test]
+    fn test_build_binary_vector_column_roundtrip() {
+        // A `BinaryVector(dim)` column is `FixedSizeList<UInt8, dim>`. Accepts a
+        // native `BinaryVector` or a `List` of byte-ints, decodes back with type
+        // fidelity as `Value::BinaryVector` (not a generic int list).
+        let data_type = DataType::BinaryVector { dimensions: 3 };
+        let extractor = PropertyExtractor::new("bits", &data_type);
+
+        let props = [
+            Some(Value::BinaryVector(vec![0x00, 0xFF, 0xA5])),
+            Some(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(255),
+            ])),
+            None, // deleted
+            None, // missing/null
+        ];
+        let deleted = [false, false, true, false];
+
+        let arr_ref = extractor
+            .build_binary_vector_column(4, &deleted, |i| props[i].as_ref(), 3)
+            .unwrap();
+
+        let arr = arr_ref
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(arr.len(), 4);
+        assert!(arr.is_valid(0));
+        assert!(arr.is_valid(1));
+        assert!(arr.is_valid(2)); // deleted rows are valid zeros
+        assert!(!arr.is_valid(3)); // null row
+
+        let child = arr.values().as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(child.value(0), 0x00);
+        assert_eq!(child.value(1), 0xFF);
+        assert_eq!(child.value(2), 0xA5);
+        assert_eq!(child.value(3), 1);
+        assert_eq!(child.value(5), 255);
+
+        // Read-back preserves type identity.
+        assert_eq!(
+            arrow_to_value(&arr_ref, 0, Some(&data_type)),
+            Value::BinaryVector(vec![0x00, 0xFF, 0xA5])
+        );
+        assert_eq!(
+            arrow_to_value(&arr_ref, 1, Some(&data_type)),
+            Value::BinaryVector(vec![1, 2, 255])
+        );
+        assert_eq!(arrow_to_value(&arr_ref, 3, Some(&data_type)), Value::Null);
+    }
+
+    #[test]
+    fn test_build_binary_vector_column_wrong_length_fails_closed() {
+        // A present, wrong-lane-count value must error at flush, not silently null.
+        let data_type = DataType::BinaryVector { dimensions: 3 };
+        let extractor = PropertyExtractor::new("bits", &data_type);
+        let props = [Some(Value::BinaryVector(vec![1, 2]))]; // only 2 lanes
+        let deleted = [false];
+        let err = extractor
+            .build_binary_vector_column(1, &deleted, |i| props[i].as_ref(), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("bits"), "got: {err}");
     }
 
     // Tests for multi-vector (ColBERT) `List<Vector>` columns (issue #96)

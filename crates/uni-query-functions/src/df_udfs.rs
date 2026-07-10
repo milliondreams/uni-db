@@ -154,6 +154,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
 
     // Duration and temporal property accessor UDFs
     ctx.register_udf(create_duration_property_udf());
+    ctx.register_udf(create_vector_distance_udf());
     ctx.register_udf(create_temporal_property_udf());
     ctx.register_udf(create_tostring_udf());
     ctx.register_udf(create_cypher_sort_key_udf());
@@ -1878,6 +1879,77 @@ impl ScalarUDFImpl for SpatialUdf {
             crate::spatial::eval_spatial_function(&func_name, val_args).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
             })
+        })
+    }
+}
+
+/// Create the `vector_distance` UDF, routing to [`eval_vector_distance`].
+///
+/// Registering it as a DataFusion UDF lets `VECTOR_DISTANCE(a, b[, metric])`
+/// run inside DataFusion-planned queries (e.g. `RETURN VECTOR_DISTANCE(...)`),
+/// not only the row-at-a-time interpreter path. Supports every metric the
+/// evaluator does — `cosine`/`l2`/`dot`/`l1` over dense vectors and
+/// `hamming`/`jaccard` over binary vectors.
+///
+/// [`eval_vector_distance`]: crate::expr_eval::eval_vector_distance
+fn create_vector_distance_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(VectorDistanceUdf::new())
+}
+
+#[derive(Debug)]
+struct VectorDistanceUdf {
+    signature: Signature,
+}
+
+impl VectorDistanceUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(VectorDistanceUdf);
+
+impl ScalarUDFImpl for VectorDistanceUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "vector_distance"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let output_type = DataType::Float64;
+        invoke_cypher_udf(args, &output_type, |val_args| {
+            if val_args.len() < 2 || val_args.len() > 3 {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "vector_distance() requires 2 or 3 arguments".to_string(),
+                ));
+            }
+            let metric = if val_args.len() == 3 {
+                val_args[2].as_str().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "vector_distance() metric must be a string".to_string(),
+                    )
+                })?
+            } else {
+                "cosine"
+            };
+            crate::expr_eval::eval_vector_distance(&val_args[0], &val_args[1], metric).map_err(
+                |e| {
+                    datafusion::error::DataFusionError::Execution(format!("vector_distance(): {e}"))
+                },
+            )
         })
     }
 }

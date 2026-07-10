@@ -435,6 +435,10 @@ pub fn decode_column_value(
         // `arrow_to_value`; the `value_from_column` serde_json path would lose
         // the type (an object would round-trip back as a `Map`).
         | DataType::SparseVector { .. }
+        // Binary vectors likewise decode to a full-fidelity `Value::BinaryVector`
+        // via `arrow_to_value` (`FixedSizeList<UInt8>` → `BinaryVector`); the
+        // serde_json path has no arm and would return `Value::Null`.
+        | DataType::BinaryVector { .. }
         // Point columns decode to the `Value::Map` shape `point(...)` produces via
         // the struct reconstruction in `arrow_to_value`; the `value_from_column`
         // scalar path has no Point arm and would return `Value::Null`.

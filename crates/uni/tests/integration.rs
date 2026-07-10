@@ -136,6 +136,8 @@ mod bge_m3_hybrid_3way;
 #[cfg(feature = "provider-onnx")]
 #[path = "common/bge_m3_real_onnx.rs"]
 mod bge_m3_real_onnx;
+#[path = "common/binary_vector_ddl_type.rs"]
+mod binary_vector_ddl_type;
 #[path = "common/dense_index.rs"]
 mod dense_index;
 #[path = "common/embedding_alias_capability.rs"]

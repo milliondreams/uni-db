@@ -1,6 +1,6 @@
 # uni-db Plugin Framework — Gaps Review (2026-07-07)
 
-**Status:** Findings. Adversarial, code-only audit. **Superseded by §0 (2026-07-09, P0 + P1 subtractive tier), §0.1 (2026-07-10, P2 quick-wins + compute-surface opens, v3.1.0), and §0.2 (2026-07-10, P2 M-tier completion, v3.2.0). P0/P1 fully shipped; P2 fully addressed (built or resolved-with-rationale).**
+**Status:** Findings. Adversarial, code-only audit. **Superseded by §0 (2026-07-09, P0 + P1 subtractive tier), §0.1 (2026-07-10, P2 quick-wins + compute-surface opens, v3.1.0), §0.2 (2026-07-10, P2 M-tier completion, v3.2.0), and §0.3 (2026-07-10, deferred-P2 tranche D1 + D2-uniqueness + D3-fixed-arity, v3.5.0). P0/P1 fully shipped; P2 fully addressed; the tractable deferred-P2 items (D1/D2-uniqueness/D3-fixed-arity) now built, their heavier tails + D4 deferred with rationale.**
 **Method:** 10 parallel code-reading auditors, one per extension domain, each required to verify every claim against three things — the **trait**, its **registrar** method, and its **runtime dispatch/call-site**. Docs, memory, and prior gaps files were explicitly excluded as sources. A surface counts as "delivered" only if the engine actually invokes a registered plugin of that kind at runtime.
 **Motivating question:** Can a third party build a BFS/DFS reachability function as a plugin? (Answer at time of writing: **no** — see §7. **As of 2026-07-09: yes**, through the front door via `AlgorithmProvider` + `GraphView` — see §0.)
 
@@ -85,7 +85,7 @@ plus the two backend-blocked items documented above.
 
 ---
 
-## 0.2. Status update — 2026-07-10 (P2 M-tier completion, v3.2.0)
+## 0.2. Status update — 2026-07-10 (P2 M-tier completion, HEAD `a9030b407`, v3.2.0)
 
 The **P2 M-tier** (the tractable remainder of §9 P2) was addressed: three items **built** end-to-end,
 one **reclassified** to deferred-L after implementation revealed it balloons past M, one **found already
@@ -140,6 +140,22 @@ common APOC expansion; authz can gate on structured label/type/property/operatio
 is four clearly-scoped L/blocked items (D1–D4) plus the edge-constraint family (edge-uniqueness +
 cardinality share the same edge-write + SSI surface, best done together as one L effort) and the
 remote-attach first-party sugar — none of which any comparable embedded engine treats as table-stakes.
+
+---
+
+## 0.3. Status update — 2026-07-10 (deferred-P2 tranche: D1 + D2-uniqueness + D3-fixed-arity)
+
+Three of the §0.2 deferred items shipped end-to-end on branch `feat/plugin-p2-deferred`
+(v3.2.0 → **3.5.0**), each its own commit + tests, fmt/clippy-clean. The heavier tails
+of each (and D4) remain deferred with rationale (below).
+
+| §0.2 item | Verdict | Evidence |
+|---|---|---|
+| **D1 — Hamming/Jaccard metrics** | ✅ **Done (exact)** (v3.3.0) | New `DataType::BinaryVector`/`Value::BinaryVector(Vec<u8>)` end-to-end (Arrow `FixedSizeList<UInt8>`, WAL codec tag 21, value-codec full-fidelity routing, L0 scan + flush column builders, `BINARY_VECTOR(N)` DDL grammar + parse, PyO3). `DistanceMetric::{Hamming,Jaccard}` via `compute_distance_binary` (popcount), routed through `parse_vector_metric` + `VECTOR_DISTANCE`; a binary-metric ANN index is rejected with a clear message. Also **registered `VECTOR_DISTANCE` as a real DataFusion UDF** (previously interpreter-only → errored in a RETURN for every metric). Exact-only as predicted — Lance has no Jaccard ANN and Hamming-ANN is UInt8-only; the **Lance UInt8 Hamming-ANN** wiring stays deferred. |
+| **D2 — edge-property uniqueness** | ✅ **Done (flush-safe)** (v3.4.0) | Full edge enforcement spine mirroring vertex NodeKey: L0 `edge_constraint_index` (6 lifecycle points incl. WAL-replay rebuild), a flush-safe full-horizon probe (`PropertyManager::flushed_edge_key_conflict`) that resolves the **LSM delta table's latest-version-per-eid liveness** correctly (candidate-narrow on one key prop, then per-eid current-props resolution — no false-positive after delete/update, no O(edges) scan), a commit-time SSI edge guard, and `ON ()-[r:TYPE]-()` DDL grammar/AST/walker/executor. Corrects §0.2's "properties packed, not a mirror" premise (the per-type `DeltaDataset` is columnar). **Relationship cardinality (D2/§0.2)** and **bulk-loader edge parity** stay deferred. |
+| **D3 — Locy generator predicates** | ✅ **Done (fixed-arity, SLG)** (v3.5.0) | New `LocyGenerator` plugin surface (trait + `GenSignature`/`GeneratorOutput` + full registry plumbing), grammar `name(args) -> (out…)` + AST/walker, and SLG dispatch (`dispatch_locy_generator` + `apply_generators` row-explosion, output vars carried like ALONG). Generator rules are SLG-resolved; the columnar fixpoint skips them. Also fixed a **latent gap**: the Locy path never scoped a plugin registry task-local, so SLG `eval_function` dispatch of any `add_plugin` plugin (predicate or generator) was unreachable. **Variable arity + recursion-through-a-generator**, a **columnar `LocyGenerateExec`** operator (so generators can feed FOLD rules), and **session-scoped generator plugins** stay deferred. |
+
+**Still deferred (rationale unchanged):** D1's Hamming-ANN, D2's relationship cardinality + edge-uniqueness bulk parity, D3's variable-arity/recursion + columnar operator, and **D4 — BM25 `k1`/`b`** (backend-blocked; Lance hardcodes the constants). None is table-stakes for a comparable embedded engine; each has a clear scope in the commit messages on `feat/plugin-p2-deferred`.
 
 ---
 

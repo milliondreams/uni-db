@@ -383,7 +383,7 @@ impl PropertyManager {
     /// deleted or updated away from `val`. Instead this narrows to candidate eids
     /// on ONE key property (guaranteed present in some `op = 0` row iff the edge
     /// currently holds that value), then resolves each candidate's *current
-    /// merged* properties via [`Self::fetch_all_edge_props_from_storage_with_hint`]
+    /// merged* properties via `fetch_all_edge_props_from_storage_with_hint`
     /// and confirms the full key still matches on a live edge. Correct — never
     /// leaks a duplicate — without an O(edges) full scan.
     ///

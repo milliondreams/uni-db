@@ -7,7 +7,7 @@
 //! `CALL` dispatch path (proposal §8 Phase 1 exit / §9.4 E-1). Unlike the pregel
 //! `uni.algo.pagerank`, it never touches the CSR directly: it projects a graph
 //! into an [`AlgoSession`], then drives [`personalized_pagerank`] purely through
-//! the [`GraphCompute`](super::session::GraphCompute) trait — exactly the surface
+//! the [`GraphCompute`] trait — exactly the surface
 //! a guest plugin will drive once the loader shims land. The native-work budget
 //! and arena cap are installed from the invocation's capabilities on the CALL
 //! path (proposal §5.1 / §12), so a runaway kernel loop fails closed here just as

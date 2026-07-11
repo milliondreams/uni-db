@@ -2,7 +2,8 @@
 //!
 //! This algorithm is deliberately authored the same way a third-party
 //! plugin must: it obtains graph topology **only** through the stable
-//! [`GraphView`] returned by [`AlgorithmHost::project`], never by
+//! [`GraphView`] returned by
+//! [`AlgorithmHost::project`](uni_plugin::traits::algorithm::AlgorithmHost::project), never by
 //! downcasting host internals. It is registered purely as an
 //! [`AlgorithmProvider`] (not through the static `uni_algo` registry), so
 //! a `CALL uni.algo.reachability(...)` exercises the provider-dispatch

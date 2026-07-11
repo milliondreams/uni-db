@@ -410,7 +410,8 @@ impl Tensor {
     }
 }
 
-/// A batch of sampled random walks, behind a [`HandleKind::Walks`] handle.
+/// A batch of sampled random walks, behind a
+/// [`HandleKind::Walks`](super::handle::HandleKind::Walks) handle.
 ///
 /// Each inner vector is one walk as a sequence of vertex *slots* (dense u32);
 /// walks may be shorter than the requested length when a walk hits a dead end.

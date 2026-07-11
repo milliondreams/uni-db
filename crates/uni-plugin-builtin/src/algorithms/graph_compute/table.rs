@@ -83,7 +83,12 @@ impl<T> Slab<T> {
             .slots
             .get(slot as usize)
             .ok_or_else(error::stale_handle)?;
-        if s.retired || s.generation != generation {
+        if s.retired {
+            return Err(error::wrap_fail_closed(
+                "handle targets a slot retired after a generation wrap",
+            ));
+        }
+        if s.generation != generation {
             return Err(error::stale_handle());
         }
         s.value.as_ref().ok_or_else(error::stale_handle)
@@ -97,7 +102,12 @@ impl<T> Slab<T> {
             .slots
             .get_mut(slot as usize)
             .ok_or_else(error::stale_handle)?;
-        if s.retired || s.generation != generation {
+        if s.retired {
+            return Err(error::wrap_fail_closed(
+                "handle targets a slot retired after a generation wrap",
+            ));
+        }
+        if s.generation != generation {
             return Err(error::stale_handle());
         }
         let value = s.value.take().ok_or_else(error::stale_handle)?;
@@ -310,8 +320,13 @@ mod tests {
         // A brand-new allocation must NOT reuse the retired slot 0.
         let fresh = t.insert_tensor(tensor(1.0));
         assert_ne!(fresh.slot(), 0, "retired slot must not be recycled");
-        // And the retired handle stays rejected.
-        assert!(t.get_tensor(last).is_err());
+        // And the retired handle stays rejected — with the distinct fail-closed
+        // wrap code (0x86B), not a generic stale-handle (0x860).
+        assert_eq!(
+            t.get_tensor(last).unwrap_err().code,
+            error::WRAP_FAIL_CLOSED,
+            "a retired-slot access must report the fail-closed wrap code"
+        );
     }
 
     #[test]

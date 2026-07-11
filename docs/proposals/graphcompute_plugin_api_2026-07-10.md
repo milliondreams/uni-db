@@ -623,7 +623,7 @@ So §10 is honest, not hopeful — an audit of the current tree for the GNN/tens
 
 | Const | Default | Notes |
 |---|---|---|
-| `DEFAULT_WORK_EDGE_MULTIPLIER` | `100` | budget = min(multiplier × \|E\|, ceiling) — D3 |
+| `DEFAULT_WORK_EDGE_MULTIPLIER` | `10_000` | budget = min(multiplier × (\|V\| + \|E\|), ceiling) — D3 (retuned, see below) |
 | `DEFAULT_WORK_ABS_CEILING` | `1_000_000_000` | 1e9 work units (≈ edges touched) |
 | `BUDGET_CHECK_CHUNK` | `65_536` | in-kernel check granularity; P0-4 overshoot bound |
 | `DEFAULT_ARENA_MAX_BYTES` | `256 MiB` | host-side handle arena (§5.1) |
@@ -632,5 +632,7 @@ So §10 is honest, not hopeful — an audit of the current tree for the GNN/tens
 | quota variants | `Capability::GraphComputeWork(u64)`, `Capability::GraphComputeArenaBytes(u64)` | manifest-declarable, intersected with grants like all quotas |
 
 P0-9 (§9.1) asserts these defaults are installed on the CALL path; the values themselves are starting points and may be tuned by the E-6/COST nightly data — via a change to this table.
+
+**Ratified retune (implementation):** `DEFAULT_WORK_EDGE_MULTIPLIER` was moved from `100 × |E|` to `10_000 × (|V| + |E|)`. The original `100 × |E|` was inconsistent with `DEFAULT_MAX_SUPERSTEPS = 10_000` — an iterative algorithm running a few `O(V + E)` passes per iteration exhausted the meter at ~25 iterations, far below the superstep cap — and it undercounted the `O(V)` per-vertex kernels (`map_apply`, `reduce`, `ewise`, `scatter`) which the meter charges `|V|` each (§5.1). Basing the allowance on `|V| + |E|` matches what a pass actually touches, and `10_000` lets a default run fit comfortably below the superstep cap while an unbounded loop still hits the finite `DEFAULT_WORK_ABS_CEILING`. §9.0 provision-2 permits tuning these starting-point values; the code (`DEFAULT_WORK_EDGE_MULTIPLIER` in the crate owning `AlgoSession`) is authoritative and this table now matches it.
 
 **Trait-extension notes for the implementer:** `AlgorithmSignature` gains `args`/`slices` as `Default`-ed fields (§4.6, additive); `GraphProjectionSpec` gets `#[non_exhaustive]` in Phase 1 (§10); `Capability` gains `GraphCompute` + the two quota variants above (kebab-case serde, matching `capability.rs:30` conventions).

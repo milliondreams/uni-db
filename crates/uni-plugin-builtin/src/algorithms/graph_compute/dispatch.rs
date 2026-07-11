@@ -202,7 +202,10 @@ fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, FnError> {
 /// A ~60-bit-entropy random key closes that cross-session hole (review H2).
 #[derive(Debug, Default)]
 pub struct GraphComputeRegistry {
-    sessions: Mutex<HashMap<u64, AlgoSession>>,
+    /// A short-lived map lock guards only lookup/insert/remove; each session sits
+    /// behind its own `Mutex` so one guest's O(E) kernel never stalls another
+    /// concurrent CALL's session (proposal §5.1 / E6).
+    sessions: Mutex<HashMap<u64, Arc<Mutex<AlgoSession>>>>,
 }
 
 impl GraphComputeRegistry {
@@ -224,7 +227,7 @@ impl GraphComputeRegistry {
         loop {
             let id = uuid::Uuid::new_v4().as_u64_pair().0;
             if id != 0 && !sessions.contains_key(&id) {
-                sessions.insert(id, session);
+                sessions.insert(id, Arc::new(Mutex::new(session)));
                 return id;
             }
         }
@@ -233,9 +236,11 @@ impl GraphComputeRegistry {
     /// Removes and returns the session with `id`, if present.
     ///
     /// The adapter calls this after the guest returns to read the emitted
-    /// columns and drop the session (freeing every handle).
+    /// columns and drop the session (freeing every handle). The guest has
+    /// returned, so no `call` still holds a clone and the `Arc` unwraps cleanly.
     pub fn close(&self, id: u64) -> Option<AlgoSession> {
-        self.sessions.lock().remove(&id)
+        let arc = self.sessions.lock().remove(&id)?;
+        Arc::try_unwrap(arc).ok().map(Mutex::into_inner)
     }
 
     /// Dispatches one kernel call and returns its typed response.
@@ -245,20 +250,26 @@ impl GraphComputeRegistry {
     /// (proposal §5.4).
     #[must_use]
     pub fn call(&self, req: &KernelRequest) -> KernelResponse {
-        let mut sessions = self.sessions.lock();
-        let Some(session) = sessions.get_mut(&req.session) else {
-            return KernelResponse::Err {
-                code: 0x863,
-                message: format!("unknown or closed session {}", req.session),
+        // Hold the map lock only long enough to clone the session's Arc, then
+        // release it so other sessions run concurrently (E6).
+        let session = {
+            let sessions = self.sessions.lock();
+            let Some(arc) = sessions.get(&req.session) else {
+                return KernelResponse::Err {
+                    code: 0x863,
+                    message: format!("unknown or closed session {}", req.session),
+                };
             };
+            Arc::clone(arc)
         };
+        let mut guard = session.lock();
         // Panic isolation (proposal §5.4): a defensive panic in a kernel becomes
         // a typed error, not a worker crash, so a hostile guest driving the JSON
         // surface cannot bring down the process. parking_lot locks don't poison,
         // so the session mutex releases cleanly on unwind; the session is
         // per-CALL and discarded after, so any partial state is irrelevant.
         let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::dispatch(session, req)
+            Self::dispatch(&mut guard, req)
         }));
         match dispatched {
             Ok(Ok(resp)) => resp,

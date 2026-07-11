@@ -221,6 +221,40 @@ async fn gcpagerank_deadline_surfaces_typed_timeout_e2e() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn e5_hostquery_scopes_restrict_projection() -> anyhow::Result<()> {
+    // E5: a plugin whose HostQuery grant is scoped to `Other` cannot project the
+    // `Node` label — the projection is denied before any kernel runs.
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: vec!["Other".into()],
+        },
+    ]);
+    db.add_plugin(ExampleGcPlugin::new(caps))?;
+
+    let session = db.session();
+    // Explicitly project the out-of-scope `Node` label.
+    let query = format!(
+        "CALL examplegc.pr({vid_a}, 0.85, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+         YIELD nodeId, score RETURN nodeId"
+    );
+    let err = session
+        .query(&query)
+        .await
+        .expect_err("projecting a label outside the granted scopes must be denied");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("scope") || msg.contains("Node"),
+        "error should name the out-of-scope label, got: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn l1_runaway_budget_surfaces_typed_exhausted_e2e() -> anyhow::Result<()> {
     // L-1 / P0-7 (Exhausted): a 1-unit native-work grant is drained by the first
     // O(E) kernel, and the abort surfaces through CALL as a typed

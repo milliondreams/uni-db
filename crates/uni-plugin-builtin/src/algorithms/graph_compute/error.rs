@@ -34,6 +34,11 @@ pub const SEED_NOT_IN_PROJECTION: u32 = 0x868;
 /// `emit` columns did not match the declared `output_fields` (proposal §4.6).
 pub const EMIT_SCHEMA_MISMATCH: u32 = 0x869;
 /// A manifest requested a capability slice version the host lacks (§4.3).
+///
+/// **Reserved**: the host currently exposes a single `graph-compute@1` slice, so
+/// a load-time version negotiation never fails. This code is pinned for the
+/// forward-compatible multi-version check (proposal §4.3 / L-4) and is
+/// intentionally unused until a second slice version ships.
 pub const SLICE_VERSION_MISMATCH: u32 = 0x86A;
 /// A generation or epoch wrap was rejected fail-closed (proposal §4.2).
 pub const WRAP_FAIL_CLOSED: u32 = 0x86B;

@@ -159,6 +159,40 @@ impl AlgorithmHostBridge {
                 ))
             });
         }
+        // Enforce the HostQuery scope restriction (E5): when the grant names
+        // scopes (label / edge-type prefixes), every projected label and edge
+        // type must match one — a plugin scoped to `Person` cannot project the
+        // whole graph. An empty scope list is unrestricted (the default).
+        let scope_prefixes: Vec<String> = self
+            .effective_caps
+            .iter()
+            .find_map(|c| match c {
+                Capability::HostQuery { scopes, .. } => {
+                    Some(scopes.iter().map(ToString::to_string).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        if !scope_prefixes.is_empty() {
+            let in_scope = |name: &str| scope_prefixes.iter().any(|p| name.starts_with(p.as_str()));
+            let denied = spec
+                .node_labels
+                .iter()
+                .chain(spec.edge_types.iter())
+                .find(|name| !in_scope(name));
+            if let Some(name) = denied {
+                let name = name.clone();
+                let scopes = scope_prefixes.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: `{name}` is outside the granted HostQuery scopes [{scopes}]"
+                        ),
+                    ))
+                });
+            }
+        }
         let storage = Arc::clone(&self.algo_ctx.storage);
         let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
         let spec = spec.clone();

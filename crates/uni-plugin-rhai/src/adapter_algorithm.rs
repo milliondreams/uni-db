@@ -109,6 +109,9 @@ impl AlgorithmProvider for RhaiAlgorithm {
         let runtime = Arc::clone(&self.runtime);
         let name = self.name.clone();
         let schema_for_batch = Arc::clone(&out_schema);
+        let expected_cols = uni_plugin_builtin::algorithms::graph_compute::guest_emit_columns(
+            &self.signature.output_fields,
+        );
 
         let stream = futures::stream::once(async move {
             let graph = projection
@@ -119,11 +122,14 @@ impl AlgorithmProvider for RhaiAlgorithm {
                 WorkBudget::from_graph_size(graph.vertex_count() as u64, graph.edge_count() as u64)
                     .total();
             let total = work_cap.map_or(size_budget, |w| w.min(size_budget));
-            let session = Arc::new(parking_lot::Mutex::new(AlgoSession::new(
-                next_session_epoch(),
-                WorkBudget::new(total.max(1)),
-                Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
-            )));
+            let session = Arc::new(parking_lot::Mutex::new(
+                AlgoSession::new(
+                    next_session_epoch(),
+                    WorkBudget::new(total.max(1)),
+                    Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
+                )
+                .with_expected_columns(expected_cols),
+            ));
             let g = session.lock().bind_graph(Arc::clone(&graph));
             let gc = new_session(Arc::clone(&session), g);
 

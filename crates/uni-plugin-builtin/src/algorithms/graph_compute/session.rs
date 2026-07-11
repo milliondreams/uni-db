@@ -153,6 +153,10 @@ pub struct AlgoSession {
     emitted: Vec<(String, Vec<f64>)>,
     /// Optional wall-clock deadline; every metered kernel checks it (§5.2).
     deadline: Option<std::time::Instant>,
+    /// Optional declared guest-emitted column names (the host `nodeId` column
+    /// excluded). When set, `emit` requires the emitted set to match it exactly
+    /// — no missing, extra, or duplicate columns — failing `0x869` otherwise.
+    expected_columns: Option<Vec<String>>,
 }
 
 impl AlgoSession {
@@ -166,6 +170,7 @@ impl AlgoSession {
             primary_graph: None,
             emitted: Vec::new(),
             deadline: None,
+            expected_columns: None,
         }
     }
 
@@ -175,6 +180,19 @@ impl AlgoSession {
     #[must_use]
     pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// Declares the columns the guest is required to `emit` (the host-generated
+    /// `nodeId` column excluded), enabling exact-match schema validation.
+    ///
+    /// Set by the provider/loader adapters from the declared `output_fields`
+    /// before the guest runs: `emit` then rejects a guest that omits a declared
+    /// column, invents an undeclared one, or repeats one (`0x869`), instead of
+    /// silently dropping extras and only catching omissions downstream (§4.6).
+    #[must_use]
+    pub fn with_expected_columns(mut self, columns: Vec<String>) -> Self {
+        self.expected_columns = Some(columns);
         self
     }
 
@@ -905,6 +923,33 @@ impl GraphCompute for AlgoSession {
     }
 
     fn emit(&mut self, cols: &[(&str, Handle)]) -> Result<(), FnError> {
+        // Validate the emitted set against the declared columns (when known)
+        // before any handle work: exactly the declared names, no repeats, no
+        // extras, none missing (proposal §4.6, error 0x869).
+        if let Some(expected) = &self.expected_columns {
+            let mut seen: Vec<&str> = Vec::with_capacity(cols.len());
+            for &(name, _) in cols {
+                if seen.contains(&name) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "emit column `{name}` declared more than once"
+                    )));
+                }
+                if !expected.iter().any(|e| e == name) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "emit column `{name}` is not a declared output field"
+                    )));
+                }
+                seen.push(name);
+            }
+            for want in expected {
+                if !seen.contains(&want.as_str()) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "declared output field `{want}` was not emitted"
+                    )));
+                }
+            }
+        }
+
         // Validate every column is a [V] map of equal length before capturing.
         let mut captured = Vec::with_capacity(cols.len());
         let mut expected_len: Option<usize> = None;

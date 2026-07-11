@@ -23,14 +23,14 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rhai::{Array, Engine, EvalAltResult, ImmutableString, Position};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, ImmutableString, Position};
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
-use uni_plugin_builtin::algorithms::graph_compute::value::Scalar;
+use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
 /// A Rhai-visible handle to a per-CALL GraphCompute session.
 ///
@@ -90,6 +90,26 @@ fn dir(s: &str) -> Result<Direction, Box<EvalAltResult>> {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         other => Err(rt(FnError::new(0x861, format!("bad direction `{other}`")))),
+    }
+}
+
+/// Packs an external vertex id into the `i64` a guest holds.
+fn vid_to_i64(vid: Vid) -> i64 {
+    #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
+    let v = vid.as_u64() as i64;
+    v
+}
+
+/// Parses a generic `map_apply` op string with its scalar operands.
+fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, Box<EvalAltResult>> {
+    match s {
+        "recip" => Ok(MapOp::Recip),
+        "scale" => Ok(MapOp::Scale(a)),
+        "log" => Ok(MapOp::Log),
+        "affine" => Ok(MapOp::AxPlusB(a, b)),
+        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
+        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
+        other => Err(rt(FnError::new(0x861, format!("bad map op `{other}`")))),
     }
 }
 
@@ -316,6 +336,75 @@ impl GcSession {
         let mut s = self.session.lock();
         s.emit(&[(name.as_str(), from_i64(h))]).map_err(rt)
     }
+
+    /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);
+    /// `a`,`b` are the scalar operands (`scale a`, `affine a·x+b`).
+    fn map_apply(
+        &mut self,
+        m: i64,
+        op: ImmutableString,
+        a: f64,
+        b: f64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let o = map_op(op.as_str(), a, b)?;
+        let mut s = self.session.lock();
+        s.map_apply(from_i64(m), o).map(to_i64).map_err(rt)
+    }
+
+    /// A zeroed float map over the graph's vertices.
+    fn zero_map(&mut self, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.zero_map(from_i64(g), DType::F64).map(to_i64).map_err(rt)
+    }
+
+    /// Overwrites `map` at each `frontier` member with `value`.
+    fn scatter(&mut self, map: i64, frontier: i64, value: f64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.scatter(from_i64(map), from_i64(frontier), Scalar::F64(value))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Set difference `a \ b`.
+    fn set_diff(&mut self, a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.set_diff(from_i64(a), from_i64(b)).map(to_i64).map_err(rt)
+    }
+
+    /// Set intersection `a ∩ b`.
+    fn set_intersect(&mut self, a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.set_intersect(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// The `[vertexId, value]` extremum of a map (`want_max` selects max vs min).
+    fn arg_extreme(&mut self, m: i64, want_max: bool) -> Result<Array, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        let (vid, val) = s.arg_extreme(from_i64(m), want_max).map_err(rt)?;
+        Ok(vec![
+            Dynamic::from_int(vid_to_i64(vid)),
+            Dynamic::from_float(val.as_f64()),
+        ])
+    }
+
+    /// The top-`k` `[vertexId, value]` pairs by descending value.
+    fn topk(&mut self, m: i64, k: i64) -> Result<Array, Box<EvalAltResult>> {
+        let kk = u32::try_from(k).unwrap_or(0);
+        let mut s = self.session.lock();
+        let ranked = s.topk(from_i64(m), kk).map_err(rt)?;
+        Ok(ranked
+            .into_iter()
+            .map(|(vid, val)| {
+                let pair: Array = vec![
+                    Dynamic::from_int(vid_to_i64(vid)),
+                    Dynamic::from_float(val.as_f64()),
+                ];
+                Dynamic::from_array(pair)
+            })
+            .collect())
+    }
 }
 
 /// Registers the [`GcSession`] type and its kernel methods on `engine`.
@@ -343,8 +432,15 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("l1_diff", GcSession::l1_diff)
         .register_fn("expand", GcSession::expand)
         .register_fn("set_union", GcSession::set_union)
+        .register_fn("set_diff", GcSession::set_diff)
+        .register_fn("set_intersect", GcSession::set_intersect)
         .register_fn("set_len", GcSession::set_len)
         .register_fn("is_empty", GcSession::is_empty)
+        .register_fn("map_apply", GcSession::map_apply)
+        .register_fn("zero_map", GcSession::zero_map)
+        .register_fn("scatter", GcSession::scatter)
+        .register_fn("arg_extreme", GcSession::arg_extreme)
+        .register_fn("topk", GcSession::topk)
         .register_fn("free", GcSession::free)
         .register_fn("emit", GcSession::emit);
 }

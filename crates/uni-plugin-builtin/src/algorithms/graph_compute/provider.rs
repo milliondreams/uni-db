@@ -156,6 +156,7 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
 
         let out_schema = Arc::new(Schema::new(self.signature.output_fields.clone()));
         let schema_for_batch = Arc::clone(&out_schema);
+        let expected_cols = super::guest_emit_columns(&self.signature.output_fields);
         let stream = futures::stream::once(async move {
             let graph = projection
                 .await
@@ -173,7 +174,8 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
             let deadline_at = deadline_ms
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
             let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at);
+                .with_deadline(deadline_at)
+                .with_expected_columns(expected_cols);
             let g = session.bind_graph(Arc::clone(&graph));
 
             // Flagship returns the last iterate (allow_partial = true), matching

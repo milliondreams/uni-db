@@ -38,7 +38,7 @@ use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
-use uni_plugin_builtin::algorithms::graph_compute::value::Scalar;
+use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
 /// A Python-visible handle to a per-CALL GraphCompute session.
 #[pyclass]
@@ -105,6 +105,26 @@ fn semiring(s: &str) -> PyResult<Semiring> {
         "linear_algebra" => Ok(Semiring::LinearAlgebra),
         "min_max" => Ok(Semiring::MinMax),
         other => Err(PyRuntimeError::new_err(format!("bad semiring `{other}`"))),
+    }
+}
+
+/// Packs an external vertex id into the `i64` a guest holds.
+fn vid_to_i64(vid: Vid) -> i64 {
+    #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
+    let v = vid.as_u64() as i64;
+    v
+}
+
+/// Parses a generic `map_apply` op string with its scalar operands.
+fn map_op(s: &str, a: f64, b: f64) -> PyResult<MapOp> {
+    match s {
+        "recip" => Ok(MapOp::Recip),
+        "scale" => Ok(MapOp::Scale(a)),
+        "log" => Ok(MapOp::Log),
+        "affine" => Ok(MapOp::AxPlusB(a, b)),
+        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
+        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
+        other => Err(PyRuntimeError::new_err(format!("bad map op `{other}`"))),
     }
 }
 
@@ -331,6 +351,80 @@ impl GcSession {
             .lock()
             .emit(&[(name, from_i64(h))])
             .map_err(py_err)
+    }
+
+    /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);
+    /// `a`,`b` are the scalar operands (`scale a`, `affine a*x+b`).
+    #[pyo3(signature = (m, op, a = 0.0, b = 0.0))]
+    fn map_apply(&self, m: i64, op: &str, a: f64, b: f64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let o = map_op(op, a, b)?;
+        self.session
+            .lock()
+            .map_apply(from_i64(m), o)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// A zeroed float map over the graph's vertices.
+    fn zero_map(&self, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .zero_map(from_i64(g), DType::F64)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Overwrites `map` at each `frontier` member with `value`.
+    fn scatter(&self, map: i64, frontier: i64, value: f64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .scatter(from_i64(map), from_i64(frontier), Scalar::F64(value))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Set difference `a \ b`.
+    fn set_diff(&self, a: i64, b: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .set_diff(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Set intersection `a & b`.
+    fn set_intersect(&self, a: i64, b: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .set_intersect(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// The `(vertexId, value)` extremum of a map (`want_max` selects max vs min).
+    fn arg_extreme(&self, m: i64, want_max: bool) -> PyResult<(i64, f64)> {
+        self.check_deadline()?;
+        let (vid, val) = self
+            .session
+            .lock()
+            .arg_extreme(from_i64(m), want_max)
+            .map_err(py_err)?;
+        Ok((vid_to_i64(vid), val.as_f64()))
+    }
+
+    /// The top-`k` `(vertexId, value)` pairs by descending value.
+    fn topk(&self, m: i64, k: u32) -> PyResult<Vec<(i64, f64)>> {
+        self.check_deadline()?;
+        let ranked = self.session.lock().topk(from_i64(m), k).map_err(py_err)?;
+        Ok(ranked
+            .into_iter()
+            .map(|(vid, val)| (vid_to_i64(vid), val.as_f64()))
+            .collect())
     }
 }
 

@@ -308,6 +308,51 @@ fn f4_ppr_matches_power_iteration_oracle() {
     }
 }
 
+// ---- W3 · emit schema validation (0x869) ---------------------------------
+
+/// A session declaring its output columns rejects an emit that names an
+/// undeclared column, repeats one, or omits a declared one (proposal §4.6).
+#[test]
+fn emit_validates_against_declared_columns() {
+    let nodes = vec![0, 1, 2];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0)];
+    let mk_session = |cols: Vec<String>| {
+        let arena = Arena::new(
+            super::DEFAULT_ARENA_MAX_BYTES,
+            super::DEFAULT_ARENA_MAX_HANDLES,
+        );
+        let mut s = AlgoSession::new(1, WorkBudget::from_edge_count(1_000), arena)
+            .with_expected_columns(cols);
+        let g = s.bind_graph(Arc::new(build_projection(&nodes, &edges, false, false)));
+        let m = s.zero_map(g, super::value::DType::F64).unwrap();
+        (s, m)
+    };
+
+    // Undeclared name -> 0x869.
+    let (mut s, m) = mk_session(vec!["score".to_string()]);
+    assert_eq!(
+        s.emit(&[("wrong", m)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH
+    );
+    // The declared name succeeds.
+    let (mut s, m) = mk_session(vec!["score".to_string()]);
+    s.emit(&[("score", m)]).expect("declared column emits");
+
+    // Omitting a declared column -> 0x869.
+    let (mut s, m) = mk_session(vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(
+        s.emit(&[("a", m)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH
+    );
+
+    // Repeating a column -> 0x869.
+    let (mut s, m) = mk_session(vec!["score".to_string()]);
+    assert_eq!(
+        s.emit(&[("score", m), ("score", m)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH
+    );
+}
+
 // ---- W2 · §5.2 incomplete-reason reachability ----------------------------
 
 /// P0-7 (reason 0x866): a non-converging PPR with `allow_partial = false`

@@ -64,6 +64,15 @@ pub struct KernelRequest {
     /// A scalar operand.
     #[serde(default)]
     pub f: f64,
+    /// A second scalar operand (e.g. the `b` of `map_apply` `AxPlusB(a, b)`).
+    #[serde(default)]
+    pub f2: f64,
+    /// A count operand (the `k` of `topk`).
+    #[serde(default)]
+    pub k: u32,
+    /// A boolean operand (the `want_max` of `arg_extreme`).
+    #[serde(default)]
+    pub want_max: bool,
     /// Seed vertex ids (for `frontier`).
     #[serde(default)]
     pub seeds: Vec<i64>,
@@ -85,6 +94,17 @@ pub enum KernelResponse {
     /// A boolean result.
     #[serde(rename = "b")]
     Bool(bool),
+    /// A `(vertexId, scalar)` result (`arg_extreme`).
+    #[serde(rename = "vs")]
+    VidScalar {
+        /// The external vertex id of the extremum.
+        vid: i64,
+        /// The extremum's scalar value.
+        f: f64,
+    },
+    /// A ranked `(vertexId, scalar)` list result (`topk`).
+    #[serde(rename = "ps")]
+    Pairs(Vec<(i64, f64)>),
     /// A no-value result (`free`, `emit`).
     #[serde(rename = "u")]
     Unit,
@@ -129,6 +149,23 @@ fn semiring(s: &str) -> Result<Semiring, FnError> {
         "linear_algebra" => Ok(Semiring::LinearAlgebra),
         "min_max" => Ok(Semiring::MinMax),
         other => Err(FnError::new(0x861, format!("bad semiring `{other}`"))),
+    }
+}
+
+/// Decodes a generic `map_apply` op string plus its scalar operands.
+///
+/// Covers every [`MapOp`] variant so a guest can express affine (`ax+b`) and
+/// `log` maps that the fixed `scale`/`recip`/`normalize` ops cannot reach; `a`
+/// is the first scalar (`req.f`), `b` the second (`req.f2`).
+fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, FnError> {
+    match s {
+        "recip" => Ok(MapOp::Recip),
+        "scale" => Ok(MapOp::Scale(a)),
+        "log" => Ok(MapOp::Log),
+        "affine" => Ok(MapOp::AxPlusB(a, b)),
+        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
+        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
+        other => Err(FnError::new(0x861, format!("bad map op `{other}`"))),
     }
 }
 
@@ -305,6 +342,30 @@ impl GraphComputeRegistry {
             "zero_map" => session
                 .zero_map(from_i64(req.g), super::value::DType::F64)
                 .map(h),
+            "map_apply" => session
+                .map_apply(from_i64(req.g), map_op(&req.s, req.f, req.f2)?)
+                .map(h),
+            "edge_count" => Ok(KernelResponse::Float(
+                session.edge_count(from_i64(req.g))? as f64
+            )),
+            "scatter" => session
+                .scatter(from_i64(req.a), from_i64(req.b), Scalar::F64(req.f))
+                .map(h),
+            "arg_extreme" => {
+                let (vid, s) = session.arg_extreme(from_i64(req.g), req.want_max)?;
+                #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
+                let vid = vid.as_u64() as i64;
+                Ok(KernelResponse::VidScalar { vid, f: s.as_f64() })
+            }
+            "topk" => {
+                let ranked = session.topk(from_i64(req.g), req.k)?;
+                #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
+                let pairs = ranked
+                    .into_iter()
+                    .map(|(vid, s)| (vid.as_u64() as i64, s.as_f64()))
+                    .collect();
+                Ok(KernelResponse::Pairs(pairs))
+            }
             "expand" => session
                 .expand(
                     from_i64(req.g),
@@ -390,7 +451,8 @@ mod tests {
         let call = |req: KernelRequest| -> KernelResponse {
             let json = serde_json::to_string(&serde_json::json!({
                 "session": req.session, "op": req.op, "g": req.g, "a": req.a,
-                "b": req.b, "s": req.s, "s2": req.s2, "f": req.f,
+                "b": req.b, "s": req.s, "s2": req.s2, "f": req.f, "f2": req.f2,
+                "k": req.k, "want_max": req.want_max,
                 "seeds": req.seeds, "name": req.name,
             }))
             .unwrap();
@@ -410,6 +472,9 @@ mod tests {
             s: String::new(),
             s2: String::new(),
             f: 0.0,
+            f2: 0.0,
+            k: 0,
+            want_max: false,
             seeds: vec![],
             name: String::new(),
         };
@@ -515,6 +580,74 @@ mod tests {
     }
 
     #[test]
+    fn new_kernels_reachable_via_json() {
+        // W3 (B2): edge_count / topk / arg_extreme / scatter / generic map_apply
+        // must all be expressible over the loader-agnostic JSON wire, so the
+        // §9.3 corpus (Bellman-Ford scatter, top-k egress) is guest-authorable on
+        // the sandboxed loaders too.
+        let nodes = vec![0u64, 1, 2, 3];
+        // out-degrees: node 0 -> 3, node 1 -> 1, nodes 2,3 -> 0.
+        let edges = vec![(0, 1), (0, 2), (0, 3), (1, 2)];
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            7,
+            WorkBudget::from_graph_size(4, 4),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+
+        match call(format!(r#"{{"session":{sid},"op":"edge_count","g":{g}}}"#)) {
+            KernelResponse::Float(e) => assert_eq!(e, 4.0, "edge_count"),
+            other => panic!("edge_count -> {other:?}"),
+        }
+
+        let deg = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+        )));
+
+        match call(format!(
+            r#"{{"session":{sid},"op":"topk","g":{deg},"k":2}}"#
+        )) {
+            KernelResponse::Pairs(p) => {
+                assert_eq!(p.len(), 2, "topk returns k pairs");
+                assert_eq!(p[0], (0, 3.0), "highest out-degree ranked first");
+            }
+            other => panic!("topk -> {other:?}"),
+        }
+
+        match call(format!(
+            r#"{{"session":{sid},"op":"arg_extreme","g":{deg},"want_max":true}}"#
+        )) {
+            KernelResponse::VidScalar { vid, f } => {
+                assert_eq!((vid, f), (0, 3.0), "max out-degree is node 0")
+            }
+            other => panic!("arg_extreme -> {other:?}"),
+        }
+
+        // Generic affine map 2*x+1 (unreachable via scale/recip/normalize), then a
+        // scatter over a frontier — both must return live handles.
+        let affine = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{deg},"s":"affine","f":2.0,"f2":1.0}}"#
+        )));
+        let f1 = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"frontier","g":{g},"seeds":[1]}}"#
+        )));
+        let _scattered = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"scatter","a":{affine},"b":{f1},"f":99.0}}"#
+        )));
+    }
+
+    #[test]
     fn unknown_session_is_typed_error_not_panic() {
         let registry = GraphComputeRegistry::new();
         let resp = registry.call_json(r#"{"session": 999, "op": "vertex_count", "g": 0}"#);
@@ -577,7 +710,7 @@ mod tests {
     impl Serialize for KernelRequest {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeStruct;
-            let mut st = s.serialize_struct("KernelRequest", 10)?;
+            let mut st = s.serialize_struct("KernelRequest", 13)?;
             st.serialize_field("session", &self.session)?;
             st.serialize_field("op", &self.op)?;
             st.serialize_field("g", &self.g)?;
@@ -586,6 +719,9 @@ mod tests {
             st.serialize_field("s", &self.s)?;
             st.serialize_field("s2", &self.s2)?;
             st.serialize_field("f", &self.f)?;
+            st.serialize_field("f2", &self.f2)?;
+            st.serialize_field("k", &self.k)?;
+            st.serialize_field("want_max", &self.want_max)?;
             st.serialize_field("seeds", &self.seeds)?;
             st.serialize_field("name", &self.name)?;
             st.end()

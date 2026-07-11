@@ -49,6 +49,27 @@ pub use session::{
 pub use table::HandleTable;
 pub use value::{DType, Scalar, Shape, Tensor, VertexSet};
 
+/// Name of the host-generated vertex-id column, prepended to every result batch.
+///
+/// The guest never emits it — the adapters synthesize it by slot→Vid translation
+/// — so it is excluded from the guest's declared-column contract.
+pub const HOST_NODE_ID_COLUMN: &str = "nodeId";
+
+/// The columns a guest is required to `emit`, from a declared output schema.
+///
+/// Strips the host-generated [`HOST_NODE_ID_COLUMN`]; the remainder are the
+/// value columns the guest must produce. Passed to
+/// [`AlgoSession::with_expected_columns`] so `emit` can validate the emitted set
+/// exactly (proposal §4.6).
+#[must_use]
+pub fn guest_emit_columns(fields: &[arrow_schema::Field]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|n| n != HOST_NODE_ID_COLUMN)
+        .collect()
+}
+
 /// Native-work budget multiplier applied to graph size to derive the default cap.
 ///
 /// The default budget is `min(DEFAULT_WORK_EDGE_MULTIPLIER * (|V| + |E|),

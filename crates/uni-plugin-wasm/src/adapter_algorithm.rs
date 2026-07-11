@@ -106,6 +106,9 @@ impl AlgorithmProvider for ComponentAlgorithm {
         let registry = Arc::clone(&self.registry);
         let pool = Arc::clone(&self.pool);
         let qname_str = self.qname.to_string();
+        let expected_cols = uni_plugin_builtin::algorithms::graph_compute::guest_emit_columns(
+            &self.signature.output_fields,
+        );
 
         let stream = futures::stream::once(async move {
             let graph = projection
@@ -120,7 +123,8 @@ impl AlgorithmProvider for ComponentAlgorithm {
                 next_session_epoch(),
                 WorkBudget::new(total.max(1)),
                 Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
-            );
+            )
+            .with_expected_columns(expected_cols);
             let g = to_i64(session.bind_graph(Arc::clone(&graph)));
             let sid = registry.open(session);
 

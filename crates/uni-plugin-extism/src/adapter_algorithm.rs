@@ -118,6 +118,7 @@ impl AlgorithmProvider for ExtismAlgorithm {
         let registry = Arc::clone(&self.registry);
         let pool = Arc::clone(&self.pool);
         let invoke_export = self.invoke_export.clone();
+        let qname_str = self.qname.to_string();
 
         let stream = futures::stream::once(async move {
             let graph = projection
@@ -139,6 +140,7 @@ impl AlgorithmProvider for ExtismAlgorithm {
             // Everything that can fail between open and close is wrapped so the
             // session is ALWAYS closed (no leak of the projected graph into the
             // process-global registry), even if input-build or `acquire` fails.
+            let started = std::time::Instant::now();
             let call_result: Result<(), DataFusionError> = (|| {
                 let input = serde_json::to_vec(&serde_json::json!({
                     "session": sid, "graph": g, "args": json_args,
@@ -157,7 +159,24 @@ impl AlgorithmProvider for ExtismAlgorithm {
 
             // Always close the session (freeing handles) even on guest error.
             let closed = registry.close(sid);
-            call_result?;
+            if let Err(orig) = call_result {
+                // Classify from the closed session: a drained budget is a typed
+                // Exhausted outcome (§5.2). Extism sets no host wall-clock
+                // deadline, so a Timeout is never inferred. Other faults verbatim.
+                let (spent, budget) = closed
+                    .as_ref()
+                    .map_or((0, 0), |s| (s.work_spent(), s.work_budget()));
+                return Err(
+                    uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
+                        &qname_str,
+                        false,
+                        spent,
+                        budget,
+                        started.elapsed().as_millis() as u64,
+                    )
+                    .map_or(orig, DataFusionError::Execution),
+                );
+            }
             let mut closed =
                 closed.ok_or_else(|| DataFusionError::Execution("session vanished".into()))?;
             let emitted = closed.take_emitted();

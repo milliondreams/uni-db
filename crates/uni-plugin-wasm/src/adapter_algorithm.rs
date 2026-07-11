@@ -126,6 +126,7 @@ impl AlgorithmProvider for ComponentAlgorithm {
 
             // Wrap the fallible steps so the session is ALWAYS closed after open
             // (no leak of the projected graph), even if input-build/acquire fails.
+            let started = std::time::Instant::now();
             let call_result: Result<(), DataFusionError> = (|| {
                 let input = serde_json::to_vec(&serde_json::json!({
                     "session": sid, "graph": g, "args": json_args,
@@ -145,7 +146,24 @@ impl AlgorithmProvider for ComponentAlgorithm {
             })();
 
             let closed = registry.close(sid);
-            call_result?;
+            if let Err(orig) = call_result {
+                // Classify from the closed session: a drained budget is a typed
+                // Exhausted outcome (§5.2). This adapter sets no host wall-clock
+                // deadline, so a Timeout is never inferred. Other faults verbatim.
+                let (spent, budget) = closed
+                    .as_ref()
+                    .map_or((0, 0), |s| (s.work_spent(), s.work_budget()));
+                return Err(
+                    uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
+                        &qname_str,
+                        false,
+                        spent,
+                        budget,
+                        started.elapsed().as_millis() as u64,
+                    )
+                    .map_or(orig, DataFusionError::Execution),
+                );
+            }
             let mut closed =
                 closed.ok_or_else(|| DataFusionError::Execution("session vanished".into()))?;
             let emitted = closed.take_emitted();

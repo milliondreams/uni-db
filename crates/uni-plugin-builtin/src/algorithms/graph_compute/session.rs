@@ -151,6 +151,8 @@ pub struct AlgoSession {
     primary_graph: Option<Arc<GraphProjection>>,
     /// Captured `emit` output: `(column_name, values)` per emitted column.
     emitted: Vec<(String, Vec<f64>)>,
+    /// Optional wall-clock deadline; every metered kernel checks it (§5.2).
+    deadline: Option<std::time::Instant>,
 }
 
 impl AlgoSession {
@@ -163,7 +165,17 @@ impl AlgoSession {
             arena,
             primary_graph: None,
             emitted: Vec::new(),
+            deadline: None,
         }
+    }
+
+    /// Sets a wall-clock deadline after which any metered kernel fails with
+    /// `Timeout` (`0x867`), distinguishing "too slow" from budget `Exhausted`
+    /// and non-convergence `IterationLimit` (proposal §5.2).
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Binds a pre-built projection into the table, returning its graph handle.
@@ -188,6 +200,12 @@ impl AlgoSession {
     #[must_use]
     pub fn work_spent(&self) -> u64 {
         self.budget.spent()
+    }
+
+    /// Returns the session's total native-work budget (for incomplete diagnostics).
+    #[must_use]
+    pub fn work_budget(&self) -> u64 {
+        self.budget.total()
     }
 
     /// Returns the count of live handles (for reclaim tests).
@@ -218,7 +236,17 @@ impl AlgoSession {
     }
 
     /// Charges `units` of native work, mapping exhaustion to error `0x865`.
+    ///
+    /// Also enforces the wall-clock deadline (§5.2): since every metered kernel
+    /// funnels through here, a per-kernel deadline check bounds a slow guest even
+    /// when it stays within its native-work budget, surfacing `Timeout` (0x867).
     fn charge(&mut self, units: u64) -> Result<(), FnError> {
+        if self
+            .deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(error::timeout());
+        }
         self.budget
             .try_charge(units)
             .map_err(|e| error::budget_exhausted(e.to_string()))

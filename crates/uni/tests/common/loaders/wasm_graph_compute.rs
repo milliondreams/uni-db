@@ -25,7 +25,9 @@ const WASM_PATH: &str = concat!(
 
 fn load_wasm_bytes() -> Vec<u8> {
     std::fs::read(WASM_PATH).unwrap_or_else(|e| {
-        panic!("wasm graph component missing at {WASM_PATH}: {e}\nRun ./scripts/build-wasm-fixtures.sh")
+        panic!(
+            "wasm graph component missing at {WASM_PATH}: {e}\nRun ./scripts/build-wasm-fixtures.sh"
+        )
     })
 }
 
@@ -94,7 +96,10 @@ async fn wasm_guest_ppr_via_call() -> anyhow::Result<()> {
     let mut total = 0.0;
     for row in rows {
         let s = row.get::<f64>("score")?;
-        assert!(s.is_finite() && s >= 0.0, "score must be a valid probability");
+        assert!(
+            s.is_finite() && s >= 0.0,
+            "score must be a valid probability"
+        );
         total += s;
     }
     assert!(

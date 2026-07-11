@@ -104,7 +104,11 @@ pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniEr
 /// All other executor errors remain `UniError::Query`.
 fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
-    if msg.contains("Query cancelled") {
+    if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
+        UniError::GraphComputeIncomplete {
+            detail: Box::new(detail),
+        }
+    } else if msg.contains("Query cancelled") {
         UniError::Cancelled
     } else if msg.contains("Query timed out") {
         UniError::Query {
@@ -138,7 +142,11 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
 /// [`into_execution_error`] classification minus those two arms.
 fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
-    if msg.contains("TypeError:") {
+    if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
+        UniError::GraphComputeIncomplete {
+            detail: Box::new(detail),
+        }
+    } else if msg.contains("TypeError:") {
         UniError::Type {
             expected: msg,
             actual: String::new(),

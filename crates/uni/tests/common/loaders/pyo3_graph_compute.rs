@@ -115,7 +115,10 @@ async fn python_guest_ppr_via_call() -> anyhow::Result<()> {
     let mut total = 0.0;
     for row in rows {
         let s = row.get::<f64>("score")?;
-        assert!(s.is_finite() && s >= 0.0, "score must be a valid probability");
+        assert!(
+            s.is_finite() && s >= 0.0,
+            "score must be a valid probability"
+        );
         total += s;
     }
     assert!(
@@ -203,7 +206,17 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
         elapsed < std::time::Duration::from_secs(15),
         "spin must be interrupted near the 500ms deadline, took {elapsed:?}"
     );
-    let _ = err; // the message wraps the interrupt; we only require it errored fast.
+    // The interrupt surfaces as a typed incomplete outcome, not a generic query
+    // error: the reason is Timeout (0x867), distinguishable from Exhausted /
+    // IterationLimit so a caller knows to raise the deadline (proposal §5.2).
+    match err {
+        uni_common::UniError::GraphComputeIncomplete { detail } => assert_eq!(
+            detail.reason,
+            uni_common::GraphComputeIncompleteReason::Timeout,
+            "a runaway guest past its wall-clock deadline must be a Timeout, got {detail}"
+        ),
+        other => panic!("expected GraphComputeIncomplete{{Timeout}}, got {other:?}"),
+    }
 
     // Worker survived: a normal CALL on the same plugin still works.
     let ok = session

@@ -18,6 +18,7 @@
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 
+use super::error;
 use super::handle::Handle;
 use super::session::{
     Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
@@ -33,9 +34,16 @@ use super::value::{DType, Scalar};
 /// `emit` it). The interpreter runs `O(iterations)` trivial steps while every
 /// `O(E)` operation is a native kernel.
 ///
+/// When `allow_partial` is false and the power iteration exhausts `max_iters`
+/// without the L1 delta falling below `tol`, the result is *not* returned
+/// silently — an `IterationLimit` error (`0x866`) is raised instead, mirroring
+/// Locy's non-convergence contract (proposal §5.2). Pass `allow_partial = true`
+/// for anytime semantics (return the last iterate).
+///
 /// # Errors
-/// Returns a typed [`FnError`] on a bad handle, an unmapped seed (`0x868`), or an
-/// exhausted native-work budget / arena cap.
+/// Returns a typed [`FnError`] on a bad handle, an unmapped seed (`0x868`), an
+/// exhausted native-work budget / arena cap, or `0x866` on non-convergence when
+/// `allow_partial` is false.
 pub fn personalized_pagerank(
     gc: &mut dyn GraphCompute,
     g: Handle,
@@ -43,6 +51,7 @@ pub fn personalized_pagerank(
     alpha: f64,
     max_iters: usize,
     tol: f64,
+    allow_partial: bool,
 ) -> Result<Handle, FnError> {
     // Uniform teleport over the seed set (each seed = 1/|seeds|).
     let seed_set = gc.frontier(g, seeds)?;
@@ -59,6 +68,7 @@ pub fn personalized_pagerank(
 
     // rank := teleport (a fresh copy, so freeing rank never frees teleport).
     let mut rank = gc.map_apply(teleport, MapOp::Scale(1.0))?;
+    let mut converged = false;
     for _ in 0..max_iters {
         let contrib = gc.ewise(rank, inv_deg, EwiseOp::Mul)?;
         let spread = gc.spmv(g, contrib, Semiring::LinearAlgebra, Direction::Out, None)?;
@@ -74,6 +84,7 @@ pub fn personalized_pagerank(
         gc.free(rank)?;
         rank = next;
         if diff < tol {
+            converged = true;
             break;
         }
     }
@@ -81,6 +92,10 @@ pub fn personalized_pagerank(
     gc.free(teleport)?;
     gc.free(inv_deg)?;
     gc.free(dangling)?;
+    if !converged && !allow_partial {
+        gc.free(rank)?;
+        return Err(error::iteration_limit(max_iters));
+    }
     Ok(rank)
 }
 

@@ -140,15 +140,33 @@ impl AlgorithmProvider for RhaiAlgorithm {
             let engine = Arc::clone(&runtime.engine);
             let ast = Arc::clone(&runtime.ast);
             let fn_name = name.clone();
+            let started = std::time::Instant::now();
             let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 engine.call_fn::<Dynamic>(&mut scope, &ast, fn_name.as_str(), call_args)
             }));
             match call {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    return Err(DataFusionError::Execution(format!(
-                        "rhai algorithm `{name}`: {e}"
-                    )));
+                    // A drained native-work budget is a typed Exhausted outcome
+                    // (§5.2); a Rhai guest has no host wall-clock deadline, so a
+                    // Timeout is never inferred here. Other faults report verbatim.
+                    let (spent, budget) = {
+                        let s = session.lock();
+                        (s.work_spent(), s.work_budget())
+                    };
+                    return Err(
+                        uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
+                            name.as_str(),
+                            false,
+                            spent,
+                            budget,
+                            started.elapsed().as_millis() as u64,
+                        )
+                        .map_or_else(
+                            || DataFusionError::Execution(format!("rhai algorithm `{name}`: {e}")),
+                            DataFusionError::Execution,
+                        ),
+                    );
                 }
                 Err(_) => {
                     return Err(DataFusionError::Execution(format!(

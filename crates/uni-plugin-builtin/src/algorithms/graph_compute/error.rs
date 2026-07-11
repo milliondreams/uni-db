@@ -85,6 +85,86 @@ pub fn iteration_limit(cap: usize) -> FnError {
     )
 }
 
+/// Builds a `0x867` timeout error for a wall-clock deadline elapsing mid-run.
+#[must_use]
+pub fn timeout() -> FnError {
+    FnError::new(
+        TIMEOUT,
+        "GraphCompute: invocation wall-clock deadline exceeded",
+    )
+}
+
+/// Builds a tagged incomplete-diagnostic message from a kernel [`FnError`].
+///
+/// Returns `Some(tagged_message)` when `err`'s code names a §5.2 incomplete
+/// outcome — budget exhaustion (`0x865`), an iteration cap (`0x866`), or a
+/// wall-clock deadline (`0x867`) — encoding the structured diagnostics behind
+/// [`uni_common::GRAPH_COMPUTE_INCOMPLETE_TAG`] so the query API boundary can
+/// recover a typed [`uni_common::UniError::GraphComputeIncomplete`]. Any other
+/// error (a forged handle, a bad seed) is not an incomplete outcome and yields
+/// `None`, so the caller reports it as an ordinary execution error.
+#[must_use]
+pub fn incomplete_tag_for(
+    err: &FnError,
+    algorithm: &str,
+    elapsed_ms: u64,
+    iterations: u64,
+    work_charged: u64,
+    work_budget: u64,
+) -> Option<String> {
+    let reason = uni_common::GraphComputeIncompleteReason::from_error_code(err.code)?;
+    Some(
+        uni_common::GraphComputeIncomplete {
+            reason,
+            algorithm: algorithm.to_string(),
+            elapsed_ms,
+            iterations,
+            work_charged,
+            work_budget,
+        }
+        .to_tagged_message(),
+    )
+}
+
+/// Classifies a guest invocation that errored into a §5.2 incomplete outcome,
+/// from host-observable state, if one applies.
+///
+/// A sandboxed guest error does not carry a numeric kernel code across the loader
+/// boundary, so the loader adapters instead inspect the host-side session after
+/// the guest returns: an elapsed wall-clock deadline is a `Timeout` (`0x867`); a
+/// fully-drained native-work budget is `Exhausted` (`0x865`). Returns the tagged
+/// diagnostic message when one applies, or `None` when the error is an ordinary
+/// guest fault the adapter should report verbatim. (`IterationLimit` is a native
+/// first-party outcome only — a guest expresses its own loop bound, invisible to
+/// the host — so it is never inferred here.)
+#[must_use]
+pub fn incomplete_tag_after_guest(
+    algorithm: &str,
+    deadline_elapsed: bool,
+    work_charged: u64,
+    work_budget: u64,
+    elapsed_ms: u64,
+) -> Option<String> {
+    let reason = if deadline_elapsed {
+        uni_common::GraphComputeIncompleteReason::Timeout
+    } else if work_budget > 0 && work_charged >= work_budget {
+        uni_common::GraphComputeIncompleteReason::Exhausted
+    } else {
+        return None;
+    };
+    Some(
+        uni_common::GraphComputeIncomplete {
+            reason,
+            algorithm: algorithm.to_string(),
+            elapsed_ms,
+            iterations: 0,
+            work_charged,
+            work_budget,
+        }
+        .to_tagged_message(),
+    )
+}
+
 /// Builds a `0x868` seed-not-in-projection error for an unmapped Vid.
 #[must_use]
 pub fn seed_not_in_projection(vid: u64) -> FnError {

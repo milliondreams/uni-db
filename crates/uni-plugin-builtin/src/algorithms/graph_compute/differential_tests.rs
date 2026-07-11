@@ -292,7 +292,7 @@ fn f4_ppr_matches_power_iteration_oracle() {
     let alpha = 0.85;
     let iters = 100;
     let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
-    let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], alpha, iters, 1e-12).unwrap();
+    let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], alpha, iters, 1e-12, true).unwrap();
     let got = read_tensor(&s, rank);
 
     let want = oracle_ppr(&nodes, &edges, &[0], alpha, iters);
@@ -306,6 +306,55 @@ fn f4_ppr_matches_power_iteration_oracle() {
             "PPR score for {vid}: got {score}, want {expected}"
         );
     }
+}
+
+// ---- W2 · §5.2 incomplete-reason reachability ----------------------------
+
+/// P0-7 (reason 0x866): a non-converging PPR with `allow_partial = false`
+/// raises `IterationLimit`, not a silent last-iterate.
+#[test]
+fn ppr_non_convergence_is_iteration_limit_not_silent() {
+    // A two-cycle: the power iteration keeps moving mass, so two iterations at
+    // a 1e-15 tolerance cannot converge.
+    let nodes = vec![0, 1, 2, 3];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 0, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+    let err = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 2, 1e-15, false)
+        .expect_err("2 iters at 1e-15 tol must not converge");
+    assert_eq!(
+        err.code,
+        super::error::ITERATION_LIMIT,
+        "non-convergence must surface as 0x866, got {err}"
+    );
+    // The same run with anytime semantics returns the last iterate instead.
+    let (mut s2, g2) = session_with(build_projection(&nodes, &edges, false, false));
+    personalized_pagerank(&mut s2, g2, &[Vid::new(0)], 0.85, 2, 1e-15, true)
+        .expect("allow_partial = true returns the last iterate");
+}
+
+/// P0-7 (reason 0x867): a session whose wall-clock deadline has already passed
+/// aborts the first charged kernel with `Timeout`, distinct from 0x866/0x865.
+#[test]
+fn expired_deadline_aborts_with_timeout() {
+    let nodes = vec![0, 1, 2];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0)];
+    let edge_count = edges.len() as u64;
+    let budget = WorkBudget::from_edge_count(edge_count.max(1_000));
+    let arena = Arena::new(
+        super::DEFAULT_ARENA_MAX_BYTES,
+        super::DEFAULT_ARENA_MAX_HANDLES,
+    );
+    // A deadline one second in the past: the very first `charge` must trip it.
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut s = AlgoSession::new(1, budget, arena).with_deadline(Some(past));
+    let g = s.bind_graph(Arc::new(build_projection(&nodes, &edges, false, false)));
+    let err = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 100, 1e-12, true)
+        .expect_err("an expired deadline must abort the invocation");
+    assert_eq!(
+        err.code,
+        super::error::TIMEOUT,
+        "an expired deadline must surface as 0x867, got {err}"
+    );
 }
 
 /// Naive normalized power iteration for eigenvector centrality (F-5 oracle).
@@ -431,7 +480,7 @@ fn m2_ppr_mass_is_conserved() {
     let nodes = vec![0, 1, 2, 3];
     let edges = vec![(0, 1, 1.0), (1, 2, 1.0)]; // 2 and 3 are dangling
     let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
-    let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 200, 1e-14).unwrap();
+    let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 200, 1e-14, true).unwrap();
     let total: f64 = read_tensor(&s, rank).iter().sum();
     assert!(
         (total - 1.0).abs() < 1e-9,
@@ -452,7 +501,7 @@ fn e5_ppr_is_deterministic_across_runs() {
     ];
     let run = || {
         let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
-        let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 50, 1e-12).unwrap();
+        let rank = personalized_pagerank(&mut s, g, &[Vid::new(0)], 0.85, 50, 1e-12, true).unwrap();
         read_tensor(&s, rank)
     };
     assert_eq!(

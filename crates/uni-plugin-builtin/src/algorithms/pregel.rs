@@ -110,6 +110,28 @@ impl std::fmt::Display for PregelIncomplete {
     }
 }
 
+impl PregelIncomplete {
+    /// Encodes this non-convergence as a tagged incomplete-diagnostic message.
+    ///
+    /// A convergence-style Pregel program that exhausts its superstep budget is
+    /// an `IterationLimit` outcome (`0x866`); tagging it lets the query API
+    /// boundary recover a typed [`uni_common::UniError::GraphComputeIncomplete`]
+    /// rather than a plain execution string, unifying Pregel non-convergence
+    /// with the coarse-kernel path (proposal §5.2).
+    #[must_use]
+    fn to_tagged_message(self, algorithm: &str) -> String {
+        uni_common::GraphComputeIncomplete {
+            reason: uni_common::GraphComputeIncompleteReason::IterationLimit,
+            algorithm: algorithm.to_owned(),
+            elapsed_ms: 0,
+            iterations: self.supersteps as u64,
+            work_charged: 0,
+            work_budget: 0,
+        }
+        .to_tagged_message()
+    }
+}
+
 /// Deliver `msg` into `inbox`, folding via the program's combiner when present.
 fn deliver<P: VertexProgram>(program: &P, inbox: &mut Vec<P::Message>, msg: P::Message) {
     // With a combiner an inbox holds at most one (folded) message.
@@ -214,6 +236,7 @@ fn run_program_to_stream<P: VertexProgram + 'static>(
     spec: GraphProjectionSpec,
     max_supersteps: usize,
     out_schema: Arc<Schema>,
+    algorithm: &'static str,
 ) -> Result<SendableRecordBatchStream, FnError> {
     // Obtain the `'static` projection future before the stream so the borrow of
     // `host` does not escape into the returned stream (mirrors reachability).
@@ -224,8 +247,10 @@ fn run_program_to_stream<P: VertexProgram + 'static>(
         let view = projection
             .await
             .map_err(|e| DataFusionError::Execution(format!("pregel: {e}")))?;
+        // Non-convergence surfaces as a typed incomplete outcome (§5.2), not a
+        // plain execution error, so a caller can tell "did not converge" apart.
         let values = run_pregel(&program, view.as_ref(), max_supersteps)
-            .map_err(|e| DataFusionError::Execution(format!("pregel: {e}")))?;
+            .map_err(|e| DataFusionError::Execution(e.to_tagged_message(algorithm)))?;
 
         let mut node_ids: Vec<i64> = Vec::with_capacity(values.len());
         #[allow(
@@ -428,9 +453,11 @@ impl AlgorithmProvider for PageRankProvider {
                 vertex_count: view.vertex_count().max(1),
             };
             // PageRank is a fixed-schedule program, so this never errors, but
-            // handle the `Result` explicitly rather than unwrapping.
-            let values = run_pregel(&program, view.as_ref(), iters)
-                .map_err(|e| DataFusionError::Execution(format!("pagerank: {e}")))?;
+            // handle the `Result` explicitly rather than unwrapping. Tag it for
+            // uniformity with the convergence-style providers (§5.2).
+            let values = run_pregel(&program, view.as_ref(), iters).map_err(|e| {
+                DataFusionError::Execution(e.to_tagged_message("uni.algo.pagerank"))
+            })?;
             let mut node_ids: Vec<i64> = Vec::with_capacity(values.len());
             #[allow(
                 clippy::cast_possible_wrap,
@@ -591,6 +618,7 @@ impl AlgorithmProvider for SsspProvider {
             spec,
             SSSP_MAX_SUPERSTEPS,
             pregel_output_schema("distance"),
+            "uni.algo.sssp",
         )
     }
 }

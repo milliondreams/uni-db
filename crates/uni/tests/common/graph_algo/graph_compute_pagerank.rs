@@ -183,6 +183,44 @@ async fn l2_kernels_denied_without_graph_compute_cap() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn gcpagerank_deadline_surfaces_typed_timeout_e2e() -> anyhow::Result<()> {
+    // P0-7 (native path): a zero-millisecond wall-clock grant trips the very
+    // first metered kernel, and the abort surfaces through CALL as a *typed*
+    // GraphComputeIncomplete{Timeout} (0x867) — distinguishable from Exhausted /
+    // IterationLimit — not a generic query error (proposal §5.2). Proves the
+    // provider→DataFusion→query-API boundary preserves the structured reason.
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+        // A 0ms budget: the first `charge` sees the deadline already elapsed.
+        Capability::WallClockMillisPerCall(0),
+    ]);
+    db.add_plugin(ExampleGcPlugin::new(caps))?;
+
+    let session = db.session();
+    let query = format!("CALL examplegc.pr({vid_a}) YIELD nodeId, score RETURN nodeId");
+    let err = session
+        .query(&query)
+        .await
+        .expect_err("a 0ms deadline must abort the invocation");
+    match err {
+        uni_common::UniError::GraphComputeIncomplete { detail } => assert_eq!(
+            detail.reason,
+            uni_common::GraphComputeIncompleteReason::Timeout,
+            "an elapsed wall-clock deadline must be a Timeout, got {detail}"
+        ),
+        other => panic!("expected GraphComputeIncomplete{{Timeout}}, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn l3_project_needs_hostquery_too() -> anyhow::Result<()> {
     // L-3: a provider WITH `GraphCompute` but WITHOUT `HostQuery` can hold the
     // kernel surface but cannot `project` — the second orthogonal gate.

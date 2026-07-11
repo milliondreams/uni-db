@@ -152,6 +152,7 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
         // stream, so no borrow of `ctx.host` escapes this synchronous `run`.
         let projection = bridge.project_for_graph_compute(&spec);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
+        let deadline_ms = bridge.graph_compute_deadline_ms();
 
         let out_schema = Arc::new(Schema::new(self.signature.output_fields.clone()));
         let schema_for_batch = Arc::clone(&out_schema);
@@ -167,12 +168,43 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
             let total = work_cap.map_or(size_budget, |w| w.min(size_budget));
             let budget = WorkBudget::new(total.max(1));
             let arena = Arena::new(arena_bytes, super::DEFAULT_ARENA_MAX_HANDLES);
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena);
+            // Wall-clock deadline (proposal §5.2): the guest/native loop aborts
+            // with Timeout (0x867) once this instant passes, checked in `charge`.
+            let deadline_at = deadline_ms
+                .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
+                .with_deadline(deadline_at);
             let g = session.bind_graph(Arc::clone(&graph));
 
-            let rank =
-                personalized_pagerank(&mut session, g, &seeds, alpha, DEFAULT_ITERS, DEFAULT_TOL)
-                    .map_err(|e| DataFusionError::Execution(format!("gcpagerank: {e}")))?;
+            // Flagship returns the last iterate (allow_partial = true), matching
+            // the fixed-loop guest scripts; the IterationLimit error path is
+            // exercised by a first-party unit test with allow_partial = false.
+            // A mid-run budget/deadline abort (0x865/0x867) still surfaces as a
+            // typed incomplete outcome (§5.2), not a plain execution error.
+            let started = std::time::Instant::now();
+            let rank = personalized_pagerank(
+                &mut session,
+                g,
+                &seeds,
+                alpha,
+                DEFAULT_ITERS,
+                DEFAULT_TOL,
+                true,
+            )
+            .map_err(|e| {
+                super::error::incomplete_tag_for(
+                    &e,
+                    "uni.algo.gcpagerank",
+                    started.elapsed().as_millis() as u64,
+                    0,
+                    session.work_spent(),
+                    session.work_budget(),
+                )
+                .map_or_else(
+                    || DataFusionError::Execution(format!("gcpagerank: {e}")),
+                    DataFusionError::Execution,
+                )
+            })?;
             session
                 .emit(&[("score", rank)])
                 .map_err(|e| DataFusionError::Execution(format!("gcpagerank emit: {e}")))?;

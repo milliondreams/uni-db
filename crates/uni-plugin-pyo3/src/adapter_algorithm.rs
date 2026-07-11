@@ -123,7 +123,8 @@ impl AlgorithmProvider for PyAlgorithm {
             )));
             let g = session.lock().bind_graph(Arc::clone(&graph));
             let deadline_ms = deadline_ms_cap.unwrap_or(DEFAULT_DEADLINE_SECS * 1000);
-            let deadline_at = Instant::now().checked_add(Duration::from_millis(deadline_ms));
+            let started = Instant::now();
+            let deadline_at = started.checked_add(Duration::from_millis(deadline_ms));
 
             // Arm a wall-clock watchdog on the guest thread BEFORE running it, so
             // a guest that never calls a kernel (`while True: pass`) is still
@@ -161,7 +162,27 @@ impl AlgorithmProvider for PyAlgorithm {
             drop(watchdog);
             crate::watchdog::cancel_pending_interrupt(tid);
 
-            call_result?;
+            // A guest fault does not carry a kernel code across the Python
+            // boundary, so classify incompleteness from host-side state: an
+            // elapsed deadline is a Timeout (the watchdog fired), a drained
+            // budget is Exhausted. Other faults surface verbatim (§5.2).
+            if let Err(orig) = call_result {
+                let (spent, budget) = {
+                    let s = session.lock();
+                    (s.work_spent(), s.work_budget())
+                };
+                let deadline_elapsed = deadline_at.is_some_and(|d| Instant::now() >= d);
+                return Err(
+                    uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
+                        local_name.as_str(),
+                        deadline_elapsed,
+                        spent,
+                        budget,
+                        started.elapsed().as_millis() as u64,
+                    )
+                    .map_or(orig, DataFusionError::Execution),
+                );
+            }
             let emitted = session.lock().take_emitted();
             build_batch(&schema_for_batch, &graph, &emitted)
                 .map_err(|e| DataFusionError::Execution(format!("python algorithm emit: {e}")))

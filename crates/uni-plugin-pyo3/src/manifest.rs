@@ -78,6 +78,23 @@ pub struct PyProcedureEntry {
     pub callable: Py<PyAny>,
 }
 
+/// One GraphCompute algorithm entry.
+///
+/// The captured callable is `def my_algo(gc, *args)` where `gc` is an injected
+/// `GcSession` driving the coarse kernels (proposal §4.6). Its `yields` become
+/// the `AlgorithmSignature::output_fields`.
+#[derive(Debug)]
+pub struct PyAlgorithmEntry {
+    /// User-facing algorithm name.
+    pub name: SmolStr,
+    /// Argument type names (excluding the injected leading `gc`).
+    pub args: Vec<SmolStr>,
+    /// Yielded column type names (e.g. `"nodeId:int"`, `"score:float"`).
+    pub yields: Vec<SmolStr>,
+    /// The captured Python callable.
+    pub callable: Py<PyAny>,
+}
+
 /// Top-level manifest accumulated by decorator calls.
 #[derive(Debug, Default)]
 pub struct PyManifest {
@@ -94,6 +111,8 @@ pub struct PyManifest {
     pub aggregate_fns: Vec<PyAggregateEntry>,
     /// Procedure entries.
     pub procedures: Vec<PyProcedureEntry>,
+    /// GraphCompute algorithm entries.
+    pub algorithms: Vec<PyAlgorithmEntry>,
 }
 
 impl PyManifest {
@@ -110,16 +129,21 @@ impl PyManifest {
             scalar_fns: Vec::new(),
             aggregate_fns: Vec::new(),
             procedures: Vec::new(),
+            algorithms: Vec::new(),
         }
     }
 
     /// Reject a manifest with zero declared entries — would register
     /// nothing.
     pub fn validate_non_empty(&self) -> Result<(), PyPluginError> {
-        if self.scalar_fns.is_empty() && self.aggregate_fns.is_empty() && self.procedures.is_empty()
+        if self.scalar_fns.is_empty()
+            && self.aggregate_fns.is_empty()
+            && self.procedures.is_empty()
+            && self.algorithms.is_empty()
         {
             return Err(PyPluginError::ManifestInvalid(
-                "no scalar / aggregate / procedure entries were declared by decorators".into(),
+                "no scalar / aggregate / procedure / algorithm entries were declared by decorators"
+                    .into(),
             ));
         }
         Ok(())
@@ -177,6 +201,11 @@ impl ManifestBuilder {
         self.inner.lock().procedures.push(entry);
     }
 
+    /// Append a GraphCompute algorithm entry.
+    pub fn push_algorithm(&self, entry: PyAlgorithmEntry) {
+        self.inner.lock().algorithms.push(entry);
+    }
+
     /// Drain the builder into the accumulated [`PyManifest`].
     #[must_use]
     pub fn into_manifest(&self) -> PyManifest {
@@ -187,6 +216,6 @@ impl ManifestBuilder {
     #[must_use]
     pub fn entry_count(&self) -> usize {
         let m = self.inner.lock();
-        m.scalar_fns.len() + m.aggregate_fns.len() + m.procedures.len()
+        m.scalar_fns.len() + m.aggregate_fns.len() + m.procedures.len() + m.algorithms.len()
     }
 }

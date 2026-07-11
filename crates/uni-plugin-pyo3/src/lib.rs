@@ -53,6 +53,8 @@ pub mod error;
 #[cfg(feature = "pyo3")]
 pub mod adapter_aggregate;
 #[cfg(feature = "pyo3")]
+pub mod adapter_algorithm;
+#[cfg(feature = "pyo3")]
 pub mod adapter_procedure;
 #[cfg(feature = "pyo3")]
 pub mod adapter_scalar;
@@ -61,6 +63,8 @@ pub(crate) mod adapter_scalar_helpers;
 #[cfg(feature = "pyo3")]
 pub mod arrow_bridge;
 #[cfg(feature = "pyo3")]
+pub mod graph_compute;
+#[cfg(feature = "pyo3")]
 pub mod loader;
 #[cfg(feature = "pyo3")]
 pub mod manifest;
@@ -68,6 +72,8 @@ pub mod manifest;
 pub mod plugin_handle;
 #[cfg(feature = "pyo3")]
 pub mod runtime;
+#[cfg(feature = "pyo3")]
+pub mod watchdog;
 
 #[doc(inline)]
 pub use crate::error::PyPluginError;

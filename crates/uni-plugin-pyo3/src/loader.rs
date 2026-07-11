@@ -237,6 +237,14 @@ impl PyPluginLoader {
         } else {
             Vec::new()
         };
+        if effective.contains(&Capability::Algorithm) {
+            register_algorithms(
+                registrar,
+                Arc::clone(&runtime),
+                &resolved_id,
+                &manifest.algorithms,
+            )?;
+        }
 
         Ok(LoadOutcome {
             plugin_id: resolved_id,
@@ -466,7 +474,63 @@ fn derive_declared_capabilities(m: &PyManifest) -> CapabilitySet {
     if !m.procedures.is_empty() {
         set.insert(Capability::Procedure);
     }
+    if !m.algorithms.is_empty() {
+        // A GraphCompute algorithm needs three orthogonal grants (proposal
+        // §4.6): `Algorithm` to register, `GraphCompute` for the kernels, and
+        // `HostQuery` to project. Each is intersected with the host's grants.
+        set.insert(Capability::Algorithm);
+        set.insert(Capability::GraphCompute);
+        set.insert(Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        });
+    }
     set
+}
+
+fn register_algorithms(
+    registrar: &mut PluginRegistrar<'_>,
+    runtime: Arc<PyPluginRuntime>,
+    plugin_id: &PluginId,
+    entries: &[crate::manifest::PyAlgorithmEntry],
+) -> Result<Vec<String>, PyPluginError> {
+    use arrow_schema::Field;
+    use uni_plugin::traits::algorithm::AlgorithmSignature;
+
+    let mut registered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Yields are declared `"name:type"` (e.g. `"score:float"`) so the
+        // emitted column and the special `nodeId` column bind by name.
+        let output_fields: Vec<Field> = entry
+            .yields
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let (name, type_name) = match spec.split_once(':') {
+                    Some((n, t)) => (n.trim().to_string(), t.trim()),
+                    None => (format!("col{i}"), spec.as_str()),
+                };
+                let dt = type_name_to_datatype(type_name)?;
+                Ok(Field::new(name, dt, false))
+            })
+            .collect::<Result<_, PyPluginError>>()?;
+        let sig = AlgorithmSignature {
+            output_fields,
+            docs: String::new(),
+        };
+
+        let local_name = entry.name.clone();
+        let qname = QName::new(plugin_id.as_str(), local_name.clone());
+        let callable = Python::attach(|py| entry.callable.clone_ref(py));
+        runtime.insert(local_name.clone(), callable);
+        let adapter =
+            crate::adapter_algorithm::PyAlgorithm::new(Arc::clone(&runtime), local_name, sig);
+        registrar
+            .algorithm(qname.clone(), Arc::new(adapter))
+            .map_err(PyPluginError::from)?;
+        registered.push(qname.to_string());
+    }
+    Ok(registered)
 }
 
 fn intersect_caps(
@@ -621,6 +685,19 @@ impl PyDecoratorSink {
         make_procedure_trampoline(py, Arc::clone(&self.builder), name, args, yields, mode)
     }
 
+    /// `@db.algorithm(name, args=[...], yields=[...])` — a GraphCompute algorithm
+    /// whose function receives an injected `GcSession` as its first argument.
+    #[pyo3(signature = (name, args, yields))]
+    fn algorithm(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        yields: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        make_algorithm_trampoline(py, Arc::clone(&self.builder), name, args, yields)
+    }
+
     /// `db.set_plugin_id("ai.example.geo")` — overrides the default
     /// id resolved by the loader.
     fn set_plugin_id(&self, id: String) {
@@ -726,6 +803,25 @@ pub fn make_procedure_trampoline(
     Ok(Py::new(py, trampoline)?.into_any())
 }
 
+/// Build an algorithm-fn decorator trampoline (mirrors the procedure one).
+///
+/// # Errors
+/// Returns a `PyErr` if `args`/`yields` cannot be coerced to lists of strings.
+#[doc(hidden)]
+pub fn make_algorithm_trampoline(
+    py: Python<'_>,
+    builder: Arc<ManifestBuilder>,
+    name: String,
+    args: Bound<'_, PyAny>,
+    yields: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let args_vec = extract_args_list(&args)?;
+    let yields_vec = extract_args_list(&yields)?;
+    let trampoline =
+        PyDecoratorTrampoline::new_algorithm(builder, SmolStr::new(&name), args_vec, yields_vec);
+    Ok(Py::new(py, trampoline)?.into_any())
+}
+
 fn extract_args_list(obj: &Bound<'_, PyAny>) -> PyResult<Vec<SmolStr>> {
     // Accept any iterable of strings (list / tuple / generator / ...).
     let mut out = Vec::new();
@@ -760,6 +856,7 @@ enum TrampolineKind {
     Scalar,
     Aggregate,
     Procedure,
+    Algorithm,
 }
 
 impl PyDecoratorTrampoline {
@@ -823,6 +920,25 @@ impl PyDecoratorTrampoline {
             determinism: SmolStr::default(),
         }
     }
+
+    fn new_algorithm(
+        builder: Arc<ManifestBuilder>,
+        name: SmolStr,
+        args: Vec<SmolStr>,
+        yields: Vec<SmolStr>,
+    ) -> Self {
+        Self {
+            kind: TrampolineKind::Algorithm,
+            builder,
+            name,
+            args,
+            yields,
+            returns: SmolStr::default(),
+            mode: SmolStr::default(),
+            vectorized: false,
+            determinism: SmolStr::default(),
+        }
+    }
 }
 
 #[pymethods]
@@ -866,6 +982,15 @@ impl PyDecoratorTrampoline {
                     callable: target.clone_ref(py),
                 };
                 self.builder.push_procedure(entry);
+            }
+            TrampolineKind::Algorithm => {
+                let entry = crate::manifest::PyAlgorithmEntry {
+                    name: self.name.clone(),
+                    args: self.args.clone(),
+                    yields: self.yields.clone(),
+                    callable: target.clone_ref(py),
+                };
+                self.builder.push_algorithm(entry);
             }
         }
         // Decorators must return the wrapped target unchanged so user

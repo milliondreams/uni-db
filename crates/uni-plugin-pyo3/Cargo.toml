@@ -13,6 +13,11 @@ categories = ["database"]
 
 [dependencies]
 uni-plugin = { workspace = true }
+# GraphCompute kernel catalog driven by guest Python algorithms (pyo3 feature).
+# No cycle: uni-plugin-builtin does not depend on this crate.
+uni-plugin-builtin = { workspace = true, optional = true }
+uni-common = { workspace = true, optional = true }
+uni-algo = { workspace = true, optional = true }
 # `ffi` enables `arrow_array::ffi` / `arrow_schema::ffi` — the C Data
 # Interface types we use to bridge to PyArrow via the Arrow PyCapsule
 # protocol. pyo3-arrow is NOT a dep: its 0.15.x line needs buffer-protocol
@@ -48,7 +53,7 @@ pyo3 = { version = "0.29", optional = true, features = ["abi3-py310", "auto-init
 
 [features]
 default = []
-pyo3 = ["dep:pyo3"]
+pyo3 = ["dep:pyo3", "dep:uni-plugin-builtin", "dep:uni-common", "dep:uni-algo"]
 
 [dev-dependencies]
 tokio = { workspace = true }

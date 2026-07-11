@@ -38,3 +38,12 @@ pub mod procedure {
         path: "wit",
     });
 }
+
+/// GraphCompute algorithm plugin world. The guest drives coarse kernels
+/// through the imported `host-graph` interface and emits its result.
+pub mod algorithm {
+    wasmtime::component::bindgen!({
+        world: "algorithm-plugin",
+        path: "wit",
+    });
+}

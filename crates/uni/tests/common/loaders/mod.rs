@@ -8,6 +8,7 @@ pub mod extism_graph_compute;
 pub mod m8_pyo3_cross_loader_parity;
 pub mod m8_pyo3_load_e2e;
 pub mod pyo3_graph_compute;
+pub mod wasm_graph_compute;
 pub mod m8_pyo3_session_scope;
 pub mod multi_version_abi;
 pub mod req2_req4_rhai_cypher;

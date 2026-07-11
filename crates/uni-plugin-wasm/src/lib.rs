@@ -58,6 +58,8 @@ pub mod adapter;
 #[cfg(feature = "wasmtime-runtime")]
 pub mod adapter_aggregate;
 #[cfg(feature = "wasmtime-runtime")]
+pub mod adapter_algorithm;
+#[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod adapter_common;
 #[cfg(feature = "wasmtime-runtime")]
 pub mod adapter_procedure;

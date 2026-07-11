@@ -106,6 +106,43 @@ pub fn build_scalar_linker_v1(
     {
         add_host_net(&mut linker)?;
     }
+    // `host-graph` is added here too (when granted) so the bootstrap pass — which
+    // instantiates any plugin against the scalar linker to read its `manifest` /
+    // `register` exports — can satisfy an algorithm component's `host-graph`
+    // import. The algorithm pool uses its own linker for the invoke path.
+    if effective_caps
+        .iter()
+        .any(|c| matches!(c, Capability::GraphCompute))
+    {
+        add_host_graph(&mut linker)?;
+    }
+    Ok(linker)
+}
+
+/// Build the `Linker<HostState>` for the `algorithm-plugin` world.
+///
+/// Adds WASI + `host-log` + `host-trace-context` like the other worlds, plus the
+/// capability-gated `host-graph` interface when `Capability::GraphCompute` is
+/// granted. A guest importing `host-graph` without the grant fails at
+/// instantiate (structural enforcement), exactly like `host-net`.
+///
+/// # Errors
+/// [`WasmError::Instantiate`] if any host-fn registration fails.
+pub fn build_algorithm_linker_v1(
+    engine: &Engine,
+    effective_caps: &uni_plugin::CapabilitySet,
+) -> Result<Linker<HostState>, WasmError> {
+    let mut linker = Linker::<HostState>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|e| WasmError::Instantiate(format!("link wasi: {e}")))?;
+    add_host_log(&mut linker)?;
+    add_host_trace_context(&mut linker)?;
+    if effective_caps
+        .iter()
+        .any(|c| matches!(c, Capability::GraphCompute))
+    {
+        add_host_graph(&mut linker)?;
+    }
     Ok(linker)
 }
 
@@ -220,6 +257,36 @@ fn add_host_net(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
             },
         )
         .map_err(|e| WasmError::Instantiate(format!("link host-net http-post: {e}")))?;
+    Ok(())
+}
+
+/// Add the capability-gated `uni:plugin/host-graph` interface.
+///
+/// The single `graph-call` function dispatches one GraphCompute kernel call
+/// through the session registry on `HostState`, returning the JSON response.
+/// Per-kernel errors are reported in-band inside the JSON (never a WIT-level
+/// error), so only a missing registry surfaces as `fn-error` (proposal §5.4).
+fn add_host_graph(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    let mut instance = linker
+        .instance("uni:plugin/host-graph@0.1.0")
+        .map_err(|e| WasmError::Instantiate(format!("link host-graph instance: {e}")))?;
+    instance
+        .func_wrap(
+            "graph-call",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (req,): (String,)|
+             -> wasmtime::Result<(Result<String, WasmFnError>,)> {
+                let result = match &store.data().graph {
+                    Some(registry) => Ok(registry.call_json(&req)),
+                    None => Err(fn_err(
+                        0x86C,
+                        "host-graph: no GraphCompute registry configured",
+                    )),
+                };
+                Ok((result,))
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(format!("link host-graph graph-call: {e}")))?;
     Ok(())
 }
 

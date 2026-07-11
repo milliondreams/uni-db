@@ -140,6 +140,7 @@ mod tests {
             kms,
             secrets: None,
             http: None,
+            graph: None,
         }
     }
 

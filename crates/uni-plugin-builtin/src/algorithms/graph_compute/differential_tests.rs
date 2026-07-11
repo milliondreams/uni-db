@@ -987,7 +987,7 @@ fn p0_8_kernels_charge_their_exact_work() {
     let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
 
     let mut last = s.work_spent();
-    let mut charged = |s: &AlgoSession, last: &mut u64| -> u64 {
+    let charged = |s: &AlgoSession, last: &mut u64| -> u64 {
         let now = s.work_spent();
         let delta = now - *last;
         *last = now;

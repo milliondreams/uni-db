@@ -619,10 +619,11 @@ pub fn check_dense_vector_value(
 /// Validates a value against a declared `BinaryVector(dimensions)` column.
 ///
 /// The binary-vector companion to [`check_dense_vector_value`]: `dimensions` is
-/// the number of `u8` lanes. Accepts a [`Value::BinaryVector`] of exactly that
-/// many bytes, or the literal input form — a [`Value::List`] of exactly that
-/// many integers each in `[0, 255]` (coerced to bytes by the write path).
-/// [`Value::Null`] passes.
+/// the number of `u8` lanes. Accepts a [`Value::BinaryVector`](crate::value::Value::BinaryVector)
+/// of exactly that many bytes, or the literal input form — a
+/// [`Value::List`](crate::value::Value::List) of exactly that many integers each
+/// in `[0, 255]` (coerced to bytes by the write path).
+/// [`Value::Null`](crate::value::Value::Null) passes.
 ///
 /// # Errors
 /// Returns [`VectorDimError::WrongLength`] on a lane-count mismatch,

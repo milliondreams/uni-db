@@ -13,6 +13,12 @@ categories = ["database"]
 
 [dependencies]
 uni-plugin = { workspace = true }
+# GraphCompute kernel catalog (AlgoSession, kernels, first-party algorithms)
+# that guest Rhai algorithms drive. No cycle: uni-plugin-builtin does not
+# depend on this crate.
+uni-plugin-builtin = { workspace = true }
+uni-common = { workspace = true }
+uni-algo = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

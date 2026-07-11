@@ -55,13 +55,17 @@ pub mod adapter;
 #[cfg(feature = "rhai-runtime")]
 pub mod adapter_aggregate;
 #[cfg(feature = "rhai-runtime")]
-pub mod adapter_procedure;
+pub mod adapter_algorithm;
 #[cfg(feature = "rhai-runtime")]
+pub mod adapter_procedure;
+
 pub mod columns;
+
 #[cfg(feature = "rhai-runtime")]
 pub mod dynamic_bridge;
 #[cfg(feature = "rhai-runtime")]
 pub mod engine;
+pub mod graph_compute;
 #[cfg(feature = "rhai-runtime")]
 pub mod loader;
 #[cfg(feature = "rhai-runtime")]

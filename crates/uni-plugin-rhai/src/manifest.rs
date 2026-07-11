@@ -48,6 +48,24 @@ pub struct RhaiManifest {
     pub aggregate_fns: Vec<AggregateEntry>,
     /// Declared procedures.
     pub procedures: Vec<ProcedureEntry>,
+    /// Declared GraphCompute algorithms.
+    pub algorithms: Vec<AlgorithmEntry>,
+}
+
+/// One GraphCompute algorithm entry.
+///
+/// Mirrors [`ProcedureEntry`] but its guest function receives a `GcSession`
+/// handle as its first argument and drives the coarse kernels, emitting its
+/// result via `session.emit(...)` rather than returning row maps (proposal
+/// §4.6). The declared `yields` become the `AlgorithmSignature::output_fields`.
+#[derive(Debug, Clone)]
+pub struct AlgorithmEntry {
+    /// Algorithm name (also the Rhai callable driven per invocation).
+    pub name: String,
+    /// Argument type names, excluding the leading injected `GcSession`.
+    pub args: Vec<String>,
+    /// Yielded columns (in declaration order).
+    pub yields: Vec<YieldField>,
 }
 
 /// One scalar fn entry from the Rhai manifest.
@@ -138,6 +156,7 @@ pub fn parse_manifest(engine: &Engine, ast: &AST) -> Result<RhaiManifest, RhaiEr
     let scalar_fns = parse_scalar_entries(&map)?;
     let aggregate_fns = parse_aggregate_entries(&map)?;
     let procedures = parse_procedure_entries(&map)?;
+    let algorithms = parse_algorithm_entries(&map)?;
 
     Ok(RhaiManifest {
         id,
@@ -146,6 +165,7 @@ pub fn parse_manifest(engine: &Engine, ast: &AST) -> Result<RhaiManifest, RhaiEr
         scalar_fns,
         aggregate_fns,
         procedures,
+        algorithms,
     })
 }
 
@@ -206,6 +226,16 @@ fn parse_procedure_entries(map: &Map) -> Result<Vec<ProcedureEntry>, RhaiError> 
             args: required_string_array(m, "args")?,
             yields: parse_yield_fields(m)?,
             mode: optional_string(m, "mode").unwrap_or_else(|| "read".into()),
+        })
+    })
+}
+
+fn parse_algorithm_entries(map: &Map) -> Result<Vec<AlgorithmEntry>, RhaiError> {
+    parse_entry_array(map, "algorithms", |m| {
+        Ok(AlgorithmEntry {
+            name: required_string(m, "name")?,
+            args: required_string_array(m, "args")?,
+            yields: parse_yield_fields(m)?,
         })
     })
 }

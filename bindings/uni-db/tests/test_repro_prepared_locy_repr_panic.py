@@ -10,8 +10,6 @@
 # This test constructs the exact input that tripped the old byte-slice and
 # asserts the repr now returns a clean truncated string instead of panicking.
 
-import pytest
-
 import uni_db
 
 
@@ -24,7 +22,7 @@ def test_prepared_locy_repr_truncates_on_char_boundary():
     # boundary. pad=9 places 'é' exactly at byte 59 for this template — the old
     # `&t[..60]` slice landed mid-codepoint here and panicked.
     name = "x" * 9 + "é" + "y"
-    prog = "CREATE RULE r AS MATCH (a:Person) WHERE a.name = '%s' YIELD KEY a" % name
+    prog = f"CREATE RULE r AS MATCH (a:Person) WHERE a.name = '{name}' YIELD KEY a"
     encoded = prog.encode()
     assert encoded.find(b"\xc3\xa9") == 59  # é starts at 59 => byte 60 mid-char
 

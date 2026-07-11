@@ -61,6 +61,8 @@ pub mod adapter;
 #[cfg(feature = "extism-runtime")]
 pub mod adapter_aggregate;
 #[cfg(feature = "extism-runtime")]
+pub mod adapter_algorithm;
+#[cfg(feature = "extism-runtime")]
 pub mod adapter_common;
 #[cfg(feature = "extism-runtime")]
 pub mod adapter_procedure;

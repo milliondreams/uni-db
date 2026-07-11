@@ -1,0 +1,35 @@
+# Standalone example Extism plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-extism-graph
+#   cargo build --target wasm32-unknown-unknown --release
+#
+# Produces target/wasm32-unknown-unknown/release/example_extism_graph.wasm.
+#
+# A GraphCompute guest algorithm: Personalized PageRank driven entirely through
+# the `uni_graph_call` host fn (one JSON kernel call per op). Load with a
+# CapabilitySet granting `graph-compute` + `host-query` and a session registry
+# wired via `ExtismLoader::with_graph`.
+[workspace]
+
+[package]
+name = "example-extism-graph"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Extism plugin: Personalized PageRank via the GraphCompute host fn"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

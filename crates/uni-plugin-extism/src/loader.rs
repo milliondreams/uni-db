@@ -117,6 +117,8 @@ pub struct ExtismLoader {
     secrets: Option<std::sync::Arc<uni_plugin::secrets::SecretStore>>,
     /// Optional HTTP egress backing `uni_http_*`.
     http: Option<std::sync::Arc<dyn uni_plugin::HttpEgress>>,
+    /// Optional GraphCompute session registry backing `uni_graph_call`.
+    graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 impl std::fmt::Debug for ExtismLoader {
@@ -222,6 +224,24 @@ impl ExtismLoader {
         self
     }
 
+    /// Attach a GraphCompute session registry backing `uni_graph_call`.
+    #[must_use]
+    pub fn with_graph(
+        mut self,
+        registry: uni_plugin_builtin::algorithms::graph_compute::SharedRegistry,
+    ) -> Self {
+        self.graph = Some(registry);
+        self
+    }
+
+    /// Shared access to the GraphCompute registry, if configured.
+    #[must_use]
+    pub fn graph_registry(
+        &self,
+    ) -> Option<&uni_plugin_builtin::algorithms::graph_compute::SharedRegistry> {
+        self.graph.as_ref()
+    }
+
     /// The host-fn map for a single load: the static `runtime_fns` plus the
     /// per-load capability-gated service functions (`uni_kms_*`,
     /// `uni_secret_acquire`, `uni_http_*`).
@@ -243,6 +263,7 @@ impl ExtismLoader {
             kms: self.kms.clone(),
             secrets: self.secrets.clone(),
             http: self.http.clone(),
+            graph: self.graph.clone(),
         };
         for name in &prepared.allowed_host_fns {
             if fns.contains_key(name) {
@@ -518,6 +539,30 @@ impl ExtismLoader {
                         })?;
                     procedures_registered.push(qname);
                 }
+                crate::exports::RegistrationEntry::Algorithm {
+                    qname,
+                    args: _,
+                    yields,
+                } => {
+                    let parsed_qname = parse_entry_qname(&qname)?;
+                    let registry = self.graph.clone().ok_or_else(|| {
+                        ExtismError::Internal(format!(
+                            "algorithm `{qname}` needs a GraphCompute registry \
+                             (call ExtismLoader::with_graph)"
+                        ))
+                    })?;
+                    let sig = build_algorithm_signature(&yields)?;
+                    let adapter =
+                        std::sync::Arc::new(crate::adapter_algorithm::ExtismAlgorithm::new(
+                            std::sync::Arc::clone(&pool),
+                            registry,
+                            parsed_qname.clone(),
+                            sig,
+                        ));
+                    registrar.algorithm(parsed_qname, adapter).map_err(|e| {
+                        ExtismError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
+                    })?;
+                }
             }
         }
 
@@ -546,6 +591,37 @@ impl ExtismLoader {
 fn parse_entry_qname(qname: &str) -> Result<uni_plugin::QName, ExtismError> {
     uni_plugin::QName::parse(qname)
         .map_err(|e| ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}")))
+}
+
+/// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
+fn build_algorithm_signature(
+    yields: &[String],
+) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, ExtismError> {
+    use arrow_schema::{DataType, Field};
+    let output_fields: Vec<Field> = yields
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let (name, type_name) = match spec.split_once(':') {
+                Some((n, t)) => (n.trim().to_string(), t.trim()),
+                None => (format!("col{i}"), spec.as_str()),
+            };
+            let dt = match type_name.to_ascii_lowercase().as_str() {
+                "int" | "integer" | "i64" => DataType::Int64,
+                "float" | "double" | "f64" => DataType::Float64,
+                other => {
+                    return Err(ExtismError::OutputDecode(format!(
+                        "algorithm yield type `{other}` unsupported (int/float)"
+                    )));
+                }
+            };
+            Ok(Field::new(name, dt, false))
+        })
+        .collect::<Result<_, ExtismError>>()?;
+    Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
+        output_fields,
+        docs: String::new(),
+    })
 }
 
 /// Build an `extism::Plugin` from owned-data inputs.

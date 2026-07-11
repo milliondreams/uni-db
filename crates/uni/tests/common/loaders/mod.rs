@@ -4,6 +4,7 @@ pub mod m6_cross_abi_parity;
 pub mod m6a3_authz_write_verbs;
 pub mod m7_rhai_cross_loader_parity;
 pub mod m7_rhai_load_e2e;
+pub mod extism_graph_compute;
 pub mod m8_pyo3_cross_loader_parity;
 pub mod m8_pyo3_load_e2e;
 pub mod pyo3_graph_compute;

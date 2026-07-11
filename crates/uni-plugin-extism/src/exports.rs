@@ -116,6 +116,18 @@ pub enum RegistrationEntry {
         #[serde(default = "default_proc_mode")]
         mode: String,
     },
+    /// A GraphCompute algorithm. Its guest export drives the coarse kernels via
+    /// the `uni_graph_call` host fn and emits its per-vertex result (proposal
+    /// §4.6). `yields` become the `AlgorithmSignature::output_fields`.
+    Algorithm {
+        /// Fully-qualified name.
+        qname: String,
+        /// Argument signatures (excluding the injected session id).
+        args: Vec<WireArgType>,
+        /// Yielded columns as `"name:type"` strings (e.g. `"score:float"`), so
+        /// the emitted column and the special `nodeId` column bind by name.
+        yields: Vec<String>,
+    },
 }
 
 fn default_proc_mode() -> String {
@@ -129,7 +141,8 @@ impl RegistrationEntry {
         match self {
             Self::Scalar { qname, .. }
             | Self::Aggregate { qname, .. }
-            | Self::Procedure { qname, .. } => qname,
+            | Self::Procedure { qname, .. }
+            | Self::Algorithm { qname, .. } => qname,
         }
     }
 }

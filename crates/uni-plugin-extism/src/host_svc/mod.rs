@@ -34,9 +34,13 @@ use uni_plugin::{Capability, CapabilitySet, FnError, HttpEgress, KmsProvider};
 use crate::host_fns::HostFnSpec;
 use crate::loader::ExtismLoader;
 
+pub mod graph;
 pub mod kms;
 pub mod net;
 pub mod secret;
+
+/// Import name for the GraphCompute kernel dispatch host fn.
+pub(crate) const FN_GRAPH_CALL: &str = "uni_graph_call";
 
 /// Import name for `uni.kms.sign`.
 pub(crate) const FN_KMS_SIGN: &str = "uni_kms_sign";
@@ -64,6 +68,8 @@ pub(crate) struct HostSvcCtx {
     pub secrets: Option<Arc<SecretStore>>,
     /// HTTP egress backing `uni.http.*`.
     pub http: Option<Arc<dyn HttpEgress>>,
+    /// GraphCompute session registry backing `uni_graph_call`.
+    pub graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 /// Lowercase hex encoding for the JSON wire boundary.
@@ -175,6 +181,13 @@ pub(crate) fn build_service_fn(name: &str, ctx: &HostSvcCtx) -> Option<Function>
             UserData::new(ctx.clone()),
             net::uni_http_post,
         ),
+        FN_GRAPH_CALL => Function::new(
+            FN_GRAPH_CALL,
+            [ValType::I64],
+            [ValType::I64],
+            UserData::new(ctx.clone()),
+            graph::uni_graph_call,
+        ),
         _ => return None,
     };
     Some(f)
@@ -218,6 +231,11 @@ pub fn register_default_host_svc(loader: &mut ExtismLoader) {
             FN_HTTP_POST,
             Capability::Network { allow: Vec::new() },
             "HTTP POST against a URL in the granted allow-list.",
+        ),
+        (
+            FN_GRAPH_CALL,
+            Capability::GraphCompute,
+            "Dispatch one GraphCompute kernel call (JSON in / JSON out).",
         ),
     ];
     for (name, cap, docs) in specs {
@@ -275,12 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn register_default_host_svc_registers_five_specs() {
+    fn register_default_host_svc_registers_six_specs() {
         let mut loader = ExtismLoader::new();
         register_default_host_svc(&mut loader);
-        assert_eq!(loader.host_fns().len(), 5);
+        assert_eq!(loader.host_fns().len(), 6);
         assert!(loader.host_fns().get(FN_KMS_SIGN).is_some());
         assert!(loader.host_fns().get(FN_HTTP_POST).is_some());
+        assert!(loader.host_fns().get(FN_GRAPH_CALL).is_some());
     }
 
     #[test]
@@ -290,6 +309,7 @@ mod tests {
             kms: None,
             secrets: None,
             http: None,
+            graph: None,
         };
         assert!(build_service_fn("not_a_service_fn", &ctx).is_none());
         assert!(build_service_fn(FN_KMS_SIGN, &ctx).is_some());

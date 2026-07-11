@@ -789,6 +789,187 @@ fn e5_ppr_is_deterministic_across_runs() {
     );
 }
 
+// ---- W5 · metamorphic properties (M-1, M-3, M-4, M-5) --------------------
+
+/// M-1 relabel invariance: permuting the vertex ids permutes the PPR result
+/// identically — the strongest determinism/labeling test (proposal §9.1).
+#[test]
+fn m1_ppr_is_relabel_invariant() {
+    // Base graph and a relabeling that maps id `x` -> `perm[x]`.
+    let base_nodes = vec![0u64, 1, 2, 3, 4];
+    let base_edges = vec![
+        (0, 1, 1.0),
+        (1, 2, 1.0),
+        (2, 0, 1.0),
+        (2, 3, 1.0),
+        (3, 4, 1.0),
+    ];
+    // A bijection on the ids (10 + reversal), so slot order differs from ids.
+    let relabel = |x: u64| 100 + (4 - x);
+    let re_nodes: Vec<u64> = base_nodes.iter().map(|&x| relabel(x)).collect();
+    let re_edges: Vec<(u64, u64, f64)> = base_edges
+        .iter()
+        .map(|&(u, v, w)| (relabel(u), relabel(v), w))
+        .collect();
+
+    let score_of = |nodes: &[u64], edges: &[(u64, u64, f64)], seed: u64| -> HashMap<u64, u64> {
+        let (mut s, g) = session_with(build_projection(nodes, edges, false, false));
+        let rank =
+            personalized_pagerank(&mut s, g, &[Vid::new(seed)], 0.85, 80, 1e-12, true).unwrap();
+        let vals = read_tensor(&s, rank);
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(slot, &vid)| (vid, vals[slot].to_bits()))
+            .collect()
+    };
+
+    let base = score_of(&base_nodes, &base_edges, 0);
+    let relabeled = score_of(&re_nodes, &re_edges, relabel(0));
+    // Each original vertex's score must equal its relabeled counterpart, bitwise.
+    for &x in &base_nodes {
+        assert_eq!(
+            base[&x],
+            relabeled[&relabel(x)],
+            "PPR score for id {x} must be invariant under relabeling"
+        );
+    }
+}
+
+/// M-3 reachability monotonicity: adding an edge never shrinks the reachable set
+/// (proposal §9.1).
+#[test]
+fn m3_reachability_is_monotone_under_edge_addition() {
+    let nodes = vec![0, 1, 2, 3, 4];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0)];
+    let reach = |edges: &[(u64, u64, f64)]| -> HashSet<u64> {
+        let (mut s, g) = session_with(build_projection(&nodes, edges, false, true));
+        let set = reachable_set(&mut s, g, &[Vid::new(0)], Direction::Out).unwrap();
+        let mut out = HashSet::new();
+        for &vid in &nodes {
+            let f = s.frontier(g, &[Vid::new(vid)]).unwrap();
+            if s.set_intersect(set, f).and_then(|h| s.set_len(h)).unwrap() > 0 {
+                out.insert(vid);
+            }
+            s.free(f).unwrap();
+        }
+        out
+    };
+    let before = reach(&edges);
+    let mut more = edges.clone();
+    more.push((2, 3, 1.0)); // opens a new vertex
+    let after = reach(&more);
+    assert!(
+        before.is_subset(&after),
+        "reachable set must only grow: {before:?} !⊆ {after:?}"
+    );
+    assert!(after.contains(&3), "the new edge must expose vertex 3");
+}
+
+/// M-4 mask fusion: `spmv(mask = m)` equals `spmv` then filter-by-`m`
+/// (proposal §9.1, the fused-mask optimization must be transparent).
+#[test]
+fn m4_spmv_mask_fuses_with_filter() {
+    use super::session::{Direction, GraphCompute, Semiring};
+
+    let nodes = vec![0, 1, 2, 3];
+    let edges = vec![(0, 1, 1.0), (0, 2, 1.0), (1, 3, 1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+    // A uniform source vector.
+    let ones = s.vertex_ids(g).unwrap();
+    let src = s
+        .map_apply(ones, super::session::MapOp::AxPlusB(0.0, 1.0))
+        .unwrap();
+    s.free(ones).unwrap();
+    // Mask = {slot 3}.
+    let mask = s.frontier(g, &[Vid::new(3)]).unwrap();
+
+    // (a) fused: spmv with the mask applied inside.
+    let fused = s
+        .spmv(g, src, Semiring::LinearAlgebra, Direction::Out, Some(mask))
+        .unwrap();
+    // (b) unfused: spmv then zero out everything outside the mask via ewise-mul
+    // with the mask's indicator map.
+    let full = s
+        .spmv(g, src, Semiring::LinearAlgebra, Direction::Out, None)
+        .unwrap();
+    let indicator = s.set_to_map(mask, Scalar::F64(1.0)).unwrap();
+    let filtered = s
+        .ewise(full, indicator, super::session::EwiseOp::Mul)
+        .unwrap();
+
+    let a = read_tensor(&s, fused);
+    let b = read_tensor(&s, filtered);
+    for slot in 0..nodes.len() {
+        assert_eq!(
+            a[slot].to_bits(),
+            b[slot].to_bits(),
+            "fused vs filtered spmv differ at slot {slot}"
+        );
+    }
+}
+
+/// M-5 direction duality: `degrees(In)` on `G` equals `degrees(Out)` on the
+/// edge-reversed graph (proposal §9.1).
+#[test]
+fn m5_in_out_direction_duality() {
+    use super::session::{Direction, GraphCompute};
+
+    let nodes = vec![0, 1, 2, 3];
+    let edges = vec![(0, 1, 1.0), (0, 2, 1.0), (1, 3, 1.0)];
+    let reversed: Vec<(u64, u64, f64)> = edges.iter().map(|&(u, v, w)| (v, u, w)).collect();
+
+    let indeg = {
+        let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+        let d = s.degrees(g, Direction::In).unwrap();
+        read_tensor(&s, d).to_vec()
+    };
+    let outdeg_rev = {
+        let (mut s, g) = session_with(build_projection(&nodes, &reversed, false, true));
+        let d = s.degrees(g, Direction::Out).unwrap();
+        read_tensor(&s, d).to_vec()
+    };
+    assert_eq!(
+        indeg, outdeg_rev,
+        "in-degree on G must equal out-degree on reverse(G)"
+    );
+}
+
+/// H-6 reclaim: freeing every handle returns the arena to zero live bytes and
+/// zero live handles — no leak across a long convergence run (proposal §9.2).
+#[test]
+fn h6_freeing_all_handles_reclaims_arena() {
+    use super::session::{Direction, GraphCompute, Semiring};
+
+    let nodes = vec![0, 1, 2, 3, 4];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 4, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+    assert_eq!(s.bytes_live(), 0, "a fresh session holds no value bytes");
+
+    let a = s.vertex_ids(g).unwrap();
+    let b = s.degrees(g, Direction::Out).unwrap();
+    let c = s
+        .spmv(g, a, Semiring::LinearAlgebra, Direction::Out, None)
+        .unwrap();
+    assert!(s.bytes_live() > 0, "allocations charge the arena");
+    // Four live handles: the bound graph (0 bytes) plus three value tensors.
+    assert_eq!(s.live_handles(), 4, "graph + three value handles are live");
+
+    s.free(a).unwrap();
+    s.free(b).unwrap();
+    s.free(c).unwrap();
+    assert_eq!(
+        s.bytes_live(),
+        0,
+        "freeing every value handle reclaims all bytes"
+    );
+    assert_eq!(
+        s.live_handles(),
+        1,
+        "only the zero-byte graph handle remains"
+    );
+}
+
 // ---- handle-security tests (H-1..H-7) ------------------------------------
 
 #[test]

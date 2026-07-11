@@ -246,6 +246,12 @@ impl AlgoSession {
         self.table.live_handles()
     }
 
+    /// Returns the arena bytes currently charged to live values (reclaim tests).
+    #[must_use]
+    pub fn bytes_live(&self) -> usize {
+        self.arena.bytes_live()
+    }
+
     /// Reads a tensor handle's values back out, for differential tests only.
     ///
     /// # Panics

@@ -24,7 +24,7 @@ use uni_plugin::errors::FnError;
 
 use super::error;
 use super::handle::{Handle, HandleKind, MAX_GENERATION};
-use super::value::{Tensor, VertexSet};
+use super::value::{Tensor, VertexSet, WalkMatrix};
 
 /// One slot in a per-kind slab: a generation plus an optional live value.
 #[derive(Debug)]
@@ -129,6 +129,7 @@ pub struct HandleTable {
     sets: Slab<VertexSet>,
     tensors: Slab<Tensor>,
     graphs: Slab<Arc<GraphProjection>>,
+    walks: Slab<WalkMatrix>,
 }
 
 impl HandleTable {
@@ -140,6 +141,7 @@ impl HandleTable {
             sets: Slab::default(),
             tensors: Slab::default(),
             graphs: Slab::default(),
+            walks: Slab::default(),
         }
     }
 
@@ -165,6 +167,12 @@ impl HandleTable {
     pub fn insert_graph(&mut self, graph: Arc<GraphProjection>) -> Handle {
         let (slot, generation) = self.graphs.insert(graph);
         Handle::pack(self.epoch, HandleKind::Graph, generation, slot)
+    }
+
+    /// Inserts a batch of random walks and returns its handle.
+    pub fn insert_walks(&mut self, walks: WalkMatrix) -> Handle {
+        let (slot, generation) = self.walks.insert(walks);
+        Handle::pack(self.epoch, HandleKind::Walks, generation, slot)
     }
 
     /// Validates the epoch and kind of `h`, returning the resolved kind.
@@ -212,6 +220,17 @@ impl HandleTable {
         }
     }
 
+    /// Resolves a walks handle.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
+    pub fn get_walks(&self, h: Handle) -> Result<&WalkMatrix, FnError> {
+        match self.check_epoch_and_kind(h)? {
+            HandleKind::Walks => self.walks.get(h.slot(), h.generation()),
+            _ => Err(error::kind_mismatch("Walks")),
+        }
+    }
+
     /// Frees any handle, returning the number of heap bytes reclaimed.
     ///
     /// Graph handles report zero bytes: the projection is shared behind an `Arc`
@@ -234,14 +253,21 @@ impl HandleTable {
                 let _ = self.graphs.free(h.slot(), h.generation())?;
                 Ok(0)
             }
-            HandleKind::Walks | HandleKind::Levels => Err(error::kind_mismatch("a v1 kind")),
+            HandleKind::Walks => {
+                let v = self.walks.free(h.slot(), h.generation())?;
+                Ok(v.heap_bytes())
+            }
+            HandleKind::Levels => Err(error::kind_mismatch("a supported kind")),
         }
     }
 
     /// Returns the total number of live handles across all kinds.
     #[must_use]
     pub fn live_handles(&self) -> usize {
-        self.sets.live_count() + self.tensors.live_count() + self.graphs.live_count()
+        self.sets.live_count()
+            + self.tensors.live_count()
+            + self.graphs.live_count()
+            + self.walks.live_count()
     }
 }
 

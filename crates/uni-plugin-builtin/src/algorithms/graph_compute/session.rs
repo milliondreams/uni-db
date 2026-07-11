@@ -17,26 +17,29 @@
 //! (proposal §5.4). Pure-functional kernels return a *new* handle and never
 //! mutate an input (proposal §4.1 / decision D6).
 //!
-//! # Phase 1 scope
+//! # Scope
 //! This ships kernel groups 0–6 and 8 (plumbing, sets, traversal, `spmv`, value
 //! maps, reductions, iteration control, and `emit`) — enough to author the F-row
-//! algorithms (PageRank/PPR, reachability, WCC, Bellman-Ford, HITS). The
-//! stochastic (`random_walks`) and starred kernels (`next_bucket`, `bfs_levels`,
-//! `reverse_accumulate`, `neighborhood_overlap`) are added in later phases
-//! (proposal §8).
+//! algorithms (PageRank/PPR, reachability, WCC, Bellman-Ford, HITS) — plus the
+//! stochastic `random_walks` (F-8, with `walk_visit_counts`) and the starred
+//! `neighborhood_overlap` (C-3) and `next_bucket` (C-1) kernels. The remaining
+//! starred Brandes primitives (`bfs_levels`, `reverse_accumulate`) are deferred;
+//! exact betweenness is available today via the native `uni.algo.betweenness`
+//! provider (proposal §8).
 //
 // Rust guideline compliant
 
 use std::sync::Arc;
 
 use uni_algo::algo::GraphProjection;
+use uni_algo::algo::algorithms::{Algorithm, RandomWalk, RandomWalkConfig};
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 
 use super::error;
 use super::handle::{Handle, HandleKind};
 use super::table::HandleTable;
-use super::value::{DType, Scalar, Tensor, VertexSet};
+use super::value::{DType, Scalar, Tensor, VertexSet, WalkMatrix};
 use super::{Arena, BUDGET_CHECK_CHUNK, WorkBudget};
 
 /// Which adjacency direction a traversal or `spmv` follows.
@@ -135,6 +138,17 @@ pub enum Semiring {
     LinearAlgebra,
     /// `(max, min)` — bottleneck / widest path.
     MinMax,
+}
+
+/// A neighbourhood-overlap similarity metric (proposal §8, C-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlapMetric {
+    /// `|N(u) ∩ N(v)| / |N(u) ∪ N(v)|`.
+    Jaccard,
+    /// `|N(u) ∩ N(v)| / min(|N(u)|, |N(v)|)`.
+    Overlap,
+    /// `|N(u) ∩ N(v)| / sqrt(|N(u)| · |N(v)|)`.
+    Cosine,
 }
 
 /// A per-invocation GraphCompute session: handle table, budget, arena, sink.
@@ -287,6 +301,12 @@ impl AlgoSession {
     fn alloc_set(&mut self, set: VertexSet) -> Result<Handle, FnError> {
         self.reserve(set.heap_bytes())?;
         Ok(self.table.insert_set(set))
+    }
+
+    /// Charges the arena and inserts a walk batch, returning its handle.
+    fn alloc_walks(&mut self, walks: WalkMatrix) -> Result<Handle, FnError> {
+        self.reserve(walks.heap_bytes())?;
+        Ok(self.table.insert_walks(walks))
     }
 }
 
@@ -472,6 +492,63 @@ pub trait GraphCompute {
     /// Returns `0x869` if a column is not a `[V]` map, or a typed [`FnError`] on
     /// a bad handle.
     fn emit(&mut self, cols: &[(&str, Handle)]) -> Result<(), FnError>;
+
+    /// Group 7 (F-8): samples `walks_per_node` random walks of length
+    /// `walk_length` from each seed (all vertices when `seeds` is empty).
+    ///
+    /// `p`/`q` are the node2vec return/in-out bias (both `1.0` = uniform); `seed`
+    /// makes the sampling deterministic. Returns a [`HandleKind::Walks`] handle.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an unmapped seed, or exhausted
+    /// resources.
+    #[allow(clippy::too_many_arguments, reason = "mirrors RandomWalkConfig fields")]
+    fn random_walks(
+        &mut self,
+        g: Handle,
+        walk_length: usize,
+        walks_per_node: usize,
+        seeds: &[Vid],
+        p: f64,
+        q: f64,
+        seed: u64,
+    ) -> Result<Handle, FnError>;
+
+    /// Group 7 (F-8): folds a walks handle into a per-vertex visit-count map.
+    ///
+    /// `counts[v]` is the number of times slot `v` appears across all walks — the
+    /// co-occurrence basis for DeepWalk/node2vec and an emittable `[V]` map.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or exhausted resources.
+    fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError>;
+
+    /// Starred (C-3): the per-vertex neighbourhood-overlap similarity to `source`.
+    ///
+    /// `overlap[v]` is the chosen [`OverlapMetric`] between the undirected
+    /// neighbourhoods of `source` and `v` (0 for `v = source`). One bulk kernel
+    /// over sorted adjacency; returns an emittable `[V]` map.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an unmapped source, or
+    /// exhausted resources.
+    fn neighborhood_overlap(
+        &mut self,
+        g: Handle,
+        source: Vid,
+        metric: OverlapMetric,
+    ) -> Result<Handle, FnError>;
+
+    /// Starred (C-1): the Δ-stepping frontier — vertices whose distance lies in
+    /// `[bucket · delta, (bucket + 1) · delta)`.
+    ///
+    /// A bucket primitive over a distance `[V]` map (e.g. from Bellman-Ford):
+    /// returns the vertex set for the next bucket to relax. Infinite distances
+    /// never fall in a finite bucket.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or exhausted resources.
+    fn next_bucket(&mut self, dist: Handle, delta: f64, bucket: u32) -> Result<Handle, FnError>;
 }
 
 impl GraphCompute for AlgoSession {
@@ -1122,4 +1199,160 @@ impl GraphCompute for AlgoSession {
         self.emitted = captured;
         Ok(())
     }
+
+    fn random_walks(
+        &mut self,
+        g: Handle,
+        walk_length: usize,
+        walks_per_node: usize,
+        seeds: &[Vid],
+        p: f64,
+        q: f64,
+        seed: u64,
+    ) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        // Validate every seed maps into the projection before doing any work.
+        for &vid in seeds {
+            if graph.to_slot(vid).is_none() {
+                return Err(error::seed_not_in_projection(vid.as_u64()));
+            }
+        }
+        // The native walker touches Σ walks · length edges; charge that up front.
+        let start_count = if seeds.is_empty() {
+            graph.vertex_count()
+        } else {
+            seeds.len()
+        };
+        self.charge((start_count * walks_per_node * walk_length.max(1)) as u64)?;
+
+        let config = RandomWalkConfig {
+            walk_length,
+            walks_per_node,
+            start_nodes: seeds.to_vec(),
+            return_param: p,
+            in_out_param: q,
+            seed: Some(seed),
+        };
+        let result = RandomWalk::run(&graph, config);
+        // Store walks as slot sequences (translate each Vid back to its slot).
+        let mut walks: Vec<Vec<u32>> = Vec::with_capacity(result.walks.len());
+        for walk in &result.walks {
+            let mut slots = Vec::with_capacity(walk.len());
+            for &vid in walk {
+                let slot = graph
+                    .to_slot(vid)
+                    .ok_or_else(|| error::seed_not_in_projection(vid.as_u64()))?;
+                slots.push(slot);
+            }
+            walks.push(slots);
+        }
+        self.alloc_walks(WalkMatrix::new(walks))
+    }
+
+    fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {
+        let n = self.table.get_graph(g)?.vertex_count();
+        let wm = self.table.get_walks(walks)?;
+        let total_steps: usize = wm.walks().iter().map(Vec::len).sum();
+        let mut counts = vec![0.0f64; n];
+        for walk in wm.walks() {
+            for &slot in walk {
+                counts[slot as usize] += 1.0;
+            }
+        }
+        self.charge(total_steps as u64)?;
+        self.alloc_tensor(Tensor::from_f64(counts))
+    }
+
+    fn neighborhood_overlap(
+        &mut self,
+        g: Handle,
+        source: Vid,
+        metric: OverlapMetric,
+    ) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let n = graph.vertex_count();
+        let src = graph
+            .to_slot(source)
+            .ok_or_else(|| error::seed_not_in_projection(source.as_u64()))?;
+        // Undirected neighbourhood of a slot: sorted, deduped out ∪ in neighbours.
+        let undirected = |u: u32| -> Vec<u32> {
+            let mut ns: Vec<u32> = graph.out_neighbors(u).to_vec();
+            if graph.has_reverse() {
+                ns.extend_from_slice(graph.in_neighbors(u));
+            }
+            ns.sort_unstable();
+            ns.dedup();
+            ns
+        };
+        let src_nbrs = undirected(src);
+        let mut out = vec![0.0f64; n];
+        // O(Σ_v (deg(src) + deg(v))) — charge each vertex's neighbourhood scan.
+        let mut charged = 0u64;
+        for v in 0..n as u32 {
+            if v == src {
+                continue;
+            }
+            let v_nbrs = undirected(v);
+            charged += (src_nbrs.len() + v_nbrs.len()) as u64;
+            let overlap = intersect_sorted_len(&src_nbrs, &v_nbrs) as f64;
+            let (du, dv) = (src_nbrs.len() as f64, v_nbrs.len() as f64);
+            out[v as usize] = match metric {
+                OverlapMetric::Jaccard => {
+                    let union = du + dv - overlap;
+                    if union == 0.0 { 0.0 } else { overlap / union }
+                }
+                OverlapMetric::Overlap => {
+                    let m = du.min(dv);
+                    if m == 0.0 { 0.0 } else { overlap / m }
+                }
+                OverlapMetric::Cosine => {
+                    let d = (du * dv).sqrt();
+                    if d == 0.0 { 0.0 } else { overlap / d }
+                }
+            };
+        }
+        self.charge(charged.max(n as u64))?;
+        self.alloc_tensor(Tensor::from_f64(out))
+    }
+
+    fn next_bucket(&mut self, dist: Handle, delta: f64, bucket: u32) -> Result<Handle, FnError> {
+        let t = self.table.get_tensor(dist)?;
+        if t.is_i64() {
+            return Err(error::shape_mismatch(
+                "next_bucket requires an f64 distance map",
+            ));
+        }
+        if delta.is_nan() || delta <= 0.0 {
+            return Err(error::shape_mismatch("next_bucket delta must be positive"));
+        }
+        let lo = f64::from(bucket) * delta;
+        let hi = lo + delta;
+        let n = t.len();
+        let mut set = VertexSet::with_capacity(n);
+        for (i, &d) in t.values().iter().enumerate() {
+            if d.is_finite() && d >= lo && d < hi {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "index bounded by tensor length which fits u32"
+                )]
+                set.insert(i as u32);
+            }
+        }
+        self.charge(n as u64)?;
+        self.alloc_set(set)
+    }
+}
+
+/// Branchless sorted-slice intersection size (mirrors `triangle_count`).
+fn intersect_sorted_len(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut count) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (va, vb) = (a[i], b[j]);
+        let le = va <= vb;
+        let ge = va >= vb;
+        count += usize::from(le && ge);
+        i += usize::from(le);
+        j += usize::from(ge);
+    }
+    count
 }

@@ -410,6 +410,53 @@ impl Tensor {
     }
 }
 
+/// A batch of sampled random walks, behind a [`HandleKind::Walks`] handle.
+///
+/// Each inner vector is one walk as a sequence of vertex *slots* (dense u32);
+/// walks may be shorter than the requested length when a walk hits a dead end.
+/// Produced by `random_walks` and consumed by reductions like
+/// `walk_visit_counts` (proposal §8, F-8). Slots (not external `Vid`s) are stored
+/// so a reduction can index per-vertex arrays directly.
+#[derive(Clone, Debug)]
+pub struct WalkMatrix {
+    walks: Vec<Vec<u32>>,
+}
+
+impl WalkMatrix {
+    /// Wraps a batch of slot-sequence walks.
+    #[must_use]
+    pub fn new(walks: Vec<Vec<u32>>) -> Self {
+        Self { walks }
+    }
+
+    /// Returns the walks as slot sequences.
+    #[must_use]
+    pub fn walks(&self) -> &[Vec<u32>] {
+        &self.walks
+    }
+
+    /// Returns the number of walks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.walks.len()
+    }
+
+    /// Returns `true` if there are no walks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.walks.is_empty()
+    }
+
+    /// Returns the number of bytes held live, for arena accounting.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.walks
+            .iter()
+            .map(|w| w.len() * std::mem::size_of::<u32>())
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

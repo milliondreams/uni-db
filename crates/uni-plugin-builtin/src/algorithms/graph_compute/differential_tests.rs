@@ -308,6 +308,148 @@ fn f4_ppr_matches_power_iteration_oracle() {
     }
 }
 
+// ---- W4 · new kernels (F-8 random_walks, C-3 overlap, C-1 next_bucket) ----
+
+/// `random_walks` is deterministic at a fixed seed and its visit counts land
+/// only on reachable vertices, summing to the total step count (F-8).
+#[test]
+fn random_walks_are_deterministic_and_visit_only_reachable() {
+    use super::session::GraphCompute;
+    use super::value::DType;
+
+    // Two disjoint triangles: {0,1,2} and {3,4,5}. Walks from 0 never reach the
+    // second component.
+    let nodes = vec![0, 1, 2, 3, 4, 5];
+    let edges = vec![
+        (0, 1, 1.0),
+        (1, 2, 1.0),
+        (2, 0, 1.0),
+        (3, 4, 1.0),
+        (4, 5, 1.0),
+        (5, 3, 1.0),
+    ];
+    let counts_at = |seed: u64| -> Vec<f64> {
+        let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+        let walks = s
+            .random_walks(g, 10, 4, &[Vid::new(0)], 1.0, 1.0, seed)
+            .unwrap();
+        let counts = s.walk_visit_counts(walks, g).unwrap();
+        let out = read_tensor(&s, counts);
+        out.to_vec()
+    };
+
+    let a = counts_at(0xABCD);
+    let b = counts_at(0xABCD);
+    assert_eq!(a, b, "same seed must reproduce identical visit counts");
+    // A different seed still stays within the reachable component.
+    let c = counts_at(0x1234);
+
+    // Reachable component is {0,1,2} (slots 0..=2); the rest are never visited.
+    for (slot, (&va, &vc)) in a.iter().zip(&c).enumerate() {
+        if slot >= 3 {
+            assert_eq!(va, 0.0, "unreachable slot {slot} must never be visited");
+            assert_eq!(vc, 0.0, "unreachable slot {slot} must never be visited");
+        }
+    }
+    // 4 walks of length 10 => 4 * 11 = 44 visited steps total (no dead ends in a
+    // cycle), matching the sum of counts.
+    let total: f64 = a.iter().sum();
+    assert_eq!(total, 44.0, "visit counts must sum to Σ walk lengths");
+    let _ = DType::F64; // dtype import kept for symmetry with sibling tests
+}
+
+/// `neighborhood_overlap` matches a naive sorted-set Jaccard oracle (C-3).
+#[test]
+fn neighborhood_overlap_matches_naive_jaccard() {
+    use super::session::{GraphCompute, OverlapMetric};
+
+    // Undirected-ish: 0-1, 0-2, 1-2, 1-3, 2-3, plus 4 isolated-ish (4-5).
+    let nodes = vec![0, 1, 2, 3, 4, 5];
+    let edges = vec![
+        (0, 1, 1.0),
+        (0, 2, 1.0),
+        (1, 2, 1.0),
+        (1, 3, 1.0),
+        (2, 3, 1.0),
+        (4, 5, 1.0),
+    ];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+    let overlap = s
+        .neighborhood_overlap(g, Vid::new(0), OverlapMetric::Jaccard)
+        .unwrap();
+    let got = read_tensor(&s, overlap);
+
+    // Naive undirected neighbourhoods.
+    let mut nbr: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for &(u, v, _) in &edges {
+        nbr.entry(u).or_default().insert(v);
+        nbr.entry(v).or_default().insert(u);
+    }
+    let empty = HashSet::new();
+    let n0 = nbr.get(&0).unwrap_or(&empty);
+    for (slot, &g_val) in got.iter().enumerate() {
+        let vid = vid_of_slot(&nodes, slot) as u64;
+        let want = if vid == 0 {
+            0.0
+        } else {
+            let nv = nbr.get(&vid).unwrap_or(&empty);
+            let inter = n0.intersection(nv).count() as f64;
+            let union = n0.union(nv).count() as f64;
+            if union == 0.0 { 0.0 } else { inter / union }
+        };
+        assert!(
+            (g_val - want).abs() < 1e-12,
+            "Jaccard for slot {slot}: got {g_val}, want {want}"
+        );
+    }
+}
+
+/// `next_bucket` selects exactly the vertices whose distance lies in the band.
+#[test]
+fn next_bucket_selects_the_distance_band() {
+    use super::session::{Direction, GraphCompute, Semiring};
+    use super::value::{DType, Scalar};
+
+    // A path 0->1->2->3 with unit weights: dist from 0 is [0,1,2,3].
+    let nodes = vec![0, 1, 2, 3];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+    // Build a distance map via Bellman-Ford-style relaxation to be safe: seed 0.
+    let base = s.zero_map(g, DType::F64).unwrap();
+    let inf = s
+        .map_apply(base, super::session::MapOp::AxPlusB(0.0, f64::INFINITY))
+        .unwrap();
+    s.free(base).unwrap();
+    let src = s.frontier(g, &[Vid::new(0)]).unwrap();
+    let mut dist = s.scatter(inf, src, Scalar::F64(0.0)).unwrap();
+    s.free(inf).unwrap();
+    s.free(src).unwrap();
+    for _ in 0..nodes.len() {
+        let relaxed = s
+            .spmv(g, dist, Semiring::ShortestPath, Direction::Out, None)
+            .unwrap();
+        let next = s
+            .ewise(dist, relaxed, super::session::EwiseOp::Min)
+            .unwrap();
+        s.free(relaxed).unwrap();
+        s.free(dist).unwrap();
+        dist = next;
+    }
+    // Bucket 1 with delta=1 => distances in [1,2): only slot 1.
+    let band = s.next_bucket(dist, 1.0, 1).unwrap();
+    let slot1 = s.frontier(g, &[Vid::new(1)]).unwrap();
+    let inter = s
+        .set_intersect(band, slot1)
+        .and_then(|h| s.set_len(h))
+        .unwrap();
+    assert_eq!(
+        s.set_len(band).unwrap(),
+        1,
+        "band [1,2) holds exactly one vertex"
+    );
+    assert_eq!(inter, 1, "and it is slot 1");
+}
+
 // ---- W4 · i64 exact path-counting (F-9) ----------------------------------
 
 /// Counts length-`k` walks from a source by repeated i64 `spmv` over the

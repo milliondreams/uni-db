@@ -32,9 +32,15 @@ use uni_plugin::errors::FnError;
 
 use super::handle::Handle;
 use super::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
+    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, OverlapMetric, Predicate, ReduceOp,
+    Semiring,
 };
 use super::value::Scalar;
+
+/// Serde default for the node2vec bias params (unbiased = 1.0).
+fn one_f64() -> f64 {
+    1.0
+}
 
 /// One kernel call from a guest, deserialized from the request JSON.
 ///
@@ -67,12 +73,27 @@ pub struct KernelRequest {
     /// A second scalar operand (e.g. the `b` of `map_apply` `AxPlusB(a, b)`).
     #[serde(default)]
     pub f2: f64,
-    /// A count operand (the `k` of `topk`).
+    /// A count operand (the `k` of `topk`, the `bucket` of `next_bucket`).
     #[serde(default)]
     pub k: u32,
     /// A boolean operand (the `want_max` of `arg_extreme`).
     #[serde(default)]
     pub want_max: bool,
+    /// Walk length (`random_walks`).
+    #[serde(default)]
+    pub wl: u32,
+    /// Walks per node (`random_walks`).
+    #[serde(default)]
+    pub wn: u32,
+    /// node2vec return bias `p` (`random_walks`).
+    #[serde(default = "one_f64")]
+    pub p: f64,
+    /// node2vec in-out bias `q` (`random_walks`).
+    #[serde(default = "one_f64")]
+    pub q: f64,
+    /// Deterministic RNG seed (`random_walks`).
+    #[serde(default)]
+    pub seed: u64,
     /// Seed vertex ids (for `frontier`).
     #[serde(default)]
     pub seeds: Vec<i64>,
@@ -363,6 +384,48 @@ impl GraphComputeRegistry {
                 let vid = vid.as_u64() as i64;
                 Ok(KernelResponse::VidScalar { vid, f: s.as_f64() })
             }
+            "random_walks" => {
+                let seeds: Vec<Vid> = req
+                    .seeds
+                    .iter()
+                    .map(|&i| {
+                        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+                        let u = i as u64;
+                        Vid::new(u)
+                    })
+                    .collect();
+                session
+                    .random_walks(
+                        from_i64(req.g),
+                        req.wl as usize,
+                        req.wn as usize,
+                        &seeds,
+                        req.p,
+                        req.q,
+                        req.seed,
+                    )
+                    .map(h)
+            }
+            "walk_visit_counts" => session
+                .walk_visit_counts(from_i64(req.a), from_i64(req.g))
+                .map(h),
+            "neighborhood_overlap" => {
+                let source = req.seeds.first().copied().unwrap_or(0);
+                #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+                let source = Vid::new(source as u64);
+                let metric = match req.s.as_str() {
+                    "jaccard" => OverlapMetric::Jaccard,
+                    "overlap" => OverlapMetric::Overlap,
+                    "cosine" => OverlapMetric::Cosine,
+                    other => {
+                        return Err(FnError::new(0x861, format!("bad overlap metric `{other}`")));
+                    }
+                };
+                session
+                    .neighborhood_overlap(from_i64(req.g), source, metric)
+                    .map(h)
+            }
+            "next_bucket" => session.next_bucket(from_i64(req.g), req.f, req.k).map(h),
             "topk" => {
                 let ranked = session.topk(from_i64(req.g), req.k)?;
                 #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
@@ -459,6 +522,7 @@ mod tests {
                 "session": req.session, "op": req.op, "g": req.g, "a": req.a,
                 "b": req.b, "s": req.s, "s2": req.s2, "f": req.f, "f2": req.f2,
                 "k": req.k, "want_max": req.want_max,
+                "wl": req.wl, "wn": req.wn, "p": req.p, "q": req.q, "seed": req.seed,
                 "seeds": req.seeds, "name": req.name,
             }))
             .unwrap();
@@ -481,6 +545,11 @@ mod tests {
             f2: 0.0,
             k: 0,
             want_max: false,
+            wl: 0,
+            wn: 0,
+            p: 1.0,
+            q: 1.0,
+            seed: 0,
             seeds: vec![],
             name: String::new(),
         };
@@ -716,7 +785,7 @@ mod tests {
     impl Serialize for KernelRequest {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeStruct;
-            let mut st = s.serialize_struct("KernelRequest", 13)?;
+            let mut st = s.serialize_struct("KernelRequest", 18)?;
             st.serialize_field("session", &self.session)?;
             st.serialize_field("op", &self.op)?;
             st.serialize_field("g", &self.g)?;
@@ -728,6 +797,11 @@ mod tests {
             st.serialize_field("f2", &self.f2)?;
             st.serialize_field("k", &self.k)?;
             st.serialize_field("want_max", &self.want_max)?;
+            st.serialize_field("wl", &self.wl)?;
+            st.serialize_field("wn", &self.wn)?;
+            st.serialize_field("p", &self.p)?;
+            st.serialize_field("q", &self.q)?;
+            st.serialize_field("seed", &self.seed)?;
             st.serialize_field("seeds", &self.seeds)?;
             st.serialize_field("name", &self.name)?;
             st.end()

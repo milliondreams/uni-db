@@ -36,7 +36,7 @@ use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 ///
 /// Cheap to clone (shares the inner `Arc<Mutex<AlgoSession>>`), as required by
 /// Rhai's `sync` feature. The `graph` field is the handle of the projected graph
-/// the guest algorithm runs over, exposed via [`GcSession::graph`].
+/// the guest algorithm runs over, exposed to a script via the `graph()` method.
 #[derive(Clone)]
 pub struct GcSession {
     session: Arc<Mutex<AlgoSession>>,

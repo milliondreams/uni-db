@@ -3,7 +3,7 @@
 
 //! DataFusion adapter for plugin window functions.
 //!
-//! Bridges the [`WindowPluginFn`](uni_plugin::traits::window::WindowPluginFn)
+//! Bridges the [`WindowPluginFn`]
 //! trait (bespoke `evaluate(partition, frame)` shape) onto DataFusion's
 //! `WindowUDFImpl` + `PartitionEvaluator`, so a registered window plugin is
 //! callable from a Cypher `... OVER (PARTITION BY ...)` clause. Mirrors the

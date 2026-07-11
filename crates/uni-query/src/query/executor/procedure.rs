@@ -224,7 +224,8 @@ impl ProcedureRegistry {
             .and_then(|pr| pr.algorithm_entry(qname))
     }
 
-    /// Resolve a user-facing `CALL` name to a registered [`AlgorithmProvider`]
+    /// Resolve a user-facing `CALL` name to a registered
+    /// [`AlgorithmProvider`](uni_plugin::traits::algorithm::AlgorithmProvider)
     /// entry, applying the same namespace rules as
     /// [`Self::resolve_user_procedure`].
     ///

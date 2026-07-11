@@ -221,6 +221,43 @@ async fn gcpagerank_deadline_surfaces_typed_timeout_e2e() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn l1_runaway_budget_surfaces_typed_exhausted_e2e() -> anyhow::Result<()> {
+    // L-1 / P0-7 (Exhausted): a 1-unit native-work grant is drained by the first
+    // O(E) kernel, and the abort surfaces through CALL as a typed
+    // GraphComputeIncomplete{Exhausted} (0x865) — distinct from Timeout /
+    // IterationLimit (proposal §5.1/§5.2).
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+        // A 1-unit work budget: the first metered kernel exceeds it.
+        Capability::GraphComputeWork(1),
+    ]);
+    db.add_plugin(ExampleGcPlugin::new(caps))?;
+
+    let session = db.session();
+    let query = format!("CALL examplegc.pr({vid_a}) YIELD nodeId, score RETURN nodeId");
+    let err = session
+        .query(&query)
+        .await
+        .expect_err("a 1-unit budget must abort the invocation");
+    match err {
+        uni_common::UniError::GraphComputeIncomplete { detail } => assert_eq!(
+            detail.reason,
+            uni_common::GraphComputeIncompleteReason::Exhausted,
+            "a drained native-work budget must be Exhausted, got {detail}"
+        ),
+        other => panic!("expected GraphComputeIncomplete{{Exhausted}}, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn l3_project_needs_hostquery_too() -> anyhow::Result<()> {
     // L-3: a provider WITH `GraphCompute` but WITHOUT `HostQuery` can hold the
     // kernel surface but cannot `project` — the second orthogonal gate.

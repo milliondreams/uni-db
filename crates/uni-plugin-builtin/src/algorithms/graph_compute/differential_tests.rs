@@ -970,6 +970,53 @@ fn h6_freeing_all_handles_reclaims_arena() {
     );
 }
 
+// ---- W6 · Phase-0 metering (P0-8) ----------------------------------------
+
+/// P0-8 (anti-Goodhart): each kernel decrements the native-work meter by its
+/// exact §5.1 amount — `|V|` for the per-vertex maps/reductions and `2·|E|` for
+/// `spmv` (charged once for admission, once before the result alloc). A kernel
+/// that silently did O(E) work under an O(V) charge would fail here.
+#[test]
+fn p0_8_kernels_charge_their_exact_work() {
+    use super::session::{Direction, GraphCompute, MapOp, ReduceOp, Semiring};
+
+    let nodes = vec![0, 1, 2, 3];
+    let edges = vec![(0, 1, 1.0), (0, 2, 1.0), (1, 3, 1.0), (2, 3, 1.0)];
+    let v = nodes.len() as u64;
+    let e = edges.len() as u64;
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+
+    let mut last = s.work_spent();
+    let mut charged = |s: &AlgoSession, last: &mut u64| -> u64 {
+        let now = s.work_spent();
+        let delta = now - *last;
+        *last = now;
+        delta
+    };
+
+    let deg = s.degrees(g, Direction::Out).unwrap();
+    assert_eq!(charged(&s, &mut last), v, "degrees charges |V|");
+
+    let inv = s.map_apply(deg, MapOp::Scale(2.0)).unwrap();
+    assert_eq!(charged(&s, &mut last), v, "map_apply charges |V|");
+
+    let sum = s.ewise(deg, inv, super::session::EwiseOp::Add).unwrap();
+    assert_eq!(charged(&s, &mut last), v, "ewise charges |V|");
+
+    let _ = s.reduce(sum, ReduceOp::Sum, None).unwrap();
+    assert_eq!(charged(&s, &mut last), v, "reduce charges |V|");
+
+    let _ = s.l1_diff(deg, inv).unwrap();
+    assert_eq!(charged(&s, &mut last), v, "l1_diff charges |V|");
+
+    let spread = s
+        .spmv(g, deg, Semiring::LinearAlgebra, Direction::Out, None)
+        .unwrap();
+    assert_eq!(charged(&s, &mut last), 2 * e, "spmv charges 2·|E|");
+
+    let _ = (inv, sum, spread); // handles owned by the session; freed on drop
+}
+
 // ---- handle-security tests (H-1..H-7) ------------------------------------
 
 #[test]

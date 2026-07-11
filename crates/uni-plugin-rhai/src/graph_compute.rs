@@ -357,6 +357,22 @@ impl GcSession {
         s.zero_map(from_i64(g), DType::F64).map(to_i64).map_err(rt)
     }
 
+    /// A zeroed map of a given dtype (`"f64"` or `"i64"`); `"i64"` seeds an exact
+    /// integer path-counting run (F-9).
+    fn zero_map_typed(
+        &mut self,
+        g: i64,
+        dtype: ImmutableString,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let ty = if dtype.as_str() == "i64" {
+            DType::I64
+        } else {
+            DType::F64
+        };
+        let mut s = self.session.lock();
+        s.zero_map(from_i64(g), ty).map(to_i64).map_err(rt)
+    }
+
     /// Overwrites `map` at each `frontier` member with `value`.
     fn scatter(&mut self, map: i64, frontier: i64, value: f64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
@@ -438,6 +454,7 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("is_empty", GcSession::is_empty)
         .register_fn("map_apply", GcSession::map_apply)
         .register_fn("zero_map", GcSession::zero_map)
+        .register_fn("zero_map", GcSession::zero_map_typed)
         .register_fn("scatter", GcSession::scatter)
         .register_fn("arg_extreme", GcSession::arg_extreme)
         .register_fn("topk", GcSession::topk)

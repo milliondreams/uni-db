@@ -308,6 +308,97 @@ fn f4_ppr_matches_power_iteration_oracle() {
     }
 }
 
+// ---- W4 · i64 exact path-counting (F-9) ----------------------------------
+
+/// Counts length-`k` walks from a source by repeated i64 `spmv` over the
+/// LinearAlgebra semiring, and proves exactness beyond `2^53` where an f64
+/// accumulator would round (proposal §4.2 / F-9).
+#[test]
+fn i64_spmv_counts_paths_exactly_beyond_f64() {
+    use super::session::{Direction, ReduceOp, Semiring};
+    use super::value::{DType, Scalar};
+
+    // A layered complete-bipartite DAG: L0={source}, each L_i (width nodes) fully
+    // connects to L_{i+1}. #paths source→each node of L_i is width^(i-1), so the
+    // total over the last layer is width^(layers-1). With width=64 (=2^6) and 10
+    // layers that is 64^9 = 2^54 — one bit past f64's exact-integer range.
+    let width = 64u64;
+    let layers = 10usize;
+    let mut nodes: Vec<u64> = Vec::new();
+    let mut edges: Vec<(u64, u64, f64)> = Vec::new();
+    let mut layer_nodes: Vec<Vec<u64>> = Vec::new();
+    let mut next_id = 0u64;
+    for li in 0..layers {
+        let count = if li == 0 { 1 } else { width };
+        let mut this: Vec<u64> = Vec::new();
+        for _ in 0..count {
+            nodes.push(next_id);
+            this.push(next_id);
+            next_id += 1;
+        }
+        layer_nodes.push(this);
+    }
+    for li in 0..layers - 1 {
+        for &u in &layer_nodes[li] {
+            for &v in &layer_nodes[li + 1] {
+                edges.push((u, v, 1.0));
+            }
+        }
+    }
+    // Exact oracle: #paths reaching the last layer = width^(layers-1), summed
+    // over that layer's nodes = width^(layers-1) * width = width^(layers-1)*... .
+    // #paths from source to *each* last-layer node = width^(layers-2); total over
+    // the last layer = width^(layers-1).
+    let total_paths: u128 = (width as u128).pow((layers - 1) as u32);
+
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+    // Seed an i64 one-hot at the source (slot 0), then spmv `layers-1` times.
+    let seed_set = s.frontier(g, &[Vid::new(0)]).unwrap();
+    let zero = s.zero_map(g, DType::I64).unwrap();
+    let mut counts = s.scatter(zero, seed_set, Scalar::I64(1)).unwrap();
+    s.free(zero).unwrap();
+    s.free(seed_set).unwrap();
+    for _ in 0..layers - 1 {
+        let next = s
+            .spmv(g, counts, Semiring::LinearAlgebra, Direction::Out, None)
+            .unwrap();
+        s.free(counts).unwrap();
+        counts = next;
+    }
+    // Sum the final counts exactly via an i64 reduce.
+    let got = match s.reduce(counts, ReduceOp::Sum, None).unwrap() {
+        Scalar::I64(v) => v as u128,
+        other => panic!("i64 reduce must return I64, got {other:?}"),
+    };
+    s.free(counts).unwrap();
+    assert_eq!(
+        got, total_paths,
+        "i64 path count must match the exact oracle"
+    );
+    // Guard the premise: this count exceeds the f64 exact-integer range.
+    assert!(
+        total_paths > (1u128 << 53),
+        "test must exercise counts beyond 2^53, got {total_paths}"
+    );
+}
+
+/// f64-only kernels reject an i64 tensor with a typed shape mismatch (0x862),
+/// never a panic — the dead code lights up (proposal §12 / E2).
+#[test]
+fn f64_kernels_reject_i64_with_shape_mismatch() {
+    use super::session::MapOp;
+    use super::value::DType;
+
+    let nodes = vec![0, 1, 2];
+    let edges = vec![(0, 1, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
+    let imap = s.zero_map(g, DType::I64).unwrap();
+    assert_eq!(
+        s.map_apply(imap, MapOp::Recip).unwrap_err().code,
+        super::error::SHAPE_MISMATCH
+    );
+}
+
 // ---- W3 · emit schema validation (0x869) ---------------------------------
 
 /// A session declaring its output columns rejects an emit that names an

@@ -366,12 +366,20 @@ impl GcSession {
             .map_err(py_err)
     }
 
-    /// A zeroed float map over the graph's vertices.
-    fn zero_map(&self, g: i64) -> PyResult<i64> {
+    /// A zeroed map over the graph's vertices (`dtype` = `"f64"` or `"i64"`).
+    ///
+    /// An `"i64"` map seeds an exact integer path-counting run (F-9).
+    #[pyo3(signature = (g, dtype = "f64"))]
+    fn zero_map(&self, g: i64, dtype: &str) -> PyResult<i64> {
         self.check_deadline()?;
+        let ty = if dtype == "i64" {
+            DType::I64
+        } else {
+            DType::F64
+        };
         self.session
             .lock()
-            .zero_map(from_i64(g), DType::F64)
+            .zero_map(from_i64(g), ty)
             .map(to_i64)
             .map_err(py_err)
     }

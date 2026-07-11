@@ -20,7 +20,7 @@
 //
 // Rust guideline compliant
 
-use arrow_array::{Array, Float64Array};
+use arrow_array::{Array, Float64Array, Int64Array};
 
 /// A logical element type for a [`Tensor`].
 ///
@@ -87,6 +87,24 @@ impl Scalar {
                     0.0
                 }
             }
+        }
+    }
+
+    /// Coerces the scalar to `i64` for the exact integer compute path.
+    ///
+    /// A whole-valued `f64` round-trips exactly; a fractional `f64` truncates
+    /// toward zero (a caller scattering an integer into an `i64` map passes a
+    /// whole value).
+    #[must_use]
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Scalar::I64(x) => x,
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "i64 maps are seeded with whole values"
+            )]
+            Scalar::F64(x) => x as i64,
+            Scalar::Bool(b) => i64::from(b),
         }
     }
 }
@@ -223,12 +241,23 @@ impl VertexSet {
     }
 }
 
+/// The physical Arrow buffer behind a [`Tensor`].
+///
+/// The `f64` path is the v1 default; the `i64` path backs exact integer
+/// path-counting (proposal §4.2 / F-9), where accumulated counts can exceed the
+/// `2⁵³` exact-integer range of `f64`.
+#[derive(Clone, Debug)]
+enum TensorBuf {
+    F64(Float64Array),
+    I64(Int64Array),
+}
+
 /// A shaped, Arrow-backed per-vertex value map.
 ///
-/// v1 is always [`Shape::V`] backed by a [`Float64Array`] of length `V` (see
-/// module docs). The Arrow backing satisfies the forward-compatibility invariant
-/// that a `[V]` map *is* a DataFusion column (proposal §4.1 / D6), so a future
-/// columnar bridge is a zero-copy view rather than a marshal.
+/// v1 is [`Shape::V`] backed by a [`Float64Array`] by default; the exact
+/// integer path-counting kernels (F-9) back it with an [`Int64Array`] instead.
+/// The Arrow backing satisfies the invariant that a `[V]` map *is* a DataFusion
+/// column (proposal §4.1 / D6), so a future columnar bridge is a zero-copy view.
 ///
 /// # Examples
 /// ```
@@ -243,7 +272,7 @@ impl VertexSet {
 pub struct Tensor {
     shape: Shape,
     dtype: DType,
-    buf: Float64Array,
+    buf: TensorBuf,
 }
 
 impl Tensor {
@@ -253,20 +282,34 @@ impl Tensor {
         Self {
             shape: Shape::V,
             dtype: DType::F64,
-            buf: Float64Array::from(values),
+            buf: TensorBuf::F64(Float64Array::from(values)),
         }
     }
 
     /// Builds a `[V]` tensor from values, tagging it with a logical `dtype`.
     ///
-    /// The buffer is still `f64` (v1 single compute path); `dtype` records the
-    /// caller's logical intent (e.g. `U32` slot ids from `vertex_ids`).
+    /// The buffer is still `f64`; `dtype` records the caller's logical intent
+    /// (e.g. `U32` slot ids from `vertex_ids`). Integer *compute* uses
+    /// [`from_i64`](Self::from_i64), which backs the buffer with an `Int64Array`.
     #[must_use]
     pub fn from_f64_typed(values: Vec<f64>, dtype: DType) -> Self {
         Self {
             shape: Shape::V,
             dtype,
-            buf: Float64Array::from(values),
+            buf: TensorBuf::F64(Float64Array::from(values)),
+        }
+    }
+
+    /// Builds a `[V]` exact-integer (`i64`) tensor from a value vector.
+    ///
+    /// Backs the buffer with an `Int64Array` so path counts beyond `2⁵³` stay
+    /// exact (proposal §4.2 / F-9); `f64`-only kernels reject it with `0x862`.
+    #[must_use]
+    pub fn from_i64(values: Vec<i64>) -> Self {
+        Self {
+            shape: Shape::V,
+            dtype: DType::I64,
+            buf: TensorBuf::I64(Int64Array::from(values)),
         }
     }
 
@@ -282,39 +325,88 @@ impl Tensor {
         self.dtype
     }
 
+    /// Returns `true` if the tensor is backed by an exact `i64` buffer.
+    #[must_use]
+    pub fn is_i64(&self) -> bool {
+        matches!(self.buf, TensorBuf::I64(_))
+    }
+
     /// Returns the element count (`V`).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        match &self.buf {
+            TensorBuf::F64(b) => b.len(),
+            TensorBuf::I64(b) => b.len(),
+        }
     }
 
     /// Returns `true` if the tensor has no elements.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len() == 0
     }
 
     /// Returns the values as a zero-copy `f64` slice.
     ///
     /// # Panics
-    /// Panics if the backing array contains nulls, which the constructors never
-    /// produce (a non-null buffer is a Tensor invariant).
+    /// Panics if the tensor is `i64`-backed (callers must dtype-dispatch first)
+    /// or the backing array contains nulls, which the constructors never produce.
     #[must_use]
     pub fn values(&self) -> &[f64] {
-        assert_eq!(self.buf.null_count(), 0, "Tensor buffer must be non-null");
-        self.buf.values()
+        match &self.buf {
+            TensorBuf::F64(b) => {
+                assert_eq!(b.null_count(), 0, "Tensor buffer must be non-null");
+                b.values()
+            }
+            TensorBuf::I64(_) => panic!("values(): tensor is i64-backed; use values_i64()"),
+        }
     }
 
-    /// Returns the underlying Arrow array (the columnar-bridge anchor).
+    /// Returns the values as a zero-copy `i64` slice, or `None` if `f64`-backed.
+    #[must_use]
+    pub fn values_i64(&self) -> Option<&[i64]> {
+        match &self.buf {
+            TensorBuf::I64(b) => {
+                assert_eq!(b.null_count(), 0, "Tensor buffer must be non-null");
+                Some(b.values())
+            }
+            TensorBuf::F64(_) => None,
+        }
+    }
+
+    /// Returns a copy of the values as `f64`, regardless of the backing type.
+    ///
+    /// The `f64`-backed case is a plain copy; an `i64` buffer is widened (exact
+    /// for counts within `±2⁵³`). Used by `emit`, whose result sink is `f64`.
+    #[must_use]
+    pub fn as_f64_vec(&self) -> Vec<f64> {
+        match &self.buf {
+            TensorBuf::F64(b) => b.values().to_vec(),
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "emit sink is f64; exact for counts within 2^53"
+            )]
+            TensorBuf::I64(b) => b.values().iter().map(|&v| v as f64).collect(),
+        }
+    }
+
+    /// Returns the underlying `f64` Arrow array (the columnar-bridge anchor).
+    ///
+    /// # Panics
+    /// Panics if the tensor is `i64`-backed.
     #[must_use]
     pub fn arrow(&self) -> &Float64Array {
-        &self.buf
+        match &self.buf {
+            TensorBuf::F64(b) => b,
+            TensorBuf::I64(_) => panic!("arrow(): tensor is i64-backed"),
+        }
     }
 
     /// Returns the number of bytes this tensor holds live, for arena accounting.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
-        self.len() * std::mem::size_of::<f64>()
+        // Both element types are 8 bytes wide.
+        self.len() * std::mem::size_of::<i64>()
     }
 }
 

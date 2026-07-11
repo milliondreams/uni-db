@@ -55,6 +55,16 @@ pub fn kind_mismatch(expected: &str) -> FnError {
     )
 }
 
+/// Builds a `0x862` shape/dtype-mismatch error from a formatted cause.
+///
+/// Raised when a kernel's operands disagree in length or element type — e.g. an
+/// `f64`-only kernel handed an `i64` tensor, or `ewise` on two different lengths
+/// (proposal §4.2). Distinguishes a genuine shape fault from a forged handle.
+#[must_use]
+pub fn shape_mismatch(cause: impl Into<String>) -> FnError {
+    FnError::new(SHAPE_MISMATCH, cause.into())
+}
+
 /// Builds a `0x863` epoch-mismatch error (cross-session or forged handle).
 #[must_use]
 pub fn epoch_mismatch() -> FnError {

@@ -339,9 +339,15 @@ impl GraphComputeRegistry {
                     None,
                 )
                 .map(h),
-            "zero_map" => session
-                .zero_map(from_i64(req.g), super::value::DType::F64)
-                .map(h),
+            "zero_map" => {
+                // `s == "i64"` seeds an exact path-counting run; default f64.
+                let ty = if req.s == "i64" {
+                    super::value::DType::I64
+                } else {
+                    super::value::DType::F64
+                };
+                session.zero_map(from_i64(req.g), ty).map(h)
+            }
             "map_apply" => session
                 .map_apply(from_i64(req.g), map_op(&req.s, req.f, req.f2)?)
                 .map(h),

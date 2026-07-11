@@ -510,7 +510,12 @@ impl GraphCompute for AlgoSession {
         let ta = self.table.get_tensor(a)?;
         let tb = self.table.get_tensor(b)?;
         if ta.len() != tb.len() {
-            return Err(error::kind_mismatch("two maps of equal length"));
+            return Err(error::shape_mismatch(
+                "ewise requires two maps of equal length",
+            ));
+        }
+        if ta.is_i64() || tb.is_i64() {
+            return Err(error::shape_mismatch("ewise requires f64 maps"));
         }
         let n = ta.len();
         let (xa, xb) = (ta.values(), tb.values());
@@ -544,6 +549,9 @@ impl GraphCompute for AlgoSession {
 
     fn map_to_set(&mut self, m: Handle, pred: Predicate) -> Result<Handle, FnError> {
         let t = self.table.get_tensor(m)?;
+        if t.is_i64() {
+            return Err(error::shape_mismatch("map_to_set requires an f64 map"));
+        }
         let n = t.len();
         let mut set = VertexSet::with_capacity(n);
         for (i, &x) in t.values().iter().enumerate() {
@@ -668,9 +676,27 @@ impl GraphCompute for AlgoSession {
         let n = graph.vertex_count();
         let input = self.table.get_tensor(vec)?;
         if input.len() != n {
-            return Err(error::kind_mismatch("a [V] map matching the graph"));
+            return Err(error::shape_mismatch(
+                "spmv input must be a [V] map matching the graph",
+            ));
         }
-        let src = input.values().to_vec();
+        let is_i64 = input.is_i64();
+        // The exact-integer path counts walks; only the LinearAlgebra semiring
+        // (plus-times over the counting monoid) has an integer meaning. The
+        // tropical/boolean semirings are f64-only (proposal §4.2 / F-9).
+        if is_i64 && !matches!(sr, Semiring::LinearAlgebra) {
+            return Err(error::shape_mismatch(
+                "i64 spmv supports only the LinearAlgebra semiring (path counting)",
+            ));
+        }
+        // Capture the source values now, releasing the table's immutable borrow
+        // before `charge` takes `&mut self`.
+        let src_i64: Option<Vec<i64>> = input.values_i64().map(<[i64]>::to_vec);
+        let src_f64: Option<Vec<f64>> = if is_i64 {
+            None
+        } else {
+            Some(input.values().to_vec())
+        };
         let mask_set = match mask {
             Some(h) => Some(self.table.get_set(h)?.clone()),
             None => None,
@@ -679,6 +705,41 @@ impl GraphCompute for AlgoSession {
         // scatter, so an exhausted budget stops the work rather than accounting
         // for it after the fact (proposal §5.1 — the meter must fail closed).
         self.charge(graph.edge_count() as u64)?;
+
+        if let Some(src) = src_i64 {
+            // Exact integer path-counting: out[v] += Σ_{u→v} src[u]. Unweighted
+            // (a path count has no edge-weight meaning), accumulated in i64 so a
+            // count beyond 2⁵³ stays exact where f64 would round (F-9).
+            let mut out = vec![0i64; n];
+            for u in 0..n as u32 {
+                let contrib = src[u as usize];
+                if contrib == 0 {
+                    continue;
+                }
+                let neighbors = match dir {
+                    Direction::Out => graph.out_neighbors(u),
+                    Direction::In => graph.in_neighbors(u),
+                };
+                for &v in neighbors {
+                    out[v as usize] = out[v as usize].saturating_add(contrib);
+                }
+            }
+            if let Some(m) = &mask_set {
+                for (v, slot) in out.iter_mut().enumerate() {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "vertex index bounded by n which fits u32"
+                    )]
+                    if !m.contains(v as u32) {
+                        *slot = 0;
+                    }
+                }
+            }
+            self.charge(graph.edge_count() as u64)?;
+            return self.alloc_tensor(Tensor::from_i64(out));
+        }
+
+        let src = src_f64.expect("non-i64 tensor captured an f64 source");
         let has_w = graph.has_weights();
 
         // Identity element of the additive monoid.
@@ -748,14 +809,32 @@ impl GraphCompute for AlgoSession {
         self.alloc_tensor(Tensor::from_f64(out))
     }
 
-    fn zero_map(&mut self, g: Handle, _ty: DType) -> Result<Handle, FnError> {
+    fn zero_map(&mut self, g: Handle, ty: DType) -> Result<Handle, FnError> {
         let n = self.table.get_graph(g)?.vertex_count();
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64(vec![0.0; n]))
+        // An I64 zero map seeds an exact path-counting run (F-9); every other
+        // dtype uses the f64 buffer (the v1 compute default).
+        let tensor = if matches!(ty, DType::I64) {
+            Tensor::from_i64(vec![0; n])
+        } else {
+            Tensor::from_f64(vec![0.0; n])
+        };
+        self.alloc_tensor(tensor)
     }
 
     fn scatter(&mut self, map: Handle, frontier: Handle, value: Scalar) -> Result<Handle, FnError> {
-        let mut out = self.table.get_tensor(map)?.values().to_vec();
+        let t = self.table.get_tensor(map)?;
+        if let Some(ivals) = t.values_i64() {
+            let mut out = ivals.to_vec();
+            let v = value.as_i64();
+            let set = self.table.get_set(frontier)?;
+            for slot in set.iter() {
+                out[slot as usize] = v;
+            }
+            self.charge(out.len() as u64)?;
+            return self.alloc_tensor(Tensor::from_i64(out));
+        }
+        let mut out = t.values().to_vec();
         let set = self.table.get_set(frontier)?;
         let v = value.as_f64();
         for slot in set.iter() {
@@ -767,6 +846,9 @@ impl GraphCompute for AlgoSession {
 
     fn map_apply(&mut self, map: Handle, op: MapOp) -> Result<Handle, FnError> {
         let t = self.table.get_tensor(map)?;
+        if t.is_i64() {
+            return Err(error::shape_mismatch("map_apply requires an f64 map"));
+        }
         let x = t.values();
         let n = x.len();
         let out: Vec<f64> = match op {
@@ -810,8 +892,34 @@ impl GraphCompute for AlgoSession {
             None => None,
         };
         // Fixed ascending-slot order for deterministic float reduction (§5.3).
-        let vals = t.values();
         let included = |i: usize| mask_set.is_none_or(|m| m.contains(i as u32));
+        // Exact integer reductions read the i64 buffer directly, so a summed
+        // path count stays exact (F-9). Only Sum/Count have an integer meaning;
+        // the norm/min/max forms are f64-only.
+        if t.is_i64() {
+            let ivals = t.values_i64().expect("i64 tensor exposes an i64 slice");
+            return match op {
+                ReduceOp::Sum => Ok(Scalar::I64(
+                    ivals
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| included(i))
+                        .map(|(_, v)| *v)
+                        .sum(),
+                )),
+                ReduceOp::Count => Ok(Scalar::I64(
+                    ivals
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| included(i))
+                        .count() as i64,
+                )),
+                _ => Err(error::shape_mismatch(
+                    "i64 reduce supports only Sum and Count",
+                )),
+            };
+        }
+        let vals = t.values();
         let result = match op {
             ReduceOp::Sum => vals
                 .iter()
@@ -857,9 +965,31 @@ impl GraphCompute for AlgoSession {
         let n = self.table.get_tensor(map)?.len();
         self.charge(n as u64)?;
         let t = self.table.get_tensor(map)?;
+        if let Some(ivals) = t.values_i64() {
+            if ivals.is_empty() {
+                return Err(error::shape_mismatch(
+                    "arg_extreme requires a non-empty map",
+                ));
+            }
+            let mut best_slot = 0usize;
+            let mut best = ivals[0];
+            for (i, &v) in ivals.iter().enumerate().skip(1) {
+                if (want_max && v > best) || (!want_max && v < best) {
+                    best = v;
+                    best_slot = i;
+                }
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "slot index bounded by tensor length which fits u32"
+            )]
+            return Ok((self.slot_to_vid(best_slot as u32), Scalar::I64(best)));
+        }
         let vals = t.values();
         if vals.is_empty() {
-            return Err(error::kind_mismatch("a non-empty map"));
+            return Err(error::shape_mismatch(
+                "arg_extreme requires a non-empty map",
+            ));
         }
         // Lowest-slot-id tie-break (proposal §4.3): a strict `>` / `<` keeps the
         // first (lowest) slot on ties since we scan in ascending order.
@@ -882,6 +1012,22 @@ impl GraphCompute for AlgoSession {
         let n = self.table.get_tensor(map)?.len();
         self.charge(n as u64)?;
         let t = self.table.get_tensor(map)?;
+        if let Some(ivals) = t.values_i64() {
+            // Sort by value desc, lowest-slot-id tie-break, then take k.
+            let mut indexed: Vec<(usize, i64)> = ivals.iter().copied().enumerate().collect();
+            indexed.sort_by(|&(ia, a), &(ib, b)| b.cmp(&a).then(ia.cmp(&ib)));
+            return Ok(indexed
+                .into_iter()
+                .take(k as usize)
+                .map(|(slot, v)| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "slot index bounded by tensor length which fits u32"
+                    )]
+                    (self.slot_to_vid(slot as u32), Scalar::I64(v))
+                })
+                .collect());
+        }
         // Sort by value desc, lowest-slot-id tie-break, then take k.
         let mut indexed: Vec<(usize, f64)> = t.values().iter().copied().enumerate().collect();
         indexed.sort_by(|&(ia, a), &(ib, b)| {
@@ -907,7 +1053,12 @@ impl GraphCompute for AlgoSession {
             let ta = self.table.get_tensor(a)?;
             let tb = self.table.get_tensor(b)?;
             if ta.len() != tb.len() {
-                return Err(error::kind_mismatch("two maps of equal length"));
+                return Err(error::shape_mismatch(
+                    "l1_diff requires two maps of equal length",
+                ));
+            }
+            if ta.is_i64() || tb.is_i64() {
+                return Err(error::shape_mismatch("l1_diff requires f64 maps"));
             }
             ta.len()
         };
@@ -964,7 +1115,8 @@ impl GraphCompute for AlgoSession {
                 }
                 _ => expected_len = Some(t.len()),
             }
-            captured.push((name.to_owned(), t.values().to_vec()));
+            // Widen an i64 (path-count) column to the f64 result sink.
+            captured.push((name.to_owned(), t.as_f64_vec()));
         }
         self.charge(expected_len.unwrap_or(0) as u64 * cols.len() as u64)?;
         self.emitted = captured;

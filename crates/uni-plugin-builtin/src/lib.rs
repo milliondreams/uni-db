@@ -114,6 +114,8 @@ impl BuiltinPlugin {
             Capability::Index,
             Capability::Storage,
             Capability::Algorithm,
+            // Drive the GraphCompute kernel catalog (e.g. `uni.algo.gcpagerank`).
+            Capability::GraphCompute,
             Capability::Crdt,
             Capability::Hook,
             Capability::Trigger,

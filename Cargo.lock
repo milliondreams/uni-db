@@ -13046,7 +13046,10 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uni-algo",
+ "uni-common",
  "uni-plugin",
+ "uni-plugin-builtin",
  "uni-plugin-wasm-rt",
  "wat",
 ]
@@ -13106,7 +13109,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uni-algo",
+ "uni-common",
  "uni-plugin",
+ "uni-plugin-builtin",
  "uni-plugin-conformance",
 ]
 
@@ -13134,7 +13140,10 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uni-algo",
+ "uni-common",
  "uni-plugin",
+ "uni-plugin-builtin",
 ]
 
 [[package]]
@@ -13155,7 +13164,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uni-algo",
+ "uni-common",
  "uni-plugin",
+ "uni-plugin-builtin",
  "uni-plugin-conformance",
  "uni-plugin-wasm-rt",
  "wasmtime",

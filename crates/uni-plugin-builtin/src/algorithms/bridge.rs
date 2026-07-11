@@ -117,6 +117,103 @@ impl AlgorithmHostBridge {
             effective_caps,
         }
     }
+
+    /// Builds a concrete projection for GraphCompute kernels, gated on caps.
+    ///
+    /// Unlike [`AlgorithmHost::project`] (which yields an opaque
+    /// `Arc<dyn GraphView>`), this returns the concrete `Arc<GraphProjection>`
+    /// an [`AlgoSession`](crate::algorithms::graph_compute::AlgoSession) binds.
+    /// It enforces the two orthogonal gates of the proposal (§4.6):
+    /// [`Capability::GraphCompute`] for the kernel surface and
+    /// [`Capability::HostQuery`] for the data read.
+    ///
+    /// # Errors
+    /// Returns `0x86C` if `GraphCompute` is not granted, `0x804` if `HostQuery`
+    /// is not granted, or `0x803` if the projection build fails.
+    pub fn project_for_graph_compute(
+        &self,
+        spec: &GraphProjectionSpec,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
+        if !self
+            .effective_caps
+            .contains_variant(&Capability::GraphCompute)
+        {
+            return Box::pin(async {
+                Err(FnError::new(
+                    crate::algorithms::graph_compute::error::CAPABILITY_DENIED,
+                    "GraphCompute: capability `graph-compute` not granted",
+                ))
+            });
+        }
+        if !self
+            .effective_caps
+            .contains_variant(&Capability::HostQuery {
+                read_only: false,
+                scopes: Vec::new(),
+            })
+        {
+            return Box::pin(async {
+                Err(FnError::new(
+                    0x804,
+                    "GraphCompute: `project` additionally requires `HostQuery`",
+                ))
+            });
+        }
+        let storage = Arc::clone(&self.algo_ctx.storage);
+        let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
+        let spec = spec.clone();
+        Box::pin(async move {
+            let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
+            let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let mut builder = ProjectionBuilder::new(storage)
+                .l0_manager(l0)
+                .node_labels(&node_labels)
+                .edge_types(&edge_types)
+                .include_reverse(spec.include_reverse);
+            if let Some(prop) = spec.weight_property.as_deref() {
+                builder = builder.weight_property(prop);
+            }
+            let projection = builder.build().await.map_err(|e| {
+                FnError::new(0x803, format!("GraphCompute project build failed: {e}"))
+            })?;
+            Ok(Arc::new(projection))
+        })
+    }
+
+    /// Reads the per-invocation GraphCompute work and arena-byte caps.
+    ///
+    /// Uses a plugin's declared [`Capability::GraphComputeWork`] /
+    /// [`Capability::GraphComputeArenaBytes`] quota when present, otherwise the
+    /// pinned defaults (proposal §12). The work cap is combined with the
+    /// edge-count multiple by the caller.
+    #[must_use]
+    pub fn graph_compute_caps(&self) -> (Option<u64>, usize) {
+        let mut work = None;
+        let mut arena = crate::algorithms::graph_compute::DEFAULT_ARENA_MAX_BYTES;
+        for cap in self.effective_caps.iter() {
+            match cap {
+                Capability::GraphComputeWork(w) => work = Some(*w),
+                Capability::GraphComputeArenaBytes(b) => {
+                    arena = usize::try_from(*b).unwrap_or(usize::MAX);
+                }
+                _ => {}
+            }
+        }
+        (work, arena)
+    }
+
+    /// Reads the per-invocation wall-clock deadline for a GraphCompute guest.
+    ///
+    /// Returns the plugin's declared [`Capability::WallClockMillisPerCall`] grant
+    /// in milliseconds, if present. A loader uses it to arm its watchdog /
+    /// deadline; absent, the loader applies its own default.
+    #[must_use]
+    pub fn graph_compute_deadline_ms(&self) -> Option<u64> {
+        self.effective_caps.iter().find_map(|cap| match cap {
+            Capability::WallClockMillisPerCall(ms) => Some(*ms),
+            _ => None,
+        })
+    }
 }
 
 impl AlgorithmHost for AlgorithmHostBridge {

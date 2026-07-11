@@ -224,6 +224,12 @@ fn register_builtin_plugins(
             read_only: true,
             scopes: Vec::new(),
         });
+        // GraphCompute (Phase 1): the first-party `uni.algo.gcpagerank`
+        // provider drives the coarse kernel catalog, gated on
+        // `Capability::GraphCompute` (orthogonal to the `HostQuery` gate on
+        // `project`). Third-party plugins must declare `graph-compute` in
+        // their manifest to earn the same.
+        caps.insert(Capability::GraphCompute);
         let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
         let algo_registry: Arc<uni_algo::algo::AlgorithmRegistry> =
             Arc::new(uni_algo::algo::AlgorithmRegistry::new());

@@ -20,6 +20,7 @@ use uni_plugin::{PluginError, PluginRegistrar};
 
 pub mod bridge;
 pub mod expand;
+pub mod graph_compute;
 pub mod pregel;
 pub mod reachability;
 
@@ -83,6 +84,13 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
     r.algorithm(
         QName::new("uni", "path.expand"),
         Arc::new(ExpandProvider::new()),
+    )?;
+
+    // Personalized PageRank authored on the GraphCompute kernel catalog — the
+    // Phase-1 dogfood that drives the coarse kernels through the CALL path.
+    r.algorithm(
+        QName::new("uni", "algo.gcpagerank"),
+        Arc::new(graph_compute::provider::GraphComputePageRankProvider::new()),
     )?;
 
     Ok(())

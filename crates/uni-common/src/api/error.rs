@@ -100,6 +100,19 @@ pub enum UniError {
     #[error("Locy evaluation incomplete: {detail}")]
     LocyIncomplete { detail: Box<LocyIncomplete> },
 
+    /// A GraphCompute invocation stopped before producing a complete result
+    /// because it exceeded its wall-clock deadline, its convergence-iteration
+    /// cap, or its native-work budget.
+    ///
+    /// Like [`UniError::LocyIncomplete`], this is the *default* outcome of an
+    /// over-budget run: partial output is never returned silently (GraphCompute
+    /// proposal §5.2). The boxed [`GraphComputeIncomplete`] distinguishes
+    /// `Timeout` (too slow) from `IterationLimit` (did not converge) from
+    /// `Exhausted` (hit the native-work meter), so a caller can pick the right
+    /// remedy. To recover an anytime partial result, re-run with `allow_partial`.
+    #[error("GraphCompute invocation incomplete: {detail}")]
+    GraphComputeIncomplete { detail: Box<GraphComputeIncomplete> },
+
     #[error("Type error: expected {expected}, got {actual}")]
     Type { expected: String, actual: String },
 
@@ -449,6 +462,111 @@ impl std::fmt::Display for LocyIncomplete {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Why a GraphCompute invocation stopped before producing a complete result.
+///
+/// The three outcomes call for different remedies — raise the deadline, raise
+/// the iteration cap, or raise the native-work budget — so they are reported
+/// distinctly rather than collapsed into a single "incomplete" flag
+/// (GraphCompute proposal §5.2, error codes `0x865`–`0x867`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphComputeIncompleteReason {
+    /// The native-work budget (a multiple of `|E|` plus an absolute ceiling)
+    /// was drained by kernel work before the algorithm finished. Maps to `0x865`.
+    Exhausted,
+    /// A convergence loop reached its superstep/iteration cap without settling.
+    /// Maps to `0x866`.
+    IterationLimit,
+    /// The wall-clock deadline elapsed mid-invocation. Maps to `0x867`.
+    Timeout,
+}
+
+impl GraphComputeIncompleteReason {
+    /// Returns a stable machine-readable tag for non-Rust callers.
+    ///
+    /// One of `"exhausted"`, `"iteration_limit"`, or `"timeout"` — surfaced to
+    /// callers (e.g. the Python bindings) that cannot match on a Rust enum.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GraphComputeIncompleteReason::Exhausted => "exhausted",
+            GraphComputeIncompleteReason::IterationLimit => "iteration_limit",
+            GraphComputeIncompleteReason::Timeout => "timeout",
+        }
+    }
+
+    /// Returns the GraphCompute error code (`0x865`–`0x867`) for this reason.
+    ///
+    /// Lets the loader shims map an incomplete outcome onto the pinned error
+    /// block (proposal §12) without re-deriving the mapping per loader.
+    #[must_use]
+    pub fn error_code(self) -> u32 {
+        match self {
+            GraphComputeIncompleteReason::Exhausted => 0x865,
+            GraphComputeIncompleteReason::IterationLimit => 0x866,
+            GraphComputeIncompleteReason::Timeout => 0x867,
+        }
+    }
+}
+
+impl std::fmt::Display for GraphComputeIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Diagnostics describing a GraphCompute invocation that stopped early.
+///
+/// Returned (boxed) inside [`UniError::GraphComputeIncomplete`] when an
+/// invocation exceeds its native-work budget, iteration cap, or wall-clock
+/// deadline. The counters let a caller tell "too slow" apart from "did not
+/// converge" apart from "did too much work", and size a retry accordingly.
+///
+/// # Examples
+/// ```
+/// use uni_common::{GraphComputeIncomplete, GraphComputeIncompleteReason};
+///
+/// let detail = GraphComputeIncomplete {
+///     reason: GraphComputeIncompleteReason::Exhausted,
+///     algorithm: "guest.ppr".into(),
+///     elapsed_ms: 120,
+///     iterations: 7,
+///     work_charged: 1_000_000_000,
+///     work_budget: 1_000_000_000,
+/// };
+/// assert!(detail.to_string().contains("exhausted"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphComputeIncomplete {
+    /// Why the invocation stopped.
+    pub reason: GraphComputeIncompleteReason,
+    /// Qualified name of the algorithm being run, for the diagnostic message.
+    pub algorithm: String,
+    /// Wall-clock time elapsed when the invocation was cut short, in milliseconds.
+    pub elapsed_ms: u64,
+    /// Number of guest control-loop iterations completed before the cutoff.
+    pub iterations: u64,
+    /// Native work units charged when the invocation stopped (`0` if untracked).
+    pub work_charged: u64,
+    /// The configured native-work budget in the same units as `work_charged`.
+    pub work_budget: u64,
+}
+
+impl std::fmt::Display for GraphComputeIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{reason} in algorithm `{algo}` after {elapsed_ms}ms, {iters} iteration(s); \
+             charged {charged}/{budget} native-work units",
+            reason = self.reason,
+            algo = self.algorithm,
+            elapsed_ms = self.elapsed_ms,
+            iters = self.iterations,
+            charged = self.work_charged,
+            budget = self.work_budget,
+        )
     }
 }
 

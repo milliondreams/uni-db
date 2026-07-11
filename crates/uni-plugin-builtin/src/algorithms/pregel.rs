@@ -73,6 +73,41 @@ pub trait VertexProgram: Send + Sync {
 
     /// The scalar output value for a vertex's final state (result column).
     fn output(&self, state: &Self::State) -> f64;
+
+    /// Whether this program is expected to converge by quiescence — every
+    /// vertex halting with no messages in flight — rather than by running a
+    /// fixed superstep schedule.
+    ///
+    /// Convergence-style programs (e.g. SSSP) return `true` (the default):
+    /// exhausting `max_supersteps` without quiescing means the algorithm did
+    /// not converge, which [`run_pregel`] reports as an error instead of
+    /// silently truncating (GraphCompute proposal §5.2). Fixed-schedule
+    /// programs (e.g. PageRank, which never halts a vertex) return `false`:
+    /// reaching the superstep count is their intended, correct stopping point.
+    fn converges_by_quiescence(&self) -> bool {
+        true
+    }
+}
+
+/// A convergence-style Pregel program hit `max_supersteps` without quiescing.
+///
+/// Carries the superstep cap that was exhausted so the caller can surface a
+/// precise non-convergence diagnostic (GraphCompute proposal §5.2, error code
+/// `0x866` / [`uni_common::GraphComputeIncompleteReason::IterationLimit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PregelIncomplete {
+    /// The `max_supersteps` cap that was reached without reaching quiescence.
+    pub supersteps: usize,
+}
+
+impl std::fmt::Display for PregelIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pregel did not converge within {} supersteps",
+            self.supersteps
+        )
+    }
 }
 
 /// Deliver `msg` into `inbox`, folding via the program's combiner when present.
@@ -93,17 +128,29 @@ fn deliver<P: VertexProgram>(program: &P, inbox: &mut Vec<P::Message>, msg: P::M
 
 /// Run `program` over `view` for up to `max_supersteps`, returning each vertex's
 /// [`VertexProgram::output`] value indexed by slot.
-#[must_use]
+///
+/// # Errors
+/// Returns [`PregelIncomplete`] when a convergence-style program (one whose
+/// [`VertexProgram::converges_by_quiescence`] is `true`) exhausts
+/// `max_supersteps` without every vertex halting. This surfaces
+/// non-convergence as a hard error rather than silently returning a truncated,
+/// unconverged result (GraphCompute proposal §5.2). Fixed-schedule programs
+/// (`converges_by_quiescence() == false`) always return `Ok`.
 pub fn run_pregel<P: VertexProgram>(
     program: &P,
     view: &dyn GraphView,
     max_supersteps: usize,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, PregelIncomplete> {
     let n = view.vertex_count();
     let mut states: Vec<P::State> = (0..n as u32).map(|s| program.init(s, view)).collect();
     let mut active = vec![true; n];
     let mut inboxes: Vec<Vec<P::Message>> = (0..n).map(|_| Vec::new()).collect();
 
+    // Track whether the loop stopped because the computation reached quiescence
+    // (all vertices halted, no messages pending) rather than by exhausting the
+    // superstep budget. Only quiescence is a "complete" result for a
+    // convergence-style program.
+    let mut quiesced = false;
     for superstep in 0..max_supersteps {
         let mut next_inboxes: Vec<Vec<P::Message>> = (0..n).map(|_| Vec::new()).collect();
         let mut any_work = false;
@@ -132,11 +179,22 @@ pub fn run_pregel<P: VertexProgram>(
 
         inboxes = next_inboxes;
         if !any_work {
+            quiesced = true;
             break;
         }
     }
 
-    (0..n).map(|s| program.output(&states[s])).collect()
+    // A convergence-style program that ran its full budget without quiescing did
+    // not converge: report it instead of truncating silently (§5.2). Fixed
+    // schedules (PageRank) opt out via `converges_by_quiescence() == false`, for
+    // which reaching `max_supersteps` is the intended stopping point.
+    if program.converges_by_quiescence() && !quiesced {
+        return Err(PregelIncomplete {
+            supersteps: max_supersteps,
+        });
+    }
+
+    Ok((0..n).map(|s| program.output(&states[s])).collect())
 }
 
 /// Two-column `(nodeId INT, value FLOAT)` output schema shared by Pregel
@@ -166,7 +224,8 @@ fn run_program_to_stream<P: VertexProgram + 'static>(
         let view = projection
             .await
             .map_err(|e| DataFusionError::Execution(format!("pregel: {e}")))?;
-        let values = run_pregel(&program, view.as_ref(), max_supersteps);
+        let values = run_pregel(&program, view.as_ref(), max_supersteps)
+            .map_err(|e| DataFusionError::Execution(format!("pregel: {e}")))?;
 
         let mut node_ids: Vec<i64> = Vec::with_capacity(values.len());
         #[allow(
@@ -285,6 +344,13 @@ impl VertexProgram for PageRankProgram {
     fn output(&self, state: &f64) -> f64 {
         *state
     }
+
+    // PageRank never halts a vertex; it runs a fixed iteration schedule, so
+    // reaching `max_supersteps` is its intended stopping point, not a
+    // non-convergence error (see `run_pregel` / proposal §5.2).
+    fn converges_by_quiescence(&self) -> bool {
+        false
+    }
 }
 
 /// First-party `uni.algo.pagerank` provider (Pregel PageRank).
@@ -361,7 +427,10 @@ impl AlgorithmProvider for PageRankProvider {
                 damping,
                 vertex_count: view.vertex_count().max(1),
             };
-            let values = run_pregel(&program, view.as_ref(), iters);
+            // PageRank is a fixed-schedule program, so this never errors, but
+            // handle the `Result` explicitly rather than unwrapping.
+            let values = run_pregel(&program, view.as_ref(), iters)
+                .map_err(|e| DataFusionError::Execution(format!("pagerank: {e}")))?;
             let mut node_ids: Vec<i64> = Vec::with_capacity(values.len());
             #[allow(
                 clippy::cast_possible_wrap,

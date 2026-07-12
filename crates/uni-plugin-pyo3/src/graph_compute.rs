@@ -105,7 +105,9 @@ fn overlap_metric(s: &str) -> PyResult<OverlapMetric> {
         "overlap" => Ok(OverlapMetric::Overlap),
         "cosine" => Ok(OverlapMetric::Cosine),
         "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
-        other => Err(PyRuntimeError::new_err(format!("bad overlap metric `{other}`"))),
+        other => Err(PyRuntimeError::new_err(format!(
+            "bad overlap metric `{other}`"
+        ))),
     }
 }
 
@@ -453,6 +455,10 @@ impl GcSession {
     /// sampling deterministic. Returns a walks handle for `emit_walks` /
     /// `walk_visit_counts`.
     #[pyo3(signature = (g, seeds, walk_length, walks_per_node = 1, p = 1.0, q = 1.0, seed = 0))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each arg is a distinct Python keyword in the exposed node2vec signature"
+    )]
     fn random_walks(
         &self,
         g: i64,
@@ -540,7 +546,10 @@ impl GcSession {
     /// Emits a pair list as `(srcId, dstId, value)` result rows.
     fn emit_pairs(&self, pairs: i64) -> PyResult<()> {
         self.check_deadline()?;
-        self.session.lock().emit_pairs(from_i64(pairs)).map_err(py_err)
+        self.session
+            .lock()
+            .emit_pairs(from_i64(pairs))
+            .map_err(py_err)
     }
 }
 

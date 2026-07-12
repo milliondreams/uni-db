@@ -494,10 +494,17 @@ impl GcSession {
     }
 
     /// The Δ-stepping frontier of vertices whose distance lies in the bucket band.
-    fn next_bucket(&mut self, dist: i64, delta: f64, bucket: i64) -> Result<i64, Box<EvalAltResult>> {
+    fn next_bucket(
+        &mut self,
+        dist: i64,
+        delta: f64,
+        bucket: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
         let b = u32::try_from(bucket).unwrap_or(0);
         let mut s = self.session.lock();
-        s.next_bucket(from_i64(dist), delta, b).map(to_i64).map_err(rt)
+        s.next_bucket(from_i64(dist), delta, b)
+            .map(to_i64)
+            .map_err(rt)
     }
 
     /// All-pairs neighbourhood overlap over adjacent vertex pairs.
@@ -520,7 +527,9 @@ impl GcSession {
             PairSpec::AdjacentPairs
         };
         let mut s = self.session.lock();
-        s.all_pairs_overlap(from_i64(g), spec, m).map(to_i64).map_err(rt)
+        s.all_pairs_overlap(from_i64(g), spec, m)
+            .map(to_i64)
+            .map_err(rt)
     }
 
     /// Emits a pair list as `(srcId, dstId, value)` result rows.

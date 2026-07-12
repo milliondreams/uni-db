@@ -1545,10 +1545,7 @@ impl GraphCompute for AlgoSession {
         for i in 0..val.len() {
             let s = self.slot_to_vid(src[i]);
             let d = self.slot_to_vid(dst[i]);
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "Cypher vids fit i64 in practice"
-            )]
+            #[expect(clippy::cast_possible_wrap, reason = "Cypher vids fit i64 in practice")]
             out.push((s.as_u64() as i64, d.as_u64() as i64, val[i]));
         }
         self.emitted_pairs = out;

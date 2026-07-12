@@ -5,7 +5,8 @@
 //!
 //! Dogfoods the bulk `all_pairs_overlap` kernel and the per-edge `emit_pairs`
 //! egress (proposal §4.3 C-3). The result is a per-*edge* `(srcId, dstId, value)`
-//! table — a shape a `[V]` map cannot express — so it uses the [`PairList`] sink
+//! table — a shape a `[V]` map cannot express — so it uses the
+//! [`PairList`](crate::algorithms::graph_compute::value::PairList) sink
 //! rather than the `[V]`/`nodeId` path of `gcpagerank`. With the default `count`
 //! metric each row's value is the adjacent pair's triangle support, the basis for
 //! triangle counting and k-truss.
@@ -146,12 +147,12 @@ fn parse_config(config_json: &str) -> Result<OverlapArgs, FnError> {
         .and_then(serde_json::Value::as_str)
         .map_or_else(|| parse_metric(DEFAULT_METRIC), parse_metric)?;
 
-    let pair_mode = args.get(1).and_then(serde_json::Value::as_str).unwrap_or("adjacent");
+    let pair_mode = args
+        .get(1)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("adjacent");
     let spec = if pair_mode == "topk" {
-        let k = args
-            .get(2)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
+        let k = args.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0);
         PairSpec::TopKCandidates(u32::try_from(k).unwrap_or(u32::MAX))
     } else {
         PairSpec::AdjacentPairs

@@ -122,7 +122,10 @@ async fn gcwalks_via_call_emits_walk_sequences_over_l0() -> anyhow::Result<()> {
     );
     let res = session.query(&query).await?;
     let rows = res.rows();
-    assert!(!rows.is_empty(), "walks must egress at least the start step");
+    assert!(
+        !rows.is_empty(),
+        "walks must egress at least the start step"
+    );
 
     // walk_id in 0..3; each walk's steps start at 0; nodeId is a real vertex id.
     let mut steps_by_walk: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
@@ -164,7 +167,10 @@ async fn gcoverlap_via_call_yields_pair_rows_over_l0() -> anyhow::Result<()> {
         let value = row.get::<f64>("value")?;
         assert!(src >= 0 && dst >= 0, "endpoints are real vertex ids");
         assert!(src < dst, "adjacent pairs are emitted with src < dst");
-        assert!(value.is_finite() && value >= 0.0, "support is finite and ≥ 0");
+        assert!(
+            value.is_finite() && value >= 0.0,
+            "support is finite and ≥ 0"
+        );
     }
     Ok(())
 }

@@ -33,7 +33,7 @@ pub struct AlgorithmSignature {
     /// Empty (the default) preserves the legacy behavior: arguments arrive as a
     /// raw positional `config_json` array the provider parses itself. When
     /// non-empty, the host validates arity and coerces each positional argument
-    /// against the declared [`NamedArgType`] before the provider runs, filling
+    /// against the declared [`NamedArgType`](crate::traits::procedure::NamedArgType) before the provider runs, filling
     /// omitted trailing arguments from their declared defaults.
     pub args: Vec<crate::traits::procedure::NamedArgType>,
     /// Required capability slices, checked at load time.
@@ -144,10 +144,7 @@ impl AlgorithmSignature {
                     {
                         return Err(FnError::new(
                             0x86E,
-                            format!(
-                                "argument `{}` (position {i}) has the wrong type",
-                                arg.name
-                            ),
+                            format!("argument `{}` (position {i}) has the wrong type", arg.name),
                         ));
                     }
                     out.push(value);
@@ -169,10 +166,7 @@ impl AlgorithmSignature {
 }
 
 /// Whether a JSON value is compatible with a declared primitive/vector arg type.
-fn json_matches_argtype(
-    value: &serde_json::Value,
-    ty: &crate::traits::scalar::ArgType,
-) -> bool {
+fn json_matches_argtype(value: &serde_json::Value, ty: &crate::traits::scalar::ArgType) -> bool {
     use arrow_schema::DataType;
 
     use crate::traits::scalar::ArgType;
@@ -414,7 +408,7 @@ mod tests {
     use arrow_schema::DataType;
     use datafusion::scalar::ScalarValue;
 
-    use super::{AlgorithmSignature, SliceReq, HOST_CAPABILITY_SLICES};
+    use super::{AlgorithmSignature, HOST_CAPABILITY_SLICES, SliceReq};
     use crate::traits::procedure::NamedArgType;
     use crate::traits::scalar::ArgType;
 
@@ -438,25 +432,48 @@ mod tests {
     #[test]
     fn check_slices_accepts_available_and_rejects_missing() {
         // graph-compute@1 is the host surface; @1 passes, @2 and unknown fail 0x86A.
-        let ok = sig_with(vec![], vec![SliceReq { slice: "graph-compute".into(), version: 1 }]);
+        let ok = sig_with(
+            vec![],
+            vec![SliceReq {
+                slice: "graph-compute".into(),
+                version: 1,
+            }],
+        );
         assert!(ok.check_slices(HOST_CAPABILITY_SLICES).is_ok());
 
-        let too_new =
-            sig_with(vec![], vec![SliceReq { slice: "graph-compute".into(), version: 2 }]);
+        let too_new = sig_with(
+            vec![],
+            vec![SliceReq {
+                slice: "graph-compute".into(),
+                version: 2,
+            }],
+        );
         let err = too_new
             .check_slices(HOST_CAPABILITY_SLICES)
             .expect_err("graph-compute@2 must be refused");
         assert_eq!(err.code, 0x86A, "slice mismatch is 0x86A");
 
-        let unknown =
-            sig_with(vec![], vec![SliceReq { slice: "tensor-compute".into(), version: 1 }]);
+        let unknown = sig_with(
+            vec![],
+            vec![SliceReq {
+                slice: "tensor-compute".into(),
+                version: 1,
+            }],
+        );
         assert_eq!(
-            unknown.check_slices(HOST_CAPABILITY_SLICES).unwrap_err().code,
+            unknown
+                .check_slices(HOST_CAPABILITY_SLICES)
+                .unwrap_err()
+                .code,
             0x86A
         );
 
         // No declared slices is grandfathered onto the base surface.
-        assert!(sig_with(vec![], vec![]).check_slices(HOST_CAPABILITY_SLICES).is_ok());
+        assert!(
+            sig_with(vec![], vec![])
+                .check_slices(HOST_CAPABILITY_SLICES)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -471,7 +488,11 @@ mod tests {
         let s = sig_with(
             vec![
                 arg("src", ArgType::CypherValue, None),
-                arg("alpha", ArgType::Primitive(DataType::Float64), Some(ScalarValue::Float64(Some(0.85)))),
+                arg(
+                    "alpha",
+                    ArgType::Primitive(DataType::Float64),
+                    Some(ScalarValue::Float64(Some(0.85))),
+                ),
             ],
             vec![],
         );
@@ -494,10 +515,7 @@ mod tests {
         assert_eq!(err.code, 0x86E);
 
         // Too many positional args is rejected.
-        assert_eq!(
-            s.coerce_config_json("[5, 0.9, 1]").unwrap_err().code,
-            0x86E
-        );
+        assert_eq!(s.coerce_config_json("[5, 0.9, 1]").unwrap_err().code, 0x86E);
 
         // A CypherValue arg accepts an array (the `sourceVids` shape).
         let arr_src = s.coerce_config_json("[[1, 2, 3], 0.9]").unwrap();

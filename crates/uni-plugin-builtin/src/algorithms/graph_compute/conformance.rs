@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use uni_algo::algo::GraphProjection;
 use uni_common::Value;
-use uni_plugin::traits::algorithm::{AlgorithmSignature, SliceReq, HOST_CAPABILITY_SLICES};
+use uni_plugin::traits::algorithm::{AlgorithmSignature, HOST_CAPABILITY_SLICES, SliceReq};
 
 use super::error;
 use super::handle::Handle;

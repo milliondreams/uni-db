@@ -58,7 +58,8 @@ pub const GRAPH_COMPUTE_SLICE: &str = "graph-compute";
 
 /// The single slice version this host implements (`graph-compute@1`).
 ///
-/// Slice negotiation checks a guest algorithm's declared [`SliceReq`]s against
+/// Slice negotiation checks a guest algorithm's declared
+/// [`SliceReq`](uni_plugin::traits::algorithm::SliceReq)s against
 /// this at load time; a request for a higher version fails closed with `0x86A`
 /// rather than trapping later on an unknown kernel op (proposal §4.3 / D6).
 pub const GRAPH_COMPUTE_SLICE_VERSION: u16 = 1;

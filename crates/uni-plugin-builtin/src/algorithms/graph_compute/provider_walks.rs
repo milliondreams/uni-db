@@ -26,8 +26,8 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use uni_common::core::id::Vid;
 use datafusion::scalar::ScalarValue;
+use uni_common::core::id::Vid;
 use uni_plugin::FnError;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
@@ -57,17 +57,13 @@ fn gcwalks_args() -> Vec<NamedArgType> {
         clippy::cast_possible_wrap,
         reason = "small literal defaults fit i64 exactly"
     )]
-    let defaults = [
-        DEFAULT_WALK_LENGTH as i64,
-        DEFAULT_WALKS_PER_NODE as i64,
-    ];
+    let defaults = [DEFAULT_WALK_LENGTH as i64, DEFAULT_WALKS_PER_NODE as i64];
     vec![
         NamedArgType {
             name: "sourceVids".into(),
             ty: ArgType::CypherValue,
             default: None,
-            doc: "Start vertex, array of start vertices, or [] for every vertex."
-                .to_owned(),
+            doc: "Start vertex, array of start vertices, or [] for every vertex.".to_owned(),
         },
         NamedArgType {
             name: "walkLength".into(),
@@ -189,9 +185,7 @@ fn parse_config(config_json: &str) -> Result<WalksArgs, FnError> {
 
     let usize_arg = |i: usize, default: usize| -> usize {
         match args.get(i) {
-            Some(serde_json::Value::Number(n)) => {
-                n.as_u64().map_or(default, |v| v as usize)
-            }
+            Some(serde_json::Value::Number(n)) => n.as_u64().map_or(default, |v| v as usize),
             _ => default,
         }
     };

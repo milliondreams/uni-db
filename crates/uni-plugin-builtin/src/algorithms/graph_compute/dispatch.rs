@@ -850,8 +850,9 @@ mod tests {
         let g = to_i64(session.bind_graph(StdArc::new(graph)));
         let sid = registry.open(session);
 
-        let call =
-            |json: String| -> KernelResponse { serde_json::from_str(&registry.call_json(&json)).unwrap() };
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
         let as_handle = |r: KernelResponse| match r {
             KernelResponse::Handle(h) => h,
             other => panic!("want handle, got {other:?}"),
@@ -877,7 +878,11 @@ mod tests {
         let mut closed = registry.close(sid).expect("session present");
         let rows = closed.take_emitted_walks();
         // 2 walks of length 4 over a cycle => 2 * 5 = 10 step rows.
-        assert_eq!(rows.len(), 10, "walk sequences egress through the JSON path");
+        assert_eq!(
+            rows.len(),
+            10,
+            "walk sequences egress through the JSON path"
+        );
     }
 
     #[test]

@@ -26,8 +26,8 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use uni_common::core::id::Vid;
 use datafusion::scalar::ScalarValue;
+use uni_common::core::id::Vid;
 use uni_plugin::FnError;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
@@ -57,8 +57,7 @@ fn gcpagerank_args() -> Vec<NamedArgType> {
             name: "sourceVid".into(),
             ty: ArgType::CypherValue,
             default: None,
-            doc: "The personalization seed vertex (or an array of seed vertices)."
-                .to_owned(),
+            doc: "The personalization seed vertex (or an array of seed vertices).".to_owned(),
         },
         NamedArgType {
             name: "alpha".into(),

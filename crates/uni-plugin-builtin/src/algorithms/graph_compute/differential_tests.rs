@@ -538,7 +538,11 @@ fn all_pairs_overlap_counts_triangles_on_complete_graph() {
 
         // Every one of the C(n,2) adjacent pairs has support n-2.
         let expected_pairs = (n * (n - 1) / 2) as usize;
-        assert_eq!(rows.len(), expected_pairs, "K_{n} has C(n,2) adjacent pairs");
+        assert_eq!(
+            rows.len(),
+            expected_pairs,
+            "K_{n} has C(n,2) adjacent pairs"
+        );
         for (src, dst, value) in &rows {
             assert!(src < dst, "pairs are emitted with src < dst");
             #[expect(clippy::cast_precision_loss, reason = "small test integers")]

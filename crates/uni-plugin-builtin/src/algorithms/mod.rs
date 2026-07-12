@@ -93,5 +93,19 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
         Arc::new(graph_compute::provider::GraphComputePageRankProvider::new()),
     )?;
 
+    // node2vec/DeepWalk random-walk generation on the GraphCompute catalog —
+    // dogfoods the `random_walks` kernel and the `emit_walks` sequence egress.
+    r.algorithm(
+        QName::new("uni", "algo.gcwalks"),
+        Arc::new(graph_compute::provider_walks::GraphComputeWalksProvider::new()),
+    )?;
+
+    // All-pairs neighbourhood overlap (triangle support / k-truss basis) — the
+    // per-edge egress dogfood for `all_pairs_overlap` + `emit_pairs`.
+    r.algorithm(
+        QName::new("uni", "algo.gcoverlap"),
+        Arc::new(graph_compute::provider_pairs::GraphComputeOverlapProvider::new()),
+    )?;
+
     Ok(())
 }

@@ -329,6 +329,7 @@ impl AlgoProviderBridge {
         let signature = AlgorithmSignature {
             output_fields,
             docs: format!("uni.{} (algorithm)", proc.name()),
+            ..Default::default()
         };
         Self {
             proc,

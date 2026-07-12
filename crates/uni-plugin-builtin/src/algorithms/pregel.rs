@@ -403,6 +403,7 @@ impl PageRankProvider {
                     Field::new("rank", DataType::Float64, false),
                 ],
                 docs: "uni.algo.pagerank([config]) — damped PageRank over a projection".to_owned(),
+                ..Default::default()
             },
         }
     }
@@ -575,6 +576,7 @@ impl SsspProvider {
                     Field::new("distance", DataType::Float64, false),
                 ],
                 docs: "uni.algo.sssp(sourceVid[, config]) — single-source shortest path".to_owned(),
+                ..Default::default()
             },
         }
     }

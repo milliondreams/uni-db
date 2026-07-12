@@ -28,7 +28,8 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
+    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, OverlapMetric, PairSpec, Predicate,
+    ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -421,6 +422,127 @@ impl GcSession {
             })
             .collect())
     }
+
+    /// Samples node2vec/DeepWalk random walks; empty `seeds` walks every vertex.
+    ///
+    /// `p`/`q` are the return/in-out bias (`1.0` = unbiased); `seed` makes the
+    /// sampling deterministic. Returns a walks handle for `emit_walks` /
+    /// `walk_visit_counts`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the random_walks kernel")]
+    fn random_walks(
+        &mut self,
+        g: i64,
+        seeds: Array,
+        walk_length: i64,
+        walks_per_node: i64,
+        p: f64,
+        q: f64,
+        seed: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let vids: Vec<Vid> = seeds
+            .into_iter()
+            .map(|d| {
+                d.as_int()
+                    .map(|i| {
+                        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+                        let u = i as u64;
+                        Vid::new(u)
+                    })
+                    .map_err(|_| rt(FnError::new(0x802, "random_walks: seed must be an integer")))
+            })
+            .collect::<Result<_, _>>()?;
+        let wl = usize::try_from(walk_length).unwrap_or(0);
+        let wn = usize::try_from(walks_per_node).unwrap_or(0);
+        #[expect(clippy::cast_sign_loss, reason = "the rng seed round-trips bit-exact")]
+        let rng_seed = seed as u64;
+        let mut s = self.session.lock();
+        s.random_walks(from_i64(g), wl, wn, &vids, p, q, rng_seed)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Folds a walks handle into a per-vertex visit-count map.
+    fn walk_visit_counts(&mut self, walks: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.walk_visit_counts(from_i64(walks), from_i64(g))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Emits the walk *sequences* as `(walk_id, step, nodeId)` result rows.
+    fn emit_walks(&mut self, walks: i64) -> Result<(), Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.emit_walks(from_i64(walks)).map_err(rt)
+    }
+
+    /// Per-vertex neighbourhood-overlap similarity to `source`.
+    ///
+    /// `metric` is `"jaccard"`, `"overlap"`, `"cosine"`, or `"adamic_adar"`.
+    fn neighborhood_overlap(
+        &mut self,
+        g: i64,
+        source: i64,
+        metric: ImmutableString,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let m = overlap_metric(metric.as_str())?;
+        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+        let src = Vid::new(source as u64);
+        let mut s = self.session.lock();
+        s.neighborhood_overlap(from_i64(g), src, m)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// The Δ-stepping frontier of vertices whose distance lies in the bucket band.
+    fn next_bucket(&mut self, dist: i64, delta: f64, bucket: i64) -> Result<i64, Box<EvalAltResult>> {
+        let b = u32::try_from(bucket).unwrap_or(0);
+        let mut s = self.session.lock();
+        s.next_bucket(from_i64(dist), delta, b).map(to_i64).map_err(rt)
+    }
+
+    /// All-pairs neighbourhood overlap over adjacent vertex pairs.
+    ///
+    /// `metric` is `"count"` (triangle support), `"jaccard"`, `"overlap"`,
+    /// `"cosine"`, or `"adamic_adar"`; `pair_mode` is `"adjacent"` or `"topk"`
+    /// (keeping the `k` highest-value pairs). Returns a pairs handle for
+    /// `emit_pairs`.
+    fn all_pairs_overlap(
+        &mut self,
+        g: i64,
+        metric: ImmutableString,
+        pair_mode: ImmutableString,
+        k: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let m = overlap_metric(metric.as_str())?;
+        let spec = if pair_mode.as_str() == "topk" {
+            PairSpec::TopKCandidates(u32::try_from(k).unwrap_or(0))
+        } else {
+            PairSpec::AdjacentPairs
+        };
+        let mut s = self.session.lock();
+        s.all_pairs_overlap(from_i64(g), spec, m).map(to_i64).map_err(rt)
+    }
+
+    /// Emits a pair list as `(srcId, dstId, value)` result rows.
+    fn emit_pairs(&mut self, pairs: i64) -> Result<(), Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.emit_pairs(from_i64(pairs)).map_err(rt)
+    }
+}
+
+/// Parses an overlap-metric name into an [`OverlapMetric`].
+fn overlap_metric(name: &str) -> Result<OverlapMetric, Box<EvalAltResult>> {
+    match name {
+        "count" => Ok(OverlapMetric::Count),
+        "jaccard" => Ok(OverlapMetric::Jaccard),
+        "overlap" => Ok(OverlapMetric::Overlap),
+        "cosine" => Ok(OverlapMetric::Cosine),
+        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
+        other => Err(rt(FnError::new(
+            0x861,
+            format!("overlap: bad metric `{other}`"),
+        ))),
+    }
 }
 
 /// Registers the [`GcSession`] type and its kernel methods on `engine`.
@@ -459,5 +581,12 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("arg_extreme", GcSession::arg_extreme)
         .register_fn("topk", GcSession::topk)
         .register_fn("free", GcSession::free)
-        .register_fn("emit", GcSession::emit);
+        .register_fn("emit", GcSession::emit)
+        .register_fn("random_walks", GcSession::random_walks)
+        .register_fn("walk_visit_counts", GcSession::walk_visit_counts)
+        .register_fn("emit_walks", GcSession::emit_walks)
+        .register_fn("neighborhood_overlap", GcSession::neighborhood_overlap)
+        .register_fn("next_bucket", GcSession::next_bucket)
+        .register_fn("all_pairs_overlap", GcSession::all_pairs_overlap)
+        .register_fn("emit_pairs", GcSession::emit_pairs);
 }

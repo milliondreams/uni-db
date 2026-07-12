@@ -36,7 +36,8 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
+    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, OverlapMetric, PairSpec, Predicate,
+    ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -94,6 +95,17 @@ fn dir(s: &str) -> PyResult<Direction> {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         other => Err(PyRuntimeError::new_err(format!("bad direction `{other}`"))),
+    }
+}
+
+fn overlap_metric(s: &str) -> PyResult<OverlapMetric> {
+    match s {
+        "count" => Ok(OverlapMetric::Count),
+        "jaccard" => Ok(OverlapMetric::Jaccard),
+        "overlap" => Ok(OverlapMetric::Overlap),
+        "cosine" => Ok(OverlapMetric::Cosine),
+        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
+        other => Err(PyRuntimeError::new_err(format!("bad overlap metric `{other}`"))),
     }
 }
 
@@ -433,6 +445,102 @@ impl GcSession {
             .into_iter()
             .map(|(vid, val)| (vid_to_i64(vid), val.as_f64()))
             .collect())
+    }
+
+    /// Samples node2vec/DeepWalk random walks; empty `seeds` walks every vertex.
+    ///
+    /// `p`/`q` are the return/in-out bias (`1.0` = unbiased); `seed` makes the
+    /// sampling deterministic. Returns a walks handle for `emit_walks` /
+    /// `walk_visit_counts`.
+    #[pyo3(signature = (g, seeds, walk_length, walks_per_node = 1, p = 1.0, q = 1.0, seed = 0))]
+    fn random_walks(
+        &self,
+        g: i64,
+        seeds: Vec<i64>,
+        walk_length: usize,
+        walks_per_node: usize,
+        p: f64,
+        q: f64,
+        seed: u64,
+    ) -> PyResult<i64> {
+        self.check_deadline()?;
+        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+        let vids: Vec<Vid> = seeds.into_iter().map(|i| Vid::new(i as u64)).collect();
+        self.session
+            .lock()
+            .random_walks(from_i64(g), walk_length, walks_per_node, &vids, p, q, seed)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Folds a walks handle into a per-vertex visit-count map.
+    fn walk_visit_counts(&self, walks: i64, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .walk_visit_counts(from_i64(walks), from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Emits the walk *sequences* as `(walk_id, step, nodeId)` result rows.
+    fn emit_walks(&self, walks: i64) -> PyResult<()> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .emit_walks(from_i64(walks))
+            .map_err(py_err)
+    }
+
+    /// Per-vertex neighbourhood-overlap similarity to `source`.
+    ///
+    /// `metric` is `"jaccard"`, `"overlap"`, `"cosine"`, or `"adamic_adar"`.
+    fn neighborhood_overlap(&self, g: i64, source: i64, metric: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        let m = overlap_metric(metric)?;
+        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+        let src = Vid::new(source as u64);
+        self.session
+            .lock()
+            .neighborhood_overlap(from_i64(g), src, m)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// The Δ-stepping frontier of vertices whose distance lies in the bucket band.
+    fn next_bucket(&self, dist: i64, delta: f64, bucket: u32) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .next_bucket(from_i64(dist), delta, bucket)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// All-pairs neighbourhood overlap over adjacent vertex pairs.
+    ///
+    /// `metric` is `"count"` (triangle support), `"jaccard"`, `"overlap"`,
+    /// `"cosine"`, or `"adamic_adar"`; `pair_mode` is `"adjacent"` or `"topk"`.
+    #[pyo3(signature = (g, metric = "count", pair_mode = "adjacent", k = 0))]
+    fn all_pairs_overlap(&self, g: i64, metric: &str, pair_mode: &str, k: u32) -> PyResult<i64> {
+        self.check_deadline()?;
+        let m = overlap_metric(metric)?;
+        let spec = if pair_mode == "topk" {
+            PairSpec::TopKCandidates(k)
+        } else {
+            PairSpec::AdjacentPairs
+        };
+        self.session
+            .lock()
+            .all_pairs_overlap(from_i64(g), spec, m)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Emits a pair list as `(srcId, dstId, value)` result rows.
+    fn emit_pairs(&self, pairs: i64) -> PyResult<()> {
+        self.check_deadline()?;
+        self.session.lock().emit_pairs(from_i64(pairs)).map_err(py_err)
     }
 }
 

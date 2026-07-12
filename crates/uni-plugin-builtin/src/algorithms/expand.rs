@@ -89,6 +89,7 @@ impl ExpandProvider {
                 ],
                 docs: "uni.path.expand(sourceVid[, config]) — bounded BFS path expansion"
                     .to_owned(),
+                ..Default::default()
             },
         }
     }

@@ -604,7 +604,12 @@ pub(crate) fn run_algorithm_provider(
         l0_manager,
         entry.effective_caps.clone(),
     );
-    let ctx = AlgorithmContext::new(config_json).with_host(&bridge);
+    // Host-side arg validation/coercion (proposal §4.6 / D7): a provider that
+    // declares typed `args` gets arity + type checking and default-filling here,
+    // before it runs; providers on the legacy untyped contract (empty `args`)
+    // see `config_json` pass through unchanged.
+    let coerced = entry.provider.signature().coerce_config_json(config_json)?;
+    let ctx = AlgorithmContext::new(&coerced).with_host(&bridge);
     entry.provider.run(ctx)
 }
 

@@ -1416,6 +1416,7 @@ fn build_algorithm_signature(
     Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
         output_fields,
         docs: String::new(),
+        ..Default::default()
     })
 }
 

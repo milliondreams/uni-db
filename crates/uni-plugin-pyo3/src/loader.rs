@@ -517,6 +517,7 @@ fn register_algorithms(
         let sig = AlgorithmSignature {
             output_fields,
             docs: String::new(),
+            ..Default::default()
         };
 
         let local_name = entry.name.clone();

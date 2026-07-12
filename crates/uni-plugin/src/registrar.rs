@@ -371,6 +371,12 @@ impl<'a> PluginRegistrar<'a> {
     ) -> Result<&mut Self, PluginError> {
         self.require(&Capability::Algorithm)?;
         self.validate_qname(&qname)?;
+        // Slice-version negotiation (proposal §4.3 / D6): refuse at load time if
+        // the algorithm declares a capability slice/version the host does not
+        // implement, rather than trapping later on an unknown kernel op.
+        p.signature()
+            .check_slices(crate::traits::algorithm::HOST_CAPABILITY_SLICES)
+            .map_err(|e| PluginError::SliceUnavailable(e.message))?;
         // Snapshot the effective caps so the stored entry can gate host
         // graph access (e.g. `HostQuery`) at CALL time.
         let effective_caps = self.effective_caps.clone();

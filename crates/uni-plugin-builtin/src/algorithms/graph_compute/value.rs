@@ -458,6 +458,71 @@ impl WalkMatrix {
     }
 }
 
+/// A per-edge value list: parallel `(src, dst, value)` columns over vertex slots.
+///
+/// The result of an all-pairs kernel such as `all_pairs_overlap` — one entry per
+/// adjacent vertex pair — which structurally cannot be a `[V]` [`Tensor`]. `src`
+/// and `dst` are vertex slots; a provider translates them to external Vids at
+/// egress. This is the per-edge support basis for triangle counting and k-truss
+/// (proposal §4.3 starred `neighborhood_overlap` / `PairSpec::AdjacentPairs`).
+#[derive(Clone, Debug, Default)]
+pub struct PairList {
+    src: Vec<u32>,
+    dst: Vec<u32>,
+    val: Vec<f64>,
+}
+
+impl PairList {
+    /// Wraps parallel `(src, dst, value)` slot columns of equal length.
+    ///
+    /// # Panics
+    /// Panics if the three columns differ in length (a construction invariant).
+    #[must_use]
+    pub fn new(src: Vec<u32>, dst: Vec<u32>, val: Vec<f64>) -> Self {
+        assert!(
+            src.len() == dst.len() && dst.len() == val.len(),
+            "PairList columns must be equal length"
+        );
+        Self { src, dst, val }
+    }
+
+    /// Returns the source-slot column.
+    #[must_use]
+    pub fn src(&self) -> &[u32] {
+        &self.src
+    }
+
+    /// Returns the destination-slot column.
+    #[must_use]
+    pub fn dst(&self) -> &[u32] {
+        &self.dst
+    }
+
+    /// Returns the per-pair value column.
+    #[must_use]
+    pub fn val(&self) -> &[f64] {
+        &self.val
+    }
+
+    /// Returns the number of pairs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.val.len()
+    }
+
+    /// Returns `true` if there are no pairs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.val.is_empty()
+    }
+
+    /// Returns the number of bytes held live, for arena accounting.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.src.len() * (2 * std::mem::size_of::<u32>() + std::mem::size_of::<f64>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

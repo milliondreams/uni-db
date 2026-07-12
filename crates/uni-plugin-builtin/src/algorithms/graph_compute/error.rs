@@ -35,11 +35,23 @@ pub const SEED_NOT_IN_PROJECTION: u32 = 0x868;
 pub const EMIT_SCHEMA_MISMATCH: u32 = 0x869;
 /// A manifest requested a capability slice version the host lacks (§4.3).
 ///
-/// **Reserved**: the host currently exposes a single `graph-compute@1` slice, so
-/// a load-time version negotiation never fails. This code is pinned for the
-/// forward-compatible multi-version check (proposal §4.3 / L-4) and is
-/// intentionally unused until a second slice version ships.
+/// Raised by [`AlgorithmSignature::check_slices`] at load time when an
+/// algorithm declares a capability slice/version the host does not implement
+/// (today the host provides only `graph-compute@1`). Negotiating up front means
+/// a `graph-compute@2` guest fails registration with a clear message instead of
+/// trapping later on an unknown kernel op (proposal §4.3 / L-4 / decision D6).
+///
+/// [`AlgorithmSignature::check_slices`]: uni_plugin::traits::algorithm::AlgorithmSignature::check_slices
 pub const SLICE_VERSION_MISMATCH: u32 = 0x86A;
+/// An algorithm argument violated the declared arity or type (§4.6).
+///
+/// Raised by [`AlgorithmSignature::coerce_config_json`] before a provider runs
+/// when a positional argument is missing (no default), mistyped, or in excess of
+/// the declared arity — closing the native providers' untyped-arg weakness at the
+/// one place all loaders share (proposal §4.6 / decision D7).
+///
+/// [`AlgorithmSignature::coerce_config_json`]: uni_plugin::traits::algorithm::AlgorithmSignature::coerce_config_json
+pub const ARG_VALIDATION: u32 = 0x86E;
 /// A generation or epoch wrap was rejected fail-closed (proposal §4.2).
 pub const WRAP_FAIL_CLOSED: u32 = 0x86B;
 /// A kernel was called without the `graph-compute` capability grant (§4.6).

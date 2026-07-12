@@ -28,6 +28,7 @@
 //
 // Rust guideline compliant
 
+pub mod conformance;
 pub mod dispatch;
 pub mod error;
 pub mod first_party;
@@ -40,14 +41,36 @@ pub mod value;
 mod differential_tests;
 
 pub mod provider;
+pub mod provider_pairs;
+pub mod provider_walks;
 
+pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
 pub use session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
 pub use table::HandleTable;
-pub use value::{DType, Scalar, Shape, Tensor, VertexSet};
+pub use value::{DType, PairList, Scalar, Shape, Tensor, VertexSet};
+
+/// The capability-slice name the GraphCompute kernel catalog is versioned under.
+pub const GRAPH_COMPUTE_SLICE: &str = "graph-compute";
+
+/// The single slice version this host implements (`graph-compute@1`).
+///
+/// Slice negotiation checks a guest algorithm's declared [`SliceReq`]s against
+/// this at load time; a request for a higher version fails closed with `0x86A`
+/// rather than trapping later on an unknown kernel op (proposal §4.3 / D6).
+pub const GRAPH_COMPUTE_SLICE_VERSION: u16 = 1;
+
+/// Builds the `graph-compute@1` slice requirement a first-party provider declares.
+#[must_use]
+pub fn graph_compute_slice_req() -> uni_plugin::traits::algorithm::SliceReq {
+    uni_plugin::traits::algorithm::SliceReq {
+        slice: GRAPH_COMPUTE_SLICE.into(),
+        version: GRAPH_COMPUTE_SLICE_VERSION,
+    }
+}
 
 /// Name of the host-generated vertex-id column, prepended to every result batch.
 ///

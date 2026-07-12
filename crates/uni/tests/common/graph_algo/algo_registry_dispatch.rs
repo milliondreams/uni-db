@@ -20,12 +20,14 @@ async fn all_algorithms_registered_in_plugin_registry() {
 
     // The plugin registry contains every algorithm from the static
     // `uni-algo` registry (each registered as both a procedure adapter
-    // and a provider) PLUS five first-party providers authored directly
+    // and a provider) PLUS seven first-party providers authored directly
     // against `AlgorithmProvider` / `GraphView` and deliberately absent
     // from the static registry: `uni.algo.reachability`, `uni.algo.pagerank`,
-    // `uni.algo.sssp` (Pregel), `uni.path.expand`, and `uni.algo.gcpagerank`
-    // (the GraphCompute kernel-driven Personalized PageRank).
-    const FIRST_PARTY_PROVIDERS: usize = 5;
+    // `uni.algo.sssp` (Pregel), `uni.path.expand`, `uni.algo.gcpagerank`
+    // (the GraphCompute kernel-driven Personalized PageRank),
+    // `uni.algo.gcwalks` (GraphCompute node2vec/DeepWalk walk generation), and
+    // `uni.algo.gcoverlap` (GraphCompute all-pairs neighbourhood overlap).
+    const FIRST_PARTY_PROVIDERS: usize = 7;
     let static_registry = uni_algo::algo::AlgorithmRegistry::new();
     let expected_count = static_registry.list().len() + FIRST_PARTY_PROVIDERS;
     assert_eq!(

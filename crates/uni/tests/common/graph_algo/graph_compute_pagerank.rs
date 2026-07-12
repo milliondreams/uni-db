@@ -107,6 +107,68 @@ async fn gcpagerank_is_deterministic_e2e() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn gcwalks_via_call_emits_walk_sequences_over_l0() -> anyhow::Result<()> {
+    // WS1: `emit_walks` egress reaches the user as (walk_id, step, nodeId) rows
+    // through the CALL path, over unflushed L0.
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let session = db.session();
+
+    let query = format!(
+        "CALL uni.algo.gcwalks([{vid_a}], 4, 3, 1.0, 1.0, 42, \
+         {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+         YIELD walk_id, step, nodeId RETURN walk_id, step, nodeId ORDER BY walk_id, step"
+    );
+    let res = session.query(&query).await?;
+    let rows = res.rows();
+    assert!(!rows.is_empty(), "walks must egress at least the start step");
+
+    // walk_id in 0..3; each walk's steps start at 0; nodeId is a real vertex id.
+    let mut steps_by_walk: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for row in rows {
+        let walk_id = row.get::<i64>("walk_id")?;
+        let step = row.get::<i64>("step")?;
+        let node_id = row.get::<i64>("nodeId")?;
+        assert!((0..3).contains(&walk_id), "walk_id {walk_id} out of range");
+        assert!(node_id >= 0, "nodeId must be a real vertex id");
+        steps_by_walk.entry(walk_id).or_default().push(step);
+    }
+    for (walk_id, steps) in &steps_by_walk {
+        assert_eq!(steps[0], 0, "walk {walk_id} must start at step 0");
+        assert!(
+            steps.windows(2).all(|w| w[1] == w[0] + 1),
+            "walk {walk_id} steps must be contiguous"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn gcoverlap_via_call_yields_pair_rows_over_l0() -> anyhow::Result<()> {
+    // WS2B: the per-edge `all_pairs_overlap` + `emit_pairs` path reaches the user
+    // as (srcId, dstId, value) rows through CALL, over unflushed L0.
+    let db = Uni::in_memory().build().await?;
+    let _vid_a = build_graph(&db).await?;
+    let session = db.session();
+
+    let query = "CALL uni.algo.gcoverlap('count', 'adjacent', 0, \
+         {nodeLabels: ['Node'], edgeTypes: ['LINKS']}) \
+         YIELD srcId, dstId, value RETURN srcId, dstId, value"
+        .to_owned();
+    let res = session.query(&query).await?;
+    // The result is well-formed: each row is a real edge with a finite support.
+    for row in res.rows() {
+        let src = row.get::<i64>("srcId")?;
+        let dst = row.get::<i64>("dstId")?;
+        let value = row.get::<f64>("value")?;
+        assert!(src >= 0 && dst >= 0, "endpoints are real vertex ids");
+        assert!(src < dst, "adjacent pairs are emitted with src < dst");
+        assert!(value.is_finite() && value >= 0.0, "support is finite and ≥ 0");
+    }
+    Ok(())
+}
+
 /// A third-party plugin registering the GraphCompute PageRank provider under its
 /// own namespace, with a configurable capability set to exercise the gates.
 struct ExampleGcPlugin {

@@ -352,6 +352,7 @@ fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignatur
     Ok(AlgorithmSignature {
         output_fields,
         docs: String::new(),
+        ..Default::default()
     })
 }
 

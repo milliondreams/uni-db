@@ -21,11 +21,22 @@
 //! This ships kernel groups 0–6 and 8 (plumbing, sets, traversal, `spmv`, value
 //! maps, reductions, iteration control, and `emit`) — enough to author the F-row
 //! algorithms (PageRank/PPR, reachability, WCC, Bellman-Ford, HITS) — plus the
-//! stochastic `random_walks` (F-8, with `walk_visit_counts`) and the starred
-//! `neighborhood_overlap` (C-3) and `next_bucket` (C-1) kernels. The remaining
-//! starred Brandes primitives (`bfs_levels`, `reverse_accumulate`) are deferred;
-//! exact betweenness is available today via the native `uni.algo.betweenness`
-//! provider (proposal §8).
+//! stochastic `random_walks` (F-8) with both its egress paths (`walk_visit_counts`
+//! for the per-vertex fold and `emit_walks` for the ordered walk sequences that
+//! DeepWalk/node2vec training needs), the single-source `neighborhood_overlap` and
+//! the bulk `all_pairs_overlap` (C-3, with `emit_pairs` for the per-edge
+//! triangle-support / k-truss output shape a `[V]` map cannot express), and
+//! `next_bucket` (C-1).
+//!
+//! # Deferred (native fallback exists)
+//! The starred Brandes primitives (`bfs_levels`, `reverse_accumulate`) are the one
+//! remaining C-class gap: exact betweenness is authorable today via the native
+//! `uni.algo.betweenness` provider (proposal §8), so this is a performance/ergonomic
+//! deferral, not a capability loss. The `EdgeFilter` traversal predicate — and the
+//! temporal `TimestampLe` / weight-range expansion the §6 differentiators build on
+//! it — is also deferred: edge-*type* filtering is covered at projection-build time
+//! via `GraphProjectionSpec.edge_types`, but a time- or weight-thresholded `expand`
+//! is not yet expressible (proposal §6.2 / §7, "Ongoing differentiators").
 //
 // Rust guideline compliant
 
@@ -39,7 +50,7 @@ use uni_plugin::errors::FnError;
 use super::error;
 use super::handle::{Handle, HandleKind};
 use super::table::HandleTable;
-use super::value::{DType, Scalar, Tensor, VertexSet, WalkMatrix};
+use super::value::{DType, PairList, Scalar, Tensor, VertexSet, WalkMatrix};
 use super::{Arena, BUDGET_CHECK_CHUNK, WorkBudget};
 
 /// Which adjacency direction a traversal or `spmv` follows.
@@ -143,12 +154,39 @@ pub enum Semiring {
 /// A neighbourhood-overlap similarity metric (proposal §8, C-3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlapMetric {
+    /// `|N(u) ∩ N(v)|` — the raw shared-neighbour count.
+    ///
+    /// On an adjacent pair `(u, v)` this is the edge's triangle *support*, the
+    /// basis for triangle counting and k-truss.
+    Count,
     /// `|N(u) ∩ N(v)| / |N(u) ∪ N(v)|`.
     Jaccard,
     /// `|N(u) ∩ N(v)| / min(|N(u)|, |N(v)|)`.
     Overlap,
     /// `|N(u) ∩ N(v)| / sqrt(|N(u)| · |N(v)|)`.
     Cosine,
+    /// `Σ_{w ∈ N(u) ∩ N(v)} 1 / ln(deg(w))` (Adamic-Adar).
+    ///
+    /// Weights each shared neighbour by the inverse log of its degree, so a
+    /// common neighbour that is a hub contributes less than a rare one. Unbounded
+    /// (not a ratio); common neighbours of degree ≤ 1 contribute 0.
+    AdamicAdar,
+}
+
+/// Which vertex pairs an all-pairs overlap kernel emits (proposal §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairSpec {
+    /// Every adjacent undirected pair `(u, v)` with `u < v`.
+    ///
+    /// This is the per-edge support basis for triangle counting and k-truss:
+    /// with [`OverlapMetric::Count`] each pair's value is its triangle support.
+    AdjacentPairs,
+    /// The `k` adjacent pairs with the highest metric value, ranked descending.
+    ///
+    /// A bounded top-`k` over the [`PairSpec::AdjacentPairs`] set (lowest
+    /// `(src, dst)` breaking value ties), for surfacing the strongest links
+    /// without materializing every pair downstream.
+    TopKCandidates(u32),
 }
 
 /// A per-invocation GraphCompute session: handle table, budget, arena, sink.
@@ -165,6 +203,13 @@ pub struct AlgoSession {
     primary_graph: Option<Arc<GraphProjection>>,
     /// Captured `emit` output: `(column_name, values)` per emitted column.
     emitted: Vec<(String, Vec<f64>)>,
+    /// Captured `emit_walks` output: `(walk_id, step, nodeId)` rows, row-major
+    /// over walks then steps. A ragged, multi-row sink distinct from `emitted`,
+    /// which is strictly `[V]`-shaped (proposal §4.6 `emit_walks`).
+    emitted_walks: Vec<(i64, i64, i64)>,
+    /// Captured `emit_pairs` output: `(srcId, dstId, value)` per-edge rows — the
+    /// all-pairs overlap egress that cannot be a `[V]` map (proposal §4.3 C-3).
+    emitted_pairs: Vec<(i64, i64, f64)>,
     /// Optional wall-clock deadline; every metered kernel checks it (§5.2).
     deadline: Option<std::time::Instant>,
     /// Optional declared guest-emitted column names (the host `nodeId` column
@@ -183,6 +228,8 @@ impl AlgoSession {
             arena,
             primary_graph: None,
             emitted: Vec::new(),
+            emitted_walks: Vec::new(),
+            emitted_pairs: Vec::new(),
             deadline: None,
             expected_columns: None,
         }
@@ -228,6 +275,25 @@ impl AlgoSession {
         std::mem::take(&mut self.emitted)
     }
 
+    /// Consumes the session's captured `emit_walks` output.
+    ///
+    /// Each row is `(walk_id, step, nodeId)` with `nodeId` already translated to
+    /// the external Vid, so the walks provider builds its batch directly.
+    #[must_use]
+    pub fn take_emitted_walks(&mut self) -> Vec<(i64, i64, i64)> {
+        std::mem::take(&mut self.emitted_walks)
+    }
+
+    /// Consumes the session's captured `emit_pairs` output.
+    ///
+    /// Each row is `(srcId, dstId, value)` with the endpoint slots already
+    /// translated to external Vids, so the overlap provider builds its batch
+    /// directly.
+    #[must_use]
+    pub fn take_emitted_pairs(&mut self) -> Vec<(i64, i64, f64)> {
+        std::mem::take(&mut self.emitted_pairs)
+    }
+
     /// Returns the work units charged so far (for accounting tests).
     #[must_use]
     pub fn work_spent(&self) -> u64 {
@@ -250,6 +316,15 @@ impl AlgoSession {
     #[must_use]
     pub fn bytes_live(&self) -> usize {
         self.arena.bytes_live()
+    }
+
+    /// Snapshots a tensor handle's values, or `None` if it is not a tensor.
+    ///
+    /// Used by the conformance probes (and reachable outside `cfg(test)`) to read
+    /// a kernel's output back for determinism checks.
+    #[must_use]
+    pub(crate) fn tensor_snapshot(&self, h: Handle) -> Option<Vec<f64>> {
+        self.table.get_tensor(h).ok().map(|t| t.values().to_vec())
     }
 
     /// Reads a tensor handle's values back out, for differential tests only.
@@ -313,6 +388,12 @@ impl AlgoSession {
     fn alloc_walks(&mut self, walks: WalkMatrix) -> Result<Handle, FnError> {
         self.reserve(walks.heap_bytes())?;
         Ok(self.table.insert_walks(walks))
+    }
+
+    /// Charges the arena and inserts a pair list, returning its handle.
+    fn alloc_pairs(&mut self, pairs: PairList) -> Result<Handle, FnError> {
+        self.reserve(pairs.heap_bytes())?;
+        Ok(self.table.insert_pairs(pairs))
     }
 }
 
@@ -529,6 +610,19 @@ pub trait GraphCompute {
     /// Returns a typed [`FnError`] on a bad handle or exhausted resources.
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError>;
 
+    /// Group 8 (egress): emits each walk as `(walk_id, step, nodeId)` rows.
+    ///
+    /// Host-terminal, like [`emit`](GraphCompute::emit): the guest never receives
+    /// a `RecordBatch` back. Unlike `emit`, the result is a ragged, multi-row
+    /// table (one row per step across all walks), so it captures the actual walk
+    /// *sequences* — the skip-gram basis DeepWalk/node2vec training needs, which
+    /// the lossy `walk_visit_counts` fold discards (proposal §4.6 `emit_walks`).
+    /// Slots are translated to external Vids in-kernel.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget.
+    fn emit_walks(&mut self, walks: Handle) -> Result<(), FnError>;
+
     /// Starred (C-3): the per-vertex neighbourhood-overlap similarity to `source`.
     ///
     /// `overlap[v]` is the chosen [`OverlapMetric`] between the undirected
@@ -544,6 +638,32 @@ pub trait GraphCompute {
         source: Vid,
         metric: OverlapMetric,
     ) -> Result<Handle, FnError>;
+
+    /// Starred (C-3): bulk overlap over vertex *pairs* — the k-truss basis.
+    ///
+    /// Computes the chosen [`OverlapMetric`] for the pairs named by `spec` in one
+    /// native pass and returns a [`HandleKind::Pairs`] handle. With
+    /// [`PairSpec::AdjacentPairs`] + [`OverlapMetric::Count`] each pair's value is
+    /// its triangle support — the per-edge output shape a `[V]` map cannot express
+    /// (proposal §4.3 starred `neighborhood_overlap` / `PairSpec`).
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or exhausted resources.
+    fn all_pairs_overlap(
+        &mut self,
+        g: Handle,
+        spec: PairSpec,
+        metric: OverlapMetric,
+    ) -> Result<Handle, FnError>;
+
+    /// Group 8 (egress): emits a pair list as `(srcId, dstId, value)` rows.
+    ///
+    /// Host-terminal, translating endpoint slots to external Vids in-kernel. The
+    /// per-edge counterpart to [`emit`](GraphCompute::emit) (proposal §4.3 C-3).
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget.
+    fn emit_pairs(&mut self, pairs: Handle) -> Result<(), FnError>;
 
     /// Starred (C-1): the Δ-stepping frontier — vertices whose distance lies in
     /// `[bucket · delta, (bucket + 1) · delta)`.
@@ -1269,6 +1389,27 @@ impl GraphCompute for AlgoSession {
         self.alloc_tensor(Tensor::from_f64(counts))
     }
 
+    fn emit_walks(&mut self, walks: Handle) -> Result<(), FnError> {
+        // Copy the slot rows out first, releasing the `&WalkMatrix` borrow of
+        // `self.table` before the `&self` slot→Vid translation below.
+        let rows: Vec<Vec<u32>> = self.table.get_walks(walks)?.walks().to_vec();
+        let total_steps: usize = rows.iter().map(Vec::len).sum();
+        self.charge(total_steps as u64)?;
+        let mut out = Vec::with_capacity(total_steps);
+        for (walk_id, walk) in rows.iter().enumerate() {
+            for (step, &slot) in walk.iter().enumerate() {
+                let vid = self.slot_to_vid(slot);
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "walk_id/step and Cypher vids fit i64 in practice"
+                )]
+                out.push((walk_id as i64, step as i64, vid.as_u64() as i64));
+            }
+        }
+        self.emitted_walks = out;
+        Ok(())
+    }
+
     fn neighborhood_overlap(
         &mut self,
         g: Handle,
@@ -1291,34 +1432,127 @@ impl GraphCompute for AlgoSession {
             ns
         };
         let src_nbrs = undirected(src);
-        let mut out = vec![0.0f64; n];
         // O(Σ_v (deg(src) + deg(v))) — charge each vertex's neighbourhood scan.
         let mut charged = 0u64;
+        // Adamic-Adar weights each shared neighbour `w` by `1 / ln(deg(w))`, so
+        // precompute the per-slot weight (0 where deg ≤ 1, since ln(1) = 0). This
+        // is one extra O(Σ deg) undirected scan; charge its real cost.
+        let aa_weight: Option<Vec<f64>> = if matches!(metric, OverlapMetric::AdamicAdar) {
+            let mut weights = Vec::with_capacity(n);
+            for w in 0..n as u32 {
+                let d = undirected(w).len();
+                charged += d as u64;
+                let d = d as f64;
+                weights.push(if d > 1.0 { 1.0 / d.ln() } else { 0.0 });
+            }
+            Some(weights)
+        } else {
+            None
+        };
+        let mut out = vec![0.0f64; n];
         for v in 0..n as u32 {
             if v == src {
                 continue;
             }
             let v_nbrs = undirected(v);
             charged += (src_nbrs.len() + v_nbrs.len()) as u64;
-            let overlap = intersect_sorted_len(&src_nbrs, &v_nbrs) as f64;
-            let (du, dv) = (src_nbrs.len() as f64, v_nbrs.len() as f64);
-            out[v as usize] = match metric {
-                OverlapMetric::Jaccard => {
-                    let union = du + dv - overlap;
-                    if union == 0.0 { 0.0 } else { overlap / union }
-                }
-                OverlapMetric::Overlap => {
-                    let m = du.min(dv);
-                    if m == 0.0 { 0.0 } else { overlap / m }
-                }
-                OverlapMetric::Cosine => {
-                    let d = (du * dv).sqrt();
-                    if d == 0.0 { 0.0 } else { overlap / d }
-                }
-            };
+            out[v as usize] = overlap_value(&src_nbrs, &v_nbrs, metric, aa_weight.as_deref());
         }
         self.charge(charged.max(n as u64))?;
         self.alloc_tensor(Tensor::from_f64(out))
+    }
+
+    fn all_pairs_overlap(
+        &mut self,
+        g: Handle,
+        spec: PairSpec,
+        metric: OverlapMetric,
+    ) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let n = graph.vertex_count();
+        // Build every undirected neighbourhood once (sorted, deduped out ∪ in).
+        let nbrs: Vec<Vec<u32>> = (0..n as u32)
+            .map(|u| {
+                let mut ns: Vec<u32> = graph.out_neighbors(u).to_vec();
+                if graph.has_reverse() {
+                    ns.extend_from_slice(graph.in_neighbors(u));
+                }
+                ns.sort_unstable();
+                ns.dedup();
+                ns
+            })
+            .collect();
+        // Charge the neighbourhood build (Σ deg) plus each pair's intersection.
+        let mut charged: u64 = nbrs.iter().map(|x| x.len() as u64).sum();
+        let aa_weight: Option<Vec<f64>> = if matches!(metric, OverlapMetric::AdamicAdar) {
+            Some(
+                nbrs.iter()
+                    .map(|ns| {
+                        let d = ns.len() as f64;
+                        if d > 1.0 { 1.0 / d.ln() } else { 0.0 }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        // Each adjacent undirected pair (u < v) appears once: v ∈ N(u) with v > u.
+        let (mut src, mut dst, mut val) = (Vec::new(), Vec::new(), Vec::new());
+        for u in 0..n as u32 {
+            for &v in &nbrs[u as usize] {
+                if v > u {
+                    charged += (nbrs[u as usize].len() + nbrs[v as usize].len()) as u64;
+                    let value = overlap_value(
+                        &nbrs[u as usize],
+                        &nbrs[v as usize],
+                        metric,
+                        aa_weight.as_deref(),
+                    );
+                    src.push(u);
+                    dst.push(v);
+                    val.push(value);
+                }
+            }
+        }
+        self.charge(charged.max(n as u64))?;
+
+        if let PairSpec::TopKCandidates(k) = spec {
+            // Rank by descending value, tie-break by ascending (src, dst).
+            let mut order: Vec<usize> = (0..val.len()).collect();
+            order.sort_by(|&a, &b| {
+                val[b]
+                    .partial_cmp(&val[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (src[a], dst[a]).cmp(&(src[b], dst[b])))
+            });
+            order.truncate(k as usize);
+            let s2 = order.iter().map(|&i| src[i]).collect();
+            let d2 = order.iter().map(|&i| dst[i]).collect();
+            let v2 = order.iter().map(|&i| val[i]).collect();
+            return self.alloc_pairs(PairList::new(s2, d2, v2));
+        }
+        self.alloc_pairs(PairList::new(src, dst, val))
+    }
+
+    fn emit_pairs(&mut self, pairs: Handle) -> Result<(), FnError> {
+        // Copy the columns out before the `&self` slot→Vid translation below.
+        let (src, dst, val) = {
+            let p = self.table.get_pairs(pairs)?;
+            (p.src().to_vec(), p.dst().to_vec(), p.val().to_vec())
+        };
+        self.charge(val.len() as u64)?;
+        let mut out = Vec::with_capacity(val.len());
+        for i in 0..val.len() {
+            let s = self.slot_to_vid(src[i]);
+            let d = self.slot_to_vid(dst[i]);
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "Cypher vids fit i64 in practice"
+            )]
+            out.push((s.as_u64() as i64, d.as_u64() as i64, val[i]));
+        }
+        self.emitted_pairs = out;
+        Ok(())
     }
 
     fn next_bucket(&mut self, dist: Handle, delta: f64, bucket: u32) -> Result<Handle, FnError> {
@@ -1361,4 +1595,60 @@ fn intersect_sorted_len(a: &[u32], b: &[u32]) -> usize {
         j += usize::from(ge);
     }
     count
+}
+
+/// Computes a single [`OverlapMetric`] between two sorted neighbour slices.
+///
+/// Shared by the single-source `neighborhood_overlap` and the all-pairs kernel.
+/// `aa_weight` (indexed by slot) must be provided iff `metric` is
+/// [`OverlapMetric::AdamicAdar`].
+fn overlap_value(
+    u_nbrs: &[u32],
+    v_nbrs: &[u32],
+    metric: OverlapMetric,
+    aa_weight: Option<&[f64]>,
+) -> f64 {
+    let overlap = intersect_sorted_len(u_nbrs, v_nbrs) as f64;
+    let (du, dv) = (u_nbrs.len() as f64, v_nbrs.len() as f64);
+    match metric {
+        OverlapMetric::Count => overlap,
+        OverlapMetric::Jaccard => {
+            let union = du + dv - overlap;
+            if union == 0.0 { 0.0 } else { overlap / union }
+        }
+        OverlapMetric::Overlap => {
+            let m = du.min(dv);
+            if m == 0.0 { 0.0 } else { overlap / m }
+        }
+        OverlapMetric::Cosine => {
+            let d = (du * dv).sqrt();
+            if d == 0.0 { 0.0 } else { overlap / d }
+        }
+        OverlapMetric::AdamicAdar => intersect_sorted_weight(
+            u_nbrs,
+            v_nbrs,
+            aa_weight.expect("aa_weight required for AdamicAdar"),
+        ),
+    }
+}
+
+/// Sums `weight[w]` over the sorted-slice intersection — the Adamic-Adar core.
+///
+/// `a` and `b` are sorted slot slices; `weight` is indexed by slot. Each shared
+/// element `w` contributes `weight[w]` (for Adamic-Adar, `1 / ln(deg(w))`).
+fn intersect_sorted_weight(a: &[u32], b: &[u32], weight: &[f64]) -> f64 {
+    let (mut i, mut j, mut acc) = (0usize, 0usize, 0.0f64);
+    while i < a.len() && j < b.len() {
+        let (va, vb) = (a[i], b[j]);
+        if va == vb {
+            acc += weight[va as usize];
+            i += 1;
+            j += 1;
+        } else if va < vb {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    acc
 }

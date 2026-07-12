@@ -24,7 +24,7 @@ use uni_plugin::errors::FnError;
 
 use super::error;
 use super::handle::{Handle, HandleKind, MAX_GENERATION};
-use super::value::{Tensor, VertexSet, WalkMatrix};
+use super::value::{PairList, Tensor, VertexSet, WalkMatrix};
 
 /// One slot in a per-kind slab: a generation plus an optional live value.
 #[derive(Debug)]
@@ -140,6 +140,7 @@ pub struct HandleTable {
     tensors: Slab<Tensor>,
     graphs: Slab<Arc<GraphProjection>>,
     walks: Slab<WalkMatrix>,
+    pairs: Slab<PairList>,
 }
 
 impl HandleTable {
@@ -152,6 +153,7 @@ impl HandleTable {
             tensors: Slab::default(),
             graphs: Slab::default(),
             walks: Slab::default(),
+            pairs: Slab::default(),
         }
     }
 
@@ -183,6 +185,12 @@ impl HandleTable {
     pub fn insert_walks(&mut self, walks: WalkMatrix) -> Handle {
         let (slot, generation) = self.walks.insert(walks);
         Handle::pack(self.epoch, HandleKind::Walks, generation, slot)
+    }
+
+    /// Inserts a per-edge pair list and returns its handle.
+    pub fn insert_pairs(&mut self, pairs: PairList) -> Handle {
+        let (slot, generation) = self.pairs.insert(pairs);
+        Handle::pack(self.epoch, HandleKind::Pairs, generation, slot)
     }
 
     /// Validates the epoch and kind of `h`, returning the resolved kind.
@@ -241,6 +249,17 @@ impl HandleTable {
         }
     }
 
+    /// Resolves a pair-list handle.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
+    pub fn get_pairs(&self, h: Handle) -> Result<&PairList, FnError> {
+        match self.check_epoch_and_kind(h)? {
+            HandleKind::Pairs => self.pairs.get(h.slot(), h.generation()),
+            _ => Err(error::kind_mismatch("Pairs")),
+        }
+    }
+
     /// Frees any handle, returning the number of heap bytes reclaimed.
     ///
     /// Graph handles report zero bytes: the projection is shared behind an `Arc`
@@ -267,6 +286,10 @@ impl HandleTable {
                 let v = self.walks.free(h.slot(), h.generation())?;
                 Ok(v.heap_bytes())
             }
+            HandleKind::Pairs => {
+                let v = self.pairs.free(h.slot(), h.generation())?;
+                Ok(v.heap_bytes())
+            }
             HandleKind::Levels => Err(error::kind_mismatch("a supported kind")),
         }
     }
@@ -278,6 +301,7 @@ impl HandleTable {
             + self.tensors.live_count()
             + self.graphs.live_count()
             + self.walks.live_count()
+            + self.pairs.live_count()
     }
 }
 

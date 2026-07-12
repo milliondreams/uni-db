@@ -69,6 +69,8 @@ pub enum HandleKind {
     Walks = 3,
     /// Per-vertex BFS depth + path counts (reserved; Brandes kernels).
     Levels = 4,
+    /// A per-edge `(src, dst, value)` pair list (all-pairs overlap / k-truss).
+    Pairs = 5,
 }
 
 impl HandleKind {
@@ -87,6 +89,7 @@ impl HandleKind {
             2 => Some(HandleKind::Graph),
             3 => Some(HandleKind::Walks),
             4 => Some(HandleKind::Levels),
+            5 => Some(HandleKind::Pairs),
             _ => None,
         }
     }

@@ -358,6 +358,52 @@ fn random_walks_are_deterministic_and_visit_only_reachable() {
     let _ = DType::F64; // dtype import kept for symmetry with sibling tests
 }
 
+/// `emit_walks` egresses the ordered walk *sequences* as `(walk_id, step,
+/// nodeId)` rows — the lossless surface `walk_visit_counts` cannot express (§4.6).
+#[test]
+fn emit_walks_egresses_ordered_sequences() {
+    use super::session::GraphCompute;
+
+    // A single triangle over external ids {10, 20, 30} so slot != Vid, proving
+    // the in-kernel slot→Vid translation.
+    let nodes = vec![10u64, 20, 30];
+    let edges = vec![(10, 20, 1.0), (20, 30, 1.0), (30, 10, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+
+    let walks = s
+        .random_walks(g, 5, 3, &[Vid::new(10)], 1.0, 1.0, 0x51DE)
+        .expect("random_walks succeeds");
+    s.emit_walks(walks).expect("emit_walks succeeds");
+    let rows = s.take_emitted_walks();
+
+    // 3 walks of length 5 over a cycle (no dead ends) => 3 * 6 = 18 step rows.
+    assert_eq!(rows.len(), 18, "one row per step across all walks");
+
+    // walk_id ∈ 0..3, step ∈ 0..6 contiguous per walk, nodeId always an external
+    // id from the reachable triangle.
+    let external: std::collections::HashSet<i64> = [10, 20, 30].into_iter().collect();
+    let mut steps_per_walk = std::collections::HashMap::<i64, Vec<i64>>::new();
+    for (walk_id, step, node_id) in &rows {
+        assert!((0..3).contains(walk_id), "walk_id {walk_id} out of range");
+        assert!(
+            external.contains(node_id),
+            "nodeId {node_id} must be an external Vid, not a slot"
+        );
+        steps_per_walk.entry(*walk_id).or_default().push(*step);
+    }
+    for (walk_id, mut steps) in steps_per_walk {
+        steps.sort_unstable();
+        assert_eq!(
+            steps,
+            (0..steps.len() as i64).collect::<Vec<_>>(),
+            "walk {walk_id} steps must be contiguous from 0"
+        );
+    }
+
+    // The sink is consumed exactly once.
+    assert!(s.take_emitted_walks().is_empty(), "take drains the sink");
+}
+
 /// `neighborhood_overlap` matches a naive sorted-set Jaccard oracle (C-3).
 #[test]
 fn neighborhood_overlap_matches_naive_jaccard() {
@@ -402,6 +448,150 @@ fn neighborhood_overlap_matches_naive_jaccard() {
             "Jaccard for slot {slot}: got {g_val}, want {want}"
         );
     }
+}
+
+/// `neighborhood_overlap` with `AdamicAdar` matches a naive `Σ 1/ln(deg(w))`
+/// oracle and a hand-computed golden literal (C-3).
+#[test]
+fn neighborhood_overlap_adamic_adar_matches_naive() {
+    use super::session::{GraphCompute, OverlapMetric};
+
+    // Same graph as the Jaccard test; slot i = node i (ids 0..5).
+    let nodes = vec![0, 1, 2, 3, 4, 5];
+    let edges = vec![
+        (0, 1, 1.0),
+        (0, 2, 1.0),
+        (1, 2, 1.0),
+        (1, 3, 1.0),
+        (2, 3, 1.0),
+        (4, 5, 1.0),
+    ];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+    let aa = s
+        .neighborhood_overlap(g, Vid::new(0), OverlapMetric::AdamicAdar)
+        .unwrap();
+    let got = read_tensor(&s, aa);
+
+    // Naive undirected neighbourhoods and degrees.
+    let mut nbr: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for &(u, v, _) in &edges {
+        nbr.entry(u).or_default().insert(v);
+        nbr.entry(v).or_default().insert(u);
+    }
+    let deg = |w: u64| nbr.get(&w).map_or(0, HashSet::len) as f64;
+    let empty = HashSet::new();
+    let n0 = nbr.get(&0).unwrap_or(&empty);
+    for (slot, &g_val) in got.iter().enumerate() {
+        let vid = vid_of_slot(&nodes, slot) as u64;
+        let want = if vid == 0 {
+            0.0
+        } else {
+            let nv = nbr.get(&vid).unwrap_or(&empty);
+            n0.intersection(nv)
+                .map(|&w| {
+                    let d = deg(w);
+                    if d > 1.0 { 1.0 / d.ln() } else { 0.0 }
+                })
+                .sum::<f64>()
+        };
+        assert!(
+            (g_val - want).abs() < 1e-12,
+            "Adamic-Adar for slot {slot}: got {g_val}, want {want}"
+        );
+    }
+
+    // Golden literal: slot 3 shares both {1,2} (each deg 3) with node 0, so
+    // AA(0,3) = 2 / ln(3). Kept as a constant so an oracle bug can't hide.
+    let want_slot3 = 2.0 / 3.0_f64.ln();
+    assert!(
+        (got[3] - want_slot3).abs() < 1e-12,
+        "AA(0,3) golden: got {}, want {want_slot3}",
+        got[3]
+    );
+}
+
+/// `all_pairs_overlap` with `Count` gives each edge's triangle support, so on the
+/// complete graph K_n the totals match the closed forms (C-3 / k-truss basis).
+#[test]
+fn all_pairs_overlap_counts_triangles_on_complete_graph() {
+    use super::session::{GraphCompute, OverlapMetric, PairSpec};
+
+    // Build K_n (one undirected edge per pair; include_reverse makes it undirected).
+    let build_kn = |n: u64| {
+        let nodes: Vec<u64> = (0..n).collect();
+        let mut edges = Vec::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                edges.push((u, v, 1.0));
+            }
+        }
+        build_projection(&nodes, &edges, false, true)
+    };
+
+    for n in [4u64, 5, 6] {
+        let (mut s, g) = session_with(build_kn(n));
+        let pairs = s
+            .all_pairs_overlap(g, PairSpec::AdjacentPairs, OverlapMetric::Count)
+            .unwrap();
+        s.emit_pairs(pairs).unwrap();
+        let rows = s.take_emitted_pairs();
+
+        // Every one of the C(n,2) adjacent pairs has support n-2.
+        let expected_pairs = (n * (n - 1) / 2) as usize;
+        assert_eq!(rows.len(), expected_pairs, "K_{n} has C(n,2) adjacent pairs");
+        for (src, dst, value) in &rows {
+            assert!(src < dst, "pairs are emitted with src < dst");
+            #[expect(clippy::cast_precision_loss, reason = "small test integers")]
+            let want = (n - 2) as f64;
+            assert!(
+                (value - want).abs() < 1e-12,
+                "K_{n} edge support must be n-2 = {want}, got {value}"
+            );
+        }
+        // Σ support / 3 = number of triangles = C(n,3).
+        let total: f64 = rows.iter().map(|(_, _, v)| v).sum();
+        let triangles = total / 3.0;
+        #[expect(clippy::cast_precision_loss, reason = "small test integers")]
+        let want_triangles = (n * (n - 1) * (n - 2) / 6) as f64;
+        assert!(
+            (triangles - want_triangles).abs() < 1e-9,
+            "K_{n} triangle count must be C(n,3) = {want_triangles}, got {triangles}"
+        );
+    }
+}
+
+/// `all_pairs_overlap` with `TopKCandidates` keeps exactly the k highest-value
+/// pairs, ranked descending.
+#[test]
+fn all_pairs_overlap_topk_keeps_highest() {
+    use super::session::{GraphCompute, OverlapMetric, PairSpec};
+
+    // Two triangles sharing vertex 2: {0,1,2} and {2,3,4}. Edge (0,1) has support
+    // 1 (common neighbour 2); likewise (3,4). Other adjacent pairs share fewer.
+    let nodes = vec![0u64, 1, 2, 3, 4];
+    let edges = vec![
+        (0, 1, 1.0),
+        (1, 2, 1.0),
+        (0, 2, 1.0),
+        (2, 3, 1.0),
+        (3, 4, 1.0),
+        (2, 4, 1.0),
+    ];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, false, true));
+    let pairs = s
+        .all_pairs_overlap(g, PairSpec::TopKCandidates(2), OverlapMetric::Count)
+        .unwrap();
+    s.emit_pairs(pairs).unwrap();
+    let rows = s.take_emitted_pairs();
+
+    assert_eq!(rows.len(), 2, "top-2 keeps exactly two pairs");
+    // Both retained pairs have the maximum support in this graph (>= any dropped).
+    assert!(
+        rows.iter().all(|(_, _, v)| *v >= 1.0),
+        "top-2 keeps the highest-support pairs, got {rows:?}"
+    );
+    // Ranked descending.
+    assert!(rows[0].2 >= rows[1].2, "top-k output is ranked descending");
 }
 
 /// `next_bucket` selects exactly the vertices whose distance lies in the band.

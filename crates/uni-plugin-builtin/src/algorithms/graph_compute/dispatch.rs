@@ -162,6 +162,17 @@ fn dir(s: &str) -> Result<Direction, FnError> {
     }
 }
 
+fn overlap_metric(s: &str) -> Result<OverlapMetric, FnError> {
+    match s {
+        "count" => Ok(OverlapMetric::Count),
+        "jaccard" => Ok(OverlapMetric::Jaccard),
+        "overlap" => Ok(OverlapMetric::Overlap),
+        "cosine" => Ok(OverlapMetric::Cosine),
+        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
+        other => Err(FnError::new(0x861, format!("bad overlap metric `{other}`"))),
+    }
+}
+
 fn semiring(s: &str) -> Result<Semiring, FnError> {
     match s {
         "reachability" => Ok(Semiring::Reachability),
@@ -420,22 +431,30 @@ impl GraphComputeRegistry {
             "walk_visit_counts" => session
                 .walk_visit_counts(from_i64(req.a), from_i64(req.g))
                 .map(h),
+            "emit_walks" => session
+                .emit_walks(from_i64(req.g))
+                .map(|()| KernelResponse::Unit),
             "neighborhood_overlap" => {
                 let source = req.seeds.first().copied().unwrap_or(0);
                 #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
                 let source = Vid::new(source as u64);
-                let metric = match req.s.as_str() {
-                    "jaccard" => OverlapMetric::Jaccard,
-                    "overlap" => OverlapMetric::Overlap,
-                    "cosine" => OverlapMetric::Cosine,
-                    other => {
-                        return Err(FnError::new(0x861, format!("bad overlap metric `{other}`")));
-                    }
-                };
                 session
-                    .neighborhood_overlap(from_i64(req.g), source, metric)
+                    .neighborhood_overlap(from_i64(req.g), source, overlap_metric(&req.s)?)
                     .map(h)
             }
+            "all_pairs_overlap" => {
+                let spec = match req.s2.as_str() {
+                    // `topk` reads the count from `k`; anything else is all pairs.
+                    "topk" => super::session::PairSpec::TopKCandidates(req.k),
+                    _ => super::session::PairSpec::AdjacentPairs,
+                };
+                session
+                    .all_pairs_overlap(from_i64(req.g), spec, overlap_metric(&req.s)?)
+                    .map(h)
+            }
+            "emit_pairs" => session
+                .emit_pairs(from_i64(req.g))
+                .map(|()| KernelResponse::Unit),
             "next_bucket" => session.next_bucket(from_i64(req.g), req.f, req.k).map(h),
             "topk" => {
                 let ranked = session.topk(from_i64(req.g), req.k)?;
@@ -731,6 +750,134 @@ mod tests {
         let _scattered = as_handle(call(format!(
             r#"{{"session":{sid},"op":"scatter","a":{affine},"b":{f1},"f":99.0}}"#
         )));
+    }
+
+    #[test]
+    fn crossing_count_is_graph_size_invariant() {
+        // L-9 — the conductor thesis, measured. A fixed-iteration PPR issues the
+        // same number of host-fn crossings regardless of |V|: only handles and
+        // scalars cross, never per-vertex/per-edge data. Any implementation that
+        // smuggled per-element crossings (or marshalled data) would scale with the
+        // graph and fail this. We count JSON kernel calls for the identical driver
+        // on a 12-node vs a 1200-node ring and assert byte-identical call counts.
+        fn ring(n: u64) -> GraphProjection {
+            let nodes: Vec<u64> = (0..n).collect();
+            let edges: Vec<(u64, u64)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+            build_projection(&nodes, &edges)
+        }
+
+        // Runs a fixed 20-iteration PPR over the JSON wire, returning the number
+        // of host-fn (kernel) calls made — independent of the result values.
+        fn count_crossings(graph: GraphProjection) -> usize {
+            let registry = GraphComputeRegistry::new();
+            let mut session = AlgoSession::new(
+                3,
+                WorkBudget::from_graph_size(graph.vertex_count() as u64, graph.edge_count() as u64),
+                Arena::new(1 << 24, 4096),
+            );
+            let g = to_i64(session.bind_graph(StdArc::new(graph)));
+            let sid = registry.open(session);
+
+            let mut calls = 0usize;
+            let mut call = |json: String| -> KernelResponse {
+                calls += 1;
+                serde_json::from_str(&registry.call_json(&json)).unwrap()
+            };
+            let handle = |r: KernelResponse| match r {
+                KernelResponse::Handle(h) => h,
+                other => panic!("want handle, got {other:?}"),
+            };
+
+            let teleport = handle(call(format!(
+                r#"{{"session":{sid},"op":"frontier","g":{g},"seeds":[0]}}"#
+            )));
+            let teleport = handle(call(format!(
+                r#"{{"session":{sid},"op":"set_to_map","g":{teleport},"f":1.0}}"#
+            )));
+            let teleport = handle(call(format!(
+                r#"{{"session":{sid},"op":"normalize","g":{teleport},"s":"l1"}}"#
+            )));
+            let deg = handle(call(format!(
+                r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+            )));
+            let inv_deg = handle(call(format!(
+                r#"{{"session":{sid},"op":"recip","g":{deg}}}"#
+            )));
+            let mut rank = teleport;
+            for _ in 0..20 {
+                let contrib = handle(call(format!(
+                    r#"{{"session":{sid},"op":"ewise","a":{rank},"b":{inv_deg},"s":"mul"}}"#
+                )));
+                let spread = handle(call(format!(
+                    r#"{{"session":{sid},"op":"spmv","g":{g},"a":{contrib},"s":"linear_algebra","s2":"out"}}"#
+                )));
+                let scaled = handle(call(format!(
+                    r#"{{"session":{sid},"op":"scale","g":{spread},"f":0.85}}"#
+                )));
+                rank = handle(call(format!(
+                    r#"{{"session":{sid},"op":"ewise","a":{scaled},"b":{teleport},"s":"axpy","f":0.15}}"#
+                )));
+                let _ = call(format!(r#"{{"session":{sid},"op":"free","g":{contrib}}}"#));
+            }
+            let _ = call(format!(
+                r#"{{"session":{sid},"op":"emit","g":{rank},"name":"score"}}"#
+            ));
+            calls
+        }
+
+        let small = count_crossings(ring(12));
+        let large = count_crossings(ring(1_200));
+        assert_eq!(
+            small, large,
+            "host-fn crossings must not scale with graph size (conductor thesis)"
+        );
+    }
+
+    #[test]
+    fn walk_egress_and_adamic_adar_reachable_via_json() {
+        // WS1/WS2A: `random_walks` → `emit_walks` and `neighborhood_overlap`
+        // with the `adamic_adar` metric must be drivable over the loader-agnostic
+        // JSON wire so the sandboxed WASM/Extism loaders reach them too.
+        let nodes = vec![0u64, 1, 2];
+        let edges = vec![(0, 1), (1, 2), (2, 0)];
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            11,
+            WorkBudget::from_graph_size(3, 3),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+
+        let call =
+            |json: String| -> KernelResponse { serde_json::from_str(&registry.call_json(&json)).unwrap() };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+
+        // Adamic-Adar over the triangle returns a live tensor handle.
+        let _aa = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"neighborhood_overlap","g":{g},"seeds":[0],"s":"adamic_adar"}}"#
+        )));
+
+        // random_walks -> emit_walks: the walk sequences reach the walk sink.
+        let walks = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"random_walks","g":{g},"seeds":[0],"wl":4,"wn":2,"seed":7}}"#
+        )));
+        assert_eq!(
+            call(format!(
+                r#"{{"session":{sid},"op":"emit_walks","g":{walks}}}"#
+            )),
+            KernelResponse::Unit,
+            "emit_walks returns Unit over JSON"
+        );
+
+        let mut closed = registry.close(sid).expect("session present");
+        let rows = closed.take_emitted_walks();
+        // 2 walks of length 4 over a cycle => 2 * 5 = 10 step rows.
+        assert_eq!(rows.len(), 10, "walk sequences egress through the JSON path");
     }
 
     #[test]

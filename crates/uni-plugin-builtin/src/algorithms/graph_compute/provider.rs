@@ -27,18 +27,53 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use uni_common::core::id::Vid;
+use datafusion::scalar::ScalarValue;
 use uni_plugin::FnError;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
 };
+use uni_plugin::traits::procedure::NamedArgType;
+use uni_plugin::traits::scalar::ArgType;
 
 use super::first_party::personalized_pagerank;
+use super::graph_compute_slice_req;
 use super::session::{AlgoSession, GraphCompute};
 use super::{Arena, WorkBudget};
 use crate::algorithms::bridge::AlgorithmHostBridge;
 
 /// Default damping factor when the CALL omits `alpha`.
 const DEFAULT_ALPHA: f64 = 0.85;
+
+/// The declared positional arguments of `uni.algo.gcpagerank` (proposal §4.6).
+///
+/// Enables host-side arity/type validation before the provider runs: a bad
+/// `sourceVid` or `alpha` type is rejected with a typed error up front, and an
+/// omitted `alpha` is filled from its default. `config` is an opaque
+/// [`ArgType::CypherValue`] map, per the existing untyped-config convention.
+fn gcpagerank_args() -> Vec<NamedArgType> {
+    vec![
+        NamedArgType {
+            // Opaque because it accepts a single vid *or* an array of vids.
+            name: "sourceVid".into(),
+            ty: ArgType::CypherValue,
+            default: None,
+            doc: "The personalization seed vertex (or an array of seed vertices)."
+                .to_owned(),
+        },
+        NamedArgType {
+            name: "alpha".into(),
+            ty: ArgType::Primitive(arrow_schema::DataType::Float64),
+            default: Some(ScalarValue::Float64(Some(DEFAULT_ALPHA))),
+            doc: "Damping factor in [0, 1); defaults to 0.85.".to_owned(),
+        },
+        NamedArgType {
+            name: "config".into(),
+            ty: ArgType::CypherValue,
+            default: Some(ScalarValue::Null),
+            doc: "Optional {nodeLabels, edgeTypes} projection filter.".to_owned(),
+        },
+    ]
+}
 /// Default power-iteration cap.
 const DEFAULT_ITERS: usize = 100;
 /// Default convergence tolerance (L1).
@@ -78,6 +113,8 @@ impl GraphComputePageRankProvider {
                 docs: "uni.algo.gcpagerank(sourceVid[, alpha[, config]]) — Personalized \
                        PageRank driven through the GraphCompute kernel catalog"
                     .to_owned(),
+                args: gcpagerank_args(),
+                slices: vec![graph_compute_slice_req()],
             },
         }
     }

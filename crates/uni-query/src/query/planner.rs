@@ -9479,7 +9479,6 @@ fn collect_properties_recursive(
         LogicalPlan::Traverse {
             input,
             target_filter,
-            step_variable: _,
             ..
         } => {
             if let Some(expr) = target_filter {

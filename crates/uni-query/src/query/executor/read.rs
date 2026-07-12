@@ -3475,7 +3475,7 @@ impl Executor {
             }
 
             // Process each partition
-            for (_partition_key, row_indices) in partition_map.iter_mut() {
+            for row_indices in partition_map.values_mut() {
                 // Sort rows within partition by ORDER BY clause
                 if !window_spec.order_by.is_empty() {
                     row_indices.sort_by(|&a, &b| {

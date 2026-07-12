@@ -79,6 +79,20 @@ fi
 echo "    extism-graph plugin size: $(du -h "$EXTISM_GRAPH_WASM" | cut -f1)"
 echo "    (GraphCompute Personalized PageRank via the uni_graph_call host fn)"
 
+echo "==> Building example-extism-manifest-callout (wasm32-unknown-unknown)"
+(
+    cd examples/example-extism-manifest-callout
+    cargo build --target wasm32-unknown-unknown --release
+)
+
+EXTISM_MANIFEST_CALLOUT_WASM="examples/example-extism-manifest-callout/target/wasm32-unknown-unknown/release/example_extism_manifest_callout.wasm"
+if [[ ! -f "$EXTISM_MANIFEST_CALLOUT_WASM" ]]; then
+    echo "ERROR: expected $EXTISM_MANIFEST_CALLOUT_WASM after build" >&2
+    exit 1
+fi
+echo "    extism-manifest-callout plugin size: $(du -h "$EXTISM_MANIFEST_CALLOUT_WASM" | cut -f1)"
+echo "    (manifest-declared exports fire host callouts under uninteresting grants)"
+
 echo "==> Building example-wasm-geo (wasm32-wasip2)"
 (
     cd examples/example-wasm-geo

@@ -3164,7 +3164,7 @@ impl Writer {
                 && let Some(props_meta) = schema.properties.get(t_name)
             {
                 let mut crdt_keys = Vec::new();
-                for (key, _) in properties.iter() {
+                for key in properties.keys() {
                     if let Some(meta) = props_meta.get(key)
                         && matches!(meta.r#type, uni_common::core::schema::DataType::Crdt(_))
                     {

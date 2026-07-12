@@ -600,7 +600,7 @@ impl PyExplainOutput {
         format!(
             "ExplainOutput(warnings={}, plan_text='{}...')",
             self.warnings.len(),
-            &self.plan_text.chars().take(60).collect::<String>()
+            self.plan_text.chars().take(60).collect::<String>()
         )
     }
 }
@@ -1240,7 +1240,7 @@ impl PyGenerationResult {
     fn __repr__(&self) -> String {
         format!(
             "GenerationResult(text='{}...')",
-            &self.text.chars().take(40).collect::<String>()
+            self.text.chars().take(40).collect::<String>()
         )
     }
 }
@@ -1455,7 +1455,7 @@ impl PyRulePromotionError {
     fn __repr__(&self) -> String {
         format!(
             "RulePromotionError(rule='{}...', error='{}')",
-            &self.rule_text.chars().take(40).collect::<String>(),
+            self.rule_text.chars().take(40).collect::<String>(),
             self.error
         )
     }

@@ -56,9 +56,16 @@ async fn sweep_tick(weak: &Weak<UniInner>) -> anyhow::Result<()> {
     if expired.is_empty() {
         return Ok(());
     }
-    // Re-wrap into a Uni handle so we can call the public cascade API.
-    // `Uni { inner }` is a thin newtype; this does not duplicate state.
-    let db = Uni { inner };
+    // Re-wrap into a Uni handle ONLY to reach the `drop_fork_cascade` API.
+    //
+    // `impl Drop for Uni` broadcasts `shutdown_blocking()` on the shared
+    // `UniInner`, which would permanently stop every background task of the
+    // still-running database (auto-flush, compaction, CDC, the scheduler, and
+    // this sweeper itself) — silently, since queries keep working. A transient
+    // wrapper over an upgraded `Weak<UniInner>` must NOT own that shutdown
+    // responsibility, so wrap it in `ManuallyDrop` and reclaim the `Arc`
+    // afterwards instead of letting `Uni::drop` run.
+    let db = std::mem::ManuallyDrop::new(Uni { inner });
     for fork in expired {
         match db.drop_fork_cascade(&fork.name).await {
             Ok(()) => {
@@ -72,6 +79,12 @@ async fn sweep_tick(weak: &Weak<UniInner>) -> anyhow::Result<()> {
             }
         }
     }
+    // SAFETY: move the single `Arc<UniInner>` field out of the `ManuallyDrop`
+    // without running `Uni::drop`. `db` is never touched again and
+    // `ManuallyDrop` never drops its contents, so the `Arc`'s strong count is
+    // decremented exactly once — here, as an ordinary `Arc` — with no leak, no
+    // double-free, and no shutdown broadcast on the live database.
+    let _inner: std::sync::Arc<UniInner> = unsafe { std::ptr::read(&db.inner) };
     Ok(())
 }
 
@@ -176,9 +189,10 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                 continue;
             }
             // Skip only when a fork-local index of the SAME kind already
-            // exists: a column can carry e.g. both a scalar and a vector
-            // index, and `fork_local_index` is keyed by `(label, column)`.
-            if scope.fork_local_index(label, column) == Some(*kind) {
+            // exists: a column can carry e.g. both a scalar and a
+            // full-text index, so `fork_local_indexes` holds a set of
+            // kinds per `(label, column)` and we probe for this one.
+            if scope.has_fork_local_index(label, column, *kind) {
                 continue;
             }
             match uni_store::fork::index_builder::build_fork_local_index(

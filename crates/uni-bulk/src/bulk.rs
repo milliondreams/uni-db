@@ -550,10 +550,32 @@ impl BulkWriter {
                 _ => continue,
             }
 
+            // Unique and NodeKey share the uniqueness machinery; NodeKey adds a
+            // NOT-NULL pre-check on every key property (a missing/null key is a
+            // violation, whereas Unique simply skips enforcement for that row).
             match &constraint.constraint_type {
-                uni_common::core::schema::ConstraintType::Unique {
-                    properties: unique_props,
-                } => {
+                ct if ct.unique_properties().is_some() => {
+                    let unique_props = ct.unique_properties().expect("guarded by is_some");
+                    let is_node_key =
+                        matches!(ct, uni_common::core::schema::ConstraintType::NodeKey { .. });
+                    let kind = if is_node_key { "NODE KEY" } else { "UNIQUE" };
+
+                    // NodeKey NOT-NULL half.
+                    if is_node_key {
+                        for (idx, props) in vertices.iter().enumerate() {
+                            for prop in unique_props {
+                                if props.get(prop).is_none_or(|v| v.is_null()) {
+                                    return Err(anyhow!(
+                                        "NODE KEY constraint '{}' violated at row {}: property '{}' must exist and be non-null",
+                                        constraint.name,
+                                        idx,
+                                        prop
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // Check for duplicates within the batch
                     let mut seen_keys: HashSet<String> = HashSet::new();
                     for (idx, props) in vertices.iter().enumerate() {
@@ -562,7 +584,8 @@ impl BulkWriter {
                             && !seen_keys.insert(k.clone())
                         {
                             return Err(anyhow!(
-                                "UNIQUE constraint violation at row {}: duplicate key '{}' in batch",
+                                "{} constraint violation at row {}: duplicate key '{}' in batch",
+                                kind,
                                 idx,
                                 k
                             ));
@@ -583,7 +606,28 @@ impl BulkWriter {
                                 .is_some_and(|seen| seen.contains(&k))
                             {
                                 return Err(anyhow!(
-                                    "UNIQUE constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    "{} constraint violation at row {}: key '{}' conflicts with an already-loaded vertex",
+                                    kind,
+                                    idx,
+                                    k
+                                ));
+                            }
+
+                            // Also consult the main Writer's full write horizon
+                            // (current L0 + pending-flush buffers + committed
+                            // storage). The seen_unique_keys set only covers this
+                            // bulk writer's lifetime, so a key committed on the
+                            // main channel — flushed OR still in an unflushed L0
+                            // buffer — was invisible and silently twinned.
+                            // Delegates to the same lookup surface the
+                            // single-vertex path uses. (findings uni-bulk[4] / D6)
+                            if self
+                                .unique_key_exists_full_horizon(label, unique_props, props)
+                                .await?
+                            {
+                                return Err(anyhow!(
+                                    "{} constraint violation at row {}: key '{}' conflicts with a committed row",
+                                    kind,
                                     idx,
                                     k
                                 ));
@@ -634,14 +678,91 @@ impl BulkWriter {
 
     /// Compute a unique key string from properties for UNIQUE constraint checking.
     fn compute_unique_key(&self, unique_props: &[String], props: &Properties) -> Option<String> {
-        let mut parts = Vec::new();
+        // Build the key from length-prefixed, type-tagged codec bytes rather than
+        // a lossy `Display` join. `to_string()` collided distinct values —
+        // Int(1) vs Float(1.0) both render "1", ("x:y","z") vs ("x","y:z") both
+        // render "x:y:z", and equal-length Bytes rendered alike. The codec tags
+        // the type and the length prefix makes field boundaries unambiguous.
+        // (finding uni-bulk[3])
+        let mut buf: Vec<u8> = Vec::new();
         for prop in unique_props {
-            match props.get(prop) {
-                Some(v) if !v.is_null() => parts.push(v.to_string()),
+            let v = match props.get(prop) {
+                Some(v) if !v.is_null() => v,
                 _ => return None, // Missing property means can't enforce uniqueness
-            }
+            };
+            let enc = uni_common::cypher_value_codec::encode(v);
+            buf.extend_from_slice(&(enc.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&enc);
         }
-        Some(parts.join(":"))
+        // Hex so the (binary) key stays a String for the dedup sets.
+        Some(
+            buf.iter()
+                .fold(String::with_capacity(buf.len() * 2), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
+        )
+    }
+
+    /// Whether a committed row (L1/L2) already holds this UNIQUE key.
+    ///
+    /// Mirrors the storage step of the single-vertex
+    /// `Writer::check_unique_constraint_multi`: build a typed `prop = value`
+    /// filter over the unique properties and count live rows. Returns `false`
+    /// when any unique property is missing/null (can't enforce), or when the
+    /// label's vertex table isn't flushed yet.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend scan/count errors rather than failing open.
+    /// Reports whether a UNIQUE key already exists on the main write channel.
+    ///
+    /// Delegates to [`Writer::unique_key_exists_full_horizon`] so the bulk path
+    /// sees the same layers the single-vertex path does — the main Writer's
+    /// current L0, its pending-flush buffers, and committed storage — closing the
+    /// cross-channel window where a committed-but-unflushed key was invisible to
+    /// the bulk loader (finding D6).
+    ///
+    /// Non-scalar or null key values are not representable as a constraint key
+    /// here and return `false`, deferring to the in-load/L0 dedup checks rather
+    /// than erroring — matching the prior storage-probe behavior.
+    ///
+    /// # Errors
+    /// Returns an error if the Writer's horizon probe (e.g. a storage backend
+    /// query) fails.
+    async fn unique_key_exists_full_horizon(
+        &self,
+        label: &str,
+        unique_props: &[String],
+        props: &Properties,
+    ) -> Result<bool> {
+        let mut key_values = Vec::with_capacity(unique_props.len());
+        for prop in unique_props {
+            let val = match props.get(prop) {
+                // Non-scalar unique keys aren't representable as a constraint
+                // key; fall back to the in-load/L0 checks rather than error.
+                Some(v @ (Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_))) => {
+                    v.clone()
+                }
+                _ => return Ok(false),
+            };
+            key_values.push((prop.clone(), val));
+        }
+
+        // The bulk vertex has no allocated VID at validation time (VIDs are
+        // assigned later, in `insert_vertices`), so `exclude_vid = None` — there
+        // is no self to exclude, and every genuine hit counts as a violation.
+        // `tx_l0 = None`: a preexisting committed row lives in the main Writer's
+        // L0, not the bulk transaction's L0, which the bulk path bypasses.
+        let writer = self
+            .backend
+            .writer
+            .as_ref()
+            .expect("BulkWriter always holds a Writer (build() enforces it)");
+        writer
+            .unique_key_exists_full_horizon(label, &key_values, None, None)
+            .await
     }
 
     /// Evaluate a simple CHECK constraint expression.
@@ -683,8 +804,20 @@ impl BulkWriter {
         };
 
         match op {
-            "=" | "==" => Ok(prop_val == &target_val),
-            "!=" | "<>" => Ok(prop_val != &target_val),
+            // Route numeric equality through `compare_values` so Int/Float coerce
+            // (matching the ordering ops below); Value's `PartialEq` is type-strict
+            // and has no Int/Float arm, so `Float(5.0) == Int(5)` would be false.
+            // Non-numeric operands keep strict structural equality.
+            "=" | "==" => Ok(if prop_val.is_number() && target_val.is_number() {
+                self.compare_values(prop_val, &target_val)?.is_eq()
+            } else {
+                prop_val == &target_val
+            }),
+            "!=" | "<>" => Ok(if prop_val.is_number() && target_val.is_number() {
+                !self.compare_values(prop_val, &target_val)?.is_eq()
+            } else {
+                prop_val != &target_val
+            }),
             ">" => Ok(self.compare_values(prop_val, &target_val)?.is_gt()),
             "<" => Ok(self.compare_values(prop_val, &target_val)?.is_lt()),
             ">=" => Ok(self.compare_values(prop_val, &target_val)?.is_ge()),
@@ -703,12 +836,18 @@ impl BulkWriter {
             (Value::Float(f1), Value::Float(f2)) => {
                 Ok(f1.partial_cmp(f2).unwrap_or(Ordering::Equal))
             }
-            (Value::Int(n), Value::Float(f)) => {
-                Ok((*n as f64).partial_cmp(f).unwrap_or(Ordering::Equal))
-            }
-            (Value::Float(f), Value::Int(n)) => {
-                Ok(f.partial_cmp(&(*n as f64)).unwrap_or(Ordering::Equal))
-            }
+            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
+            // preserve the prior NaN-as-Equal behavior for the degenerate case.
+            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f)
+            }),
+            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f).reverse()
+            }),
             (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
             _ => Err(anyhow!(
                 "Cannot compare incompatible types: {:?} vs {:?}",
@@ -1112,11 +1251,20 @@ impl BulkWriter {
 
         let index_start = Instant::now();
 
-        // 3. Rebuild indexes for vertices
-        if self.config.defer_vector_indexes || self.config.defer_scalar_indexes {
+        // 3. Rebuild indexes for vertices.
+        //
+        // User-declared indexes are materialized ONLY here — the flush path only
+        // builds the fixed _vid/_uid/ext_id indexes. So this block must run
+        // regardless of the defer flags; gating it on `defer_* == true` meant a
+        // load with both flags false (build eagerly) silently built no user
+        // index at all. The defer flags only select the BACKGROUND (deferred)
+        // path; an eager load rebuilds synchronously at commit.
+        {
             let labels_to_rebuild: Vec<String> = self.touched_labels.iter().cloned().collect();
+            let use_async = self.config.async_indexes
+                && (self.config.defer_vector_indexes || self.config.defer_scalar_indexes);
 
-            if self.config.async_indexes && !labels_to_rebuild.is_empty() {
+            if use_async && !labels_to_rebuild.is_empty() {
                 // Async mode: mark affected indexes as Stale before scheduling
                 let schema = self.backend.schema.schema();
                 for label in &labels_to_rebuild {

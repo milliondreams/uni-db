@@ -574,6 +574,45 @@ fn serde_json_to_scalar(v: &serde_json::Value, vt: &ValueType) -> Option<ScalarV
     }
 }
 
+/// Run a registered [`AlgorithmProvider`] and return its result stream.
+///
+/// Builds an [`AlgorithmHostBridge`] carrying the algorithm's storage, L0
+/// snapshot, and the owning plugin's effective capabilities, then invokes
+/// `provider.run`. The returned `SendableRecordBatchStream` is `'static`
+/// (the provider extracts owned handles from the host before returning),
+/// so the transient bridge dropped here does not invalidate it.
+///
+/// Shared by both CALL dispatch paths (the planned df_graph path and the
+/// simple executor fallback), each of which adapts the stream to its own
+/// output shape.
+///
+/// # Errors
+///
+/// Returns [`FnError`] if the provider cannot start — including when the
+/// owning plugin lacks the `HostQuery` capability the bridge's
+/// `project` gate requires.
+pub(crate) fn run_algorithm_provider(
+    entry: &uni_plugin::registry::AlgorithmEntry,
+    storage: Arc<uni_store::storage::manager::StorageManager>,
+    l0_manager: Option<Arc<uni_store::runtime::L0Manager>>,
+    config_json: &str,
+) -> Result<SendableRecordBatchStream, FnError> {
+    use uni_plugin::traits::algorithm::AlgorithmContext;
+
+    let bridge = uni_plugin_builtin::algorithms::bridge::host_bridge_from_storage(
+        storage,
+        l0_manager,
+        entry.effective_caps.clone(),
+    );
+    // Host-side arg validation/coercion (proposal §4.6 / D7): a provider that
+    // declares typed `args` gets arity + type checking and default-filling here,
+    // before it runs; providers on the legacy untyped contract (empty `args`)
+    // see `config_json` pass through unchanged.
+    let coerced = entry.provider.signature().coerce_config_json(config_json)?;
+    let ctx = AlgorithmContext::new(&coerced).with_host(&bridge);
+    entry.provider.run(ctx)
+}
+
 /// Register every `uni.algo.*` adapter from `algo_registry` into `r`.
 ///
 /// One `ProcedurePlugin` registration per entry; the adapter retains an

@@ -232,6 +232,12 @@ impl PhysicalExpr for PatternExistsExecExpr {
 
         // Step 3: Evaluate pattern existence per row using batch CSR lookups.
         let mut result = vec![false; num_rows];
+        // Rows whose bound target VID is NULL (e.g. an unmatched OPTIONAL MATCH):
+        // the pattern references a null node, so its truth value is NULL, not
+        // false or "any neighbor matches". Tracked here so the output emits NULL —
+        // which excludes the row under both `(n)-[:R]->(m)` and `NOT (...)`, per
+        // Cypher three-valued logic.
+        let mut endpoint_null = vec![false; num_rows];
         let query_ctx = self.graph_ctx.query_context();
 
         // Build initial frontier: (row_index, vid) pairs for non-null anchors.
@@ -302,6 +308,14 @@ impl PhysicalExpr for PatternExistsExecExpr {
 
                 for &(row_idx, src_vid_u64) in &frontier {
                     if result[row_idx as usize] {
+                        continue;
+                    }
+                    // NULL bound target -> pattern is NULL for this row; record
+                    // and skip so it is never satisfied by an arbitrary neighbor.
+                    if let Some(ref bound_vids) = bound_target_vids
+                        && bound_vids.is_null(row_idx as usize)
+                    {
+                        endpoint_null[row_idx as usize] = true;
                         continue;
                     }
                     let vid = Vid::from(src_vid_u64);
@@ -402,11 +416,20 @@ impl PhysicalExpr for PatternExistsExecExpr {
                     if result[row_idx as usize] {
                         continue;
                     }
+                    // NULL bound target -> pattern is NULL for this row; record
+                    // and skip so it is never satisfied by an arbitrary neighbor.
+                    if let Some(ref bv) = bound_target_vids
+                        && bv.is_null(row_idx as usize)
+                    {
+                        endpoint_null[row_idx as usize] = true;
+                        continue;
+                    }
                     let vid = Vid::from(src_vid_u64);
                     let mut found = false;
                     let mut seen_eids = std::collections::HashSet::new();
 
                     // For bound targets, extract the expected VID for this row.
+                    // (Null-bound rows were already skipped above.)
                     let expected_target: Option<u64> = bound_target_vids.as_ref().and_then(|bv| {
                         if bv.is_null(row_idx as usize) {
                             None
@@ -451,8 +474,14 @@ impl PhysicalExpr for PatternExistsExecExpr {
             frontier = next_frontier;
         }
 
-        // Step 4: Build BooleanArray from the result vector.
-        let bool_array = BooleanArray::from(result);
+        // Step 4: Build BooleanArray from the result vector. Rows whose bound
+        // target was NULL emit NULL (three-valued logic), not false, so a `NOT`
+        // wrapper also excludes them.
+        let bool_array: BooleanArray = result
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| if endpoint_null[i] { None } else { Some(r) })
+            .collect();
         Ok(ColumnarValue::Array(Arc::new(bool_array)))
     }
 

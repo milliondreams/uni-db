@@ -368,6 +368,63 @@ async fn promote_default_is_insert_only_twin() -> Result<()> {
     Ok(())
 }
 
+/// Re-promoting a fork that made NO changes is idempotent — it must not spawn a
+/// content twin on each call (correctness-scan uni-fork[3], D3). The registered
+/// content-UID double-folds `ext_id` (arg + stored `"ext_id"` property), while
+/// Cypher strips that key; the promote side now re-injects `ext_id`
+/// (`content_uid_with_ext_id`) so the dedup recognizes the unchanged row and
+/// skips it. Before the fix the UID never matched for ext_id-bearing rows, so
+/// every re-promote inserted another twin (unbounded growth).
+#[tokio::test]
+async fn promote_default_is_idempotent_for_unchanged_ext_id_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = Uni::open(dir.path().to_str().unwrap()).build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .property("age", DataType::Int64)
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {ext_id: 'p1', name: 'Alice', age: 30})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Fork makes NO changes; promoting it twice must leave a single Alice.
+    let _fork = session.fork("noop").await?;
+
+    let first = db
+        .promote_from_fork("noop", &[PromotePattern::label("Person")])
+        .await?;
+    db.flush().await?;
+    let second = db
+        .promote_from_fork("noop", &[PromotePattern::label("Person")])
+        .await?;
+    db.flush().await?;
+
+    // Neither promote may insert a twin: the unchanged row dedups by content-UID.
+    assert_eq!(
+        (first.vertices_inserted, second.vertices_inserted),
+        (0, 0),
+        "unchanged re-promote must insert nothing: first={first:?} second={second:?}"
+    );
+
+    let rows = session
+        .query("MATCH (p:Person {name: 'Alice'}) RETURN p.age AS age")
+        .await?;
+    assert_eq!(
+        rows.rows().len(),
+        1,
+        "exactly one Alice must remain after two no-op promotes: {:?}",
+        rows.rows()
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}
+
 /// Review M4: delete-promotion removes a vertex the fork deleted, while a
 /// primary row the fork never saw survives (the anti-spurious-delete
 /// guarantee). The fork deletes an inherited vertex (now supported).

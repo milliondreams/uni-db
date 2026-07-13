@@ -31,4 +31,5 @@ pub mod scheduler;
 pub mod scheduler_persistence;
 pub mod shutdown;
 pub mod synthetic_procedure;
+pub mod synthetic_trigger;
 pub mod triggers;

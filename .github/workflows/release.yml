@@ -274,6 +274,18 @@ jobs:
           # be on crates.io before those two crates can be packaged.
           publish_crate uni-plugin-conformance
           sleep 30
+          # uni-plugin-{pyo3,rhai,extism,wasm} depend on uni-plugin-builtin
+          # (the GraphCompute AlgoSession + session registry), which pulls in
+          # uni-algo -> uni-store -> uni-crdt; that chain must publish before the
+          # loaders that now consume it.
+          publish_crate uni-crdt
+          sleep 30
+          publish_crate uni-store
+          sleep 30
+          publish_crate uni-algo
+          sleep 30
+          publish_crate uni-plugin-builtin
+          sleep 30
           publish_crate uni-plugin-pyo3
           sleep 30
           publish_crate uni-plugin-rhai
@@ -282,19 +294,11 @@ jobs:
           sleep 30
           publish_crate uni-sidecar
           sleep 30
-          publish_crate uni-crdt
-          sleep 30
           publish_crate uni-plugin-custom
           sleep 30
           publish_crate uni-plugin-extism
           sleep 30
           publish_crate uni-plugin-wasm
-          sleep 30
-          publish_crate uni-store
-          sleep 30
-          publish_crate uni-algo
-          sleep 30
-          publish_crate uni-plugin-builtin
           sleep 30
           publish_crate uni-query-functions
           sleep 30

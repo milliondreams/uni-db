@@ -100,6 +100,19 @@ pub enum UniError {
     #[error("Locy evaluation incomplete: {detail}")]
     LocyIncomplete { detail: Box<LocyIncomplete> },
 
+    /// A GraphCompute invocation stopped before producing a complete result
+    /// because it exceeded its wall-clock deadline, its convergence-iteration
+    /// cap, or its native-work budget.
+    ///
+    /// Like [`UniError::LocyIncomplete`], this is the *default* outcome of an
+    /// over-budget run: partial output is never returned silently (GraphCompute
+    /// proposal §5.2). The boxed [`GraphComputeIncomplete`] distinguishes
+    /// `Timeout` (too slow) from `IterationLimit` (did not converge) from
+    /// `Exhausted` (hit the native-work meter), so a caller can pick the right
+    /// remedy. To recover an anytime partial result, re-run with `allow_partial`.
+    #[error("GraphCompute invocation incomplete: {detail}")]
+    GraphComputeIncomplete { detail: Box<GraphComputeIncomplete> },
+
     #[error("Type error: expected {expected}, got {actual}")]
     Type { expected: String, actual: String },
 
@@ -452,9 +465,218 @@ impl std::fmt::Display for LocyIncomplete {
     }
 }
 
+/// Why a GraphCompute invocation stopped before producing a complete result.
+///
+/// The three outcomes call for different remedies — raise the deadline, raise
+/// the iteration cap, or raise the native-work budget — so they are reported
+/// distinctly rather than collapsed into a single "incomplete" flag
+/// (GraphCompute proposal §5.2, error codes `0x865`–`0x867`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GraphComputeIncompleteReason {
+    /// The native-work budget (a multiple of `|E|` plus an absolute ceiling)
+    /// was drained by kernel work before the algorithm finished. Maps to `0x865`.
+    Exhausted,
+    /// A convergence loop reached its superstep/iteration cap without settling.
+    /// Maps to `0x866`.
+    IterationLimit,
+    /// The wall-clock deadline elapsed mid-invocation. Maps to `0x867`.
+    Timeout,
+}
+
+impl GraphComputeIncompleteReason {
+    /// Returns a stable machine-readable tag for non-Rust callers.
+    ///
+    /// One of `"exhausted"`, `"iteration_limit"`, or `"timeout"` — surfaced to
+    /// callers (e.g. the Python bindings) that cannot match on a Rust enum.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GraphComputeIncompleteReason::Exhausted => "exhausted",
+            GraphComputeIncompleteReason::IterationLimit => "iteration_limit",
+            GraphComputeIncompleteReason::Timeout => "timeout",
+        }
+    }
+
+    /// Returns the GraphCompute error code (`0x865`–`0x867`) for this reason.
+    ///
+    /// Lets the loader shims map an incomplete outcome onto the pinned error
+    /// block (proposal §12) without re-deriving the mapping per loader.
+    #[must_use]
+    pub fn error_code(self) -> u32 {
+        match self {
+            GraphComputeIncompleteReason::Exhausted => 0x865,
+            GraphComputeIncompleteReason::IterationLimit => 0x866,
+            GraphComputeIncompleteReason::Timeout => 0x867,
+        }
+    }
+
+    /// Maps a GraphCompute error code (`0x865`–`0x867`) back to its reason.
+    ///
+    /// The inverse of [`error_code`](Self::error_code): the provider boundary
+    /// receives a typed `FnError` carrying one of these codes and reconstructs
+    /// the reason for the user-visible [`UniError::GraphComputeIncomplete`].
+    /// Any other code is not an incomplete outcome and yields `None`.
+    #[must_use]
+    pub fn from_error_code(code: u32) -> Option<Self> {
+        match code {
+            0x865 => Some(GraphComputeIncompleteReason::Exhausted),
+            0x866 => Some(GraphComputeIncompleteReason::IterationLimit),
+            0x867 => Some(GraphComputeIncompleteReason::Timeout),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for GraphComputeIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Diagnostics describing a GraphCompute invocation that stopped early.
+///
+/// Returned (boxed) inside [`UniError::GraphComputeIncomplete`] when an
+/// invocation exceeds its native-work budget, iteration cap, or wall-clock
+/// deadline. The counters let a caller tell "too slow" apart from "did not
+/// converge" apart from "did too much work", and size a retry accordingly.
+///
+/// # Examples
+/// ```
+/// use uni_common::{GraphComputeIncomplete, GraphComputeIncompleteReason};
+///
+/// let detail = GraphComputeIncomplete {
+///     reason: GraphComputeIncompleteReason::Exhausted,
+///     algorithm: "guest.ppr".into(),
+///     elapsed_ms: 120,
+///     iterations: 7,
+///     work_charged: 1_000_000_000,
+///     work_budget: 1_000_000_000,
+/// };
+/// assert!(detail.to_string().contains("exhausted"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphComputeIncomplete {
+    /// Why the invocation stopped.
+    pub reason: GraphComputeIncompleteReason,
+    /// Qualified name of the algorithm being run, for the diagnostic message.
+    pub algorithm: String,
+    /// Wall-clock time elapsed when the invocation was cut short, in milliseconds.
+    pub elapsed_ms: u64,
+    /// Number of guest control-loop iterations completed before the cutoff.
+    pub iterations: u64,
+    /// Native work units charged when the invocation stopped (`0` if untracked).
+    pub work_charged: u64,
+    /// The configured native-work budget in the same units as `work_charged`.
+    pub work_budget: u64,
+}
+
+impl std::fmt::Display for GraphComputeIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{reason} in algorithm `{algo}` after {elapsed_ms}ms, {iters} iteration(s); \
+             charged {charged}/{budget} native-work units",
+            reason = self.reason,
+            algo = self.algorithm,
+            elapsed_ms = self.elapsed_ms,
+            iters = self.iterations,
+            charged = self.work_charged,
+            budget = self.work_budget,
+        )
+    }
+}
+
+/// Stable marker prefixing a serialized [`GraphComputeIncomplete`] in an error
+/// message, so the structured reason survives the DataFusion error channel.
+///
+/// The GraphCompute `CALL` runs through generic DataFusion machinery whose only
+/// egress is a stringified error (there is no bespoke execution node to carry an
+/// out-of-band slot, as Locy uses for `LocyIncomplete`). The provider serializes
+/// the diagnostics behind this tag; the query API boundary
+/// ([`GraphComputeIncomplete::from_tagged_message`]) recovers them into the typed
+/// [`UniError::GraphComputeIncomplete`]. This mirrors the codebase's existing
+/// message-classification boundary (e.g. `TypeError:`, `ConstraintVerificationFailed:`).
+pub const GRAPH_COMPUTE_INCOMPLETE_TAG: &str = "GraphComputeIncomplete:";
+
+impl GraphComputeIncomplete {
+    /// Serializes this diagnostic behind [`GRAPH_COMPUTE_INCOMPLETE_TAG`].
+    ///
+    /// The provider boundary returns the result as a `DataFusionError` message;
+    /// the query API recovers the struct with
+    /// [`from_tagged_message`](Self::from_tagged_message). Serialization cannot
+    /// fail for this plain-data struct, so a marshalling error degrades to the
+    /// bare tag rather than panicking.
+    #[must_use]
+    pub fn to_tagged_message(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        format!("{GRAPH_COMPUTE_INCOMPLETE_TAG}{json}")
+    }
+
+    /// Recovers a [`GraphComputeIncomplete`] from a tagged error message.
+    ///
+    /// Locates [`GRAPH_COMPUTE_INCOMPLETE_TAG`] anywhere in `msg` (upstream
+    /// layers prepend context such as `Algorithm 'x': `) and deserializes the
+    /// single JSON object that follows, ignoring any trailing text a later
+    /// error-wrapping layer may append. Returns `None` when the tag is absent or
+    /// the payload does not parse.
+    #[must_use]
+    pub fn from_tagged_message(msg: &str) -> Option<Self> {
+        let start = msg.find(GRAPH_COMPUTE_INCOMPLETE_TAG)? + GRAPH_COMPUTE_INCOMPLETE_TAG.len();
+        let payload = &msg[start..];
+        // A streaming deserializer reads exactly one JSON value and stops, so any
+        // suffix appended by an outer error wrapper is harmless.
+        let mut stream =
+            serde_json::Deserializer::from_str(payload).into_iter::<GraphComputeIncomplete>();
+        stream.next()?.ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_compute_incomplete_tag_round_trips() {
+        let original = GraphComputeIncomplete {
+            reason: GraphComputeIncompleteReason::IterationLimit,
+            // A qname with dots/quotes must survive the round trip intact.
+            algorithm: "guest.author's.ppr".into(),
+            elapsed_ms: 42,
+            iterations: 200,
+            work_charged: 1_234,
+            work_budget: 5_678,
+        };
+        let tagged = original.to_tagged_message();
+        assert!(tagged.starts_with(GRAPH_COMPUTE_INCOMPLETE_TAG));
+
+        // Recovered verbatim even when an outer layer wraps the message with a
+        // prefix and a trailing suffix (as the DataFusion channel does).
+        let wrapped = format!("Algorithm 'x': {tagged}\ncaused by: stream closed");
+        let recovered =
+            GraphComputeIncomplete::from_tagged_message(&wrapped).expect("tag must be recovered");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn graph_compute_incomplete_reason_code_round_trips() {
+        for reason in [
+            GraphComputeIncompleteReason::Exhausted,
+            GraphComputeIncompleteReason::IterationLimit,
+            GraphComputeIncompleteReason::Timeout,
+        ] {
+            assert_eq!(
+                GraphComputeIncompleteReason::from_error_code(reason.error_code()),
+                Some(reason)
+            );
+        }
+        // Codes outside the 0x865-0x867 incomplete block are not incomplete.
+        assert_eq!(GraphComputeIncompleteReason::from_error_code(0x860), None);
+    }
+
+    #[test]
+    fn untagged_message_yields_no_incomplete() {
+        assert!(GraphComputeIncomplete::from_tagged_message("Execution error: boom").is_none());
+    }
 
     #[test]
     fn retriable_errors_are_contention_failures() {

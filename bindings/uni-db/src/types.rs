@@ -600,7 +600,7 @@ impl PyExplainOutput {
         format!(
             "ExplainOutput(warnings={}, plan_text='{}...')",
             self.warnings.len(),
-            &self.plan_text.chars().take(60).collect::<String>()
+            self.plan_text.chars().take(60).collect::<String>()
         )
     }
 }
@@ -1240,7 +1240,7 @@ impl PyGenerationResult {
     fn __repr__(&self) -> String {
         format!(
             "GenerationResult(text='{}...')",
-            &self.text.chars().take(40).collect::<String>()
+            self.text.chars().take(40).collect::<String>()
         )
     }
 }
@@ -1455,7 +1455,7 @@ impl PyRulePromotionError {
     fn __repr__(&self) -> String {
         format!(
             "RulePromotionError(rule='{}...', error='{}')",
-            &self.rule_text.chars().take(40).collect::<String>(),
+            self.rule_text.chars().take(40).collect::<String>(),
             self.error
         )
     }
@@ -1530,7 +1530,12 @@ impl PyCommitResult {
 /// A prepared Cypher query that can be executed multiple times with different parameters.
 #[pyclass]
 pub struct PyPreparedQuery {
-    pub inner: std::sync::Mutex<::uni_db::PreparedQuery>,
+    // Shared, lock-free handle. `PreparedQuery` is `Send + Sync` with its own
+    // internal `RwLock`, so an outer `Mutex` is unnecessary — and holding a
+    // `Mutex` guard across the GIL-releasing `py.detach(block_on(..))` below
+    // created a GIL/mutex ABBA deadlock (correctness-scan R13). `Arc` shares
+    // without a lock, so nothing is held across the await.
+    pub inner: std::sync::Arc<::uni_db::PreparedQuery>,
 }
 
 #[pymethods]
@@ -1558,13 +1563,12 @@ impl PyPreparedQuery {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Clone the shared handle (not a lock) so nothing is held across the
+        // GIL-releasing `py.detach` — see the ABBA note on `inner` (R13).
+        let prepared = std::sync::Arc::clone(&self.inner);
         let result = py
             .detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+                pyo3_async_runtimes::tokio::get_runtime().block_on(prepared.execute(&param_refs))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::query_result_to_py_class(py, result)
@@ -1572,20 +1576,11 @@ impl PyPreparedQuery {
 
     /// Get the original query text.
     fn query_text(&self) -> pyo3::PyResult<String> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.query_text().to_string())
+        Ok(self.inner.query_text().to_string())
     }
 
     fn __repr__(&self) -> String {
-        let text = self
-            .inner
-            .lock()
-            .map(|g| g.query_text().to_string())
-            .unwrap_or_else(|_| "<locked>".to_string());
-        format!("PreparedQuery({:?})", text)
+        format!("PreparedQuery({:?})", self.inner.query_text())
     }
 
     /// Create a fluent binder for this prepared query.
@@ -1820,7 +1815,8 @@ impl PySessionMetrics {
 /// A prepared Locy program that can be executed multiple times.
 #[pyclass(name = "PreparedLocy")]
 pub struct PyPreparedLocy {
-    pub(crate) inner: std::sync::Mutex<::uni_db::PreparedLocy>,
+    // Shared, lock-free handle — see `PyPreparedQuery::inner` (correctness-scan R13).
+    pub(crate) inner: std::sync::Arc<::uni_db::PreparedLocy>,
 }
 
 #[pymethods]
@@ -1846,13 +1842,11 @@ impl PyPreparedLocy {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Clone the shared handle (not a lock); nothing held across `py.detach` (R13).
+        let prepared = std::sync::Arc::clone(&self.inner);
         let result = py
             .detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+                pyo3_async_runtimes::tokio::get_runtime().block_on(prepared.execute(&param_refs))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::locy_result_to_py_class(py, result)
@@ -1860,26 +1854,17 @@ impl PyPreparedLocy {
 
     /// Get the original program text.
     fn program_text(&self) -> pyo3::PyResult<String> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(guard.program_text().to_string())
+        Ok(self.inner.program_text().to_string())
     }
 
     fn __repr__(&self) -> String {
-        let text = self
-            .inner
-            .lock()
-            .map(|g| {
-                let t = g.program_text();
-                if t.len() > 60 {
-                    format!("{}...", &t[..60])
-                } else {
-                    t.to_string()
-                }
-            })
-            .unwrap_or_else(|_| "<locked>".to_string());
+        let t = self.inner.program_text();
+        // Truncate by CHARACTER, not byte index: `&t[..60]` panics when
+        // byte 60 falls inside a multibyte UTF-8 codepoint.
+        let text = match t.char_indices().nth(60) {
+            Some((byte_idx, _)) => format!("{}...", &t[..byte_idx]),
+            None => t.to_string(),
+        };
         format!("PreparedLocy({:?})", text)
     }
 
@@ -1961,13 +1946,11 @@ impl PyPreparedQueryBinder {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let guard = prepared
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Clone the shared handle (not a lock); nothing held across `py.detach` (R13).
+        let handle = std::sync::Arc::clone(&prepared.inner);
         let result = py
             .detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+                pyo3_async_runtimes::tokio::get_runtime().block_on(handle.execute(&param_refs))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::query_result_to_py_class(py, result)
@@ -2008,13 +1991,11 @@ impl PyPreparedLocyBinder {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let guard = prepared
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Clone the shared handle (not a lock); nothing held across `py.detach` (R13).
+        let handle = std::sync::Arc::clone(&prepared.inner);
         let result = py
             .detach(|| {
-                pyo3_async_runtimes::tokio::get_runtime().block_on(guard.execute(&param_refs))
+                pyo3_async_runtimes::tokio::get_runtime().block_on(handle.execute(&param_refs))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         crate::convert::locy_result_to_py_class(py, result)
@@ -2110,6 +2091,14 @@ impl PyDatabaseMetrics {
 #[pyclass(name = "CommitStream")]
 pub struct PyCommitStream {
     pub(crate) inner: std::sync::Mutex<Option<::uni_db::CommitStream>>,
+    // `close()` used to block acquiring `inner` while `__next__` held it across
+    // a GIL-releasing `block_on(stream.next())` that parks indefinitely waiting
+    // for a commit — a GIL/mutex deadlock (correctness-scan R13). We now (a) take
+    // the stream out of the mutex for the await so `inner` is never held across
+    // it, and (b) let `close()` actively interrupt an in-flight `next()` via a
+    // wakeup, so a parked reader returns promptly instead of hanging.
+    pub(crate) closed: std::sync::atomic::AtomicBool,
+    pub(crate) close_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
@@ -2119,24 +2108,65 @@ impl PyCommitStream {
     }
 
     fn __next__(&self, py: Python<'_>) -> pyo3::PyResult<Option<PyCommitNotification>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let stream = match guard.as_mut() {
-            Some(s) => s,
-            None => return Ok(None),
+        use std::sync::atomic::Ordering;
+        // Take the stream out of the mutex so `inner` is NOT held across the
+        // GIL-releasing await (R13). A concurrent `__next__` sees `None` and
+        // stops — single-stream concurrent iteration is unordered anyway.
+        let mut stream = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            match guard.take() {
+                Some(s) => s,
+                None => return Ok(None),
+            }
         };
-        let notification =
-            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(stream.next()));
-        match notification {
-            Some(n) => Ok(Some(PyCommitNotification::from(n))),
-            None => Ok(None),
+        let notify = std::sync::Arc::clone(&self.close_notify);
+        let closed = &self.closed;
+        // Await the next notification, but race it against `close()`'s wakeup so
+        // a parked reader returns promptly. `stream.next()` (a broadcast recv)
+        // is cancel-safe, so dropping it when `close()` wins loses no message.
+        let notification = py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // Register the waiter BEFORE re-checking `closed`, so a `close()`
+                // racing between the take above and here cannot be lost.
+                notified.as_mut().enable();
+                if closed.load(Ordering::SeqCst) {
+                    return None;
+                }
+                tokio::select! {
+                    n = stream.next() => n,
+                    _ = notified => None,
+                }
+            })
+        });
+        // Re-lock briefly: put the stream back unless `close()` ran during the
+        // await (then drop it). Either way, surface any item already pulled.
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            if !self.closed.load(Ordering::SeqCst) {
+                *guard = Some(stream);
+            }
         }
+        Ok(notification.map(PyCommitNotification::from))
     }
 
     /// Close the stream, releasing resources.
     fn close(&self) -> pyo3::PyResult<()> {
+        use std::sync::atomic::Ordering;
+        // Signal first (no lock held) so a reader parked in `__next__` wakes
+        // promptly, then take the stream — `inner` is now uncontended (R13).
+        self.closed.store(true, Ordering::SeqCst);
+        self.close_notify.notify_waiters();
         let mut guard = self
             .inner
             .lock()
@@ -2230,6 +2260,8 @@ impl PyWatchBuilder {
         })?;
         Ok(PyCommitStream {
             inner: std::sync::Mutex::new(Some(builder.build())),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            close_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2752,6 +2784,12 @@ impl PyValue {
             inner: ::uni_db::Value::Vector(v),
         }
     }
+    #[staticmethod]
+    fn binary_vector(v: Vec<u8>) -> Self {
+        Self {
+            inner: ::uni_db::Value::BinaryVector(v),
+        }
+    }
 
     /// Create a BTIC temporal interval from a string literal.
     #[staticmethod]
@@ -2784,6 +2822,7 @@ impl PyValue {
             ::uni_db::Value::Edge(_) => "edge",
             ::uni_db::Value::Path(_) => "path",
             ::uni_db::Value::Vector(_) => "vector",
+            ::uni_db::Value::BinaryVector(_) => "binary_vector",
             ::uni_db::Value::Temporal(uni_common::value::TemporalValue::Btic { .. }) => "btic",
             ::uni_db::Value::Temporal(_) => "temporal",
             _ => "unknown",

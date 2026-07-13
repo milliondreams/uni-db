@@ -34,8 +34,10 @@ fn loader() -> ExtismLoader {
 }
 
 #[test]
-fn default_surface_registers_five_specs() {
-    assert_eq!(loader().host_fns().len(), 5);
+fn default_surface_registers_six_specs() {
+    // KMS sign/verify, secret acquire, HTTP get/post, and the GraphCompute
+    // `uni_graph_call` host fn.
+    assert_eq!(loader().host_fns().len(), 6);
 }
 
 #[test]

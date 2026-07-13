@@ -176,11 +176,16 @@ pub(super) fn parse_reranker_options(
         .map(String::from)
         .or_else(|| default_text_property.map(String::from))
         .unwrap_or_default();
+    // Rerank at least `k` candidates and at most 1000, but never below `k`.
+    // `Ord::clamp` panics when `min > max`, so a search `k > 1000` would abort;
+    // compose `max`/`min` (with an upper bound that can never fall below `k`)
+    // to stay panic-free for every `k`.
+    let upper = k.max(1000);
     let reranker_k = map
         .get("reranker_k")
         .and_then(|v| v.as_u64())
-        .map(|v| (v as usize).clamp(k, 1000))
-        .unwrap_or((k * 3).min(1000));
+        .map(|v| (v as usize).max(k).min(upper))
+        .unwrap_or_else(|| k.saturating_mul(3).min(upper));
     let query_override = map
         .get("reranker_query")
         .and_then(|v| v.as_str())
@@ -1573,9 +1578,11 @@ pub(crate) async fn run_hybrid_search(
         let qvec = if let Some(ref v) = query_vector {
             v.clone()
         } else {
-            auto_embed_text(host, &label, vec_prop, &query_text)
-                .await
-                .unwrap_or_default()
+            // Propagate an auto-embed failure instead of swallowing it to an
+            // empty vector. Swallowing left `qvec` empty, silently skipping the
+            // dense arm so hybrid search degraded to FTS-only with no error —
+            // inconsistent with the fts/sparse arms below, which use `?`.
+            auto_embed_text(host, &label, vec_prop, &query_text).await?
         };
 
         if !qvec.is_empty() {
@@ -1656,6 +1663,32 @@ pub(crate) async fn run_hybrid_search(
                     (&sparse_results, weights[2], NormKind::ScoreByMax),
                 ])
             }
+        }
+        // Relative-score fusion (Weaviate `relativeScore`): per-source min-max
+        // normalize to [0, 1] then weighted-sum across all sources. Distinct from
+        // `weighted` in that it always min-max normalizes every source uniformly
+        // (never the two-way `alpha` shim). `rsf` is an accepted alias.
+        "relative_score" | "rsf" => {
+            let weights = parse_three_weights(options_map);
+            use crate::query::fusion::NormKind;
+            crate::query::fusion::fuse_weighted_sources(&[
+                (&vector_results, weights[0], NormKind::DistanceToSim),
+                (&fts_results, weights[1], NormKind::ScoreByMax),
+                (&sparse_results, weights[2], NormKind::ScoreByMax),
+            ])
+        }
+        // Distribution-Based Score Fusion (Qdrant DBSF): per-source z-score
+        // normalize (robust to a single outlier stretching one list) then sum.
+        // Weights default to equal thirds; equal weights make it a plain z-sum
+        // (uniform scaling is rank-invariant).
+        "dbsf" => {
+            let weights = parse_three_weights(options_map);
+            use crate::query::fusion::NormKind;
+            crate::query::fusion::fuse_dbsf(&[
+                (&vector_results, weights[0], NormKind::DistanceToSim),
+                (&fts_results, weights[1], NormKind::ScoreByMax),
+                (&sparse_results, weights[2], NormKind::ScoreByMax),
+            ])
         }
         _ => crate::query::fusion::fuse_rrf_multi(
             &[&vector_results, &fts_results, &sparse_results],

@@ -4,8 +4,9 @@
 use crate::api::Uni;
 use std::path::Path;
 use uni_common::core::schema::{
-    DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
-    ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig, VectorIndexType,
+    AnalyzerConfig, DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig,
+    IndexDefinition, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
+    VectorIndexType,
 };
 use uni_common::{Result, UniError};
 
@@ -197,6 +198,10 @@ impl<'a> SchemaBuilder<'a> {
                     to_labels,
                     description,
                 } => {
+                    // Keep the requested endpoint labels to compare against the
+                    // stored definition if the edge type already exists.
+                    let requested_from = from_labels.clone();
+                    let requested_to = to_labels.clone();
                     match manager.add_edge_type_with_desc(
                         &name,
                         from_labels,
@@ -204,7 +209,31 @@ impl<'a> SchemaBuilder<'a> {
                         description,
                     ) {
                         Ok(_) => {}
-                        Err(e) if e.to_string().contains("already exists") => {}
+                        Err(e) if e.to_string().contains("already exists") => {
+                            // `add_edge_type_with_desc` errors on NAME collision
+                            // and returns BEFORE updating the stored labels. A
+                            // re-declaration is idempotent only when the existing
+                            // endpoint labels match; a re-declaration with
+                            // different from/to labels is a real conflict that
+                            // must not be silently swallowed (which would leave
+                            // the stale definition). Mirror `declare_property`
+                            // and surface it.
+                            let existing_schema = manager.schema();
+                            let matches = existing_schema
+                                .get_edge_type_case_insensitive(&name)
+                                .is_some_and(|m| {
+                                    m.src_labels == requested_from && m.dst_labels == requested_to
+                                });
+                            if !matches {
+                                return Err(UniError::Schema {
+                                    message: format!(
+                                        "edge type '{name}' already exists with different \
+                                         endpoint labels; drop it before re-declaring with \
+                                         from={requested_from:?} to={requested_to:?}"
+                                    ),
+                                });
+                            }
+                        }
                         Err(e) => {
                             return Err(UniError::Schema {
                                 message: e.to_string(),
@@ -311,6 +340,16 @@ impl<'a> LabelBuilder<'a> {
                 with_positions: true,
                 metadata: Default::default(),
             }),
+            IndexType::FullTextWithAnalyzer(analyzer) => {
+                IndexDefinition::FullText(FullTextIndexConfig {
+                    name: format!("fts_{}_{}", self.name, property),
+                    label: self.name.clone(),
+                    properties: vec![property.to_string()],
+                    tokenizer: TokenizerConfig::Analyzer(analyzer),
+                    with_positions: true,
+                    metadata: Default::default(),
+                })
+            }
             IndexType::Scalar(stype) => IndexDefinition::Scalar(ScalarIndexConfig {
                 name: format!("idx_{}_{}", self.name, property),
                 label: self.name.clone(),
@@ -502,7 +541,11 @@ pub struct ConstraintInfo {
 #[non_exhaustive]
 pub enum IndexType {
     Vector(VectorIndexCfg),
+    /// Full-text index using the default (standard) analyzer.
     FullText,
+    /// Full-text index with an explicit analyzer pipeline (tokenizer, language,
+    /// stemming, stop words, ...). Construct via [`IndexType::full_text_with_analyzer`].
+    FullTextWithAnalyzer(AnalyzerConfig),
     Scalar(ScalarType),
     Inverted(uni_common::core::schema::InvertedIndexConfig),
     /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
@@ -517,6 +560,26 @@ pub enum IndexType {
 }
 
 impl IndexType {
+    /// A full-text index with an explicit analyzer pipeline.
+    ///
+    /// Use this to configure the base tokenizer, language, stemming, stop-word
+    /// removal, ASCII folding and token-length limits. Plain
+    /// [`IndexType::FullText`] keeps the default (standard) analyzer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use uni_common::core::schema::{AnalyzerConfig, FtsLanguage};
+    /// let idx = IndexType::full_text_with_analyzer(AnalyzerConfig {
+    ///     language: FtsLanguage::French,
+    ///     ..AnalyzerConfig::default()
+    /// });
+    /// ```
+    #[must_use]
+    pub fn full_text_with_analyzer(analyzer: AnalyzerConfig) -> Self {
+        Self::FullTextWithAnalyzer(analyzer)
+    }
+
     /// A sparse-vector index over a `dimensions`-wide term space with 8-bit
     /// weight quantization enabled (the default; use the [`IndexType::Sparse`]
     /// struct variant directly to disable it or to set auto-embedding).
@@ -708,6 +771,9 @@ pub enum VectorMetric {
     Cosine,
     L2,
     Dot,
+    /// L1 / Manhattan distance. Searched exact/brute-force — L1 columns cannot
+    /// build an ANN vector index.
+    L1,
 }
 
 impl VectorMetric {
@@ -716,6 +782,7 @@ impl VectorMetric {
             VectorMetric::Cosine => DistanceMetric::Cosine,
             VectorMetric::L2 => DistanceMetric::L2,
             VectorMetric::Dot => DistanceMetric::Dot,
+            VectorMetric::L1 => DistanceMetric::L1,
         }
     }
 }

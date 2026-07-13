@@ -22,37 +22,282 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use uni_algo::algo::procedures::{AlgoContext, AlgoProcedure, AlgoResultRow, ValueType};
-use uni_plugin::FnError;
+use uni_algo::algo::projection::{GraphProjection, ProjectionBuilder};
+use uni_common::core::id::Vid;
 use uni_plugin::traits::algorithm::{
-    AlgorithmContext, AlgorithmHost, AlgorithmProvider, AlgorithmSignature,
+    AlgorithmContext, AlgorithmHost, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
+    GraphView,
 };
+use uni_plugin::{Capability, CapabilitySet, FnError};
+
+/// Read-only [`GraphView`] backed by a materialized [`GraphProjection`].
+///
+/// Slot-indexed accessors delegate directly to the projection's dense CSR
+/// arrays; see [`GraphView`] for the panic contract on weights / reverse.
+pub struct GraphViewImpl(Arc<GraphProjection>);
+
+impl std::fmt::Debug for GraphViewImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphViewImpl")
+            .field("vertex_count", &self.0.vertex_count())
+            .field("edge_count", &self.0.edge_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GraphView for GraphViewImpl {
+    fn vertex_count(&self) -> usize {
+        self.0.vertex_count()
+    }
+    fn edge_count(&self) -> usize {
+        self.0.edge_count()
+    }
+    fn out_neighbors(&self, slot: u32) -> &[u32] {
+        self.0.out_neighbors(slot)
+    }
+    fn out_degree(&self, slot: u32) -> u32 {
+        self.0.out_degree(slot)
+    }
+    fn in_neighbors(&self, slot: u32) -> &[u32] {
+        self.0.in_neighbors(slot)
+    }
+    fn in_degree(&self, slot: u32) -> u32 {
+        self.0.in_degree(slot)
+    }
+    fn has_reverse(&self) -> bool {
+        self.0.has_reverse()
+    }
+    fn out_weight(&self, slot: u32, edge_idx: usize) -> f64 {
+        self.0.out_weight(slot, edge_idx)
+    }
+    fn has_weights(&self) -> bool {
+        self.0.has_weights()
+    }
+    fn to_vid(&self, slot: u32) -> Vid {
+        self.0.to_vid(slot)
+    }
+    fn to_slot(&self, vid: Vid) -> Option<u32> {
+        self.0.to_slot(vid)
+    }
+    fn vertices(&self) -> Box<dyn Iterator<Item = (u32, Vid)> + '_> {
+        Box::new(self.0.vertices())
+    }
+}
 
 /// Bridge host that surfaces `StorageManager` + optional `L0Manager`
-/// to plugin algorithms through [`AlgorithmHost::as_any`].
+/// to plugin algorithms through [`AlgorithmHost`].
+///
+/// Provides [`AlgorithmHost::project`] (gated on [`Capability::HostQuery`])
+/// as the stable topology-access path, and retains
+/// [`AlgorithmHost::as_any`] for the legacy downcast used by
+/// [`AlgoProviderBridge`].
 pub struct AlgorithmHostBridge {
     /// The concrete algo context the wrapped procedures need.
     pub algo_ctx: AlgoContext,
+    /// Effective capabilities of the plugin owning the running algorithm.
+    pub effective_caps: CapabilitySet,
 }
 
 impl std::fmt::Debug for AlgorithmHostBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlgorithmHostBridge")
+            .field("effective_caps", &self.effective_caps)
             .finish_non_exhaustive()
     }
 }
 
 impl AlgorithmHostBridge {
-    /// Construct a host bridge from an [`AlgoContext`].
+    /// Construct a host bridge from an [`AlgoContext`] and effective caps.
     #[must_use]
-    pub fn new(algo_ctx: AlgoContext) -> Self {
-        Self { algo_ctx }
+    pub fn new(algo_ctx: AlgoContext, effective_caps: CapabilitySet) -> Self {
+        Self {
+            algo_ctx,
+            effective_caps,
+        }
+    }
+
+    /// Builds a concrete projection for GraphCompute kernels, gated on caps.
+    ///
+    /// Unlike [`AlgorithmHost::project`] (which yields an opaque
+    /// `Arc<dyn GraphView>`), this returns the concrete `Arc<GraphProjection>`
+    /// an [`AlgoSession`](crate::algorithms::graph_compute::AlgoSession) binds.
+    /// It enforces the two orthogonal gates of the proposal (§4.6):
+    /// [`Capability::GraphCompute`] for the kernel surface and
+    /// [`Capability::HostQuery`] for the data read.
+    ///
+    /// # Errors
+    /// Returns `0x86C` if `GraphCompute` is not granted, `0x804` if `HostQuery`
+    /// is not granted, or `0x803` if the projection build fails.
+    pub fn project_for_graph_compute(
+        &self,
+        spec: &GraphProjectionSpec,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
+        if !self
+            .effective_caps
+            .contains_variant(&Capability::GraphCompute)
+        {
+            return Box::pin(async {
+                Err(FnError::new(
+                    crate::algorithms::graph_compute::error::CAPABILITY_DENIED,
+                    "GraphCompute: capability `graph-compute` not granted",
+                ))
+            });
+        }
+        if !self
+            .effective_caps
+            .contains_variant(&Capability::HostQuery {
+                read_only: false,
+                scopes: Vec::new(),
+            })
+        {
+            return Box::pin(async {
+                Err(FnError::new(
+                    0x804,
+                    "GraphCompute: `project` additionally requires `HostQuery`",
+                ))
+            });
+        }
+        // Enforce the HostQuery scope restriction (E5): when the grant names
+        // scopes (label / edge-type prefixes), every projected label and edge
+        // type must match one — a plugin scoped to `Person` cannot project the
+        // whole graph. An empty scope list is unrestricted (the default).
+        let scope_prefixes: Vec<String> = self
+            .effective_caps
+            .iter()
+            .find_map(|c| match c {
+                Capability::HostQuery { scopes, .. } => {
+                    Some(scopes.iter().map(ToString::to_string).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        if !scope_prefixes.is_empty() {
+            let in_scope = |name: &str| scope_prefixes.iter().any(|p| name.starts_with(p.as_str()));
+            let denied = spec
+                .node_labels
+                .iter()
+                .chain(spec.edge_types.iter())
+                .find(|name| !in_scope(name));
+            if let Some(name) = denied {
+                let name = name.clone();
+                let scopes = scope_prefixes.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: `{name}` is outside the granted HostQuery scopes [{scopes}]"
+                        ),
+                    ))
+                });
+            }
+        }
+        let storage = Arc::clone(&self.algo_ctx.storage);
+        let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
+        let spec = spec.clone();
+        Box::pin(async move {
+            let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
+            let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let mut builder = ProjectionBuilder::new(storage)
+                .l0_manager(l0)
+                .node_labels(&node_labels)
+                .edge_types(&edge_types)
+                .include_reverse(spec.include_reverse);
+            if let Some(prop) = spec.weight_property.as_deref() {
+                builder = builder.weight_property(prop);
+            }
+            let projection = builder.build().await.map_err(|e| {
+                FnError::new(0x803, format!("GraphCompute project build failed: {e}"))
+            })?;
+            Ok(Arc::new(projection))
+        })
+    }
+
+    /// Reads the per-invocation GraphCompute work and arena-byte caps.
+    ///
+    /// Uses a plugin's declared [`Capability::GraphComputeWork`] /
+    /// [`Capability::GraphComputeArenaBytes`] quota when present, otherwise the
+    /// pinned defaults (proposal §12). The work cap is combined with the
+    /// edge-count multiple by the caller.
+    #[must_use]
+    pub fn graph_compute_caps(&self) -> (Option<u64>, usize) {
+        let mut work = None;
+        let mut arena = crate::algorithms::graph_compute::DEFAULT_ARENA_MAX_BYTES;
+        for cap in self.effective_caps.iter() {
+            match cap {
+                Capability::GraphComputeWork(w) => work = Some(*w),
+                Capability::GraphComputeArenaBytes(b) => {
+                    arena = usize::try_from(*b).unwrap_or(usize::MAX);
+                }
+                _ => {}
+            }
+        }
+        (work, arena)
+    }
+
+    /// Reads the per-invocation wall-clock deadline for a GraphCompute guest.
+    ///
+    /// Returns the plugin's declared [`Capability::WallClockMillisPerCall`] grant
+    /// in milliseconds, if present. A loader uses it to arm its watchdog /
+    /// deadline; absent, the loader applies its own default.
+    #[must_use]
+    pub fn graph_compute_deadline_ms(&self) -> Option<u64> {
+        self.effective_caps.iter().find_map(|cap| match cap {
+            Capability::WallClockMillisPerCall(ms) => Some(*ms),
+            _ => None,
+        })
     }
 }
 
 impl AlgorithmHost for AlgorithmHostBridge {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn project(
+        &self,
+        spec: &GraphProjectionSpec,
+    ) -> BoxFuture<'static, Result<Arc<dyn GraphView>, FnError>> {
+        // Gate topology access on `HostQuery` (variant match; payload
+        // attenuation is applied at registration-time intersection).
+        if !self
+            .effective_caps
+            .contains_variant(&Capability::HostQuery {
+                read_only: false,
+                scopes: Vec::new(),
+            })
+        {
+            return Box::pin(async {
+                Err(FnError::new(
+                    0x804,
+                    "AlgorithmHost::project: capability `HostQuery` not granted",
+                ))
+            });
+        }
+
+        // Clone owned inputs into the `'static` future so it can be moved
+        // into the stream a provider returns from the synchronous `run`.
+        let storage = Arc::clone(&self.algo_ctx.storage);
+        let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
+        let spec = spec.clone();
+
+        Box::pin(async move {
+            let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
+            let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let mut builder = ProjectionBuilder::new(storage)
+                .l0_manager(l0)
+                .node_labels(&node_labels)
+                .edge_types(&edge_types)
+                .include_reverse(spec.include_reverse);
+            if let Some(prop) = spec.weight_property.as_deref() {
+                builder = builder.weight_property(prop);
+            }
+            let projection = builder.build().await.map_err(|e| {
+                FnError::new(0x803, format!("AlgorithmHost::project build failed: {e}"))
+            })?;
+            Ok(Arc::new(GraphViewImpl(Arc::new(projection))) as Arc<dyn GraphView>)
+        })
     }
 }
 
@@ -84,6 +329,7 @@ impl AlgoProviderBridge {
         let signature = AlgorithmSignature {
             output_fields,
             docs: format!("uni.{} (algorithm)", proc.name()),
+            ..Default::default()
         };
         Self {
             proc,
@@ -248,11 +494,14 @@ fn build_record_batch(
 
 /// Helper: build an `AlgorithmHostBridge` from `StorageManager` + L0.
 ///
-/// Hosts use this when constructing an `AlgorithmContext`.
+/// Hosts use this when constructing an `AlgorithmContext`. `effective_caps`
+/// carries the owning plugin's grants so [`AlgorithmHost::project`] can gate
+/// topology access on [`Capability::HostQuery`].
 #[must_use]
 pub fn host_bridge_from_storage(
     storage: Arc<uni_store::storage::manager::StorageManager>,
     l0: Option<Arc<uni_store::runtime::L0Manager>>,
+    effective_caps: CapabilitySet,
 ) -> AlgorithmHostBridge {
-    AlgorithmHostBridge::new(AlgoContext::new(storage, l0))
+    AlgorithmHostBridge::new(AlgoContext::new(storage, l0), effective_caps)
 }

@@ -185,6 +185,13 @@ pub enum DataType {
     SparseVector {
         dimensions: usize,
     },
+    /// Binary/bit vector for Hamming/Jaccard similarity. `dimensions` is the
+    /// number of `u8` lanes (each lane holds 8 bits), stored as
+    /// `FixedSizeList<UInt8>`. Exact/brute-force only — Lance ANN over binary
+    /// metrics is not wired, so a `BinaryVector` column builds no ANN index.
+    BinaryVector {
+        dimensions: usize,
+    },
     Btic,
     Crdt(CrdtType),
     List(Box<DataType>),
@@ -238,6 +245,10 @@ impl DataType {
                 *dimensions as i32,
             ),
             DataType::SparseVector { .. } => ArrowDataType::Struct(sparse_vector_struct_fields()),
+            DataType::BinaryVector { dimensions } => ArrowDataType::FixedSizeList(
+                Arc::new(Field::new("item", ArrowDataType::UInt8, true)),
+                *dimensions as i32,
+            ),
             DataType::Btic => ArrowDataType::FixedSizeBinary(24),
             DataType::Crdt(_) => ArrowDataType::Binary, // Store CRDT as binary MessagePack
             DataType::List(inner) => {
@@ -389,6 +400,12 @@ impl DataType {
             DataType::SparseVector { .. } => {
                 matches!(value, Value::SparseVector { .. } | Value::Map(_))
             }
+            // Shape-only: the declared lane count is enforced by
+            // `check_vector_dims`. A `Value::List` of byte-valued integers is the
+            // literal input form, coerced to `BinaryVector` by the write path.
+            DataType::BinaryVector { .. } => {
+                matches!(value, Value::BinaryVector(_) | Value::List(_))
+            }
             // Shape-only: for `List(Vector)` multi-vector columns, per-token
             // dimensions are enforced by `check_vector_dims` (issue #137).
             DataType::List(_) => matches!(value, Value::List(_)),
@@ -422,6 +439,7 @@ impl DataType {
 
         match self {
             DataType::Vector { dimensions } => check_dense_vector_value(value, *dimensions),
+            DataType::BinaryVector { dimensions } => check_binary_vector_value(value, *dimensions),
             DataType::List(inner) => {
                 let DataType::Vector { dimensions } = inner.as_ref() else {
                     return Ok(());
@@ -598,6 +616,58 @@ pub fn check_dense_vector_value(
     }
 }
 
+/// Validates a value against a declared `BinaryVector(dimensions)` column.
+///
+/// The binary-vector companion to [`check_dense_vector_value`]: `dimensions` is
+/// the number of `u8` lanes. Accepts a [`Value::BinaryVector`](crate::value::Value::BinaryVector)
+/// of exactly that many bytes, or the literal input form — a
+/// [`Value::List`](crate::value::Value::List) of exactly that many integers each
+/// in `[0, 255]` (coerced to bytes by the write path).
+/// [`Value::Null`](crate::value::Value::Null) passes.
+///
+/// # Errors
+/// Returns [`VectorDimError::WrongLength`] on a lane-count mismatch,
+/// [`VectorDimError::NonNumericElement`] if a list element is not an integer in
+/// `[0, 255]`, or [`VectorDimError::NotAVector`] for any other value.
+pub fn check_binary_vector_value(
+    value: &crate::value::Value,
+    dimensions: usize,
+) -> Result<(), VectorDimError> {
+    use crate::value::Value;
+
+    match value {
+        Value::Null => Ok(()),
+        Value::BinaryVector(bytes) => {
+            if bytes.len() == dimensions {
+                Ok(())
+            } else {
+                Err(VectorDimError::WrongLength {
+                    expected: dimensions,
+                    actual: bytes.len(),
+                })
+            }
+        }
+        Value::List(items) => {
+            if items.len() != dimensions {
+                return Err(VectorDimError::WrongLength {
+                    expected: dimensions,
+                    actual: items.len(),
+                });
+            }
+            if let Some(index) = items
+                .iter()
+                .position(|e| !matches!(e.as_i64(), Some(0..=255)))
+            {
+                return Err(VectorDimError::NonNumericElement { index });
+            }
+            Ok(())
+        }
+        other => Err(VectorDimError::NotAVector {
+            actual: value_variant_name(other),
+        }),
+    }
+}
+
 /// Returns a short variant name for a `Value`, used in dimension-mismatch messages.
 fn value_variant_name(value: &crate::value::Value) -> &'static str {
     use crate::value::Value;
@@ -616,6 +686,7 @@ fn value_variant_name(value: &crate::value::Value) -> &'static str {
         Value::Path(_) => "Path",
         Value::Vector(_) => "Vector",
         Value::SparseVector { .. } => "SparseVector",
+        Value::BinaryVector(_) => "BinaryVector",
         Value::Temporal(_) => "Temporal",
     }
 }
@@ -672,9 +743,38 @@ pub struct EdgeTypeMeta {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub enum ConstraintType {
-    Unique { properties: Vec<String> },
-    Exists { property: String },
-    Check { expression: String },
+    Unique {
+        properties: Vec<String>,
+    },
+    Exists {
+        property: String,
+    },
+    Check {
+        expression: String,
+    },
+    /// Composite node key: the property tuple must be unique AND every listed
+    /// property must be present (non-null). Equivalent to `Unique` over the tuple
+    /// plus `Exists` on each member, enforced together at write time.
+    NodeKey {
+        properties: Vec<String>,
+    },
+}
+
+impl ConstraintType {
+    /// The property tuple whose combination must be unique.
+    ///
+    /// Returns `Some` for the uniqueness-enforcing kinds — `Unique` and `NodeKey`
+    /// (a node key is a unique tuple plus NOT-NULL) — and `None` otherwise. Lets
+    /// the write path share one key-collection/probe path across both kinds.
+    #[must_use]
+    pub fn unique_properties(&self) -> Option<&[String]> {
+        match self {
+            ConstraintType::Unique { properties } | ConstraintType::NodeKey { properties } => {
+                Some(properties)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1270,6 +1370,19 @@ pub enum DistanceMetric {
     Cosine,
     L2,
     Dot,
+    /// L1 / Manhattan distance (`Σ|xᵢ − yᵢ|`). Exact/brute-force only — Lance
+    /// ANN indexes do not support it, so an L1 column cannot build an ANN index.
+    L1,
+    /// Hamming distance over binary vectors: the number of differing bits
+    /// (`Σ popcount(aᵢ ⊕ bᵢ)` across `u8` lanes). Applies only to
+    /// [`DataType::BinaryVector`] columns. Exact/brute-force only — Lance ANN
+    /// over binary metrics is not wired here.
+    Hamming,
+    /// Jaccard distance over binary vectors: `1 − |A ∩ B| / |A ∪ B|` computed
+    /// bitwise (two all-zero vectors are defined as distance `0`). Applies only
+    /// to [`DataType::BinaryVector`] columns. Exact/brute-force only — Lance has
+    /// no Jaccard ANN.
+    Jaccard,
 }
 
 impl DistanceMetric {
@@ -1280,6 +1393,7 @@ impl DistanceMetric {
     /// - **L2**: squared Euclidean distance.
     /// - **Cosine**: `1.0 - cosine_similarity` (range \[0, 2\]).
     /// - **Dot**: negative dot product.
+    /// - **L1**: Manhattan distance (`Σ|xᵢ − yᵢ|`).
     ///
     /// # Panics
     ///
@@ -1288,6 +1402,7 @@ impl DistanceMetric {
         assert_eq!(a.len(), b.len(), "vector dimension mismatch");
         match self {
             DistanceMetric::L2 => a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum(),
+            DistanceMetric::L1 => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
             DistanceMetric::Cosine => {
                 let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
                 let norm_a: f32 = a.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
@@ -1299,6 +1414,60 @@ impl DistanceMetric {
                 let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
                 -dot
             }
+            // Binary metrics operate on `&[u8]`, not float lanes; routing a
+            // float vector here is a programming error (a `BinaryVector` column
+            // is scored via `compute_distance_binary`).
+            DistanceMetric::Hamming | DistanceMetric::Jaccard => {
+                panic!("{self:?} is a binary-vector metric; use compute_distance_binary")
+            }
+        }
+    }
+
+    /// Returns `true` if this metric operates on binary vectors (`&[u8]` lanes)
+    /// rather than float vectors — i.e. [`DistanceMetric::Hamming`] or
+    /// [`DistanceMetric::Jaccard`].
+    ///
+    /// Callers use this to route between [`DistanceMetric::compute_distance`]
+    /// and [`DistanceMetric::compute_distance_binary`], and to decide that a
+    /// column is scored exact/brute-force (binary metrics have no ANN backend).
+    pub fn is_binary(&self) -> bool {
+        matches!(self, DistanceMetric::Hamming | DistanceMetric::Jaccard)
+    }
+
+    /// Computes the distance between two binary vectors (`u8` lanes) using this
+    /// metric, following the LanceDB "lower is more similar" convention.
+    ///
+    /// - **Hamming**: number of differing bits, `Σ popcount(aᵢ ⊕ bᵢ)`.
+    /// - **Jaccard**: `1 − |A ∩ B| / |A ∪ B|` computed bitwise; two all-zero
+    ///   vectors are defined as distance `0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a` and `b` have different lengths, or if `self` is a
+    /// float metric ([`DistanceMetric::L2`], `Cosine`, `Dot`, or `L1`) — those
+    /// are computed via [`DistanceMetric::compute_distance`].
+    pub fn compute_distance_binary(&self, a: &[u8], b: &[u8]) -> f32 {
+        assert_eq!(a.len(), b.len(), "binary vector dimension mismatch");
+        match self {
+            DistanceMetric::Hamming => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x ^ y).count_ones())
+                .sum::<u32>() as f32,
+            DistanceMetric::Jaccard => {
+                let mut inter: u32 = 0;
+                let mut union: u32 = 0;
+                for (x, y) in a.iter().zip(b) {
+                    inter += (x & y).count_ones();
+                    union += (x | y).count_ones();
+                }
+                if union == 0 {
+                    0.0
+                } else {
+                    1.0 - (inter as f32) / (union as f32)
+                }
+            }
+            other => panic!("{other:?} is a float-vector metric; use compute_distance"),
         }
     }
 }
@@ -1319,8 +1488,147 @@ pub struct FullTextIndexConfig {
 pub enum TokenizerConfig {
     Standard,
     Whitespace,
-    Ngram { min: u8, max: u8 },
-    Custom { name: String },
+    Ngram {
+        min: u8,
+        max: u8,
+    },
+    Custom {
+        name: String,
+    },
+    /// Fully specified analyzer pipeline (base tokenizer + language + filters).
+    ///
+    /// Carries stemming, stop-word, lowercasing, ASCII-folding and token-length
+    /// configuration so full-text indexes honor the requested analysis instead
+    /// of falling back to the hardcoded standard tokenizer.
+    Analyzer(AnalyzerConfig),
+}
+
+/// Full analyzer pipeline configuration for a full-text index.
+///
+/// This is a backend-agnostic, plainly serializable description of the token
+/// analysis chain. The `uni-store` Lance backend maps it onto the underlying
+/// `InvertedIndexParams`; this crate stays free of any Lance dependency.
+///
+/// Every field carries `#[serde(default)]` so schemas persisted before a field
+/// existed still deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnalyzerConfig {
+    /// Base tokenizer that splits raw text into tokens.
+    #[serde(default)]
+    pub base: BaseTokenizer,
+    /// Language used for stemming and built-in stop-word lists.
+    #[serde(default)]
+    pub language: FtsLanguage,
+    /// Whether to lowercase tokens.
+    #[serde(default = "default_true")]
+    pub lower_case: bool,
+    /// Whether to apply language-specific stemming.
+    #[serde(default = "default_true")]
+    pub stem: bool,
+    /// Whether to drop stop words (built-in list, or `custom_stop_words`).
+    #[serde(default = "default_true")]
+    pub remove_stop_words: bool,
+    /// Explicit stop-word list overriding the language's built-in list.
+    #[serde(default)]
+    pub custom_stop_words: Option<Vec<String>>,
+    /// Whether to fold accented characters to ASCII (é → e).
+    #[serde(default = "default_true")]
+    pub ascii_folding: bool,
+    /// Drop tokens longer than this many bytes (`None` keeps the backend default).
+    #[serde(default)]
+    pub max_token_length: Option<u32>,
+}
+
+impl Default for AnalyzerConfig {
+    fn default() -> Self {
+        Self {
+            base: BaseTokenizer::default(),
+            language: FtsLanguage::default(),
+            lower_case: true,
+            stem: true,
+            remove_stop_words: true,
+            custom_stop_words: None,
+            ascii_folding: true,
+            max_token_length: None,
+        }
+    }
+}
+
+/// Base tokenizer that produces the initial token stream.
+///
+/// `Custom` is a passthrough for backend-native tokenizers such as
+/// `"lindera/*"` or `"jieba/*"` (which require external dictionaries).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum BaseTokenizer {
+    /// Split on whitespace and punctuation (recommended default).
+    #[default]
+    Simple,
+    /// Split on whitespace only.
+    Whitespace,
+    /// No tokenization; the whole field is one token.
+    Raw,
+    /// Character N-gram tokenizer with inclusive `[min, max]` gram lengths.
+    Ngram {
+        /// Minimum gram length (must be `>= 1` and `<= max`).
+        min: u32,
+        /// Maximum gram length.
+        max: u32,
+    },
+    /// Backend-native tokenizer name, passed through verbatim (e.g. `"jieba/default"`).
+    Custom(String),
+}
+
+/// Language used for stemming and built-in stop-word removal.
+///
+/// Mirrors the 18 languages the Lance tokenizer supports. Note that not every
+/// language ships a built-in stop-word list; the backend mapper handles those
+/// cases (see `uni-store`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FtsLanguage {
+    /// Arabic.
+    Arabic,
+    /// Danish.
+    Danish,
+    /// Dutch.
+    Dutch,
+    /// English (default).
+    #[default]
+    English,
+    /// Finnish.
+    Finnish,
+    /// French.
+    French,
+    /// German.
+    German,
+    /// Greek.
+    Greek,
+    /// Hungarian.
+    Hungarian,
+    /// Italian.
+    Italian,
+    /// Norwegian.
+    Norwegian,
+    /// Portuguese.
+    Portuguese,
+    /// Romanian.
+    Romanian,
+    /// Russian.
+    Russian,
+    /// Spanish.
+    Spanish,
+    /// Swedish.
+    Swedish,
+    /// Tamil.
+    Tamil,
+    /// Turkish.
+    Turkish,
+}
+
+/// Serde default helper: boolean fields that default to `true`.
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2110,6 +2418,11 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
+        // Validate the new name like declare_property/add_property do — otherwise
+        // a rename bypasses the reserved-storage-column guard and the leading-
+        // underscore rule, letting a user property collide with an internal Arrow
+        // column (e.g. `_vid`, `src_vid`, `overflow_json`).
+        validate_property_name(new_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let Some(props) = schema.properties.get_mut(label_or_type) else {
@@ -2261,6 +2574,86 @@ mod tests {
     use crate::value::{TemporalValue, Value};
     use object_store::local::LocalFileSystem;
     use tempfile::tempdir;
+
+    #[test]
+    fn binary_vector_metrics_exact() {
+        // Hamming = number of differing bits. 0x00 vs 0xFF = 8 bits; 0xA5 vs 0xA5
+        // = 0; 0x0F vs 0x00 = 4 bits.
+        assert_eq!(
+            DistanceMetric::Hamming.compute_distance_binary(&[0x00], &[0xFF]),
+            8.0
+        );
+        assert_eq!(
+            DistanceMetric::Hamming.compute_distance_binary(&[0xA5, 0x0F], &[0xA5, 0x00]),
+            4.0
+        );
+        assert_eq!(
+            DistanceMetric::Hamming.compute_distance_binary(&[0xA5], &[0xA5]),
+            0.0
+        );
+
+        // Jaccard = 1 − |A∩B|/|A∪B|. 0b1100 & 0b1010 = 0b1000 (1 bit);
+        // 0b1100 | 0b1010 = 0b1110 (3 bits) → 1 − 1/3 = 2/3.
+        let j = DistanceMetric::Jaccard.compute_distance_binary(&[0b1100], &[0b1010]);
+        assert!((j - (2.0 / 3.0)).abs() < 1e-6, "got {j}");
+        // Identical vectors → distance 0.
+        assert_eq!(
+            DistanceMetric::Jaccard.compute_distance_binary(&[0xFF], &[0xFF]),
+            0.0
+        );
+        // Two all-zero vectors are defined as distance 0 (empty union).
+        assert_eq!(
+            DistanceMetric::Jaccard.compute_distance_binary(&[0x00, 0x00], &[0x00, 0x00]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn binary_metrics_are_binary_and_route_correctly() {
+        assert!(DistanceMetric::Hamming.is_binary());
+        assert!(DistanceMetric::Jaccard.is_binary());
+        assert!(!DistanceMetric::L2.is_binary());
+        assert!(!DistanceMetric::L1.is_binary());
+    }
+
+    #[test]
+    #[should_panic(expected = "binary-vector metric")]
+    fn float_compute_distance_rejects_binary_metric() {
+        DistanceMetric::Hamming.compute_distance(&[1.0], &[0.0]);
+    }
+
+    #[test]
+    fn check_binary_vector_value_guards() {
+        let ty = DataType::BinaryVector { dimensions: 3 };
+        assert!(
+            ty.check_vector_dims(&Value::BinaryVector(vec![1, 2, 3]))
+                .is_ok()
+        );
+        assert!(ty.check_vector_dims(&Value::Null).is_ok());
+        // Wrong lane count.
+        assert!(
+            ty.check_vector_dims(&Value::BinaryVector(vec![1, 2]))
+                .is_err()
+        );
+        // List of byte-ints is the literal form.
+        assert!(
+            ty.check_vector_dims(&Value::List(vec![
+                Value::Int(0),
+                Value::Int(255),
+                Value::Int(128)
+            ]))
+            .is_ok()
+        );
+        // Out-of-byte-range element.
+        assert!(
+            ty.check_vector_dims(&Value::List(vec![
+                Value::Int(0),
+                Value::Int(256),
+                Value::Int(1)
+            ]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_datatype_accepts_matrix() {

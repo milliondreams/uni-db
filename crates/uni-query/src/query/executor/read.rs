@@ -3475,7 +3475,7 @@ impl Executor {
             }
 
             // Process each partition
-            for (_partition_key, row_indices) in partition_map.iter_mut() {
+            for row_indices in partition_map.values_mut() {
                 // Sort rows within partition by ORDER BY clause
                 if !window_spec.order_by.is_empty() {
                     row_indices.sort_by(|&a, &b| {
@@ -4997,6 +4997,7 @@ impl Executor {
                 ConstraintType::Unique { .. } => "UNIQUE",
                 ConstraintType::Exists { .. } => "EXISTS",
                 ConstraintType::Check { .. } => "CHECK",
+                ConstraintType::NodeKey { .. } => "NODE KEY",
                 _ => "UNKNOWN",
             };
             row.insert("type".to_string(), Value::String(type_str.to_string()));
@@ -5060,12 +5061,13 @@ impl Executor {
         left_rows.append(&mut right_rows);
 
         if !all {
+            // Sorting keys fixes map order, but `format!("{:?}")` still renders
+            // each `Value` via `Debug`, and a `Value::Map`-valued cell nests a
+            // `HashMap` whose `Debug` order is instance-dependent — so equal
+            // rows could survive UNION dedup. `canonical_row_key` encodes both
+            // keys and values structurally and deterministically.
             let mut seen = HashSet::new();
-            left_rows.retain(|row| {
-                let sorted_row: std::collections::BTreeMap<_, _> = row.iter().collect();
-                let key = format!("{sorted_row:?}");
-                seen.insert(key)
-            });
+            left_rows.retain(|row| seen.insert(Self::canonical_row_key(row)));
         }
         Ok(left_rows)
     }

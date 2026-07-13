@@ -215,6 +215,21 @@ fn register_builtin_plugins(
         // plugin owns both procedure registrations (`uni.algo.*`
         // adapters) and the AlgorithmProvider chain.
         caps.insert(Capability::Algorithm);
+        // GraphView (P0): the first-party `uni.algo.reachability`
+        // provider reaches topology through `AlgorithmHost::project`,
+        // which is gated on `HostQuery`. Grant it read-only, unscoped so
+        // the built-in provider passes its own gate; third-party plugins
+        // must declare `HostQuery` in their manifest to earn the same.
+        caps.insert(Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        });
+        // GraphCompute (Phase 1): the first-party `uni.algo.gcpagerank`
+        // provider drives the coarse kernel catalog, gated on
+        // `Capability::GraphCompute` (orthogonal to the `HostQuery` gate on
+        // `project`). Third-party plugins must declare `graph-compute` in
+        // their manifest to earn the same.
+        caps.insert(Capability::GraphCompute);
         let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
         let algo_registry: Arc<uni_algo::algo::AlgorithmRegistry> =
             Arc::new(uni_algo::algo::AlgorithmRegistry::new());
@@ -246,9 +261,14 @@ fn register_builtin_plugins(
     {
         let synthesizer: Arc<dyn uni_plugin_custom::ProcedureBodySynthesizer> =
             Arc::new(crate::synthetic_procedure::CypherProcedureSynthesizer::new());
+        // WS-A — trigger synthesizer so `declareTrigger` installs a real
+        // `TriggerPlugin` that fires on the commit path.
+        let trigger_synthesizer: Arc<dyn uni_plugin_custom::TriggerBodySynthesizer> =
+            Arc::new(crate::synthetic_trigger::CypherTriggerSynthesizer::new());
         let plugin = uni_plugin_custom::CustomPlugin::new(Arc::clone(registry), persistence)
             .map_err(|e| uni_plugin::PluginError::internal(format!("uni-plugin-custom: {e}")))?
-            .with_procedure_synthesizer(synthesizer);
+            .with_procedure_synthesizer(synthesizer)
+            .with_trigger_synthesizer(trigger_synthesizer);
         plugin.reactivate_into_registry().map_err(|e| {
             uni_plugin::PluginError::internal(format!("uni-plugin-custom reactivate: {e}"))
         })?;
@@ -357,6 +377,7 @@ fn constraint_infos_for(
             ConstraintType::Unique { properties } => ("UNIQUE", properties.clone()),
             ConstraintType::Exists { property } => ("EXISTS", vec![property.clone()]),
             ConstraintType::Check { expression } => ("CHECK", vec![expression.clone()]),
+            ConstraintType::NodeKey { properties } => ("NODE KEY", properties.clone()),
             _ => ("UNKNOWN", vec![]),
         };
         constraints.push(crate::api::schema::ConstraintInfo {
@@ -440,38 +461,6 @@ fn edge_index_descriptor(
     }
 }
 
-/// Shared inner state of a Uni database instance.
-///
-/// Wrapped in `Arc` by [`Uni`] so that [`Session`](session::Session) and
-/// [`Transaction`](transaction::Transaction) can hold cheap, owned references
-/// without lifetime parameters.
-/// One live entry in the `UniInner::active_connectors` map.
-///
-/// Holds the `Arc<dyn Connector>` so the trait object outlives the
-/// plugin-registry snapshot it was started from, the underlying
-/// plugin-reported `ConnectorHandle` for the eventual `stop()`
-/// dispatch, and the protocol name for diagnostics / `Uni::active_connectors`.
-#[derive(Clone)]
-#[doc(hidden)]
-pub struct ActiveConnector {
-    /// Protocol name (`"bolt"`, `"graphql"`, …).
-    pub protocol: String,
-    /// Connector handle as returned by the plugin's `start()` —
-    /// passed back to `Connector::stop()` verbatim.
-    pub handle: uni_plugin::traits::connector::ConnectorHandle,
-    /// Connector trait object kept alive for the lifecycle.
-    pub connector: Arc<dyn uni_plugin::traits::connector::Connector>,
-}
-
-impl std::fmt::Debug for ActiveConnector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActiveConnector")
-            .field("protocol", &self.protocol)
-            .field("handle", &self.handle)
-            .finish_non_exhaustive()
-    }
-}
-
 /// A live plugin entry tracked by `UniInner.plugins`.
 ///
 /// Holds the installed plugin object, the lifecycle handle the reload
@@ -532,6 +521,13 @@ pub struct UniInner {
     /// task spawned in `Uni::build` drives this queue; the trigger
     /// router pushes to it on `Defer`.
     pub(crate) defer_queue: Arc<crate::api::triggers::DeferralQueue>,
+    /// WS-E: per-`Uni` EventualConsistency coalescing queue. Buffers
+    /// `FireMode::EventualConsistency` after-phase fires into per-trigger
+    /// buckets and flushes a single coalesced `DeferredItem` per bucket on
+    /// the shared deferral tick. Shared by `Arc` into each commit's
+    /// (ephemeral) `TriggerRouter`, exactly like `defer_queue`; coalesced
+    /// work rides `defer_queue`'s durability, so this needs no sidecar.
+    pub(crate) ec_queue: Arc<crate::api::triggers::EcQueue>,
     /// M11 background-job scheduler host. Owns the
     /// [`uni_plugin::scheduler::Scheduler`] primitive that the
     /// `uni.periodic.*` procedures register jobs against. Driver task
@@ -599,21 +595,6 @@ pub struct UniInner {
     /// typed `UniError::ForkInflightTx` instead of letting the drop
     /// proceed and silently discard the work.
     pub(crate) inflight_tx_count: Arc<AtomicUsize>,
-    /// M6a.3 — registry of active connector lifecycles.
-    ///
-    /// Map key is the `ConnectorHandle.0` returned by
-    /// `Connector::start`. The value carries the protocol name (so
-    /// `stop_connector` can dispatch back to the right
-    /// `Connector::stop` impl) and a shared `Arc<dyn Connector>` so
-    /// the connector trait object stays alive for the duration of
-    /// the lifecycle even if the plugin registry is later swapped
-    /// (the current `PluginRegistry::connectors` returns an `Arc`
-    /// snapshot, so this is mostly belt-and-braces).
-    pub(crate) active_connectors: Arc<DashMap<u64, ActiveConnector>>,
-    /// M6a.3 — monotonically increasing id used to disambiguate
-    /// `ConnectorHandle`s when a plugin returns id=0 for every
-    /// `start` (the trait doesn't require unique ids).
-    pub(crate) next_connector_seq: AtomicU64,
     /// Phase 2 Day 8 cache: same-fork-name `Session::fork(name)` calls
     /// share the same `Arc<UniInner>` so sibling sessions on the same
     /// fork see each other's commits without flushing through Lance
@@ -821,6 +802,7 @@ impl UniInner {
             plugin_registry: self.plugin_registry.clone(),
             plugins: self.plugins.clone(),
             defer_queue: self.defer_queue.clone(),
+            ec_queue: self.ec_queue.clone(),
             scheduler_host: Arc::clone(&self.scheduler_host),
             shutdown_handle: Arc::new(ShutdownHandle::new(Duration::from_secs(30))),
             locy_rule_registry,
@@ -841,8 +823,6 @@ impl UniInner {
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
             inflight_tx_count: Arc::new(AtomicUsize::new(0)),
-            active_connectors: Arc::new(DashMap::new()),
-            next_connector_seq: AtomicU64::new(1),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -2571,106 +2551,6 @@ impl Uni {
         )
     }
 
-    // ── Connector lifecycle (M6a.3) ─────────────────────────────────
-
-    /// Start a registered wire-protocol connector.
-    ///
-    /// Looks up the first [`Connector`] in the plugin registry whose
-    /// `protocol()` matches `protocol`, calls its `start(cfg)` with the
-    /// supplied configuration, and records the returned handle so that
-    /// [`Self::stop_connector`] can later route to the right `stop()`.
-    /// The returned `u64` is a host-side handle that disambiguates
-    /// connectors that all return the same plugin-side
-    /// `ConnectorHandle(0)`; pass it back to [`Self::stop_connector`]
-    /// to shut the connector down.
-    ///
-    /// # Errors
-    ///
-    /// - [`UniError::NotFound`] if no registered connector advertises
-    ///   `protocol`.
-    /// - [`UniError::Internal`] (wrapping the connector's `FnError`) if
-    ///   `Connector::start` itself fails.
-    ///
-    /// [`Connector`]: uni_plugin::traits::connector::Connector
-    pub fn start_connector(
-        &self,
-        protocol: &str,
-        config: uni_plugin::traits::connector::ConnectorConfig,
-    ) -> Result<u64> {
-        let connectors = self.inner.plugin_registry.connectors();
-        let connector = connectors
-            .iter()
-            .find(|c| c.protocol() == protocol)
-            .ok_or_else(|| UniError::InvalidArgument {
-                arg: "protocol".to_owned(),
-                message: format!("no connector registered for protocol `{protocol}`"),
-            })?;
-        let plugin_handle = connector.start(config).map_err(|e| {
-            UniError::Internal(anyhow::anyhow!(
-                "connector `{protocol}` start failed (code={}): {}",
-                e.code,
-                e.message
-            ))
-        })?;
-        let host_handle = self.inner.next_connector_seq.fetch_add(1, Ordering::SeqCst);
-        self.inner.active_connectors.insert(
-            host_handle,
-            ActiveConnector {
-                protocol: protocol.to_owned(),
-                handle: plugin_handle,
-                connector: Arc::clone(connector),
-            },
-        );
-        Ok(host_handle)
-    }
-
-    /// Stop a previously-started connector by its host handle.
-    ///
-    /// Removes the connector from the active map and calls
-    /// `Connector::stop()` on the trait object recorded at start time.
-    /// Stopping a handle that was never recorded — or that was already
-    /// stopped — returns [`UniError::NotFound`].
-    ///
-    /// # Errors
-    ///
-    /// - [`UniError::NotFound`] if `host_handle` does not name an
-    ///   active connector.
-    /// - [`UniError::Internal`] (wrapping the connector's `FnError`)
-    ///   if `Connector::stop` itself fails. The entry is removed from
-    ///   the active map regardless — `stop` is expected to be
-    ///   idempotent host-side.
-    pub fn stop_connector(&self, host_handle: u64) -> Result<()> {
-        let (_, active) = self
-            .inner
-            .active_connectors
-            .remove(&host_handle)
-            .ok_or_else(|| UniError::InvalidArgument {
-                arg: "host_handle".to_owned(),
-                message: format!("no active connector with handle {host_handle}"),
-            })?;
-        active.connector.stop(active.handle).map_err(|e| {
-            UniError::Internal(anyhow::anyhow!(
-                "connector `{}` stop failed (code={}): {}",
-                active.protocol,
-                e.code,
-                e.message
-            ))
-        })
-    }
-
-    /// Snapshot the active-connector map for diagnostics.
-    ///
-    /// Returns `(host_handle, protocol)` pairs for every connector
-    /// currently running on this `Uni` instance. Order is unspecified.
-    #[must_use]
-    pub fn active_connectors(&self) -> Vec<(u64, String)> {
-        self.inner
-            .active_connectors
-            .iter()
-            .map(|kv| (*kv.key(), kv.value().protocol.clone()))
-            .collect()
-    }
-
     /// Get schema manager.
     #[doc(hidden)]
     pub fn schema_manager(&self) -> Arc<SchemaManager> {
@@ -3290,7 +3170,7 @@ impl UniBuilder {
             .as_ref()
             .map(Self::cloud_config_to_lancedb_storage_options);
 
-        let storage = if is_hybrid || is_remote_uri {
+        let mut storage = if is_hybrid || is_remote_uri {
             // Preserve explicit cloud settings (endpoint, credentials, path style)
             // by reusing the constructed remote store.
             StorageManager::new_with_store_and_storage_options(
@@ -3313,22 +3193,17 @@ impl UniBuilder {
             .map_err(UniError::Internal)?
         };
 
-        let storage = Arc::new(storage);
-
-        // Create shutdown handle
-        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
-
-        // Start background compaction with shutdown signal
-        let compaction_handle = storage
-            .clone()
-            .start_background_compaction(shutdown_handle.subscribe());
-        shutdown_handle.track_task(compaction_handle);
-
         // Plugin registry is built early so `PropertyManager` can
         // share it for registry-dispatched CRDT merges. Built-ins are
         // registered against this same Arc below; the registry is
         // shared by-reference, so the registrations are visible to
         // every later consumer.
+        //
+        // Built BEFORE the StorageManager is wrapped in `Arc` so the same
+        // registry can be stamped onto it via `set_plugin_registry`, wiring
+        // the durable CRDT merge paths (compaction, L0 flush) to the same
+        // provider set that governs `PropertyManager`. Behavior-preserving
+        // when no `CrdtKindProvider` is registered (native `try_merge`).
         let plugin_registry = Arc::new(uni_plugin::PluginRegistry::new());
         // M11 A.2: pass the data directory so `SystemLabelPersistence`
         // can be wired as the meta-plugin persistence backend. Remote /
@@ -3344,6 +3219,22 @@ impl UniBuilder {
             register_builtin_plugins(&plugin_registry, persistence_data_path.as_deref()).expect(
                 "BuiltinPlugin / ApocCorePlugin registration must succeed against fresh registry",
             );
+
+        // Stamp the registry onto the owned StorageManager (before it is
+        // shared) so compaction and L0 flush route custom CRDT merges through
+        // it, matching the `PropertyManager` wiring below.
+        storage.set_plugin_registry(Arc::clone(&plugin_registry));
+
+        let storage = Arc::new(storage);
+
+        // Create shutdown handle
+        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
+
+        // Start background compaction with shutdown signal
+        let compaction_handle = storage
+            .clone()
+            .start_background_compaction(shutdown_handle.subscribe());
+        shutdown_handle.track_task(compaction_handle);
 
         // Initialize property manager
         let prop_cache_capacity = self.config.cache_size / 1024;
@@ -3760,30 +3651,6 @@ impl UniBuilder {
             df_session_template.clone(),
         );
 
-        // M5i: start every registered Connector once at DB build.
-        // Failures log + continue — connectors are external wire
-        // protocols, not critical paths. Stop hooks fire from
-        // `Uni::shutdown`.
-        {
-            use uni_plugin::traits::connector::ConnectorConfig;
-            let connectors = plugin_registry.connectors();
-            for c in connectors.iter() {
-                let cfg = ConnectorConfig::default();
-                match c.start(cfg) {
-                    Ok(_handle) => {
-                        tracing::debug!(protocol = %c.protocol(), "Connector started");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            protocol = %c.protocol(),
-                            error = %e,
-                            "Connector start failed; continuing without"
-                        );
-                    }
-                }
-            }
-        }
-
         // M11 v1 + FU-5: spawn the deferral-queue tick task. When a
         // local `data_path` is available, use the JSON-sidecar
         // persistence backend (`<data_path>/_system/deferred_triggers.json`)
@@ -3798,6 +3665,17 @@ impl UniBuilder {
         // `add_plugin`s above this point.
         let _restored = defer_queue.load_from_sidecar(&plugin_registry);
 
+        // WS-E: per-`Uni` EventualConsistency coalescing queue. Wired to
+        // the shared `defer_queue` (coalesced fires + back-pressure drains
+        // push there) and configured from the flush knobs. Buckets survive
+        // across per-commit router rebuilds because this `Arc` lives on
+        // `UniInner`.
+        let ec_queue = crate::api::triggers::EcQueue::new(
+            Some(Arc::clone(&defer_queue)),
+            self.config.ec_flush_interval,
+            self.config.ec_flush_threshold,
+        );
+
         // FU-4: spawn the CDC runtime. Snapshots registered CDC
         // providers, resumes each from its last persisted LSN, and
         // forwards every commit notification as a `CdcBatch`.
@@ -3809,12 +3687,18 @@ impl UniBuilder {
         );
         {
             let queue = Arc::clone(&defer_queue);
+            // WS-E: reuse the one 50ms deferral timer to also flush due
+            // EventualConsistency coalescing buckets — no second task.
+            let ec = Arc::clone(&ec_queue);
             let mut shutdown_rx = shutdown_handle.subscribe();
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => { queue.tick(); }
+                        _ = ticker.tick() => {
+                            ec.flush_due(std::time::Instant::now());
+                            queue.tick();
+                        }
                         _ = shutdown_rx.recv() => { break; }
                     }
                 }
@@ -3921,6 +3805,7 @@ impl UniBuilder {
                 plugin_registry,
                 plugins: Arc::new(parking_lot::RwLock::new(HashMap::new())),
                 defer_queue,
+                ec_queue,
                 scheduler_host: Arc::clone(&scheduler_host),
                 shutdown_handle,
                 locy_rule_registry: Arc::new(std::sync::RwLock::new(loaded_locy_registry)),
@@ -3940,8 +3825,6 @@ impl UniBuilder {
                 fork_registry,
                 fork_inners: Arc::new(DashMap::new()),
                 inflight_tx_count: Arc::new(AtomicUsize::new(0)),
-                active_connectors: Arc::new(DashMap::new()),
-                next_connector_seq: AtomicU64::new(1),
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),

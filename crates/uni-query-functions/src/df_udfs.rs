@@ -147,8 +147,14 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
         ctx.register_udf(create_temporal_udf(name));
     }
 
+    // Spatial UDFs: point constructor, distance, and bounding-box containment.
+    for name in &["point", "distance", "point.withinbbox"] {
+        ctx.register_udf(create_spatial_udf(name));
+    }
+
     // Duration and temporal property accessor UDFs
     ctx.register_udf(create_duration_property_udf());
+    ctx.register_udf(create_vector_distance_udf());
     ctx.register_udf(create_temporal_property_udf());
     ctx.register_udf(create_tostring_udf());
     ctx.register_udf(create_cypher_sort_key_udf());
@@ -1431,13 +1437,21 @@ impl ScalarUDFImpl for RangeUdf {
                 let mut current = start;
                 while current <= end {
                     list_builder.values().append_value(current);
-                    current += step;
+                    // checked_add: a range ending at/near i64::MAX must stop, not
+                    // overflow (the interpreted path uses checked_add too).
+                    match current.checked_add(step) {
+                        Some(n) => current = n,
+                        None => break,
+                    }
                 }
             } else if step < 0 && start >= end {
                 let mut current = start;
                 while current >= end {
                     list_builder.values().append_value(current);
-                    current += step;
+                    match current.checked_add(step) {
+                        Some(n) => current = n,
+                        None => break,
+                    }
                 }
             }
             // Else: direction and step are inconsistent -> append an empty list row.
@@ -1801,6 +1815,141 @@ impl ScalarUDFImpl for TemporalUdf {
             crate::datetime::eval_datetime_function(&func_name, val_args).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
             })
+        })
+    }
+}
+
+/// Create a UDF for a Cypher spatial function, delegating to the interpreter.
+///
+/// Handles `point`, `distance`, and `point.withinBBox` by forwarding to
+/// [`eval_spatial_function`](crate::spatial::eval_spatial_function). Registering
+/// these as DataFusion UDFs lets spatial calls run inside DataFusion-planned
+/// queries (e.g. `RETURN distance(a.loc, b.loc)`), not only the row-at-a-time
+/// interpreter path.
+fn create_spatial_udf(name: &str) -> ScalarUDF {
+    ScalarUDF::new_from_impl(SpatialUdf::new(name.to_string()))
+}
+
+#[derive(Debug)]
+struct SpatialUdf {
+    name: String,
+    signature: Signature,
+}
+
+impl SpatialUdf {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(SpatialUdf);
+
+impl ScalarUDFImpl for SpatialUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        match self.name.to_lowercase().as_str() {
+            // distance() returns meters (geographic) or Euclidean units (cartesian).
+            "distance" => Ok(DataType::Float64),
+            // point.withinBBox() is a containment predicate.
+            "point.withinbbox" => Ok(DataType::Boolean),
+            // point() yields a point map, carried through DataFusion via the
+            // CypherValue codec exactly like the temporal constructors.
+            _ => Ok(DataType::LargeBinary),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let func_name = self.name.to_uppercase();
+        let output_type = self.return_type(&[])?;
+        invoke_cypher_udf(args, &output_type, |val_args| {
+            crate::spatial::eval_spatial_function(&func_name, val_args).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
+            })
+        })
+    }
+}
+
+/// Create the `vector_distance` UDF, routing to [`eval_vector_distance`].
+///
+/// Registering it as a DataFusion UDF lets `VECTOR_DISTANCE(a, b[, metric])`
+/// run inside DataFusion-planned queries (e.g. `RETURN VECTOR_DISTANCE(...)`),
+/// not only the row-at-a-time interpreter path. Supports every metric the
+/// evaluator does — `cosine`/`l2`/`dot`/`l1` over dense vectors and
+/// `hamming`/`jaccard` over binary vectors.
+///
+/// [`eval_vector_distance`]: crate::expr_eval::eval_vector_distance
+fn create_vector_distance_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(VectorDistanceUdf::new())
+}
+
+#[derive(Debug)]
+struct VectorDistanceUdf {
+    signature: Signature,
+}
+
+impl VectorDistanceUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(VectorDistanceUdf);
+
+impl ScalarUDFImpl for VectorDistanceUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "vector_distance"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let output_type = DataType::Float64;
+        invoke_cypher_udf(args, &output_type, |val_args| {
+            if val_args.len() < 2 || val_args.len() > 3 {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "vector_distance() requires 2 or 3 arguments".to_string(),
+                ));
+            }
+            let metric = if val_args.len() == 3 {
+                val_args[2].as_str().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "vector_distance() metric must be a string".to_string(),
+                    )
+                })?
+            } else {
+                "cosine"
+            };
+            crate::expr_eval::eval_vector_distance(&val_args[0], &val_args[1], metric).map_err(
+                |e| {
+                    datafusion::error::DataFusionError::Execution(format!("vector_distance(): {e}"))
+                },
+            )
         })
     }
 }
@@ -2953,11 +3102,21 @@ fn encode_sort_key_to_buf(value: &Value, buf: &mut Vec<u8>) {
         Value::Float(f) if f.is_nan() => {} // rank byte 0x09 is sufficient
         Value::Bool(b) => buf.push(if *b { 0x01 } else { 0x00 }),
         Value::Int(i) => {
-            let f = *i as f64;
-            buf.extend_from_slice(&encode_order_preserving_f64(f));
+            // f64 bucket (coarse position, shared with Float so the two
+            // interleave) plus the exact offset of the true integer from that
+            // bucket, which distinguishes i64 values above 2^53 that a bare
+            // `i as f64` cast would collapse to identical bytes.
+            let primary = *i as f64;
+            let int_delta = (*i as i128 - primary as i128) as i64;
+            encode_numeric_payload(primary, int_delta, buf);
         }
         Value::Float(f) => {
-            buf.extend_from_slice(&encode_order_preserving_f64(*f));
+            // Delta 0: an integer exactly representable as this float (incl. all
+            // |i| < 2^53) also yields delta 0, so Int(n) and Float(n.0) produce
+            // byte-identical keys (Cypher `n = n.0`, load-bearing for join-key
+            // unification). The constant tie-break must be present so a Float key
+            // is never a byte-prefix of the matching Int key.
+            encode_numeric_payload(*f, 0, buf);
         }
         Value::String(s) => {
             byte_stuff_terminate(s.as_bytes(), buf);
@@ -3236,6 +3395,20 @@ fn encode_order_preserving_f64(f: f64) -> [u8; 8] {
 fn encode_order_preserving_i64(i: i64) -> [u8; 8] {
     // XOR with sign bit to flip ordering
     ((i as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+/// Appends the unified numeric sort-key payload for rank `0x08` (Int and Float).
+///
+/// Emits an 8-byte order-preserving `primary` f64 bucket followed by an 8-byte
+/// order-preserving `int_delta`. Because round-to-nearest is monotonic, values
+/// in different buckets order correctly by `primary`; within one shared bucket
+/// both operands measure `int_delta` from the same reference, so the tie-break
+/// orders by true value — making the full i64 range exact while Int and Float
+/// still interleave. Both arms MUST emit this identical 16-byte layout so that
+/// `Int(n)` and `Float(n.0)` stay byte-identical (join-key equality).
+fn encode_numeric_payload(primary: f64, int_delta: i64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&encode_order_preserving_f64(primary));
+    buf.extend_from_slice(&encode_order_preserving_i64(int_delta));
 }
 
 /// Order-preserving encoding of i32.
@@ -4028,8 +4201,14 @@ where
             // Helper to extract string from each row (handles Utf8, LargeUtf8, and LargeBinary/CypherValue)
             let extract_string_at = |arr: &dyn Array, idx: usize| -> Option<String> {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                    if str_arr.is_null(idx) {
+                        return None;
+                    }
                     str_arr.value(idx).to_string().into()
                 } else if let Some(str_arr) = arr.as_any().downcast_ref::<LargeStringArray>() {
+                    if str_arr.is_null(idx) {
+                        return None;
+                    }
                     str_arr.value(idx).to_string().into()
                 } else if let Some(bin_arr) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
                     if bin_arr.is_null(idx) {
@@ -4189,6 +4368,21 @@ fn compare_cv_numeric(bytes: &[u8], rhs: f64, op: &BinaryOp) -> Option<bool> {
     compare_f64(lhs, rhs, op)
 }
 
+/// Compare a CypherValue-encoded LHS against an exact `i64` RHS.
+///
+/// The `compare_cv_numeric` int fast-path is exact only if the caller preserves
+/// the RHS integer; passing `rhs as f64` first rounds values above 2^53 before
+/// the compare. When the LHS is itself an int, compare `i64` vs `i64` directly;
+/// only a float LHS falls back to `f64` (where exact-int semantics don't apply).
+fn compare_cv_vs_i64(bytes: &[u8], rhs: i64, op: &BinaryOp) -> Option<bool> {
+    use uni_common::cypher_value_codec::{TAG_INT, TAG_NULL, decode_int, peek_tag};
+    match peek_tag(bytes) {
+        Some(TAG_NULL) => None,
+        Some(TAG_INT) => decode_int(bytes).map(|lhs| apply_comparison_op(lhs.cmp(&rhs), op)),
+        _ => compare_f64(cv_bytes_as_f64(bytes)?, rhs as f64, op),
+    }
+}
+
 /// Fast-path comparison for LargeBinary (CypherValue) vs native Arrow types.
 ///
 /// Returns `Some(ColumnarValue)` if fast path succeeded, `None` to fallback to slow path.
@@ -4223,7 +4417,9 @@ fn try_fast_compare(
                 if lb_arr.is_null(i) || int_arr.is_null(i) {
                     builder.append_null();
                 } else {
-                    match compare_cv_numeric(lb_arr.value(i), int_arr.value(i) as f64, op) {
+                    // Pass the exact i64 (not `as f64`) so an int-vs-int compare
+                    // above 2^53 stays exact. (finding uni-query-functions[14])
+                    match compare_cv_vs_i64(lb_arr.value(i), int_arr.value(i), op) {
                         Some(result) => builder.append_value(result),
                         None => builder.append_null(),
                     }
@@ -6956,7 +7152,12 @@ impl DfAccumulator for CypherSumAccumulator {
                         Some(TAG_INT) => {
                             if let Some(v) = decode_int(bytes) {
                                 self.sum += v as f64;
-                                self.int_sum = self.int_sum.wrapping_add(v);
+                                // On i64 overflow, drop the exact-int path so the
+                                // result is the f64 sum, not a silent wraparound.
+                                match self.int_sum.checked_add(v) {
+                                    Some(s) => self.int_sum = s,
+                                    None => self.all_ints = false,
+                                }
                                 self.has_value = true;
                             }
                         }
@@ -6974,7 +7175,10 @@ impl DfAccumulator for CypherSumAccumulator {
                     let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
                     let v = a.value(i);
                     self.sum += v as f64;
-                    self.int_sum = self.int_sum.wrapping_add(v);
+                    match self.int_sum.checked_add(v) {
+                        Some(s) => self.int_sum = s,
+                        None => self.all_ints = false,
+                    }
                     self.has_value = true;
                 }
                 DataType::Float64 => {
@@ -7019,7 +7223,10 @@ impl DfAccumulator for CypherSumAccumulator {
         for i in 0..sum_arr.len() {
             if !has_value_arr.is_null(i) && has_value_arr.value(i) {
                 self.sum += sum_arr.value(i);
-                self.int_sum = self.int_sum.wrapping_add(int_sum_arr.value(i));
+                match self.int_sum.checked_add(int_sum_arr.value(i)) {
+                    Some(s) => self.int_sum = s,
+                    None => self.all_ints = false,
+                }
                 if !all_ints_arr.value(i) {
                     self.all_ints = false;
                 }

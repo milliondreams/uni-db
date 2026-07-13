@@ -16,27 +16,28 @@ use crate::qname::QName;
 use crate::registry::PluginRegistry;
 use crate::surfaces::{
     AggregateSurface, AlgorithmSurface, AppendReg, AuthSurface, AuthzSurface, BackgroundJobSurface,
-    CatalogSurface, CdcSurface, CollationSurface, ConnectorSurface, CrdtSurface,
-    DynPendingRegistration, HookSurface, IndexKindSurface, KeyedUniqueReg, LabelStorageSurface,
-    LocyAggregateSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg,
-    OperatorSurface, OptimizerRuleSurface, PregelSurface, ProcedureSurface, ReplacementScanSurface,
-    ScalarSurface, StorageBackendSurface, TriggerSurface, VersionedReg, WindowSurface,
+    CatalogSurface, CdcSurface, CollationSurface, CrdtSurface, DynPendingRegistration, HookSurface,
+    IndexKindSurface, KeyedUniqueReg, LabelStorageSurface, LocyAggregateSurface,
+    LocyGeneratorSurface, LocyPredicateSurface, LogicalTypeSurface, NamedUniqueReg,
+    OptimizerRuleSurface, ProcedureSurface, ReplacementScanSurface, ScalarSurface, TriggerSurface,
+    VersionedReg, WindowSurface,
 };
 use crate::traits::aggregate::{AggSignature, AggregatePluginFn};
-use crate::traits::algorithm::{AlgorithmProvider, PregelProgramProvider};
+use crate::traits::algorithm::AlgorithmProvider;
 use crate::traits::background::BackgroundJobProvider;
 use crate::traits::catalog::{CatalogProvider, ReplacementScanProvider};
 use crate::traits::cdc::CdcOutputProvider;
 use crate::traits::collation::CollationProvider;
-use crate::traits::connector::{AuthProvider, AuthzPolicy, Connector};
+use crate::traits::connector::{AuthProvider, AuthzPolicy};
 use crate::traits::crdt::{CrdtKind, CrdtKindProvider};
 use crate::traits::hook::SessionHook;
 use crate::traits::index::{IndexKind, IndexKindProvider};
-use crate::traits::locy::{LocyAggregate, LocyPredicate, PredSignature};
-use crate::traits::operator::{OperatorProvider, OptimizerRuleProvider};
+use crate::traits::locy::{
+    GenSignature, LocyAggregate, LocyGenerator, LocyPredicate, PredSignature,
+};
+use crate::traits::operator::OptimizerRuleProvider;
 use crate::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use crate::traits::scalar::{FnSignature, ScalarPluginFn};
-use crate::traits::storage::StorageBackend;
 use crate::traits::trigger::TriggerPlugin;
 use crate::traits::types::LogicalTypeProvider;
 use crate::traits::window::{WindowPluginFn, WindowSignature};
@@ -279,22 +280,23 @@ impl<'a> PluginRegistrar<'a> {
         Ok(self)
     }
 
-    /// Register a physical operator.
+    /// Register a Locy generator predicate (table-valued, binds 1:N variables).
     ///
     /// # Errors
     ///
-    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::Operator`] is absent.
-    pub fn operator(
+    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::LocyGenerator`] is absent.
+    pub fn locy_generator(
         &mut self,
         qname: QName,
-        p: Arc<dyn OperatorProvider>,
+        sig: GenSignature,
+        p: Arc<dyn LocyGenerator>,
     ) -> Result<&mut Self, PluginError> {
-        self.require(&Capability::Operator)?;
+        self.require(&Capability::LocyGenerator)?;
         self.validate_qname(&qname)?;
         self.pending
-            .push(Box::new(NamedUniqueReg::<OperatorSurface> {
+            .push(Box::new(NamedUniqueReg::<LocyGeneratorSurface> {
                 q: qname,
-                sig: (),
+                sig,
                 provider: p,
             }));
         Ok(self)
@@ -334,31 +336,10 @@ impl<'a> PluginRegistrar<'a> {
         Ok(self)
     }
 
-    /// Register a storage backend by URI scheme.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::Storage`] is absent.
-    pub fn storage_backend(
-        &mut self,
-        scheme: &'static str,
-        b: Arc<dyn StorageBackend>,
-    ) -> Result<&mut Self, PluginError> {
-        self.require(&Capability::Storage)?;
-        self.pending
-            .push(Box::new(KeyedUniqueReg::<StorageBackendSurface> {
-                key_override: Some(SmolStr::new(scheme)),
-                provider: b,
-            }));
-        Ok(self)
-    }
-
     /// Register a per-label plugin storage (M5h.2).
     ///
     /// Native-schema label scans for `label` will be routed through
-    /// `storage` instead of the host's native backend. Distinct from
-    /// [`Self::storage_backend`], which is keyed by URI scheme and
-    /// opens new `Storage` instances on demand.
+    /// `storage` instead of the host's native backend.
     ///
     /// # Errors
     ///
@@ -390,32 +371,21 @@ impl<'a> PluginRegistrar<'a> {
     ) -> Result<&mut Self, PluginError> {
         self.require(&Capability::Algorithm)?;
         self.validate_qname(&qname)?;
+        // Slice-version negotiation (proposal §4.3 / D6): refuse at load time if
+        // the algorithm declares a capability slice/version the host does not
+        // implement, rather than trapping later on an unknown kernel op.
+        p.signature()
+            .check_slices(crate::traits::algorithm::HOST_CAPABILITY_SLICES)
+            .map_err(|e| PluginError::SliceUnavailable(e.message))?;
+        // Snapshot the effective caps so the stored entry can gate host
+        // graph access (e.g. `HostQuery`) at CALL time.
+        let effective_caps = self.effective_caps.clone();
         self.pending
             .push(Box::new(NamedUniqueReg::<AlgorithmSurface> {
                 q: qname,
-                sig: (),
+                sig: effective_caps,
                 provider: p,
             }));
-        Ok(self)
-    }
-
-    /// Register a Pregel-style algorithm.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::Algorithm`] is absent.
-    pub fn pregel(
-        &mut self,
-        qname: QName,
-        p: Arc<dyn PregelProgramProvider>,
-    ) -> Result<&mut Self, PluginError> {
-        self.require(&Capability::Algorithm)?;
-        self.validate_qname(&qname)?;
-        self.pending.push(Box::new(NamedUniqueReg::<PregelSurface> {
-            q: qname,
-            sig: (),
-            provider: p,
-        }));
         Ok(self)
     }
 
@@ -488,18 +458,6 @@ impl<'a> PluginRegistrar<'a> {
         self.require(&Capability::Authz)?;
         self.pending
             .push(Box::new(AppendReg::<AuthzSurface> { provider: p }));
-        Ok(self)
-    }
-
-    /// Register a wire-protocol connector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PluginError::CapabilityRequired`] if [`Capability::Connector`] is absent.
-    pub fn connector(&mut self, c: Arc<dyn Connector>) -> Result<&mut Self, PluginError> {
-        self.require(&Capability::Connector)?;
-        self.pending
-            .push(Box::new(AppendReg::<ConnectorSurface> { provider: c }));
         Ok(self)
     }
 

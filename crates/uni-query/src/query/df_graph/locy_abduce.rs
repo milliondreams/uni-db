@@ -200,11 +200,26 @@ fn extract_edge_candidates(
     candidates: &mut Vec<Modification>,
 ) {
     let mut source_var = String::new();
+    // Index (into `candidates`) of the RemoveEdge awaiting its target node — the
+    // node that follows the relationship we just pushed. Using this per-hop index
+    // (not `candidates.last_mut()`) attributes each hop's target to ITS OWN edge,
+    // so a multi-hop path `(a)-[:R1]->(b)-[:R2]->(c)` yields (a,b),(b,c) instead of
+    // an empty first target and a (b,b) self-loop on the last edge.
+    let mut pending_target: Option<usize> = None;
     for element in &path.elements {
         match element {
             PatternElement::Node(node) => {
                 if let Some(var) = &node.variable {
+                    if let Some(idx) = pending_target.take()
+                        && let Some(Modification::RemoveEdge { target_var, .. }) =
+                            candidates.get_mut(idx)
+                        && target_var.is_empty()
+                    {
+                        *target_var = var.clone();
+                    }
                     source_var = var.clone();
+                } else {
+                    pending_target = None;
                 }
             }
             PatternElement::Relationship(rel) => {
@@ -221,27 +236,9 @@ fn extract_edge_candidates(
                     edge_type,
                     match_properties,
                 });
+                pending_target = Some(candidates.len() - 1);
             }
             _ => {}
-        }
-    }
-
-    // Fix up target_var
-    let mut prev_was_rel = false;
-    for element in &path.elements {
-        if prev_was_rel {
-            if let PatternElement::Node(node) = element
-                && let Some(var) = &node.variable
-                && let Some(c) = candidates.last_mut()
-                && let Modification::RemoveEdge { target_var, .. } = c
-                && target_var.is_empty()
-            {
-                *target_var = var.clone();
-            }
-            prev_was_rel = false;
-        }
-        if matches!(element, PatternElement::Relationship(_)) {
-            prev_was_rel = true;
         }
     }
 }
@@ -252,11 +249,23 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
     for clause in &rule.clauses {
         for path in &clause.match_pattern.paths {
             let mut source_var = String::new();
+            // Per-hop target index (see extract_edge_candidates) — attributes each
+            // edge's target to ITS OWN AddEdge, not `candidates.last_mut()`.
+            let mut pending_target: Option<usize> = None;
             for element in &path.elements {
                 match element {
                     PatternElement::Node(node) => {
                         if let Some(var) = &node.variable {
+                            if let Some(idx) = pending_target.take()
+                                && let Some(Modification::AddEdge { target_var, .. }) =
+                                    candidates.get_mut(idx)
+                                && target_var.is_empty()
+                            {
+                                *target_var = var.clone();
+                            }
                             source_var = var.clone();
+                        } else {
+                            pending_target = None;
                         }
                     }
                     PatternElement::Relationship(rel) => {
@@ -267,26 +276,9 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
                             edge_type,
                             properties: HashMap::new(),
                         });
+                        pending_target = Some(candidates.len() - 1);
                     }
                     _ => {}
-                }
-            }
-            // Fix target_var
-            let mut prev_was_rel = false;
-            for element in &path.elements {
-                if prev_was_rel {
-                    if let PatternElement::Node(node) = element
-                        && let Some(var) = &node.variable
-                        && let Some(c) = candidates.last_mut()
-                        && let Modification::AddEdge { target_var, .. } = c
-                        && target_var.is_empty()
-                    {
-                        *target_var = var.clone();
-                    }
-                    prev_was_rel = false;
-                }
-                if matches!(element, PatternElement::Relationship(_)) {
-                    prev_was_rel = true;
                 }
             }
         }
@@ -368,11 +360,6 @@ fn modification_to_cypher(modification: &Modification) -> Query {
             edge_type,
             match_properties,
         } => {
-            let edge_var_name = if edge_var.is_empty() {
-                "r".to_string()
-            } else {
-                edge_var.clone()
-            };
             let src_var = if source_var.is_empty() {
                 "src".to_string()
             } else {
@@ -382,6 +369,28 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                 "tgt".to_string()
             } else {
                 target_var.clone()
+            };
+            // The rule body's relationship is frequently anonymous (empty
+            // `edge_var`). The edge variable exists only so we can DELETE the
+            // matched relationship, so any name works — EXCEPT one that collides
+            // with an endpoint node variable. A rule body like
+            // `(a)-[:REMEDIATED_BY]->(r:RemediationAction)` has an anonymous edge
+            // and a target node literally named `r`; blindly defaulting the edge
+            // var to `"r"` produced `MATCH (src)-[r:...]->(r) DELETE r`, which the
+            // planner rejects as VariableTypeConflict. Pick a base default that is
+            // unlikely to appear in a rule body, then disambiguate against both
+            // endpoints (covers the case where the rule itself names the edge the
+            // same as an endpoint).
+            let edge_var_name = {
+                let mut candidate = if edge_var.is_empty() {
+                    "_abd_edge".to_string()
+                } else {
+                    edge_var.clone()
+                };
+                while candidate == src_var || candidate == tgt_var {
+                    candidate.push('_');
+                }
+                candidate
             };
 
             let where_conditions: Vec<Expr> = match_properties
@@ -592,5 +601,123 @@ fn compute_cost(modification: &Modification) -> f64 {
         Modification::RemoveEdge { .. } => 1.0,
         Modification::ChangeProperty { .. } => 0.5,
         Modification::AddEdge { .. } => 1.5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract (source_var, edge_var, target_var) from the MATCH path of a
+    /// RemoveEdge query produced by `modification_to_cypher`.
+    fn extract_pattern_vars(query: &Query) -> (String, String, String) {
+        let Query::Single(stmt) = query else {
+            panic!("expected single statement");
+        };
+        let Clause::Match(m) = &stmt.clauses[0] else {
+            panic!("expected MATCH as first clause");
+        };
+        let elems = &m.pattern.paths[0].elements;
+        let mut src = String::new();
+        let mut edge = String::new();
+        let mut tgt = String::new();
+        let mut seen_edge = false;
+        for e in elems {
+            match e {
+                PatternElement::Node(n) => {
+                    let v = n.variable.clone().unwrap_or_default();
+                    if seen_edge {
+                        tgt = v;
+                    } else {
+                        src = v;
+                    }
+                }
+                PatternElement::Relationship(r) => {
+                    edge = r.variable.clone().unwrap_or_default();
+                    seen_edge = true;
+                }
+                _ => {}
+            }
+        }
+        (src, edge, tgt)
+    }
+
+    /// Regression: an anonymous edge in the rule body into a node literally named
+    /// `r` (`(a)-[:REMEDIATED_BY]->(r:RemediationAction)`) must NOT default the
+    /// edge variable to the colliding `"r"`. Previously this produced
+    /// `MATCH (a)-[r:...]->(r) DELETE r`, which the planner rejects with
+    /// `VariableTypeConflict - Variable 'r' already defined as relationship`.
+    #[test]
+    fn remove_edge_anonymous_edge_into_node_named_r_no_var_collision() {
+        let modification = Modification::RemoveEdge {
+            source_var: "a".to_string(),
+            target_var: "r".to_string(),
+            edge_var: String::new(), // anonymous relationship in the rule body
+            edge_type: "REMEDIATED_BY".to_string(),
+            match_properties: HashMap::new(),
+        };
+
+        let query = modification_to_cypher(&modification);
+        let (src, edge, tgt) = extract_pattern_vars(&query);
+
+        assert_eq!(src, "a");
+        assert_eq!(tgt, "r", "target node keeps its rule-body name");
+        assert_ne!(
+            edge, tgt,
+            "edge var must not collide with the target node var (was the bug)"
+        );
+        assert_ne!(
+            edge, src,
+            "edge var must not collide with the source node var"
+        );
+
+        // The DELETE clause must target the (renamed) edge var, not the node.
+        let Query::Single(stmt) = &query else {
+            unreachable!()
+        };
+        let Clause::Delete(d) = &stmt.clauses[1] else {
+            panic!("expected DELETE as second clause");
+        };
+        assert_eq!(
+            d.items,
+            vec![Expr::Variable(edge.clone())],
+            "DELETE must reference the disambiguated edge variable"
+        );
+    }
+
+    /// A named edge that happens to equal an endpoint node var is also
+    /// disambiguated (defense in depth for pathological rule bodies).
+    #[test]
+    fn remove_edge_named_edge_colliding_with_endpoint_is_disambiguated() {
+        let modification = Modification::RemoveEdge {
+            source_var: "x".to_string(),
+            target_var: "e".to_string(),
+            edge_var: "e".to_string(), // collides with target node var
+            edge_type: "R".to_string(),
+            match_properties: HashMap::new(),
+        };
+        let query = modification_to_cypher(&modification);
+        let (src, edge, tgt) = extract_pattern_vars(&query);
+        assert_eq!(src, "x");
+        assert_eq!(tgt, "e");
+        assert_ne!(edge, tgt);
+        assert_ne!(edge, src);
+    }
+
+    /// The common case (distinct named edge) is unchanged.
+    #[test]
+    fn remove_edge_named_edge_preserved() {
+        let modification = Modification::RemoveEdge {
+            source_var: "a".to_string(),
+            target_var: "b".to_string(),
+            edge_var: "rel".to_string(),
+            edge_type: "R".to_string(),
+            match_properties: HashMap::new(),
+        };
+        let query = modification_to_cypher(&modification);
+        let (src, edge, tgt) = extract_pattern_vars(&query);
+        assert_eq!(src, "a");
+        assert_eq!(edge, "rel");
+        assert_eq!(tgt, "b");
     }
 }

@@ -1,0 +1,44 @@
+// uni-db plugin framework — GraphCompute algorithm example world.
+//
+// Mirrors the host's `crates/uni-plugin-wasm/wit/world.wit` package. The
+// `graph-algo-plugin` world below exports both `invoke-scalar` (a stub, so the
+// host's bootstrap pass — which instantiates every component against the scalar
+// world to read `manifest`/`register` — succeeds) and `invoke-algorithm` (the
+// real entry), and imports the capability-gated `host-graph` interface.
+
+package uni:plugin@0.1.0;
+
+interface types {
+    record fn-error {
+        code: u32,
+        message: string,
+        retryable: bool,
+    }
+}
+
+interface host-log {
+    log: func(level: string, message: string);
+}
+
+interface host-graph {
+    use types.{fn-error};
+
+    graph-call: func(req: string) -> result<string, fn-error>;
+}
+
+/// Combined world: export-compatible with the host's `scalar-plugin` world
+/// (for bootstrap) AND its `algorithm-plugin` world (for the invoke path), and
+/// imports `host-graph` for the kernel calls.
+world graph-algo-plugin {
+    use types.{fn-error};
+
+    import host-log;
+    import host-graph;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+    export invoke-scalar: func(qname: string, ipc-bytes: list<u8>)
+        -> result<list<u8>, fn-error>;
+    export invoke-algorithm: func(qname: string, args-ipc: list<u8>)
+        -> result<list<u8>, fn-error>;
+}

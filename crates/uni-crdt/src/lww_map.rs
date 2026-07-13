@@ -28,25 +28,35 @@ impl<K: Hash + Eq + Clone, V: Clone> LWWMap<K, V> {
         Self::default()
     }
 
-    /// A fresh, empty register for a key not yet present. The `-1` timestamp
-    /// sentinel sorts before any real write, so the first `set` always wins.
-    fn empty_register() -> LWWRegister<Option<V>> {
-        LWWRegister::new(None, -1)
-    }
-
     /// Put a key-value pair into the map with a timestamp.
+    ///
+    /// A first write to a key that is not yet present always wins: instead of
+    /// seeding a sentinel-timestamped register (which would reserve part of the
+    /// `i64` range and silently drop writes with sufficiently negative
+    /// timestamps), the register is created directly from this write.
     pub fn put(&mut self, key: K, value: V, timestamp: i64) {
-        let register = self.map.entry(key).or_insert_with(Self::empty_register);
-        register.set(Some(value), timestamp);
+        match self.map.get_mut(&key) {
+            Some(register) => register.set(Some(value), timestamp),
+            None => {
+                self.map
+                    .insert(key, LWWRegister::new(Some(value), timestamp));
+            }
+        }
     }
 
     /// Remove a key from the map with a timestamp (using a tombstone).
+    ///
+    /// As with [`put`](Self::put), a first observation of a key is recorded
+    /// directly from this write, so no sentinel timestamp is reserved and every
+    /// `i64` timestamp behaves correctly.
     pub fn remove(&mut self, key: &K, timestamp: i64) {
-        let register = self
-            .map
-            .entry(key.clone())
-            .or_insert_with(Self::empty_register);
-        register.set(None, timestamp);
+        match self.map.get_mut(key) {
+            Some(register) => register.set(None, timestamp),
+            None => {
+                self.map
+                    .insert(key.clone(), LWWRegister::new(None, timestamp));
+            }
+        }
     }
 
     /// Get the value associated with a key.
@@ -76,11 +86,12 @@ impl<K: Hash + Eq + Clone, V: Clone> LWWMap<K, V> {
 impl<K: Hash + Eq + Clone, V: Clone + Serialize> CrdtMerge for LWWMap<K, V> {
     fn merge(&mut self, other: &Self) {
         for (key, other_register) in &other.map {
-            let register = self
-                .map
-                .entry(key.clone())
-                .or_insert_with(Self::empty_register);
-            register.merge(other_register);
+            match self.map.get_mut(key) {
+                Some(register) => register.merge(other_register),
+                None => {
+                    self.map.insert(key.clone(), other_register.clone());
+                }
+            }
         }
     }
 }

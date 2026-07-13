@@ -177,6 +177,145 @@ async fn test_fts_auto_build_on_create_index() -> Result<()> {
     Ok(())
 }
 
+/// A CREATE FULLTEXT INDEX with an English stemmer + stop-word removal must
+/// honor the analyzer: `run` matches the inflections `running`/`runs` (Snowball
+/// folds them to the `run` stem) but not the unrelated `walking`, and the stop
+/// word `the` matches nothing (it is dropped at index + query time).
+///
+/// Note: `ran` is an irregular form the algorithmic stemmer does not fold, so it
+/// is intentionally absent from the corpus.
+#[tokio::test]
+async fn test_fts_analyzer_stemming_and_stopwords() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempdir()?;
+    let path = dir.path();
+
+    let schema_manager =
+        uni_db::core::schema::SchemaManager::load(&path.join("schema.json")).await?;
+    schema_manager.add_label("Doc")?;
+    schema_manager.add_property("Doc", "title", DataType::String, false)?;
+    schema_manager.add_property("Doc", "content", DataType::String, false)?;
+    schema_manager.save().await?;
+
+    let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Doc { title: "A", content: "running fast every morning" })"#)
+        .await?;
+    tx.execute(r#"CREATE (:Doc { title: "B", content: "she runs a marathon" })"#)
+        .await?;
+    tx.execute(r#"CREATE (:Doc { title: "C", content: "walking to the store" })"#)
+        .await?;
+    tx.execute(r#"CREATE (:Doc { title: "D", content: "the quick brown fox" })"#)
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // English analyzer with stemming + built-in stop words.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content] \
+         OPTIONS { analyzer: 'standard', language: 'english', stemmer: true, stopwords: true }",
+    )
+    .await?;
+    tx.commit().await?;
+
+    // Stemming: 'run' should match running (A) and runs (B) but not walking (C).
+    let results = db
+        .session()
+        .query(
+            "CALL uni.fts.query('Doc', 'content', 'run', 10) \
+             YIELD node RETURN node.title AS title ORDER BY title",
+        )
+        .await?;
+    let titles: Vec<String> = results
+        .rows()
+        .iter()
+        .map(|r| r.get::<String>("title").unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["A".to_string(), "B".to_string()],
+        "English stemmer should match running/runs for query 'run'; got {titles:?}"
+    );
+
+    // Stop word: 'the' is removed, so it matches nothing.
+    let results = db
+        .session()
+        .query(
+            "CALL uni.fts.query('Doc', 'content', 'the', 10) \
+             YIELD node RETURN node.title AS title",
+        )
+        .await?;
+    assert_eq!(
+        results.len(),
+        0,
+        "stop word 'the' should be dropped and match nothing; got {} rows",
+        results.len()
+    );
+
+    Ok(())
+}
+
+/// A full-text index built with a custom analyzer must keep honoring that
+/// analyzer after the database is reopened (the tokenizer config is persisted
+/// with the index definition).
+#[tokio::test]
+async fn test_fts_analyzer_persists_across_reopen() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempdir()?;
+    let path = dir.path();
+    let path_str = path.to_str().unwrap().to_string();
+
+    {
+        let schema_manager =
+            uni_db::core::schema::SchemaManager::load(&path.join("schema.json")).await?;
+        schema_manager.add_label("Doc")?;
+        schema_manager.add_property("Doc", "title", DataType::String, false)?;
+        schema_manager.add_property("Doc", "content", DataType::String, false)?;
+        schema_manager.save().await?;
+
+        let db = uni_db::Uni::open(&path_str).build().await?;
+        let tx = db.session().tx().await?;
+        tx.execute(r#"CREATE (:Doc { title: "A", content: "jumping over fences" })"#)
+            .await?;
+        tx.commit().await?;
+        db.flush().await?;
+
+        let tx = db.session().tx().await?;
+        tx.execute(
+            "CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content] \
+             OPTIONS { analyzer: 'standard', language: 'english', stemmer: true }",
+        )
+        .await?;
+        tx.commit().await?;
+    }
+
+    // Reopen the database.
+    let db = uni_db::Uni::open(&path_str).build().await?;
+
+    // Stemmed match still works: 'jump' matches 'jumping'.
+    let results = db
+        .session()
+        .query(
+            "CALL uni.fts.query('Doc', 'content', 'jump', 10) \
+             YIELD node RETURN node.title AS title",
+        )
+        .await?;
+    assert_eq!(
+        results.len(),
+        1,
+        "stemming analyzer should persist across reopen; got {} rows",
+        results.len()
+    );
+    let title: String = results.rows()[0].get("title")?;
+    assert_eq!(title, "A");
+
+    Ok(())
+}
+
 /// FTS queries must see unflushed L0 writes and respect L0 tombstones.
 #[tokio::test]
 async fn test_fts_query_sees_l0_writes() -> Result<()> {

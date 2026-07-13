@@ -135,20 +135,24 @@ impl Algorithm for BidirectionalDijkstra {
                     // GraphProjection should probably store in_weights if needed.
                     // If no weights, assume 1.0.
                     let weight = if graph.has_weights() {
-                        // TODO: efficiently get weight for v -> u
-                        // Linear scan of v's out_neighbors
-                        let mut w = 1.0;
-                        // This is O(degree), making backward search slower on dense graphs.
-                        // Ideally GraphProjection stores in_weights.
-                        // For now, assume 1.0 or implement scan.
+                        // Resolve the weight of the reverse edge v -> u by scanning
+                        // v's out-neighbors. Parallel edges v -> u may carry
+                        // different weights; the forward search relaxes every
+                        // parallel edge, so the backward search must mirror that by
+                        // taking the MINIMUM weight (not the first match) to avoid
+                        // overestimating dist_bwd and terminating early.
+                        // This is O(degree), making backward search slower on dense
+                        // graphs. Ideally GraphProjection stores in_weights.
+                        let mut w = f64::INFINITY;
                         let neighbors = graph.out_neighbors(v);
                         for (idx, &n) in neighbors.iter().enumerate() {
                             if n == u {
-                                w = graph.out_weight(v, idx);
-                                break;
+                                w = w.min(graph.out_weight(v, idx));
                             }
                         }
-                        w
+                        // No matching out-edge found (should not happen when the
+                        // in-CSR is consistent); fall back to unit weight.
+                        if w.is_infinite() { 1.0 } else { w }
                     } else {
                         1.0
                     };

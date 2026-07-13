@@ -11,11 +11,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use uni_db::{DataType, ModelAliasSpec, ModelTask, QueryResult, Uni, WarmupPolicy};
+use uni_db::{
+    DataType, EmbeddingCfg, IndexType, ModelAliasSpec, ModelTask, QueryResult, Uni, VectorAlgo,
+    VectorIndexCfg, VectorMetric, WarmupPolicy,
+};
 use uni_xervo::runtime::ModelRuntime;
 use uni_xervo::traits::{
-    LoadedModelHandle, ModelInfo, ModelProvider, ProviderCapabilities, ProviderHealth,
-    RerankerModel, ScoredDoc,
+    EmbedResult, EmbeddingModel, LoadedModelHandle, ModelInfo, ModelProvider, ProviderCapabilities,
+    ProviderHealth, RerankerModel, ScoredDoc,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,10 +103,77 @@ fn reranker_spec() -> ModelAliasSpec {
     }
 }
 
+/// Mock embedding model: maps any query text to the fixed 2-dim unit vector
+/// `[1.0, 0.0]`, so query-time auto-embed in `uni.search` produces the same
+/// reference point the doc embeddings are laid out around (Doc1 closest).
+struct FixedEmbedder;
+
+impl ModelInfo for FixedEmbedder {
+    fn model_id(&self) -> &str {
+        "fixed-embedder"
+    }
+}
+
+#[async_trait]
+impl EmbeddingModel for FixedEmbedder {
+    async fn embed(&self, texts: &[&str]) -> uni_xervo::error::Result<EmbedResult> {
+        Ok(EmbedResult {
+            vectors: texts.iter().map(|_| vec![1.0_f32, 0.0]).collect(),
+            usage: None,
+        })
+    }
+
+    fn dimensions(&self) -> u32 {
+        2
+    }
+}
+
+/// Mock provider that creates `FixedEmbedder` instances for the embed task.
+struct MockEmbedderProvider;
+
+#[async_trait]
+impl ModelProvider for MockEmbedderProvider {
+    fn provider_id(&self) -> &'static str {
+        "mock/embedder"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supported_tasks: vec![ModelTask::Embed],
+        }
+    }
+
+    async fn load(&self, _spec: &ModelAliasSpec) -> uni_xervo::error::Result<LoadedModelHandle> {
+        let handle: Arc<dyn EmbeddingModel> = Arc::new(FixedEmbedder);
+        Ok(Arc::new(handle) as LoadedModelHandle)
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Healthy
+    }
+}
+
+fn embedder_spec() -> ModelAliasSpec {
+    ModelAliasSpec {
+        alias: "embed/mock".to_string(),
+        task: ModelTask::Embed,
+        provider_id: "mock/embedder".to_string(),
+        model_id: "fixed-embedder".to_string(),
+        revision: None,
+        warmup: WarmupPolicy::Lazy,
+        required: false,
+        timeout: None,
+        load_timeout: None,
+        retry: None,
+        options: serde_json::json!({}),
+    }
+}
+
 async fn build_mock_runtime() -> Arc<ModelRuntime> {
     ModelRuntime::builder()
         .register_provider(MockRerankerProvider)
-        .catalog(vec![reranker_spec()])
+        .register_provider(MockEmbedderProvider)
+        .catalog(vec![reranker_spec(), embedder_spec()])
         .build()
         .await
         .expect("Failed to build mock runtime")
@@ -126,13 +196,31 @@ async fn setup_db() -> anyhow::Result<Uni> {
 
     let db = Uni::temporary().xervo_runtime(runtime).build().await?;
 
-    // Declare schema with vector property
+    // Declare schema with vector property + a Flat/Cosine index carrying an
+    // embedding config, so `uni.search` can auto-embed a text query against the
+    // `embedding` column. Docs below are created with EXPLICIT embedding vectors,
+    // which the writer preserves (auto-embed only fills an absent target), so the
+    // hand-picked per-doc vectors used by the vector-order tests are unchanged.
     db.schema()
         .label("Doc")
         .property("title", DataType::String)
         .property("content", DataType::String)
         .property("price", DataType::Float)
         .property("embedding", DataType::Vector { dimensions: 2 })
+        .index(
+            "embedding",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::Flat,
+                metric: VectorMetric::Cosine,
+                embedding: Some(EmbeddingCfg {
+                    alias: "embed/mock".to_string(),
+                    source_properties: vec!["content".to_string()],
+                    batch_size: 16,
+                    document_prefix: None,
+                    query_prefix: None,
+                }),
+            }),
+        )
         .apply()
         .await?;
 

@@ -20,3 +20,8 @@ futures = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+arrow-schema = { workspace = true }
+object_store = { workspace = true }

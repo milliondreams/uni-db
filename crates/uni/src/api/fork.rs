@@ -268,10 +268,21 @@ async fn create_fork_2pc(
     // `build_datasets_for_fork` so branches are cut at the fork-point
     // version rather than a re-read live tip.
     let candidate_datasets = fork_candidate_dataset_names(&parent.db.schema.schema());
+    // For a nested fork, resolve the parent's branch name per dataset so the
+    // writer can capture each parent-branch tip under `flush_lock` (the child
+    // branches off that tip, which advances independently of `main`). Empty when
+    // the parent is the primary DB (`fork_scope()` is `None`).
+    let parent_branches: BTreeMap<String, String> = match parent.fork_scope() {
+        Some(scope) => candidate_datasets
+            .iter()
+            .filter_map(|name| scope.branch_for(name).map(|b| (name.clone(), b)))
+            .collect(),
+        None => BTreeMap::new(),
+    };
     let fork_point = if let Some(writer_lock) = &parent.db.writer {
         let writer: &uni_store::Writer = writer_lock.as_ref();
         writer
-            .flush_and_capture_fork_point(&candidate_datasets)
+            .flush_and_capture_fork_point(&candidate_datasets, &parent_branches)
             .await
             .map_err(UniError::Internal)?
     } else {
@@ -340,20 +351,26 @@ async fn create_fork_2pc(
     // collects the dataset list from the *current* schema's labels +
     // edge types. New labels created on a forked session land in
     // Phase 2 (on-the-fly dataset+branch creation).
-    let datasets =
-        match build_datasets_for_fork(parent, fork_id, &fork_point.dataset_versions).await {
-            Ok(ds) => ds,
-            Err(e) => {
-                // Recovery on next boot will roll back the Pending entry
-                // and force-delete any partial branches. We also try a
-                // best-effort rollback here so the state is clean if the
-                // process keeps running.
-                if let Err(rb) = registry.rollback_create(&name).await {
-                    tracing::warn!("rollback after partial create_branch failed: {rb}");
-                }
-                return Err(e);
+    let datasets = match build_datasets_for_fork(
+        parent,
+        fork_id,
+        &fork_point.dataset_versions,
+        &fork_point.parent_branch_versions,
+    )
+    .await
+    {
+        Ok(ds) => ds,
+        Err(e) => {
+            // Recovery on next boot will roll back the Pending entry
+            // and force-delete any partial branches. We also try a
+            // best-effort rollback here so the state is clean if the
+            // process keeps running.
+            if let Err(rb) = registry.rollback_create(&name).await {
+                tracing::warn!("rollback after partial create_branch failed: {rb}");
             }
-        };
+            return Err(e);
+        }
+    };
 
     // Step 4: promote to Active with the full datasets map.
     let active = registry.finish_create(&name, datasets).await?;
@@ -414,6 +431,7 @@ async fn build_datasets_for_fork(
     parent: &Session,
     fork_id: ForkId,
     captured_versions: &BTreeMap<String, u64>,
+    parent_branch_versions: &BTreeMap<String, u64>,
 ) -> Result<BTreeMap<String, String>> {
     let schema = parent.db.schema.schema();
     let storage_uri = parent.db.storage.base_uri().to_string();
@@ -447,15 +465,25 @@ async fn build_datasets_for_fork(
                 .and_then(|s| s.branch_for(&dataset_name))
             {
                 Some(parent_branch) => {
-                    // Nested fork: branch off the parent fork's branch tip.
-                    let parent_v =
-                        lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
-                            .await
-                            .map_err(|e| UniError::ForkLifecycle {
-                                name: format!("<fork:{fork_id}>"),
-                                stage: "current_version_on_branch",
-                                source: e.into(),
-                            })?;
+                    // Nested fork: branch off the parent fork's branch tip, at
+                    // the version captured under `flush_lock` (D2) — NOT a re-read
+                    // of the live tip, which a concurrent parent commit+flush
+                    // could have advanced past the fork point. Mirrors the
+                    // primary arm below (captured value + should-never-fire live
+                    // fallback for a dataset that materialized after capture).
+                    fail::fail_point!("nested_fork_before_branch");
+                    let parent_v = match parent_branch_versions.get(&dataset_name) {
+                        Some(v) => *v,
+                        None => {
+                            lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
+                                .await
+                                .map_err(|e| UniError::ForkLifecycle {
+                                    name: format!("<fork:{fork_id}>"),
+                                    stage: "current_version_on_branch",
+                                    source: e.into(),
+                                })?
+                        }
+                    };
                     lance_branch::create_branch_from(
                         &dataset_uri,
                         &branch_name,

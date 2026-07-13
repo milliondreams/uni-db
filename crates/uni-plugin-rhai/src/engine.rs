@@ -76,6 +76,11 @@ pub fn build_engine(effective_caps: &CapabilitySet, host_fns: &RhaiHostFnRegistr
     // Always-available column userdata for vectorized mode.
     crate::columns::register_column_types(&mut engine);
 
+    // Always-available GraphCompute kernel surface. A guest that is never
+    // handed a `GcSession` cannot call any kernel; the capability gate is
+    // enforced host-side at projection time (proposal §4.6).
+    crate::graph_compute::register_graph_compute(&mut engine);
+
     // Register capability-gated host fns.
     for spec in host_fns.iter() {
         let granted = match &spec.required_capability {

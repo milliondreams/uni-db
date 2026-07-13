@@ -26,13 +26,15 @@
 //! - On shutdown the runtime calls `shutdown()` on each stream and
 //!   exits.
 //!
-//! ## v1 limitations
+//! ## Mutation delivery
 //!
-//! `CdcBatch::mutations` ships as an empty single-row `RecordBatch`
-//! today — the LSN advancement, ordering, and checkpoint round-trip
-//! are the parts under test. Filling the batch with the actual
-//! mutation rows uses the same machinery as
-//! `crate::triggers::MutationEvents` and is tracked as a follow-up.
+//! `CdcBatch::mutations` carries the actual committed mutation rows:
+//! the broadcaster pre-materializes the RecordBatch on `CommitNotification`
+//! when at least one `CdcOutputProvider` is registered (FU-4), using the
+//! same machinery as `crate::triggers::MutationEvents`. An empty batch
+//! (matching the canonical event-row schema) is delivered only as a
+//! fallback when a commit carried zero rows or a provider registered
+//! mid-commit (picked up on the next commit).
 
 // Rust guideline compliant
 
@@ -134,6 +136,13 @@ impl CdcCheckpointSidecar {
 struct ActiveStream {
     name: String,
     stream: Box<dyn CdcStream>,
+    /// Set once a `deliver` fails, or the commit broadcaster drops commits
+    /// (`Lagged`), for this stream. A halted stream is never delivered to or
+    /// checkpointed again — its checkpoint therefore stays at the last
+    /// CONTIGUOUS delivered commit rather than silently advancing past the gap.
+    /// There is no redelivery path, so continuing would create a permanent,
+    /// undetectable hole in the CDC feed.
+    halted: bool,
 }
 
 /// Resume `provider` from its persisted LSN and start its stream.
@@ -160,6 +169,7 @@ fn start_stream(
             Some(ActiveStream {
                 name: name.to_owned(),
                 stream,
+                halted: false,
             })
         }
         Err(e) => {
@@ -258,8 +268,11 @@ impl CdcRuntime {
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(
                                 lagged = n,
-                                "CdcRuntime: commit broadcaster lagged",
+                                "CdcRuntime: commit broadcaster lagged; halting all streams \
+                                 (the dropped commits cannot be redelivered, so continuing would \
+                                 leave a silent gap in every feed)",
                             );
+                            runtime_clone.halt_all_streams();
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -275,6 +288,21 @@ impl CdcRuntime {
     #[must_use]
     pub fn active_stream_count(&self) -> usize {
         self.streams.lock().len()
+    }
+
+    /// Number of streams currently halted after a deliver failure or a
+    /// broadcaster lag (for diagnostics + tests).
+    #[must_use]
+    pub fn halted_stream_count(&self) -> usize {
+        self.streams.lock().iter().filter(|s| s.halted).count()
+    }
+
+    /// Halt every active stream — used when the commit broadcaster lagged and
+    /// dropped commits that cannot be redelivered.
+    fn halt_all_streams(&self) {
+        for active in self.streams.lock().iter_mut() {
+            active.halted = true;
+        }
     }
 
     /// Borrow the checkpoint sidecar, if local-disk persistence is
@@ -331,12 +359,20 @@ impl CdcRuntime {
 
         let mut streams = self.streams.lock();
         for active in streams.iter_mut() {
+            // Never deliver to (or checkpoint) a halted stream — its checkpoint
+            // must stay at the last contiguous commit so the gap is visible, not
+            // papered over by a later successful commit.
+            if active.halted {
+                continue;
+            }
             if let Err(e) = active.stream.deliver(&batch) {
                 tracing::warn!(
                     provider = %active.name,
                     error = %e,
-                    "CdcRuntime: deliver failed",
+                    "CdcRuntime: deliver failed; halting stream to avoid a silent feed gap \
+                     (its checkpoint stays at the last delivered commit)",
                 );
+                active.halted = true;
                 continue;
             }
             match active.stream.checkpoint() {

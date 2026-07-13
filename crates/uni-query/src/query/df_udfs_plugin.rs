@@ -162,7 +162,103 @@ pub fn register_plugin_scalar_udfs(
             Arc::clone(&entry),
         )));
     }
+
+    // Locy filter predicates are exposed as boolean-returning scalar UDFs so a
+    // plugin predicate is callable from a rule-body `WHERE` (the columnar
+    // DataFusion filter path). The in-memory Locy eval paths dispatch the same
+    // predicate through `locy_eval::eval_function`; both must resolve or they
+    // diverge. Registered under the same case-folds + dotted name as scalars.
+    for (qname, entry) in plugin_registry.iter_locy_predicates() {
+        let local = qname.local();
+        let lower_local = local.to_lowercase();
+        let upper_local = local.to_uppercase();
+
+        if lower_local != upper_local {
+            ctx.register_udf(ScalarUDF::new_from_impl(PluginPredicateUdf::new(
+                lower_local.clone(),
+                Arc::clone(&entry),
+            )));
+        }
+        ctx.register_udf(ScalarUDF::new_from_impl(PluginPredicateUdf::new(
+            upper_local,
+            Arc::clone(&entry),
+        )));
+        ctx.register_udf(ScalarUDF::new_from_impl(PluginPredicateUdf::new(
+            qname.to_string(),
+            Arc::clone(&entry),
+        )));
+    }
     Ok(())
+}
+
+/// DataFusion adapter exposing a registered [`uni_plugin::traits::locy::LocyPredicate`]
+/// as a boolean-returning scalar UDF for the columnar rule-body `WHERE` path.
+struct PluginPredicateUdf {
+    name: String,
+    entry: Arc<uni_plugin::registry::LocyPredicateEntry>,
+    signature: Signature,
+}
+
+impl PluginPredicateUdf {
+    fn new(name: String, entry: Arc<uni_plugin::registry::LocyPredicateEntry>) -> Self {
+        let volatility = entry.signature.volatility;
+        Self {
+            signature: Signature::new(TypeSignature::VariadicAny, volatility),
+            name,
+            entry,
+        }
+    }
+}
+
+impl std::fmt::Debug for PluginPredicateUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginPredicateUdf")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PartialEq for PluginPredicateUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.signature == other.signature
+    }
+}
+
+impl Eq for PluginPredicateUdf {}
+
+impl Hash for PluginPredicateUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for PluginPredicateUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let rows = args.number_rows;
+        let arr = self
+            .entry
+            .predicate
+            .evaluate(&args.args, rows)
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "plugin predicate `{}` failed: {e}",
+                    self.name
+                ))
+            })?;
+        Ok(ColumnarValue::Array(Arc::new(arr)))
+    }
 }
 
 /// Build a shadow [`uni_plugin::PluginRegistry`] from the pure

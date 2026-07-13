@@ -5,6 +5,60 @@ the workspace version unless an entry is annotated otherwise — the
 workspace stays on `1.3.x` while individual crates publish additive
 v1.4 minor bumps when their ABI grows.
 
+## 3.0.0 — 2026-07-07 — BREAKING: remove dead surfaces + trigger honesty pass
+
+Plugin-framework honesty & subtraction (P0). This release makes the advertised
+plugin API match what the engine actually honors: it **removes four registrable
+but never-dispatched traits**, fixes surfaces that silently did nothing, and
+changes the `TriggerContext` ABI. All breaking changes land under this single
+3.0 tag.
+
+### Removed (BREAKING)
+
+- **`PregelProgramProvider`** (`traits::algorithm`) — a stub trait with no
+  executor; never invoked. Its support types (`PregelSignature`,
+  `AggregationMode`, `ComputeOutcome`, `PregelStats`) are removed too.
+- **`OperatorProvider`** (`traits::operator`) — custom physical operators were
+  never inserted into the planner. `OptimizerRuleProvider` (same module) is
+  **retained** and is the supported planner-extension surface.
+- **Plugin `StorageBackend`** (`traits::storage`) — the scheme-keyed durable
+  backend plugin was never consulted by the storage engine. The per-label
+  `Storage` surface (`label_storage()` / `lookup_label_storage`) is **retained**.
+  (Unrelated: the internal `uni_store::backend::StorageBackend` is a different
+  trait and is unaffected.)
+- **`Connector`** (`traits::connector`) — a lifecycle-only stub with no
+  query-time data path. Also removed: `Capability::Connector`, the
+  `SurfaceKind::Connector` variant, and the public `Uni::start_connector` /
+  `Uni::stop_connector` / `ConnectorLifecycle` API. `AuthProvider` / `AuthzPolicy`
+  (same module) are **retained**. For external data, use the `CatalogProvider` /
+  `ReplacementScanProvider` surfaces instead.
+- The corresponding registrar methods (`pregel`, `operator`, `storage_backend`,
+  `connector`) and `SurfaceKind` variants are removed. The shared capabilities
+  `Capability::{Operator, Storage, Algorithm}` are **retained** (they back the
+  delivered `optimizer_rule` / `label_storage` / `algorithm` surfaces).
+
+### Changed (BREAKING)
+
+- **`TriggerContext` gains an owned `Option<Arc<dyn ProcedureHost>>`** (private
+  field; `with_host()` / `host()` accessors). `TriggerContext::new` is unchanged
+  (host defaults to `None`), so existing `TriggerPlugin` implementors keep
+  compiling, but the struct's shape changed. This enables declared triggers to
+  execute Cypher action bodies.
+- **`FireMode::EventualConsistency` now batches for real** instead of aliasing
+  `Async`. Events coalesce per-trigger and drain via the deferral queue on an
+  interval/size threshold (`UniConfig::ec_flush_interval` / `ec_flush_threshold`).
+
+### Fixed
+
+- **`uni.plugin.declareTrigger` now installs a real, firing `TriggerPlugin`**
+  (AfterCommit/Async v1) instead of a callable procedure that never fired.
+- **Plugin-namespaced Locy `FOLD` aggregates now resolve** (dotted `ns.NAME`).
+- **Custom CRDT merges now route through the registry on the compaction and L0
+  durable paths** (previously bypassed).
+- **FTS indexes now honor tokenizer/analyzer/stemmer/stop-word config**
+  (`TokenizerConfig::Analyzer` + `CREATE FULLTEXT INDEX ... OPTIONS { ... }`).
+- Corrected several stale doc-comments that contradicted the code.
+
 ## 1.9.0 — 2026-06-01 — always-on Ed25519 manifest verification + signing-payload fix (security)
 
 Hardens signed-manifest verification. Two changes, both security-relevant:

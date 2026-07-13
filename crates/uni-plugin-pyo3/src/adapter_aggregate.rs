@@ -263,9 +263,12 @@ impl PluginAccumulator for PyAccumulator {
             let state_obj = match &self.state {
                 Some(s) => s.clone_ref(py),
                 None => {
-                    // Empty accumulator — emit an empty state shape
-                    // (`{}`) so the receiving merge_batch is a no-op.
-                    return Ok(vec![ScalarValue::Utf8(Some("{}".into()))]);
+                    // Empty accumulator — emit a NULL state so the receiving
+                    // `merge_batch` (which skips NULL entries) treats it as a
+                    // genuine no-op. Emitting a non-null `"{}"` here would be
+                    // `json.loads`'ed into `{}` and fed to the user's
+                    // `merge(state, {})`, breaking dict-shaped states.
+                    return Ok(vec![ScalarValue::Utf8(None)]);
                 }
             };
             let json_dumps = py

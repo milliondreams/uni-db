@@ -18,14 +18,23 @@ async fn all_algorithms_registered_in_plugin_registry() {
         .map(|(q, _)| q)
         .collect();
 
-    // Compare against the static registry which is the source of truth
-    // for the 36 algorithms shipped with `uni-algo`.
+    // The plugin registry contains every algorithm from the static
+    // `uni-algo` registry (each registered as both a procedure adapter
+    // and a provider) PLUS seven first-party providers authored directly
+    // against `AlgorithmProvider` / `GraphView` and deliberately absent
+    // from the static registry: `uni.algo.reachability`, `uni.algo.pagerank`,
+    // `uni.algo.sssp` (Pregel), `uni.path.expand`, `uni.algo.gcpagerank`
+    // (the GraphCompute kernel-driven Personalized PageRank),
+    // `uni.algo.gcwalks` (GraphCompute node2vec/DeepWalk walk generation), and
+    // `uni.algo.gcoverlap` (GraphCompute all-pairs neighbourhood overlap).
+    const FIRST_PARTY_PROVIDERS: usize = 7;
     let static_registry = uni_algo::algo::AlgorithmRegistry::new();
-    let expected_count = static_registry.list().len();
+    let expected_count = static_registry.list().len() + FIRST_PARTY_PROVIDERS;
     assert_eq!(
         listed.len(),
         expected_count,
-        "registry must contain exactly {expected_count} algorithms; got {}: {listed:?}",
+        "registry must contain the {} static algorithms plus {FIRST_PARTY_PROVIDERS} first-party providers; got {}: {listed:?}",
+        static_registry.list().len(),
         listed.len()
     );
 
@@ -35,6 +44,14 @@ async fn all_algorithms_registered_in_plugin_registry() {
         assert!(
             registry.algorithm(&qname).is_some(),
             "algorithm {name} (qname {qname:?}) must be registered"
+        );
+    }
+
+    // The provider-only first-party algorithms resolve too.
+    for local in ["algo.reachability", "algo.pagerank", "algo.sssp"] {
+        assert!(
+            registry.algorithm(&QName::new("uni", local)).is_some(),
+            "the first-party uni.{local} provider must be registered"
         );
     }
 }

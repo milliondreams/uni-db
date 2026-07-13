@@ -429,26 +429,35 @@ pub async fn create_vector_index_on_branch(
 /// Used by `fork_index_builder::build_fork_local_index` for the
 /// `FullText` kind.
 ///
+/// `tokenizer` selects the analyzer pipeline (mapped through the shared
+/// `fts_analyzer` mapper). Position postings are not stored for branch indexes.
+///
 /// # Errors
 ///
 /// - The dataset or branch cannot be opened.
 /// - The column type is not text.
+/// - The tokenizer configuration is invalid (bad N-gram bounds, unsupported
+///   stop-word language).
 /// - Object-store IO failures.
 pub async fn create_fts_index_on_branch(
     uri: &str,
     branch: &str,
     column: &str,
     index_name: &str,
+    tokenizer: &uni_common::core::schema::TokenizerConfig,
 ) -> Result<()> {
     use lance::index::DatasetIndexExt;
-    use lance_index::{IndexType, scalar::InvertedIndexParams};
+    use lance_index::IndexType;
 
     let mut on_branch = open_branch(uri, branch).await?;
     // Mirrors `IndexManager::create_fts_index`: uses
     // `IndexType::Inverted` (not Scalar) and `InvertedIndexParams`
     // which carries the required `base_tokenizer` config that
-    // ScalarIndexParams::for_builtin(Inverted) doesn't set.
-    let fts_params = InvertedIndexParams::default();
+    // ScalarIndexParams::for_builtin(Inverted) doesn't set. The tokenizer
+    // config is mapped through the shared `fts_analyzer` mapper so fork-local
+    // FTS honors the same analyzer pipeline as the main index.
+    let fts_params = super::fts_analyzer::to_inverted_params(tokenizer, false)
+        .with_context(|| format!("invalid FTS tokenizer for branch index on column={column}"))?;
     on_branch
         .create_index_builder(&[column], IndexType::Inverted, &fts_params)
         .name(index_name.to_string())

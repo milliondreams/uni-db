@@ -26,13 +26,16 @@ use uni_plugin::capability::SideEffects;
 use uni_plugin::secrets::SecretStore;
 use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
 
+use uni_plugin::traits::algorithm::AlgorithmSignature;
+
 use crate::adapter::RhaiScalarFn;
 use crate::adapter_aggregate::{RhaiAggregateFn, build_agg_signature};
+use crate::adapter_algorithm::RhaiAlgorithm;
 use crate::adapter_procedure::RhaiProcedure;
 use crate::engine::build_engine;
 use crate::error::RhaiError;
 use crate::host_fns::RhaiHostFnRegistry;
-use crate::manifest::{ProcedureEntry, RhaiManifest, compile, parse_manifest};
+use crate::manifest::{AlgorithmEntry, ProcedureEntry, RhaiManifest, compile, parse_manifest};
 use crate::runtime::RhaiPluginRuntime;
 use crate::wire_translate::{build_fn_signature, type_name_to_argtype, type_name_to_datatype};
 
@@ -256,6 +259,18 @@ impl RhaiLoader {
             }
         }
 
+        if effective.contains(&Capability::Algorithm) {
+            for entry in &manifest.algorithms {
+                let sig = build_algorithm_signature(entry)?;
+                let qname = QName::new(plugin_id.as_str(), entry.name.clone());
+                let adapter =
+                    RhaiAlgorithm::new(Arc::clone(&runtime), entry.name.clone(), sig.clone());
+                registrar
+                    .algorithm(qname, Arc::new(adapter))
+                    .map_err(plugin_to_rhai_err)?;
+            }
+        }
+
         Ok(LoadOutcome {
             plugin_id,
             version: manifest.version,
@@ -289,9 +304,15 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
         .yields
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            let dt = type_name_to_datatype(t)?;
-            Ok(Field::new(format!("col{i}"), dt, true))
+        .map(|(i, y)| {
+            let dt = type_name_to_datatype(&y.type_name)?;
+            // Prefer the declared column name so it aligns with the keys the
+            // procedure uses in its returned row maps. Only fall back to a
+            // positional `col{i}` name when the manifest declared none — a
+            // fabricated name would never match a natural-key row map and the
+            // column would silently read all-NULL.
+            let name = y.name.clone().unwrap_or_else(|| format!("col{i}"));
+            Ok(Field::new(name, dt, true))
         })
         .collect::<Result<_, RhaiError>>()?;
 
@@ -317,6 +338,24 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
     })
 }
 
+fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignature, RhaiError> {
+    let output_fields: Vec<Field> = entry
+        .yields
+        .iter()
+        .enumerate()
+        .map(|(i, y)| {
+            let dt = type_name_to_datatype(&y.type_name)?;
+            let name = y.name.clone().unwrap_or_else(|| format!("col{i}"));
+            Ok(Field::new(name, dt, false))
+        })
+        .collect::<Result<_, RhaiError>>()?;
+    Ok(AlgorithmSignature {
+        output_fields,
+        docs: String::new(),
+        ..Default::default()
+    })
+}
+
 fn derive_declared_capabilities(m: &RhaiManifest) -> CapabilitySet {
     let mut set = CapabilitySet::new();
     if !m.scalar_fns.is_empty() {
@@ -327,6 +366,20 @@ fn derive_declared_capabilities(m: &RhaiManifest) -> CapabilitySet {
     }
     if !m.procedures.is_empty() {
         set.insert(Capability::Procedure);
+    }
+    if !m.algorithms.is_empty() {
+        // A GraphCompute algorithm needs three orthogonal grants (proposal
+        // §4.6): `Algorithm` to register the entry, `GraphCompute` for the
+        // kernel surface, and `HostQuery` to project the graph. The Rhai
+        // manifest derives capabilities from entry-kind presence, so declaring
+        // `algorithms:` derives all three; each is still intersected with the
+        // host's grants, so the host retains final control.
+        set.insert(Capability::Algorithm);
+        set.insert(Capability::GraphCompute);
+        set.insert(Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        });
     }
     set
 }

@@ -211,6 +211,7 @@ impl PyPluginLoader {
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.scalar_fns,
+                &manifest.determinism,
             )?
         } else {
             Vec::new()
@@ -221,6 +222,7 @@ impl PyPluginLoader {
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.aggregate_fns,
+                &manifest.determinism,
             )?
         } else {
             Vec::new()
@@ -235,6 +237,14 @@ impl PyPluginLoader {
         } else {
             Vec::new()
         };
+        if effective.contains(&Capability::Algorithm) {
+            register_algorithms(
+                registrar,
+                Arc::clone(&runtime),
+                &resolved_id,
+                &manifest.algorithms,
+            )?;
+        }
 
         Ok(LoadOutcome {
             plugin_id: resolved_id,
@@ -269,11 +279,25 @@ impl PyPluginLoader {
     }
 }
 
+/// Resolve an entry's effective determinism: a per-entry declaration wins, and
+/// the sentinel `"inherit"` (the decorator default) falls back to the
+/// manifest-wide value set via `db.set_determinism(...)`. This is what makes
+/// `set_determinism` observable — without it, entries always kept the decorator
+/// default and the manifest-wide setting was dead.
+fn effective_determinism<'a>(entry_determinism: &'a str, manifest_determinism: &'a str) -> &'a str {
+    if entry_determinism == "inherit" {
+        manifest_determinism
+    } else {
+        entry_determinism
+    }
+}
+
 fn register_scalars(
     registrar: &mut PluginRegistrar<'_>,
     runtime: Arc<PyPluginRuntime>,
     plugin_id: &PluginId,
     entries: &[PyScalarEntry],
+    manifest_determinism: &str,
 ) -> Result<Vec<String>, PyPluginError> {
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -283,10 +307,11 @@ fn register_scalars(
             .map(|t| type_name_to_argtype(t.as_str()))
             .collect::<Result<_, PyPluginError>>()?;
         let returns_type = type_name_to_argtype(entry.returns.as_str())?;
+        let determinism = effective_determinism(entry.determinism.as_str(), manifest_determinism);
         let sig = FnSignature {
             args: args_types,
             returns: returns_type,
-            volatility: determinism_to_volatility(entry.determinism.as_str()),
+            volatility: determinism_to_volatility(determinism),
             null_handling: NullHandling::PropagateNulls,
         };
 
@@ -316,10 +341,12 @@ fn register_aggregates(
     runtime: Arc<PyPluginRuntime>,
     plugin_id: &PluginId,
     entries: &[PyAggregateEntry],
+    manifest_determinism: &str,
 ) -> Result<Vec<String>, PyPluginError> {
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
-        let sig = build_py_agg_signature(&entry.args, &entry.returns, entry.determinism.as_str())
+        let determinism = effective_determinism(entry.determinism.as_str(), manifest_determinism);
+        let sig = build_py_agg_signature(&entry.args, &entry.returns, determinism)
             .map_err(|e| PyPluginError::ManifestInvalid(e.message))?;
         let local_name = entry.name.clone();
         let qname = QName::new(plugin_id.as_str(), local_name.clone());
@@ -447,7 +474,64 @@ fn derive_declared_capabilities(m: &PyManifest) -> CapabilitySet {
     if !m.procedures.is_empty() {
         set.insert(Capability::Procedure);
     }
+    if !m.algorithms.is_empty() {
+        // A GraphCompute algorithm needs three orthogonal grants (proposal
+        // §4.6): `Algorithm` to register, `GraphCompute` for the kernels, and
+        // `HostQuery` to project. Each is intersected with the host's grants.
+        set.insert(Capability::Algorithm);
+        set.insert(Capability::GraphCompute);
+        set.insert(Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        });
+    }
     set
+}
+
+fn register_algorithms(
+    registrar: &mut PluginRegistrar<'_>,
+    runtime: Arc<PyPluginRuntime>,
+    plugin_id: &PluginId,
+    entries: &[crate::manifest::PyAlgorithmEntry],
+) -> Result<Vec<String>, PyPluginError> {
+    use arrow_schema::Field;
+    use uni_plugin::traits::algorithm::AlgorithmSignature;
+
+    let mut registered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Yields are declared `"name:type"` (e.g. `"score:float"`) so the
+        // emitted column and the special `nodeId` column bind by name.
+        let output_fields: Vec<Field> = entry
+            .yields
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let (name, type_name) = match spec.split_once(':') {
+                    Some((n, t)) => (n.trim().to_string(), t.trim()),
+                    None => (format!("col{i}"), spec.as_str()),
+                };
+                let dt = type_name_to_datatype(type_name)?;
+                Ok(Field::new(name, dt, false))
+            })
+            .collect::<Result<_, PyPluginError>>()?;
+        let sig = AlgorithmSignature {
+            output_fields,
+            docs: String::new(),
+            ..Default::default()
+        };
+
+        let local_name = entry.name.clone();
+        let qname = QName::new(plugin_id.as_str(), local_name.clone());
+        let callable = Python::attach(|py| entry.callable.clone_ref(py));
+        runtime.insert(local_name.clone(), callable);
+        let adapter =
+            crate::adapter_algorithm::PyAlgorithm::new(Arc::clone(&runtime), local_name, sig);
+        registrar
+            .algorithm(qname.clone(), Arc::new(adapter))
+            .map_err(PyPluginError::from)?;
+        registered.push(qname.to_string());
+    }
+    Ok(registered)
 }
 
 fn intersect_caps(
@@ -540,8 +624,12 @@ impl PyDecoratorSink {
 
 #[pymethods]
 impl PyDecoratorSink {
-    /// `@db.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism='pure')`
-    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="pure"))]
+    /// `@db.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism='inherit')`
+    ///
+    /// The default `"inherit"` takes the manifest-wide determinism set via
+    /// `db.set_determinism(...)` (itself defaulting to `"pure"`); pass an explicit
+    /// spelling here to override it per entry.
+    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="inherit"))]
     fn scalar_fn(
         &self,
         py: Python<'_>,
@@ -566,7 +654,7 @@ impl PyDecoratorSink {
     /// — the wrapped object MUST be a `dict` with `init`/`accumulate`/
     /// `merge`/`finalize` keys, or a class with those attributes. The
     /// trampoline validates on call.
-    #[pyo3(signature = (name, args, returns, determinism="pure"))]
+    #[pyo3(signature = (name, args, returns, determinism="inherit"))]
     fn aggregate_fn(
         &self,
         py: Python<'_>,
@@ -596,6 +684,19 @@ impl PyDecoratorSink {
         mode: &str,
     ) -> PyResult<Py<PyAny>> {
         make_procedure_trampoline(py, Arc::clone(&self.builder), name, args, yields, mode)
+    }
+
+    /// `@db.algorithm(name, args=[...], yields=[...])` — a GraphCompute algorithm
+    /// whose function receives an injected `GcSession` as its first argument.
+    #[pyo3(signature = (name, args, yields))]
+    fn algorithm(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        yields: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        make_algorithm_trampoline(py, Arc::clone(&self.builder), name, args, yields)
     }
 
     /// `db.set_plugin_id("ai.example.geo")` — overrides the default
@@ -703,6 +804,25 @@ pub fn make_procedure_trampoline(
     Ok(Py::new(py, trampoline)?.into_any())
 }
 
+/// Build an algorithm-fn decorator trampoline (mirrors the procedure one).
+///
+/// # Errors
+/// Returns a `PyErr` if `args`/`yields` cannot be coerced to lists of strings.
+#[doc(hidden)]
+pub fn make_algorithm_trampoline(
+    py: Python<'_>,
+    builder: Arc<ManifestBuilder>,
+    name: String,
+    args: Bound<'_, PyAny>,
+    yields: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let args_vec = extract_args_list(&args)?;
+    let yields_vec = extract_args_list(&yields)?;
+    let trampoline =
+        PyDecoratorTrampoline::new_algorithm(builder, SmolStr::new(&name), args_vec, yields_vec);
+    Ok(Py::new(py, trampoline)?.into_any())
+}
+
 fn extract_args_list(obj: &Bound<'_, PyAny>) -> PyResult<Vec<SmolStr>> {
     // Accept any iterable of strings (list / tuple / generator / ...).
     let mut out = Vec::new();
@@ -737,6 +857,7 @@ enum TrampolineKind {
     Scalar,
     Aggregate,
     Procedure,
+    Algorithm,
 }
 
 impl PyDecoratorTrampoline {
@@ -800,6 +921,25 @@ impl PyDecoratorTrampoline {
             determinism: SmolStr::default(),
         }
     }
+
+    fn new_algorithm(
+        builder: Arc<ManifestBuilder>,
+        name: SmolStr,
+        args: Vec<SmolStr>,
+        yields: Vec<SmolStr>,
+    ) -> Self {
+        Self {
+            kind: TrampolineKind::Algorithm,
+            builder,
+            name,
+            args,
+            yields,
+            returns: SmolStr::default(),
+            mode: SmolStr::default(),
+            vectorized: false,
+            determinism: SmolStr::default(),
+        }
+    }
 }
 
 #[pymethods]
@@ -843,6 +983,15 @@ impl PyDecoratorTrampoline {
                     callable: target.clone_ref(py),
                 };
                 self.builder.push_procedure(entry);
+            }
+            TrampolineKind::Algorithm => {
+                let entry = crate::manifest::PyAlgorithmEntry {
+                    name: self.name.clone(),
+                    args: self.args.clone(),
+                    yields: self.yields.clone(),
+                    callable: target.clone_ref(py),
+                };
+                self.builder.push_algorithm(entry);
             }
         }
         // Decorators must return the wrapped target unchanged so user

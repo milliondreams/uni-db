@@ -1,38 +1,4 @@
-//! Wire-protocol connector plugins.
-
-use crate::errors::FnError;
-
-/// Free-form connector configuration (JSON-encoded).
-#[derive(Clone, Debug, Default)]
-pub struct ConnectorConfig {
-    /// JSON config payload.
-    pub config_json: String,
-}
-
-/// Opaque handle returned by [`Connector::start`].
-#[derive(Clone, Copy, Debug)]
-pub struct ConnectorHandle(pub u64);
-
-/// A wire-protocol connector — Bolt, GraphQL, REST, etc.
-pub trait Connector: Send + Sync {
-    /// Protocol name (`"bolt"`, `"graphql"`, …).
-    fn protocol(&self) -> &str;
-
-    /// Start the connector with the given configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] if the connector cannot start (bind failure,
-    /// missing dependency).
-    fn start(&self, cfg: ConnectorConfig) -> Result<ConnectorHandle, FnError>;
-
-    /// Stop the connector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FnError`] if the shutdown fails.
-    fn stop(&self, handle: ConnectorHandle) -> Result<(), FnError>;
-}
+//! Authentication and authorization plugins.
 
 /// Authentication credentials presented to an `AuthProvider`.
 #[derive(Clone, Debug)]
@@ -108,10 +74,24 @@ pub struct Action {
 }
 
 /// Authorization resource under check.
-#[derive(Clone, Debug)]
+///
+/// `path` is the raw query text (retained for backward compatibility); the
+/// structured fields are extracted from the parsed query so a policy can gate on
+/// vertex labels, relationship types, touched properties, and operations rather
+/// than string-matching the Cypher. Empty structured fields mean "none found" or
+/// "not extracted" — a policy should treat empties conservatively.
+#[derive(Clone, Debug, Default)]
 pub struct Resource {
-    /// Resource path / identifier.
+    /// Raw query text / resource identifier.
     pub path: String,
+    /// Vertex labels the query references.
+    pub labels: Vec<String>,
+    /// Relationship types the query references.
+    pub rel_types: Vec<String>,
+    /// Property keys the query reads or writes.
+    pub properties: Vec<String>,
+    /// Operations the query performs (`"read"`, `"write"`, `"delete"`, …).
+    pub operations: Vec<String>,
 }
 
 /// Authorization decision.

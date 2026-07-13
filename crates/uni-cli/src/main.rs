@@ -136,7 +136,11 @@ async fn main() -> Result<()> {
         }
         Commands::Query { statement, path } => {
             let db = open_db(&path).await?;
-            repl::execute_query(&db, &statement).await;
+            // Exit non-zero when the one-shot query fails, so scripts and CI can
+            // detect failure instead of the previous always-0 exit.
+            if !repl::execute_query(&db, &statement).await {
+                std::process::exit(1);
+            }
         }
         Commands::Repl { path } => {
             let db = open_db(&path).await?;

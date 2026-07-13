@@ -104,7 +104,11 @@ pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniEr
 /// All other executor errors remain `UniError::Query`.
 fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
-    if msg.contains("Query cancelled") {
+    if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
+        UniError::GraphComputeIncomplete {
+            detail: Box::new(detail),
+        }
+    } else if msg.contains("Query cancelled") {
         UniError::Cancelled
     } else if msg.contains("Query timed out") {
         UniError::Query {
@@ -138,7 +142,11 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
 /// [`into_execution_error`] classification minus those two arms.
 fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
-    if msg.contains("TypeError:") {
+    if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
+        UniError::GraphComputeIncomplete {
+            detail: Box::new(detail),
+        }
+    } else if msg.contains("TypeError:") {
         UniError::Type {
             expected: msg,
             actual: String::new(),
@@ -647,8 +655,14 @@ impl crate::api::UniInner {
             });
         }
 
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            // Attach the plugin registry like every other planner construction in
+            // this file — without it plugin-catalog features (virtual-label
+            // resolution, replacement scans, virtual-label write rejection) all
+            // silently no-op, so a config-override query drops catalog rows the
+            // default path returns.
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let logical_plan = uni_query::fuse_create_set(logical_plan);
@@ -753,8 +767,14 @@ impl crate::api::UniInner {
                 .await;
         }
 
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            // Attach the plugin registry like every other planner construction in
+            // this file — without it plugin-catalog features (virtual-label
+            // resolution, replacement scans, virtual-label write rejection) all
+            // silently no-op, so a config-override query drops catalog rows the
+            // default path returns.
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let logical_plan = uni_query::fuse_create_set(logical_plan);

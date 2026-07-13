@@ -31,7 +31,8 @@ use uni_common::api::error::UniError;
 use uni_common::core::fork::{ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta};
 
 use crate::store_utils::{
-    DEFAULT_TIMEOUT, delete_with_timeout, get_with_timeout, list_with_timeout, put_with_timeout,
+    DEFAULT_TIMEOUT, delete_with_timeout, get_with_timeout, is_not_found, list_with_timeout,
+    put_with_timeout,
 };
 
 /// Registry handle.
@@ -168,12 +169,20 @@ impl ForkRegistryHandle {
                     }
                 })?
             }
-            Err(_) => {
-                // Either the registry has never been created or the object
-                // store reports NotFound. Either way, start empty; the
-                // recovery driver in `super::recovery` runs after load
-                // and reconciles any orphaned partial states.
+            Err(e) if is_not_found(&e) => {
+                // The registry has never been created (store reports NotFound).
+                // Only then is an empty registry correct; the recovery driver in
+                // `super::recovery` runs after load and reconciles any orphaned
+                // partial states.
                 ForkRegistryFile::default()
+            }
+            Err(e) => {
+                // A transient/IO failure must NOT be read as "no registry":
+                // starting empty here would let the next mutation persist an
+                // empty registry over the real one, orphaning every existing
+                // fork. Propagate as a lifecycle error per this method's
+                // documented contract.
+                return Err(lifecycle_anyhow("<registry>", "load", e));
             }
         };
 

@@ -47,6 +47,17 @@ pub enum PluginError {
     #[error("plugin requested capability {0:?}; denied by host")]
     CapabilityDenied(Capability),
 
+    /// An algorithm declared a capability slice/version the host lacks.
+    ///
+    /// Raised at load time when a provider's [`AlgorithmSignature::check_slices`]
+    /// finds a requirement the host cannot satisfy, so a version mismatch fails
+    /// registration with a clear message instead of trapping later on an unknown
+    /// kernel op (proposal §4.3 / decision D6).
+    ///
+    /// [`AlgorithmSignature::check_slices`]: crate::traits::algorithm::AlgorithmSignature::check_slices
+    #[error("plugin declared an unavailable capability slice: {0}")]
+    SliceUnavailable(String),
+
     /// Two registrations attempted to claim the same qualified name.
     #[error("duplicate registration for qualified name {0}")]
     DuplicateRegistration(QName),

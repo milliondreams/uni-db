@@ -37,9 +37,10 @@
 //! system label `_DeclaredPlugin`. Writing to that label from inside
 //! a procedure requires write-enabled
 //! [`uni_plugin::traits::procedure::ProcedureHost`] execution, which
-//! does not yet exist (the host's `execute_inner_query` is read-only
-//! and does not bind parameters — see
-//! `crates/uni-query/src/query/executor/procedure_host.rs`).
+//! now exists: `execute_inner_query` binds named parameters and runs
+//! in write mode when the host is constructed with a writer (see
+//! `crates/uni-query/src/query/executor/procedure_host.rs`). The
+//! system-label cutover is therefore unblocked but not yet wired.
 //!
 //! M9 ships persistence behind a [`persistence::Persistence`] trait
 //! with a JSON-sidecar implementation that preserves the exact
@@ -160,6 +161,11 @@ pub struct CustomPlugin {
     /// procedures/triggers are recorded + persisted but no executable
     /// plugin is registered (today's pre-M11 behavior).
     procedure_synthesizer: Option<Arc<dyn ProcedureBodySynthesizer>>,
+    /// Optional synthesizer for declared-trigger bodies (WS-A). Set by
+    /// the host alongside `procedure_synthesizer`. When `None`, declared
+    /// triggers are recorded + persisted but no `TriggerPlugin` is
+    /// registered (record-only, same as procedures without a synthesizer).
+    trigger_synthesizer: Option<Arc<dyn TriggerBodySynthesizer>>,
     manifest: std::sync::OnceLock<uni_plugin::PluginManifest>,
 }
 
@@ -187,6 +193,29 @@ pub trait ProcedureBodySynthesizer: Send + Sync + std::fmt::Debug {
         &self,
         decl: &DeclaredPlugin,
     ) -> Result<Arc<dyn uni_plugin::traits::procedure::ProcedurePlugin>, String>;
+}
+
+/// Host callback that turns a declared-trigger record into an executable
+/// [`uni_plugin::traits::trigger::TriggerPlugin`] (WS-A).
+///
+/// Mirrors [`ProcedureBodySynthesizer`], but the produced plugin lands
+/// in `PluginRegistry::triggers()` (via `PluginRegistrar::trigger`)
+/// instead of as a callable procedure, so the transaction commit-path
+/// router fires it on matching mutations. `uni-db`'s host implements
+/// this using `uni_plugin_host::synthetic_trigger::CypherTriggerSynthesizer`.
+pub trait TriggerBodySynthesizer: Send + Sync + std::fmt::Debug {
+    /// Build a `TriggerPlugin` whose `fire()` runs the Cypher action
+    /// body of `decl` on matching mutation events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a free-form error string on synthesis failure — notably
+    /// a `[SYNC]` event-filter marker, which v1 rejects at declare time
+    /// (synchronous before-commit WRITE actions are unsafe).
+    fn synthesize(
+        &self,
+        decl: &DeclaredPlugin,
+    ) -> Result<Arc<dyn uni_plugin::traits::trigger::TriggerPlugin>, String>;
 }
 
 impl std::fmt::Debug for CustomPlugin {
@@ -233,6 +262,7 @@ impl CustomPlugin {
             registry,
             persistence,
             procedure_synthesizer: None,
+            trigger_synthesizer: None,
             manifest: std::sync::OnceLock::new(),
         })
     }
@@ -250,6 +280,19 @@ impl CustomPlugin {
         synthesizer: Arc<dyn ProcedureBodySynthesizer>,
     ) -> Self {
         self.procedure_synthesizer = Some(synthesizer);
+        self
+    }
+
+    /// Attach a host-side trigger synthesizer so declared triggers
+    /// install executable [`TriggerBodySynthesizer`]-produced
+    /// `TriggerPlugin`s at declare time and on restart (WS-A). Without
+    /// it, declared triggers are recorded + persisted but never fire.
+    #[must_use]
+    pub fn with_trigger_synthesizer(
+        mut self,
+        synthesizer: Arc<dyn TriggerBodySynthesizer>,
+    ) -> Self {
+        self.trigger_synthesizer = Some(synthesizer);
         self
     }
 
@@ -296,7 +339,7 @@ impl CustomPlugin {
                 "aggregate" => {
                     crate::aggregate::install_aggregate_into_registry(&self.registry, &record)
                 }
-                "procedure" | "trigger" => {
+                "procedure" => {
                     // M11 A.3: if the host wired a procedure-body
                     // synthesizer (uni-db installs one at Uni::build
                     // time), use it to register an executable
@@ -304,6 +347,21 @@ impl CustomPlugin {
                     // record-only declaration (pre-M11 behavior).
                     match self.procedure_synthesizer.as_ref() {
                         Some(synth) => procedures::install_synthesized_procedure(
+                            &self.registry,
+                            &record,
+                            synth.as_ref(),
+                        ),
+                        None => continue,
+                    }
+                }
+                "trigger" => {
+                    // WS-A: route trigger kinds through the trigger
+                    // synthesizer so they land in `reg.triggers()` (fired
+                    // by the commit-path router) rather than as a
+                    // callable procedure. Record-only when no synthesizer
+                    // is wired.
+                    match self.trigger_synthesizer.as_ref() {
+                        Some(synth) => procedures::install_synthesized_trigger(
                             &self.registry,
                             &record,
                             synth.as_ref(),
@@ -344,6 +402,9 @@ impl CustomPlugin {
                 Capability::Procedure,
                 Capability::ProcedureWrites,
                 Capability::PluginDeclare,
+                // WS-A — declared triggers register into the trigger
+                // surface, which the registrar gates on `Trigger`.
+                Capability::Trigger,
             ]),
             determinism: Determinism::Nondeterministic,
             side_effects: SideEffects::ReadOnly,
@@ -422,8 +483,8 @@ impl uni_plugin::Plugin for CustomPlugin {
         r.procedure(
             QName::new(Self::ID, "plugin.declareTrigger"),
             procedures::declare_trigger_signature(),
-            std::sync::Arc::new(match self.procedure_synthesizer.as_ref() {
-                Some(synth) => procedures::DeclareTriggerProcedure::new_with_synthesis(
+            std::sync::Arc::new(match self.trigger_synthesizer.as_ref() {
+                Some(synth) => procedures::DeclareTriggerProcedure::new_with_trigger_synthesis(
                     Arc::clone(&self.store),
                     Arc::clone(&self.persistence),
                     Arc::clone(&self.registry),
@@ -766,11 +827,18 @@ pub mod procedures {
                 .drop_declared(&qname)
                 .map_err(|e| FnError::new(0xB01, format!("dropDeclared: {e}")))?;
             if existed {
-                // Remove from registry — bound to the synthetic
-                // plugin id we registered under (the qname's
-                // namespace). `remove_plugin` is idempotent.
+                // Remove ONLY this declared surface from the registry, not the
+                // whole namespace plugin id — sibling declarations (e.g.
+                // `mycorp.f2` when dropping `mycorp.f1`) share that id and must
+                // survive. `remove_named_unique` is idempotent and scoped to the
+                // qname. Also clear uni-cypher's plugin-aggregate hint (idempotent
+                // for functions) so a dropped aggregate stops routing through
+                // aggregate translation.
                 let pid = PluginId::new(declared_plugin_id(&qname));
-                self.registry.remove_plugin(&pid);
+                if let Ok(qn) = QName::parse(&qname) {
+                    self.registry.remove_named_unique(&pid, &qn);
+                }
+                uni_cypher::unregister_plugin_aggregate(&qname);
                 self.persistence
                     .delete(&qname)
                     .map_err(|e| FnError::new(0xB01, format!("dropDeclared persist: {e}")))?;
@@ -845,9 +913,24 @@ pub mod procedures {
                 active: true,
             };
 
+            // A genuine re-declaration is one where THIS store already owned the
+            // qname (checked before we overwrite the store entry below). Only then
+            // do we drop the prior registry entry before re-installing, so
+            // re-registration is not misread as shadowing a native fn. A FIRST
+            // declaration that collides with a native fn sharing the namespace must
+            // NOT remove it — it correctly surfaces as NativeShadow below.
+            let is_redeclare = self.store.get(&qname).is_some();
+
             self.store
                 .declare(record.clone())
                 .map_err(custom_to_fn_err)?;
+
+            if is_redeclare {
+                let pid = uni_plugin::PluginId::new(declared_plugin_id(&qname));
+                if let Ok(qn) = QName::parse(&qname) {
+                    self.registry.remove_named_unique(&pid, &qn);
+                }
+            }
 
             match install_function_into_registry(&self.registry, &record) {
                 Ok(()) => {}
@@ -986,6 +1069,35 @@ pub mod procedures {
         let plugin_id = uni_plugin::PluginId::new(declared_plugin_id(&record.qname));
         let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
         r.procedure(qname, signature, plugin)
+            .map_err(|e| map_plugin_error(e, &record.qname))?;
+        r.commit_to_registry()
+            .map_err(|e| map_plugin_error(e, &record.qname))?;
+        Ok(())
+    }
+
+    /// Install a synthesized trigger (WS-A).
+    ///
+    /// The synthesizer builds a host-side `TriggerPlugin` whose `fire()`
+    /// runs the declared action body via the write-enabled
+    /// `QueryProcedureHost::execute_inner_query`. Unlike
+    /// [`install_synthesized_procedure`], the plugin is registered into
+    /// the registry's **trigger** surface (`PluginRegistrar::trigger`),
+    /// so the transaction commit-path router fires it — it is NOT a
+    /// callable procedure. Requires the plugin id to carry
+    /// [`uni_plugin::Capability::Trigger`] (the registrar's gate).
+    pub(super) fn install_synthesized_trigger(
+        registry: &Arc<PluginRegistry>,
+        record: &DeclaredPlugin,
+        synthesizer: &dyn crate::TriggerBodySynthesizer,
+    ) -> Result<(), CustomError> {
+        let plugin = synthesizer
+            .synthesize(record)
+            .map_err(CustomError::Registration)?;
+        let mut caps = uni_plugin::CapabilitySet::new();
+        caps.insert(uni_plugin::Capability::Trigger);
+        let plugin_id = uni_plugin::PluginId::new(declared_plugin_id(&record.qname));
+        let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
+        r.trigger(plugin)
             .map_err(|e| map_plugin_error(e, &record.qname))?;
         r.commit_to_registry()
             .map_err(|e| map_plugin_error(e, &record.qname))?;
@@ -1184,6 +1296,10 @@ pub mod procedures {
                 registry: Arc<uni_plugin::PluginRegistry>,
                 synthesizer:
                     Option<Arc<dyn crate::ProcedureBodySynthesizer>>,
+                /// WS-A trigger synthesizer, used only by the
+                /// `declareTrigger` variant of this macro.
+                trigger_synthesizer:
+                    Option<Arc<dyn crate::TriggerBodySynthesizer>>,
             }
 
             impl $name {
@@ -1198,12 +1314,13 @@ pub mod procedures {
                         persistence,
                         registry: Arc::new(uni_plugin::PluginRegistry::new()),
                         synthesizer: None,
+                        trigger_synthesizer: None,
                     }
                 }
 
-                /// Construct with a host-supplied synthesizer so
-                /// declarations install executable plugins at
-                /// declare time (M11 A.3).
+                /// Construct with a host-supplied procedure-body
+                /// synthesizer so declarations install executable
+                /// plugins at declare time (M11 A.3).
                 #[must_use]
                 pub fn new_with_synthesis(
                     store: Arc<DeclaredPluginStore>,
@@ -1216,6 +1333,26 @@ pub mod procedures {
                         persistence,
                         registry,
                         synthesizer: Some(synthesizer),
+                        trigger_synthesizer: None,
+                    }
+                }
+
+                /// Construct with a host-supplied trigger-body
+                /// synthesizer so declared triggers install executable
+                /// `TriggerPlugin`s at declare time (WS-A).
+                #[must_use]
+                pub fn new_with_trigger_synthesis(
+                    store: Arc<DeclaredPluginStore>,
+                    persistence: Arc<dyn Persistence>,
+                    registry: Arc<uni_plugin::PluginRegistry>,
+                    trigger_synthesizer: Arc<dyn crate::TriggerBodySynthesizer>,
+                ) -> Self {
+                    Self {
+                        store,
+                        persistence,
+                        registry,
+                        synthesizer: None,
+                        trigger_synthesizer: Some(trigger_synthesizer),
                     }
                 }
             }
@@ -1286,13 +1423,15 @@ pub mod procedures {
                     }
                     let dependencies = parse_deps(args, $field_count - 1)?;
                     let declared_by = principal_id(&ctx);
-                    // `body` mirrors the first positional arg after
-                    // `qname` (position 1), looked up by its signature
-                    // name.
-                    let body = sig_args
-                        .get(1)
-                        .map(|a| a.name.to_string())
-                        .and_then(|key| sig.get(&key))
+                    // `body` mirrors the declared signature's `body`
+                    // argument by NAME, not by a hardcoded position.
+                    // The Cypher body sits at position 1 for
+                    // `declareProcedure` but at position 2 for
+                    // `declareTrigger` (whose position 1 is
+                    // `event_filter`); keying off the name stores the
+                    // real Cypher body in every case.
+                    let body = sig
+                        .get("body")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_owned();
@@ -1308,35 +1447,88 @@ pub mod procedures {
                     self.store
                         .declare(record.clone())
                         .map_err(custom_to_fn_err)?;
-                    self.persistence
-                        .save(&record)
-                        .map_err(|e| FnError::new(0xB30, format!("declare persist: {e}")))?;
-                    // M11 A.3: if the host attached a synthesizer,
-                    // install the executable plugin at declare time
-                    // so subsequent `CALL <qname>(...)` invocations
-                    // dispatch through it.
-                    if let Some(synth) = self.synthesizer.as_ref() {
-                        if let Err(e) = crate::procedures::install_synthesized_procedure(
-                            &self.registry,
-                            &record,
-                            synth.as_ref(),
-                        ) {
-                            // NativeShadow is expected when the qname
-                            // is already taken; downgrade the record
-                            // to inactive but do not fail the
-                            // declaration.
-                            match e {
-                                CustomError::NativeShadow(_) => {
-                                    let mut shadowed = record.clone();
-                                    shadowed.active = false;
-                                    self.store.replace(shadowed.clone());
-                                    let _ = self.persistence.save(&shadowed);
+                    if $kind == "trigger" {
+                        // WS-A: route trigger kinds through the trigger
+                        // synthesizer so they land in `reg.triggers()`
+                        // (fired by the commit-path router) rather than
+                        // as a callable procedure. The synthesizer is
+                        // run BEFORE persisting so an unsupported filter
+                        // (notably `[SYNC]`) never persists a record that
+                        // would fail on restart replay.
+                        match self.trigger_synthesizer.as_ref() {
+                            Some(synth) => {
+                                match crate::procedures::install_synthesized_trigger(
+                                    &self.registry,
+                                    &record,
+                                    synth.as_ref(),
+                                ) {
+                                    Ok(()) => {
+                                        self.persistence.save(&record).map_err(|e| {
+                                            FnError::new(
+                                                0xB30,
+                                                format!("declare persist: {e}"),
+                                            )
+                                        })?;
+                                    }
+                                    // Qname already taken by a native
+                                    // trigger: downgrade to inactive.
+                                    Err(CustomError::NativeShadow(_)) => {
+                                        let mut shadowed = record.clone();
+                                        shadowed.active = false;
+                                        self.store.replace(shadowed.clone());
+                                        let _ = self.persistence.save(&shadowed);
+                                    }
+                                    // Unsupported filter (e.g. `[SYNC]`)
+                                    // or bad body: roll back the
+                                    // in-memory declaration and refuse —
+                                    // nothing is persisted.
+                                    Err(other) => {
+                                        let _ = self.store.drop_declared(&qname);
+                                        return Err(FnError::new(
+                                            0xB31,
+                                            format!("declare trigger synthesize: {other}"),
+                                        ));
+                                    }
                                 }
-                                other => {
-                                    return Err(FnError::new(
-                                        0xB31,
-                                        format!("declare synthesize: {other}"),
-                                    ));
+                            }
+                            None => {
+                                // Record-only (no trigger synthesizer).
+                                self.persistence.save(&record).map_err(|e| {
+                                    FnError::new(0xB30, format!("declare persist: {e}"))
+                                })?;
+                            }
+                        }
+                    } else {
+                        self.persistence.save(&record).map_err(|e| {
+                            FnError::new(0xB30, format!("declare persist: {e}"))
+                        })?;
+                        // M11 A.3: if the host attached a synthesizer,
+                        // install the executable plugin at declare time
+                        // so subsequent `CALL <qname>(...)` invocations
+                        // dispatch through it.
+                        if let Some(synth) = self.synthesizer.as_ref() {
+                            if let Err(e) = crate::procedures::install_synthesized_procedure(
+                                &self.registry,
+                                &record,
+                                synth.as_ref(),
+                            ) {
+                                // NativeShadow is expected when the qname
+                                // is already taken; downgrade the record
+                                // to inactive but do not fail the
+                                // declaration.
+                                match e {
+                                    CustomError::NativeShadow(_) => {
+                                        let mut shadowed = record.clone();
+                                        shadowed.active = false;
+                                        self.store.replace(shadowed.clone());
+                                        let _ = self.persistence.save(&shadowed);
+                                    }
+                                    other => {
+                                        return Err(FnError::new(
+                                            0xB31,
+                                            format!("declare synthesize: {other}"),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -1492,26 +1684,30 @@ impl DeclaredPluginStore {
     /// [`CustomError::DependencyCycle`] if adding this plugin would
     /// introduce a cycle.
     pub fn declare(&self, plugin: DeclaredPlugin) -> Result<(), CustomError> {
-        {
-            let map = self.by_qname.read().expect("declared-plugin lock poisoned");
-            for dep in &plugin.dependencies {
-                if !map.contains_key(dep) {
-                    return Err(CustomError::DependencyMissing {
-                        dependent: plugin.qname.clone(),
-                        dep: dep.clone(),
-                    });
-                }
-            }
-            if would_introduce_cycle(&map, &plugin) {
-                return Err(CustomError::DependencyCycle(chain_starting_at(
-                    &map, &plugin,
-                )));
+        // Validate-and-insert atomically under a single write lock.
+        // Splitting validation (read lock) from insertion (separate
+        // write lock) opens a check-then-act (TOCTOU) window in which
+        // two concurrent declares can each pass validation and then both
+        // commit — persisting a dependency cycle the checks were meant
+        // to reject. Holding the write lock across both steps closes it.
+        let mut map = self
+            .by_qname
+            .write()
+            .expect("declared-plugin lock poisoned");
+        for dep in &plugin.dependencies {
+            if !map.contains_key(dep) {
+                return Err(CustomError::DependencyMissing {
+                    dependent: plugin.qname.clone(),
+                    dep: dep.clone(),
+                });
             }
         }
-        self.by_qname
-            .write()
-            .expect("declared-plugin lock poisoned")
-            .insert(plugin.qname.clone(), plugin);
+        if would_introduce_cycle(&map, &plugin) {
+            return Err(CustomError::DependencyCycle(chain_starting_at(
+                &map, &plugin,
+            )));
+        }
+        map.insert(plugin.qname.clone(), plugin);
         Ok(())
     }
 
@@ -1809,6 +2005,7 @@ mod tests {
             registry: Arc::clone(&registry),
             persistence: Arc::new(NullPersistence),
             procedure_synthesizer: Some(synth.clone()),
+            trigger_synthesizer: None,
             manifest: std::sync::OnceLock::new(),
         };
         plugin
@@ -1842,6 +2039,7 @@ mod tests {
             registry,
             persistence: Arc::new(NullPersistence),
             procedure_synthesizer: None, // no synthesizer
+            trigger_synthesizer: None,
             manifest: std::sync::OnceLock::new(),
         };
         plugin

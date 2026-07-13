@@ -1039,15 +1039,15 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Failed to downcast to UInt64Array"))?;
                 Ok(Value::Int(array.value(row_idx) as i64))
             }
-            _ => {
-                // For other types, try to convert to string
-                let array = column.as_any().downcast_ref::<arrow_array::StringArray>();
-                if let Some(arr) = array {
-                    Ok(Value::String(arr.value(row_idx).to_string()))
-                } else {
-                    Ok(Value::Null)
-                }
-            }
+            // Every other Arrow type (Timestamp, Date32/64, LargeUtf8, Utf8View,
+            // lists, decimals, ...) formerly fell through a StringArray downcast
+            // that failed and returned Null — so COPY FROM silently dropped those
+            // columns. Delegate to the shared, exhaustive arrow->Value decoder.
+            _ => Ok(uni_store::storage::arrow_convert::arrow_to_value(
+                column.as_ref(),
+                row_idx,
+                None,
+            )),
         }
     }
 
@@ -1204,6 +1204,13 @@ impl Executor {
                     .parse::<usize>()
                     .map_err(|_| anyhow!("Invalid vector dimensions: {}", dims_str))?;
                 Ok(DataType::Vector { dimensions })
+            }
+            s if s.starts_with("binary_vector(") && s.ends_with(')') => {
+                let dims_str = &s["binary_vector(".len()..s.len() - 1];
+                let dimensions = dims_str
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("Invalid binary_vector dimensions: {}", dims_str))?;
+                Ok(DataType::BinaryVector { dimensions })
             }
             s if s.starts_with("list<") && s.ends_with('>') => {
                 let inner_type_str = &s[5..s.len() - 1];
@@ -1459,9 +1466,20 @@ impl Executor {
 
     pub(crate) async fn execute_create_constraint(&self, clause: CreateConstraint) -> Result<()> {
         let sm = self.storage.schema_manager_arc();
-        let target = ConstraintTarget::Label(clause.label);
+        // A relationship pattern (`ON ()-[r:TYPE]-()`) targets an edge type; a
+        // node pattern targets a label.
+        let target = if clause.on_relationship {
+            ConstraintTarget::EdgeType(clause.label)
+        } else {
+            ConstraintTarget::Label(clause.label)
+        };
         let c_type = match clause.constraint_type {
-            AstConstraintType::Unique | AstConstraintType::NodeKey => ConstraintType::Unique {
+            AstConstraintType::Unique => ConstraintType::Unique {
+                properties: clause.properties,
+            },
+            // NodeKey keeps its own variant so the write path can enforce the
+            // NOT-NULL half of node-key semantics, not just uniqueness.
+            AstConstraintType::NodeKey => ConstraintType::NodeKey {
                 properties: clause.properties,
             },
             AstConstraintType::Exists => {

@@ -185,8 +185,25 @@ rule_where_clause = { WHERE ~ rule_condition ~ ((AND | ",") ~ rule_condition)* }
 rule_condition = {
     is_not_rule_reference
     | is_rule_reference
+    | generator_reference
     | expression
 }
+
+// ── Generator predicate (1:N, binds new variables) ──────────────────────
+//
+// Form:  name(arg, …) -> (out1, out2)
+//
+// A table-valued rule-body condition: for each input row the named generator
+// emits zero or more tuples, binding the fixed, statically-known output
+// variables `(out1, out2)`. Tried before the bare `expression` arm (a plain
+// `name(args)` with no `-> (…)` is a 1:1 filter predicate that rides
+// `expression`). The `->` after the call is what distinguishes the two.
+generator_reference = {
+    generator_name ~ "(" ~ generator_arg_list? ~ ")" ~ "->" ~ "(" ~ generator_outputs ~ ")"
+}
+generator_name = { locy_identifier ~ ("." ~ locy_identifier)* }
+generator_arg_list = { expression ~ ("," ~ expression)* }
+generator_outputs = { locy_identifier ~ ("," ~ locy_identifier)* }
 
 // ── IS rule reference (positive) ────────────────────────────────────────
 //

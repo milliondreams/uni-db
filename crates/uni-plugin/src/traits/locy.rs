@@ -298,6 +298,56 @@ pub trait LocyPredicate: Send + Sync {
     }
 }
 
+/// A Locy *generator* predicate — a table-valued rule-body condition that binds
+/// new variables (1:N), like a Datomic/Souffle functor.
+///
+/// Where a [`LocyPredicate`] filters rows (1:1 → bool), a generator emits zero or
+/// more output tuples per input row, binding a statically-known, fixed number of
+/// new variables (`GenSignature::outputs`). The host replicates each input row
+/// once per emitted tuple and appends the generated columns.
+pub trait LocyGenerator: Send + Sync {
+    /// Static signature — input arg types and the fixed output-variable types.
+    fn signature(&self) -> &GenSignature;
+
+    /// Generate output tuples for a batch of `rows` input rows.
+    ///
+    /// Returns a [`GeneratorOutput`] whose `columns` (one per output variable,
+    /// in `signature().outputs` order) are parallel to `row_map`, which records
+    /// the input row each output tuple was produced from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FnError`] if generation fails on this input.
+    fn generate(&self, args: &[ColumnarValue], rows: usize) -> Result<GeneratorOutput, FnError>;
+}
+
+/// Static signature of a Locy generator predicate.
+#[derive(Clone, Debug)]
+pub struct GenSignature {
+    /// Input argument types.
+    pub args: Vec<ArgType>,
+    /// Output-variable types. The length is the fixed output arity `K` — it must
+    /// be known at plan time so the fixpoint schema can be widened statically.
+    pub outputs: Vec<ArgType>,
+    /// Volatility.
+    pub volatility: Volatility,
+}
+
+/// Table-valued output of a [`LocyGenerator::generate`] call.
+///
+/// `columns[c]` holds the values of output variable `c` (for every emitted
+/// tuple), and `row_map[i]` is the index of the input row that produced emitted
+/// tuple `i`. All `columns` and `row_map` share the same length (the total number
+/// of emitted tuples), which may be more or fewer than the input row count.
+#[derive(Clone, Debug)]
+pub struct GeneratorOutput {
+    /// For each emitted tuple, the input row index it was generated from.
+    pub row_map: Vec<u32>,
+    /// One array per output variable (in `GenSignature::outputs` order); each has
+    /// length `row_map.len()`.
+    pub columns: Vec<arrow_array::ArrayRef>,
+}
+
 /// Static signature of a Locy predicate.
 #[derive(Clone, Debug)]
 pub struct PredSignature {

@@ -697,6 +697,21 @@ impl<'a> LocyPlanBuilder<'a> {
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
+            // Generator predicates (`name(args) -> (outs)`) bind new variables
+            // 1:N and are resolved by the in-memory SLG engine
+            // (`locy_slg::apply_generators`), not the columnar fixpoint — which has
+            // no row-explosion operator. Skip such rules here so the fixpoint never
+            // plans their generator-bound yield columns (which are not produced by
+            // the MATCH body); QUERY resolution re-derives them through SLG, and
+            // the non-FOLD columnar output would be discarded regardless.
+            let has_generator = rule.clauses.iter().any(|c| {
+                c.where_conditions
+                    .iter()
+                    .any(|cond| matches!(cond, RuleCondition::Generator(_)))
+            });
+            if has_generator {
+                continue;
+            }
             rules.push(self.build_rule(
                 rule,
                 stratum.is_recursive,
@@ -747,6 +762,16 @@ impl<'a> LocyPlanBuilder<'a> {
 
         // All clauses share the same schema; derive metadata from first clause
         let first_clause = rule.clauses.first();
+        // HAVING / BEST BY / FOLD-output metadata must come from the SAME clause
+        // that provides the FOLD (mirroring `fold_bindings` below), not clause 0:
+        // a base clause (no FOLD) followed by a recursive clause with
+        // `FOLD ... HAVING ... BEST BY` would otherwise silently lose its HAVING
+        // filter and BEST BY pruning. Falls back to clause 0 when no clause folds.
+        let fold_clause = rule
+            .clauses
+            .iter()
+            .find(|c| !c.fold.is_empty())
+            .or(first_clause);
 
         // Collect fold bindings from the first clause that has them.
         // A rule may have a base clause (no FOLD) plus recursive clauses (with FOLD);
@@ -795,7 +820,7 @@ impl<'a> LocyPlanBuilder<'a> {
             .map(|(name, alias, _)| (name.clone(), alias.clone()))
             .collect();
 
-        let having = first_clause
+        let having = fold_clause
             .map(|c| {
                 c.having
                     .iter()
@@ -803,7 +828,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let best_by_criteria = first_clause
+        let best_by_criteria = fold_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
                 bb.items
@@ -818,7 +843,7 @@ impl<'a> LocyPlanBuilder<'a> {
             })
             .unwrap_or_default();
 
-        let fold_output_names: HashSet<&str> = first_clause
+        let fold_output_names: HashSet<&str> = fold_clause
             .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
             .unwrap_or_default();
         let along_names: HashSet<&str> = first_clause
@@ -854,6 +879,54 @@ impl<'a> LocyPlanBuilder<'a> {
             })
             .collect();
 
+        // Post-fold YIELD projection specs.
+        //
+        // A YIELD expression that references a FOLD output but is not a bare
+        // fold-output variable (e.g. `total * 2.0 AS score`) cannot be produced
+        // in the pre-fold body — the aggregate does not exist there. Record the
+        // full yield-column projection so it can run POST-fold (`apply_post_fold_
+        // projection`). Only populated when at least one column is such a
+        // computed expression; otherwise the common path is unchanged (FoldExec
+        // output already matches `yield_schema`).
+        let yield_item_exprs: HashMap<String, &Expr> = match first_clause.map(|c| &c.output) {
+            Some(RuleOutput::Yield(yc)) => resolve_yield_column_names(&yc.items)
+                .into_iter()
+                .zip(yc.items.iter())
+                .map(|(name, item)| (name, &item.expr))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        let has_computed_fold_expr = yield_schema.iter().any(|yc| {
+            !yc.is_key
+                && yield_item_exprs.get(&yc.name).is_some_and(|e| {
+                    expr_references_fold_output(e, &fold_output_names)
+                        && !matches!(e, Expr::Variable(v) if fold_output_names.contains(v.as_str()))
+                })
+        });
+        let yield_projection: Vec<(String, Expr)> = if has_computed_fold_expr {
+            yield_schema
+                .iter()
+                .map(|yc| {
+                    // KEY and bare fold-output columns are already present in the
+                    // post-fold batch under their yield name — pass them through.
+                    // Computed expressions over fold outputs are evaluated, with
+                    // fold-var → alias substitution so references match the
+                    // post-fold column names (`FoldBinding.output_name`).
+                    let expr = if yc.is_key {
+                        Expr::Variable(yc.name.clone())
+                    } else {
+                        match yield_item_exprs.get(&yc.name) {
+                            Some(e) => substitute_fold_aliases((*e).clone(), &fold_alias_subs),
+                            None => Expr::Variable(yc.name.clone()),
+                        }
+                    };
+                    (yc.name.clone(), expr)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(LocyRulePlan {
             name: rule.name.clone(),
             clauses,
@@ -862,6 +935,7 @@ impl<'a> LocyPlanBuilder<'a> {
             fold_bindings,
             having,
             best_by_criteria,
+            yield_projection,
         })
     }
 
@@ -1287,21 +1361,22 @@ impl<'a> LocyPlanBuilder<'a> {
         for yc in yield_cols {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
                 rewrite_locy_expr(locy_expr)?
-            } else if let Some(fold_input) = fold_input_map.get(yc.name.as_str()) {
-                // Substitute ALONG names so a FOLD input like
-                // `MNOR(link)` where `link` is an ALONG binding
-                // unfolds to the underlying ALONG expression
-                // (e.g., `e.base * Variable("__model_scorer_0")`).
-                substitute_along_vars((*fold_input).clone(), &rewritten_along)
             } else if fold_output_names.contains(yc.name.as_str()) {
+                // FOLD output column — produced by FoldExec after aggregation.
+                // Its input column is projected separately (see the FOLD-input
+                // pass below) AS the FOLD variable name, independent of any
+                // YIELD alias, so the runtime always resolves it by name.
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
                 let e = (*orig_expr).clone();
                 let e = substitute_along_vars(e, &rewritten_along);
-                // If the resolved expression is a FOLD output variable (e.g.
-                // `n AS support` where n is from FOLD), skip it — FoldExec
-                // will produce this column after fixpoint iteration.
-                if matches!(&e, Expr::Variable(v) if fold_output_names.contains(v.as_str())) {
+                // A YIELD expression that references a FOLD output must NOT be
+                // projected in the pre-fold body: a bare fold-output variable
+                // (`n AS support`) is produced directly by FoldExec, and a
+                // computed expression over fold outputs (`total * 2.0 AS score`)
+                // is produced by the post-fold projection stage. Either way the
+                // aggregate does not exist here yet.
+                if expr_references_fold_output(&e, &fold_output_names) {
                     continue;
                 }
                 e
@@ -1321,6 +1396,41 @@ impl<'a> LocyPlanBuilder<'a> {
                 &along_names_set,
                 rule_catalog,
                 yc.is_key,
+                graph_schema,
+                &var_labels,
+            ));
+        }
+
+        // FOLD-input projection (issue #145 root fix).
+        //
+        // Every aggregate's argument column must be present in the body batch
+        // under the FOLD variable name (`fb.name`) — that is exactly the name
+        // `convert_fold_bindings` records in `FoldBinding::input_col_name` and
+        // the runtime (`FoldExec`, `FixpointExec`) resolves by. Projecting the
+        // input here, keyed on the FOLD variable rather than the YIELD column
+        // name, makes resolution independent of whether YIELD renames the
+        // aggregate (`FOLD total = SUM(e.x) ... YIELD ... total AS sum_out`),
+        // which is the root cause of the silent-zeroing corruption in #145.
+        // The aggregated *output* column (named by the YIELD alias) is produced
+        // later by FoldExec; it must not be projected here.
+        for fb in &clause.fold {
+            let Some(fold_input) = fold_input_map.get(fb.name.as_str()) else {
+                // COUNTALL / COUNT(*) has no input column to carry through.
+                continue;
+            };
+            // Mirror the substitutions the YIELD path applies: inline ALONG
+            // bindings, then rewrite non-first IS-ref value columns.
+            let expr = substitute_along_vars((*fold_input).clone(), &rewritten_along);
+            let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
+            projections.push((expr, Some(fb.name.clone())));
+            target_types.push(infer_yield_type(
+                &fb.name,
+                clause,
+                node_vars,
+                &fold_output_names,
+                &along_names_set,
+                rule_catalog,
+                false, // a FOLD input is never a KEY column
                 graph_schema,
                 &var_labels,
             ));
@@ -1427,8 +1537,18 @@ impl<'a> LocyPlanBuilder<'a> {
         // Wrapping the body with LocyFold here would double-apply the aggregate,
         // producing wrong results for COUNT/AVG where f(f(x)) ≠ f(x).
 
-        // Step 8: BEST BY wrapping
-        if let Some(best_by) = &clause.best_by {
+        // Step 8: BEST BY wrapping.
+        //
+        // Only for non-FOLD clauses. When the clause has a FOLD, BEST BY ranks on
+        // the *aggregated* value and must run POST-fold — which the rule-level
+        // pipeline already does (`merge_best_by` during fixpoint and the post-
+        // fixpoint chain in `locy_fixpoint.rs`, using the alias-substituted
+        // criteria). Wrapping the pre-fold body here would instead rank the raw
+        // per-row input column, pruning rows before aggregation and corrupting
+        // the result (and, for a renamed aggregate, referencing a column that
+        // only exists pre-fold). There is no sensible pre-fold reading of
+        // "best by an aggregate", so skip it for FOLD clauses.
+        if let Some(best_by) = clause.best_by.as_ref().filter(|_| clause.fold.is_empty()) {
             let key_columns: Vec<String> = yield_cols
                 .iter()
                 .filter(|yc| yc.is_key)
@@ -1776,27 +1896,25 @@ fn rewrite_is_ref_cols(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
     }
 }
 
-/// Recursively substitute `Variable(name)` nodes matching ALONG binding names
-/// with their rewritten expressions. This allows YIELD expressions like
-/// `ew * 2.0 AS score` to reference ALONG bindings (`ALONG ew = e.weight`)
-/// by inlining the underlying expression (`e.weight * 2.0`).
-fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
-    if along.is_empty() {
-        return expr;
-    }
+/// Exhaustively rewrite `Variable` nodes in an expression tree.
+///
+/// At each `Variable(name)`, replaces the node with `f(name)` when that returns
+/// `Some`, leaving it unchanged otherwise. This is the single source of truth for
+/// variable substitution in Locy planning: the ALONG-inlining and FOLD-alias
+/// rewrites are thin wrappers over it. Recursing through *every* `Expr` variant
+/// (not just `BinaryOp`/`UnaryOp`/`FunctionCall`) ensures a variable nested inside
+/// `CASE`, `IN`, `IS [NOT] NULL`, a list, a map, an index, etc. is rewritten
+/// rather than silently dropped — the root cause of the "No field named …" class.
+///
+/// The variant set below must stay in sync with [`rewrite_is_ref_cols`].
+fn map_variables(expr: Expr, f: &dyn Fn(&str) -> Option<Expr>) -> Expr {
+    let recur = |e: Expr| map_variables(e, f);
+    let boxed = |e: Box<Expr>| Box::new(map_variables(*e, f));
     match expr {
-        Expr::Variable(ref name) if along.contains_key(name.as_str()) => {
-            along[name.as_str()].clone()
-        }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(substitute_along_vars(*left, along)),
-            op,
-            right: Box::new(substitute_along_vars(*right, along)),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op,
-            expr: Box::new(substitute_along_vars(*inner, along)),
-        },
+        Expr::Variable(name) => f(&name).unwrap_or(Expr::Variable(name)),
+        Expr::Property(inner, prop) => Expr::Property(boxed(inner), prop),
+        Expr::List(items) => Expr::List(items.into_iter().map(recur).collect()),
+        Expr::Map(entries) => Expr::Map(entries.into_iter().map(|(k, v)| (k, recur(v))).collect()),
         Expr::FunctionCall {
             name,
             args,
@@ -1804,55 +1922,95 @@ fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
             window_spec,
         } => Expr::FunctionCall {
             name,
-            args: args
-                .into_iter()
-                .map(|a| substitute_along_vars(a, along))
-                .collect(),
+            args: args.into_iter().map(recur).collect(),
             distinct,
             window_spec,
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: boxed(left),
+            op,
+            right: boxed(right),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op,
+            expr: boxed(inner),
+        },
+        Expr::Case {
+            expr: scrutinee,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            expr: scrutinee.map(boxed),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (recur(w), recur(t)))
+                .collect(),
+            else_expr: else_expr.map(boxed),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(boxed(inner)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(boxed(inner)),
+        Expr::IsUnique(inner) => Expr::IsUnique(boxed(inner)),
+        Expr::In { expr: e, list } => Expr::In {
+            expr: boxed(e),
+            list: boxed(list),
+        },
+        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
+            array: boxed(array),
+            index: boxed(index),
+        },
+        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
+            array: boxed(array),
+            start: start.map(boxed),
+            end: end.map(boxed),
         },
         other => other,
     }
 }
 
-/// Replace FOLD output variable names with their yield aliases.
+/// Substitute `Variable(name)` nodes matching ALONG binding names with their
+/// rewritten expressions, inlining the underlying expression.
 ///
-/// When a FOLD binding is aliased (e.g. `FOLD n = COUNT(*)` with `YIELD ... n AS support`),
-/// HAVING and BEST BY expressions reference "n" but after FoldExec the column is named
-/// "support". This function rewrites Variable("n") → Variable("support").
+/// Allows YIELD/FOLD expressions like `ew * 2.0` to reference an ALONG binding
+/// (`ALONG ew = e.weight`) by inlining it to `e.weight * 2.0`. Exhaustive over
+/// all `Expr` variants via [`map_variables`].
+fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
+    if along.is_empty() {
+        return expr;
+    }
+    map_variables(expr, &|name| along.get(name).cloned())
+}
+
+/// Rename FOLD output variables to their YIELD aliases in HAVING / BEST BY exprs.
+///
+/// When a FOLD binding is aliased (`FOLD n = COUNT(*)` with `YIELD ... n AS support`),
+/// HAVING and BEST BY reference `n` but after FoldExec the column is named `support`;
+/// this rewrites `Variable("n")` → `Variable("support")`. Exhaustive over all `Expr`
+/// variants via [`map_variables`], so a fold output nested in `CASE`/`IN`/etc. is
+/// also renamed.
 fn substitute_fold_aliases(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
     if aliases.is_empty() {
         return expr;
     }
-    match expr {
-        Expr::Variable(ref name) if aliases.contains_key(name) => {
-            Expr::Variable(aliases[name].clone())
+    map_variables(expr, &|name| {
+        aliases.get(name).map(|a| Expr::Variable(a.clone()))
+    })
+}
+
+/// Return whether `expr` references any FOLD-output variable.
+///
+/// Reuses the exhaustive [`map_variables`] walk (the single source of truth for
+/// expression traversal) so every variant — including a variable nested inside
+/// `CASE`/`IN`/a list — is inspected. Used to decide that a YIELD expression
+/// must be produced POST-fold rather than in the pre-fold body.
+fn expr_references_fold_output(expr: &Expr, fold_output_names: &HashSet<&str>) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_variables(expr.clone(), &|name| {
+        if fold_output_names.contains(name) {
+            found.set(true);
         }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(substitute_fold_aliases(*left, aliases)),
-            op,
-            right: Box::new(substitute_fold_aliases(*right, aliases)),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op,
-            expr: Box::new(substitute_fold_aliases(*inner, aliases)),
-        },
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            window_spec,
-        } => Expr::FunctionCall {
-            name,
-            args: args
-                .into_iter()
-                .map(|a| substitute_fold_aliases(a, aliases))
-                .collect(),
-            distinct,
-            window_spec,
-        },
-        other => other,
-    }
+        None
+    });
+    found.get()
 }
 
 /// Map [`LocyBinaryOp`] to Cypher [`BinaryOp`].
@@ -3331,12 +3489,20 @@ mod tests {
             )
             .unwrap();
 
-        // Layered: BestBy { Project { Filter { CrossJoin { .. } } } }
-        // (Fold is deferred to apply_post_fixpoint_chain)
-        assert!(plan_is_best_by(&result.body));
-        if let LogicalPlan::LocyBestBy { input, .. } = &result.body {
-            assert!(plan_is_project(input));
-        }
+        // Layered: Project { Filter { CrossJoin { .. } } }.
+        //
+        // Both FOLD and BEST BY are deferred to the post-fold rule pipeline
+        // (`merge_best_by` + `apply_post_fixpoint_chain`). BEST BY here ranks on
+        // the aggregated `total`, which only exists post-fold; wrapping a
+        // pre-fold `LocyBestBy` around the body would instead rank the raw
+        // per-row input column and prune rows before aggregation (the #145
+        // BEST-BY corruption). So the clause body top is the YIELD Project, not
+        // a LocyBestBy.
+        assert!(
+            !plan_is_best_by(&result.body),
+            "FOLD clause must not wrap a pre-fold BEST BY"
+        );
+        assert!(plan_is_project(&result.body));
         assert_eq!(result.is_refs.len(), 1);
         assert_eq!(result.along_bindings, vec!["cost".to_string()]);
     }

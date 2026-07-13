@@ -27,6 +27,8 @@ pub struct HostState {
     pub effective: CapabilitySet,
     /// HTTP egress backing the `host-net` interface, when granted + configured.
     pub http: Option<Arc<dyn HttpEgress>>,
+    /// GraphCompute session registry backing the `host-graph` interface.
+    pub graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
     /// WASI context — minimal, no preopens, no inherited stdio.
     /// Plugins requesting filesystem / network access go through
     /// capability-gated host fns, not raw WASI preopens.
@@ -51,10 +53,21 @@ impl HostState {
         Self {
             effective,
             http,
+            graph: None,
             wasi,
             table: ResourceTable::new(),
             limits: wasmtime::StoreLimits::default(),
         }
+    }
+
+    /// Attaches a GraphCompute session registry backing `host-graph`.
+    #[must_use]
+    pub fn with_graph(
+        mut self,
+        graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
+    ) -> Self {
+        self.graph = graph;
+        self
     }
 }
 

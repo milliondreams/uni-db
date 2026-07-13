@@ -103,6 +103,8 @@ pub enum Capability {
     LocyAggregate,
     /// Register Locy predicates (including neural).
     LocyPredicate,
+    /// Register Locy generator predicates (table-valued, 1:N).
+    LocyGenerator,
     /// Register physical operators / optimizer rules.
     Operator,
     /// Register index kinds.
@@ -111,6 +113,14 @@ pub enum Capability {
     Storage,
     /// Register graph algorithms.
     Algorithm,
+    /// Drive the GraphCompute coarse-kernel catalog from a guest algorithm.
+    ///
+    /// Gates the kernel surface (`graph-compute@1`). Orthogonal to
+    /// [`Capability::HostQuery`], which additionally gates the data-read
+    /// `project` kernel: a guest algorithm needs both to project a graph, but
+    /// only `GraphCompute` to run kernels over an already-projected handle
+    /// (GraphCompute proposal §4.6).
+    GraphCompute,
     /// Register CRDT kinds.
     Crdt,
     /// Register session / query lifecycle hooks.
@@ -128,8 +138,6 @@ pub enum Capability {
     Auth,
     /// Register authorization policies.
     Authz,
-    /// Register wire / connector protocols.
-    Connector,
     /// Register collations (sort orders).
     Collation,
     /// Register CDC output sinks.
@@ -152,6 +160,10 @@ pub enum Capability {
     TotalMemoryBytes(u64),
     /// Cap on rows yielded by a procedure.
     MaxResultRows(u64),
+    /// Cap on GraphCompute native-work units per invocation (proposal §12).
+    GraphComputeWork(u64),
+    /// Cap on GraphCompute handle-arena bytes per invocation (proposal §12).
+    GraphComputeArenaBytes(u64),
 }
 
 /// Granularity of lock-capability grants.

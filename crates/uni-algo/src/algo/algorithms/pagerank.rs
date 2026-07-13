@@ -73,8 +73,12 @@ impl Algorithm for PageRank {
             // score vector decays below 1.0. Standard PageRank redistributes
             // this mass uniformly across all `n` nodes, scaled by the damping
             // factor, so total probability mass is conserved.
+            // Deterministic fixed-order reduction (GraphCompute proposal §5.3):
+            // float `+` is non-associative, so a rayon parallel `sum()` would
+            // vary bitwise with thread scheduling. Summing in ascending slot
+            // order makes PageRank reproducible run-to-run and across thread
+            // counts (test P0-2), at negligible cost versus the O(E) inner loop.
             let dangling_mass: f64 = (0..n as u32)
-                .into_par_iter()
                 .filter(|&u| graph.out_degree(u) == 0)
                 .map(|u| scores[u as usize])
                 .sum();
@@ -99,10 +103,12 @@ impl Algorithm for PageRank {
                 *score = base + dangling_share + d * sum;
             });
 
-            // Convergence check
+            // Convergence check in fixed slot order (see dangling-mass note):
+            // a parallel reduction here would make the reported `iterations`
+            // and `converged` flag nondeterministic near the tolerance boundary.
             let diff: f64 = scores
-                .par_iter()
-                .zip(next.par_iter())
+                .iter()
+                .zip(next.iter())
                 .map(|(a, b)| (a - b).abs())
                 .sum();
 

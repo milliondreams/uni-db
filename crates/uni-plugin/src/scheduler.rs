@@ -136,9 +136,16 @@ impl Scheduler {
     /// past `next_fire_at` (no-op while paused).
     pub fn add_scheduled_job(&self, id: QName, schedule: Schedule) {
         let now = SystemTime::now();
-        self.records
-            .lock()
-            .push(SchedulerJobRecord::pending_with_schedule(id, schedule, now));
+        let record = SchedulerJobRecord::pending_with_schedule(id.clone(), schedule, now);
+        let mut records = self.records.lock();
+        // Upsert by id: re-registering the same job REPLACES its record rather
+        // than pushing a duplicate. Two records for one id would double-fire, and
+        // a single `cancel` would leave the stale copy behind.
+        if let Some(existing) = records.iter_mut().find(|r| r.id == id) {
+            *existing = record;
+        } else {
+            records.push(record);
+        }
     }
 
     /// Cancel a scheduled job by id.
@@ -234,11 +241,24 @@ impl Scheduler {
                 r.status = SchedulerJobStatus::Cancelled;
                 continue;
             }
-            // Time-gate: skip jobs whose schedule hasn't fired yet.
-            if let Some(fire_at) = r.next_fire_at
-                && fire_at > now
-            {
-                continue;
+            // Time-gate.
+            match r.next_fire_at {
+                Some(fire_at) if fire_at > now => continue,
+                Some(_) => {}
+                None => {
+                    // No computed fire time. For a `Cron` this means the
+                    // expression FAILED TO PARSE (`next_after` logged + returned
+                    // None) — the job must NEVER fire, so skip it rather than
+                    // falling through and dispatching it once. For an overdue
+                    // `Once`/`Manual` (whose single instant is already past)
+                    // `next_after` also returns None, but that job SHOULD fire once
+                    // — a finished one is later gated out by its non-`Pending`
+                    // status, not by `next_fire_at`. So only a fire-time-less Cron
+                    // is skipped.
+                    if matches!(r.schedule, Schedule::Cron(_)) {
+                        continue;
+                    }
+                }
             }
             r.status = SchedulerJobStatus::Running;
             r.last_started_at = Some(now);

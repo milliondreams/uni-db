@@ -73,6 +73,7 @@ mod tests {
             kms: None,
             secrets: store,
             http: None,
+            graph: None,
         }
     }
 

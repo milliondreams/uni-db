@@ -71,6 +71,21 @@ interface host-net {
         -> result<http-response, fn-error>;
 }
 
+/// Capability-gated GraphCompute kernel dispatch.
+///
+/// Added to the `Linker` only when the plugin is granted
+/// `Capability::GraphCompute`; a plugin importing this without the grant fails
+/// at link time. A guest algorithm issues one kernel call per invocation as a
+/// JSON string carrying only handles + scalars (proposal §4.5) and receives the
+/// result (handle / scalar / error) as JSON — no vertex data crosses.
+interface host-graph {
+    use types.{fn-error};
+
+    /// Dispatch one GraphCompute kernel call. `req` is a JSON object
+    /// `{session, op, …operands}`; the response is a JSON `{t, v}` union.
+    graph-call: func(req: string) -> result<string, fn-error>;
+}
+
 /// Host trace-context propagation.
 ///
 /// Always added to the `Linker` (no capability required — it leaks nothing).
@@ -153,6 +168,24 @@ world procedure-plugin {
     export manifest: func() -> string;
     export register: func() -> string;
     export invoke-procedure: func(qname: string, args-ipc: list<u8>)
+        -> result<list<u8>, fn-error>;
+}
+
+/// GraphCompute algorithm plugin world.
+///
+/// Implements one or more guest graph algorithms. The guest drives the coarse
+/// kernels through the imported `host-graph` interface and emits its per-vertex
+/// result; `invoke-algorithm` receives a JSON `{session, graph, args}` blob and
+/// returns empty bytes (the host reads the emitted columns from the session).
+world algorithm-plugin {
+    use types.{fn-error};
+
+    import host-log;
+    import host-graph;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+    export invoke-algorithm: func(qname: string, args-ipc: list<u8>)
         -> result<list<u8>, fn-error>;
 }
 

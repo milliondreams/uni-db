@@ -34,9 +34,13 @@ use uni_plugin::{Capability, CapabilitySet, FnError, HttpEgress, KmsProvider};
 use crate::host_fns::HostFnSpec;
 use crate::loader::ExtismLoader;
 
+pub mod graph;
 pub mod kms;
 pub mod net;
 pub mod secret;
+
+/// Import name for the GraphCompute kernel dispatch host fn.
+pub(crate) const FN_GRAPH_CALL: &str = "uni_graph_call";
 
 /// Import name for `uni.kms.sign`.
 pub(crate) const FN_KMS_SIGN: &str = "uni_kms_sign";
@@ -64,6 +68,8 @@ pub(crate) struct HostSvcCtx {
     pub secrets: Option<Arc<SecretStore>>,
     /// HTTP egress backing `uni.http.*`.
     pub http: Option<Arc<dyn HttpEgress>>,
+    /// GraphCompute session registry backing `uni_graph_call`.
+    pub graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 /// Lowercase hex encoding for the JSON wire boundary.
@@ -77,13 +83,27 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode lowercase/uppercase hex; errors on odd length or non-hex digits.
+///
+/// Operates on raw bytes (`chunks_exact(2)`), NOT `&s[i..i+2]` string slicing:
+/// the guest controls this string, and byte-index slicing panics on a multibyte
+/// UTF-8 codepoint that happens to make the byte length even. A non-ASCII byte
+/// simply fails the hex-digit test and returns `Err`.
 pub(crate) fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_owned());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+    fn nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex digit".to_owned()),
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 
@@ -161,6 +181,13 @@ pub(crate) fn build_service_fn(name: &str, ctx: &HostSvcCtx) -> Option<Function>
             UserData::new(ctx.clone()),
             net::uni_http_post,
         ),
+        FN_GRAPH_CALL => Function::new(
+            FN_GRAPH_CALL,
+            [ValType::I64],
+            [ValType::I64],
+            UserData::new(ctx.clone()),
+            graph::uni_graph_call,
+        ),
         _ => return None,
     };
     Some(f)
@@ -205,6 +232,11 @@ pub fn register_default_host_svc(loader: &mut ExtismLoader) {
             Capability::Network { allow: Vec::new() },
             "HTTP POST against a URL in the granted allow-list.",
         ),
+        (
+            FN_GRAPH_CALL,
+            Capability::GraphCompute,
+            "Dispatch one GraphCompute kernel call (JSON in / JSON out).",
+        ),
     ];
     for (name, cap, docs) in specs {
         loader.host_fns_mut().register(HostFnSpec {
@@ -232,13 +264,42 @@ mod tests {
         assert!(from_hex("abc").is_err());
     }
 
+    /// Repro for `crates/uni-plugin-extism/src/host_svc/mod.rs:86`.
+    ///
+    /// `from_hex` slices the guest-controlled string with BYTE indices
+    /// (`&s[i..i + 2]`) after only checking that the BYTE length is even. An
+    /// even-byte-length input containing a multibyte UTF-8 codepoint passes the
+    /// `len % 2` guard but the byte slice lands mid-codepoint, so `str` range
+    /// indexing PANICS ("byte index N is not a char boundary") instead of
+    /// returning the documented `Err`. Callers (kms/net `do_*`) wrap the result
+    /// in `.map_err(...)` expecting a recoverable `Result` — they cannot catch a
+    /// panic, so a guest can trigger a host-fn panic (DoS) with a crafted hex
+    /// field.
+    ///
+    /// Regression: `from_hex` decodes on raw bytes, so an even-byte-length input
+    /// containing a multibyte UTF-8 codepoint returns `Err` instead of panicking
+    /// on a non-char-boundary byte slice (a guest-triggerable host-fn DoS).
     #[test]
-    fn register_default_host_svc_registers_five_specs() {
+    fn from_hex_errors_on_even_byte_multibyte_input() {
+        // "aéb" = [0x61, 0xC3, 0xA9, 0x62] — 4 bytes (even, passes len%2), but
+        // 'é' occupies byte indices 1..=2, which byte-index slicing would split.
+        let input = "aéb";
+        assert_eq!(input.len(), 4, "precondition: even byte length");
+        let res = from_hex(input);
+        assert!(
+            res.is_err(),
+            "from_hex must return Err on non-hex multibyte input, not panic; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn register_default_host_svc_registers_six_specs() {
         let mut loader = ExtismLoader::new();
         register_default_host_svc(&mut loader);
-        assert_eq!(loader.host_fns().len(), 5);
+        assert_eq!(loader.host_fns().len(), 6);
         assert!(loader.host_fns().get(FN_KMS_SIGN).is_some());
         assert!(loader.host_fns().get(FN_HTTP_POST).is_some());
+        assert!(loader.host_fns().get(FN_GRAPH_CALL).is_some());
     }
 
     #[test]
@@ -248,6 +309,7 @@ mod tests {
             kms: None,
             secrets: None,
             http: None,
+            graph: None,
         };
         assert!(build_service_fn("not_a_service_fn", &ctx).is_none());
         assert!(build_service_fn(FN_KMS_SIGN, &ctx).is_some());

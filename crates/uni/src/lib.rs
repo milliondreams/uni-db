@@ -41,6 +41,12 @@ pub mod synthetic_procedure {
     pub use uni_plugin_host::synthetic_procedure::*;
 }
 
+/// Re-export of the host-side declared-trigger synthesizer (WS-A) to
+/// keep the `uni_db::synthetic_trigger::*` path stable.
+pub mod synthetic_trigger {
+    pub use uni_plugin_host::synthetic_trigger::*;
+}
+
 pub use api::builder::PropertiesBuilder;
 pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
 pub use api::impl_locy::LocyRuleRegistry;

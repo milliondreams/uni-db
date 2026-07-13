@@ -32,19 +32,24 @@ async fn having_executed(world: &mut LocyWorld, step: &cucumber::gherkin::Step) 
         .await
         .expect("Failed to initialize database");
 
-    if let Some(query) = step.docstring() {
-        let session = world.db().session();
-        let tx = session
-            .tx()
-            .await
-            .unwrap_or_else(|e| panic!("Failed to start transaction: {}", e));
-        tx.execute(query)
-            .await
-            .unwrap_or_else(|e| panic!("Setup query failed: {}", e));
-        tx.commit()
-            .await
-            .unwrap_or_else(|e| panic!("Failed to commit setup query: {}", e));
-    }
+    // A `having executed:` step without an attached docstring is a malformed
+    // scenario: the intended graph setup would be silently skipped, letting the
+    // scenario pass against an empty graph. Fail loudly instead, mirroring the
+    // sibling `when evaluating ...` step (when_evaluate.rs).
+    let query = step
+        .docstring()
+        .expect("Expected a docstring with the setup query for `having executed:`");
+    let session = world.db().session();
+    let tx = session
+        .tx()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to start transaction: {}", e));
+    tx.execute(query)
+        .await
+        .unwrap_or_else(|e| panic!("Setup query failed: {}", e));
+    tx.commit()
+        .await
+        .unwrap_or_else(|e| panic!("Failed to commit setup query: {}", e));
 }
 
 /// Register a node label imperatively in the schema manager. Required

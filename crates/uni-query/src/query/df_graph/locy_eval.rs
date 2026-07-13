@@ -82,6 +82,48 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
             }
             Ok(Value::Map(map))
         }
+        Expr::Case {
+            expr: operand,
+            when_then,
+            else_expr,
+        } => {
+            // Searched CASE (no operand): the first WHEN whose condition is
+            // truthy yields its THEN. Simple CASE (with operand): the first WHEN
+            // whose value equals the operand yields its THEN. Otherwise the ELSE
+            // branch, or Null when absent. Equality reuses `eval_binary_op` so
+            // null/type semantics match the rest of the engine.
+            let operand_val = match operand {
+                Some(o) => Some(eval_expr(o, bindings)?),
+                None => None,
+            };
+            for (when, then) in when_then {
+                let when_val = eval_expr(when, bindings)?;
+                let matched = match &operand_val {
+                    Some(o) => eval_binary_op(o, &BinaryOp::Eq, &when_val)?
+                        .as_bool()
+                        .unwrap_or(false),
+                    None => when_val.as_bool().unwrap_or(false),
+                };
+                if matched {
+                    return eval_expr(then, bindings);
+                }
+            }
+            match else_expr {
+                Some(e) => eval_expr(e, bindings),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::In { expr, list } => {
+            let needle = eval_expr(expr, bindings)?;
+            match eval_expr(list, bindings)? {
+                Value::List(items) => Ok(Value::Bool(
+                    items.iter().any(|item| values_equal(&needle, item)),
+                )),
+                other => Err(LocyError::EvaluationError {
+                    message: format!("IN expects a list on the right-hand side, got {other:?}"),
+                }),
+            }
+        }
         _ => Err(LocyError::EvaluationError {
             message: format!("unsupported expression in in-memory evaluation: {expr:?}"),
         }),
@@ -289,7 +331,16 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
             }
             numeric_op(left, right, |a, b| a / b, |a, b| a / b)
         }
-        LocyBinaryOp::Mod => numeric_op(left, right, |a, b| a % b, |a, b| a % b),
+        LocyBinaryOp::Mod => {
+            // Guard against modulo by zero: an integer `a % 0` panics in Rust,
+            // so return a clean evaluation error instead of aborting the query.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "modulo by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
+        }
         LocyBinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
                 message: format!("pow requires numeric, got {left:?}"),
@@ -326,8 +377,24 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
         BinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        BinaryOp::Div => numeric_op(left, right, |a, b| a / b, |a, b| a / b),
-        BinaryOp::Mod => numeric_op(left, right, |a, b| a % b, |a, b| a % b),
+        BinaryOp::Div => {
+            // Guard against integer division by zero, which panics in Rust.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "division by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
+        }
+        BinaryOp::Mod => {
+            // Guard against integer modulo by zero, which panics in Rust.
+            if right.as_f64().unwrap_or(0.0) == 0.0 {
+                return Err(LocyError::EvaluationError {
+                    message: "modulo by zero".to_string(),
+                });
+            }
+            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
+        }
         BinaryOp::Pow => {
             let l = left.as_f64().unwrap_or(0.0);
             let r = right.as_f64().unwrap_or(0.0);
@@ -468,16 +535,148 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                 }
             })
         }
-        // Delegate to the full Cypher scalar function evaluator so that every
-        // function available in Cypher (temporal, math, string, spatial, …) is
-        // automatically available in Locy. Both sides use uni_common::Value, so
-        // no type conversion is needed.
-        _ => crate::query::expr_eval::eval_scalar_function(name, args, None).map_err(|e| {
-            LocyError::EvaluationError {
-                message: e.to_string(),
+        // A registered third-party Locy predicate (filter/fuzzy) takes priority
+        // over the generic scalar path — otherwise a plugin predicate name would
+        // die as an "unknown function". This single interception serves every
+        // in-memory eval path (SLG, DERIVE, delta, QUERY) since they all route
+        // through `eval_expr`/`eval_function`.
+        _ => {
+            if let Some(result) = try_dispatch_locy_predicate(name, args) {
+                return result;
             }
-        }),
+            // Delegate to the full Cypher scalar function evaluator so that every
+            // function available in Cypher (temporal, math, string, spatial, …) is
+            // automatically available in Locy. Both sides use uni_common::Value, so
+            // no type conversion is needed.
+            crate::query::expr_eval::eval_scalar_function(name, args, None).map_err(|e| {
+                LocyError::EvaluationError {
+                    message: e.to_string(),
+                }
+            })
+        }
     }
+}
+
+/// Resolve `name` to a registered [`LocyPredicate`] and evaluate it over the
+/// single-row `args`, or return `None` when no predicate is registered.
+///
+/// Resolution uses the same convention-agnostic `candidate_splits` lookup as
+/// Locy aggregates and scalars, against the session-local plugin registry. This
+/// is what makes the otherwise-dead `LocyPredicate` trait reachable from Locy.
+fn try_dispatch_locy_predicate(name: &str, args: &[Value]) -> Option<Result<Value, LocyError>> {
+    let session_pr = crate::query::df_udfs_plugin::current_session_plugin_registry()?;
+    let entry = uni_plugin::QName::candidate_splits(name)
+        .find_map(|cand| session_pr.locy_predicate(&cand))?;
+    Some(invoke_locy_predicate(&entry, name, args))
+}
+
+/// Bridge Locy `Value` args into a one-row Arrow batch, invoke the predicate,
+/// and read the single result cell back as a `Value` (bool, or float for a
+/// fuzzy predicate participating in PROB chains).
+fn invoke_locy_predicate(
+    entry: &uni_plugin::registry::LocyPredicateEntry,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, LocyError> {
+    use arrow_array::Array;
+
+    let columnar: Vec<datafusion::logical_expr::ColumnarValue> =
+        args.iter().map(value_to_single_row_columnar).collect();
+
+    let err = |e: uni_plugin::FnError| LocyError::EvaluationError {
+        message: format!("{name}: {e}"),
+    };
+
+    // Fuzzy predicates return a per-row score; plain filters a boolean.
+    if entry.signature.supports_fuzzy
+        && let Some(res) = entry.predicate.evaluate_fuzzy(&columnar, 1)
+    {
+        let arr = res.map_err(err)?;
+        return Ok(if arr.is_null(0) {
+            Value::Null
+        } else {
+            Value::Float(arr.value(0))
+        });
+    }
+
+    let arr = entry.predicate.evaluate(&columnar, 1).map_err(err)?;
+    Ok(if arr.is_null(0) {
+        Value::Null
+    } else {
+        Value::Bool(arr.value(0))
+    })
+}
+
+/// Resolve `name` to a registered [`LocyGenerator`] and evaluate it over the
+/// single-row `args`, returning the emitted output tuples (one inner `Vec` per
+/// generated row, each of length `signature().outputs.len()`). Returns `None`
+/// when no generator with that name is registered.
+///
+/// Mirrors [`try_dispatch_locy_predicate`] — same `candidate_splits` lookup
+/// against the session-local plugin registry — but is table-valued (1:N).
+pub(crate) fn dispatch_locy_generator(
+    name: &str,
+    args: &[Value],
+) -> Option<Result<Vec<Vec<Value>>, LocyError>> {
+    let session_pr = crate::query::df_udfs_plugin::current_session_plugin_registry()?;
+    let entry = uni_plugin::QName::candidate_splits(name)
+        .find_map(|cand| session_pr.locy_generator(&cand))?;
+    Some(invoke_locy_generator(&entry, name, args))
+}
+
+/// Bridge Locy `Value` args into a one-row Arrow batch, invoke the generator,
+/// and read its table-valued output back as `Vec<Vec<Value>>` (one inner `Vec`
+/// per emitted tuple, columns in `signature().outputs` order).
+fn invoke_locy_generator(
+    entry: &uni_plugin::registry::LocyGeneratorEntry,
+    name: &str,
+    args: &[Value],
+) -> Result<Vec<Vec<Value>>, LocyError> {
+    let columnar: Vec<datafusion::logical_expr::ColumnarValue> =
+        args.iter().map(value_to_single_row_columnar).collect();
+
+    let err = |e: uni_plugin::FnError| LocyError::EvaluationError {
+        message: format!("{name}: {e}"),
+    };
+
+    let out = entry.generator.generate(&columnar, 1).map_err(err)?;
+    let emitted = out.row_map.len();
+    let mut tuples = Vec::with_capacity(emitted);
+    for i in 0..emitted {
+        let mut tuple = Vec::with_capacity(out.columns.len());
+        for col in &out.columns {
+            tuple.push(uni_store::storage::arrow_convert::arrow_to_value(
+                col, i, None,
+            ));
+        }
+        tuples.push(tuple);
+    }
+    Ok(tuples)
+}
+
+/// Encode one Locy `Value` as a length-1 Arrow column for predicate input.
+///
+/// Scalars map to their natural Arrow type; a plain `Null` becomes a null
+/// `Int64` cell, and any composite value is carried as a CypherValue-encoded
+/// `LargeBinary` cell (which a predicate can decode).
+fn value_to_single_row_columnar(v: &Value) -> datafusion::logical_expr::ColumnarValue {
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
+    };
+    use std::sync::Arc;
+
+    let arr: ArrayRef = match v {
+        Value::Bool(b) => Arc::new(BooleanArray::from(vec![*b])),
+        Value::Int(i) => Arc::new(Int64Array::from(vec![*i])),
+        Value::Float(f) => Arc::new(Float64Array::from(vec![*f])),
+        Value::String(s) => Arc::new(StringArray::from(vec![s.as_str()])),
+        Value::Null => Arc::new(Int64Array::from(vec![None::<i64>])),
+        other => {
+            let bytes = uni_common::cypher_value_codec::encode(other);
+            Arc::new(LargeBinaryArray::from(vec![Some(bytes.as_slice())]))
+        }
+    };
+    datafusion::logical_expr::ColumnarValue::Array(arr)
 }
 
 /// Compare two values for equality (Cypher semantics).
@@ -523,7 +722,100 @@ pub fn value_less_than(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Float(y)) => (*x as f64) < *y,
         (Value::Float(x), Value::Int(y)) => *x < (*y as f64),
         (Value::String(x), Value::String(y)) => x < y,
+        // `false` sorts before `true`, matching Cypher boolean ordering.
+        (Value::Bool(x), Value::Bool(y)) => !x & y,
+        (Value::Temporal(x), Value::Temporal(y)) => {
+            temporal_less_than(x, y) == std::cmp::Ordering::Less
+        }
         _ => false,
+    }
+}
+
+/// Order two temporal values, matching the executor's `ORDER BY` semantics.
+///
+/// Same-kind values compare by their canonical instant; mixed kinds fall back
+/// to a stable per-variant rank so the ordering is total and deterministic.
+fn temporal_less_than(
+    left: &uni_common::TemporalValue,
+    right: &uni_common::TemporalValue,
+) -> std::cmp::Ordering {
+    use uni_common::TemporalValue as T;
+    match (left, right) {
+        (
+            T::Date {
+                days_since_epoch: l,
+            },
+            T::Date {
+                days_since_epoch: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::LocalTime {
+                nanos_since_midnight: l,
+            },
+            T::LocalTime {
+                nanos_since_midnight: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::Time {
+                nanos_since_midnight: lm,
+                offset_seconds: lo,
+            },
+            T::Time {
+                nanos_since_midnight: rm,
+                offset_seconds: ro,
+            },
+        ) => {
+            let l_utc = *lm as i128 - (*lo as i128) * 1_000_000_000;
+            let r_utc = *rm as i128 - (*ro as i128) * 1_000_000_000;
+            l_utc.cmp(&r_utc)
+        }
+        (
+            T::LocalDateTime {
+                nanos_since_epoch: l,
+            },
+            T::LocalDateTime {
+                nanos_since_epoch: r,
+            },
+        ) => l.cmp(r),
+        (
+            T::DateTime {
+                nanos_since_epoch: l,
+                ..
+            },
+            T::DateTime {
+                nanos_since_epoch: r,
+                ..
+            },
+        ) => l.cmp(r),
+        (
+            T::Duration {
+                months: lm,
+                days: ld,
+                nanos: ln,
+            },
+            T::Duration {
+                months: rm,
+                days: rd,
+                nanos: rn,
+            },
+        ) => (*lm, *ld, *ln).cmp(&(*rm, *rd, *rn)),
+        _ => temporal_variant_rank(left).cmp(&temporal_variant_rank(right)),
+    }
+}
+
+/// Stable ordering rank for mixed-kind temporal comparisons.
+fn temporal_variant_rank(v: &uni_common::TemporalValue) -> u8 {
+    use uni_common::TemporalValue as T;
+    match v {
+        T::Date { .. } => 0,
+        T::LocalTime { .. } => 1,
+        T::Time { .. } => 2,
+        T::LocalDateTime { .. } => 3,
+        T::DateTime { .. } => 4,
+        T::Duration { .. } => 5,
+        T::Btic { .. } => 6,
     }
 }
 
@@ -722,4 +1014,82 @@ fn extract_properties_from_map(map: &HashMap<String, Value>) -> HashMap<String, 
     }
 
     properties
+}
+
+#[cfg(test)]
+mod predicate_dispatch_tests {
+    use super::*;
+    use arrow_array::{Array, BooleanArray, Float64Array};
+    use datafusion::logical_expr::{ColumnarValue, Volatility};
+    use std::sync::Arc;
+    use uni_plugin::FnError;
+    use uni_plugin::traits::locy::{BatchHint, LocyPredicate, PredSignature};
+    use uni_plugin::traits::scalar::ArgType;
+
+    /// Test predicate: `is_positive(f64) -> bool`.
+    #[derive(Debug)]
+    struct IsPositive {
+        sig: PredSignature,
+    }
+
+    impl IsPositive {
+        fn new() -> Self {
+            Self {
+                sig: PredSignature {
+                    args: vec![ArgType::Primitive(arrow_schema::DataType::Float64)],
+                    volatility: Volatility::Immutable,
+                    supports_fuzzy: false,
+                    batch_hint: BatchHint::Small,
+                },
+            }
+        }
+    }
+
+    impl LocyPredicate for IsPositive {
+        fn signature(&self) -> &PredSignature {
+            &self.sig
+        }
+        fn evaluate(&self, args: &[ColumnarValue], rows: usize) -> Result<BooleanArray, FnError> {
+            let ColumnarValue::Array(a) = &args[0] else {
+                return Err(FnError::new(0, "expected array arg"));
+            };
+            let f = a
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| FnError::new(0, "expected Float64Array"))?;
+            Ok((0..rows).map(|i| Some(f.value(i) > 0.0)).collect())
+        }
+    }
+
+    fn entry() -> uni_plugin::registry::LocyPredicateEntry {
+        uni_plugin::registry::LocyPredicateEntry {
+            plugin: uni_plugin::PluginId::new("test"),
+            signature: IsPositive::new().sig,
+            predicate: Arc::new(IsPositive::new()),
+        }
+    }
+
+    #[test]
+    fn invoke_bridges_value_to_bool() {
+        let e = entry();
+        assert_eq!(
+            invoke_locy_predicate(&e, "is_positive", &[Value::Float(2.0)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            invoke_locy_predicate(&e, "is_positive", &[Value::Float(-1.0)]).unwrap(),
+            Value::Bool(false)
+        );
+        // Int coerces through the natural-type bridge only for Float here; an
+        // int arg would arrive as Int64Array and the predicate would reject it,
+        // surfacing a clean evaluation error rather than a silent wrong answer.
+        assert!(invoke_locy_predicate(&e, "is_positive", &[Value::Int(5)]).is_err());
+    }
+
+    #[test]
+    fn dispatch_returns_none_without_session_registry() {
+        // Outside a session scope there is no registry, so dispatch declines and
+        // the caller falls back to the scalar path.
+        assert!(try_dispatch_locy_predicate("anything.at_all", &[Value::Int(1)]).is_none());
+    }
 }

@@ -117,6 +117,8 @@ pub struct ExtismLoader {
     secrets: Option<std::sync::Arc<uni_plugin::secrets::SecretStore>>,
     /// Optional HTTP egress backing `uni_http_*`.
     http: Option<std::sync::Arc<dyn uni_plugin::HttpEgress>>,
+    /// Optional GraphCompute session registry backing `uni_graph_call`.
+    graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 impl std::fmt::Debug for ExtismLoader {
@@ -222,6 +224,24 @@ impl ExtismLoader {
         self
     }
 
+    /// Attach a GraphCompute session registry backing `uni_graph_call`.
+    #[must_use]
+    pub fn with_graph(
+        mut self,
+        registry: uni_plugin_builtin::algorithms::graph_compute::SharedRegistry,
+    ) -> Self {
+        self.graph = Some(registry);
+        self
+    }
+
+    /// Shared access to the GraphCompute registry, if configured.
+    #[must_use]
+    pub fn graph_registry(
+        &self,
+    ) -> Option<&uni_plugin_builtin::algorithms::graph_compute::SharedRegistry> {
+        self.graph.as_ref()
+    }
+
     /// The host-fn map for a single load: the static `runtime_fns` plus the
     /// per-load capability-gated service functions (`uni_kms_*`,
     /// `uni_secret_acquire`, `uni_http_*`).
@@ -243,6 +263,7 @@ impl ExtismLoader {
             kms: self.kms.clone(),
             secrets: self.secrets.clone(),
             http: self.http.clone(),
+            graph: self.graph.clone(),
         };
         for name in &prepared.allowed_host_fns {
             if fns.contains_key(name) {
@@ -392,14 +413,17 @@ impl ExtismLoader {
         // Pass 1: read the manifest export. A wasm module resolves *all* of
         // its imports at instantiate time, so a guest that imports a host fn
         // (e.g. `uni_http_get`) cannot even be instantiated to read its
-        // manifest unless that import is present in the linker. We don't yet
-        // know the guest's declared caps, so bootstrap with the host's
-        // *offered* grants: register the service fns whose capability variant
-        // the host offers. This is safe because pass 1 invokes only the pure
-        // `manifest` export — never a host-fn-calling `invoke` — and the live
-        // execution pool below is rebuilt with the real `declared ∩ grants`
-        // attenuation. A guest importing a host fn the host did *not* offer
-        // fails to instantiate here, which is the intended link-time gate.
+        // manifest unless that import is present in the linker. We therefore
+        // materialize the service fns whose capability variant the host offers
+        // (by NAME, for the linker) — but with an EMPTY effective grant set, so
+        // if the guest's `manifest` export actually *calls* one of them (nothing
+        // enforces manifest-export purity), the call is denied at the fn body's
+        // allow-list check instead of running with the host's full grants before
+        // `declared ∩ grants` intersection. Otherwise a zero-declaring plugin
+        // could exfiltrate/sign/read secrets during bootstrap. The live
+        // execution pool below is rebuilt with the real attenuation. A guest
+        // importing a host fn the host did *not* offer still fails to instantiate
+        // here, which is the intended link-time gate.
         let bootstrap_allowed = self.allowed_host_fn_names(host_grants);
         let bootstrap_prepared = PreparedExtismPlugin {
             manifest: ExtismPluginManifest {
@@ -413,7 +437,8 @@ impl ExtismLoader {
                 memory_max_pages: None,
                 timeout_ms: None,
             },
-            effective: host_grants.clone(),
+            // Empty, NOT host_grants: bootstrap host-fn bodies must grant nothing.
+            effective: uni_plugin::CapabilitySet::new(),
             allowed_host_fns: bootstrap_allowed,
             denied_capabilities: Vec::new(),
         };
@@ -514,6 +539,30 @@ impl ExtismLoader {
                         })?;
                     procedures_registered.push(qname);
                 }
+                crate::exports::RegistrationEntry::Algorithm {
+                    qname,
+                    args: _,
+                    yields,
+                } => {
+                    let parsed_qname = parse_entry_qname(&qname)?;
+                    let registry = self.graph.clone().ok_or_else(|| {
+                        ExtismError::Internal(format!(
+                            "algorithm `{qname}` needs a GraphCompute registry \
+                             (call ExtismLoader::with_graph)"
+                        ))
+                    })?;
+                    let sig = build_algorithm_signature(&yields)?;
+                    let adapter =
+                        std::sync::Arc::new(crate::adapter_algorithm::ExtismAlgorithm::new(
+                            std::sync::Arc::clone(&pool),
+                            registry,
+                            parsed_qname.clone(),
+                            sig,
+                        ));
+                    registrar.algorithm(parsed_qname, adapter).map_err(|e| {
+                        ExtismError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
+                    })?;
+                }
             }
         }
 
@@ -542,6 +591,38 @@ impl ExtismLoader {
 fn parse_entry_qname(qname: &str) -> Result<uni_plugin::QName, ExtismError> {
     uni_plugin::QName::parse(qname)
         .map_err(|e| ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}")))
+}
+
+/// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
+fn build_algorithm_signature(
+    yields: &[String],
+) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, ExtismError> {
+    use arrow_schema::{DataType, Field};
+    let output_fields: Vec<Field> = yields
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let (name, type_name) = match spec.split_once(':') {
+                Some((n, t)) => (n.trim().to_string(), t.trim()),
+                None => (format!("col{i}"), spec.as_str()),
+            };
+            let dt = match type_name.to_ascii_lowercase().as_str() {
+                "int" | "integer" | "i64" => DataType::Int64,
+                "float" | "double" | "f64" => DataType::Float64,
+                other => {
+                    return Err(ExtismError::OutputDecode(format!(
+                        "algorithm yield type `{other}` unsupported (int/float)"
+                    )));
+                }
+            };
+            Ok(Field::new(name, dt, false))
+        })
+        .collect::<Result<_, ExtismError>>()?;
+    Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
+        output_fields,
+        docs: String::new(),
+        ..Default::default()
+    })
 }
 
 /// Build an `extism::Plugin` from owned-data inputs.

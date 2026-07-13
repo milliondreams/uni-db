@@ -280,12 +280,13 @@ pub fn maxsim(
 ///
 /// The conversion depends on the distance metric:
 /// - **Cosine**: `(2 - d) / 2` (LanceDB cosine distance ranges 0..2)
-/// - **Dot**: pass-through (already a similarity measure)
+/// - **Dot**: `-d` — [`DistanceMetric::compute_distance`] returns `-dot`, so
+///   negating recovers the dot product as the similarity measure
 /// - **L2** and others: `1 / (1 + d)`
 pub fn calculate_score(distance: f32, metric: &DistanceMetric) -> f32 {
     match metric {
         DistanceMetric::Cosine => (2.0 - distance) / 2.0,
-        DistanceMetric::Dot => distance,
+        DistanceMetric::Dot => -distance,
         _ => 1.0 / (1.0 + distance),
     }
 }
@@ -375,9 +376,20 @@ fn value_to_sparse(v: &Value) -> Result<uni_sparse_vector::SparseVector> {
             };
             let indices: Vec<u32> = as_list("indices")?
                 .iter()
-                .map(|x| x.as_i64().map(|i| i as u32))
-                .collect::<Option<_>>()
-                .ok_or_else(|| anyhow::anyhow!("sparse_similar_to: 'indices' must be integers"))?;
+                .map(|x| {
+                    let i = x.as_i64().ok_or_else(|| {
+                        anyhow::anyhow!("sparse_similar_to: 'indices' must be integers")
+                    })?;
+                    // A term id must fit in u32; reject negative or too-large
+                    // values instead of silently wrapping them (e.g. -1 -> u32::MAX)
+                    // into an unrelated term.
+                    u32::try_from(i).map_err(|_| {
+                        anyhow::anyhow!(
+                            "sparse_similar_to: index {i} out of range for a sparse term id (0..=4294967295)"
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?;
             let values: Vec<f32> = as_list("values")?
                 .iter()
                 .map(|x| x.as_f64().map(|f| f as f32))

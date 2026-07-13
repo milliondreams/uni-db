@@ -92,8 +92,13 @@ impl<'a> RuleRegistry<'a> {
     /// Returns [`UniError::Query`] if `name` shares its source program with
     /// other rules, or an I/O error if persistence fails.
     pub async fn remove(&self, name: &str) -> Result<bool> {
-        let new_sources = {
-            let registry = self.registry.read().unwrap();
+        // Hold the WRITE lock across snapshot → rebuild → assign so a concurrent
+        // `register` cannot slip a rule in between the read and the write and be
+        // clobbered by `*registry = rebuilt` (the registry is a pure function of
+        // its sources; the whole read-modify-write must be atomic). The guard is
+        // dropped before the async persister save below.
+        {
+            let mut registry = self.registry.write().unwrap();
             let Some(owning) = registry
                 .sources
                 .iter()
@@ -117,16 +122,15 @@ impl<'a> RuleRegistry<'a> {
                     query: None,
                 });
             }
-            registry
+            let new_sources = registry
                 .sources
                 .iter()
                 .filter(|s| !s.rule_names.iter().any(|r| r == name))
                 .cloned()
-                .collect::<Vec<_>>()
-        };
-
-        let rebuilt = super::impl_locy::rebuild_registry_from_sources(&new_sources)?;
-        *self.registry.write().unwrap() = rebuilt;
+                .collect::<Vec<_>>();
+            let rebuilt = super::impl_locy::rebuild_registry_from_sources(&new_sources)?;
+            *registry = rebuilt;
+        }
         if let Some(persister) = self.persister {
             persister.save(self.registry).await?;
         }

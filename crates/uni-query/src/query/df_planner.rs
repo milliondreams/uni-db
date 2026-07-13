@@ -2791,6 +2791,7 @@ impl HybridPhysicalPlanner {
         target_label_id: u16,
         target_variable: &str,
         all_properties: &HashMap<String, HashSet<String>>,
+        optional: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::common::NullEquality;
         use datafusion::physical_expr::expressions::{Column, col as col_expr};
@@ -2840,12 +2841,21 @@ impl HybridPhysicalPlanner {
             Arc::new(Column::new(&vid_col_name, left_idx)),
             Arc::new(Column::new(&vid_col_name, right_idx)),
         )];
+        // An OPTIONAL traverse emits NULL-target rows (unmatched `{target}._vid`);
+        // a Left join preserves them (right side null-padded) instead of dropping
+        // them as an Inner join would, keeping OPTIONAL MATCH semantics intact for
+        // a plugin virtual target.
+        let join_type = if optional {
+            JoinType::Left
+        } else {
+            JoinType::Inner
+        };
         let join = HashJoinExec::try_new(
             traverse_plan,
             catalog_plan,
             on,
             None,
-            &JoinType::Inner,
+            &join_type,
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
@@ -3020,6 +3030,7 @@ impl HybridPhysicalPlanner {
                 target_label_id,
                 target_variable,
                 all_properties,
+                optional,
             )?
         } else {
             projected
@@ -3537,6 +3548,7 @@ impl HybridPhysicalPlanner {
                 target_label_id,
                 target_variable,
                 all_properties,
+                optional,
             )?;
         }
 
@@ -4327,12 +4339,17 @@ impl HybridPhysicalPlanner {
             compiled.swap(0, anchor_pair_idx);
         }
 
-        // 6. Translate join_type. RIGHT outer is rejected — we can't
-        // produce probe rows that don't match any build VID, since our
-        // probe scan only fetches rows whose `_vid` is in the build set.
-        let join_kind = match join_type {
-            JoinType::Inner => VidJoinKind::Inner,
-            JoinType::Left => VidJoinKind::Left,
+        // 6. Translate join_type. This operator is build-outer: it fully
+        // materializes the build side and fetches the probe *by* build VIDs, so
+        // it can only null-pad unmatched BUILD rows — never unmatched probe rows
+        // (those are never scanned). RIGHT outer is therefore rejected, and LEFT
+        // outer is correct only when the build side IS the left (outer) side, i.e.
+        // the probe is on the right. When the probe is on the left, emitting this
+        // fast-path would preserve the right side instead — inverting LEFT to
+        // RIGHT semantics — so bail and let the standard join handle it.
+        let join_kind = match (join_type, probe_side) {
+            (JoinType::Inner, _) => VidJoinKind::Inner,
+            (JoinType::Left, ProbeSide::Right) => VidJoinKind::Left,
             _ => return Ok(None),
         };
 
@@ -4884,38 +4901,32 @@ impl HybridPhysicalPlanner {
             let df_agg = match name_lower.as_str() {
                 "count" if args.is_empty() => count(datafusion::logical_expr::lit(1)),
                 "count" => {
-                    // For count(*) or count(variable) where variable is a node/edge
-                    // (not a property), translate to count(lit(1)) since the variable
-                    // itself has no column in the scan schema.
-                    // Exception: COUNT(DISTINCT variable) needs the actual column
-                    // reference so that null rows (from OPTIONAL MATCH) are excluded.
+                    // count(*) counts every row (including the all-null padding row
+                    // an unmatched OPTIONAL MATCH produces), so it maps to
+                    // count(lit(1)). count(variable), by contrast, is count over an
+                    // expression and must EXCLUDE nulls per Cypher semantics — so it
+                    // counts the entity's identity column (_vid/_eid), which is
+                    // non-null for matched rows and null for the OPTIONAL pad, letting
+                    // DataFusion's COUNT drop those rows. count(lit(1)) here would
+                    // over-count by one per unmatched group. The later `.distinct()`
+                    // pass turns this into COUNT(DISTINCT identity) when requested;
+                    // dedup by identity (not the full materialized struct) also avoids
+                    // reading every property column (issue #134 family). Scalar-bound
+                    // variables (not Node/Edge) count their own column, which likewise
+                    // excludes nulls.
                     if matches!(args.first(), Some(uni_cypher::ast::Expr::Wildcard)) {
                         count(datafusion::logical_expr::lit(1))
                     } else if let Some(uni_cypher::ast::Expr::Variable(var)) = args.first() {
-                        if *distinct {
-                            // COUNT(DISTINCT entity) dedups by identity (_vid/_eid),
-                            // NOT the full materialized struct — this avoids reading
-                            // every property column just to compute distinctness
-                            // (issue #134 family). The identity column is a
-                            // non-nullable base column always present in the scan,
-                            // and stays null for unmatched OPTIONAL MATCH rows so
-                            // they are excluded exactly as before. Scalar-bound
-                            // variables (not Node/Edge) keep their own column.
-                            let id_col = match ctx.variable_kinds.get(var) {
-                                Some(VariableKind::Node) => Some("_vid"),
-                                Some(VariableKind::Edge) => Some("_eid"),
-                                _ => None,
-                            };
-                            match id_col {
-                                Some(suffix) => {
-                                    count(DfExpr::Column(datafusion::common::Column::from_name(
-                                        format!("{var}.{suffix}"),
-                                    )))
-                                }
-                                None => count(get_arg()?),
-                            }
-                        } else {
-                            count(datafusion::logical_expr::lit(1))
+                        let id_col = match ctx.variable_kinds.get(var) {
+                            Some(VariableKind::Node) => Some("_vid"),
+                            Some(VariableKind::Edge) => Some("_eid"),
+                            _ => None,
+                        };
+                        match id_col {
+                            Some(suffix) => count(DfExpr::Column(
+                                datafusion::common::Column::from_name(format!("{var}.{suffix}")),
+                            )),
+                            None => count(get_arg()?),
                         }
                     } else {
                         count(get_arg()?)
@@ -5518,7 +5529,14 @@ impl HybridPhysicalPlanner {
 
         // Build translation context with variable kinds if we have a logical plan
         let tx_ctx = context_plan.map(|p| self.translation_context_for_plan(p));
-        let mut window_expr_list = Vec::new();
+        // Each window with its OWN required input ordering. Two windows with
+        // conflicting ORDER BY (e.g. one ASC, one DESC) cannot share a single
+        // SortExec — evaluating the second over the first's ordering silently
+        // produces wrong ranks. So we sort per window (see the chaining below).
+        let mut window_specs: Vec<(
+            std::sync::Arc<dyn datafusion::physical_expr::window::WindowExpr>,
+            Vec<datafusion::physical_expr::PhysicalSortExpr>,
+        )> = Vec::new();
 
         for expr in window_exprs {
             let Expr::FunctionCall {
@@ -5571,7 +5589,25 @@ impl HybridPhysicalPlanner {
                     false,
                 ),
                 "nth_value" => (WindowFunctionDefinition::WindowUDF(nth_value_udwf()), false),
-                other => return Err(anyhow!("Unsupported window function: {}", other)),
+                other => {
+                    // Fall through to a registered plugin window function.
+                    // Resolve the (possibly dotted) name against the registry via
+                    // every namespace/local split, mirroring the aggregate path.
+                    let resolved = uni_plugin::QName::candidate_splits(other)
+                        .find_map(|q| self.plugin_registry.window(&q).map(|e| (q, e)));
+                    match resolved {
+                        Some((qname, entry)) => {
+                            let udwf = datafusion::logical_expr::WindowUDF::from(
+                                crate::query::df_udwf_plugin::PluginWindowUdwf::new(
+                                    qname.to_string(),
+                                    &entry,
+                                ),
+                            );
+                            (WindowFunctionDefinition::WindowUDF(Arc::new(udwf)), false)
+                        }
+                        None => return Err(anyhow!("Unsupported window function: {}", other)),
+                    }
+                }
             };
 
             // Translate argument expressions to physical expressions
@@ -5705,77 +5741,56 @@ impl HybridPhysicalPlanner {
                 None, // filter
             )?;
 
-            window_expr_list.push(window_expr);
-        }
-
-        // WindowAggExec requires input to be sorted by partition columns + order by columns.
-        // Create a SortExec to ensure proper ordering.
-        let mut sort_exprs = Vec::new();
-
-        // Add partition columns to sort (must be sorted by partition first)
-        for expr in window_exprs {
-            if let Expr::FunctionCall {
-                window_spec: Some(window_spec),
-                ..
-            } = expr
-            {
-                for partition_expr in &window_spec.partition_by {
-                    let df_expr = cypher_expr_to_df(partition_expr, tx_ctx.as_ref())?;
-                    let physical_expr =
-                        create_physical_expr(&df_expr, &df_schema, state.execution_props())?;
-
-                    // Only add if not already in sort list
-                    // Use display comparison as proxy for equality since PhysicalExpr doesn't implement Eq
-                    if !sort_exprs
-                        .iter()
-                        .any(|s: &datafusion::physical_expr::PhysicalSortExpr| {
-                            s.expr.to_string() == physical_expr.to_string()
-                        })
-                    {
-                        sort_exprs.push(datafusion::physical_expr::PhysicalSortExpr {
-                            expr: physical_expr,
-                            options: datafusion::arrow::compute::SortOptions {
-                                descending: false,
-                                nulls_first: false,
-                            },
-                        });
-                    }
-                }
-
-                // Then add order by columns
-                for sort_item in &window_spec.order_by {
-                    let df_expr = cypher_expr_to_df(&sort_item.expr, tx_ctx.as_ref())?;
-                    let physical_expr =
-                        create_physical_expr(&df_expr, &df_schema, state.execution_props())?;
-
-                    sort_exprs.push(datafusion::physical_expr::PhysicalSortExpr {
-                        expr: physical_expr,
-                        options: datafusion::arrow::compute::SortOptions {
-                            descending: !sort_item.ascending,
-                            nulls_first: !sort_item.ascending,
-                        },
-                    });
+            // This window's required input ordering: PARTITION BY columns first
+            // (as ascending sorts), then its ORDER BY. Captured per window so each
+            // gets its own SortExec below.
+            let mut required_ordering: Vec<datafusion::physical_expr::PhysicalSortExpr> =
+                Vec::new();
+            for p in &partition_by_physical {
+                required_ordering.push(datafusion::physical_expr::PhysicalSortExpr {
+                    expr: Arc::clone(p),
+                    options: datafusion::arrow::compute::SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                });
+            }
+            for ob in &order_by_physical {
+                if !required_ordering
+                    .iter()
+                    .any(|s| s.expr.to_string() == ob.expr.to_string())
+                {
+                    required_ordering.push(ob.clone());
                 }
             }
+
+            window_specs.push((window_expr, required_ordering));
         }
 
-        // Add SortExec before WindowAggExec if we have partition or order by columns
-        let sorted_input = if !sort_exprs.is_empty() {
-            let lex_ordering = LexOrdering::new(sort_exprs)
-                .ok_or_else(|| anyhow!("Failed to create LexOrdering for window function"))?;
-            Arc::new(SortExec::new(lex_ordering, input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
+        // Chain one SortExec + WindowAggExec per window, so each window is
+        // evaluated over ITS OWN required ordering. A prior version concatenated
+        // every window's PARTITION/ORDER BY into a single SortExec, which cannot
+        // satisfy two windows with conflicting ORDER BY — the second was silently
+        // computed over the first's ordering. (Grouping windows that share an
+        // ordering would be a perf optimization; correctness needs only per-window
+        // sorting, and each WindowAggExec preserves the columns the next sorts on.)
+        let mut plan = input;
+        for (window_expr, ordering) in window_specs {
+            let sorted_input = if ordering.is_empty() {
+                plan
+            } else {
+                let lex_ordering = LexOrdering::new(ordering)
+                    .ok_or_else(|| anyhow!("Failed to create LexOrdering for window function"))?;
+                Arc::new(SortExec::new(lex_ordering, plan)) as Arc<dyn ExecutionPlan>
+            };
+            plan = Arc::new(WindowAggExec::try_new(
+                vec![window_expr],
+                sorted_input,
+                false, // can_repartition - keep data on current partitions
+            )?);
+        }
 
-        // Create WindowAggExec
-        let window_agg_exec = WindowAggExec::try_new(
-            window_expr_list,
-            sorted_input,
-            false, // can_repartition - keep data on current partitions
-        )?;
-
-        Ok(Arc::new(window_agg_exec))
+        Ok(plan)
     }
 
     /// Plan an empty input that produces exactly one row.
@@ -6503,6 +6518,11 @@ fn resolve_fold_bindings(
                             "COLLECT" => smol_str::SmolStr::new_static("COLLECT"),
                             "MNOR" => smol_str::SmolStr::new_static("MNOR"),
                             "MPROD" => smol_str::SmolStr::new_static("MPROD"),
+                            // Plugin-namespaced custom aggregate (dotted
+                            // name, e.g. `myplugin.MYAGG`): pass through raw
+                            // so `resolve_locy_aggregate` resolves it by
+                            // namespace. Bare unknown names remain errors.
+                            _ if name.contains('.') => smol_str::SmolStr::new(name.as_str()),
                             other => {
                                 return Err(anyhow::anyhow!(
                                     "Unsupported FOLD aggregate function: {}",

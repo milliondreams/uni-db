@@ -25,6 +25,7 @@
 
 // Rust guideline compliant
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -114,15 +115,19 @@ pub struct ForkScope {
     /// ground truth; this counter is only a flush-time accumulator.
     fragment_counts: Arc<DashMap<String, u64>>,
     /// Phase 5a: registry of completed fork-local index builds.
-    /// Keyed on `(label, column)`; value is the index kind that was
-    /// built. Read by the planner's `fork_index_exists` check to
-    /// decide whether to emit `FusedIndexScan`. Written by the
-    /// `IndexRebuildManager` after a fork-local build completes.
-    /// In-memory only — a restart re-detects existing fork-local
-    /// indexes by listing the fork's branch directory once at
-    /// `Uni::open` time (Phase 5a uses lazy first-touch detection;
-    /// see `repopulate_indexes_from_disk`).
-    fork_local_indexes: Arc<DashMap<(String, String), ForkLocalIndexKind>>,
+    /// Keyed on `(label, column)`; value is the SET of index kinds
+    /// built for that pair. A single column can carry several kinds
+    /// simultaneously (e.g. a `ScalarBtree` for equality plus a
+    /// `FullText` for search), so this must be a set — a single-value
+    /// map would let one build clobber another and the auto-builder
+    /// would ping-pong between them forever. Read by the planner's
+    /// `has_fork_index` check to decide whether to emit a specific
+    /// `FusedIndexScan`. Written by the `IndexRebuildManager` after a
+    /// fork-local build completes. In-memory only — a restart
+    /// re-detects existing fork-local indexes by listing the fork's
+    /// branch directory once at `Uni::open` time (Phase 5a uses lazy
+    /// first-touch detection; see `repopulate_indexes_from_disk`).
+    fork_local_indexes: Arc<DashMap<(String, String), HashSet<ForkLocalIndexKind>>>,
     /// RAII guard. Lifetime-tied to this `ForkScope`. Cloning the
     /// containing `Arc<ForkScope>` does *not* increment the holder
     /// count — only the constructor does, via `register_holder`.
@@ -204,26 +209,42 @@ impl ForkScope {
     /// the fork's branch.
     pub fn register_fork_local_index(&self, label: &str, column: &str, kind: ForkLocalIndexKind) {
         self.fork_local_indexes
-            .insert((label.to_string(), column.to_string()), kind);
+            .entry((label.to_string(), column.to_string()))
+            .or_default()
+            .insert(kind);
     }
 
-    /// Phase 5a: lookup the fork-local index kind for a `(label,
-    /// column)` pair, if one has been built. Returns `None` when
+    /// Phase 5a: whether a fork-local index of `kind` has been built
+    /// for a `(label, column)` pair. Distinct kinds coexist on one
+    /// column, so the planner asks for the specific kind it wants to
+    /// fuse rather than a single stored value. Returns `false` when
     /// the planner should fall back to the inherited primary index
     /// (or to a plain scan).
     #[must_use]
-    pub fn fork_local_index(&self, label: &str, column: &str) -> Option<ForkLocalIndexKind> {
+    pub fn has_fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+        kind: ForkLocalIndexKind,
+    ) -> bool {
         self.fork_local_indexes
             .get(&(label.to_string(), column.to_string()))
-            .map(|r| *r.value())
+            .is_some_and(|r| r.value().contains(&kind))
     }
 
-    /// Phase 5a: snapshot of every registered fork-local index.
+    /// Phase 5a: snapshot of every registered fork-local index, one
+    /// `(label, column)` → `kind` tuple per built kind.
     #[must_use]
     pub fn all_fork_local_indexes(&self) -> Vec<((String, String), ForkLocalIndexKind)> {
         self.fork_local_indexes
             .iter()
-            .map(|r| (r.key().clone(), *r.value()))
+            .flat_map(|r| {
+                let key = r.key().clone();
+                r.value()
+                    .iter()
+                    .map(move |kind| (key.clone(), *kind))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 

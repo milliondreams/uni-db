@@ -10,6 +10,8 @@
 pub mod branched;
 pub mod capabilities;
 #[cfg(feature = "lance-backend")]
+pub mod fts_analyzer;
+#[cfg(feature = "lance-backend")]
 pub mod lance;
 #[cfg(feature = "lance-backend")]
 pub mod lance_branch;

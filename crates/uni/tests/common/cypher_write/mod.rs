@@ -18,5 +18,6 @@ pub mod partial_lance_delete_test;
 pub mod partial_lance_edges_test;
 pub mod partial_lance_writes_test;
 pub mod plan_cache_param_fold_test;
+pub mod point_type_test;
 pub mod set_projection_test;
 pub mod tx_plan_cache_test;

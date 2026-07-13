@@ -16,7 +16,7 @@ use std::time::Instant;
 use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, Expr};
 use uni_cypher::locy_ast::{
-    LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput, resolve_yield_column_names,
+    GeneratorRef, LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput, resolve_yield_column_names,
 };
 use uni_locy::types::{CompiledClause, CompiledRule};
 use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
@@ -226,8 +226,12 @@ impl<'a> SLGResolver<'a> {
                 .await?;
                 self.stats.queries_executed += 1;
 
+                // Explode any generator predicates (1:N) before projection, so
+                // their bound output variables are present as columns.
+                let rows = apply_generators(rows, clause)?;
+
                 // Apply YIELD projections to compute non-key columns.
-                let mut projected = apply_yield_projections(rows, clause);
+                let mut projected = apply_yield_projections(rows, clause)?;
 
                 // Multiply __prob_complement_* columns into the PROB column.
                 // This must happen AFTER yield projections because YIELD
@@ -266,8 +270,11 @@ impl<'a> SLGResolver<'a> {
                 self.stats.queries_executed += 1;
                 let raw_rows = record_batches_to_locy_rows(&raw_batches);
 
+                // Explode any generator predicates (1:N) before projection.
+                let raw_rows = apply_generators(raw_rows, clause)?;
+
                 // Apply YIELD projections to compute non-key columns.
-                let projected = apply_yield_projections(raw_rows, clause);
+                let projected = apply_yield_projections(raw_rows, clause)?;
                 all_answers.extend(projected);
             }
         }
@@ -374,10 +381,76 @@ fn locy_expr_to_cypher(locy: &LocyExpr) -> Option<Expr> {
 /// property accesses (`n.val AS v`), computed expressions (`1.0 - n.val AS sev`),
 /// or literal constants (`0.5 AS lit`).  This function evaluates each clause's
 /// YIELD items against the raw rows to produce the projected columns.
-fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> Vec<FactRow> {
+/// Explode generator predicates (`name(args) -> (out…)`) in a clause: for each
+/// input row, evaluate every generator's input args, dispatch it to the
+/// registered [`LocyGenerator`], and emit one widened row per generated tuple
+/// (the parent row plus the generator's bound output columns). Multiple
+/// generators compose left-to-right (each explodes the previous result).
+///
+/// A clause with no generator conditions returns its rows unchanged.
+///
+/// # Errors
+/// Returns an error if a generator is not registered, or returns a tuple whose
+/// arity differs from its declared output-variable count.
+fn apply_generators(
+    rows: Vec<FactRow>,
+    clause: &CompiledClause,
+) -> Result<Vec<FactRow>, LocyError> {
+    let generators: Vec<&GeneratorRef> = clause
+        .where_conditions
+        .iter()
+        .filter_map(|c| match c {
+            RuleCondition::Generator(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    if generators.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut current = rows;
+    for generator in generators {
+        let mut next = Vec::new();
+        for row in &current {
+            let args = generator
+                .args
+                .iter()
+                .map(|a| eval_expr(a, row))
+                .collect::<Result<Vec<Value>, LocyError>>()?;
+            let tuples = super::locy_eval::dispatch_locy_generator(&generator.name, &args)
+                .ok_or_else(|| LocyError::EvaluationError {
+                    message: format!("generator '{}' is not registered", generator.name),
+                })??;
+            for tuple in tuples {
+                if tuple.len() != generator.outputs.len() {
+                    return Err(LocyError::EvaluationError {
+                        message: format!(
+                            "generator '{}' returned {} values but binds {} output variable(s)",
+                            generator.name,
+                            tuple.len(),
+                            generator.outputs.len()
+                        ),
+                    });
+                }
+                let mut widened = row.clone();
+                for (var, val) in generator.outputs.iter().zip(tuple) {
+                    widened.insert(var.clone(), val);
+                }
+                next.push(widened);
+            }
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+fn apply_yield_projections(
+    raw_rows: Vec<FactRow>,
+    clause: &CompiledClause,
+) -> Result<Vec<FactRow>, LocyError> {
     let yield_items = match &clause.output {
         RuleOutput::Yield(yc) => &yc.items,
-        _ => return raw_rows,
+        _ => return Ok(raw_rows),
     };
 
     // Projection is required when any YIELD item needs expression evaluation:
@@ -390,7 +463,7 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
         .iter()
         .any(|item| !item.is_key || !matches!(&item.expr, Expr::Variable(_)));
     if !needs_projection {
-        return raw_rows;
+        return Ok(raw_rows);
     }
 
     // De-collided output names, shared with the type checker and planner so the
@@ -399,7 +472,7 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
 
     raw_rows
         .into_iter()
-        .map(|raw_row| {
+        .map(|raw_row| -> Result<FactRow, LocyError> {
             let mut projected = FactRow::new();
             for (item, name) in yield_items.iter().zip(names.iter()) {
                 let name = name.clone();
@@ -418,25 +491,15 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                         // KEY variable might be the graph entity itself
                         projected.insert(name, val.clone());
                     } else {
-                        match eval_expr(&item.expr, &raw_row) {
-                            Ok(val) => {
-                                projected.insert(name, val);
-                            }
-                            Err(_) => {
-                                projected.insert(name, Value::Null);
-                            }
-                        }
+                        // A property-access or expression KEY. Propagate an
+                        // evaluation error rather than silently masking it as
+                        // Null (which previously hid unsupported expressions).
+                        projected.insert(name, eval_expr(&item.expr, &raw_row)?);
                     }
                 } else {
-                    // Non-key columns: evaluate the YIELD expression against the raw row
-                    match eval_expr(&item.expr, &raw_row) {
-                        Ok(val) => {
-                            projected.insert(name, val);
-                        }
-                        Err(_) => {
-                            projected.insert(name, Value::Null);
-                        }
-                    }
+                    // Non-key columns: evaluate the YIELD expression against the
+                    // raw row. Propagate errors (see KEY branch above).
+                    projected.insert(name, eval_expr(&item.expr, &raw_row)?);
                 }
             }
 
@@ -455,18 +518,25 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                 if !projected.contains_key(&along.name)
                     && let Some(cypher_expr) = locy_expr_to_cypher(&along.expr)
                 {
-                    match eval_expr(&cypher_expr, &raw_row) {
-                        Ok(val) => {
-                            projected.insert(along.name.clone(), val);
-                        }
-                        Err(_) => {
-                            projected.insert(along.name.clone(), Value::Null);
+                    projected.insert(along.name.clone(), eval_expr(&cypher_expr, &raw_row)?);
+                }
+            }
+
+            // Carry through generator-bound output variables (already present in
+            // the exploded rows from `apply_generators`), like ALONG bindings.
+            for cond in &clause.where_conditions {
+                if let RuleCondition::Generator(g) = cond {
+                    for out in &g.outputs {
+                        if !projected.contains_key(out)
+                            && let Some(v) = raw_row.get(out)
+                        {
+                            projected.insert(out.clone(), v.clone());
                         }
                     }
                 }
             }
 
-            projected
+            Ok(projected)
         })
         .collect()
 }
@@ -485,6 +555,16 @@ fn store_derived_facts(
         for along in &clause.along {
             if !all_columns.contains(&along.name) {
                 all_columns.push(along.name.clone());
+            }
+        }
+        // Generator-bound output variables are output columns of the rule too.
+        for cond in &clause.where_conditions {
+            if let RuleCondition::Generator(g) = cond {
+                for out in &g.outputs {
+                    if !all_columns.contains(out) {
+                        all_columns.push(out.clone());
+                    }
+                }
             }
         }
     }

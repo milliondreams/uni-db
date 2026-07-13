@@ -10,8 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{
-    EmbeddingConfig, FullTextIndexConfig, IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig,
-    ScalarIndexType, Schema, SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
+    AnalyzerConfig, BaseTokenizer, EmbeddingConfig, FtsLanguage, FullTextIndexConfig,
+    IndexDefinition, JsonFtsIndexConfig, ScalarIndexConfig, ScalarIndexType, Schema,
+    SparseVectorIndexConfig, TokenizerConfig, VectorIndexConfig,
 };
 use uni_cypher::ast::{
     AlterEdgeType, AlterLabel, BinaryOp, CallKind, Clause, CreateConstraint, CreateEdgeType,
@@ -1845,8 +1846,8 @@ pub enum LogicalPlan {
     },
     /// Phase 5a-impl: fused scan over both primary's index and the
     /// forked session's fork-local index. Emitted by the planner only
-    /// when (a) the session is forked AND (b) `StorageManager::fork_index_exists`
-    /// returns `Some(_)` for the target column. Otherwise the planner
+    /// when (a) the session is forked AND (b) `StorageManager::has_fork_index`
+    /// returns `true` for the target column and fusion kind. Otherwise the planner
     /// keeps emitting `Scan` and Lance's `base_paths` chain transparently
     /// covers parent-inherited indexes.
     ///
@@ -2507,6 +2508,25 @@ struct TraverseParams<'a> {
     /// All variables from this OPTIONAL MATCH pattern.
     /// Used to ensure multi-hop patterns correctly NULL all vars when any hop fails.
     optional_pattern_vars: HashSet<String>,
+}
+
+/// Which `plan_where_clause` rewriter a reachability check is standing in for.
+///
+/// Each predicate/label/KNN rewriter recurses through a fixed set of
+/// "transparent" plan nodes and its own base node, falling through
+/// `other => other` for everything else. [`QueryPlanner::rewrite_target_reachable`]
+/// mirrors exactly that per-rewriter descent so consumption of a predicate can be
+/// gated on whether the rewriter can actually apply it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteTarget {
+    /// `replace_scan_with_knn`: base `Scan(var)`; descends Filter/Project/Limit/CrossJoin.
+    Knn,
+    /// `push_predicate_to_scan`: base `Scan|ScanAll(var)`; descends Filter/Project/CrossJoin/Traverse.
+    Scan,
+    /// `replace_scan_all_with_label_union`: base `ScanAll(var)`; descends Filter/Project/CrossJoin/Traverse.
+    LabelUnion,
+    /// `push_predicate_to_traverse`: base `Traverse(target==var)`; descends Filter/Project/CrossJoin/Traverse.
+    TraverseTarget,
 }
 
 impl QueryPlanner {
@@ -3265,7 +3285,12 @@ impl QueryPlanner {
             };
         }
 
-        if return_clause.skip.is_some() || return_clause.limit.is_some() {
+        // SKIP/LIMIT are parsed here (so a bad expression errors early and the
+        // folded-param note is recorded) but the `Limit` node is added AFTER the
+        // Project/Distinct below: openCypher applies SKIP/LIMIT to the DISTINCT
+        // result, not to the pre-deduplication rows. Adding it here would `LIMIT`
+        // before `DISTINCT` and return too few (or wrong) rows.
+        let skip_limit = if return_clause.skip.is_some() || return_clause.limit.is_some() {
             let skip = return_clause
                 .skip
                 .as_ref()
@@ -3284,13 +3309,10 @@ impl QueryPlanner {
                 })
                 .transpose()?
                 .flatten();
-
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                skip,
-                fetch,
-            };
-        }
+            Some((skip, fetch))
+        } else {
+            None
+        };
 
         if !projections.is_empty() {
             // If we created an Aggregate or Window node, we need to adjust the final projections
@@ -3351,6 +3373,15 @@ impl QueryPlanner {
         if return_clause.distinct {
             plan = LogicalPlan::Distinct {
                 input: Box::new(plan),
+            };
+        }
+
+        // SKIP/LIMIT last — applied to the projected, deduplicated rows.
+        if let Some((skip, fetch)) = skip_limit {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                skip,
+                fetch,
             };
         }
 
@@ -3560,6 +3591,22 @@ impl QueryPlanner {
                                     subquery: Box::new(proc_plan),
                                     input_filter: None,
                                 };
+                            }
+
+                            // Apply a post-YIELD WHERE predicate. The grammar nests
+                            // `WHERE <expr>` inside `yield_clause` (cypher.pest), so
+                            // `CALL ... YIELD ... WHERE ...` stores the predicate on
+                            // the CALL node rather than as a standalone clause. Without
+                            // consuming it here it was silently dropped, returning
+                            // unfiltered rows. Mirrors the MATCH-WHERE (plan_where_clause)
+                            // and WITH-WHERE handling. YIELD vars are already in scope.
+                            if let Some(predicate) = &call_clause.where_clause {
+                                plan = self.plan_where_clause(
+                                    predicate,
+                                    plan,
+                                    &vars_in_scope,
+                                    HashSet::new(),
+                                )?;
                             }
                         }
                         CallKind::Subquery(query) => {
@@ -4360,6 +4407,18 @@ impl QueryPlanner {
                 "shortestPath requires at least one relationship: (a)-[*]->(b)"
             ));
         }
+        // Only a single (source)-[rel]->(target) hop is planned below — the
+        // planner reads elements[0..3] and ignores any further hops. Reject a
+        // multi-hop shortestPath rather than SILENTLY dropping the extra
+        // relationship/node constraints (which would return wrong matches). This
+        // mirrors Neo4j, which rejects a multi-relationship shortestPath pattern.
+        if elements.len() > 3 {
+            return Err(anyhow!(
+                "shortestPath supports a single relationship pattern \
+                 (a)-[*]->(b); a multi-hop pattern with intermediate nodes is \
+                 not supported"
+            ));
+        }
 
         let source_node = match &elements[0] {
             PatternElement::Node(n) => n,
@@ -5116,6 +5175,15 @@ impl QueryPlanner {
 
                     // Skip the outer target node if we consumed it
                     if outer_target_node.is_some() {
+                        // This QPP consumed the following outer node as its target.
+                        // A subsequent consecutive QPP must anchor at THAT node, not
+                        // the stale earlier source — so advance last_outer_node_var
+                        // to the consumed target's variable (only the Node arm did
+                        // this before, so `(a)(qpp1)(b)(qpp2)(c)` wrongly anchored
+                        // qpp2 at `a`).
+                        if let Some(v) = target_node.variable.as_ref().filter(|v| !v.is_empty()) {
+                            last_outer_node_var = Some(v.clone());
+                        }
                         i += 2; // skip both Parenthesized and the following Node
                     } else {
                         i += 1;
@@ -6127,7 +6195,10 @@ impl QueryPlanner {
         // 1. Try to extract vector_similarity predicate for optimization
         if let Some(extraction) = extract_vector_similarity(&current_predicate) {
             let vs = &extraction.predicate;
-            if Self::find_scan_label_id(&plan, &vs.variable).is_some() {
+            // Only consume the vector predicate if the KNN rewriter can actually
+            // reach the Scan; otherwise leave it in `current_predicate` so it
+            // becomes a residual Filter instead of being silently dropped.
+            if Self::rewrite_target_reachable(&plan, &vs.variable, RewriteTarget::Knn) {
                 plan = Self::replace_scan_with_knn(
                     plan,
                     &vs.variable,
@@ -6162,7 +6233,11 @@ impl QueryPlanner {
                     continue;
                 }
                 // Node label disjunction → Union of label-scoped Scans.
-                if Self::is_scan_all_for(&plan, &var.name)
+                // Gate on reachability by the label-union rewriter (not the
+                // laxer `is_scan_all_for`), so a `ScanAll` sitting under a
+                // Sort/Limit/Aggregate/Apply/Union — which the rewriter can't
+                // rebuild — leaves the conjunct in `keep` as a residual Filter.
+                if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::LabelUnion)
                     && let Some(labels) = try_label_or_to_union(&conj, &var.name)
                 {
                     plan = self.replace_scan_all_with_label_union(plan, &var.name, &labels, false);
@@ -6207,8 +6282,12 @@ impl QueryPlanner {
                 continue;
             }
 
-            // Check if var is produced by a Scan
-            if Self::find_scan_label_id(&plan, &var.name).is_some() {
+            // Check if var is produced by a Scan the pushdown rewriter can reach.
+            // Gate on `rewrite_target_reachable` (not the laxer
+            // `find_scan_label_id`), so a scan under Sort/Limit/Aggregate/Apply —
+            // which `push_predicate_to_scan` can't rebuild — keeps its predicate
+            // in `current_predicate` as a residual Filter instead of dropping it.
+            if Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::Scan) {
                 let (pushable, residual) =
                     Self::extract_variable_predicates(&current_predicate, &var.name);
 
@@ -6221,8 +6300,12 @@ impl QueryPlanner {
                 } else {
                     current_predicate = Expr::TRUE;
                 }
-            } else if Self::is_traverse_target(&plan, &var.name) {
-                // Push to Traverse
+            } else if Self::rewrite_target_reachable(
+                &plan,
+                &var.name,
+                RewriteTarget::TraverseTarget,
+            ) {
+                // Push to Traverse (same reachability discipline).
                 let (pushable, residual) =
                     Self::extract_variable_predicates(&current_predicate, &var.name);
 
@@ -7261,13 +7344,10 @@ impl QueryPlanner {
             .transpose()?
             .flatten();
 
-        if skip.is_some() || fetch.is_some() {
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                skip,
-                fetch,
-            };
-        }
+        // SKIP/LIMIT applied to the DISTINCT result — the `Limit` node is added
+        // AFTER the Distinct below, not here (openCypher applies it to the
+        // deduplicated rows, not the pre-distinct ones).
+        let skip_limit = (skip.is_some() || fetch.is_some()).then_some((skip, fetch));
 
         // Strip passthrough columns that were only needed by WHERE / ORDER BY.
         if needs_cleanup {
@@ -7284,6 +7364,15 @@ impl QueryPlanner {
         if with_clause.distinct {
             plan = LogicalPlan::Distinct {
                 input: Box::new(plan),
+            };
+        }
+
+        // SKIP/LIMIT last — applied to the projected, deduplicated rows.
+        if let Some((skip, fetch)) = skip_limit {
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                skip,
+                fetch,
             };
         }
 
@@ -7619,6 +7708,67 @@ impl QueryPlanner {
             | LogicalPlan::CreateConstraint(_)
             | LogicalPlan::DropConstraint(_)
             | LogicalPlan::ShowConstraints(_) => None,
+        }
+    }
+
+    /// Whether the given rewriter can actually reach its target node for `variable`.
+    ///
+    /// The `plan_where_clause` gates (`find_scan_label_id` / `is_scan_all_for` /
+    /// `is_traverse_target`) descend Sort/Limit/Aggregate/Apply/Union, but the
+    /// sibling rewriters do NOT rebuild those nodes — they fall through
+    /// `other => other`. So a predicate whose target sits under one of those
+    /// nodes is marked "consumed" by the gate yet silently not applied, dropping
+    /// the WHERE/label/vector predicate. Consumption must instead be gated on
+    /// this check, which descends only the "transparent" nodes each rewriter
+    /// actually rebuilds — so an unreachable predicate stays in the residual and
+    /// becomes a correct (if unoptimized) `Filter`. Keep the descent arms here in
+    /// lockstep with the matching rewriter.
+    fn rewrite_target_reachable(plan: &LogicalPlan, variable: &str, target: RewriteTarget) -> bool {
+        // Base-node match (the node the rewriter actually rewrites).
+        match plan {
+            LogicalPlan::Scan { variable: var, .. } if var == variable => {
+                if matches!(target, RewriteTarget::Knn | RewriteTarget::Scan) {
+                    return true;
+                }
+            }
+            LogicalPlan::ScanAll { variable: var, .. } if var == variable => {
+                if matches!(target, RewriteTarget::Scan | RewriteTarget::LabelUnion) {
+                    return true;
+                }
+            }
+            LogicalPlan::Traverse {
+                target_variable, ..
+            } if target_variable == variable => {
+                if matches!(target, RewriteTarget::TraverseTarget) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        // Transparent descent — each rewriter's recursive arms, and no more.
+        match plan {
+            LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            // Only `replace_scan_with_knn` recurses through `Limit`.
+            LogicalPlan::Limit { input, .. } if matches!(target, RewriteTarget::Knn) => {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            // Scan/label-union/traverse-target rewriters recurse through `Traverse`;
+            // the KNN rewriter does not.
+            LogicalPlan::Traverse { input, .. }
+                if matches!(
+                    target,
+                    RewriteTarget::Scan | RewriteTarget::LabelUnion | RewriteTarget::TraverseTarget
+                ) =>
+            {
+                Self::rewrite_target_reachable(input, variable, target)
+            }
+            LogicalPlan::CrossJoin { left, right } => {
+                Self::rewrite_target_reachable(left, variable, target)
+                    || Self::rewrite_target_reachable(right, variable, target)
+            }
+            _ => false,
         }
     }
 
@@ -8083,6 +8233,57 @@ impl QueryPlanner {
 
     /// Extract predicates that only reference variables from Apply's input.
     /// Returns (input_only_predicates, remaining_predicates).
+    /// Whether an operand is one the Apply `input_filter` evaluator can resolve.
+    ///
+    /// `df_graph::apply::resolve_expr_value` resolves only literals, bare
+    /// variables, and `var.key` properties; anything else resolves to `Null`.
+    fn apply_operand_supported(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(_) | Expr::Variable(_) => true,
+            Expr::Property(base, _) => matches!(base.as_ref(), Expr::Variable(_)),
+            _ => false,
+        }
+    }
+
+    /// Whether `expr` is a shape the Apply `input_filter` evaluator handles.
+    ///
+    /// `df_graph::apply::evaluate_filter` handles And/Or/Not over comparisons
+    /// (`Eq`/`NotEq`/`Lt`/`LtEq`/`Gt`/`GtEq`) whose operands pass
+    /// [`Self::apply_operand_supported`], plus a bare truth test on such an
+    /// operand. EVERY other operator or shape (STARTS WITH, CONTAINS, IN,
+    /// arithmetic, CASE, regex, function calls) silently evaluates to
+    /// `false`/`Null` there — and `NOT <unsupported>` inverts to `true`. Such
+    /// predicates must NOT be pushed into `input_filter`; they stay as a residual
+    /// `Filter` that evaluates them correctly. Keep in lockstep with
+    /// `df_graph/apply.rs`.
+    fn apply_input_filter_supported(expr: &Expr) -> bool {
+        use uni_cypher::ast::{BinaryOp, UnaryOp};
+        match expr {
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOp::And | BinaryOp::Or => {
+                    Self::apply_input_filter_supported(left)
+                        && Self::apply_input_filter_supported(right)
+                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => {
+                    Self::apply_operand_supported(left) && Self::apply_operand_supported(right)
+                }
+                _ => false,
+            },
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr,
+            } => Self::apply_input_filter_supported(expr),
+            // Bare truth test: the evaluator's catch-all resolves the value and
+            // reads `.as_bool()`, which is only meaningful for these operands.
+            other => Self::apply_operand_supported(other),
+        }
+    }
+
     fn extract_apply_input_predicates(
         predicate: &Expr,
         input_variables: &HashSet<String>,
@@ -8099,7 +8300,15 @@ impl QueryPlanner {
             let refs_input_only = vars.iter().all(|v| input_variables.contains(v));
             let refs_any_subquery = vars.iter().any(|v| subquery_new_variables.contains(v));
 
-            if refs_input_only && !refs_any_subquery && !vars.is_empty() {
+            // Only push shapes the input_filter evaluator can evaluate correctly;
+            // otherwise leave the conjunct as a residual Filter (which handles the
+            // full expression grammar) rather than have the evaluator silently
+            // mis-evaluate it to `false`.
+            if refs_input_only
+                && !refs_any_subquery
+                && !vars.is_empty()
+                && Self::apply_input_filter_supported(&conj)
+            {
                 input_preds.push(conj);
             } else {
                 remaining.push(conj);
@@ -8696,17 +8905,20 @@ impl QueryPlanner {
                     if_not_exists: c.if_not_exists,
                 })
             }
-            SchemaCommand::CreateFullTextIndex(cfg) => Ok(LogicalPlan::CreateFullTextIndex {
-                config: FullTextIndexConfig {
-                    name: cfg.name,
-                    label: cfg.label,
-                    properties: cfg.properties,
-                    tokenizer: TokenizerConfig::Standard,
-                    with_positions: true,
-                    metadata: Default::default(),
-                },
-                if_not_exists: cfg.if_not_exists,
-            }),
+            SchemaCommand::CreateFullTextIndex(cfg) => {
+                let tokenizer = Self::parse_tokenizer_options(&cfg.options)?;
+                Ok(LogicalPlan::CreateFullTextIndex {
+                    config: FullTextIndexConfig {
+                        name: cfg.name,
+                        label: cfg.label,
+                        properties: cfg.properties,
+                        tokenizer,
+                        with_positions: true,
+                        metadata: Default::default(),
+                    },
+                    if_not_exists: cfg.if_not_exists,
+                })
+            }
             SchemaCommand::CreateScalarIndex(cfg) => {
                 // Convert expressions to storage strings (strip variable prefix)
                 let properties: Vec<String> = cfg
@@ -8781,6 +8993,167 @@ impl QueryPlanner {
                 options: cmd.options,
             }),
         }
+    }
+
+    /// Parse `CREATE FULLTEXT INDEX ... OPTIONS { ... }` into a [`TokenizerConfig`].
+    ///
+    /// With no analyzer-related options the result is [`TokenizerConfig::Standard`]
+    /// (the unchanged default). Recognized keys:
+    /// `analyzer`/`tokenizer` (base tokenizer name), `language`, `stemmer`/`stem`,
+    /// `stopwords` (bool or explicit list), `ascii_folding`, `lower_case`,
+    /// `max_token_length`, `ngram_min`/`ngram_max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown `language`, an unusable `ngram_min`/`ngram_max`
+    /// range, or an option value of the wrong type.
+    fn parse_tokenizer_options(
+        options: &std::collections::HashMap<String, Value>,
+    ) -> Result<TokenizerConfig> {
+        // Keys that, when present, opt into the richer analyzer pipeline.
+        const ANALYZER_KEYS: [&str; 11] = [
+            "analyzer",
+            "tokenizer",
+            "language",
+            "stemmer",
+            "stem",
+            "stopwords",
+            "stop_words",
+            "ascii_folding",
+            "lower_case",
+            "max_token_length",
+            "ngram_min",
+        ];
+        let has_ngram_max = options.contains_key("ngram_max");
+        if !has_ngram_max && !ANALYZER_KEYS.iter().any(|k| options.contains_key(*k)) {
+            // No FTS analyzer options → keep the historical default.
+            return Ok(TokenizerConfig::Standard);
+        }
+
+        let base_raw = options
+            .get("analyzer")
+            .or_else(|| options.get("tokenizer"))
+            .and_then(|v| v.as_str());
+        let ngram_min = options.get("ngram_min").and_then(|v| v.as_i64());
+        let ngram_max = options.get("ngram_max").and_then(|v| v.as_i64());
+
+        let base = match base_raw.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("standard") | Some("simple") | None => BaseTokenizer::Simple,
+            Some("whitespace") => BaseTokenizer::Whitespace,
+            Some("raw") | Some("keyword") => BaseTokenizer::Raw,
+            Some("ngram") => {
+                let min = ngram_min.unwrap_or(3);
+                let max = ngram_max.unwrap_or_else(|| min.max(3));
+                if min < 1 || min > max {
+                    return Err(anyhow!(
+                        "invalid ngram options: ngram_min ({min}) must be >= 1 and <= ngram_max ({max})"
+                    ));
+                }
+                BaseTokenizer::Ngram {
+                    min: min as u32,
+                    max: max as u32,
+                }
+            }
+            // Passthrough for backend-native tokenizers (e.g. "jieba/default",
+            // "lindera/ipadic"); preserve the original casing.
+            Some(_) => BaseTokenizer::Custom(base_raw.unwrap().to_string()),
+        };
+
+        let language = match options.get("language").and_then(|v| v.as_str()) {
+            None => FtsLanguage::English,
+            Some(s) => Self::parse_fts_language(s)?,
+        };
+
+        // Filters default to the analyzer's own defaults (all enabled).
+        let defaults = AnalyzerConfig::default();
+        let lower_case = options
+            .get("lower_case")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.lower_case);
+        let stem = options
+            .get("stemmer")
+            .or_else(|| options.get("stem"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.stem);
+        let ascii_folding = options
+            .get("ascii_folding")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.ascii_folding);
+        let max_token_length = options
+            .get("max_token_length")
+            .and_then(|v| v.as_i64())
+            .map(|n| n.max(0) as u32);
+
+        // `stopwords`/`stop_words` accepts either a bool toggle or an explicit
+        // list of stop words (which also enables removal).
+        let stopwords_val = options
+            .get("stopwords")
+            .or_else(|| options.get("stop_words"));
+        let (remove_stop_words, custom_stop_words) = match stopwords_val {
+            None => (defaults.remove_stop_words, None),
+            Some(v) => {
+                if let Some(arr) = v.as_array() {
+                    let words: Vec<String> = arr
+                        .iter()
+                        .filter_map(|w| w.as_str().map(|s| s.to_string()))
+                        .collect();
+                    (true, Some(words))
+                } else if let Some(b) = v.as_bool() {
+                    (b, None)
+                } else {
+                    return Err(anyhow!(
+                        "invalid `stopwords` option: expected a boolean or a list of strings"
+                    ));
+                }
+            }
+        };
+
+        Ok(TokenizerConfig::Analyzer(AnalyzerConfig {
+            base,
+            language,
+            lower_case,
+            stem,
+            remove_stop_words,
+            custom_stop_words,
+            ascii_folding,
+            max_token_length,
+        }))
+    }
+
+    /// Map a language name (case-insensitive) onto an [`FtsLanguage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unrecognized language name.
+    fn parse_fts_language(s: &str) -> Result<FtsLanguage> {
+        let lang = match s.to_ascii_lowercase().as_str() {
+            "arabic" => FtsLanguage::Arabic,
+            "danish" => FtsLanguage::Danish,
+            "dutch" => FtsLanguage::Dutch,
+            "english" => FtsLanguage::English,
+            "finnish" => FtsLanguage::Finnish,
+            "french" => FtsLanguage::French,
+            "german" => FtsLanguage::German,
+            "greek" => FtsLanguage::Greek,
+            "hungarian" => FtsLanguage::Hungarian,
+            "italian" => FtsLanguage::Italian,
+            "norwegian" => FtsLanguage::Norwegian,
+            "portuguese" => FtsLanguage::Portuguese,
+            "romanian" => FtsLanguage::Romanian,
+            "russian" => FtsLanguage::Russian,
+            "spanish" => FtsLanguage::Spanish,
+            "swedish" => FtsLanguage::Swedish,
+            "tamil" => FtsLanguage::Tamil,
+            "turkish" => FtsLanguage::Turkish,
+            other => {
+                return Err(anyhow!(
+                    "unknown FTS language '{other}' (expected one of: arabic, danish, dutch, \
+                     english, finnish, french, german, greek, hungarian, italian, norwegian, \
+                     portuguese, romanian, russian, spanish, swedish, tamil, turkish)"
+                ));
+            }
+        };
+        Ok(lang)
     }
 
     fn parse_embedding_config(emb_val: &Value) -> Result<Option<EmbeddingConfig>> {
@@ -9106,7 +9479,6 @@ fn collect_properties_recursive(
         LogicalPlan::Traverse {
             input,
             target_filter,
-            step_variable: _,
             ..
         } => {
             if let Some(expr) = target_filter {
@@ -9866,44 +10238,55 @@ fn analyze_function_property_requirements(
 /// callers don't need to depend on the fork module directly; tests
 /// can mock by implementing it on a `HashMap`.
 pub trait ForkIndexLookup {
-    fn fork_index_for(
+    /// Whether a fork-local index of `kind` exists for `(label,
+    /// column)`. A column can carry several kinds at once (e.g. a
+    /// `ScalarBtree` for equality plus a `FullText` for search), so
+    /// each fusion site probes for the exact kind it intends to emit
+    /// rather than reading a single stored value.
+    fn fork_index_has(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind>;
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool;
 
     /// Phase 5b followup: resolve a label id, then dispatch to
-    /// `fork_index_for`. Used by the rewrite when wrapping
+    /// `fork_index_has`. Used by the rewrite when wrapping
     /// `VectorKnn` and `InvertedIndexLookup` nodes which carry
     /// `label_id: u16` rather than the label name. Default returns
-    /// `None`; the `StorageManager` impl resolves via its
+    /// `false`; the `StorageManager` impl resolves via its
     /// `schema_manager`.
-    fn fork_index_for_label_id(
+    fn fork_index_has_label_id(
         &self,
         _label_id: u16,
         _column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
-        None
+        _kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
+        false
     }
 }
 
 impl ForkIndexLookup for uni_store::storage::StorageManager {
-    fn fork_index_for(
+    fn fork_index_has(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
-        self.fork_index_exists(label, column)
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
+        self.has_fork_index(label, column, kind)
     }
 
-    fn fork_index_for_label_id(
+    fn fork_index_has_label_id(
         &self,
         label_id: u16,
         column: &str,
-    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> bool {
         let schema = self.schema_manager().schema();
-        let label_name = schema.label_name_by_id(label_id)?;
-        self.fork_index_exists(label_name, column)
+        match schema.label_name_by_id(label_id) {
+            Some(label_name) => self.has_fork_index(label_name, column, kind),
+            None => false,
+        }
     }
 }
 
@@ -10182,9 +10565,20 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                 && let Some(col) = filter
                     .as_ref()
                     .and_then(|f| equality_target_column(f, &variable))
-                && let Some(idx_kind) = lookup.fork_index_for(&labels[0], &col)
             {
-                into_fusion_kind(idx_kind)
+                // Equality-scan fusion only applies to the scalar-equality
+                // kinds (uid-equality first, then btree). A column can carry
+                // several fork-local index kinds (e.g. `ScalarBtree` +
+                // `FullText`), so probe for the equality-appropriate one in a
+                // deterministic order rather than reading whichever value
+                // happened to be stored.
+                [
+                    uni_store::fork::ForkLocalIndexKind::VidUid,
+                    uni_store::fork::ForkLocalIndexKind::ScalarBtree,
+                ]
+                .into_iter()
+                .find(|k| lookup.fork_index_has(&labels[0], &col, *k))
+                .and_then(into_fusion_kind)
             } else {
                 None
             };
@@ -10245,8 +10639,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             k,
             threshold,
         } => {
-            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
-                && let Some(kind) = into_fusion_kind(idx_kind)
+            if lookup.fork_index_has_label_id(
+                label_id,
+                &property,
+                uni_store::fork::ForkLocalIndexKind::Vector,
+            ) && let Some(kind) = into_fusion_kind(uni_store::fork::ForkLocalIndexKind::Vector)
             {
                 LogicalPlan::FusedIndexScanWrapped {
                     inner: Box::new(LogicalPlan::VectorKnn {
@@ -10276,8 +10673,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             property,
             terms,
         } => {
-            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
-                && let Some(kind) = into_fusion_kind(idx_kind)
+            if lookup.fork_index_has_label_id(
+                label_id,
+                &property,
+                uni_store::fork::ForkLocalIndexKind::FullText,
+            ) && let Some(kind) = into_fusion_kind(uni_store::fork::ForkLocalIndexKind::FullText)
             {
                 LogicalPlan::FusedIndexScanWrapped {
                     inner: Box::new(LogicalPlan::InvertedIndexLookup {
@@ -10338,8 +10738,11 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                     [single_sort],
                 ) if labels.len() == 1
                     && let Some(col) = column_of_scan_variable(&single_sort.expr, &variable)
-                    && let Some(uni_store::fork::ForkLocalIndexKind::Sorted) =
-                        lookup.fork_index_for(&labels[0], &col) =>
+                    && lookup.fork_index_has(
+                        &labels[0],
+                        &col,
+                        uni_store::fork::ForkLocalIndexKind::Sorted,
+                    ) =>
                 {
                     LogicalPlan::FusedIndexScan {
                         label_id,
@@ -10425,11 +10828,10 @@ fn procedure_call_fusion_kind<L: ForkIndexLookup>(
         "uni.sparse.query" => uni_store::fork::ForkLocalIndexKind::Sparse,
         _ => return None,
     };
-    let registered = lookup.fork_index_for(label, column)?;
-    if registered != expected {
+    if !lookup.fork_index_has(label, column, expected) {
         return None;
     }
-    into_fusion_kind(registered)
+    into_fusion_kind(expected)
 }
 
 /// Map a fork-local index kind to its planner-side fusion variant.
@@ -10518,6 +10920,113 @@ mod pushdown_tests {
             .cloned()
             .collect();
         assert_eq!(properties.get("e").unwrap(), &e_props);
+    }
+
+    // R6 / uni-query[22]: the Apply input_filter gate must admit ONLY the shapes
+    // the df_graph::apply fast-path evaluator can resolve, and reject every other
+    // operator/shape (which stays as a residual Filter). This is the load-bearing
+    // invariant that keeps the two files in lockstep; guard it directly.
+    #[test]
+    fn apply_input_filter_gate_accepts_only_supported_shapes() {
+        use uni_cypher::ast::{BinaryOp, UnaryOp};
+
+        fn prop(var: &str, key: &str) -> Expr {
+            Expr::Property(Box::new(Expr::Variable(var.into())), key.into())
+        }
+        fn lit_s(s: &str) -> Expr {
+            Expr::Literal(CypherLiteral::String(s.into()))
+        }
+        fn lit_i(i: i64) -> Expr {
+            Expr::Literal(CypherLiteral::Integer(i))
+        }
+        let cmp = |op: BinaryOp, l: Expr, r: Expr| Expr::BinaryOp {
+            left: Box::new(l),
+            op,
+            right: Box::new(r),
+        };
+
+        // ACCEPTED: comparisons over literal/variable/var.key operands, And/Or/Not,
+        // and a bare property truth test.
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Eq,
+            prop("a", "name"),
+            lit_s("Alice")
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Gt,
+            prop("a", "x"),
+            lit_i(10)
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::And,
+            cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Alice")),
+            cmp(BinaryOp::Gt, prop("a", "x"), lit_i(1)),
+        )));
+        assert!(QueryPlanner::apply_input_filter_supported(&Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: Box::new(cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Bob"))),
+        }));
+        assert!(QueryPlanner::apply_input_filter_supported(&prop(
+            "a", "active"
+        )));
+
+        // REJECTED: string operators, regex, arithmetic operand, IN, CASE,
+        // function calls, and NOT/OR wrapping an unsupported shape.
+        for op in [
+            BinaryOp::StartsWith,
+            BinaryOp::EndsWith,
+            BinaryOp::Contains,
+            BinaryOp::Regex,
+        ] {
+            assert!(
+                !QueryPlanner::apply_input_filter_supported(&cmp(
+                    op,
+                    prop("a", "name"),
+                    lit_s("x")
+                )),
+                "string/regex operator must be rejected: {op:?}"
+            );
+        }
+        // Arithmetic operand under a supported comparison.
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Gt,
+            cmp(BinaryOp::Add, prop("a", "x"), lit_i(1)),
+            lit_i(100),
+        )));
+        // IN — dedicated Expr variant.
+        assert!(!QueryPlanner::apply_input_filter_supported(&Expr::In {
+            expr: Box::new(prop("a", "name")),
+            list: Box::new(Expr::List(vec![lit_s("Zed")])),
+        }));
+        // CASE — dedicated Expr variant.
+        assert!(!QueryPlanner::apply_input_filter_supported(&Expr::Case {
+            expr: None,
+            when_then: vec![(lit_s("x"), lit_s("y"))],
+            else_expr: None,
+        }));
+        // Function call as an operand.
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Eq,
+            Expr::FunctionCall {
+                name: "toUpper".into(),
+                args: vec![prop("a", "name")],
+                distinct: false,
+                window_spec: None,
+            },
+            lit_s("ALICE"),
+        )));
+        // NOT / OR wrapping an unsupported shape must not sneak through.
+        assert!(!QueryPlanner::apply_input_filter_supported(
+            &Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr: Box::new(cmp(BinaryOp::Contains, prop("a", "name"), lit_s("li"))),
+            }
+        ));
+        assert!(!QueryPlanner::apply_input_filter_supported(&cmp(
+            BinaryOp::Or,
+            cmp(BinaryOp::Eq, prop("a", "name"), lit_s("Alice")),
+            cmp(BinaryOp::Contains, prop("a", "name"), lit_s("li")),
+        )));
     }
 
     #[test]
@@ -10873,5 +11382,125 @@ mod pushdown_tests {
         let n_props = properties.get("n").expect("n should need embedding");
         assert!(n_props.contains("embedding"));
         assert_eq!(n_props.len(), 1, "only embedding should be projected");
+    }
+}
+
+#[cfg(test)]
+mod fts_tokenizer_option_tests {
+    use super::*;
+    use uni_common::Value;
+    use uni_common::core::schema::{BaseTokenizer, FtsLanguage, TokenizerConfig};
+
+    fn opts(pairs: &[(&str, Value)]) -> std::collections::HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn no_options_yields_standard() {
+        let cfg = QueryPlanner::parse_tokenizer_options(&opts(&[])).unwrap();
+        assert_eq!(cfg, TokenizerConfig::Standard);
+    }
+
+    #[test]
+    fn analyzer_language_stemmer_stopwords_roundtrip() {
+        let o = opts(&[
+            ("analyzer", Value::String("standard".into())),
+            ("language", Value::String("english".into())),
+            ("stemmer", Value::Bool(true)),
+            (
+                "stopwords",
+                Value::List(vec![Value::String("the".into()), Value::String("a".into())]),
+            ),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Simple);
+                assert_eq!(a.language, FtsLanguage::English);
+                assert!(a.stem);
+                assert!(a.remove_stop_words);
+                assert_eq!(
+                    a.custom_stop_words,
+                    Some(vec!["the".to_string(), "a".to_string()])
+                );
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_analyzer_maps_base() {
+        let o = opts(&[("tokenizer", Value::String("whitespace".into()))]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => assert_eq!(a.base, BaseTokenizer::Whitespace),
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ngram_options_map_bounds() {
+        let o = opts(&[
+            ("analyzer", Value::String("ngram".into())),
+            ("ngram_min", Value::Int(2)),
+            ("ngram_max", Value::Int(4)),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Ngram { min: 2, max: 4 })
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ngram_bad_bounds_rejected() {
+        let o = opts(&[
+            ("analyzer", Value::String("ngram".into())),
+            ("ngram_min", Value::Int(5)),
+            ("ngram_max", Value::Int(2)),
+        ]);
+        assert!(QueryPlanner::parse_tokenizer_options(&o).is_err());
+    }
+
+    #[test]
+    fn unknown_language_rejected() {
+        let o = opts(&[("language", Value::String("klingon".into()))]);
+        let err = QueryPlanner::parse_tokenizer_options(&o)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown FTS language"), "{err}");
+    }
+
+    #[test]
+    fn custom_tokenizer_passthrough() {
+        let o = opts(&[("analyzer", Value::String("jieba/default".into()))]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert_eq!(a.base, BaseTokenizer::Custom("jieba/default".into()))
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopwords_bool_false_disables() {
+        let o = opts(&[
+            ("analyzer", Value::String("standard".into())),
+            ("stopwords", Value::Bool(false)),
+        ]);
+        let cfg = QueryPlanner::parse_tokenizer_options(&o).unwrap();
+        match cfg {
+            TokenizerConfig::Analyzer(a) => {
+                assert!(!a.remove_stop_words);
+                assert_eq!(a.custom_stop_words, None);
+            }
+            other => panic!("expected Analyzer, got {other:?}"),
+        }
     }
 }

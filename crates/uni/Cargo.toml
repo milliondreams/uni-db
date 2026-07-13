@@ -15,6 +15,11 @@ readme = "README.md"
 [dependencies]
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+# `fail_point!` markers in production paths (e.g. the nested-fork branch-point
+# seam in `api/fork.rs`). Inert and zero-cost unless the `failpoints` feature is
+# enabled (which turns on `fail/failpoints`); linked so the macro always
+# resolves. Mirrors uni-store's `fail` dependency.
+fail = "0.5"
 uni-algo = { workspace = true }
 uni-query = { workspace = true }
 uni-query-functions = { workspace = true }
@@ -104,6 +109,9 @@ rand = { workspace = true }
 [dev-dependencies]
 criterion = "0.8"
 mimalloc = { version = "0.1", default-features = false }
+# Also a normal dependency (for production `fail_point!` markers); listed here
+# so integration tests can drive `fail::cfg` under `--features failpoints`.
+fail = "0.5"
 rand = { workspace = true }
 arrow = { workspace = true }
 lance = { workspace = true }
@@ -121,9 +129,6 @@ imbl = "7"
 # Capture emitted `metrics` counters in-process so SSI resilience/stress tests
 # can assert on freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
 metrics-util = "0.20"
-# Configure the commit-path `fail_point!` markers from crash-recovery tests
-# (`fail::cfg` / `FailScenario`). Only has effect under `--features failpoints`.
-fail = "0.5"
 # Randomized workload generation for the SSI invariant-oracle + chaos tests.
 proptest = { workspace = true }
 
@@ -249,8 +254,9 @@ storage-internals = []
 # `UniConfig::ssi_enabled` (default `true`); it is no longer a cargo feature.
 # Forwards commit-path fault injection (uni-store `fail_point!` markers) so the
 # crash-recovery resilience tests can simulate a crash at a precise point.
-# Test-only.
-failpoints = ["uni-store/failpoints"]
+# `fail/failpoints` activates this crate's own `fail_point!` markers (e.g. the
+# nested-fork branch-point seam in `api/fork.rs`). Test-only.
+failpoints = ["fail/failpoints", "uni-store/failpoints"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]

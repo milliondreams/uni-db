@@ -307,6 +307,10 @@ impl ExecutionPlan for OptionalFilterExec {
             schema: Arc::clone(&self.schema),
             source_key_columns,
             optional_col_indices,
+            passed_keys: HashSet::new(),
+            pending_null: HashMap::new(),
+            pending_order: Vec::new(),
+            flushed: false,
             metrics,
         }))
     }
@@ -333,13 +337,34 @@ struct OptionalFilterStream {
     /// Indices of optional columns (nulled for filtered-out groups).
     optional_col_indices: Vec<usize>,
 
+    /// Source groups that have already emitted at least one passing row, across
+    /// every batch seen so far. A group here never needs a NULL recovery row.
+    passed_keys: HashSet<Vec<u8>>,
+
+    /// Source groups seen but not yet passed: a one-row representative batch
+    /// (source columns preserved, optional columns NULL) to emit at end-of-stream
+    /// if the group never passes. Keyed by source key; iteration order tracked in
+    /// `pending_order` for deterministic output.
+    pending_null: HashMap<Vec<u8>, RecordBatch>,
+    pending_order: Vec<Vec<u8>>,
+
+    /// Set once the input is exhausted and the pending NULL rows have been
+    /// flushed, so `poll_next` returns `None` afterward.
+    flushed: bool,
+
     /// Metrics.
     metrics: BaselineMetrics,
 }
 
 impl OptionalFilterStream {
     /// Process a single input batch with optional filter semantics.
-    fn process_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
+    ///
+    /// Emits only the rows that pass the filter. NULL recovery rows are NOT
+    /// emitted here — a source group whose rows span multiple batches must not
+    /// produce a NULL row per batch, and must not produce one at all if it passes
+    /// in a *later* batch. Instead, groups that fail in this batch are buffered in
+    /// `pending_null` and flushed once, at end-of-stream, by [`Self::flush`].
+    fn process_batch(&mut self, batch: RecordBatch) -> DFResult<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch);
         }
@@ -356,12 +381,6 @@ impl OptionalFilterStream {
                 )
             })?;
 
-        // If all rows pass, return the batch as-is.
-        if filter_bools.true_count() == batch.num_rows() {
-            self.metrics.record_output(batch.num_rows());
-            return Ok(batch);
-        }
-
         // Group rows by source VID values.
         // Key = serialized source VID values, Value = list of row indices.
         let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
@@ -375,9 +394,8 @@ impl OptionalFilterStream {
             groups.entry(key).or_default().push(row_idx);
         }
 
-        // For each group, check if any row passes the filter.
+        // For each group, collect passing rows and update cross-batch state.
         let mut passed_indices: Vec<usize> = Vec::new();
-        let mut null_row_indices: Vec<usize> = Vec::new(); // Row index to use for source cols
 
         for key in &group_order {
             let row_indices = &groups[key];
@@ -390,49 +408,70 @@ impl OptionalFilterStream {
                 }
             }
 
-            if !any_passed {
-                // No rows passed for this source group — emit a null row.
-                // Use the first row of the group for source column values.
-                null_row_indices.push(row_indices[0]);
+            if any_passed {
+                // This group is satisfied; cancel any buffered NULL recovery row.
+                self.passed_keys.insert(key.clone());
+                self.pending_null.remove(key);
+            } else if !self.passed_keys.contains(key) && !self.pending_null.contains_key(key) {
+                // Group failed and has not passed in any prior batch — remember a
+                // single representative row (source cols kept, optional cols NULL)
+                // to emit at end-of-stream unless a later batch passes it.
+                let null_batch = self.build_null_row(&batch, row_indices[0])?;
+                self.pending_null.insert(key.clone(), null_batch);
+                self.pending_order.push(key.clone());
             }
         }
 
-        // Build output batch.
-        let total_rows = passed_indices.len() + null_row_indices.len();
-        if total_rows == 0 {
+        // Build the output batch of passing rows only.
+        if passed_indices.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
 
-        let optional_set: HashSet<usize> = self.optional_col_indices.iter().copied().collect();
-
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
-        for (col_idx, field) in self.schema.fields().iter().enumerate() {
-            let col = batch.column(col_idx);
-
-            if optional_set.contains(&col_idx) {
-                // Optional column: passed rows get real values, null rows get NULL.
-                let passed_array = take_indices(col, &passed_indices)?;
-                let null_array = new_null_array(field.data_type(), null_row_indices.len());
-                let combined =
-                    arrow::compute::concat(&[&*passed_array, &*null_array]).map_err(|e| {
-                        datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                    })?;
-                columns.push(combined);
-            } else {
-                // Source column: take values from both passed and null row indices.
-                let all_indices: Vec<usize> = passed_indices
-                    .iter()
-                    .chain(null_row_indices.iter())
-                    .copied()
-                    .collect();
-                let taken = take_indices(col, &all_indices)?;
-                columns.push(taken);
-            }
+        for col in batch.columns() {
+            columns.push(take_indices(col, &passed_indices)?);
         }
 
-        self.metrics.record_output(total_rows);
+        self.metrics.record_output(passed_indices.len());
 
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)
+    }
+
+    /// Build a one-row batch preserving `row_idx`'s source columns and NULLing
+    /// every optional column — the deferred NULL recovery row for a source group.
+    fn build_null_row(&self, batch: &RecordBatch, row_idx: usize) -> DFResult<RecordBatch> {
+        let optional_set: HashSet<usize> = self.optional_col_indices.iter().copied().collect();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            if optional_set.contains(&col_idx) {
+                columns.push(new_null_array(field.data_type(), 1));
+            } else {
+                columns.push(take_indices(batch.column(col_idx), &[row_idx])?);
+            }
+        }
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)
+    }
+
+    /// Emit all buffered NULL recovery rows as one batch, once the input is
+    /// exhausted. Groups that never passed in any batch each contribute one row.
+    fn flush(&mut self) -> DFResult<Option<RecordBatch>> {
+        if self.pending_order.is_empty() {
+            return Ok(None);
+        }
+        let keys = std::mem::take(&mut self.pending_order);
+        let mut batches: Vec<RecordBatch> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(b) = self.pending_null.remove(&key) {
+                batches.push(b);
+            }
+        }
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let refs: Vec<&RecordBatch> = batches.iter().collect();
+        let combined = arrow::compute::concat_batches(&self.schema, refs).map_err(arrow_err)?;
+        self.metrics.record_output(combined.num_rows());
+        Ok(Some(combined))
     }
 
     /// Compute a grouping key from source column values for a row.
@@ -499,12 +538,31 @@ impl Stream for OptionalFilterStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let metrics = self.metrics.clone();
         let _timer = metrics.elapsed_compute().timer();
-        match self.input.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                let result = self.process_batch(batch);
-                Poll::Ready(Some(result))
+        loop {
+            match self.input.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(batch))) => match self.process_batch(batch) {
+                    // A batch whose rows all fail produces no passing rows; keep
+                    // pulling (its NULL recovery rows are flushed at end-of-stream)
+                    // rather than emitting a spurious empty batch.
+                    Ok(b) if b.num_rows() == 0 => continue,
+                    Ok(b) => return Poll::Ready(Some(Ok(b))),
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                },
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => {
+                    // Input exhausted: emit the buffered NULL recovery rows once.
+                    if self.flushed {
+                        return Poll::Ready(None);
+                    }
+                    self.flushed = true;
+                    return match self.flush() {
+                        Ok(Some(b)) => Poll::Ready(Some(Ok(b))),
+                        Ok(None) => Poll::Ready(None),
+                        Err(e) => Poll::Ready(Some(Err(e))),
+                    };
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            other => other,
         }
     }
 }

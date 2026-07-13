@@ -83,6 +83,10 @@ pub struct L0Manager {
     // only under the `current` lock so a snapshot captures a buffer and token
     // from the same generation. See `PinToken`.
     current_pin: RwLock<Arc<PinToken>>,
+    // Plugin registry for registry-dispatched CRDT merges, stamped onto every
+    // buffer this manager mints (initial buffer via `set_plugin_registry`,
+    // rotated buffers via `rotate`). `None` preserves native `try_merge`.
+    plugin_registry: RwLock<Option<Arc<uni_plugin::PluginRegistry>>>,
 }
 
 impl L0Manager {
@@ -92,7 +96,22 @@ impl L0Manager {
             current: RwLock::new(Arc::new(RwLock::new(l0))),
             pending_flush: RwLock::new(Vec::new()),
             current_pin: RwLock::new(Arc::new(PinToken(()))),
+            plugin_registry: RwLock::new(None),
         }
+    }
+
+    /// Install the plugin registry for registry-dispatched CRDT merges.
+    ///
+    /// Stamps the current buffer immediately and every buffer minted by a
+    /// later [`Self::rotate`], so commit-time property merges route custom
+    /// CRDT kinds through a registered provider. Called once at writer
+    /// construction from the owning `StorageManager`'s registry. A `None`
+    /// registry (never installed) preserves native `try_merge` behavior.
+    pub fn set_plugin_registry(&self, registry: Arc<uni_plugin::PluginRegistry>) {
+        *self.plugin_registry.write() = Some(registry.clone());
+        // Stamp the buffer that already exists (minted by `new` before the
+        // registry was known).
+        self.current.read().write().set_plugin_registry(registry);
     }
 
     /// Create a read-only snapshot L0Manager from existing buffers.
@@ -107,6 +126,9 @@ impl L0Manager {
             current: RwLock::new(current),
             pending_flush: RwLock::new(pending_flush),
             current_pin: RwLock::new(Arc::new(PinToken(()))),
+            // Read-only snapshot manager: buffers already carry their registry
+            // and this manager never rotates, so no stamping is needed.
+            plugin_registry: RwLock::new(None),
         }
     }
 
@@ -140,7 +162,12 @@ impl L0Manager {
         let mut guard = self.current.write();
         let old_l0 = guard.clone();
 
-        let new_l0 = L0Buffer::new(next_version, new_wal);
+        let mut new_l0 = L0Buffer::new(next_version, new_wal);
+        // Carry the registry onto the fresh generation so its commit-time
+        // merges route through any registered CRDT provider.
+        if let Some(reg) = self.plugin_registry.read().as_ref() {
+            new_l0.set_plugin_registry(reg.clone());
+        }
         *guard = Arc::new(RwLock::new(new_l0));
 
         // A fresh generation starts unpinned. Reset the pin token while still

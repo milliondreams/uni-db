@@ -100,6 +100,16 @@ pub struct StorageManager {
     /// have aged out of L0 into Lance storage — notably on forks, whose data
     /// is flushed to Lance before branching.
     vid_labels_index: Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>,
+    /// Optional plugin registry for registry-dispatched CRDT merges on the
+    /// durable paths (compaction, L0 flush).
+    ///
+    /// Behavior-preserving when absent: the durable merge helpers fall back to
+    /// [`uni_crdt::Crdt::try_merge`] bit-for-bit when no
+    /// [`uni_plugin::traits::crdt::CrdtKindProvider`] is registered. Threaded
+    /// down to the writer's `L0Manager` (and hence each `L0Buffer`) and read by
+    /// the [`crate::storage::compaction::Compactor`] via
+    /// [`Self::plugin_registry`].
+    plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
 }
 
 /// RAII counter increment for `StorageManager.flush_in_progress`.
@@ -182,6 +192,11 @@ pub async fn merge_insert_batch_with_lance_conflict_retry(
     batch: arrow_array::RecordBatch,
     on: &[&str],
 ) -> anyhow::Result<()> {
+    // NOTE: `backend.merge_insert` already takes the per-table write lock
+    // internally (the same mutex `lock_table_for_write` exposes), so it is
+    // serialized against a compaction that holds that lock across its whole
+    // scan → overwrite. Do NOT take `lock_table_for_write` here as well — that
+    // would re-lock the same non-reentrant mutex and self-deadlock.
     retry_on_lance_conflict(|| async {
         let exists = backend.table_exists(table_name).await?;
         if !exists {
@@ -301,6 +316,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 crate::storage::vid_labels::VidLabelsIndex::new(),
             )),
+            plugin_registry: None,
         };
 
         // Rebuild VidLabelsIndex from persisted vertices. A failure leaves the
@@ -473,6 +489,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 
@@ -516,6 +533,7 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 
@@ -585,7 +603,25 @@ impl StorageManager {
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 self.vid_labels_index.read().clone(),
             )),
+            plugin_registry: self.plugin_registry.clone(),
         }
+    }
+
+    /// Borrow the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Returns `None` when no registry has been installed, in which case the
+    /// durable merge paths fall back to native [`uni_crdt::Crdt::try_merge`].
+    pub fn plugin_registry(&self) -> Option<&Arc<uni_plugin::PluginRegistry>> {
+        self.plugin_registry.as_ref()
+    }
+
+    /// Install the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Called once at DB construction (before the manager is shared) so the
+    /// same registry that backs `PropertyManager` also governs the compaction
+    /// and L0-flush durable merge paths.
+    pub fn set_plugin_registry(&mut self, registry: Arc<uni_plugin::PluginRegistry>) {
+        self.plugin_registry = Some(registry);
     }
 
     /// Borrow the active fork scope, if any.
@@ -593,25 +629,28 @@ impl StorageManager {
         self.fork_scope.as_ref()
     }
 
-    /// Phase 5a: query whether a fork-local index exists for the
-    /// `(label, column)` pair on the active fork scope. Returns
-    /// `None` outside a fork or when no fork-local build has
-    /// completed for that pair.
+    /// Phase 5a: query whether a fork-local index of `kind` exists
+    /// for the `(label, column)` pair on the active fork scope.
+    /// Returns `false` outside a fork or when no fork-local build of
+    /// that kind has completed for the pair.
     ///
-    /// The planner consults this to decide whether to emit
-    /// `FusedIndexScan` (returns `Some`) or fall back to the
-    /// inherited primary index via `base_paths` (returns `None`).
-    /// The lookup is a `DashMap::get` on `ForkScope` — O(1) and
-    /// safe to call per query without caching above this layer.
+    /// The planner consults this to decide whether to emit a specific
+    /// `FusedIndexScan` (returns `true`) or fall back to the inherited
+    /// primary index via `base_paths` (returns `false`). A column can
+    /// carry several kinds at once, so callers ask for the exact kind
+    /// they intend to fuse. The lookup is a `DashMap::get` on
+    /// `ForkScope` — O(1) and safe to call per query without caching
+    /// above this layer.
     #[must_use]
-    pub fn fork_index_exists(
+    pub fn has_fork_index(
         &self,
         label: &str,
         column: &str,
-    ) -> Option<crate::fork::ForkLocalIndexKind> {
+        kind: crate::fork::ForkLocalIndexKind,
+    ) -> bool {
         self.fork_scope
             .as_ref()
-            .and_then(|s| s.fork_local_index(label, column))
+            .is_some_and(|s| s.has_fork_local_index(label, column, kind))
     }
 
     /// Base URI for this storage manager (the directory or remote
@@ -834,7 +873,7 @@ impl StorageManager {
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
                 let tbl_name = table_names::delta_table_name(name, dir);
-                if !backend.table_exists(&tbl_name).await.unwrap_or(false) {
+                if !backend.table_exists(&tbl_name).await? {
                     continue;
                 }
                 let row_count = backend.count_rows(&tbl_name, None).await.unwrap_or(0);
@@ -1122,7 +1161,7 @@ impl StorageManager {
         let vtable = table_names::main_vertex_table_name();
 
         // Check if the table exists (fresh database)
-        if !backend.table_exists(vtable).await.unwrap_or(false) {
+        if !backend.table_exists(vtable).await? {
             self.vid_labels_index = Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new()));
             return Ok(());
         }
@@ -1292,7 +1331,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1362,7 +1401,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::delta_table_name(edge_type, direction);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1425,7 +1464,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::main_vertex_table_name();
 
-        if !backend.table_exists(table_name).await.unwrap_or(false) {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
@@ -1473,7 +1512,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::main_edge_table_name();
 
-        if !backend.table_exists(table_name).await.unwrap_or(false) {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
@@ -1498,7 +1537,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }
 
@@ -1528,7 +1567,7 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let vtable = table_names::main_vertex_table_name();
         let mut out = std::collections::HashMap::new();
-        if !backend.table_exists(vtable).await.unwrap_or(false) {
+        if !backend.table_exists(vtable).await? {
             return Ok(out);
         }
         let request = ScanRequest::all(vtable)
@@ -1585,7 +1624,7 @@ impl StorageManager {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
 
-        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+        if !backend.table_exists(&table_name).await? {
             return Ok(Vec::new());
         }
 
@@ -1794,11 +1833,16 @@ impl StorageManager {
         let mut results = Vec::new();
 
         // Only search if the table exists
-        if backend.table_exists(&name).await.unwrap_or(false) {
+        if backend.table_exists(&name).await? {
             let backend_metric = match &metric {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
                 DistanceMetric::Dot => BackendMetric::Dot,
+                // L1 has no ANN backend metric (its column is never ANN-indexed);
+                // candidates are fetched by L2 over the FULL table (`fetch_k`
+                // below) then re-scored with exact L1, so this L2 ordering does
+                // not affect the final result.
+                DistanceMetric::L1 => BackendMetric::L2,
                 _ => BackendMetric::L2,
             };
 
@@ -1811,12 +1855,21 @@ impl StorageManager {
             }
             let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
+            // L1/Manhattan is served exact/brute-force: fetch every candidate
+            // (limit = full row count) and rank by the exact L1 re-score below.
+            // O(N) — the inherent cost of exact L1, which cannot use an ANN index.
+            let fetch_k = if matches!(metric, DistanceMetric::L1) {
+                backend.count_rows(&name, None).await.unwrap_or(k).max(k)
+            } else {
+                k
+            };
+
             let batches = backend
                 .vector_search(
                     &name,
                     property,
                     query,
-                    k,
+                    fetch_k,
                     backend_metric,
                     combined_filter,
                     opts,
@@ -1842,6 +1895,13 @@ impl StorageManager {
         if let Some(qctx) = ctx {
             merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric);
         }
+
+        // Exact top-k. The L1 over-fetch (and the no-L0-activity early return in
+        // the merge) can leave more than `k` candidates; rank by distance
+        // ascending and truncate. Idempotent for the ANN paths, which already
+        // return `k` sorted.
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
 
         Ok(results)
     }
@@ -2139,7 +2199,7 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
 
-        let mut results = if backend.table_exists(&name).await.unwrap_or(false) {
+        let mut results = if backend.table_exists(&name).await? {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             if ctx.is_some()
@@ -2580,6 +2640,14 @@ fn merge_l0_into_vector_results(
 
     // Overwrite or append L0 candidates.
     for (vid, dist) in &l0_candidates {
+        // Skip a vid the precedence chain ultimately tombstoned: it can be a
+        // live candidate from an earlier buffer while a later buffer deleted it
+        // (that later buffer never revisits it in the label loop, so it stays
+        // in `l0_candidates`). Appending it here would resurrect a deleted
+        // vertex into vector-search results.
+        if tombstoned.contains(vid) {
+            continue;
+        }
         if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
             existing.1 = *dist;
         } else {
@@ -2735,6 +2803,12 @@ fn merge_l0_into_fts_results(
 
     // Overwrite or append L0 candidates.
     for (vid, score) in &l0_candidates {
+        // Skip a vid the precedence chain ultimately tombstoned (see the vector
+        // helper above): a later buffer's delete must not be resurrected into
+        // full-text-search results by an earlier buffer's live candidate.
+        if tombstoned.contains(vid) {
+            continue;
+        }
         if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
             existing.1 = *score;
         } else {

@@ -220,3 +220,66 @@ async fn anonymous_principal_sees_policies() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Policy that denies if the query touches any label outside its allowlist —
+/// exercises the structured `Resource.labels` extraction (not the raw string).
+struct AllowLabels {
+    allowed: Vec<String>,
+}
+
+impl AuthzPolicy for AllowLabels {
+    fn check(
+        &self,
+        _principal: &Principal,
+        _action: &Action,
+        resource: &Resource,
+    ) -> Result<Decision, AuthzError> {
+        for label in &resource.labels {
+            if !self.allowed.iter().any(|a| a == label) {
+                return Ok(Decision::Deny {
+                    reason: format!("label `{label}` is not permitted"),
+                });
+            }
+        }
+        Ok(Decision::Allow)
+    }
+}
+
+#[tokio::test]
+async fn structured_resource_gates_by_label() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    // Register a label-gating policy (allows only `Doc`). The always-on builtin
+    // AllowGroupAuthzPolicy also applies (AND), so the principal is in `admin`.
+    {
+        let caps = CapabilitySet::from_iter_of([Capability::Authz]);
+        let mut r = PluginRegistrar::new(
+            PluginId::new("test-allow-labels"),
+            &caps,
+            db.plugin_registry(),
+        );
+        r.authz_policy(Arc::new(AllowLabels {
+            allowed: vec!["Doc".to_owned()],
+        }))?;
+        r.commit_to_registry()?;
+    }
+
+    let session = db.session().with_principal(Arc::new(Principal {
+        id: "alice".to_owned(),
+        groups: vec!["admin".to_owned()],
+        capabilities: uni_plugin::CapabilitySet::default(),
+    }));
+
+    // A query touching only `Doc` is allowed — the extractor surfaces labels=[Doc].
+    let ok = session.query("MATCH (d:Doc) RETURN d").await;
+    assert!(ok.is_ok(), "Doc-only query must be allowed: {ok:?}");
+
+    // A query touching `Other` is denied — structured labels=[Other] fails the
+    // policy even though the raw path string would need per-policy parsing.
+    let denied = session.query("MATCH (o:Other) RETURN o").await;
+    assert!(
+        matches!(denied, Err(UniError::AuthorizationDenied { .. })),
+        "Other-label query must be denied: {denied:?}"
+    );
+    Ok(())
+}

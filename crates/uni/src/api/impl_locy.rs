@@ -153,14 +153,17 @@ pub(crate) fn register_rules_on_registry(
     registry_lock: &std::sync::RwLock<LocyRuleRegistry>,
     program: &str,
 ) -> Result<bool> {
-    let existing = {
-        let registry = registry_lock.read().unwrap();
-        // Idempotent: exact-duplicate registration changes nothing.
-        if registry.sources.iter().any(|s| s.source == program) {
-            return Ok(false);
-        }
-        registry.sources.clone()
-    };
+    // Hold the WRITE lock across the whole read → compile → rebuild → assign so
+    // concurrent register/remove calls serialize and cannot clobber each other's
+    // update. Previously the read lock was released before `*write() = rebuilt`,
+    // so two concurrent registrations both rebuilt from the same snapshot and the
+    // second overwrite silently dropped the first's rule (lost update).
+    let mut registry = registry_lock.write().unwrap();
+    // Idempotent: exact-duplicate registration changes nothing.
+    if registry.sources.iter().any(|s| s.source == program) {
+        return Ok(false);
+    }
+    let existing = registry.sources.clone();
 
     // Discover the rule names this program defines so that any prior source
     // defining them is superseded — the last registration of a name wins, and
@@ -202,7 +205,7 @@ pub(crate) fn register_rules_on_registry(
     });
 
     let rebuilt = rebuild_registry_from_sources(&kept)?;
-    *registry_lock.write().unwrap() = rebuilt;
+    *registry = rebuilt;
     Ok(true)
 }
 
@@ -412,15 +415,28 @@ impl<'a> LocyEngine<'a> {
     /// are passed to the compiler so that IS-ref and QUERY references to
     /// registered rules are accepted during validation.
     pub fn compile_only(&self, program: &str) -> Result<CompiledProgram> {
+        self.compile_only_with_config(program, &LocyConfig::default())
+    }
+
+    /// Compile a Locy program (without registering) under an explicit
+    /// [`LocyConfig`], so `neural_predicates_preview` gates fire on the
+    /// transaction/evaluate path. A bare `compile_only` dropped the config, so
+    /// preview-only programs failed to compile there.
+    pub fn compile_only_with_config(
+        &self,
+        program: &str,
+        config: &LocyConfig,
+    ) -> Result<CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
         let registry = self.db.locy_rule_registry.read().unwrap();
         if registry.rules.is_empty() {
             drop(registry);
-            compile(&ast).map_err(map_compile_error)
+            uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)
         } else {
             let external_names: Vec<String> = registry.rules.keys().cloned().collect();
             drop(registry);
-            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(map_compile_error)
+            uni_locy::compile_with_external_rules_and_config(&ast, &external_names, config)
+                .map_err(map_compile_error)
         }
     }
 
@@ -506,7 +522,7 @@ impl<'a> LocyEngine<'a> {
         config: &LocyConfig,
         profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
     ) -> Result<LocyResult> {
-        let mut compiled = self.compile_only(program)?;
+        let mut compiled = self.compile_only_with_config(program, config)?;
 
         // Merge registered rules into the compiled program.
         {
@@ -1501,11 +1517,54 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             .iter()
             .map(|(k, v)| (k.clone(), v.rows.clone()))
             .collect();
+
+        // Enrichment resolves each vid by running `MATCH (n) WHERE id(n) IN [...]`.
+        // It MUST read through the same hypothetical `locy_l0` overlay the fixpoint
+        // just used — otherwise a node created only inside this ASSUME/ABDUCE block
+        // (which lives in the forked overlay, not base storage) is not found, the
+        // vid stays a bare `Value::Int`, and any predicate reading its properties
+        // (e.g. `QUERY ... WHERE b.name = 'B'`) evaluates `Int.name` → NULL and
+        // silently drops the row. Rebuild an overlay-aware context mirroring the
+        // command-dispatch path (`dispatch`/`execute_pattern`).
+        let enrich_storage = self.effective_storage();
+        let enrich_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext> = {
+            let tx_l0_for_ctx = self
+                .locy_l0
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| self.tx_l0_override.clone());
+            if (tx_l0_for_ctx.is_some() || self.read_snapshot.is_some())
+                && let Some(writer) = self.db.writer.as_ref()
+            {
+                let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
+                    Some(snap) => (snap.main.clone(), snap.extra.clone()),
+                    None => (
+                        writer.l0_manager.get_current(),
+                        writer.l0_manager.get_pending_flush(),
+                    ),
+                };
+                let l0_ctx = uni_query::query::df_graph::L0Context {
+                    current_l0: Some(current_l0),
+                    transaction_l0: tx_l0_for_ctx,
+                    pending_flush_l0s,
+                };
+                Arc::new(
+                    uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                        enrich_storage.clone(),
+                        l0_ctx,
+                        self.graph_ctx.property_manager().clone(),
+                    ),
+                )
+            } else {
+                self.graph_ctx.clone()
+            }
+        };
         let enriched = enrich_vids_with_nodes(
             self.db,
             &native_store,
             store_rows,
-            &self.graph_ctx,
+            &enrich_ctx,
             &self.session_ctx,
         )
         .await;

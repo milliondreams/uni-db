@@ -337,6 +337,17 @@ impl Transaction {
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn query_inner(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
+        // Authorization: `query_inner` is the execution choke point for BOTH
+        // reads and writes — `Session::run` routes writes here (via `tx.query`)
+        // to preserve trailing `RETURN` rows, and direct `tx.query` calls also
+        // land here. Only `tx.execute`/the parameterized builders authorized
+        // before, so a write run through `tx.query` bypassed the `AuthzPolicy`
+        // chain. Authorize here with a read-aware verb (a pure read must not be
+        // mis-classified as a write). Gated on a registered policy so the common
+        // no-policy path skips the extra parse.
+        if !self.db.plugin_registry.authz_policies().is_empty() {
+            self.authorize(cypher, self.authz_verb(cypher))?;
+        }
         if self.db.config.ssi_enabled {
             self.acquire_for_update_locks(cypher, &HashMap::new())
                 .await?;
@@ -494,6 +505,29 @@ impl Transaction {
     /// retroactively escalated by a session re-auth.
     fn authorize(&self, cypher: &str, verb: &str) -> Result<()> {
         crate::api::session::authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
+    }
+
+    /// Classify the authorization verb for a statement executed via
+    /// [`Self::query_inner`].
+    ///
+    /// A statement with no write/schema/dbms clause authorizes under `"read"`;
+    /// otherwise it uses [`classify_verb`]. Mirrors `Session::run`'s read-only
+    /// oracle (consulting the db-level plugin registry for procedure modes — a
+    /// transaction has no session-scoped registry) so a write executed through
+    /// `tx.query` is authorized under the correct verb rather than mis-denying a
+    /// read as a write.
+    fn authz_verb(&self, cypher: &str) -> &'static str {
+        let proc_is_write = |name: &str| {
+            use uni_plugin::traits::procedure::ProcedureMode;
+            uni_plugin::QName::parse(name)
+                .ok()
+                .and_then(|q| self.db.plugin_registry.procedure(&q))
+                .is_some_and(|e| !matches!(e.signature.mode, ProcedureMode::Read))
+        };
+        match uni_cypher::parse(cypher) {
+            Ok(ast) if uni_query::validate_read_only_with(&ast, &proc_is_write).is_ok() => "read",
+            _ => classify_verb(cypher),
+        }
     }
 
     /// Per-statement guards shared by the typed `execute`/`query` entry points
@@ -934,6 +968,7 @@ impl Transaction {
         let trigger_router = TriggerRouter::from_registry_with_queue(
             &self.db.plugin_registry,
             Some(Arc::clone(&self.db.defer_queue)),
+            Arc::clone(&self.db.ec_queue),
         )?;
 
         // M11 FU-4: CDC subscribers also need per-row mutation events,
@@ -1034,29 +1069,31 @@ impl Transaction {
         // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
         self.snapshot.lock().take();
 
-        // Wrap the commit (which acquires `flush_lock` internally) in the
-        // same timeout that used to wrap the outer writer-RwLock acquisition.
-        // `flush_lock` is now the actual serialization point.
-        //
-        // commit_transaction_l0 takes `self: &Arc<Self>` so the async branch
-        // can pass `Arc<Writer>` into the spawned stream task. We pass the
-        // Arc directly (no deref to &Writer).
-        let (wal_lsn, _flush_pending) = tokio::time::timeout(
-            self.db.config.commit_timeout,
-            writer_lock.commit_transaction_l0(self.tx_l0.clone()),
-        )
-        .await
-        .map_err(|_| UniError::CommitTimeout {
-            tx_id: self.id.clone(),
-            hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
-        })?
-        // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
-        // `ConstraintConflict`) so callers can detect and retry them, instead
-        // of flattening every error into `Internal`.
-        .map_err(|e| match e.downcast::<UniError>() {
-            Ok(typed) => typed,
-            Err(other) => UniError::Internal(other),
-        })?;
+        // Bound ONLY the `flush_lock` acquisition (contention with another
+        // in-progress commit) by `commit_timeout` — passed INTO the writer rather
+        // than wrapping the whole future in `tokio::time::timeout`. Wrapping the
+        // whole future would cancel it past the durable point (WAL flush) — e.g.
+        // during the inline post-commit L0→L1 flush — and return a retriable
+        // `CommitTimeout` for a transaction that is already durable and visible,
+        // which a retry would double-apply. The writer surfaces `CommitTimeout`
+        // with an empty `tx_id` on a lock-acquisition timeout; we fill it in.
+        let (wal_lsn, _flush_pending) = writer_lock
+            .commit_transaction_l0_with_lock_timeout(
+                self.tx_l0.clone(),
+                Some(self.db.config.commit_timeout),
+            )
+            .await
+            // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
+            // `ConstraintConflict`) so callers can detect and retry them, instead
+            // of flattening every error into `Internal`.
+            .map_err(|e| match e.downcast::<UniError>() {
+                Ok(UniError::CommitTimeout { hint, .. }) => UniError::CommitTimeout {
+                    tx_id: self.id.clone(),
+                    hint,
+                },
+                Ok(typed) => typed,
+                Err(other) => UniError::Internal(other),
+            })?;
         // _flush_pending is true when async_flush_enabled and the coordinator
         // accepted a flush submission. Nothing to do here — the spawned stream
         // task drives the pipeline to completion independently.
@@ -1090,11 +1127,50 @@ impl Transaction {
                 self.session_rule_registry.write(),
             ) {
                 (Ok(tx_reg), Ok(mut session_reg)) => {
-                    let mut promoted = 0;
-                    for (name, rule) in &tx_reg.rules {
-                        if !session_reg.rules.contains_key(name) {
-                            session_reg.rules.insert(name.clone(), rule.clone());
-                            promoted += 1;
+                    let new_names: Vec<String> = tx_reg
+                        .rules
+                        .keys()
+                        .filter(|n| !session_reg.rules.contains_key(*n))
+                        .cloned()
+                        .collect();
+                    let promoted = new_names.len();
+                    if promoted > 0 {
+                        // Promote the SOURCES that own the new rules and rebuild
+                        // the session registry from the combined sources, so the
+                        // promoted rules get their STRATA too. Copying only the
+                        // rules map left them stratum-less, so they never
+                        // evaluated (and a later rebuild dropped them). Fall back
+                        // to a rules-only copy if any promoted rule lacks a
+                        // tracked source (rebuild would otherwise drop it).
+                        let mut combined = session_reg.sources.clone();
+                        for src in &tx_reg.sources {
+                            let owns_new = src.rule_names.iter().any(|r| new_names.contains(r));
+                            let already = combined.iter().any(|s| s.source == src.source);
+                            if owns_new && !already {
+                                combined.push(src.clone());
+                            }
+                        }
+                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(&combined);
+                        let preserved_all = |r: &super::impl_locy::LocyRuleRegistry| {
+                            new_names.iter().all(|n| r.rules.contains_key(n))
+                                && session_reg.rules.keys().all(|n| r.rules.contains_key(n))
+                        };
+                        match rebuilt {
+                            Ok(r) if preserved_all(&r) => *session_reg = r,
+                            _ => {
+                                for (name, rule) in &tx_reg.rules {
+                                    session_reg
+                                        .rules
+                                        .entry(name.clone())
+                                        .or_insert_with(|| rule.clone());
+                                }
+                                rule_promotion_errors.push(RulePromotionError {
+                                    rule_text: "<promotion rebuild>".into(),
+                                    error: "promoted rules lacked tracked sources; \
+                                            strata not rebuilt"
+                                        .into(),
+                                });
+                            }
                         }
                     }
                     promoted
@@ -1211,7 +1287,42 @@ impl Transaction {
         // on the tokio runtime so the commit returns immediately.
         if let Some(events) = trigger_events {
             let tx_id_u64 = tx_id_to_u64(&self.id);
-            let ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            let mut ctx = TriggerContext::new(&self.session_id, tx_id_u64);
+            // WS-A — attach a write-enabled host so a declared
+            // (synthesized) trigger's after-commit Cypher action can run
+            // against the just-committed graph state. Built ONCE per
+            // commit and only when triggers are registered. The L0
+            // context uses the writer's post-commit `current` buffer so
+            // the action sees the data this transaction just committed;
+            // `execute_inner_query(Write)` writes land directly in main
+            // L0 + WAL (durable, immediately visible) rather than through
+            // a nested transaction, so no re-entrant commit is produced.
+            if !trigger_router.is_empty()
+                && let Some(writer_arc) = self.db.writer.as_ref()
+            {
+                let l0_ctx = uni_query::query::df_graph::L0Context {
+                    current_l0: Some(writer_arc.l0_manager.get_current()),
+                    // Data is now in main L0; the tx's private buffer is
+                    // excluded to avoid double-vision on read.
+                    transaction_l0: None,
+                    pending_flush_l0s: writer_arc.l0_manager.get_pending_flush(),
+                };
+                let host: Arc<dyn uni_plugin::traits::procedure::ProcedureHost> = Arc::new(
+                    uni_query::query::executor::procedure_host::QueryProcedureHost::from_commit_parts(
+                        Arc::clone(&self.db.storage),
+                        Arc::clone(&self.db.properties),
+                        Some(Arc::clone(&self.db.procedure_registry)),
+                        self.db.xervo_runtime.clone(),
+                        l0_ctx,
+                        // Top-level commit runs declared-trigger actions
+                        // at depth 0; the synthetic-trigger re-entrancy
+                        // guard caps the chain.
+                        0,
+                    )
+                    .with_writer(Arc::clone(writer_arc)),
+                );
+                ctx = ctx.with_host(host);
+            }
             let runtime = tokio::runtime::Handle::current();
             trigger_router.dispatch_after(ctx, &events, &runtime);
         }

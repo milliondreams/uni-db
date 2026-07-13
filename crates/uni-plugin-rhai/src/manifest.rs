@@ -48,6 +48,24 @@ pub struct RhaiManifest {
     pub aggregate_fns: Vec<AggregateEntry>,
     /// Declared procedures.
     pub procedures: Vec<ProcedureEntry>,
+    /// Declared GraphCompute algorithms.
+    pub algorithms: Vec<AlgorithmEntry>,
+}
+
+/// One GraphCompute algorithm entry.
+///
+/// Mirrors [`ProcedureEntry`] but its guest function receives a `GcSession`
+/// handle as its first argument and drives the coarse kernels, emitting its
+/// result via `session.emit(...)` rather than returning row maps (proposal
+/// §4.6). The declared `yields` become the `AlgorithmSignature::output_fields`.
+#[derive(Debug, Clone)]
+pub struct AlgorithmEntry {
+    /// Algorithm name (also the Rhai callable driven per invocation).
+    pub name: String,
+    /// Argument type names, excluding the leading injected `GcSession`.
+    pub args: Vec<String>,
+    /// Yielded columns (in declaration order).
+    pub yields: Vec<YieldField>,
 }
 
 /// One scalar fn entry from the Rhai manifest.
@@ -80,6 +98,21 @@ pub struct AggregateEntry {
     pub state: String,
 }
 
+/// One declared procedure yield column.
+///
+/// A yield is declared as a string that is either a bare type (`"int"`) —
+/// carrying no caller-facing name, so the loader falls back to a positional
+/// `col{i}` name — or a `"name:type"` pair (`"id:int"`) that names the column.
+/// The name must match the key the procedure uses in its returned row maps;
+/// otherwise the column reads back as all-NULL.
+#[derive(Debug, Clone)]
+pub struct YieldField {
+    /// Column name as it appears in the returned row maps, when declared.
+    pub name: Option<String>,
+    /// Yielded column type name (`"int"`, `"string"`, …).
+    pub type_name: String,
+}
+
 /// One procedure entry.
 #[derive(Debug, Clone)]
 pub struct ProcedureEntry {
@@ -87,8 +120,8 @@ pub struct ProcedureEntry {
     pub name: String,
     /// Argument type names.
     pub args: Vec<String>,
-    /// Yielded column type names (in declaration order).
-    pub yields: Vec<String>,
+    /// Yielded columns (in declaration order).
+    pub yields: Vec<YieldField>,
     /// Mode: `"read"`, `"write"`, `"schema"`, or `"dbms"`. Default
     /// `"read"`.
     pub mode: String,
@@ -123,6 +156,7 @@ pub fn parse_manifest(engine: &Engine, ast: &AST) -> Result<RhaiManifest, RhaiEr
     let scalar_fns = parse_scalar_entries(&map)?;
     let aggregate_fns = parse_aggregate_entries(&map)?;
     let procedures = parse_procedure_entries(&map)?;
+    let algorithms = parse_algorithm_entries(&map)?;
 
     Ok(RhaiManifest {
         id,
@@ -131,6 +165,7 @@ pub fn parse_manifest(engine: &Engine, ast: &AST) -> Result<RhaiManifest, RhaiEr
         scalar_fns,
         aggregate_fns,
         procedures,
+        algorithms,
     })
 }
 
@@ -189,10 +224,52 @@ fn parse_procedure_entries(map: &Map) -> Result<Vec<ProcedureEntry>, RhaiError> 
         Ok(ProcedureEntry {
             name: required_string(m, "name")?,
             args: required_string_array(m, "args")?,
-            yields: required_string_array(m, "yields")?,
+            yields: parse_yield_fields(m)?,
             mode: optional_string(m, "mode").unwrap_or_else(|| "read".into()),
         })
     })
+}
+
+fn parse_algorithm_entries(map: &Map) -> Result<Vec<AlgorithmEntry>, RhaiError> {
+    parse_entry_array(map, "algorithms", |m| {
+        Ok(AlgorithmEntry {
+            name: required_string(m, "name")?,
+            args: required_string_array(m, "args")?,
+            yields: parse_yield_fields(m)?,
+        })
+    })
+}
+
+/// Parse a procedure's `yields` string array into named [`YieldField`]s.
+///
+/// Each element is a string: a bare type (`"int"`) or a `"name:type"` pair
+/// (`"id:int"`). The named form is required whenever the procedure returns row
+/// maps keyed by natural names — the column name must equal the row-map key,
+/// or the column reads all-NULL. A flat string array (rather than nested maps)
+/// keeps the manifest expression within the sandbox complexity limit.
+///
+/// # Errors
+/// Returns [`RhaiError::ManifestInvalid`] if `yields` is missing, is not an
+/// array, or contains a non-string element.
+fn parse_yield_fields(map: &Map) -> Result<Vec<YieldField>, RhaiError> {
+    let specs = required_string_array(map, "yields")?;
+    Ok(specs.iter().map(|s| parse_yield_spec(s)).collect())
+}
+
+/// Split a single yield spec string into an optional name and a type name.
+///
+/// `"id:int"` → name `Some("id")`, type `"int"`; a bare `"int"` → name `None`.
+fn parse_yield_spec(spec: &str) -> YieldField {
+    match spec.split_once(':') {
+        Some((name, ty)) => YieldField {
+            name: Some(name.trim().to_string()),
+            type_name: ty.trim().to_string(),
+        },
+        None => YieldField {
+            name: None,
+            type_name: spec.trim().to_string(),
+        },
+    }
 }
 
 fn required_string(map: &Map, key: &str) -> Result<String, RhaiError> {
@@ -302,6 +379,38 @@ mod tests {
         assert_eq!(m.aggregate_fns.len(), 1);
         assert_eq!(m.aggregate_fns[0].name, "stats");
         assert_eq!(m.procedures.len(), 1);
-        assert_eq!(m.procedures[0].yields, vec!["int", "string"]);
+        let ytypes: Vec<&str> = m.procedures[0]
+            .yields
+            .iter()
+            .map(|y| y.type_name.as_str())
+            .collect();
+        assert_eq!(ytypes, vec!["int", "string"]);
+        // Bare type strings carry no caller-facing name.
+        assert!(m.procedures[0].yields.iter().all(|y| y.name.is_none()));
+    }
+
+    #[test]
+    fn parses_named_procedure_yields() {
+        let script = r#"
+            fn uni_manifest() {
+                #{
+                    id: "ai.test.named",
+                    version: "0.1.0",
+                    procedures: [
+                        #{ name: "rows", args: [],
+                           yields: ["id:int", "label:string"],
+                           mode: "read" },
+                    ],
+                }
+            }
+        "#;
+        let eng = engine();
+        let ast = compile(&eng, script).unwrap();
+        let m = parse_manifest(&eng, &ast).unwrap();
+        let ys = &m.procedures[0].yields;
+        assert_eq!(ys[0].name.as_deref(), Some("id"));
+        assert_eq!(ys[0].type_name, "int");
+        assert_eq!(ys[1].name.as_deref(), Some("label"));
+        assert_eq!(ys[1].type_name, "string");
     }
 }

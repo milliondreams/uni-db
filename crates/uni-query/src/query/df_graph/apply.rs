@@ -280,7 +280,7 @@ fn evaluate_filter(filter: &Expr, row: &HashMap<String, Value>) -> bool {
                 _ => {
                     let left_val = resolve_expr_value(left, row);
                     let right_val = resolve_expr_value(right, row);
-                    evaluate_comparison(op, &left_val, &right_val)
+                    evaluate_comparison(op, left_val.as_ref(), right_val.as_ref())
                 }
             }
         }
@@ -289,28 +289,41 @@ fn evaluate_filter(filter: &Expr, row: &HashMap<String, Value>) -> bool {
             expr,
         } => !evaluate_filter(expr, row),
         _ => {
-            // Treat any other expression as a truth test on its resolved value
-            let val = resolve_expr_value(filter, row);
-            val.as_bool().unwrap_or(false)
+            // Truth-test any other expression on its resolved value. A shape the
+            // fast-path cannot evaluate (`None`) is "unknown", which for a
+            // pre-filter means KEEP the row — never silently drop it (mirrors the
+            // `_ => true` operator backstop in `evaluate_comparison`). A resolved
+            // value, including a genuine NULL, is truth-tested per Cypher 3VL.
+            match resolve_expr_value(filter, row) {
+                Some(val) => val.as_bool().unwrap_or(false),
+                None => true,
+            }
         }
     }
 }
 
 /// Resolve a simple expression to a Value using the row context.
-fn resolve_expr_value(expr: &Expr, row: &HashMap<String, Value>) -> Value {
+///
+/// Returns `Some(value)` for the shapes the fast-path input-filter evaluator
+/// understands (literal, bare variable, or `var.key` property). Returns `None`
+/// for any other shape (arithmetic, `IN`, `CASE`, function calls, a property on
+/// a non-variable base, …) — i.e. "cannot evaluate", which callers must treat as
+/// "keep the row", never as a silent drop. This distinguishes an unevaluable
+/// shape from a genuine resolved `Value::Null`.
+fn resolve_expr_value(expr: &Expr, row: &HashMap<String, Value>) -> Option<Value> {
     match expr {
-        Expr::Literal(lit) => lit.to_value(),
-        Expr::Variable(name) => row.get(name).cloned().unwrap_or(Value::Null),
+        Expr::Literal(lit) => Some(lit.to_value()),
+        Expr::Variable(name) => Some(row.get(name).cloned().unwrap_or(Value::Null)),
         Expr::Property(base_expr, key) => {
             if let Expr::Variable(var) = base_expr.as_ref() {
                 // Look up "var.key" in the row map
                 let col_name = format!("{}.{}", var, key);
-                row.get(&col_name).cloned().unwrap_or(Value::Null)
+                Some(row.get(&col_name).cloned().unwrap_or(Value::Null))
             } else {
-                Value::Null
+                None
             }
         }
-        _ => Value::Null,
+        _ => None,
     }
 }
 
@@ -319,20 +332,45 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+        // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53); NaN keeps
+        // the prior `partial_cmp`-None (unordered) result.
+        (Value::Int(a), Value::Float(b)) => {
+            if b.is_nan() {
+                None
+            } else {
+                Some(uni_common::cmp_i64_f64(*a, *b))
+            }
+        }
+        (Value::Float(a), Value::Int(b)) => {
+            if a.is_nan() {
+                None
+            } else {
+                Some(uni_common::cmp_i64_f64(*b, *a).reverse())
+            }
+        }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
 
-/// Evaluate a binary comparison operator on two Values.
+/// Evaluate a binary comparison operator on two operands.
 ///
 /// Handles equality (`Eq`, `NotEq`) directly and delegates ordering
-/// comparisons (`Lt`, `LtEq`, `Gt`, `GtEq`) to [`compare_values`].
-fn evaluate_comparison(op: &uni_cypher::ast::BinaryOp, left: &Value, right: &Value) -> bool {
+/// comparisons (`Lt`, `LtEq`, `Gt`, `GtEq`) to [`compare_values`]. Either operand
+/// being `None` means the fast-path could not evaluate that side (e.g. an
+/// arithmetic or `IN`/`CASE` sub-expression); such a comparison is "unknown" and
+/// KEEPS the row — a pre-filter must never silently drop a row it cannot evaluate.
+fn evaluate_comparison(
+    op: &uni_cypher::ast::BinaryOp,
+    left: Option<&Value>,
+    right: Option<&Value>,
+) -> bool {
     use std::cmp::Ordering;
     use uni_cypher::ast::BinaryOp;
+
+    let (Some(left), Some(right)) = (left, right) else {
+        return true;
+    };
 
     match op {
         BinaryOp::Eq => left == right,
@@ -347,7 +385,14 @@ fn evaluate_comparison(op: &uni_cypher::ast::BinaryOp, left: &Value, right: &Val
             compare_values(left, right),
             Some(Ordering::Greater | Ordering::Equal)
         ),
-        _ => false,
+        // Any operator this fast-path evaluator does not implement (STARTS WITH,
+        // CONTAINS, IN, `=~`, arithmetic, ...) must be treated as "unknown", which
+        // for a pre-filter means KEEP the row — never silently drop it. Returning
+        // `false` here previously discarded matching rows. In production such
+        // shapes are not pushed into `input_filter` at all (the planner's
+        // `apply_input_filter_supported` gate keeps them as a residual Filter that
+        // evaluates the full grammar); this branch is the defensive backstop.
+        _ => true,
     }
 }
 
@@ -818,9 +863,17 @@ async fn run_apply(
             (merged, HashMap::new())
         };
 
-        // Check cache for identical row params
+        // Check cache for identical row params. NEVER dedup a subquery that
+        // WRITES: its side effects (e.g. `UNWIND [1,1,1] AS x CALL { CREATE (:N) }`)
+        // must run once per outer row, so a params-keyed cache hit would execute
+        // them only once. The cache is read-only-subquery-only.
         let params_key = canonical_params_key(row_params);
-        let sub_rows = if let Some(cached_rows) = subplan_cache.get(&params_key) {
+        let cached = if subquery_has_writes {
+            None
+        } else {
+            subplan_cache.get(&params_key)
+        };
+        let sub_rows = if let Some(cached_rows) = cached {
             // Cache hit: reuse previous results
             cache_hits += 1;
             tracing::debug!("run_apply: cache hit for row params, skipping execute_subplan");
@@ -850,7 +903,10 @@ async fn run_apply(
             );
 
             let rows = batches_to_row_maps(&sub_batches);
-            subplan_cache.insert(params_key, rows.clone());
+            // Only memoize read-only subqueries (see above).
+            if !subquery_has_writes {
+                subplan_cache.insert(params_key, rows.clone());
+            }
             rows
         };
 
@@ -1201,5 +1257,177 @@ mod tests {
         assert_eq!(cache.get(&a), Some(&"row-1"));
         assert_eq!(cache.get(&b), Some(&"row-2"));
         assert_eq!(cache.len(), 2);
+    }
+
+    /// Regression (D5 mirror, apply.rs cross-type Int/Float arm) — FIXED. The
+    /// pushdown-filter comparator used to cast `i64 as f64`, collapsing an
+    /// integer just above 2^53 onto the float. It now compares exactly via
+    /// `cmp_i64_f64`, so `compare_values(Int(2^53+1), Float(2^53.0))` is
+    /// `Some(Greater)` and the reverse is `Some(Less)`.
+    #[test]
+    fn repro_compare_values_int_float_precision_collapse() {
+        use std::cmp::Ordering;
+        let big_int = Value::Int(9_007_199_254_740_993);
+        let float_2p53 = Value::Float(9_007_199_254_740_992.0);
+        assert_eq!(
+            compare_values(&big_int, &float_2p53),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(compare_values(&float_2p53, &big_int), Some(Ordering::Less));
+    }
+
+    // -----------------------------------------------------------------------
+    // R6 / uni-query[22]: the input_filter fast-path must never silently DROP a
+    // row it cannot confidently evaluate to false. Unknown operators, unknown
+    // expression shapes (IN/CASE/function calls), and unresolvable operands
+    // (arithmetic) all resolve to "unknown" → KEEP. A genuinely resolved value
+    // (including NULL) is still truth-tested per Cypher 3VL. These guard the
+    // symmetric keep-on-unknown backstop; in production the planner's
+    // `apply_input_filter_supported` gate keeps such shapes out of input_filter.
+    // -----------------------------------------------------------------------
+
+    use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr as AstExpr};
+
+    /// `a.name` property access as an AST expression.
+    fn prop(var: &str, key: &str) -> AstExpr {
+        AstExpr::Property(Box::new(AstExpr::Variable(var.into())), key.into())
+    }
+
+    /// A row binding `a.name = "Alice"` and `a.x = 10`.
+    fn alice_row() -> HashMap<String, Value> {
+        params(&[
+            ("a.name", Value::String("Alice".into())),
+            ("a.x", Value::Int(10)),
+        ])
+    }
+
+    #[test]
+    fn evaluate_filter_supported_eq_true_keeps_and_false_drops() {
+        let row = alice_row();
+        let eq_true = AstExpr::BinaryOp {
+            left: Box::new(prop("a", "name")),
+            op: BinaryOp::Eq,
+            right: Box::new(AstExpr::Literal(CypherLiteral::String("Alice".into()))),
+        };
+        let eq_false = AstExpr::BinaryOp {
+            left: Box::new(prop("a", "name")),
+            op: BinaryOp::Eq,
+            right: Box::new(AstExpr::Literal(CypherLiteral::String("Bob".into()))),
+        };
+        assert!(evaluate_filter(&eq_true, &row), "TRUE Eq keeps the row");
+        assert!(!evaluate_filter(&eq_false, &row), "FALSE Eq drops the row");
+    }
+
+    #[test]
+    fn evaluate_filter_null_property_3vl_drops() {
+        // A resolved-but-NULL property truth-test is not TRUE → row dropped (3VL).
+        let row = alice_row(); // no "a.missing"
+        assert!(
+            !evaluate_filter(&prop("a", "missing"), &row),
+            "unresolved property resolves to NULL → truth-test false → drop"
+        );
+    }
+
+    #[test]
+    fn evaluate_filter_unknown_shape_in_list_keeps() {
+        // `a.name IN [...]` is a dedicated Expr::In variant the fast-path cannot
+        // evaluate → must KEEP, not drop.
+        let row = alice_row();
+        let in_expr = AstExpr::In {
+            expr: Box::new(prop("a", "name")),
+            list: Box::new(AstExpr::List(vec![AstExpr::Literal(
+                CypherLiteral::String("Zed".into()),
+            )])),
+        };
+        assert!(
+            evaluate_filter(&in_expr, &row),
+            "unevaluable IN shape must KEEP the row (never silent-drop)"
+        );
+    }
+
+    #[test]
+    fn evaluate_filter_unknown_shape_case_keeps() {
+        let row = alice_row();
+        let case_expr = AstExpr::Case {
+            expr: None,
+            when_then: vec![(
+                AstExpr::Literal(CypherLiteral::Bool(true)),
+                AstExpr::Literal(CypherLiteral::Bool(false)),
+            )],
+            else_expr: None,
+        };
+        assert!(
+            evaluate_filter(&case_expr, &row),
+            "unevaluable CASE shape must KEEP the row"
+        );
+    }
+
+    #[test]
+    fn evaluate_filter_arithmetic_operand_keeps() {
+        // `a.x + 1 > 100`: the outer `>` is supported, but the left operand is an
+        // arithmetic BinaryOp the fast-path cannot resolve → unknown → KEEP,
+        // rather than dropping via a spurious NULL comparison.
+        let row = alice_row();
+        let arith_cmp = AstExpr::BinaryOp {
+            left: Box::new(AstExpr::BinaryOp {
+                left: Box::new(prop("a", "x")),
+                op: BinaryOp::Add,
+                right: Box::new(AstExpr::Literal(CypherLiteral::Integer(1))),
+            }),
+            op: BinaryOp::Gt,
+            right: Box::new(AstExpr::Literal(CypherLiteral::Integer(100))),
+        };
+        assert!(
+            evaluate_filter(&arith_cmp, &row),
+            "comparison with an unresolvable arithmetic operand must KEEP the row"
+        );
+    }
+
+    #[test]
+    fn evaluate_filter_unknown_operator_keeps() {
+        // A string operator (STARTS WITH) the comparison fast-path does not
+        // implement → `_ => true` operator backstop → KEEP.
+        let row = alice_row();
+        let starts_with = AstExpr::BinaryOp {
+            left: Box::new(prop("a", "name")),
+            op: BinaryOp::StartsWith,
+            right: Box::new(AstExpr::Literal(CypherLiteral::String("Al".into()))),
+        };
+        assert!(
+            evaluate_filter(&starts_with, &row),
+            "unimplemented operator must KEEP the row"
+        );
+    }
+
+    #[test]
+    fn evaluate_filter_and_or_not_compose() {
+        let row = alice_row();
+        let t = AstExpr::BinaryOp {
+            left: Box::new(prop("a", "name")),
+            op: BinaryOp::Eq,
+            right: Box::new(AstExpr::Literal(CypherLiteral::String("Alice".into()))),
+        };
+        let f = AstExpr::BinaryOp {
+            left: Box::new(prop("a", "name")),
+            op: BinaryOp::Eq,
+            right: Box::new(AstExpr::Literal(CypherLiteral::String("Bob".into()))),
+        };
+        let and = AstExpr::BinaryOp {
+            left: Box::new(t.clone()),
+            op: BinaryOp::And,
+            right: Box::new(f.clone()),
+        };
+        let or = AstExpr::BinaryOp {
+            left: Box::new(t.clone()),
+            op: BinaryOp::Or,
+            right: Box::new(f.clone()),
+        };
+        let not_f = AstExpr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: Box::new(f),
+        };
+        assert!(!evaluate_filter(&and, &row), "TRUE AND FALSE = drop");
+        assert!(evaluate_filter(&or, &row), "TRUE OR FALSE = keep");
+        assert!(evaluate_filter(&not_f, &row), "NOT FALSE = keep");
     }
 }

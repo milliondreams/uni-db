@@ -5,7 +5,7 @@ use crate::storage::delta::{ENTRY_SIZE_ESTIMATE, L1Entry, Op};
 use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use arrow_array::Array;
-use arrow_array::builder::{ArrayBuilder, ListBuilder, UInt64Builder};
+use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
 use metrics;
 use std::collections::{HashMap, HashSet};
@@ -127,6 +127,13 @@ impl Compactor {
             "Starting vertex compaction"
         );
 
+        // Serialize the whole read → merge → OVERWRITE against concurrent flushes.
+        // The flush path takes the same per-table lock in
+        // `merge_insert_batch_with_lance_conflict_retry`; without it, an unguarded
+        // `AddDataMode::Overwrite` below would silently discard rows a flush
+        // appended in the window between this scan and the overwrite commit.
+        let _write_guard = backend.lock_table_for_write(&table_name).await;
+
         use crate::backend::types::ScanRequest;
         let batches: Vec<RecordBatch> = backend.scan(ScanRequest::all(&table_name)).await?;
 
@@ -226,6 +233,7 @@ impl Compactor {
                     current_entry,
                     current_version,
                     &crdt_props,
+                    self.storage.plugin_registry().map(|a| a.as_ref()),
                 )?;
             }
         }
@@ -277,7 +285,11 @@ impl Compactor {
         Ok(())
     }
 
-    fn merge_crdt_values(a: &Value, b: &Value) -> Result<Value> {
+    fn merge_crdt_values(
+        a: &Value,
+        b: &Value,
+        registry: Option<&uni_plugin::PluginRegistry>,
+    ) -> Result<Value> {
         if a.is_null() {
             return Ok(b.clone());
         }
@@ -286,9 +298,16 @@ impl Compactor {
         }
         let mut crdt_a: Crdt = serde_json::from_value(a.clone().into())?;
         let crdt_b: Crdt = serde_json::from_value(b.clone().into())?;
-        crdt_a
-            .try_merge(&crdt_b)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Operand order: self=existing (a), other=new (b). Preserve — a custom
+        // provider's merge may be non-commutative.
+        match registry {
+            Some(reg) => crdt_a
+                .merge_via_registry(&crdt_b, reg)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            None => crdt_a
+                .try_merge(&crdt_b)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        }
         Ok(Value::from(serde_json::to_value(crdt_a)?))
     }
 
@@ -300,6 +319,7 @@ impl Compactor {
         current_entry: &mut (Properties, bool),
         current_version: &mut u64,
         crdt_props: &HashSet<String>,
+        registry: Option<&uni_plugin::PluginRegistry>,
     ) -> Result<()> {
         if version > *current_version {
             // New version wins for LWW, merge for CRDTs
@@ -309,7 +329,7 @@ impl Compactor {
             for (k, v) in row_props {
                 if crdt_props.contains(&k) {
                     let existing = current_entry.0.entry(k.clone()).or_insert(Value::Null);
-                    *existing = Self::merge_crdt_values(existing, &v)?;
+                    *existing = Self::merge_crdt_values(existing, &v, registry)?;
                 } else {
                     current_entry.0.insert(k, v);
                 }
@@ -327,7 +347,7 @@ impl Compactor {
             for (k, v) in row_props {
                 if crdt_props.contains(&k) {
                     let existing = current_entry.0.entry(k.clone()).or_insert(Value::Null);
-                    *existing = Self::merge_crdt_values(existing, &v)?;
+                    *existing = Self::merge_crdt_values(existing, &v, registry)?;
                 } else {
                     current_entry.0.insert(k, v);
                 }
@@ -338,7 +358,7 @@ impl Compactor {
                 for (k, v) in row_props {
                     if crdt_props.contains(&k) {
                         let existing = current_entry.0.entry(k.clone()).or_insert(Value::Null);
-                        *existing = Self::merge_crdt_values(existing, &v)?;
+                        *existing = Self::merge_crdt_values(existing, &v, registry)?;
                     }
                 }
             }
@@ -507,8 +527,13 @@ impl Compactor {
             );
         }
 
-        // Final Flush
-        if !src_vid_builder.is_empty() {
+        // Final Flush — always replace L2, even when the compacted output is
+        // empty. If every edge for this (edge_type, direction) was deleted the
+        // builders are empty; skipping the replace here would leave the stale
+        // pre-delete L2 rows intact while the tombstone-clear below erases the
+        // Delta L1 deletes, resurrecting the deleted edges on the next read.
+        // Writing the (possibly empty) batch overwrites L2 to match the deltas.
+        {
             let src_arr = Arc::new(src_vid_builder.finish());
             let neighbors_arr = Arc::new(neighbors_builder.finish());
             let edge_ids_arr = Arc::new(edge_ids_builder.finish());
@@ -642,4 +667,120 @@ fn append_edges_to_builders(
 pub struct CompactionInfo {
     pub edge_type: String,
     pub direction: String,
+}
+
+#[cfg(test)]
+mod ws_d_crdt_tests {
+    //! WS-D (P0.4): the compaction merge path must route CRDT merges through
+    //! the plugin registry (previously it called native `try_merge` directly).
+    //! These exercise `Compactor::merge_crdt_values` in isolation: with a
+    //! registered provider the registry path runs; with `None` it falls back
+    //! to native, byte-for-byte. (The full flush→compact integration test that
+    //! proves the stamped `StorageManager` registry reaches `compact_vertices`
+    //! at runtime is a recommended follow-up.)
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use uni_common::Value;
+    use uni_crdt::{Crdt, GCounter};
+    use uni_plugin::traits::crdt::{CrdtKind, CrdtKindProvider, CrdtOp, CrdtState, ScalarValue};
+    use uni_plugin::{
+        Capability, CapabilitySet, FnError, PluginId, PluginRegistrar, PluginRegistry,
+    };
+
+    #[derive(Default)]
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+    impl CrdtKindProvider for CountingProvider {
+        fn kind(&self) -> CrdtKind {
+            CrdtKind::new("uni-crdt:g-counter")
+        }
+        fn empty(&self) -> Box<dyn CrdtState> {
+            Box::new(St {
+                inner: Crdt::GCounter(GCounter::new()),
+            })
+        }
+        fn from_persisted(&self, bytes: &[u8]) -> Result<Box<dyn CrdtState>, FnError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let inner =
+                Crdt::from_msgpack(bytes).map_err(|e| FnError::new(0xA01, format!("{e}")))?;
+            Ok(Box::new(St { inner }))
+        }
+    }
+    struct St {
+        inner: Crdt,
+    }
+    impl CrdtState for St {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn apply(&mut self, _op: &CrdtOp) -> Result<(), FnError> {
+            Ok(())
+        }
+        fn merge(&mut self, other: &dyn CrdtState) -> Result<(), FnError> {
+            let o = other
+                .as_any()
+                .downcast_ref::<St>()
+                .ok_or_else(|| FnError::new(0xA10, "type mismatch"))?;
+            self.inner
+                .try_merge(&o.inner)
+                .map_err(|e| FnError::new(0xA11, format!("{e}")))
+        }
+        fn value(&self) -> Result<ScalarValue, FnError> {
+            Ok(ScalarValue::Utf8(Some(self.inner.type_name().to_owned())))
+        }
+        fn persist(&self) -> Result<Vec<u8>, FnError> {
+            self.inner
+                .to_msgpack()
+                .map_err(|e| FnError::new(0xA12, format!("{e}")))
+        }
+    }
+
+    fn gcounter(replica: &str, by: u64) -> Value {
+        let mut g = GCounter::new();
+        g.increment(replica, by);
+        Value::from(serde_json::to_value(Crdt::GCounter(g)).unwrap())
+    }
+
+    #[test]
+    fn compaction_merge_routes_through_registry() {
+        let registry = PluginRegistry::new();
+        let provider = Arc::new(CountingProvider::default());
+        let caps = CapabilitySet::from_iter_of([Capability::Crdt]);
+        let mut r = PluginRegistrar::new(PluginId::new("test.counting"), &caps, &registry);
+        r.crdt_kind(
+            CrdtKind::new("uni-crdt:g-counter"),
+            Arc::clone(&provider) as Arc<dyn CrdtKindProvider>,
+        )
+        .unwrap();
+        r.commit_to_registry().unwrap();
+
+        let a = gcounter("r1", 5); // existing
+        let b = gcounter("r2", 7); // new
+        let merged = super::Compactor::merge_crdt_values(&a, &b, Some(&registry)).unwrap();
+
+        assert!(
+            provider.calls.load(Ordering::SeqCst) > 0,
+            "compaction merge must route through the registered provider"
+        );
+        let crdt: Crdt = serde_json::from_value(merged.into()).unwrap();
+        match crdt {
+            Crdt::GCounter(g) => assert_eq!(g.value(), 12, "5 + 7 = 12"),
+            other => panic!("expected GCounter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_merge_falls_back_to_native_without_registry() {
+        let a = gcounter("r1", 3);
+        let b = gcounter("r2", 4);
+        let merged = super::Compactor::merge_crdt_values(&a, &b, None).unwrap();
+        let crdt: Crdt = serde_json::from_value(merged.into()).unwrap();
+        match crdt {
+            Crdt::GCounter(g) => assert_eq!(g.value(), 7, "3 + 4 = 7 native fallback"),
+            other => panic!("expected GCounter, got {other:?}"),
+        }
+    }
 }

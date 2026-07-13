@@ -1,4 +1,5 @@
 pub mod bug_bulk_edge_create_repro;
+pub mod bug_call_yield_where_dropped;
 pub mod bug_coalesce_utf8;
 pub mod bug_edge_id_in_where;
 pub mod bug_empty_typed_list_inference;
@@ -49,6 +50,32 @@ pub mod issue_68_type_mismatch;
 pub mod issue_93_bytes_round_trip;
 pub mod locy_is_not_complement_recursion;
 pub mod repro_edge_export;
+// Correctness-scan Wave 0 repros.
+pub mod repro_fork_sweeper_shutdown;
+pub mod repro_hybrid_dense_arm_swallow;
+pub mod repro_schema_edge_type_swallow;
+// Correctness-scan Wave 1 repros (R5 constraint visibility).
+pub mod bug_bulk_index_skip_both_defer_false_repro;
+pub mod bug_bulk_unique_preexisting_repro;
+// Correctness-scan Wave 0 findings that fell through — neither fixed nor
+// deferred; tracked as D9/D10 in docs/correctness-deferred.md (bug-pinning
+// tests are #[ignore]d until fixed).
+pub mod bug_bulk_check_int_float_repro; // uni-bulk[5] / D10
+pub mod bug_bulk_check_large_int_repro; // uni-bulk compare_values i64->f64 (D5 mirror)
+pub mod bug_bulk_flush_intent_abandon_repro; // uni-bulk[2] / D9
+// Correctness-scan Wave 1 repros (R10 integer precision / lossy key).
+pub mod bug_bulk_unique_key_lossy_repro;
+// Correctness-scan Wave 1 repros (R11 Locy compile-context / registry).
+pub mod repro_locy_tx_neural_preview;
+pub mod repro_rule_promotion_strata;
+pub mod repro_rule_registry_lost_update;
+// Correctness-scan Wave 2 repros (L6 security/authz).
+pub mod repro_authz_query_bypass;
+pub mod repro_config_path_plugin_registry;
+// Correctness-scan Wave 2 repros (L7 commit-timeout after durable point).
+pub mod repro_commit_timeout_after_durable;
+// Correctness-scan Wave 4 repro (fork-local index-kind collision).
+pub mod repro_fork_index_kind_collision;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

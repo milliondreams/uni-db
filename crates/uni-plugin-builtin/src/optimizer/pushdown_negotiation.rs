@@ -283,7 +283,13 @@ fn try_rewrite_topn(
             && let Some(topn_marker) = markers.topn.as_ref()
         {
             let sort = sort_exprs_to_marker(expr);
-            if let Some(app) = topn_marker.push_topn(&sort, *k) {
+            // Only elide the Sort when the marker faithfully represents EVERY
+            // sort key. `sort_exprs_to_marker` silently drops non-column keys
+            // (e.g. `a + b`), so a shorter list means the source never saw the
+            // true ordering — eliding then would drop the real sort order.
+            if sort.len() == expr.len()
+                && let Some(app) = topn_marker.push_topn(&sort, *k)
+            {
                 use uni_plugin::traits::pushdown::TopNScope;
                 if matches!(app.applied, TopNScope::Global) {
                     tracing::debug!(
@@ -311,7 +317,12 @@ fn try_rewrite_topn(
             && let Some(topn_marker) = markers.topn.as_ref()
         {
             let sort = sort_exprs_to_marker(expr);
-            if let Some(app) = topn_marker.push_topn(&sort, k) {
+            // See Pattern A: only elide when every sort key survived the
+            // column-only projection, otherwise the true ordering was not
+            // pushed to the source.
+            if sort.len() == expr.len()
+                && let Some(app) = topn_marker.push_topn(&sort, k)
+            {
                 use uni_plugin::traits::pushdown::TopNScope;
                 if matches!(app.applied, TopNScope::Global) {
                     tracing::debug!(

@@ -25,14 +25,30 @@ use super::procedure::ProcedureRegistry;
 #[derive(Debug)]
 pub(crate) enum Accumulator {
     Count(i64),
-    Sum(f64),
+    /// Running sum kept exact for integers: `int_sum` accumulates i64 values
+    /// while `all_ints` holds; `float_sum` mirrors every value as f64 for the
+    /// float/overflow fallback. Summing purely in f64 lost precision above 2^53.
+    Sum {
+        int_sum: i64,
+        float_sum: f64,
+        all_ints: bool,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Collect(Vec<Value>),
     CountDistinct(HashSet<Value>),
-    PercentileDisc { values: Vec<f64>, percentile: f64 },
-    PercentileCont { values: Vec<f64>, percentile: f64 },
+    PercentileDisc {
+        values: Vec<f64>,
+        percentile: f64,
+    },
+    PercentileCont {
+        values: Vec<f64>,
+        percentile: f64,
+    },
 }
 
 /// Convert f64 to Value, preserving integer representation when possible.
@@ -96,6 +112,12 @@ fn cypher_cross_type_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float(l), Value::Int(r)) => l.partial_cmp(&(*r as f64)).unwrap_or(Ordering::Equal),
         (Value::String(l), Value::String(r)) => l.cmp(r),
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
+        // Temporal and Bytes share `cypher_type_rank` 5, so a same-rank pair
+        // reaches this match. Without these arms `min`/`max` over dates or byte
+        // strings collapsed to `Ordering::Equal` and returned the first-seen
+        // value. Order them by their natural comparison instead.
+        (Value::Temporal(l), Value::Temporal(r)) => Executor::compare_temporal(l, r),
+        (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
         _ => Ordering::Equal,
     }
 }
@@ -110,7 +132,11 @@ impl Accumulator {
         match op_upper.as_str() {
             "COUNT" if distinct => Accumulator::CountDistinct(HashSet::new()),
             "COUNT" => Accumulator::Count(0),
-            "SUM" => Accumulator::Sum(0.0),
+            "SUM" => Accumulator::Sum {
+                int_sum: 0,
+                float_sum: 0.0,
+                all_ints: true,
+            },
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
             "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
@@ -134,11 +160,26 @@ impl Accumulator {
                     *c += 1;
                 }
             }
-            Accumulator::Sum(s) => {
-                if let Some(n) = val.as_f64() {
-                    *s += n;
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                all_ints,
+            } => match val {
+                Value::Int(i) => {
+                    *float_sum += *i as f64;
+                    // Exact while it fits; on i64 overflow fall back to the f64 sum.
+                    match int_sum.checked_add(*i) {
+                        Some(s) => *int_sum = s,
+                        None => *all_ints = false,
+                    }
                 }
-            }
+                _ => {
+                    if let Some(n) = val.as_f64() {
+                        *float_sum += n;
+                        *all_ints = false;
+                    }
+                }
+            },
             Accumulator::Min(current) => {
                 if !val.is_null() {
                     *current = Some(match current.take() {
@@ -185,7 +226,17 @@ impl Accumulator {
     pub(crate) fn finish(&self) -> Value {
         match self {
             Accumulator::Count(c) => Value::Int(*c),
-            Accumulator::Sum(s) => numeric_to_value(*s),
+            Accumulator::Sum {
+                int_sum,
+                float_sum,
+                all_ints,
+            } => {
+                if *all_ints {
+                    Value::Int(*int_sum)
+                } else {
+                    numeric_to_value(*float_sum)
+                }
+            }
             Accumulator::Min(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Max(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Avg { sum, count } => {
@@ -610,14 +661,15 @@ impl Executor {
                 if r.is_nan() {
                     Ordering::Less
                 } else {
-                    (*l as f64).partial_cmp(r).unwrap_or(Ordering::Equal)
+                    // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53).
+                    uni_common::cmp_i64_f64(*l, *r)
                 }
             }
             (Value::Float(l), Value::Int(r)) => {
                 if l.is_nan() {
                     Ordering::Greater
                 } else {
-                    l.partial_cmp(&(*r as f64)).unwrap_or(Ordering::Equal)
+                    uni_common::cmp_i64_f64(*r, *l).reverse()
                 }
             }
             (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
@@ -1018,6 +1070,41 @@ mod tests {
     }
 
     #[test]
+    fn test_accumulator_minmax_temporal() {
+        // Regression for the `cypher_cross_type_cmp` finding: temporal values
+        // shared `cypher_type_rank` 5 and fell through to `Ordering::Equal`, so
+        // MIN/MAX kept the first-encountered value instead of the true extreme.
+        let dt = |secs: i64| {
+            Value::Temporal(TemporalValue::DateTime {
+                nanos_since_epoch: secs * 1_000_000_000,
+                offset_seconds: 0,
+                timezone_name: None,
+            })
+        };
+        // 2020, then 2010, then 2030 (unsorted insertion order).
+        let y2020 = dt(1_577_836_800);
+        let y2010 = dt(1_262_304_000);
+        let y2030 = dt(1_893_456_000);
+
+        let mut min_acc = Accumulator::new("MIN", false);
+        let mut max_acc = Accumulator::new("MAX", false);
+        for v in [&y2020, &y2010, &y2030] {
+            min_acc.update(v, false);
+            max_acc.update(v, false);
+        }
+        assert_eq!(
+            min_acc.finish(),
+            y2010,
+            "MIN over dates must return the earliest"
+        );
+        assert_eq!(
+            max_acc.finish(),
+            y2030,
+            "MAX over dates must return the latest"
+        );
+    }
+
+    #[test]
     fn test_accumulator_avg() {
         let mut acc = Accumulator::new("AVG", false);
         acc.update(&Value::Int(10), false);
@@ -1101,6 +1188,19 @@ mod tests {
         let l1 = Value::List(vec![Value::Int(1), Value::Int(2)]);
         let l2 = Value::List(vec![Value::Int(1), Value::Int(3)]);
         assert!(Executor::compare_values(&l1, &l2).is_lt());
+    }
+
+    /// Regression (D5 mirror, core.rs cross-type Int/Float arm) — FIXED. The
+    /// comparator used to cast `i64 as f64`, collapsing an integer just above
+    /// 2^53 onto the float. It now compares exactly via `cmp_i64_f64`, so
+    /// `compare_values(Int(2^53+1), Float(2^53.0))` is `Greater`
+    /// (9007199254740993 > 9007199254740992), and the reverse is `Less`.
+    #[test]
+    fn repro_compare_values_int_float_precision_collapse() {
+        let big_int = Value::Int(9_007_199_254_740_993);
+        let float_2p53 = Value::Float(9_007_199_254_740_992.0);
+        assert!(Executor::compare_values(&big_int, &float_2p53).is_gt());
+        assert!(Executor::compare_values(&float_2p53, &big_int).is_lt());
     }
 
     /// COUNT(DISTINCT) must coerce numerically (1 vs 1.0 count once, matching

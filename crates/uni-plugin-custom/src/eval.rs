@@ -162,7 +162,21 @@ fn type_name(v: &Value) -> &'static str {
 fn apply_binary(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
     use BinaryOp::*;
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
-        return Ok(Value::Null);
+        // Cypher three-valued logic: AND/OR still yield a definite result when
+        // one operand is NULL if the other operand dominates — `false AND null`
+        // = false, `true OR null` = true. Only when NULL cannot be dominated does
+        // the result stay NULL. Every other operator propagates NULL.
+        return match op {
+            And => match (&l, &r) {
+                (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
+                _ => Ok(Value::Null),
+            },
+            Or => match (&l, &r) {
+                (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
+                _ => Ok(Value::Null),
+            },
+            _ => Ok(Value::Null),
+        };
     }
     match op {
         Add => add_values(l, r),
@@ -196,6 +210,36 @@ fn add_values(l: Value, r: Value) -> Result<Value, EvalError> {
 }
 
 fn arith(op: BinaryOp, l: Value, r: Value) -> Result<Value, EvalError> {
+    // Exact integer path for Int/Int (except Pow, which Cypher yields as Float):
+    // routing through f64 loses precision above 2^53 and makes int/int division
+    // return a Float instead of Cypher's truncated Int. Overflow is an error, not
+    // a silent wrap. (finding uni-plugin-custom[4])
+    if let (Value::Int(a), Value::Int(b)) = (&l, &r)
+        && op != BinaryOp::Pow
+    {
+        let (a, b) = (*a, *b);
+        let res = match op {
+            BinaryOp::Sub => a.checked_sub(b),
+            BinaryOp::Mul => a.checked_mul(b),
+            BinaryOp::Div => {
+                if b == 0 {
+                    return Err(EvalError::Arithmetic("divide by zero".to_owned()));
+                }
+                a.checked_div(b) // truncates toward zero, per Cypher int division
+            }
+            BinaryOp::Mod => {
+                if b == 0 {
+                    return Err(EvalError::Arithmetic("mod by zero".to_owned()));
+                }
+                a.checked_rem(b)
+            }
+            _ => unreachable!("arith dispatched non-arith op"),
+        };
+        return res
+            .map(Value::Int)
+            .ok_or_else(|| EvalError::Arithmetic(format!("integer overflow in {op}")));
+    }
+
     let (lf, rf, both_int) = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => (*a as f64, *b as f64, true),
         (Value::Float(a), Value::Float(b)) => (*a, *b, false),

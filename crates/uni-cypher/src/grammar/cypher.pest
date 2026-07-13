@@ -273,6 +273,11 @@ dot_dot     = { ".." }
 
 expression = { or_expression }
 
+// Anchored entry point for `parse_expression`: SOI/EOI force the whole input to
+// be a single complete expression, so trailing garbage (e.g. "n.age > 18 AND")
+// is a parse error instead of being silently discarded as an unconsumed suffix.
+standalone_expression = { SOI ~ expression ~ EOI }
+
 // OR has lowest precedence
 or_expression = { xor_expression ~ (OR ~ xor_expression)* }
 
@@ -696,8 +701,16 @@ drop_index = { DROP_KW ~ INDEX ~ if_exists? ~ identifier }
 
 create_constraint = {
     CREATE ~ CONSTRAINT ~ if_not_exists? ~ identifier?
-    ~ ON ~ "(" ~ identifier ~ ":" ~ identifier_or_keyword ~ ")"
+    ~ ON ~ (constraint_rel_pattern | constraint_node_pattern)
     ~ ASSERT ~ constraint_assertion
+}
+// `ON (n:Label)` — node constraint. Inner tokens: [var, label].
+constraint_node_pattern = { "(" ~ identifier ~ ":" ~ identifier_or_keyword ~ ")" }
+// `ON ()-[r:TYPE]-()` (or `->`/`<-`) — relationship constraint. Direction uses
+// bare string literals so they are not captured; inner tokens: [var, edge_type].
+constraint_rel_pattern = {
+    "(" ~ ")" ~ ("<-" | "-") ~ "[" ~ identifier ~ ":" ~ identifier_or_keyword ~ "]"
+    ~ ("->" | "-") ~ "(" ~ ")"
 }
 constraint_assertion = {
     EXISTS ~ "(" ~ property_expr ~ ")"                        // EXISTS(n.prop)
@@ -762,11 +775,14 @@ property_definition = {
 // whitespace-free string the walker forwards to the backend `parse_data_type`.
 // Ordered choice tries the parameterized forms before the bare-token fallback,
 // so scalars (STRING, INT, bare VECTOR) still parse unchanged (backward compatible).
-type_specification = ${ type_sparse_vector | type_vector | type_list | type_map | identifier_or_keyword }
+type_specification = ${ type_sparse_vector | type_binary_vector | type_vector | type_list | type_map | identifier_or_keyword }
 type_vector = ${ VECTOR ~ "(" ~ ASCII_DIGIT+ ~ ")" }
 // `SPARSE_VECTOR(N)` — learned-sparse column over an N-term vocabulary. Tried
 // before `type_vector` (its token starts with `sparse_`, so no overlap).
 type_sparse_vector = ${ ^"sparse_vector" ~ "(" ~ ASCII_DIGIT+ ~ ")" }
+// `BINARY_VECTOR(N)` — packed bit/binary vector of N `u8` lanes, scored by
+// Hamming/Jaccard. Token starts with `binary_`, so no overlap with `vector`.
+type_binary_vector = ${ ^"binary_vector" ~ "(" ~ ASCII_DIGIT+ ~ ")" }
 type_list = ${ ^"list" ~ !ident_char ~ "<" ~ type_specification ~ ">" }
 // `MAP<K, V>` — recursive (V may itself be LIST/VECTOR/MAP); a space after the comma is
 // allowed (the common form). The whole span is forwarded to the backend `parse_data_type`,

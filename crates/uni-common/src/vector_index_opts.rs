@@ -109,9 +109,13 @@ pub fn parse_vector_metric(s: Option<&str>) -> Result<DistanceMetric> {
     match s.map(|m| m.to_ascii_lowercase()).as_deref() {
         Some("l2" | "euclidean") => Ok(DistanceMetric::L2),
         Some("dot") => Ok(DistanceMetric::Dot),
+        Some("l1" | "manhattan") => Ok(DistanceMetric::L1),
+        Some("hamming") => Ok(DistanceMetric::Hamming),
+        Some("jaccard") => Ok(DistanceMetric::Jaccard),
         Some("cosine") | None => Ok(DistanceMetric::Cosine),
         Some(other) => Err(anyhow::anyhow!(
-            "Unknown vector index metric '{other}' (expected cosine, l2, or dot)"
+            "Unknown vector index metric '{other}' \
+             (expected cosine, l2, dot, l1, hamming, or jaccard)"
         )),
     }
 }
@@ -188,6 +192,15 @@ mod tests {
             parse_vector_metric(Some("dot")).unwrap(),
             DistanceMetric::Dot
         );
-        assert!(parse_vector_metric(Some("hamming")).is_err());
+        assert_eq!(parse_vector_metric(Some("l1")).unwrap(), DistanceMetric::L1);
+        assert_eq!(
+            parse_vector_metric(Some("hamming")).unwrap(),
+            DistanceMetric::Hamming
+        );
+        assert_eq!(
+            parse_vector_metric(Some("jaccard")).unwrap(),
+            DistanceMetric::Jaccard
+        );
+        assert!(parse_vector_metric(Some("no_such_metric")).is_err());
     }
 }

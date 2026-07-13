@@ -88,7 +88,28 @@ pub fn resolve_locy_aggregate(
     {
         return Some(entry);
     }
-    registry.locy_aggregate(&qname)
+    if let Some(entry) = registry.locy_aggregate(&qname) {
+        return Some(entry);
+    }
+    // P0.2: plugin-namespaced custom aggregate (e.g. `myplugin.MYAGG`).
+    // The `builtin` lookup above only matches the reserved builtin
+    // namespace, so a third-party aggregate registered under its own
+    // plugin id was previously stored-but-unreachable. Resolve it the
+    // same convention-agnostic way scalars/procedures do: try each
+    // (namespace, local) split of the RAW name — not the builtin
+    // alias-canonicalized form — against session-local then instance
+    // registry, first hit wins.
+    for cand in uni_plugin::QName::candidate_splits(name) {
+        if let Some(session_pr) = crate::current_session_plugin_registry()
+            && let Some(entry) = session_pr.locy_aggregate(&cand)
+        {
+            return Some(entry);
+        }
+        if let Some(entry) = registry.locy_aggregate(&cand) {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 /// Returns a process-wide [`uni_plugin::PluginRegistry`] pre-populated with
@@ -450,21 +471,40 @@ impl ExecutionPlan for FoldExec {
                     // COUNTALL has no input column — the aggregate ignores it.
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
-                    // Resolve input column: prefer name-based lookup, fall back to index.
-                    let resolved_idx = binding
-                        .input_col_name
-                        .as_ref()
-                        .and_then(|name| batch.schema().index_of(name).ok())
-                        .unwrap_or(binding.input_col_index);
-                    if resolved_idx < batch.num_columns() {
-                        Arc::clone(batch.column(resolved_idx))
-                    } else {
-                        // Column not found — use zeros as fallback
-                        Arc::new(arrow_array::Float64Array::from(vec![
-                            0.0f64;
-                            batch.num_rows()
-                        ]))
-                    }
+                    // Resolve the aggregate input column. When the binding carries
+                    // a column name (the FOLD variable), the planner always projects
+                    // it into the body batch (`build_clause`'s FOLD-input pass), so a
+                    // name miss signals a real resolution bug — fail loud rather than
+                    // fabricating a zeros column that would silently corrupt the
+                    // aggregate (issue #145). `None` (test constructors / schema
+                    // reconciliation) falls back to the positional index.
+                    let resolved_idx = match &binding.input_col_name {
+                        Some(name) => batch.schema().index_of(name).map_err(|_| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "FOLD aggregate '{}' input column '{}' not found in \
+                                 body batch (columns: {:?})",
+                                binding.name,
+                                name,
+                                batch
+                                    .schema()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.name().clone())
+                                    .collect::<Vec<_>>(),
+                            ))
+                        })?,
+                        None => binding.input_col_index,
+                    };
+                    let column = batch.columns().get(resolved_idx).ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "FOLD aggregate '{}' input column index {} out of range \
+                             ({} columns)",
+                            binding.name,
+                            resolved_idx,
+                            batch.num_columns(),
+                        ))
+                    })?;
+                    Arc::clone(column)
                 };
                 let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. }) {
                     Some(TopKFoldCtx {
@@ -691,29 +731,41 @@ fn topk_dnf_disjunction(
     if proofs.is_empty() {
         return Ok(None);
     }
-    // When NO proof carries base_rvs (no IS-ref support visible —
-    // the rule's MNOR runs over plain columns, not derived facts),
-    // fall back to independence-mode noisy-OR. Going through
-    // `merge_top_k` here is wrong: it dedupes by dependency_key,
-    // collapsing all empty-base_rvs proofs into one max-weight
-    // proof. Plain noisy-OR over each row's weight preserves the
-    // pre-D-C0 AddMultProb behavior byte-identically.
-    if base_weights.is_empty() {
-        let mut complement = 1.0;
-        for p in &proofs {
-            complement *= 1.0 - p.weight;
-        }
-        return Ok(Some((1.0 - complement).clamp(0.0, 1.0)));
+    // Partition proofs by whether they carry IS-ref support (`base_rvs`). Only
+    // supported proofs are meaningful DNF clauses; an empty-base_rvs proof must
+    // NOT enter the DNF, because `DependencyDnf::weight` treats an empty clause as
+    // trivially true (prob 1.0) — so mixing a supported and an unsupported row in
+    // one group would collapse the whole group's probability to 1.0. Unsupported
+    // rows (the rule's MNOR running over plain columns, not derived facts) are
+    // instead folded in as INDEPENDENT noisy-OR factors, preserving the pre-D-C0
+    // AddMultProb behavior.
+    let (supported, unsupported): (Vec<_>, Vec<_>) =
+        proofs.into_iter().partition(|p| !p.base_rvs.is_empty());
+
+    // Complement of the independent (unsupported) contributions: ∏ (1 - weight).
+    let mut indep_complement = 1.0;
+    for p in &unsupported {
+        indep_complement *= 1.0 - p.weight;
     }
-    // At least one proof carries base_rvs — DNF inclusion-exclusion
-    // is meaningful. Merge top-K (which dedupes by dependency_key
-    // intentionally — shared bases ARE the same dependency) and
-    // compute exact (or top-K-approximated) probability via the
-    // DNF.
-    let k = if ctx.k == 0 { proofs.len() } else { ctx.k };
-    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), proofs, k);
+
+    if supported.is_empty() {
+        // No DNF terms at all — pure independence-mode noisy-OR.
+        return Ok(Some((1.0 - indep_complement).clamp(0.0, 1.0)));
+    }
+
+    // DNF inclusion-exclusion over the supported proofs. Merge top-K (which
+    // dedupes by dependency_key intentionally — shared bases ARE the same
+    // dependency).
+    let k = if ctx.k == 0 { supported.len() } else { ctx.k };
+    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), supported, k);
     let tag = uni_locy::TopKTag { proofs: kept };
-    Ok(Some(tag.to_dnf().weight(&base_weights)))
+    let dnf_prob = tag.to_dnf().weight(&base_weights);
+
+    // Combine the DNF probability with the independent unsupported rows by
+    // noisy-OR (they are independent events): 1 - (1 - dnf) · ∏ (1 - weight).
+    Ok(Some(
+        (1.0 - (1.0 - dnf_prob) * indep_complement).clamp(0.0, 1.0),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,6 +2365,34 @@ mod tests {
 
         // Unknown name still returns None — the resolver does not fall back.
         assert!(resolve_locy_aggregate(&registry, "NOT_REGISTERED").is_none());
+    }
+
+    #[test]
+    fn resolve_locy_aggregate_finds_plugin_namespaced() {
+        // P0.2 regression: a third-party aggregate registered under its own
+        // plugin namespace (not `builtin`) must resolve via a dotted name.
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new("myplugin");
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+
+        let registered: Arc<dyn LocyAggregate> = Arc::new(IdentityAgg);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        r.locy_aggregate(
+            uni_plugin::QName::new("myplugin", "MYAGG"),
+            Arc::clone(&registered),
+        )
+        .expect("register");
+        r.commit_to_registry().expect("commit");
+
+        // Before P0.2 this returned None (builtin-only lookup); now the
+        // candidate-split fallback resolves `myplugin.MYAGG`.
+        let resolved = resolve_locy_aggregate(&registry, "myplugin.MYAGG")
+            .expect("plugin-namespaced aggregate should resolve via dotted name");
+        assert!(Arc::ptr_eq(&registered, &resolved.aggregate));
+
+        // A bare local name (no namespace) must NOT resolve — avoids
+        // cross-namespace ambiguity.
+        assert!(resolve_locy_aggregate(&registry, "MYAGG").is_none());
     }
 
     #[test]

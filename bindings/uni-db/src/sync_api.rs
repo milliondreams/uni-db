@@ -32,23 +32,31 @@ pub struct QueryCursor {
 impl QueryCursor {
     /// Pull the next single row, refilling from the batch stream as needed.
     fn next_row(&self, py: Python<'_>) -> PyResult<Option<core::Row>> {
-        let mut buf = self.buffer.lock().unwrap();
-        if let Some(row) = buf.pop_front() {
-            return Ok(Some(row));
+        // Buffer fast-path in its own scope so the guard is dropped before any await.
+        {
+            let mut buf = self.buffer.lock().unwrap();
+            if let Some(row) = buf.pop_front() {
+                return Ok(Some(row));
+            }
         }
-        // Buffer empty – fetch next batch from cursor.
-        let mut guard = self.cursor.lock().unwrap();
-        let cursor = match guard.as_mut() {
+        // Take the cursor out by value so NO mutex is held across the
+        // GIL-releasing `block_on` — holding buffer+cursor guards across it was
+        // the ABBA deadlock (correctness-scan R13). Mirrors `fetch_all` below,
+        // but writes the cursor back afterwards (we stream it repeatedly).
+        let mut cursor = match self.cursor.lock().unwrap().take() {
             Some(c) => c,
-            None => return Ok(None), // closed
+            None => return Ok(None), // closed / exhausted
         };
         let batch =
             py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.next_batch()));
+        // Put the cursor back for the next call, then stash any leftover rows —
+        // both under brief, non-overlapping re-locks (no lock spans the await).
+        *self.cursor.lock().unwrap() = Some(cursor);
         match batch {
             Some(Ok(rows)) => {
                 let mut iter = rows.into_iter();
                 let first = iter.next();
-                buf.extend(iter);
+                self.buffer.lock().unwrap().extend(iter);
                 Ok(first)
             }
             Some(Err(e)) => Err(crate::exceptions::uni_error_to_pyerr(e)),
@@ -280,7 +288,7 @@ impl Transaction {
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.prepare(cypher)))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedQuery {
-            inner: std::sync::Mutex::new(prepared),
+            inner: std::sync::Arc::new(prepared),
         })
     }
 
@@ -291,7 +299,7 @@ impl Transaction {
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.prepare_locy(program)))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedLocy {
-            inner: std::sync::Mutex::new(prepared),
+            inner: std::sync::Arc::new(prepared),
         })
     }
 

@@ -377,11 +377,23 @@ impl AdjacencyManager {
                     if ts.edge_type == edge_type {
                         tombstoned_eids.insert(*eid);
 
-                        // Move to shadow CSR
+                        // Move to shadow CSR. ShadowCsr is keyed by the queried
+                        // vid for the direction, exactly like the CSRs themselves
+                        // (Incoming is keyed by dst with neighbor src — see the
+                        // insert at `insert_edge(dst, src, .., Incoming)` and the
+                        // get_neighbors_at_version swap). Key by src for Outgoing,
+                        // by dst for Incoming — otherwise a time-travel read after
+                        // compaction looks up the wrong vid and the tombstone is
+                        // invisible (deleted edge resurrected).
+                        let (key_vid, neighbor_vid) = if direction == Direction::Incoming {
+                            (ts.dst_vid, ts.src_vid)
+                        } else {
+                            (ts.src_vid, ts.dst_vid)
+                        };
                         self.shadow.add_deleted_edge(
-                            ts.src_vid,
+                            key_vid,
                             ShadowEdge {
-                                neighbor_vid: ts.dst_vid,
+                                neighbor_vid,
                                 eid: *eid,
                                 edge_type,
                                 created_version: 0, // unknown; overlay tombstones don't track creation version

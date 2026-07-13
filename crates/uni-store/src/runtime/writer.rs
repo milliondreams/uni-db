@@ -364,6 +364,15 @@ pub struct ForkPoint {
     /// `_version <= pin` read still sees inherited (base_paths) rows,
     /// while the fork's own writes get versions above it.
     pub version_hwm: u64,
+    /// `dataset_name` → parent **branch** version at the fork point, for a
+    /// nested fork (a fork of a fork). Empty when the parent is the primary DB.
+    ///
+    /// A nested fork must branch off its parent fork's Lance *branch* tip, which
+    /// advances independently of `main` (so `dataset_versions`, which tracks the
+    /// main-branch version, is not usable there). Captured under `flush_lock`
+    /// alongside `dataset_versions` so a concurrent parent commit+flush cannot
+    /// advance the tip between capture and branch creation.
+    pub parent_branch_versions: BTreeMap<String, u64>,
 }
 
 /// RAII latch on [`StorageManager::flush_in_progress`].
@@ -573,6 +582,11 @@ impl Writer {
         };
 
         let l0_manager = Arc::new(L0Manager::new(start_version, wal));
+        // Route commit-time CRDT merges through the DB's plugin registry (if
+        // installed on the StorageManager). Behavior-preserving when absent.
+        if let Some(registry) = storage.plugin_registry() {
+            l0_manager.set_plugin_registry(Arc::clone(registry));
+        }
 
         let property_manager = Some(Arc::new(PropertyManager::new(
             storage.clone(),
@@ -895,10 +909,8 @@ impl Writer {
                     if l != label {
                         continue;
                     }
-                    let ConstraintType::Unique {
-                        properties: unique_props,
-                    } = &constraint.constraint_type
-                    else {
+                    // Rebuild keys for both Unique and NodeKey (uniqueness half).
+                    let Some(unique_props) = constraint.constraint_type.unique_properties() else {
                         continue;
                     };
                     let mut key_values = Vec::new();
@@ -919,6 +931,52 @@ impl Writer {
         }
         for (key, vid) in keys {
             l0_guard.insert_constraint_key(key, vid);
+        }
+
+        // Same rebuild for edge unique/nodekey keys: `replay_mutations` restores
+        // edge properties/types but never repopulates `edge_constraint_index`, so
+        // a WAL-committed-but-unflushed unique edge key would otherwise be invisible
+        // to the edge full-horizon probe after recovery (edge counterpart of Bug #9
+        // Mechanism B).
+        let mut edge_keys: Vec<(Vec<u8>, Eid)> = Vec::new();
+        for (&eid, props) in &l0_guard.edge_properties {
+            if l0_guard.tombstones.contains_key(&eid) {
+                continue;
+            }
+            let Some(edge_type) = l0_guard.edge_types.get(&eid) else {
+                continue;
+            };
+            for constraint in &schema.constraints {
+                if !constraint.enabled {
+                    continue;
+                }
+                let ConstraintTarget::EdgeType(t) = &constraint.target else {
+                    continue;
+                };
+                if t != edge_type {
+                    continue;
+                }
+                let Some(unique_props) = constraint.constraint_type.unique_properties() else {
+                    continue;
+                };
+                let mut key_values = Vec::new();
+                let mut all_present = true;
+                for prop in unique_props {
+                    match props.get(prop) {
+                        Some(val) if !val.is_null() => key_values.push((prop.clone(), val.clone())),
+                        _ => {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                }
+                if all_present && !key_values.is_empty() {
+                    edge_keys.push((serialize_constraint_key(edge_type, &key_values), eid));
+                }
+            }
+        }
+        for (key, eid) in edge_keys {
+            l0_guard.insert_edge_constraint_key(key, eid);
         }
     }
 
@@ -1138,12 +1196,51 @@ impl Writer {
         self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
     ) -> Result<(u64, bool)> {
+        // No lock-acquisition timeout (tests and internal callers).
+        self.commit_transaction_l0_with_lock_timeout(tx_l0_arc, None)
+            .await
+    }
+
+    /// Like [`Self::commit_transaction_l0`] but bounds ONLY the `flush_lock`
+    /// acquisition by `lock_timeout` (contention with another in-progress
+    /// commit). Once the lock is held, the durable WAL flush, the main-L0 merge,
+    /// and the inline post-commit L0→L1 flush all run to completion UNCANCELLED.
+    ///
+    /// This is the load-bearing correctness property: a caller must NOT wrap the
+    /// whole future in `tokio::time::timeout`, because that would cancel past the
+    /// durable point (`flush_wal`) and return a retriable `CommitTimeout` for a
+    /// transaction that is already durable and visible — a retry would then
+    /// double-apply it. Bounding only the lock wait keeps the "another commit is
+    /// taking too long" signal without ever cancelling durable work.
+    ///
+    /// # Errors
+    /// Returns [`uni_common::api::error::UniError::CommitTimeout`] (with an empty
+    /// `tx_id` for the caller to fill in) if `flush_lock` cannot be acquired
+    /// within `lock_timeout`, plus any error from the commit itself.
+    pub async fn commit_transaction_l0_with_lock_timeout(
+        self: &Arc<Self>,
+        tx_l0_arc: Arc<RwLock<L0Buffer>>,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<(u64, bool)> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
         // `Arc<RwLock<Writer>>` already provides this exclusion, so the
         // acquisition is uncontended. Phase 4 drops the outer lock and
         // this becomes the load-bearing serialization point.
-        let _flush_lock_guard = self.flush_lock.lock().await;
+        let _flush_lock_guard = match lock_timeout {
+            Some(dur) => match tokio::time::timeout(dur, self.flush_lock.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err(uni_common::api::error::UniError::CommitTimeout {
+                        tx_id: String::new(),
+                        hint: "Another commit is in progress and taking longer than expected. \
+                               Your transaction is still active \u{2014} you can retry commit().",
+                    }
+                    .into());
+                }
+            },
+            None => self.flush_lock.lock().await,
+        };
 
         // Crash-recovery seam: simulate process death immediately after winning
         // the commit serialization point but before any durable work. No-op
@@ -1223,6 +1320,25 @@ impl Writer {
                         return Err(anyhow::Error::new(
                             uni_common::UniError::ConstraintConflict {
                                 message: "unique key already committed by a concurrent \
+                                          transaction"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                }
+
+                // Same serializable guard for edge unique/nodekey keys: abort if a
+                // concurrent transaction committed an edge with one of this
+                // transaction's edge unique keys. (Empty index → no iterations.)
+                for (key, eid) in &tx_l0.edge_constraint_index {
+                    if overlay
+                        .iter()
+                        .any(|b| b.read().has_edge_constraint_key(key, *eid))
+                    {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: "unique edge key already committed by a concurrent \
                                           transaction"
                                     .to_string(),
                             },
@@ -1780,6 +1896,34 @@ impl Writer {
                             ));
                         }
                     }
+                    ConstraintType::NodeKey {
+                        properties: key_props,
+                    } => {
+                        // Node key = composite uniqueness + NOT NULL on every key
+                        // property. Unlike `Unique` (which skips enforcement when a
+                        // key property is absent), a missing/null key property is
+                        // itself a violation.
+                        if !key_props.is_empty() {
+                            let mut key_values = Vec::with_capacity(key_props.len());
+                            for prop in key_props {
+                                match properties.get(prop) {
+                                    Some(val) if !val.is_null() => {
+                                        key_values.push((prop.clone(), val.clone()));
+                                    }
+                                    _ => {
+                                        return Err(anyhow!(
+                                            "Node key constraint '{}' violated: property '{}' must exist and be non-null for label '{}'",
+                                            constraint.name,
+                                            prop,
+                                            label
+                                        ));
+                                    }
+                                }
+                            }
+                            self.check_unique_constraint_multi(label, &key_values, vid, tx_l0)
+                                .await?;
+                        }
+                    }
                     _ => {
                         return Err(anyhow!("Unsupported constraint type"));
                     }
@@ -1871,10 +2015,8 @@ impl Writer {
                     continue;
                 }
 
-                if let ConstraintType::Unique {
-                    properties: unique_props,
-                } = &constraint.constraint_type
-                {
+                // Collect keys for both Unique and NodeKey (uniqueness half).
+                if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                     let mut key_parts = Vec::new();
                     let mut all_present = true;
                     for prop in unique_props {
@@ -1962,6 +2104,22 @@ impl Writer {
             let l0_guard = l0.read();
             Self::collect_constraint_keys_from_properties(
                 l0_guard.vertex_properties.values(),
+                label,
+                &schema.constraints,
+                &mut existing_keys,
+                &mut existing_extids,
+            );
+        }
+
+        // Scan pending-flush buffers (rows rotated off `current` but not yet in
+        // Lance). The single-vertex paths (check_unique_constraint_multi,
+        // check_extid_globally_unique) consult these; skipping them here left the
+        // Bug #9A window open — a duplicate key/ext_id whose only prior copy sits
+        // on pending_flush would pass batch validation.
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            let pending_guard = pending_l0.read();
+            Self::collect_constraint_keys_from_properties(
+                pending_guard.vertex_properties.values(),
                 label,
                 &schema.constraints,
                 &mut existing_keys,
@@ -2096,6 +2254,51 @@ impl Writer {
                             constraint.name
                         ));
                     }
+                    ConstraintType::NodeKey {
+                        properties: key_props,
+                    } => {
+                        // NOT-NULL half: every key property must be present and
+                        // non-null (a missing key is a violation, unlike Unique).
+                        // Uniqueness half: same in-batch + L0 dedup as Unique.
+                        let mut key_parts = Vec::with_capacity(key_props.len());
+                        for prop in key_props {
+                            match properties.get(prop) {
+                                Some(val) if !val.is_null() => {
+                                    key_parts.push(format!("{}:{}", prop, val));
+                                }
+                                _ => {
+                                    return Err(anyhow!(
+                                        "Constraint violation at index {}: node key '{}' requires property '{}' to exist and be non-null",
+                                        idx,
+                                        constraint.name,
+                                        prop
+                                    ));
+                                }
+                            }
+                        }
+                        let key = key_parts.join("|");
+                        if let Some(keys) = existing_keys.get(&constraint.name)
+                            && keys.contains(&key)
+                        {
+                            return Err(anyhow!(
+                                "Constraint violation at index {}: Duplicate composite key for label '{}' (constraint '{}')",
+                                idx,
+                                label,
+                                constraint.name
+                            ));
+                        }
+                        let batch_constraint_keys =
+                            batch_keys.entry(constraint.name.clone()).or_default();
+                        if let Some(first_idx) = batch_constraint_keys.get(&key) {
+                            return Err(anyhow!(
+                                "Constraint violation: Duplicate key '{}' in batch at indices {} and {}",
+                                key,
+                                first_idx,
+                                idx
+                            ));
+                        }
+                        batch_constraint_keys.insert(key, idx);
+                    }
                     _ => {}
                 }
             }
@@ -2114,10 +2317,8 @@ impl Writer {
                 continue;
             }
 
-            if let ConstraintType::Unique {
-                properties: unique_props,
-            } = &constraint.constraint_type
-            {
+            // Probe flushed storage for both Unique and NodeKey (uniqueness half).
+            if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                 // Build compound OR filter for all batch vertices
                 let mut or_filters = Vec::new();
                 for properties in properties_batch.iter() {
@@ -2414,8 +2615,18 @@ impl Writer {
         match (a, b) {
             (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
             (Value::Float(f1), Value::Float(f2)) => Ok(cmp_f64(*f1, *f2)),
-            (Value::Int(n), Value::Float(f)) => Ok(cmp_f64(*n as f64, *f)),
-            (Value::Float(f), Value::Int(n)) => Ok(cmp_f64(*f, *n as f64)),
+            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
+            // preserve `cmp_f64`'s NaN-as-Equal behavior for the degenerate case.
+            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f)
+            }),
+            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
+                Ordering::Equal
+            } else {
+                uni_common::cmp_i64_f64(*n, *f).reverse()
+            }),
             (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
             _ => Err(anyhow!(
                 "Cannot compare incompatible types: {:?} vs {:?}",
@@ -2432,18 +2643,54 @@ impl Writer {
         current_vid: Vid,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        if self
+            .unique_key_exists_full_horizon(label, key_values, Some(current_vid), tx_l0)
+            .await?
+        {
+            return Err(anyhow!(
+                "Constraint violation: Duplicate composite key for label '{}'",
+                label
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reports whether a UNIQUE composite key already exists across the full write horizon.
+    ///
+    /// Probes every layer a duplicate could hide in — the current L0 buffer, any
+    /// pending-flush buffers, an optional transaction-local L0, and committed
+    /// storage (L1/L2). `exclude_vid` is the vertex being checked so it never
+    /// conflicts with itself; pass `None` when the caller is inserting a
+    /// brand-new vertex that has no VID yet (e.g. the bulk loader), so nothing is
+    /// excluded. This is the single lookup surface shared by the Writer's own
+    /// `check_unique_constraint_multi` and the bulk loader's validation, so both
+    /// write channels observe committed-but-unflushed keys (finding uni-bulk D6).
+    ///
+    /// # Errors
+    /// Returns an error if a storage backend probe fails; the check fails closed
+    /// rather than silently treating the key as absent.
+    pub async fn unique_key_exists_full_horizon(
+        &self,
+        label: &str,
+        key_values: &[(String, Value)],
+        exclude_vid: Option<Vid>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<bool> {
         // Serialize constraint key once for O(1) lookups
         let key = serialize_constraint_key(label, key_values);
+
+        // Sentinel for the in-memory `has_constraint_key` comparisons when there
+        // is no self to exclude: u64::MAX is never an allocated VID, so any real
+        // key hit compares unequal and counts. (The storage probe below omits
+        // the `_vid !=` clause entirely rather than emit an out-of-range literal.)
+        let exclude = exclude_vid.unwrap_or_else(|| Vid::new(u64::MAX));
 
         // 1. Check L0 (in-memory) using O(1) constraint index
         {
             let l0 = self.l0_manager.get_current();
             let l0_guard = l0.read();
-            if l0_guard.has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}'",
-                    label
-                ));
+            if l0_guard.has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
@@ -2455,22 +2702,16 @@ impl Writer {
         // paths (e.g. `check_extid_globally_unique`, `get_vertex_labels`) that
         // already consult `pending_flush`.
         for pending_l0 in self.l0_manager.get_pending_flush() {
-            if pending_l0.read().has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in pending flush)",
-                    label
-                ));
+            if pending_l0.read().has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
         // Check Transaction L0
         if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
-            if tx_l0_guard.has_constraint_key(&key, current_vid) {
-                return Err(anyhow!(
-                    "Constraint violation: Duplicate composite key for label '{}' (in tx)",
-                    label
-                ));
+            if tx_l0_guard.has_constraint_key(&key, exclude) {
+                return Ok(true);
             }
         }
 
@@ -2490,10 +2731,13 @@ impl Writer {
             .collect();
 
         let mut filter = filters.join(" AND ");
-        filter.push_str(&format!(
-            " AND _deleted = false AND _vid != {}",
-            current_vid.as_u64()
-        ));
+        filter.push_str(" AND _deleted = false");
+        // Exclude the vertex's own row only when it has a VID; a brand-new insert
+        // (bulk) has none, and emitting `_vid != u64::MAX` would overflow the
+        // filter's i64 literal parsing.
+        if let Some(vid) = exclude_vid {
+            filter.push_str(&format!(" AND _vid != {}", vid.as_u64()));
+        }
 
         // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
         // correct `.lance` path). Skip cleanly when the table is not yet
@@ -2505,16 +2749,228 @@ impl Writer {
             if backend.table_exists(&table).await? {
                 let count = backend.count_rows(&table, Some(filter.as_str())).await?;
                 if count > 0 {
-                    return Err(anyhow!(
-                        "Constraint violation: Duplicate composite key for label '{}' (in storage). Filter: {}",
-                        label,
-                        filter
-                    ));
+                    return Ok(true);
                 }
             }
         }
 
+        Ok(false)
+    }
+
+    /// Edge counterpart of [`validate_vertex_constraints`](Self::validate_vertex_constraints):
+    /// enforces declared `Unique` / `NodeKey` constraints on an edge type before
+    /// the write. `NodeKey` additionally requires every key property present and
+    /// non-null; `Unique` skips enforcement when a key property is absent.
+    ///
+    /// # Errors
+    /// Returns an error if a key property collides with another live edge, or (for
+    /// `NodeKey`) if a key property is missing/null.
+    async fn validate_edge_constraints(
+        &self,
+        eid: Eid,
+        edge_type_name: &str,
+        properties: &Properties,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let schema = self.schema_manager.schema();
+        for constraint in &schema.constraints {
+            if !constraint.enabled {
+                continue;
+            }
+            match &constraint.target {
+                ConstraintTarget::EdgeType(t) if t == edge_type_name => {}
+                _ => continue,
+            }
+            match &constraint.constraint_type {
+                ConstraintType::Unique {
+                    properties: unique_props,
+                } => {
+                    if unique_props.is_empty() {
+                        continue;
+                    }
+                    let mut key_values = Vec::with_capacity(unique_props.len());
+                    let mut missing = false;
+                    for prop in unique_props {
+                        match properties.get(prop) {
+                            Some(val) => key_values.push((prop.clone(), val.clone())),
+                            None => {
+                                missing = true; // Unique skips enforcement on a missing key.
+                                break;
+                            }
+                        }
+                    }
+                    if !missing {
+                        self.check_unique_edge_constraint_multi(
+                            edge_type_name,
+                            &key_values,
+                            eid,
+                            tx_l0,
+                        )
+                        .await?;
+                    }
+                }
+                ConstraintType::NodeKey {
+                    properties: key_props,
+                } => {
+                    if key_props.is_empty() {
+                        continue;
+                    }
+                    let mut key_values = Vec::with_capacity(key_props.len());
+                    for prop in key_props {
+                        match properties.get(prop) {
+                            Some(val) if !val.is_null() => {
+                                key_values.push((prop.clone(), val.clone()))
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Relationship key constraint '{}' violated: property '{}' must exist and be non-null for edge type '{}'",
+                                    constraint.name,
+                                    prop,
+                                    edge_type_name
+                                ));
+                            }
+                        }
+                    }
+                    self.check_unique_edge_constraint_multi(
+                        edge_type_name,
+                        &key_values,
+                        eid,
+                        tx_l0,
+                    )
+                    .await?;
+                }
+                // Edge `Exists`/`Check` are out of scope for the uniqueness family.
+                _ => {}
+            }
+        }
         Ok(())
+    }
+
+    /// Registers an edge's declared `Unique`/`NodeKey` key values into the L0 edge
+    /// constraint index, the edge analogue of the vertex index-population inside
+    /// `insert_vertex_with_labels`. A key with a missing/null member is not
+    /// registered (it cannot participate in a satisfied unique key).
+    fn populate_edge_constraint_index(
+        &self,
+        eid: Eid,
+        edge_type_name: &str,
+        properties: &Properties,
+        l0: &Arc<RwLock<L0Buffer>>,
+    ) {
+        let schema = self.schema_manager.schema();
+        let mut guard = l0.write();
+        for constraint in &schema.constraints {
+            if !constraint.enabled {
+                continue;
+            }
+            match &constraint.target {
+                ConstraintTarget::EdgeType(t) if t == edge_type_name => {}
+                _ => continue,
+            }
+            let Some(key_props) = constraint.constraint_type.unique_properties() else {
+                continue;
+            };
+            let mut key_values = Vec::with_capacity(key_props.len());
+            let mut all_present = true;
+            for prop in key_props {
+                match properties.get(prop) {
+                    Some(val) if !val.is_null() => key_values.push((prop.clone(), val.clone())),
+                    _ => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if all_present && !key_values.is_empty() {
+                let key = serialize_constraint_key(edge_type_name, &key_values);
+                guard.insert_edge_constraint_key(key, eid);
+            }
+        }
+    }
+
+    /// Edge analogue of [`check_unique_constraint_multi`](Self::check_unique_constraint_multi):
+    /// errors if `key_values` collide with another live edge of `edge_type`.
+    async fn check_unique_edge_constraint_multi(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        current_eid: Eid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        if self
+            .unique_edge_key_exists_full_horizon(edge_type, key_values, Some(current_eid), tx_l0)
+            .await?
+        {
+            return Err(anyhow!(
+                "Constraint violation: Duplicate composite key for edge type '{}'",
+                edge_type
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reports whether a UNIQUE composite key already exists across the full write
+    /// horizon for an *edge type* — the edge counterpart of
+    /// [`unique_key_exists_full_horizon`](Self::unique_key_exists_full_horizon).
+    ///
+    /// Probes the same layers (current L0, pending-flush buffers, optional
+    /// transaction L0, then committed storage), keyed to an `Eid`. `exclude_eid`
+    /// is the edge being checked so it never conflicts with itself; pass `None`
+    /// for a brand-new edge with no self to exclude. The committed-storage half is
+    /// delegated to [`PropertyManager::flushed_edge_key_conflict`], which resolves
+    /// the LSM delta table's latest-version-per-eid liveness correctly.
+    ///
+    /// # Errors
+    /// Returns an error if a storage probe fails — fails closed rather than
+    /// silently treating the key as absent.
+    pub async fn unique_edge_key_exists_full_horizon(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        exclude_eid: Option<Eid>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<bool> {
+        let key = serialize_constraint_key(edge_type, key_values);
+        // Sentinel: u64::MAX is never an allocated EID, so with no self to exclude
+        // any real key hit compares unequal and counts.
+        let exclude = exclude_eid.unwrap_or_else(|| Eid::new(u64::MAX));
+
+        // 1. Current in-memory L0 index.
+        if self
+            .l0_manager
+            .get_current()
+            .read()
+            .has_edge_constraint_key(&key, exclude)
+        {
+            return Ok(true);
+        }
+
+        // 1b. Pending-flush buffers (closes the flush-window leak, mirroring the
+        // vertex probe's Bug #9A handling).
+        for pending_l0 in self.l0_manager.get_pending_flush() {
+            if pending_l0.read().has_edge_constraint_key(&key, exclude) {
+                return Ok(true);
+            }
+        }
+
+        // 1c. Transaction-local L0.
+        if let Some(tx_l0) = tx_l0
+            && tx_l0.read().has_edge_constraint_key(&key, exclude)
+        {
+            return Ok(true);
+        }
+
+        // 2. Committed storage (LSM delta), resolved for latest-version liveness.
+        #[cfg(feature = "lance-backend")]
+        if let Some(pm) = &self.property_manager
+            && pm
+                .flushed_edge_key_conflict(edge_type, key_values, exclude_eid)
+                .await?
+        {
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     async fn check_write_pressure(&self) -> Result<()> {
@@ -2708,7 +3164,7 @@ impl Writer {
                 && let Some(props_meta) = schema.properties.get(t_name)
             {
                 let mut crdt_keys = Vec::new();
-                for (key, _) in properties.iter() {
+                for key in properties.keys() {
                     if let Some(meta) = props_meta.get(key)
                         && matches!(meta.r#type, uni_common::core::schema::DataType::Crdt(_))
                     {
@@ -2861,10 +3317,9 @@ impl Writer {
                         continue;
                     }
 
-                    if let ConstraintType::Unique {
-                        properties: unique_props,
-                    } = &constraint.constraint_type
-                    {
+                    // Index keys for both Unique and NodeKey (uniqueness half), so
+                    // the full-horizon probe sees prior NodeKey rows too.
+                    if let Some(unique_props) = constraint.constraint_type.unique_properties() {
                         let mut key_values = Vec::new();
                         let mut all_present = true;
                         for prop in unique_props {
@@ -3226,9 +3681,47 @@ impl Writer {
 
             let properties_result = properties_batch.clone();
             {
+                let schema = self.schema_manager.schema();
                 let mut l0_guard = target_l0.write();
                 for (vid, props) in vids.iter().zip(properties_batch.iter()) {
                     l0_guard.insert_vertex_with_labels(*vid, props.clone(), &labels);
+
+                    // Populate the L0 constraint index so a later single insert
+                    // (or commit-time probe) sees this batch row's unique keys via
+                    // has_constraint_key. The single-vertex path does this; the
+                    // batch path formerly did not, silently twinning unique keys.
+                    for label in &labels {
+                        for constraint in &schema.constraints {
+                            if !constraint.enabled {
+                                continue;
+                            }
+                            let ConstraintTarget::Label(l) = &constraint.target else {
+                                continue;
+                            };
+                            if l != label {
+                                continue;
+                            }
+                            // Index keys for both Unique and NodeKey.
+                            if let Some(unique_props) =
+                                constraint.constraint_type.unique_properties()
+                            {
+                                let mut key_values = Vec::new();
+                                let mut all_present = true;
+                                for prop in unique_props {
+                                    if let Some(val) = props.get(prop) {
+                                        key_values.push((prop.clone(), val.clone()));
+                                    } else {
+                                        all_present = false;
+                                        break;
+                                    }
+                                }
+                                if all_present {
+                                    let key = serialize_constraint_key(label, &key_values);
+                                    l0_guard.insert_constraint_key(key, *vid);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3460,7 +3953,20 @@ impl Writer {
         let mut props = props;
         self.prepare_edge_upsert(eid, &mut props, tx_l0).await?;
 
+        // Enforce declared edge-type UNIQUE / NODE KEY constraints whose key
+        // properties are all present in this (possibly partial) write, then
+        // register them. A partial write touching only part of a composite key
+        // does not carry the full key, so like the vertex partial path it enforces
+        // only fully-present keys.
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.validate_edge_constraints(eid, type_name, &props, tx_l0)
+                .await?;
+        }
+
         let l0 = self.resolve_l0(tx_l0);
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.populate_edge_constraint_index(eid, type_name, &props, &l0);
+        }
         l0.write().insert_edge_partial_full(
             src_vid,
             dst_vid,
@@ -3510,7 +4016,19 @@ impl Writer {
         self.prepare_edge_upsert(eid, &mut properties, tx_l0)
             .await?;
 
+        // Enforce declared edge-type UNIQUE / NODE KEY constraints across the full
+        // write horizon before the edge lands, then register its keys so later
+        // writes (this tx and concurrent ones) observe it. Schemaless edges (no
+        // type name) carry no declared constraints and are skipped.
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.validate_edge_constraints(eid, type_name, &properties, tx_l0)
+                .await?;
+        }
+
         let l0 = self.resolve_l0(tx_l0);
+        if let Some(type_name) = edge_type_name.as_deref() {
+            self.populate_edge_constraint_index(eid, type_name, &properties, &l0);
+        }
         l0.write()
             .insert_edge(src_vid, dst_vid, edge_type, eid, properties, edge_type_name)?;
 
@@ -4153,6 +4671,7 @@ impl Writer {
     pub async fn flush_and_capture_fork_point(
         &self,
         candidate_dataset_names: &[String],
+        parent_branches: &BTreeMap<String, String>,
     ) -> Result<ForkPoint> {
         if let Some(coord) = self.flush_coordinator.as_ref() {
             let _ = coord.drain(self.config.drop_fork_drain_timeout).await;
@@ -4172,6 +4691,7 @@ impl Writer {
 
         let base = self.storage.base_uri();
         let mut dataset_versions = BTreeMap::new();
+        let mut parent_branch_versions = BTreeMap::new();
         for name in candidate_dataset_names {
             let uri = join_lance_uri(base, name);
             if !lance_path_exists(&uri) {
@@ -4179,6 +4699,19 @@ impl Writer {
             }
             let version = crate::backend::lance_branch::current_version(&uri).await?;
             dataset_versions.insert(name.clone(), version);
+
+            // For a nested fork, also capture the parent branch's tip under the
+            // lock — that is the version the child must branch from, and it
+            // advances independently of `main`. Reading it here (still holding
+            // `flush_lock`, after `flush_inline_under_lock`) is what makes the
+            // nested fork's branch point atomic w.r.t. a concurrent parent
+            // commit+flush (the D2 fix).
+            if let Some(parent_branch) = parent_branches.get(name) {
+                let branch_version =
+                    crate::backend::lance_branch::current_version_on_branch(&uri, parent_branch)
+                        .await?;
+                parent_branch_versions.insert(name.clone(), branch_version);
+            }
         }
 
         Ok(ForkPoint {
@@ -4186,6 +4719,7 @@ impl Writer {
             eid_hwm,
             dataset_versions,
             version_hwm,
+            parent_branch_versions,
         })
     }
 

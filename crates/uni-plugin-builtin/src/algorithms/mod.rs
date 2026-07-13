@@ -19,8 +19,15 @@
 use uni_plugin::{PluginError, PluginRegistrar};
 
 pub mod bridge;
+pub mod expand;
+pub mod graph_compute;
+pub mod pregel;
+pub mod reachability;
 
 pub use bridge::{AlgoProviderBridge, AlgorithmHostBridge};
+pub use expand::ExpandProvider;
+pub use pregel::{PageRankProvider, SsspProvider};
+pub use reachability::ReachabilityProvider;
 
 /// Register every built-in `uni.algo.*` algorithm into `r` as an
 /// `uni_plugin::traits::algorithm::AlgorithmProvider`.
@@ -52,5 +59,53 @@ pub fn register_into(r: &mut PluginRegistrar<'_>) -> Result<(), PluginError> {
         let provider = Arc::new(AlgoProviderBridge::new(proc));
         r.algorithm(qname, provider)?;
     }
+
+    // First-party algorithm authored purely against the public
+    // `AlgorithmProvider` + `GraphView` surface. Registered ONLY as a
+    // provider (absent from the static `uni_algo` registry), so a
+    // `CALL uni.algo.reachability(...)` routes through the provider
+    // dispatch path rather than the M4 procedure adapter.
+    r.algorithm(
+        QName::new("uni", "algo.reachability"),
+        Arc::new(ReachabilityProvider::new()),
+    )?;
+
+    // Pregel programs authored on top of the public `GraphView` (M5c follow-up).
+    r.algorithm(
+        QName::new("uni", "algo.pagerank"),
+        Arc::new(PageRankProvider::new()),
+    )?;
+    r.algorithm(
+        QName::new("uni", "algo.sssp"),
+        Arc::new(SsspProvider::new()),
+    )?;
+
+    // APOC-style bounded path expansion (config-driven BFS).
+    r.algorithm(
+        QName::new("uni", "path.expand"),
+        Arc::new(ExpandProvider::new()),
+    )?;
+
+    // Personalized PageRank authored on the GraphCompute kernel catalog — the
+    // Phase-1 dogfood that drives the coarse kernels through the CALL path.
+    r.algorithm(
+        QName::new("uni", "algo.gcpagerank"),
+        Arc::new(graph_compute::provider::GraphComputePageRankProvider::new()),
+    )?;
+
+    // node2vec/DeepWalk random-walk generation on the GraphCompute catalog —
+    // dogfoods the `random_walks` kernel and the `emit_walks` sequence egress.
+    r.algorithm(
+        QName::new("uni", "algo.gcwalks"),
+        Arc::new(graph_compute::provider_walks::GraphComputeWalksProvider::new()),
+    )?;
+
+    // All-pairs neighbourhood overlap (triangle support / k-truss basis) — the
+    // per-edge egress dogfood for `all_pairs_overlap` + `emit_pairs`.
+    r.algorithm(
+        QName::new("uni", "algo.gcoverlap"),
+        Arc::new(graph_compute::provider_pairs::GraphComputeOverlapProvider::new()),
+    )?;
+
     Ok(())
 }

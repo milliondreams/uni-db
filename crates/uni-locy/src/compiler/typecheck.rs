@@ -52,6 +52,7 @@ pub fn check(
     rule_groups: &HashMap<String, Vec<&RuleDefinition>>,
     strat: &StratificationResult,
     model_catalog: &HashMap<String, CompiledModel>,
+    module_ctx: &super::modules::ModuleContext,
     is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<(HashMap<String, CompiledRule>, Vec<CompilerWarning>), LocyCompileError> {
     let mut compiled_rules = HashMap::new();
@@ -125,7 +126,14 @@ pub fn check(
             // Check prev in any clause that lacks a self-IS-reference within the same SCC
             let has_self_is = def.where_conditions.iter().any(|cond| {
                 if let RuleCondition::IsReference(is_ref) = cond {
-                    scc_rules.contains(&is_ref.rule_name.to_string())
+                    // The SCC set holds module-qualified names; the IS-ref name is
+                    // raw, so qualify it first or self-recursion detection breaks
+                    // inside a MODULE (e.g. "r" vs "foo.r").
+                    let qualified = super::modules::resolve_rule_name(
+                        module_ctx,
+                        &is_ref.rule_name.to_string(),
+                    );
+                    scc_rules.contains(&qualified)
                 } else {
                     false
                 }
@@ -700,6 +708,16 @@ fn check_model_invocations(
     }
     for fold in &def.fold {
         visit(&fold.aggregate)?;
+    }
+    // ALONG and HAVING can also carry model invocations, and InvocationLifter
+    // lifts from them — so their arity/type must be checked here too.
+    for binding in &def.along {
+        if let LocyExpr::Cypher(e) = &binding.expr {
+            visit(e)?;
+        }
+    }
+    for e in &def.having {
+        visit(e)?;
     }
     if let RuleOutput::Yield(yc) = &def.output {
         for item in &yc.items {

@@ -442,7 +442,10 @@ fn build_remove_item(pair: Pair<Rule>) -> Result<RemoveItem, ParseError> {
             let labels = labels_inner
                 .into_inner()
                 .filter(|t| matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword))
-                .map(|l| l.as_str().to_string())
+                // Strip backticks (consistent with the SET branch) so `REMOVE
+                // n:`Person`` targets the normalized label `Person` instead of a
+                // literal "`Person`" that never matches and silently no-ops.
+                .map(|l| normalize_identifier(l.as_str()))
                 .collect();
             Ok(RemoveItem::Labels {
                 variable: id,
@@ -1404,12 +1407,10 @@ fn build_map_literal(pair: Pair<Rule>) -> Result<Expr, ParseError> {
             let mut inner = p.into_inner();
             let key_pair = inner.next().unwrap();
             let key = match key_pair.as_rule() {
-                Rule::string => {
-                    // Strip quotes from string literals
-                    let s = key_pair.as_str();
-                    let content = &s[1..s.len() - 1];
-                    content.to_string()
-                }
+                // Decode escapes / doubled quotes exactly as the value path does,
+                // so `{ "a\nb": 1 }` keys on a real newline (not a literal
+                // backslash-n) and `{ 'it''s': 1 }` keys on `it's`.
+                Rule::string => build_string_literal(key_pair)?,
                 _ => key_pair.as_str().to_string(), // identifier_or_keyword
             };
             let val = build_expression(inner.next().unwrap())?;
@@ -2191,9 +2192,14 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError
         }
     };
 
-    // Note: parentheses and colon are not separate tokens in the parse tree
-    let var = inner.next().unwrap().as_str().to_string();
-    let label = normalize_identifier(inner.next().unwrap().as_str());
+    // The target is a node pattern `(n:Label)` or a relationship pattern
+    // `()-[r:TYPE]-()`. Parens/colon/arrows are string literals (not tokens); the
+    // pattern rule's inner tokens are [var, label-or-edge-type].
+    let pattern = inner.next().unwrap();
+    let on_relationship = matches!(pattern.as_rule(), Rule::constraint_rel_pattern);
+    let mut pat_inner = pattern.into_inner();
+    let var = pat_inner.next().unwrap().as_str().to_string();
+    let label = normalize_identifier(pat_inner.next().unwrap().as_str());
     inner.next(); // ASSERT
 
     let assertion = inner.next().unwrap();
@@ -2205,6 +2211,7 @@ fn build_create_constraint(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError
         label,
         properties,
         expression,
+        on_relationship,
     }))
 }
 
@@ -2255,15 +2262,11 @@ fn build_constraint_assertion(
             props.retain(|p| seen.insert(p.clone()));
             Ok((ConstraintType::Check, props, Some(expr)))
         }
-        _ => {
-            // Fallback to old syntax: (props) IS [NODE|RELATIONSHIP] [UNIQUE|KEY]
-            inner.next(); // Skip (
-            let prop_list = inner.next().unwrap();
-            let properties = prop_list
-                .into_inner()
-                .map(|p| p.as_str().to_string())
-                .collect();
-            inner.next(); // )
+        Rule::identifier_list => {
+            // Composite form `(a, b) IS [NODE|RELATIONSHIP] [UNIQUE|KEY]`. The
+            // parentheses are silent literals, so `first` IS the identifier_list;
+            // its inner pairs are the bare property names.
+            let properties = first.into_inner().map(|p| p.as_str().to_string()).collect();
             inner.next(); // IS
 
             let mut next = inner.next().unwrap();
@@ -2279,6 +2282,9 @@ fn build_constraint_assertion(
 
             Ok((ctype, properties, None))
         }
+        other => Err(ParseError::new(format!(
+            "Unexpected constraint assertion form: {other:?}"
+        ))),
     }
 }
 

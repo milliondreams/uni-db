@@ -48,6 +48,15 @@ pub struct LocyRulePlan {
     pub having: Vec<Expr>,
     /// BEST BY criteria for post-fixpoint selection (expr, ascending).
     pub best_by_criteria: Vec<(Expr, bool)>,
+    /// Post-fold YIELD projection specs `(output_name, expr)`.
+    ///
+    /// Non-empty only when a YIELD column is a computed expression over a FOLD
+    /// output (e.g. `total * 2.0 AS score`), which cannot be produced pre-fold.
+    /// When present it lists every yield column in schema order; the runtime
+    /// evaluates each expression against the post-fold batch to build the final
+    /// output. Empty for the common case (FoldExec output already matches the
+    /// yield schema).
+    pub yield_projection: Vec<(String, Expr)>,
 }
 
 /// A single clause (body) of a Locy rule.

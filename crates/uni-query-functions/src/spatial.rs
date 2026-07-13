@@ -57,7 +57,13 @@ fn eval_point(args: &[Value]) -> Result<Value> {
         let y = map["y"]
             .as_f64()
             .ok_or_else(|| anyhow!("y must be a number"))?;
-        let z = map.get("z").and_then(|v| v.as_f64());
+        // A present-but-non-numeric `z` must error for parity with `x`/`y`,
+        // rather than being silently dropped and downgrading the point to 2-D.
+        // An absent or explicitly-null `z` legitimately yields a 2-D point.
+        let z = match map.get("z") {
+            Some(Value::Null) | None => None,
+            Some(v) => Some(v.as_f64().ok_or_else(|| anyhow!("z must be a number"))?),
+        };
 
         let crs = if z.is_some() {
             "Cartesian-3D"
@@ -185,9 +191,16 @@ fn eval_within_bbox(args: &[Value]) -> Result<Value> {
         let (min_lat, min_lon) = get_geo_coords(lower_left, "Lower-left")?;
         let (max_lat, max_lon) = get_geo_coords(upper_right, "Upper-right")?;
 
-        return Ok(Value::Bool(
-            (min_lat..=max_lat).contains(&lat) && (min_lon..=max_lon).contains(&lon),
-        ));
+        // When the box crosses the antimeridian its lower-left longitude is
+        // greater than its upper-right longitude (e.g. 170E -> -170E). A plain
+        // inclusive range would be empty and match nothing, so treat that case
+        // as the union of the two wrapped intervals.
+        let lon_in = if min_lon <= max_lon {
+            (min_lon..=max_lon).contains(&lon)
+        } else {
+            lon >= min_lon || lon <= max_lon
+        };
+        return Ok(Value::Bool((min_lat..=max_lat).contains(&lat) && lon_in));
     }
 
     // For Cartesian points

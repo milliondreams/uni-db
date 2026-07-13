@@ -39,15 +39,26 @@ impl Algorithm for KCore {
             };
         }
 
-        // 1. Compute degrees (undirected)
+        // 1. Compute degrees (undirected).
+        //
+        // The degree convention MUST match the peeling loop below, which counts
+        // UNIQUE neighbors (it sorts + dedups out/in neighbors). Counting raw
+        // multiplicity here (out_degree + in_degree) would double-count a
+        // reciprocal u<->v pair as 2 while peeling only decrements 1 per unique
+        // neighbor, inflating the resulting core numbers. Deduplicate to keep
+        // both sides consistent.
         let mut degrees = vec![0u32; n];
         let mut max_degree = 0;
 
         for (v, deg_ref) in degrees.iter_mut().enumerate() {
-            let mut deg = graph.out_degree(v as u32);
+            let mut neighbors = Vec::new();
+            neighbors.extend_from_slice(graph.out_neighbors(v as u32));
             if graph.has_reverse() {
-                deg += graph.in_degree(v as u32);
+                neighbors.extend_from_slice(graph.in_neighbors(v as u32));
             }
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            let deg = neighbors.len() as u32;
             *deg_ref = deg;
             if deg > max_degree {
                 max_degree = deg;

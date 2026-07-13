@@ -55,13 +55,17 @@ pub mod adapter;
 #[cfg(feature = "rhai-runtime")]
 pub mod adapter_aggregate;
 #[cfg(feature = "rhai-runtime")]
-pub mod adapter_procedure;
+pub mod adapter_algorithm;
 #[cfg(feature = "rhai-runtime")]
+pub mod adapter_procedure;
+
 pub mod columns;
+
 #[cfg(feature = "rhai-runtime")]
 pub mod dynamic_bridge;
 #[cfg(feature = "rhai-runtime")]
 pub mod engine;
+pub mod graph_compute;
 #[cfg(feature = "rhai-runtime")]
 pub mod loader;
 #[cfg(feature = "rhai-runtime")]
@@ -91,7 +95,7 @@ pub use engine::{DEFAULT_MAX_CALL_LEVELS, build_engine};
 pub use loader::{LoadOutcome, RhaiLoader};
 #[cfg(feature = "rhai-runtime")]
 #[doc(inline)]
-pub use manifest::{AggregateEntry, ProcedureEntry, RhaiManifest, ScalarEntry};
+pub use manifest::{AggregateEntry, ProcedureEntry, RhaiManifest, ScalarEntry, YieldField};
 #[cfg(feature = "rhai-runtime")]
 #[doc(inline)]
 pub use runtime::RhaiPluginRuntime;

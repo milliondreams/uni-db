@@ -591,3 +591,38 @@ async fn test_with_order_by_aggregation_expression_with_property_access_referenc
 
     Ok(())
 }
+
+/// D5: ORDER BY over i64 values above 2^53 must order exactly. The sort-key
+/// encoder used to cast Int through f64, collapsing `2^53` and `2^53 + 1` to one
+/// key; distinct large integers must now sort by true value end-to-end (this is
+/// the DataFusion sort path, complementing the encoder unit test).
+#[tokio::test]
+async fn test_order_by_large_integers_above_2p53() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    // Deliberately unsorted input straddling the 2^53 boundary.
+    let result = db
+        .session()
+        .query(
+            "UNWIND [9007199254740993, 9007199254740992, 9007199254740994, 9007199254740991] \
+             AS x RETURN x ORDER BY x",
+        )
+        .await?;
+    let ordered: Vec<i64> = result
+        .rows()
+        .iter()
+        .map(|row| row.get::<i64>("x").unwrap())
+        .collect();
+    assert_eq!(
+        ordered,
+        vec![
+            9_007_199_254_740_991,
+            9_007_199_254_740_992,
+            9_007_199_254_740_993,
+            9_007_199_254_740_994,
+        ],
+        "distinct i64 above 2^53 must sort by true value, not collapse"
+    );
+
+    Ok(())
+}

@@ -91,7 +91,11 @@ impl ScalarPluginFn for DeclaredScalarFn {
                 ),
             ));
         }
-        let row_count = rows.max(1);
+        // Honor the `ScalarPluginFn` contract: produce exactly `rows`
+        // values. A 0-row invocation must yield an empty column — do not
+        // force `max(1)`, which would fabricate one output row from
+        // out-of-range (Null) input.
+        let row_count = rows;
         let columns: Vec<ArrayRef> = args
             .iter()
             .map(|cv| columnar_to_array(cv, row_count))

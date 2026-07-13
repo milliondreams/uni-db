@@ -72,6 +72,29 @@ pub async fn get_with_timeout(
     retry_with_timeout(timeout, &msg, || store.get(path)).await
 }
 
+/// Returns `true` when an object-store read error is a permanent `NotFound`.
+///
+/// Distinguishes "the object was never created" (empty result is correct) from
+/// a transient/IO failure (which must propagate). [`get_with_timeout`] preserves
+/// `object_store::Error::NotFound` through `anyhow` (see `retry_with_timeout`),
+/// so a downcast that also matches the variant is reliable — transient errors
+/// are wrapped generically and never match.
+///
+/// # Examples
+///
+/// ```ignore
+/// match get_with_timeout(&store, &path, DEFAULT_TIMEOUT).await {
+///     Ok(r) => parse(r),
+///     Err(e) if is_not_found(&e) => Default::default(),
+///     Err(e) => return Err(e),
+/// }
+/// ```
+#[must_use]
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<object_store::Error>()
+        .is_some_and(|e| matches!(e, object_store::Error::NotFound { .. }))
+}
+
 /// Puts an object to the store with a timeout and retries.
 ///
 /// # Errors

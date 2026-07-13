@@ -393,7 +393,17 @@ impl fmt::Display for TemporalValue {
         match self {
             TemporalValue::Date { days_since_epoch } => {
                 let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let date = epoch + chrono::Duration::days(*days_since_epoch as i64);
+                // Use a checked add (like `to_date`) so an out-of-range
+                // `days_since_epoch` degrades gracefully instead of panicking
+                // inside `Display`. On overflow, saturate to chrono's
+                // representable range so we still render a valid date string.
+                let date = epoch
+                    .checked_add_signed(chrono::Duration::days(*days_since_epoch as i64))
+                    .unwrap_or(if *days_since_epoch >= 0 {
+                        chrono::NaiveDate::MAX
+                    } else {
+                        chrono::NaiveDate::MIN
+                    });
                 write!(f, "{}", date.format("%Y-%m-%d"))
             }
             TemporalValue::LocalTime {
@@ -562,6 +572,12 @@ pub enum Value {
         /// Weights, parallel to `indices`.
         values: Vec<f32>,
     },
+
+    /// Binary/bit vector for Hamming/Jaccard similarity: a packed byte buffer
+    /// where each `u8` is one lane of 8 bits. Persistence goes through the
+    /// explicit `FixedSizeList<UInt8>` column and codec paths, never untagged
+    /// serde (which would shadow it as a `List`/`Bytes`).
+    BinaryVector(Vec<u8>),
 
     // Temporal
     /// Typed temporal value (date, time, datetime, duration).
@@ -743,6 +759,7 @@ impl fmt::Display for Value {
             Value::SparseVector { indices, .. } => {
                 write!(f, "<sparse vector: {} nnz>", indices.len())
             }
+            Value::BinaryVector(bytes) => write!(f, "<binary vector: {} lanes>", bytes.len()),
             Value::Temporal(t) => write!(f, "{t}"),
         }
     }
@@ -751,6 +768,52 @@ impl fmt::Display for Value {
 // ---------------------------------------------------------------------------
 // PartialEq, Eq, and Hash implementations
 // ---------------------------------------------------------------------------
+
+/// Exact ordering of an `i64` against an `f64`, without precision loss.
+///
+/// Casting the integer to `f64` first (the naive approach) collapses distinct
+/// `i64` values above `2^53` onto the same float, so `2^53 + 1` would compare
+/// *equal* to `2^53.0`. This compares the integer against the float's exact real
+/// value instead, so the full `i64` range orders correctly against any finite
+/// float and integer/float ties resolve by true magnitude.
+///
+/// `f` is assumed non-`NaN`; callers that admit `NaN` must handle it beforehand.
+///
+/// # Examples
+/// ```
+/// use std::cmp::Ordering;
+/// use uni_common::cmp_i64_f64;
+/// assert_eq!(cmp_i64_f64(9_007_199_254_740_993, 9_007_199_254_740_992.0), Ordering::Greater);
+/// assert_eq!(cmp_i64_f64(2, 2.0), Ordering::Equal);
+/// assert_eq!(cmp_i64_f64(1, 1.5), Ordering::Less);
+/// ```
+pub fn cmp_i64_f64(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_infinite() {
+        return if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let ff = f.floor();
+    // 2^63: every i64 is <= i64::MAX = 2^63 - 1 < 2^63 <= f, so the int is Less.
+    if ff >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    // -2^63 = i64::MIN: when floor(f) < -2^63 the int is >= i64::MIN > f.
+    if ff < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    // `ff` is integral and within [-2^63, 2^63), so this cast is exact.
+    let fi = ff as i64;
+    match i.cmp(&fi) {
+        // Integer parts equal; a positive fractional part makes `f` the larger.
+        Ordering::Equal if f > ff => Ordering::Less,
+        Ordering::Equal => Ordering::Equal,
+        other => other,
+    }
+}
 
 /// Normalized float equality used by [`Value`]'s `PartialEq`/`Hash`.
 ///
@@ -762,6 +825,31 @@ fn float_eq_normalized(a: f64, b: f64) -> bool {
     a.total_cmp(&b) == std::cmp::Ordering::Equal
         || (a == 0.0 && b == 0.0)
         || (a.is_nan() && b.is_nan())
+}
+
+/// `f32` counterpart of [`float_eq_normalized`], used by the `Vector` and
+/// `SparseVector` equality arms.
+///
+/// Treats `0.0 == -0.0` and `NaN == NaN` so that vector-valued [`Value`]s
+/// uphold `Eq` reflexivity and stay consistent with [`hash_f32_normalized`]
+/// (which normalizes NaN in the `Hash` impl). Without this, a
+/// `Vector`/`SparseVector` containing NaN would not equal itself while still
+/// hashing identically — silently breaking `HashSet`/`HashMap` dedup.
+fn float_eq_normalized_f32(a: f32, b: f32) -> bool {
+    a.total_cmp(&b) == std::cmp::Ordering::Equal
+        || (a == 0.0 && b == 0.0)
+        || (a.is_nan() && b.is_nan())
+}
+
+/// Compares two `f32` slices element-wise using [`float_eq_normalized_f32`].
+///
+/// Length-checked, then per-element normalized comparison — the equality
+/// analogue of the normalized hashing done for `Vec<f32>` weights.
+fn slice_eq_normalized_f32(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| float_eq_normalized_f32(*x, *y))
 }
 
 impl PartialEq for Value {
@@ -786,7 +874,10 @@ impl PartialEq for Value {
             (Value::Node(a), Value::Node(b)) => a == b,
             (Value::Edge(a), Value::Edge(b)) => a == b,
             (Value::Path(a), Value::Path(b)) => a == b,
-            (Value::Vector(a), Value::Vector(b)) => a == b,
+            // `Vec<f32>` `==` uses IEEE-754 (`NaN != NaN`), which would break
+            // `Eq` reflexivity and disagree with the NaN-normalizing `Hash`
+            // impl; compare element-wise with the same normalization instead.
+            (Value::Vector(a), Value::Vector(b)) => slice_eq_normalized_f32(a, b),
             (
                 Value::SparseVector {
                     indices: i1,
@@ -796,7 +887,10 @@ impl PartialEq for Value {
                     indices: i2,
                     values: v2,
                 },
-            ) => i1 == i2 && v1 == v2,
+            ) => i1 == i2 && slice_eq_normalized_f32(v1, v2),
+            // Exact byte buffers — native `Vec<u8>` equality (no float
+            // normalization); parallel to the `Bytes` arm.
+            (Value::BinaryVector(a), Value::BinaryVector(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a == b,
             // Distinct variants are never equal.
             _ => false,
@@ -875,6 +969,9 @@ impl Hash for Value {
                     hash_f32_normalized(*f, state);
                 }
             }
+            // Exact byte buffer — native `Vec<u8>` hashing, consistent with the
+            // native-equality arm above.
+            Value::BinaryVector(b) => b.hash(state),
             Value::Temporal(t) => t.hash(state),
         }
     }
@@ -1614,6 +1711,14 @@ impl From<Value> for serde_json::Value {
                 map.insert("values".to_string(), vals);
                 serde_json::Value::Object(map)
             }
+            // Byte lanes as a JSON array of `0..=255` integers (parallel to the
+            // dense `Vector` arm).
+            Value::BinaryVector(bytes) => serde_json::Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|b| serde_json::Value::Number(serde_json::Number::from(b)))
+                    .collect(),
+            ),
             Value::Temporal(t) => serde_json::Value::String(t.to_string()),
         }
     }
@@ -1705,6 +1810,49 @@ impl From<f32> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn cmp_i64_f64_exact_above_2p53() {
+        // 2^53 vs 2^53+1: the naive `as f64` cast collapses these to Equal.
+        let two_p53 = 9_007_199_254_740_992.0_f64;
+        assert_eq!(cmp_i64_f64(9_007_199_254_740_992, two_p53), Ordering::Equal);
+        assert_eq!(
+            cmp_i64_f64(9_007_199_254_740_993, two_p53),
+            Ordering::Greater
+        );
+        assert_eq!(cmp_i64_f64(9_007_199_254_740_991, two_p53), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_i64_f64_small_and_fractional() {
+        assert_eq!(cmp_i64_f64(2, 2.0), Ordering::Equal);
+        assert_eq!(cmp_i64_f64(1, 1.5), Ordering::Less);
+        assert_eq!(cmp_i64_f64(2, 1.5), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(-3, -2.5), Ordering::Less);
+        assert_eq!(cmp_i64_f64(-2, -2.5), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(0, -0.0), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_i64_f64_extremes_and_infinities() {
+        assert_eq!(cmp_i64_f64(i64::MAX, f64::INFINITY), Ordering::Less);
+        assert_eq!(cmp_i64_f64(i64::MIN, f64::NEG_INFINITY), Ordering::Greater);
+        // i64::MAX = 2^63 - 1; the f64 2^63 is strictly larger.
+        assert_eq!(
+            cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0),
+            Ordering::Less
+        );
+        // i64::MIN = -2^63, exactly representable as f64 -> Equal.
+        assert_eq!(
+            cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0),
+            Ordering::Equal
+        );
+        // A float below -2^63 is smaller than any i64.
+        assert_eq!(cmp_i64_f64(i64::MIN, -1e300), Ordering::Greater);
+        // A huge positive float dwarfs any i64.
+        assert_eq!(cmp_i64_f64(i64::MAX, 1e300), Ordering::Less);
+    }
 
     #[test]
     fn test_accessor_methods() {

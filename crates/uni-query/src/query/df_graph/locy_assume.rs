@@ -128,8 +128,17 @@ fn dispatch_body_command<'a>(
                 };
                 if let Some(relation) = fold_relation {
                     let rows = relation.rows.clone();
-                    let projected = super::locy_query::apply_return_clause(
+                    // Apply the QUERY WHERE filter before RETURN — this FOLD path
+                    // (like the one in `locy_query::evaluate_query`) does not reach
+                    // the shared filter, so omitting it silently ignored the
+                    // predicate for FOLD rules queried inside an ASSUME block.
+                    let filtered = super::locy_query::filter_where(
                         rows,
+                        gq.where_expr.as_ref(),
+                        &config.params,
+                    );
+                    let projected = super::locy_query::apply_return_clause(
+                        filtered,
                         &gq.return_clause,
                         &config.params,
                     )

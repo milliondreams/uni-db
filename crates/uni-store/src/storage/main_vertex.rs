@@ -631,53 +631,85 @@ impl MainVertexDataset {
             return Ok(HashMap::new());
         }
 
-        // Build IN clause for VIDs
+        // Build IN clause for VIDs.
+        //
+        // MVCC (mirrors `find_props_by_vid`): the scan must see deletion
+        // tombstones — the highest-`_version` row per vid wins, and a deleted
+        // winner drops the vid. Filtering `_deleted = false` here would let an
+        // OLDER live version resurrect a vertex whose tombstone lives only in the
+        // main table (review C2), and last-row-wins with no `_version` ranking
+        // returned stale props depending on physical scan order.
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter = with_version_bound(
-            format!("_vid IN ({}) AND _deleted = false", vid_list.join(", ")),
-            version,
-        );
+        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
 
         let results = backend
             .scan(
                 ScanRequest::all(table_name)
                     .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string(), "props_json".to_string()]),
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "props_json".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
-        let mut props_map = HashMap::new();
+        // Per-vid highest-version winner: (version, deleted, props).
+        let mut best: HashMap<Vid, (u64, bool, Properties)> = HashMap::new();
 
         for batch in results {
             let vid_col = batch.column_by_name("_vid");
             let props_col = batch.column_by_name("props_json");
+            let ver_col = batch.column_by_name("_version");
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
 
-            if let (Some(vid_arr), Some(props_arr)) = (
+            if let (Some(vid_arr), Some(props_arr), Some(ver_arr)) = (
                 vid_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
                 props_col.and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()),
+                ver_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
             ) {
                 for i in 0..batch.num_rows() {
                     if vid_arr.is_null(i) {
                         continue;
                     }
                     let vid = Vid::new(vid_arr.value(i));
-
-                    let props: Properties = if props_arr.is_null(i) || props_arr.value(i).is_empty()
-                    {
-                        Properties::new()
+                    let version = if ver_arr.is_null(i) {
+                        0
                     } else {
-                        let bytes = props_arr.value(i);
-                        let uni_val = uni_common::cypher_value_codec::decode(bytes)
-                            .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-                        let json_val: serde_json::Value = uni_val.into();
-                        serde_json::from_value(json_val)
-                            .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?
+                        ver_arr.value(i)
                     };
 
-                    props_map.insert(vid, props);
+                    // Keep the highest-version row for this vid (>= so a later
+                    // equal-version row still wins, matching find_props_by_vid).
+                    if best.get(&vid).is_some_and(|(bv, _, _)| version < *bv) {
+                        continue;
+                    }
+                    let deleted = deleted_col.is_some_and(|d| d.value(i));
+                    let props: Properties =
+                        if deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
+                            Properties::new()
+                        } else {
+                            let bytes = props_arr.value(i);
+                            let uni_val = uni_common::cypher_value_codec::decode(bytes)
+                                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
+                            let json_val: serde_json::Value = uni_val.into();
+                            serde_json::from_value(json_val)
+                                .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?
+                        };
+                    best.insert(vid, (version, deleted, props));
                 }
             }
         }
+
+        // Drop tombstone winners; return live winners' props.
+        let props_map = best
+            .into_iter()
+            .filter(|(_, (_, deleted, _))| !*deleted)
+            .map(|(vid, (_, _, props))| (vid, props))
+            .collect();
 
         Ok(props_map)
     }
@@ -787,43 +819,72 @@ impl MainVertexDataset {
             return Ok(HashMap::new());
         }
 
-        // Build IN clause for VIDs
+        // Build IN clause for VIDs. Same MVCC discipline as
+        // `find_batch_props_by_vids`: version-max winner per vid, tombstones
+        // included (a deleted winner drops the vid). `_deleted = false` filtering
+        // + last-row-wins previously resurrected deleted vertices' labels.
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter = with_version_bound(
-            format!("_vid IN ({}) AND _deleted = false", vid_list.join(", ")),
-            version,
-        );
+        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
 
         let results = backend
             .scan(
                 ScanRequest::all(table_name)
                     .with_filter(filter)
-                    .with_columns(vec!["_vid".to_string(), "labels".to_string()]),
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
             )
             .await?;
 
-        let mut label_map = HashMap::new();
+        // Per-vid highest-version winner: (version, deleted, labels).
+        let mut best: HashMap<Vid, (u64, bool, Vec<String>)> = HashMap::new();
 
         for batch in results {
             let vid_col = batch.column_by_name("_vid");
             let labels_col = batch.column_by_name("labels");
+            let ver_col = batch.column_by_name("_version");
+            let deleted_col = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
 
-            if let (Some(vid_arr), Some(labels_arr)) = (
+            if let (Some(vid_arr), Some(labels_arr), Some(ver_arr)) = (
                 vid_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
                 labels_col.and_then(|c| c.as_any().downcast_ref::<arrow_array::ListArray>()),
+                ver_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
             ) {
                 for i in 0..batch.num_rows() {
                     if vid_arr.is_null(i) {
                         continue;
                     }
                     let vid = Vid::new(vid_arr.value(i));
+                    let version = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
 
-                    if let Some(labels) = list_array_to_labels(labels_arr, i) {
-                        label_map.insert(vid, labels);
+                    if best.get(&vid).is_some_and(|(bv, _, _)| version < *bv) {
+                        continue;
                     }
+                    let deleted = deleted_col.is_some_and(|d| d.value(i));
+                    let labels = if deleted {
+                        Vec::new()
+                    } else {
+                        list_array_to_labels(labels_arr, i).unwrap_or_default()
+                    };
+                    best.insert(vid, (version, deleted, labels));
                 }
             }
         }
+
+        let label_map = best
+            .into_iter()
+            .filter(|(_, (_, deleted, _))| !*deleted)
+            .map(|(vid, (_, _, labels))| (vid, labels))
+            .collect();
 
         Ok(label_map)
     }

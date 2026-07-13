@@ -90,12 +90,54 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode lowercase/uppercase hex; errors on odd length or non-hex digits.
+///
+/// Operates on raw bytes (`chunks_exact(2)`), NOT `&s[i..i+2]` string slicing,
+/// so a script-controlled string with a multibyte UTF-8 codepoint at an even
+/// byte length returns `Err` instead of panicking the host thread on a
+/// non-char-boundary slice.
 fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_owned());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+    fn nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex digit".to_owned()),
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{from_hex, to_hex};
+
+    #[test]
+    fn hex_round_trips() {
+        assert_eq!(
+            from_hex(&to_hex(&[0x00, 0xAB, 0xff])).unwrap(),
+            vec![0, 0xAB, 0xFF]
+        );
+    }
+
+    #[test]
+    fn from_hex_errors_on_odd_length() {
+        assert!(from_hex("abc").is_err());
+    }
+
+    #[test]
+    fn from_hex_errors_on_even_byte_multibyte_input() {
+        // "aéb" = [0x61, 0xC3, 0xA9, 0x62] — even byte length, but 'é' is a
+        // multibyte codepoint. Byte-index slicing would panic; decoding on raw
+        // bytes returns Err instead.
+        let input = "aéb";
+        assert_eq!(input.len(), 4);
+        assert!(from_hex(input).is_err(), "must return Err, not panic");
+    }
 }

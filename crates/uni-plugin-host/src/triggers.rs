@@ -32,10 +32,11 @@
 //!   those keys into the per-row property bags — predicate-gated
 //!   cost, no work for property-free predicates.
 //! - `TriggerOutcome::Defer` enqueues the trigger fire into the
-//!   per-`Uni` [`DeferralQueue`] (in-memory, ticked at 50ms by the
-//!   background task spawned in `Uni::build`). Items re-fire on the
-//!   next tick; re-deferring is capped at `DEFER_MAX_ATTEMPTS`.
-//!   Restart-durable persistence lives with the M11 CDC scheduler.
+//!   per-`Uni` [`DeferralQueue`], ticked at 50ms by the background
+//!   task spawned in `Uni::build`. Items re-fire on the next tick;
+//!   re-deferring is capped at `DEFER_MAX_ATTEMPTS`. When built with
+//!   [`DeferralQueue::with_persistence`] the queue mirrors to a JSON
+//!   sidecar (FU-5) and reloads on restart via `load_from_sidecar`.
 //! - `NODE_CREATE` / `NODE_UPDATE` / `NODE_DELETE` (and the edge
 //!   analogs) are distinguished via a committed-state probe
 //!   ([`PreExistingProbe`]) passed to
@@ -65,6 +66,7 @@ use tracing::warn;
 use uni_common::cypher_value_codec;
 use uni_common::{Properties, UniError, Value};
 use uni_plugin::PluginRegistry;
+use uni_plugin::traits::procedure::ProcedureHost;
 use uni_plugin::traits::trigger::{
     FireMode, MutationBatch, TriggerContext, TriggerEventMask, TriggerOutcome, TriggerPhase,
     TriggerPlugin, TriggerSubscription,
@@ -348,6 +350,12 @@ fn phase_index(p: TriggerPhase) -> usize {
 struct RouteEntry {
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    /// Index of this trigger among all registered triggers that share the same
+    /// `name` (in registry order). Two triggers with identical docs derive the
+    /// same `subscription_name`, so the name alone cannot re-bind a persisted
+    /// deferral to the right plugin on restart; the (name, ordinal) pair does,
+    /// as long as registration order is deterministic (it is — same plugin code).
+    name_ordinal: usize,
     event_mask: u32,
     label_filter: Option<Vec<String>>,
     edge_type_filter: Option<Vec<String>>,
@@ -411,6 +419,11 @@ pub struct TriggerRouter {
     /// without a queue — `TriggerOutcome::Defer` then falls back to
     /// the legacy warn-and-collapse behavior.
     defer_queue: Option<Arc<DeferralQueue>>,
+    /// Per-`Uni` EventualConsistency coalescing queue (WS-E). Shared by
+    /// `Arc` from `UniInner` (buckets must survive across per-commit
+    /// router rebuilds). `EventualConsistency` after-phase fires buffer
+    /// here instead of spawning per-commit like `Async`.
+    ec_queue: Arc<EcQueue>,
 }
 
 impl TriggerRouter {
@@ -432,7 +445,14 @@ impl TriggerRouter {
     /// deliberate trade-off to keep `uni-plugin` free of a `uni-cypher`
     /// dependency.
     pub fn from_registry(reg: &PluginRegistry) -> Result<Self, UniError> {
-        Self::from_registry_with_queue(reg, None)
+        // No wired queues: deferrals warn-and-drop and EventualConsistency
+        // buffers into an unwired `EcQueue` (a no-op on flush). Matches the
+        // legacy read-only / test fallback for the deferral queue.
+        Self::from_registry_with_queue(
+            reg,
+            None,
+            EcQueue::new(None, Duration::from_secs(1), 10_000),
+        )
     }
 
     /// Variant that wires in a per-`Uni` deferral queue so
@@ -445,13 +465,25 @@ impl TriggerRouter {
     pub fn from_registry_with_queue(
         reg: &PluginRegistry,
         defer_queue: Option<Arc<DeferralQueue>>,
+        ec_queue: Arc<EcQueue>,
     ) -> Result<Self, UniError> {
         let triggers = reg.triggers();
         let mut by_phase: [Vec<RouteEntry>; PHASE_COUNT] =
             [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        // Running per-name counter (registry order) → each trigger's ordinal among
+        // its same-named siblings. Matched at reload (load_from_sidecar walks the
+        // same registry order), so a persisted deferral re-binds to the exact
+        // trigger that created it even when names collide.
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
         for plugin in triggers.iter() {
             let sub: &TriggerSubscription = plugin.subscription();
             let name = subscription_name(sub);
+            let name_ordinal = {
+                let c = name_counts.entry(name.clone()).or_insert(0);
+                let ordinal = *c;
+                *c += 1;
+                ordinal
+            };
             let (compiled_predicate, properties_referenced) = match sub.predicate_source.as_deref()
             {
                 Some(src) => {
@@ -474,6 +506,7 @@ impl TriggerRouter {
             let entry = RouteEntry {
                 plugin: Arc::clone(plugin),
                 name,
+                name_ordinal,
                 event_mask: sub.events.0,
                 label_filter: sub
                     .labels
@@ -496,6 +529,7 @@ impl TriggerRouter {
         Ok(Self {
             by_phase,
             defer_queue,
+            ec_queue,
         })
     }
 
@@ -535,6 +569,27 @@ impl TriggerRouter {
         ctx: TriggerContext<'_>,
         events: &MutationEvents,
     ) -> Result<(), UniError> {
+        // Owned host handle (WS-A), cloned into each per-fire context so
+        // a declared trigger's action body can reach the write-enabled
+        // host. `None` for native-only setups. (Declared triggers are
+        // AfterCommit + Async and never actually fire in the before
+        // phase, but thread the host through for uniformity.)
+        let host = ctx.host().cloned();
+        // Deferrals are BUFFERED here and only committed to the queue once ALL
+        // synchronous before-triggers have run without a reject/error. If a later
+        // trigger rejects (returning `Err`), the transaction aborts and these
+        // buffered deferrals are dropped — otherwise a deferred item would later
+        // fire with the mutations of a transaction that never committed.
+        #[allow(clippy::type_complexity)]
+        let mut pending_deferrals: Vec<(
+            Arc<dyn TriggerPlugin>,
+            String,
+            usize,
+            MutationBatch,
+            String,
+            u64,
+            uni_plugin::traits::trigger::TriggerDeferral,
+        )> = Vec::new();
         for &phase in &[TriggerPhase::BeforeMutation, TriggerPhase::BeforeCommit] {
             let routes = &self.by_phase[phase_index(phase)];
             for entry in routes {
@@ -547,7 +602,10 @@ impl TriggerRouter {
                 let mb = MutationBatch {
                     events: Arc::new(batch),
                 };
-                let ctx_ref = TriggerContext::new(ctx.session_id, ctx.tx_id);
+                let mut ctx_ref = TriggerContext::new(ctx.session_id, ctx.tx_id);
+                if let Some(h) = host.as_ref() {
+                    ctx_ref = ctx_ref.with_host(Arc::clone(h));
+                }
                 match entry.plugin.fire(ctx_ref, &mb) {
                     Ok(TriggerOutcome::Continue) => {}
                     Ok(TriggerOutcome::Reject { reason }) => {
@@ -557,19 +615,20 @@ impl TriggerRouter {
                         });
                     }
                     Ok(TriggerOutcome::Defer { until }) => {
-                        // Memory-backed in-process deferral. FU-5 adds
-                        // an optional `delay` to `TriggerDeferral`;
-                        // `None` re-fires on the next queue tick,
+                        // Buffer the deferral (see the note above); it is committed
+                        // to the queue only after the whole before-dispatch
+                        // succeeds. FU-5 adds an optional `delay` to
+                        // `TriggerDeferral`; `None` re-fires on the next queue tick,
                         // `Some(d)` schedules at `now + d`.
-                        enqueue_deferral(
-                            &self.defer_queue,
+                        pending_deferrals.push((
                             Arc::clone(&entry.plugin),
                             entry.name.clone(),
+                            entry.name_ordinal,
                             mb.clone(),
                             ctx.session_id.to_owned(),
                             ctx.tx_id,
                             until,
-                        );
+                        ));
                     }
                     Ok(_) => {
                         // `TriggerOutcome` is `#[non_exhaustive]`; an
@@ -585,6 +644,20 @@ impl TriggerRouter {
                 }
             }
         }
+        // All before-triggers passed (no reject) — the transaction is cleared to
+        // commit, so commit the buffered deferrals now.
+        for (plugin, name, name_ordinal, mb, session_id, tx_id, until) in pending_deferrals {
+            enqueue_deferral(
+                &self.defer_queue,
+                plugin,
+                name,
+                name_ordinal,
+                mb,
+                session_id,
+                tx_id,
+                until,
+            );
+        }
         Ok(())
     }
 
@@ -592,14 +665,19 @@ impl TriggerRouter {
     ///
     /// `Synchronous` after-phase triggers run inline (panics caught and
     /// logged). `Async` triggers are spawned on `runtime`.
-    /// `EventualConsistency` triggers are spawned the same as `Async`
-    /// in v1 (a real batched queue lands with M5g).
+    /// `EventualConsistency` triggers buffer into the per-`Uni`
+    /// [`EcQueue`], which coalesces batches across commits and flushes a
+    /// single `DeferredItem` per bucket on the deferral tick (WS-E).
     pub fn dispatch_after(
         &self,
         ctx: TriggerContext<'_>,
         events: &MutationEvents,
         runtime: &Handle,
     ) {
+        // Owned host handle (WS-A). Cloned into the async spawn closure so
+        // a declared trigger's after-commit action body reaches the
+        // write-enabled host after the commit stack frame is gone.
+        let host = ctx.host().cloned();
         for &phase in &[TriggerPhase::AfterMutation, TriggerPhase::AfterCommit] {
             let routes = &self.by_phase[phase_index(phase)];
             for entry in routes {
@@ -611,29 +689,55 @@ impl TriggerRouter {
                 };
                 match entry.fire_mode {
                     FireMode::Synchronous => {
-                        fire_caught(entry, ctx.session_id, ctx.tx_id, &mb, &self.defer_queue);
+                        fire_caught(
+                            entry,
+                            ctx.session_id,
+                            ctx.tx_id,
+                            &mb,
+                            &self.defer_queue,
+                            host.as_ref(),
+                        );
                     }
-                    // `FireMode::Async`, `EventualConsistency`, and any
-                    // future variant land on the spawn path. v1 collapses
-                    // EventualConsistency onto Async (no batched queue);
-                    // M5g adds the real queue.
+                    // WS-E: EventualConsistency buffers into the per-`Uni`
+                    // coalescing queue instead of spawning per-commit. Due
+                    // buckets flush a single coalesced fire on the deferral
+                    // tick, riding the existing defer-queue durability + fire
+                    // ladder. (No longer aliases `Async`.)
+                    FireMode::EventualConsistency => {
+                        self.ec_queue.enqueue(
+                            entry,
+                            ctx.session_id,
+                            ctx.tx_id,
+                            Arc::clone(&mb.events),
+                        );
+                    }
+                    // `FireMode::Async` and any future variant land on the
+                    // spawn path: one `spawn_blocking`-style task per matching
+                    // commit, fired after the transaction lands.
                     _ => {
                         let plugin = Arc::clone(&entry.plugin);
                         let name = entry.name.clone();
+                        let name_ordinal = entry.name_ordinal;
                         let session_id = ctx.session_id.to_owned();
                         let tx_id = ctx.tx_id;
                         let queue = self.defer_queue.clone();
+                        let host = host.clone();
                         runtime.spawn(async move {
                             let mb_inner = mb;
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    plugin.fire(TriggerContext::new(&session_id, tx_id), &mb_inner)
+                                    let mut c = TriggerContext::new(&session_id, tx_id);
+                                    if let Some(h) = host.as_ref() {
+                                        c = c.with_host(Arc::clone(h));
+                                    }
+                                    plugin.fire(c, &mb_inner)
                                 }));
                             handle_fire_outcome(result, &name, "async trigger", |until| {
                                 enqueue_deferral(
                                     &queue,
                                     Arc::clone(&plugin),
                                     name.clone(),
+                                    name_ordinal,
                                     mb_inner,
                                     session_id.clone(),
                                     tx_id,
@@ -655,10 +759,12 @@ impl TriggerRouter {
 ///
 /// The fire instant honors `until.delay` (FU-5); `None` collapses to
 /// "now" so the item fires on the next tick.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_deferral(
     queue: &Option<Arc<DeferralQueue>>,
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    name_ordinal: usize,
     mb: MutationBatch,
     session_id: String,
     tx_id: u64,
@@ -673,6 +779,7 @@ fn enqueue_deferral(
         DeferredItem {
             plugin,
             name,
+            name_ordinal,
             batch: mb,
             session_id,
             tx_id,
@@ -710,19 +817,27 @@ fn fire_caught(
     tx_id: u64,
     mb: &MutationBatch,
     defer_queue: &Option<Arc<DeferralQueue>>,
+    host: Option<&Arc<dyn ProcedureHost>>,
 ) {
     let plugin = Arc::clone(&entry.plugin);
     let name = entry.name.clone();
+    let name_ordinal = entry.name_ordinal;
     let mb_clone = mb.clone();
     let session_id_owned = session_id.to_owned();
+    let host = host.cloned();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin.fire(TriggerContext::new(&session_id_owned, tx_id), &mb_clone)
+        let mut c = TriggerContext::new(&session_id_owned, tx_id);
+        if let Some(h) = host.as_ref() {
+            c = c.with_host(Arc::clone(h));
+        }
+        plugin.fire(c, &mb_clone)
     }));
     handle_fire_outcome(result, &name, "after-phase trigger", |until| {
         enqueue_deferral(
             defer_queue,
             plugin,
             name.clone(),
+            name_ordinal,
             mb_clone,
             session_id_owned,
             tx_id,
@@ -827,12 +942,21 @@ impl PreExistingProbe {
             .chain(tx_l0.tombstones.keys().copied())
             .collect();
 
+        // Buffers are probed newest→oldest (current, then pending-flush). A
+        // tombstone in a newer buffer means the entity is DEAD as of that
+        // buffer — not merely "no info here". We record it in `dead_*` so an
+        // OLDER buffer's stale CREATE props can never resurrect it as
+        // pre-existing (which would mis-emit a later recreate as an UPDATE with
+        // stale `old_value` instead of a CREATE).
+        let mut dead_vids: HashSet<uni_common::Vid> = HashSet::new();
+        let mut dead_eids: HashSet<uni_common::Eid> = HashSet::new();
         let mut probe_buffer = |buf: &L0Buffer| {
             for vid in &candidate_vids {
-                if vertices.contains_key(vid) {
+                if vertices.contains_key(vid) || dead_vids.contains(vid) {
                     continue;
                 }
                 if buf.vertex_tombstones.contains(vid) {
+                    dead_vids.insert(*vid);
                     continue;
                 }
                 if let Some(props) = buf.vertex_properties.get(vid) {
@@ -840,10 +964,11 @@ impl PreExistingProbe {
                 }
             }
             for eid in &candidate_eids {
-                if edges.contains_key(eid) {
+                if edges.contains_key(eid) || dead_eids.contains(eid) {
                     continue;
                 }
                 if buf.tombstones.contains_key(eid) {
+                    dead_eids.insert(*eid);
                     continue;
                 }
                 if buf.edge_endpoints.contains_key(eid) {
@@ -853,12 +978,19 @@ impl PreExistingProbe {
             }
         };
 
+        // Probe newest → oldest so the first definitive state per entity wins:
+        // `current` is the newest buffer, then the pending-flush buffers from
+        // newest to oldest (`get_pending_flush` returns them oldest-first). This
+        // ordering is what makes the `dead_*` short-circuit correct — a newer
+        // tombstone is seen before an older buffer's stale CREATE props — and it
+        // also records the newest (not oldest) pre-image props for a vertex
+        // updated across flush windows.
         {
             let current = l0_manager.get_current();
             let g = current.read();
             probe_buffer(&g);
         }
-        for pending in l0_manager.get_pending_flush() {
+        for pending in l0_manager.get_pending_flush().iter().rev() {
             let g = pending.read();
             probe_buffer(&g);
         }
@@ -1452,6 +1584,9 @@ const DEFER_MAX_ATTEMPTS: u32 = 10;
 struct DeferredItem {
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
+    /// Index among same-named triggers (see [`RouteEntry::name_ordinal`]) —
+    /// persisted so a reload re-binds this item to the exact trigger.
+    name_ordinal: usize,
     batch: MutationBatch,
     session_id: String,
     tx_id: u64,
@@ -1461,6 +1596,235 @@ struct DeferredItem {
     payload: String,
 }
 
+// ── WS-E: EventualConsistency coalescing queue ─────────────────────
+
+/// One per-trigger coalescing bucket inside [`EcQueue`].
+///
+/// Accumulates the projected event `RecordBatch`es for a single
+/// `EventualConsistency` trigger across commits, then flushes them as
+/// ONE concatenated `DeferredItem` into the shared [`DeferralQueue`]
+/// once the bucket is due (age >= interval or rows >= threshold).
+struct EcBucket {
+    plugin: Arc<dyn TriggerPlugin>,
+    name: String,
+    /// Index among same-named triggers — see [`RouteEntry::name_ordinal`].
+    /// Combined with `name` to re-bind the coalesced fire to the exact
+    /// trigger (same contract the deferral sidecar uses on reload).
+    name_ordinal: usize,
+    /// Session that opened this coalescing window (the first enqueue).
+    /// A coalesced fire spans multiple commits, so the per-commit session
+    /// identity is inherently lossy; we keep the window opener's.
+    session_id: String,
+    /// Tx that opened this coalescing window (the first enqueue).
+    tx_id: u64,
+    /// Per-commit projected batches, in enqueue (FIFO) order. Concatenated
+    /// in this order on flush so the coalesced batch preserves arrival order.
+    pending: Vec<Arc<RecordBatch>>,
+    /// Running total of `pending` row counts — the size-flush signal.
+    rows: usize,
+    /// When the first batch of the current window was enqueued — the
+    /// age-flush signal. Reset each window because a flushed bucket is
+    /// removed from the map and re-created fresh on the next enqueue.
+    first_enqueued: StdInstant,
+}
+
+/// Per-`Uni` batched/coalescing queue for [`FireMode::EventualConsistency`]
+/// triggers.
+///
+/// Where [`FireMode::Async`] spawns one task per matching commit,
+/// EventualConsistency triggers buffer their projected event batches into
+/// per-trigger `EcBucket`s and flush a SINGLE coalesced fire once a
+/// bucket is due. Coalesced work rides the existing [`DeferralQueue`]
+/// durability + fire ladder — there is no separate sidecar or fire path:
+/// a due bucket concatenates its pending batches into one
+/// [`MutationBatch`] and pushes one `DeferredItem`.
+///
+/// **Lifetime:** unlike [`TriggerRouter`] (rebuilt every commit), the
+/// `EcQueue` is a per-`Uni` `Arc` living in `UniInner`, `Arc`-cloned into
+/// each commit's router exactly like the deferral queue — so buckets
+/// survive across commits and actually coalesce.
+///
+/// **Flush triggers** (per bucket):
+/// - **age** — oldest pending batch is older than `flush_interval`;
+/// - **size** — accumulated `rows` reach `flush_threshold`;
+/// - **back-pressure** — a single enqueue pushes `rows` past
+///   `4 × flush_threshold`, forcing an inline drain of that bucket so the
+///   commit path never blocks and no data is dropped.
+pub struct EcQueue {
+    buckets: parking_lot::Mutex<HashMap<(String, usize), EcBucket>>,
+    /// Shared with `UniInner::defer_queue`: coalesced fires and
+    /// back-pressure drains push here. `None` for read-only / test setups
+    /// without a queue (buffering then no-ops on flush, like the deferral
+    /// queue's warn-and-drop fallback).
+    defer_queue: Option<Arc<DeferralQueue>>,
+    /// Max age of a bucket's oldest pending batch before it flushes.
+    flush_interval: Duration,
+    /// Row count at which a bucket flushes early (before `flush_interval`).
+    flush_threshold: usize,
+}
+
+impl std::fmt::Debug for EcQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let buckets = self.buckets.lock();
+        f.debug_struct("EcQueue")
+            .field("buckets", &buckets.len())
+            .field("flush_interval", &self.flush_interval)
+            .field("flush_threshold", &self.flush_threshold)
+            .finish()
+    }
+}
+
+impl EcQueue {
+    /// Build a queue wired to the shared deferral queue and configured
+    /// from `UniConfig::ec_flush_interval` / `ec_flush_threshold`.
+    #[must_use]
+    pub fn new(
+        defer_queue: Option<Arc<DeferralQueue>>,
+        flush_interval: Duration,
+        flush_threshold: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            buckets: parking_lot::Mutex::new(HashMap::new()),
+            defer_queue,
+            // A zero threshold would make every enqueue immediately
+            // over-cap (back-pressure); clamp to at least 1 row.
+            flush_interval,
+            flush_threshold: flush_threshold.max(1),
+        })
+    }
+
+    /// Number of live (non-empty) coalescing buckets — diagnostics / tests.
+    #[must_use]
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.lock().len()
+    }
+
+    /// Buffer one commit's projected batch for `entry`'s coalescing bucket.
+    ///
+    /// Appends in FIFO order, bumps the running row count, and opens a
+    /// fresh window (`first_enqueued`, `session_id`, `tx_id`) when the
+    /// bucket is new. If this enqueue pushes the bucket past
+    /// `4 × flush_threshold`, the bucket is force-drained inline to the
+    /// deferral queue (back-pressure) so the commit path never blocks and
+    /// no data is dropped. Called from the after-phase dispatch on the
+    /// commit thread — never blocks on I/O beyond the deferral push.
+    ///
+    /// Module-private because it takes the module-private [`RouteEntry`];
+    /// the only caller is [`TriggerRouter::dispatch_after`] (same module).
+    fn enqueue(&self, entry: &RouteEntry, session_id: &str, tx_id: u64, batch: Arc<RecordBatch>) {
+        let key = (entry.name.clone(), entry.name_ordinal);
+        // Back-pressure cap: 4× the early-flush threshold.
+        let cap = self.flush_threshold.saturating_mul(4);
+        let mut buckets = self.buckets.lock();
+        let bucket = buckets.entry(key.clone()).or_insert_with(|| EcBucket {
+            plugin: Arc::clone(&entry.plugin),
+            name: entry.name.clone(),
+            name_ordinal: entry.name_ordinal,
+            session_id: session_id.to_owned(),
+            tx_id,
+            pending: Vec::new(),
+            rows: 0,
+            first_enqueued: StdInstant::now(),
+        });
+        let n = batch.num_rows();
+        bucket.pending.push(batch);
+        bucket.rows += n;
+        let over_cap = bucket.rows > cap;
+        // Drop the `&mut bucket` borrow (NLL) before mutating the map again.
+        if over_cap
+            && let Some(defer_queue) = self.defer_queue.as_ref()
+            && let Some(drained) = buckets.remove(&key)
+        {
+            Self::drain_bucket(drained, defer_queue, StdInstant::now());
+        }
+    }
+
+    /// Flush every bucket that is due as of `now`: age (oldest pending
+    /// batch older than `flush_interval`) OR size (`rows >= flush_threshold`).
+    /// Each due bucket becomes ONE coalesced `DeferredItem`. Called from
+    /// the per-`Uni` 50ms deferral tick alongside `DeferralQueue::tick`.
+    pub fn flush_due(&self, now: StdInstant) {
+        let Some(defer_queue) = self.defer_queue.as_ref() else {
+            return;
+        };
+        let mut buckets = self.buckets.lock();
+        let due_keys: Vec<(String, usize)> = buckets
+            .iter()
+            .filter(|(_, b)| {
+                now.saturating_duration_since(b.first_enqueued) >= self.flush_interval
+                    || b.rows >= self.flush_threshold
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in due_keys {
+            if let Some(bucket) = buckets.remove(&key) {
+                Self::drain_bucket(bucket, defer_queue, now);
+            }
+        }
+    }
+
+    /// Concatenate a bucket's pending batches (in FIFO order) into one
+    /// coalesced `DeferredItem` and push it into `defer_queue` with
+    /// `fire_at = now`. On concat failure (schema drift) each pending batch
+    /// is pushed individually so data is never lost.
+    fn drain_bucket(bucket: EcBucket, defer_queue: &DeferralQueue, now: StdInstant) {
+        let EcBucket {
+            plugin,
+            name,
+            name_ordinal,
+            session_id,
+            tx_id,
+            pending,
+            ..
+        } = bucket;
+        if pending.is_empty() {
+            return;
+        }
+        let schema = pending[0].schema();
+        match arrow_select::concat::concat_batches(&schema, pending.iter().map(Arc::as_ref)) {
+            Ok(coalesced) => {
+                defer_queue.push(
+                    DeferredItem {
+                        plugin,
+                        name,
+                        name_ordinal,
+                        batch: MutationBatch {
+                            events: Arc::new(coalesced),
+                        },
+                        session_id,
+                        tx_id,
+                        attempts: 0,
+                        payload: String::new(),
+                    },
+                    now,
+                );
+            }
+            Err(e) => {
+                warn!(
+                    trigger = %name,
+                    error = %e,
+                    "EcQueue: batch concat failed (schema drift?); flushing pending batches individually"
+                );
+                for events in pending {
+                    defer_queue.push(
+                        DeferredItem {
+                            plugin: Arc::clone(&plugin),
+                            name: name.clone(),
+                            name_ordinal,
+                            batch: MutationBatch { events },
+                            session_id: session_id.clone(),
+                            tx_id,
+                            attempts: 0,
+                            payload: String::new(),
+                        },
+                        now,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// In-memory deferral queue for `TriggerOutcome::Defer`.
 ///
 /// Items are keyed by their scheduled fire instant in a `BTreeMap`,
@@ -1468,12 +1832,14 @@ struct DeferredItem {
 /// drained by a per-`Uni` background tick task spawned at DB build
 /// time; firing happens on the tokio runtime.
 ///
-/// **v1 limitations** (in-memory only):
-/// - Restart drops queued items. A persistent queue (system-table or
-///   WAL extension) is `TODO(M11-persist)`.
-/// - No transactional guarantee that a deferred item eventually fires
-///   — if the process exits before the scheduled instant, the item is
-///   lost.
+/// **Durability:**
+/// - By default the queue is in-memory and restart drops queued items.
+///   Built via [`DeferralQueue::with_persistence`] it mirrors every
+///   `push`/`drain_due` to a JSON sidecar (FU-5) and reloads on restart
+///   via [`DeferralQueue::load_from_sidecar`].
+/// - Even with persistence there is no transactional guarantee tying a
+///   deferred fire to the originating commit; a crash between commit and
+///   the next sidecar write can still lose an item.
 /// - Per-item retry is capped at `DEFER_MAX_ATTEMPTS` to prevent
 ///   runaway re-deferral loops.
 #[derive(Default)]
@@ -1549,14 +1915,20 @@ impl DeferralQueue {
         };
         let mut restored = 0usize;
         for row in rows {
+            // Re-bind by (name, ordinal): the Nth trigger with this name in
+            // registry order, matching the ordinal assigned in `from_registry`.
+            // `find` (first match) would misroute a deferral from a later trigger
+            // to an earlier same-named one.
             let Some(entry) = registry
                 .triggers()
                 .iter()
-                .find(|t| subscription_name(t.subscription()) == row.name)
+                .filter(|t| subscription_name(t.subscription()) == row.name)
+                .nth(row.name_ordinal)
                 .cloned()
             else {
                 tracing::warn!(
                     trigger = %row.name,
+                    ordinal = row.name_ordinal,
                     "DeferralQueue: dropping persisted item; trigger no longer registered"
                 );
                 continue;
@@ -1580,6 +1952,7 @@ impl DeferralQueue {
             let item = DeferredItem {
                 plugin: entry,
                 name: row.name,
+                name_ordinal: row.name_ordinal,
                 batch: MutationBatch {
                     events: Arc::new(batch),
                 },
@@ -1635,6 +2008,7 @@ impl DeferralQueue {
                 };
                 rows.push(PersistedDeferral {
                     name: item.name.clone(),
+                    name_ordinal: item.name_ordinal,
                     session_id: item.session_id.clone(),
                     tx_id: item.tx_id,
                     attempts: item.attempts,
@@ -1745,6 +2119,12 @@ pub fn tx_id_to_u64(tx_id: &str) -> u64 {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedDeferral {
     name: String,
+    /// Index among same-named triggers, used with `name` to re-bind to the exact
+    /// trigger on restart. `#[serde(default)]` keeps rows written before this
+    /// field readable (they resolve to the first same-named trigger, the prior
+    /// behavior).
+    #[serde(default)]
+    name_ordinal: usize,
     session_id: String,
     tx_id: u64,
     attempts: u32,
@@ -1834,6 +2214,7 @@ mod tests {
         let router = TriggerRouter {
             by_phase,
             defer_queue: None,
+            ec_queue: EcQueue::new(None, Duration::from_secs(1), 10_000),
         };
         assert!(router.is_empty());
     }
@@ -1845,5 +2226,227 @@ mod tests {
         let c = tx_id_to_u64("tx-2");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // ── WS-E: EcQueue coalescing tests ─────────────────────────────
+
+    use arrow_array::Array;
+    use uni_plugin::FnError;
+    use uni_plugin::traits::trigger::TriggerDeferral;
+
+    /// Minimal trigger double for building `RouteEntry`s in tests.
+    struct DummyTrigger {
+        sub: TriggerSubscription,
+    }
+
+    impl TriggerPlugin for DummyTrigger {
+        fn subscription(&self) -> &TriggerSubscription {
+            &self.sub
+        }
+        fn fire(
+            &self,
+            _ctx: TriggerContext<'_>,
+            _events: &MutationBatch,
+        ) -> Result<TriggerOutcome, FnError> {
+            Ok(TriggerOutcome::Continue)
+        }
+    }
+
+    /// Build an EventualConsistency `RouteEntry` for `(name, ordinal)`.
+    fn ec_route(name: &str, ordinal: usize) -> RouteEntry {
+        let sub = TriggerSubscription {
+            phase: TriggerPhase::AfterCommit,
+            events: TriggerEventMask::NODE_CREATE,
+            labels: None,
+            edge_types: None,
+            properties: None,
+            predicate_source: None,
+            fire_mode: FireMode::EventualConsistency,
+            docs: name.to_owned(),
+        };
+        RouteEntry {
+            plugin: Arc::new(DummyTrigger { sub: sub.clone() }),
+            name: name.to_owned(),
+            name_ordinal: ordinal,
+            event_mask: TriggerEventMask::NODE_CREATE.0,
+            label_filter: None,
+            edge_type_filter: None,
+            property_filter: None,
+            fire_mode: FireMode::EventualConsistency,
+            compiled_predicate: None,
+            properties_referenced: HashSet::new(),
+        }
+    }
+
+    /// One-column Int64 `RecordBatch` carrying `vals` — a stand-in for the
+    /// projected event batch. EcQueue is schema-agnostic; a stable single
+    /// column keeps the coalescing/order assertions readable.
+    fn int_batch(vals: &[i64]) -> Arc<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let col = Arc::new(Int64Array::from(vals.to_vec()));
+        Arc::new(RecordBatch::try_new(schema, vec![col]).expect("valid record batch"))
+    }
+
+    /// Read the (single) Int64 column of a `DeferredItem`'s coalesced batch.
+    fn item_values(item: &DeferredItem) -> Vec<i64> {
+        let col = item
+            .batch
+            .events
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column");
+        (0..col.len()).map(|i| col.value(i)).collect()
+    }
+
+    #[test]
+    fn ec_queue_coalesces_under_threshold_into_one_item() {
+        let defer = DeferralQueue::new();
+        let ec = EcQueue::new(Some(Arc::clone(&defer)), Duration::from_millis(10), 10_000);
+        let entry = ec_route("t", 0);
+
+        // Enqueue several small batches (well under the size threshold).
+        for i in 0..5i64 {
+            ec.enqueue(&entry, "s1", 1, int_batch(&[i]));
+        }
+        // Nothing has flushed yet (age < interval, rows < threshold).
+        assert_eq!(defer.pending(), 0);
+        assert_eq!(ec.bucket_count(), 1);
+
+        // After the interval elapses, flush_due drains the bucket as ONE item.
+        std::thread::sleep(Duration::from_millis(20));
+        ec.flush_due(StdInstant::now());
+        assert_eq!(defer.pending(), 1, "expected a single coalesced item");
+        assert_eq!(ec.bucket_count(), 0, "bucket removed after flush");
+
+        // The one item carries all 5 rows, in FIFO order.
+        let due = defer.drain_due(StdInstant::now() + Duration::from_secs(1));
+        assert_eq!(due.len(), 1);
+        assert_eq!(item_values(&due[0]), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn ec_queue_size_threshold_flushes_before_interval() {
+        let defer = DeferralQueue::new();
+        // Long interval so only the size threshold can trigger the flush.
+        let ec = EcQueue::new(Some(Arc::clone(&defer)), Duration::from_secs(3600), 3);
+        let entry = ec_route("t", 0);
+
+        // Enqueue 3 rows == threshold, immediately (elapsed ≈ 0 << interval).
+        ec.enqueue(&entry, "s1", 1, int_batch(&[1, 2]));
+        ec.enqueue(&entry, "s1", 1, int_batch(&[3]));
+
+        // flush_due with elapsed < interval still flushes: size-triggered.
+        ec.flush_due(StdInstant::now());
+        assert_eq!(defer.pending(), 1);
+        let due = defer.drain_due(StdInstant::now() + Duration::from_secs(1));
+        assert_eq!(item_values(&due[0]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ec_queue_isolates_buckets_by_ordinal_and_preserves_fifo() {
+        let defer = DeferralQueue::new();
+        let ec = EcQueue::new(Some(Arc::clone(&defer)), Duration::from_millis(5), 10_000);
+        // Two distinct triggers (same name, different ordinal → distinct bucket).
+        let a = ec_route("t", 0);
+        let b = ec_route("t", 1);
+
+        // Interleave enqueues; per-bucket FIFO must be preserved.
+        ec.enqueue(&a, "s", 1, int_batch(&[10]));
+        ec.enqueue(&b, "s", 1, int_batch(&[20]));
+        ec.enqueue(&a, "s", 1, int_batch(&[11]));
+        ec.enqueue(&b, "s", 1, int_batch(&[21]));
+        assert_eq!(ec.bucket_count(), 2);
+
+        std::thread::sleep(Duration::from_millis(10));
+        ec.flush_due(StdInstant::now());
+        assert_eq!(defer.pending(), 2, "each bucket flushes independently");
+
+        let mut due = defer.drain_due(StdInstant::now() + Duration::from_secs(1));
+        due.sort_by_key(|item| item_values(item)[0]);
+        assert_eq!(item_values(&due[0]), vec![10, 11]);
+        assert_eq!(item_values(&due[1]), vec![20, 21]);
+    }
+
+    #[test]
+    fn ec_queue_backpressure_force_drains_without_data_loss() {
+        let defer = DeferralQueue::new();
+        // threshold 2 → back-pressure cap = 8 rows.
+        let ec = EcQueue::new(Some(Arc::clone(&defer)), Duration::from_secs(3600), 2);
+        let entry = ec_route("t", 0);
+
+        // Flood past the 4× cap in a single burst of 1-row batches. The
+        // interval is an hour, so age never triggers: only inline
+        // back-pressure drains (rows > 8) can move data to the defer queue.
+        for i in 0..20i64 {
+            ec.enqueue(&entry, "s", 1, int_batch(&[i]));
+        }
+        // The force-drains fired inline; a sub-cap tail may still be
+        // buffered in the bucket. Collect both to prove zero data loss.
+        let mut all: Vec<i64> = defer
+            .drain_due(StdInstant::now() + Duration::from_secs(1))
+            .iter()
+            .flat_map(item_values)
+            .collect();
+        assert!(!all.is_empty(), "back-pressure must have force-drained");
+        // Flush whatever remained below the cap (size threshold is 2).
+        ec.flush_due(StdInstant::now());
+        all.extend(
+            defer
+                .drain_due(StdInstant::now() + Duration::from_secs(1))
+                .iter()
+                .flat_map(item_values),
+        );
+        // Every enqueued row survived exactly once — nothing dropped, nothing
+        // duplicated, across the inline drains + the tail flush.
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..20).collect::<Vec<_>>(),
+            "no rows dropped or duplicated under back-pressure"
+        );
+        assert_eq!(ec.bucket_count(), 0, "bucket fully drained");
+    }
+
+    #[test]
+    fn ec_queue_concat_failure_falls_back_to_individual_batches() {
+        // Two incompatible schemas in one bucket force concat to fail; the
+        // fallback must push each pending batch individually (no data loss).
+        let defer = DeferralQueue::new();
+        let ec = EcQueue::new(Some(Arc::clone(&defer)), Duration::from_millis(1), 10_000);
+        let entry = ec_route("t", 0);
+
+        let good = int_batch(&[1, 2]);
+        let drifted_schema = Arc::new(Schema::new(vec![Field::new("m", DataType::Utf8, false)]));
+        let drifted = Arc::new(
+            RecordBatch::try_new(
+                drifted_schema,
+                vec![Arc::new(arrow_array::StringArray::from(vec!["x"]))],
+            )
+            .expect("valid batch"),
+        );
+        ec.enqueue(&entry, "s", 1, good);
+        ec.enqueue(&entry, "s", 1, drifted);
+
+        std::thread::sleep(Duration::from_millis(5));
+        ec.flush_due(StdInstant::now());
+        // Fallback path: 2 separate items rather than 1 coalesced one.
+        assert_eq!(defer.pending(), 2, "concat failure → individual pushes");
+    }
+
+    #[test]
+    fn ec_queue_without_wired_defer_queue_is_noop_on_flush() {
+        // No wired defer queue: buffering is allowed but flush cannot land
+        // items anywhere — must not panic, must not lose the bucket silently
+        // to a phantom queue.
+        let ec = EcQueue::new(None, Duration::from_millis(1), 10_000);
+        let entry = ec_route("t", 0);
+        ec.enqueue(&entry, "s", 1, int_batch(&[1]));
+        std::thread::sleep(Duration::from_millis(5));
+        ec.flush_due(StdInstant::now()); // no-op, no panic
+        assert_eq!(ec.bucket_count(), 1, "bucket retained when no queue wired");
+
+        // Silence unused-import warnings for the deferral helper type.
+        let _ = TriggerDeferral::from_payload("");
     }
 }

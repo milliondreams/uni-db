@@ -29,6 +29,7 @@ use crate::adapter::ComponentScalarFn;
 use crate::adapter_aggregate::ComponentAggregateFn;
 use crate::adapter_procedure::ComponentProcedure;
 use crate::bindings::aggregate::{AggregatePlugin, AggregatePluginPre};
+use crate::bindings::algorithm::{AlgorithmPlugin as AlgorithmPluginBindings, AlgorithmPluginPre};
 use crate::bindings::procedure::{ProcedurePlugin as ProcedurePluginBindings, ProcedurePluginPre};
 use crate::bindings::scalar::{ScalarPlugin, ScalarPluginPre};
 use crate::error::WasmError;
@@ -150,6 +151,15 @@ pub enum RegistrationEntry {
         #[serde(default = "default_proc_mode")]
         mode: String,
     },
+    /// A GraphCompute algorithm driving the coarse kernels via `host-graph`.
+    Algorithm {
+        /// Fully-qualified name.
+        qname: String,
+        /// Argument types (excluding the injected session id).
+        args: Vec<WireArgType>,
+        /// Yielded columns as `"name:type"` strings (e.g. `"score:float"`).
+        yields: Vec<String>,
+    },
 }
 
 /// Top-level `register` export payload.
@@ -175,6 +185,9 @@ pub struct PreparedComponent {
     /// HTTP egress backing `host-net`, carried so pool factories (and the
     /// `ComponentPlugin` re-register path) can install it on each `HostState`.
     pub http: Option<Arc<dyn uni_plugin::HttpEgress>>,
+    /// GraphCompute session registry backing `host-graph`, installed on each
+    /// [`HostState`] so a guest algorithm's `graph-call` resolves its session.
+    pub graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 impl std::fmt::Debug for PreparedComponent {
@@ -241,6 +254,7 @@ macro_rules! impl_wasm_call_err {
 impl_wasm_call_err!(crate::bindings::scalar::FnError);
 impl_wasm_call_err!(crate::bindings::aggregate::FnError);
 impl_wasm_call_err!(crate::bindings::procedure::FnError);
+impl_wasm_call_err!(crate::bindings::algorithm::uni::plugin::types::FnError);
 
 /// Collapse a typed export call's nested result into our error model.
 ///
@@ -424,6 +438,35 @@ impl ProcedurePluginInstance {
     }
 }
 
+/// A fresh, single-use instance for the `algorithm-plugin` world.
+pub struct AlgorithmPluginInstance {
+    store: Store<HostState>,
+    bindings: AlgorithmPluginBindings,
+    #[expect(
+        dead_code,
+        reason = "carried for parity with the other surfaces; store armed at build time"
+    )]
+    limits: EffectiveLimits,
+}
+
+impl std::fmt::Debug for AlgorithmPluginInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlgorithmPluginInstance")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AlgorithmPluginInstance {
+    /// Call `invoke-algorithm`.
+    pub fn invoke_algorithm(&mut self, qname: &str, args_ipc: &[u8]) -> Result<Vec<u8>, WasmError> {
+        map_call(
+            "invoke-algorithm",
+            self.bindings
+                .call_invoke_algorithm(&mut self.store, qname, args_ipc),
+        )
+    }
+}
+
 /// Top-level WASM Component Model plugin loader.
 #[derive(Default)]
 pub struct WasmLoader {
@@ -431,6 +474,8 @@ pub struct WasmLoader {
     /// each instance's [`HostState`]; the linker only exposes `host-net` when
     /// the plugin is granted `Capability::Network`.
     http: Option<Arc<dyn uni_plugin::HttpEgress>>,
+    /// Optional GraphCompute session registry backing `host-graph`.
+    graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
 impl std::fmt::Debug for WasmLoader {
@@ -452,6 +497,16 @@ impl WasmLoader {
     #[must_use]
     pub fn with_http(mut self, http: Arc<dyn uni_plugin::HttpEgress>) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Attach a GraphCompute session registry backing `host-graph` (builder).
+    #[must_use]
+    pub fn with_graph(
+        mut self,
+        graph: uni_plugin_builtin::algorithms::graph_compute::SharedRegistry,
+    ) -> Self {
+        self.graph = Some(graph);
         self
     }
 
@@ -481,6 +536,7 @@ impl WasmLoader {
             effective: host_grants.clone(),
             denied_capabilities: Vec::new(),
             http: self.http.clone(),
+            graph: self.graph.clone(),
         }
     }
 
@@ -529,6 +585,7 @@ impl WasmLoader {
             effective,
             denied_capabilities: denied,
             http: self.http.clone(),
+            graph: self.graph.clone(),
         }
     }
 
@@ -554,7 +611,8 @@ impl WasmLoader {
             select_linker_for_manifest(&engine, &prepared.manifest, &prepared.effective)?;
         let mut store = Store::new(
             &engine,
-            HostState::new(prepared.effective.clone(), prepared.http.clone()),
+            HostState::new(prepared.effective.clone(), prepared.http.clone())
+                .with_graph(prepared.graph.clone()),
         );
         apply_resource_limits(&mut store, &limits);
         let bindings = ScalarPlugin::instantiate(&mut store, &component, &linker)
@@ -860,7 +918,8 @@ fn fresh_store(
 ) -> Store<HostState> {
     let mut store = Store::new(
         engine,
-        HostState::new(prepared.effective.clone(), prepared.http.clone()),
+        HostState::new(prepared.effective.clone(), prepared.http.clone())
+            .with_graph(prepared.graph.clone()),
     );
     apply_resource_limits(&mut store, limits);
     store
@@ -956,6 +1015,7 @@ fn apply_registration(
     let mut procedures = Vec::new();
     let mut agg_pool: Option<Arc<WasmInstancePool<AggregatePluginInstance>>> = None;
     let mut proc_pool: Option<Arc<WasmInstancePool<ProcedurePluginInstance>>> = None;
+    let mut algo_pool: Option<Arc<WasmInstancePool<AlgorithmPluginInstance>>> = None;
 
     for entry in registration.entries {
         match entry {
@@ -1029,6 +1089,33 @@ fn apply_registration(
                     })?;
                 procedures.push(qname);
             }
+            RegistrationEntry::Algorithm { qname, yields, .. } => {
+                let parsed_qname = parse_qname(&qname)?;
+                let registry = prepared.graph.clone().ok_or_else(|| {
+                    WasmError::Internal(format!(
+                        "algorithm `{qname}` needs a GraphCompute registry \
+                         (call WasmLoader::with_graph)"
+                    ))
+                })?;
+                let sig = build_algorithm_signature(&yields)?;
+                let pool_ref = match &algo_pool {
+                    Some(p) => Arc::clone(p),
+                    None => {
+                        let p = build_algorithm_pool(bytes, prepared)?;
+                        algo_pool = Some(Arc::clone(&p));
+                        p
+                    }
+                };
+                let adapter = Arc::new(crate::adapter_algorithm::ComponentAlgorithm::new(
+                    pool_ref,
+                    registry,
+                    parsed_qname.clone(),
+                    sig,
+                ));
+                registrar.algorithm(parsed_qname, adapter).map_err(|e| {
+                    WasmError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
+                })?;
+            }
         }
     }
 
@@ -1092,6 +1179,9 @@ fn synthesize_plugin_manifest(
                     }
                     _ => {}
                 }
+            }
+            RegistrationEntry::Algorithm { .. } => {
+                capabilities.insert(Capability::Algorithm);
             }
         }
     }
@@ -1258,6 +1348,76 @@ fn build_procedure_pool(
             })
         },
     )
+}
+
+/// Build an instance pool for the `algorithm-plugin` world.
+///
+/// Unlike the other pools this uses [`crate::linker::build_algorithm_linker_v1`]
+/// so the guest's `host-graph` import resolves, and each fresh store carries the
+/// GraphCompute registry via [`fresh_store`] → [`HostState::with_graph`].
+fn build_algorithm_pool(
+    bytes: &[u8],
+    prepared: &PreparedComponent,
+) -> Result<Arc<WasmInstancePool<AlgorithmPluginInstance>>, WasmError> {
+    let limits = EffectiveLimits::resolve(&prepared.manifest);
+    let engine = build_engine(&limits)?;
+    let component = Component::from_binary(&engine, bytes)
+        .map_err(|e| WasmError::InvalidWasm(format!("component compile: {e}")))?;
+    let linker = crate::linker::build_algorithm_linker_v1(&engine, &prepared.effective)?;
+    let pre = AlgorithmPluginPre::new(
+        linker
+            .instantiate_pre(&component)
+            .map_err(|e| WasmError::Instantiate(format!("algorithm-plugin pre: {e}")))?,
+    )
+    .map_err(|e| WasmError::Instantiate(format!("algorithm-plugin pre-new: {e}")))?;
+
+    let prepared_owned = Arc::new(prepared.clone());
+    let engine_owned = Arc::new(engine);
+    let factory = move || -> Result<AlgorithmPluginInstance, WasmError> {
+        let mut store = fresh_store(&engine_owned, &prepared_owned, &limits);
+        let bindings = pre
+            .instantiate(&mut store)
+            .map_err(|e| WasmError::Instantiate(format!("algorithm-plugin instantiate: {e}")))?;
+        Ok(AlgorithmPluginInstance {
+            store,
+            bindings,
+            limits,
+        })
+    };
+    let pool = WasmInstancePool::new(crate::pool::PoolConfig::default(), factory)?;
+    Ok(Arc::new(pool))
+}
+
+/// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
+fn build_algorithm_signature(
+    yields: &[String],
+) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, WasmError> {
+    use arrow_schema::{DataType, Field};
+    let output_fields: Vec<Field> = yields
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let (name, type_name) = match spec.split_once(':') {
+                Some((n, t)) => (n.trim().to_string(), t.trim()),
+                None => (format!("col{i}"), spec.as_str()),
+            };
+            let dt = match type_name.to_ascii_lowercase().as_str() {
+                "int" | "integer" | "i64" => DataType::Int64,
+                "float" | "double" | "f64" => DataType::Float64,
+                other => {
+                    return Err(WasmError::InvalidWasm(format!(
+                        "algorithm yield type `{other}` unsupported (int/float)"
+                    )));
+                }
+            };
+            Ok(Field::new(name, dt, false))
+        })
+        .collect::<Result<_, WasmError>>()?;
+    Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
+        output_fields,
+        docs: String::new(),
+        ..Default::default()
+    })
 }
 
 /// Translate one wire arg type into the internal [`ArgType`].

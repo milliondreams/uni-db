@@ -1,0 +1,40 @@
+# Standalone example Extism plugin — REPRO fixture for the finding at
+# crates/uni-plugin-extism/src/loader.rs:416.
+#
+# Build:
+#   cd examples/example-extism-manifest-callout
+#   cargo build --target wasm32-unknown-unknown --release
+#
+# Produces target/wasm32-unknown-unknown/release/example_extism_manifest_callout.wasm.
+#
+# This guest's `manifest` export is NOT pure: before returning a manifest that
+# declares ZERO capabilities, it calls the capability-gated host fn
+# `uni_http_post`. Pass 1 of `ExtismLoader::load` runs the manifest export with
+# `effective = host_grants` (un-intersected), so the host call fires at load
+# time even though the plugin declares no capabilities — the finding.
+
+# Opt out of the outer `uni` workspace.
+[workspace]
+
+[package]
+name = "example-extism-manifest-callout"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Repro Extism plugin: calls a host fn from inside its `manifest` export"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Only the PDK is needed — the JSON payloads are fixed string literals, so no
+# serde_json dependency (keeps the offline dependency closure minimal).
+extism-pdk = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

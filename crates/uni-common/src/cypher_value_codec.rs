@@ -39,6 +39,8 @@
 //! | 17 | LocalTime | msgpack i64 (nanoseconds since midnight) |
 //! | 18 | LocalDateTime | msgpack i64 (nanoseconds since epoch) |
 //! | 19 | Btic | 24-byte packed BTIC (lo, hi, meta) |
+//! | 20 | SparseVector | packed sparse-vector encoding (indices + weights) |
+//! | 21 | BinaryVector | msgpack binary (packed `u8` lanes) |
 //!
 //! Nested values (List elements, Map values, Node/Edge properties) are
 //! recursively encoded as `[tag][payload]` blobs.
@@ -71,6 +73,7 @@ pub const TAG_LOCALTIME: u8 = 17;
 pub const TAG_LOCALDATETIME: u8 = 18;
 pub const TAG_BTIC: u8 = 19;
 pub const TAG_SPARSE_VECTOR: u8 = 20;
+pub const TAG_BINARY_VECTOR: u8 = 21;
 
 // ---------------------------------------------------------------------------
 // rmp_serde + UniError::Storage wrappers
@@ -217,6 +220,10 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             }))
         }
         TAG_VECTOR => Ok(Value::Vector(decode_msgpack(payload, "vector")?)),
+        TAG_BINARY_VECTOR => Ok(Value::BinaryVector(decode_msgpack(
+            payload,
+            "binary vector",
+        )?)),
         TAG_DATE => Ok(Value::Temporal(crate::value::TemporalValue::Date {
             days_since_epoch: decode_msgpack(payload, "date")?,
         })),
@@ -455,6 +462,7 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
             encode_msgpack(buf, TAG_PATH, &payload, "path");
         }
         Value::Vector(v) => encode_msgpack(buf, TAG_VECTOR, v, "vector"),
+        Value::BinaryVector(b) => encode_msgpack(buf, TAG_BINARY_VECTOR, b, "binary vector"),
         Value::SparseVector { indices, values } => {
             buf.push(TAG_SPARSE_VECTOR);
             // `encode` is infallible and runs on the durable WAL path, so it must never
@@ -738,6 +746,15 @@ mod tests {
         let v = Value::Vector(vec![0.1, 0.2, 0.3]);
         let bytes = encode(&v);
         assert_eq!(bytes[0], TAG_VECTOR);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_binary_vector() {
+        let v = Value::BinaryVector(vec![0x00, 0xFF, 0xA5, 0x3C]);
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_BINARY_VECTOR);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, v);
     }

@@ -48,18 +48,22 @@ impl Algorithm for MinimumSpanningTree {
         let mut edges = Vec::new();
         for u in 0..n as u32 {
             for (i, &v) in graph.out_neighbors(u).iter().enumerate() {
-                // If treating as undirected, only add if u < v to avoid duplicates
-                // assuming symmetry. If not symmetric, Kruskal's on directed graph
-                // produces Minimum Spanning Forest (Arborescence is different).
-                // Let's assume undirected MST on the underlying graph structure.
-                if u < v {
-                    let weight = if graph.has_weights() {
-                        graph.out_weight(u, i)
-                    } else {
-                        1.0
-                    };
-                    edges.push((u, v, weight));
-                }
+                // Treat the graph as undirected: NORMALIZE each edge to
+                // (min, max) rather than keeping only `u < v`. Dropping the
+                // `u > v` direction would silently discard edges that appear
+                // only as higher->lower (e.g. when the adapter builds the
+                // projection with include_reverse=false), making them
+                // unrecoverable and yielding a wrong spanning forest. Kruskal's
+                // union-find naturally deduplicates the (min, max) pair when both
+                // directions are present, and self-loops (u == v) are rejected by
+                // union. NaN weights sort last via total_cmp below.
+                let weight = if graph.has_weights() {
+                    graph.out_weight(u, i)
+                } else {
+                    1.0
+                };
+                let (a, b) = if u <= v { (u, v) } else { (v, u) };
+                edges.push((a, b, weight));
             }
         }
 

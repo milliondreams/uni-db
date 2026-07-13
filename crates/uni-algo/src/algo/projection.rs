@@ -637,7 +637,48 @@ fn build_csr(
         current[src as usize] += 1;
     }
 
+    // Sort each CSR row into a canonical order so the projection is
+    // deterministic-by-construction (GraphCompute proposal §5.3). The upstream
+    // adjacency source returns neighbors in `HashMap` iteration order, which
+    // varies run-to-run; without this sort every kernel built on the CSR would
+    // inherit that nondeterminism. Rows are keyed by `(dst, weight)` using
+    // `f64::total_cmp` so multi-edges with distinct weights also order stably.
+    // Weights are co-permuted with their neighbor slot to stay aligned.
+    sort_csr_rows(&offsets, &mut neighbors, weights.as_deref_mut());
+
     (offsets, neighbors, weights)
+}
+
+/// Sorts each CSR adjacency row into canonical `(dst, weight)` order in place.
+///
+/// Given prefix-sum `offsets` of length `V + 1`, sorts the `neighbors[o..o+1]`
+/// slice of every vertex and co-permutes the parallel `weights` slice when
+/// present. This is the determinism guarantee behind GraphCompute (proposal
+/// §5.3): identical edge sets always yield byte-identical CSR arrays.
+fn sort_csr_rows(offsets: &[u32], neighbors: &mut [u32], mut weights: Option<&mut [f64]>) {
+    for row in offsets.windows(2) {
+        let (start, end) = (row[0] as usize, row[1] as usize);
+        if end - start <= 1 {
+            continue;
+        }
+        match weights.as_deref_mut() {
+            Some(ws) => {
+                // Sort neighbor slots and their weights together by building a
+                // permutation over the row, then applying it to both slices.
+                let mut order: Vec<usize> = (start..end).collect();
+                order.sort_by(|&a, &b| {
+                    neighbors[a]
+                        .cmp(&neighbors[b])
+                        .then_with(|| ws[a].total_cmp(&ws[b]))
+                });
+                let sorted_n: Vec<u32> = order.iter().map(|&i| neighbors[i]).collect();
+                let sorted_w: Vec<f64> = order.iter().map(|&i| ws[i]).collect();
+                neighbors[start..end].copy_from_slice(&sorted_n);
+                ws[start..end].copy_from_slice(&sorted_w);
+            }
+            None => neighbors[start..end].sort_unstable(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +701,47 @@ mod tests {
         assert_eq!(&neighbors[2..3], &[2]);
         // Node 2 has edge to 0
         assert_eq!(&neighbors[3..4], &[0]);
+    }
+
+    #[test]
+    fn csr_is_permutation_invariant() {
+        // P0-1 (build-level): the same edge set in any per-row insertion order
+        // yields byte-identical CSR arrays, killing the HashMap-order
+        // nondeterminism inherited from the adjacency source (proposal §5.3).
+        // Node 5 has out-neighbors {1, 3, 8} with distinct weights; the two
+        // permutations below feed those edges to `build_csr` in different order.
+        let perm_a = vec![
+            (5, 8, 0.2),
+            (5, 1, 0.9),
+            (5, 3, 0.5),
+            (2, 4, 1.0),
+            (2, 0, 1.0),
+        ];
+        let perm_b = vec![
+            (2, 0, 1.0),
+            (5, 3, 0.5),
+            (5, 8, 0.2),
+            (2, 4, 1.0),
+            (5, 1, 0.9),
+        ];
+        let a = build_csr(9, &perm_a, true);
+        let b = build_csr(9, &perm_b, true);
+        assert_eq!(a, b, "CSR must be identical across input permutations");
+        // And the canonical order is ascending by dst within each row.
+        let (offsets, neighbors, weights) = a;
+        let row5 = &neighbors[offsets[5] as usize..offsets[6] as usize];
+        assert_eq!(row5, &[1, 3, 8]);
+        let w = weights.expect("weights requested");
+        let w5 = &w[offsets[5] as usize..offsets[6] as usize];
+        assert_eq!(w5, &[0.9, 0.5, 0.2]);
+    }
+
+    #[test]
+    fn csr_rows_sorted_without_weights() {
+        // The unweighted path sorts neighbor slots too (uses `sort_unstable`).
+        let edges = vec![(0, 7, 0.0), (0, 2, 0.0), (0, 4, 0.0), (0, 2, 0.0)];
+        let (offsets, neighbors, _) = build_csr(1, &edges, false);
+        let row = &neighbors[offsets[0] as usize..offsets[1] as usize];
+        assert_eq!(row, &[2, 2, 4, 7]);
     }
 }

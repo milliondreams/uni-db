@@ -1825,6 +1825,150 @@ fn query_type_to_plugin(t: QueryType) -> uni_plugin::traits::hook::QueryType {
 /// Returns [`UniError::AuthorizationDenied`] if any policy denies or errors.
 ///
 /// [`AuthzPolicy`]: uni_plugin::traits::connector::AuthzPolicy
+/// Collect the property keys of a pattern-element map literal (`{k: v, …}`).
+fn collect_map_keys(
+    expr: Option<&uni_cypher::ast::Expr>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(uni_cypher::ast::Expr::Map(entries)) = expr {
+        for (k, _) in entries {
+            out.insert(k.clone());
+        }
+    }
+}
+
+/// Walk one pattern element, collecting labels, relationship types, and the
+/// property keys of any inline map literal. Recurses into parenthesized paths.
+fn collect_pattern_element(
+    el: &uni_cypher::ast::PatternElement,
+    labels: &mut std::collections::BTreeSet<String>,
+    rel_types: &mut std::collections::BTreeSet<String>,
+    properties: &mut std::collections::BTreeSet<String>,
+) {
+    use uni_cypher::ast::PatternElement;
+    match el {
+        PatternElement::Node(n) => {
+            labels.extend(n.labels.names().iter().cloned());
+            collect_map_keys(n.properties.as_ref(), properties);
+        }
+        PatternElement::Relationship(r) => {
+            rel_types.extend(r.types.names().iter().cloned());
+            collect_map_keys(r.properties.as_ref(), properties);
+        }
+        PatternElement::Parenthesized { pattern, .. } => {
+            for inner in &pattern.elements {
+                collect_pattern_element(inner, labels, rel_types, properties);
+            }
+        }
+    }
+}
+
+/// Best-effort extraction of the structured authz [`Resource`] fields —
+/// labels, relationship types, touched property keys, and operations — from a
+/// parsed Cypher query. Labels/types/operations are complete; property
+/// extraction covers inline pattern map literals (a refinement, not a security
+/// boundary on its own).
+///
+/// [`Resource`]: uni_plugin::traits::connector::Resource
+fn extract_authz_fields(
+    query: &uni_cypher::ast::Query,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+
+    let mut labels = BTreeSet::new();
+    let mut rel_types = BTreeSet::new();
+    let mut properties = BTreeSet::new();
+    let mut operations = BTreeSet::new();
+
+    walk_authz_query(
+        query,
+        &mut labels,
+        &mut rel_types,
+        &mut properties,
+        &mut operations,
+    );
+
+    (
+        labels.into_iter().collect(),
+        rel_types.into_iter().collect(),
+        properties.into_iter().collect(),
+        operations.into_iter().collect(),
+    )
+}
+
+/// Recurse the [`Query`](uni_cypher::ast::Query) enum (Single / Union / Explain /
+/// TimeTravel / Schema), accumulating authz fields from each statement's clauses.
+fn walk_authz_query(
+    query: &uni_cypher::ast::Query,
+    labels: &mut std::collections::BTreeSet<String>,
+    rel_types: &mut std::collections::BTreeSet<String>,
+    properties: &mut std::collections::BTreeSet<String>,
+    operations: &mut std::collections::BTreeSet<String>,
+) {
+    use uni_cypher::ast::{Clause, Query};
+
+    let walk_pattern =
+        |pat: &uni_cypher::ast::Pattern,
+         labels: &mut std::collections::BTreeSet<String>,
+         rel_types: &mut std::collections::BTreeSet<String>,
+         properties: &mut std::collections::BTreeSet<String>| {
+            for path in &pat.paths {
+                for el in &path.elements {
+                    collect_pattern_element(el, labels, rel_types, properties);
+                }
+            }
+        };
+
+    match query {
+        Query::Single(stmt) => {
+            for clause in &stmt.clauses {
+                match clause {
+                    Clause::Match(m) => {
+                        operations.insert("read".to_owned());
+                        walk_pattern(&m.pattern, labels, rel_types, properties);
+                    }
+                    Clause::Create(c) => {
+                        operations.insert("write".to_owned());
+                        walk_pattern(&c.pattern, labels, rel_types, properties);
+                    }
+                    Clause::Merge(m) => {
+                        operations.insert("write".to_owned());
+                        walk_pattern(&m.pattern, labels, rel_types, properties);
+                    }
+                    Clause::Delete(_) => {
+                        operations.insert("delete".to_owned());
+                        operations.insert("write".to_owned());
+                    }
+                    Clause::Set(_) | Clause::Remove(_) => {
+                        operations.insert("write".to_owned());
+                    }
+                    Clause::With(_)
+                    | Clause::WithRecursive(_)
+                    | Clause::Unwind(_)
+                    | Clause::Return(_) => {
+                        operations.insert("read".to_owned());
+                    }
+                    Clause::Call(_) => {
+                        operations.insert("call".to_owned());
+                    }
+                }
+            }
+        }
+        Query::Union { left, right, .. } => {
+            walk_authz_query(left, labels, rel_types, properties, operations);
+            walk_authz_query(right, labels, rel_types, properties, operations);
+        }
+        Query::Explain(inner) | Query::TimeTravel { query: inner, .. } => {
+            walk_authz_query(inner, labels, rel_types, properties, operations);
+        }
+        Query::Schema(_) => {
+            // DDL / schema commands — surfaced as a coarse "schema" operation.
+            // Per-command label extraction is a follow-up.
+            operations.insert("schema".to_owned());
+        }
+    }
+}
+
 pub(crate) fn authorize_query(
     db: &UniInner,
     principal: Option<&uni_plugin::traits::connector::Principal>,
@@ -1842,8 +1986,20 @@ pub(crate) fn authorize_query(
     let action = Action {
         verb: verb.to_owned(),
     };
+    // Parse the query (only when policies are active) to populate the structured
+    // Resource. This is the same parse execution runs a moment later; a parse
+    // failure leaves the structured fields empty (path-only) — the query will
+    // fail to execute anyway, and a label/type-gating policy denies on empties.
+    let (labels, rel_types, properties, operations) = match uni_cypher::parse(cypher) {
+        Ok(query) => extract_authz_fields(&query),
+        Err(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
     let resource = Resource {
         path: cypher.to_owned(),
+        labels,
+        rel_types,
+        properties,
+        operations,
     };
     for policy in policies.iter() {
         match policy.check(principal, &action, &resource) {

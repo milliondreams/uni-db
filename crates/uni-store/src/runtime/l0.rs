@@ -204,6 +204,13 @@ pub struct L0Buffer {
     /// registers a key). Tombstoned with the owning vid; transient (not rebuilt
     /// on recovery).
     pub merge_guard_index: HashMap<Vec<u8>, Vid>,
+    /// Per-edge-constraint index for O(1) unique edge-key checks. Mirrors
+    /// [`constraint_index`](Self::constraint_index) but keyed to a live edge's
+    /// `Eid` (built by [`serialize_constraint_key`] with the edge-type name as the
+    /// discriminator). Populated by the edge-insert path for declared edge-type
+    /// `Unique`/`NodeKey` constraints, tombstoned in `apply_edge_deletion`, and
+    /// rebuilt from live edge properties on recovery.
+    pub edge_constraint_index: HashMap<Vec<u8>, Eid>,
     /// Reverse index `ext_id` → owning vid for O(1) global ext_id uniqueness
     /// checks (`Writer::check_extid_globally_unique` previously scanned every
     /// `vertex_properties` map per insert — O(n²) ingest). Maintained by the
@@ -241,6 +248,15 @@ pub struct L0Buffer {
     /// records observed ids here and commit checks them for antidependencies.
     /// `None` for the main L0 and read-only / SSI-disabled paths.
     pub occ_read_set: Option<Arc<parking_lot::Mutex<OccReadSet>>>,
+    /// Optional plugin registry for registry-dispatched CRDT merges at
+    /// commit-time property merge (`merge_crdt_properties`).
+    ///
+    /// Behavior-preserving when absent: falls back to native
+    /// [`uni_crdt::Crdt::try_merge`] bit-for-bit when no provider is
+    /// registered. Stamped onto every live buffer by the owning `L0Manager`.
+    /// Not part of buffer identity — cloned buffers (forked ASSUME/ABDUCE L0s)
+    /// inherit it, but it is never serialized or flushed.
+    pub plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -287,6 +303,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            edge_constraint_index: self.edge_constraint_index.clone(),
             merge_guard_index: self.merge_guard_index.clone(),
             extid_index: self.extid_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
@@ -295,6 +312,9 @@ impl Clone for L0Buffer {
             occ_read_seq: self.occ_read_seq,
             // Forked L0s (ASSUME/ABDUCE) do not participate in OCC tracking.
             occ_read_set: None,
+            // Inherit the registry so forked buffers merge custom CRDTs the
+            // same way the parent does.
+            plugin_registry: self.plugin_registry.clone(),
         }
     }
 }
@@ -386,7 +406,11 @@ impl L0Buffer {
     ///
     /// Logs a warning when a CRDT value is overwritten by a non-CRDT scalar
     /// (limitation R1).
-    fn merge_crdt_properties(entry: &mut Properties, properties: Properties) {
+    fn merge_crdt_properties(
+        entry: &mut Properties,
+        properties: Properties,
+        registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    ) {
         // Fast path: new vertex with no existing properties — skip JSON round-trip
         if entry.is_empty() {
             *entry = properties;
@@ -401,10 +425,15 @@ impl L0Buffer {
                 && let Some(existing_v) = entry.get(&k)
                 && let Ok(existing_crdt) = serde_json::from_value::<Crdt>(existing_v.clone().into())
             {
-                // Use try_merge to avoid panic on type mismatch.
-                if new_crdt.try_merge(&existing_crdt).is_ok()
-                    && let Ok(merged_json) = serde_json::to_value(new_crdt)
-                {
+                // Use a fallible merge to avoid panic on type mismatch.
+                // Operand order: self=new (new_crdt), other=existing
+                // (existing_crdt) — existing-into-new. Preserve — a custom
+                // provider's merge may be non-commutative.
+                let merged = match registry {
+                    Some(reg) => new_crdt.merge_via_registry(&existing_crdt, reg).is_ok(),
+                    None => new_crdt.try_merge(&existing_crdt).is_ok(),
+                };
+                if merged && let Ok(merged_json) = serde_json::to_value(new_crdt) {
                     entry.insert(k, uni_common::Value::from(merged_json));
                     continue;
                 }
@@ -520,6 +549,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            edge_constraint_index: HashMap::new(),
             merge_guard_index: HashMap::new(),
             extid_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
@@ -527,7 +557,18 @@ impl L0Buffer {
             pending_embeddings: HashMap::new(),
             occ_read_seq: 0,
             occ_read_set: None,
+            plugin_registry: None,
         }
+    }
+
+    /// Install the plugin registry used for registry-dispatched CRDT merges.
+    ///
+    /// Stamped by the owning `L0Manager` onto every buffer it mints so the
+    /// commit-time merge (`merge_crdt_properties`) can route custom
+    /// CRDT kinds through a registered provider. Absent registry preserves
+    /// native [`uni_crdt::Crdt::try_merge`] behavior.
+    pub fn set_plugin_registry(&mut self, registry: Arc<uni_plugin::PluginRegistry>) {
+        self.plugin_registry = Some(registry);
     }
 
     pub fn insert_vertex(&mut self, vid: Vid, properties: Properties) {
@@ -583,7 +624,7 @@ impl L0Buffer {
         } else {
             None
         };
-        Self::merge_crdt_properties(entry, properties);
+        Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         if tracks_extid {
             let new_extid =
                 Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
@@ -727,7 +768,7 @@ impl L0Buffer {
         } else {
             None
         };
-        Self::merge_crdt_properties(entry, properties);
+        Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         if tracks_extid {
             let new_extid =
                 Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
@@ -1053,7 +1094,7 @@ impl L0Buffer {
         let props_count = properties.len();
         if !properties.is_empty() {
             let entry = self.edge_properties.entry(eid).or_default();
-            Self::merge_crdt_properties(entry, properties);
+            Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
         }
 
         self.edge_versions.insert(eid, version);
@@ -1130,6 +1171,9 @@ impl L0Buffer {
         // Deletion supersedes any pending partial-update state for this
         // EID (Round 12 §A).
         self.edge_partial_keys.remove(&eid);
+        // Drop any unique-constraint keys this edge owned so a later edge may
+        // reuse the value (mirrors `apply_vertex_deletion`).
+        self.edge_constraint_index.retain(|_, e| *e != eid);
         self.graph.remove_edge(eid);
         self.mutation_count += 1;
         self.mutation_stats.relationships_deleted += 1;
@@ -1273,6 +1317,21 @@ impl L0Buffer {
         self.constraint_index
             .get(key)
             .is_some_and(|&v| v != exclude_vid)
+    }
+
+    /// Insert an edge unique-constraint key into the index (edge analogue of
+    /// [`insert_constraint_key`](Self::insert_constraint_key)).
+    pub fn insert_edge_constraint_key(&mut self, key: Vec<u8>, eid: Eid) {
+        self.edge_constraint_index.insert(key, eid);
+    }
+
+    /// Check if an edge unique-constraint key exists, owned by an edge other than
+    /// `exclude_eid`. Edge analogue of
+    /// [`has_constraint_key`](Self::has_constraint_key).
+    pub fn has_edge_constraint_key(&self, key: &[u8], exclude_eid: Eid) -> bool {
+        self.edge_constraint_index
+            .get(key)
+            .is_some_and(|&e| e != exclude_eid)
     }
 
     /// Register a MERGE-create's key into the implicit phantom guard.
@@ -1485,6 +1544,11 @@ impl L0Buffer {
             self.merge_guard_index.insert(key.clone(), *vid);
         }
 
+        // Merge the edge unique-constraint index (parallel to `constraint_index`).
+        for (key, eid) in &other.edge_constraint_index {
+            self.edge_constraint_index.insert(key.clone(), *eid);
+        }
+
         // Carry deferred-embedding markers from the tx L0 into the main L0 so the
         // flush-time `drain_pending_embeddings` sees them (the marked vids' properties were
         // just merged above). Without this, `defer_embeddings` auto-embed silently no-ops for
@@ -1522,7 +1586,7 @@ impl L0Buffer {
                     } else {
                         None
                     };
-                    Self::merge_crdt_properties(entry, properties);
+                    Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
                     if tracks_extid {
                         let new_extid = Self::extid_of(
                             self.vertex_properties.get(&vid).expect("just inserted"),
@@ -1567,6 +1631,13 @@ impl L0Buffer {
                     self.remove_vid_from_label_index(vid);
                     self.vertex_labels.insert(vid, labels.clone());
                     self.index_labels_for_vid(vid, &labels);
+                    // Mark this vid as a label overwrite, exactly like the live
+                    // `set_vertex_labels` path. Without this marker the M8
+                    // flush/merge overwrite pass skips the vid (a label-only
+                    // mutation leaves no `vertex_properties` entry), so a
+                    // WAL-durable SET/REMOVE label on a prior-window vertex
+                    // would be silently lost at the first post-recovery flush.
+                    self.vertex_label_overwrites.insert(vid);
                     self.mutation_count += 1;
                 }
                 Mutation::InsertEdge {

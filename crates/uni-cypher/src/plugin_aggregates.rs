@@ -19,10 +19,10 @@
 //!
 //! # Lifecycle
 //!
-//! Entries are added but never removed today (M9 declared aggregates
-//! cannot be dropped while in-flight queries reference them). When
-//! `dropDeclared` infrastructure matures past M11, a counterpart
-//! `unregister_plugin_aggregate` will follow.
+//! Entries are added by [`register_plugin_aggregate`] at registration time and
+//! removed by [`unregister_plugin_aggregate`] when a declared aggregate is
+//! dropped (`uni.plugin.dropDeclared`), so a dropped aggregate stops routing
+//! through aggregate translation for the rest of the process.
 
 use std::collections::HashSet;
 use std::sync::{OnceLock, RwLock};
@@ -41,6 +41,18 @@ pub fn register_plugin_aggregate(qname: impl Into<String>) {
     let lc = qname.into().to_ascii_lowercase();
     if let Ok(mut set) = names().write() {
         set.insert(lc);
+    }
+}
+
+/// Remove a previously-registered plugin aggregate name so the Cypher planner
+/// stops routing it through aggregate translation — e.g. after
+/// `uni.plugin.dropDeclared`.
+///
+/// Case-insensitive; idempotent (a no-op if the name was never registered).
+pub fn unregister_plugin_aggregate(name: &str) {
+    let lc = name.to_ascii_lowercase();
+    if let Ok(mut set) = names().write() {
+        set.remove(&lc);
     }
 }
 

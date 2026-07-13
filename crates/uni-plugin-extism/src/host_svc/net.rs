@@ -194,6 +194,7 @@ mod tests {
             kms: None,
             secrets: None,
             http,
+            graph: None,
         }
     }
 

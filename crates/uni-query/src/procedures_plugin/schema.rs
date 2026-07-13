@@ -374,6 +374,13 @@ impl ProcedurePlugin for SchemaConstraintsProc {
                     row.insert("type".to_owned(), Value::String("CHECK".to_owned()));
                     row.insert("expression".to_owned(), Value::String(expression.clone()));
                 }
+                ConstraintType::NodeKey { properties } => {
+                    row.insert("type".to_owned(), Value::String("NODE KEY".to_owned()));
+                    row.insert(
+                        "properties".to_owned(),
+                        Value::String(serde_json::to_string(&properties).unwrap_or_default()),
+                    );
+                }
                 _ => {
                     row.insert("type".to_owned(), Value::String("UNKNOWN".to_owned()));
                 }
@@ -439,7 +446,7 @@ impl ProcedurePlugin for SchemaLabelInfoProc {
         ctx: ProcedureContext<'_>,
         args: &[ColumnarValue],
     ) -> Result<SendableRecordBatchStream, FnError> {
-        use uni_common::core::schema::{ConstraintTarget, ConstraintType, IndexDefinition};
+        use uni_common::core::schema::{ConstraintTarget, IndexDefinition};
 
         let host = require_host(&ctx)?;
         let label_name = require_string_arg(args, 0, "label")?;
@@ -464,14 +471,16 @@ impl ProcedurePlugin for SchemaLabelInfoProc {
                     IndexDefinition::Inverted(inv) => {
                         inv.label == label_name && inv.property == *prop_name
                     }
-                    IndexDefinition::JsonFullText(j) => j.label == label_name,
+                    IndexDefinition::JsonFullText(j) => {
+                        j.label == label_name && j.column == *prop_name
+                    }
                     _ => false,
                 });
                 let unique = uni_schema.constraints.iter().any(|c| {
                     if let ConstraintTarget::Label(l) = &c.target
                         && l == &label_name
                         && c.enabled
-                        && let ConstraintType::Unique { properties } = &c.constraint_type
+                        && let Some(properties) = c.constraint_type.unique_properties()
                     {
                         return properties.contains(prop_name);
                     }

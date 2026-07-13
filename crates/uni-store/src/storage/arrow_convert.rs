@@ -13,13 +13,13 @@ use arrow_array::builder::{
     FixedSizeBinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
     Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
     StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt32Builder, UInt64Builder,
+    UInt8Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
     IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ use uni_common::DataType;
 use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema;
+use uni_common::core::schema::PointType;
 use uni_crdt::Crdt;
 
 /// Build a timestamp column from a map of ID -> timestamp (nanoseconds).
@@ -286,6 +287,77 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                     });
                 }
             }
+            DataType::Point(pt) => {
+                // Reconstruct the `Value::Map` shape produced by `point(...)`
+                // (`spatial.rs`) from the declared struct layout. A Point-typed
+                // column can only hold points, so anything not reconstructable
+                // (non-struct, missing fields) is `Null` — never a bare scalar and
+                // never a panic. Returns unconditionally rather than falling
+                // through to the generic handler.
+                if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
+                    let f64_at = |name: &str| -> Option<f64> {
+                        struct_arr
+                            .column_by_name(name)
+                            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                            .filter(|a| !a.is_null(row))
+                            .map(|a| a.value(row))
+                    };
+                    let crs = struct_arr
+                        .column_by_name("crs")
+                        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                        .filter(|a| !a.is_null(row))
+                        .map(|a| a.value(row).to_string());
+
+                    match pt {
+                        PointType::Geographic => {
+                            if let (Some(lat), Some(lon)) =
+                                (f64_at("latitude"), f64_at("longitude"))
+                            {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "WGS84".into())),
+                                    ),
+                                    ("latitude".to_string(), Value::Float(lat)),
+                                    ("longitude".to_string(), Value::Float(lon)),
+                                ]));
+                            }
+                        }
+                        PointType::Cartesian2D => {
+                            if let (Some(x), Some(y)) = (f64_at("x"), f64_at("y")) {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "cartesian".into())),
+                                    ),
+                                    ("x".to_string(), Value::Float(x)),
+                                    ("y".to_string(), Value::Float(y)),
+                                ]));
+                            }
+                        }
+                        PointType::Cartesian3D => {
+                            if let (Some(x), Some(y), Some(z)) =
+                                (f64_at("x"), f64_at("y"), f64_at("z"))
+                            {
+                                return Value::Map(HashMap::from([
+                                    ("type".to_string(), Value::String("Point".into())),
+                                    (
+                                        "crs".to_string(),
+                                        Value::String(crs.unwrap_or_else(|| "cartesian-3d".into())),
+                                    ),
+                                    ("x".to_string(), Value::Float(x)),
+                                    ("y".to_string(), Value::Float(y)),
+                                    ("z".to_string(), Value::Float(z)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+                // Point-typed but not a reconstructable point → Null.
+                return Value::Null;
+            }
             DataType::Bytes => {
                 let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() else {
                     log::warn!("Bytes column is not LargeBinaryArray");
@@ -390,6 +462,11 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         let inner = list.value(row);
         if let Some(floats) = inner.as_any().downcast_ref::<Float32Array>() {
             return Value::Vector((0..floats.len()).map(|i| floats.value(i)).collect());
+        }
+        // A `UInt8` child is a binary vector — round-trip as `Value::BinaryVector`
+        // to preserve type identity (parity with the `Float32` dense-vector arm).
+        if let Some(bytes) = inner.as_any().downcast_ref::<UInt8Array>() {
+            return Value::BinaryVector((0..bytes.len()).map(|i| bytes.value(i)).collect());
         }
         let elem_hint = list_child_bytes_hint(list.data_type());
         return Value::List(array_to_value_list(&inner, elem_hint));
@@ -858,6 +935,63 @@ pub fn extract_vector_f32_values_strict(
     Ok(extract_vector_f32_values(val, is_deleted, dimensions))
 }
 
+/// Extract `u8` lane values from a Value for a `BinaryVector(dimensions)` column.
+///
+/// The binary-vector analogue of [`extract_vector_f32_values`]: always returns
+/// exactly `dimensions` bytes (zeros for null/invalid), plus a validity flag, so
+/// the Arrow `FixedSizeList<UInt8>` stride invariant holds. Accepts a
+/// [`Value::BinaryVector`] or a [`Value::List`] of byte-valued integers.
+///
+/// # Returns
+/// `(lane bytes, validity)` — validity is `true` for a valid vector or a deleted
+/// entry, `false` for a null/wrong-shape value.
+pub fn extract_binary_vector_values(
+    val: Option<&Value>,
+    is_deleted: bool,
+    dimensions: usize,
+) -> (Vec<u8>, bool) {
+    let zeros = || vec![0_u8; dimensions];
+
+    if is_deleted {
+        return (zeros(), true);
+    }
+
+    match val {
+        Some(Value::BinaryVector(b)) if b.len() == dimensions => (b.clone(), true),
+        Some(Value::BinaryVector(_)) => (zeros(), false), // Wrong lane count
+        Some(Value::List(arr)) if arr.len() == dimensions => {
+            let mut bytes = Vec::with_capacity(dimensions);
+            for v in arr {
+                match v.as_i64() {
+                    Some(n @ 0..=255) => bytes.push(n as u8),
+                    _ => return (zeros(), false), // Non-byte element
+                }
+            }
+            (bytes, true)
+        }
+        Some(Value::List(_)) => (zeros(), false), // Wrong lane count
+        _ => (zeros(), false),                    // Missing or unsupported value
+    }
+}
+
+/// Fail-closed sibling of [`extract_binary_vector_values`] for declared-schema
+/// columns, mirroring [`extract_vector_f32_values_strict`].
+///
+/// # Errors
+/// Returns the underlying [`VectorDimError`](uni_common::core::schema::VectorDimError)
+/// when a present, non-null value has the wrong lane count, a non-byte element,
+/// or is not a binary vector at all.
+pub fn extract_binary_vector_values_strict(
+    val: Option<&Value>,
+    is_deleted: bool,
+    dimensions: usize,
+) -> Result<(Vec<u8>, bool)> {
+    if !is_deleted && let Some(v) = val {
+        uni_common::core::schema::check_binary_vector_value(v, dimensions)?;
+    }
+    Ok(extract_binary_vector_values(val, is_deleted, dimensions))
+}
+
 fn values_to_fixed_size_list_f32_array(values: &[Value], size: i32) -> ArrayRef {
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), size);
     for v in values {
@@ -997,6 +1131,85 @@ fn values_to_time_struct_array(values: &[Value]) -> ArrayRef {
         Some(null_buffer.finish().into()),
     );
     Arc::new(struct_arr)
+}
+
+/// Build a Point struct array from `Value::Map` points.
+///
+/// The Arrow layout is selected by the column's declared [`PointType`], matching
+/// [`schema::DataType::to_arrow`]: Geographic → `{latitude, longitude, crs}`,
+/// Cartesian2D → `{x, y, crs}`, Cartesian3D → `{x, y, z, crs}`. All child fields
+/// are non-nullable, so a missing/mismatched row marks the struct slot null while
+/// writing placeholder `0.0`/`""` into the children (a null struct slot's child
+/// values are never observed).
+pub(crate) fn values_to_point_struct_array(values: &[Value], point_type: PointType) -> ArrayRef {
+    use arrow_array::builder::Float64Builder;
+
+    let n = values.len();
+    let fields = match schema::DataType::Point(point_type).to_arrow() {
+        ArrowDataType::Struct(f) => f,
+        // `DataType::Point` always maps to a struct; anything else is a bug.
+        _ => unreachable!("Point maps to an Arrow struct"),
+    };
+
+    // Read an f64 coordinate from a point map, or None if absent/non-numeric.
+    let coord = |v: &Value, key: &str| -> Option<f64> {
+        v.as_object()
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_f64)
+    };
+    let crs_of = |v: &Value, default: &str| -> String {
+        v.as_object()
+            .and_then(|m| m.get("crs"))
+            .and_then(|c| c.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+
+    let mut null_buffer = BooleanBufferBuilder::new(n);
+    let mut crs_b = StringBuilder::with_capacity(n, n * 8);
+
+    // Ordered coordinate builders + the key/default-crs metadata for this layout.
+    let (keys, default_crs): (&[&str], &str) = match point_type {
+        PointType::Geographic => (&["latitude", "longitude"], "WGS84"),
+        PointType::Cartesian2D => (&["x", "y"], "cartesian"),
+        PointType::Cartesian3D => (&["x", "y", "z"], "cartesian-3d"),
+    };
+    let mut coord_builders: Vec<Float64Builder> = keys
+        .iter()
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for v in values {
+        let coords: Option<Vec<f64>> = keys.iter().map(|k| coord(v, k)).collect();
+        match coords {
+            Some(cs) => {
+                for (b, c) in coord_builders.iter_mut().zip(cs) {
+                    b.append_value(c);
+                }
+                crs_b.append_value(crs_of(v, default_crs));
+                null_buffer.append(true);
+            }
+            None => {
+                for b in &mut coord_builders {
+                    b.append_value(0.0);
+                }
+                crs_b.append_value(default_crs);
+                null_buffer.append(false);
+            }
+        }
+    }
+
+    let mut columns: Vec<ArrayRef> = coord_builders
+        .into_iter()
+        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+        .collect();
+    columns.push(Arc::new(crs_b.finish()) as ArrayRef);
+
+    Arc::new(StructArray::new(
+        fields,
+        columns,
+        Some(null_buffer.finish().into()),
+    ))
 }
 
 fn values_to_large_binary_array(values: &[Value]) -> ArrayRef {
@@ -1339,6 +1552,9 @@ impl<'a> PropertyExtractor<'a> {
             DataType::SparseVector { .. } => {
                 self.build_sparse_vector_column(len, deleted, get_props)
             }
+            DataType::BinaryVector { dimensions } => {
+                self.build_binary_vector_column(len, deleted, get_props, *dimensions)
+            }
             DataType::CypherValue => self.build_json_column(len, deleted, get_props),
             DataType::Bytes => self.build_bytes_column(len, deleted, get_props),
             DataType::List(inner) => self.build_list_column(len, deleted, get_props, inner),
@@ -1348,6 +1564,7 @@ impl<'a> PropertyExtractor<'a> {
             DataType::Timestamp => self.build_timestamp_column(len, deleted, get_props),
             DataType::Date => self.build_date32_column(len, deleted, get_props),
             DataType::Time => self.build_time_struct_column(len, deleted, get_props),
+            DataType::Point(pt) => self.build_point_struct_column(len, deleted, get_props, *pt),
             DataType::Duration => self.build_duration_column(len, deleted, get_props),
             DataType::Btic => self.build_btic_column(len, deleted, get_props),
             _ => Err(anyhow!(
@@ -1425,9 +1642,11 @@ impl<'a> PropertyExtractor<'a> {
         let mut values = Vec::with_capacity(len);
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
             let val = get_props(i);
-            let ts = if is_deleted || val.is_none() {
-                Some(0i64)
-            } else if let Some(Value::Temporal(tv)) = val {
+            // A missing property on a live row must be NULL, not epoch 0 — every
+            // sibling builder (int/string/datetime-struct) appends null here.
+            // Storing Some(0) rendered absent timestamps as 1970-01-01 and broke
+            // `IS NULL`. Only deleted rows get the 0 placeholder (below).
+            let ts = if let Some(Value::Temporal(tv)) = val {
                 match tv {
                     uni_common::TemporalValue::DateTime {
                         nanos_since_epoch, ..
@@ -1481,6 +1700,20 @@ impl<'a> PropertyExtractor<'a> {
         Ok(values_to_time_struct_array(&values))
     }
 
+    fn build_point_struct_column<F>(
+        &self,
+        len: usize,
+        deleted: &[bool],
+        get_props: F,
+        point_type: PointType,
+    ) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let values = self.collect_values_or_null(len, deleted, &get_props);
+        Ok(values_to_point_struct_array(&values, point_type))
+    }
+
     /// Collect property values into a Vec, substituting `Value::Null` for deleted or missing entries.
     fn collect_values_or_null<F>(&self, len: usize, deleted: &[bool], get_props: &F) -> Vec<Value>
     where
@@ -1509,9 +1742,9 @@ impl<'a> PropertyExtractor<'a> {
 
         for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
             let val = get_props(i);
-            let days = if is_deleted || val.is_none() {
-                Some(0)
-            } else if let Some(Value::Temporal(uni_common::TemporalValue::Date {
+            // Missing property on a live row -> NULL (append_null below), not
+            // 1970-01-01. Only deleted rows get the 0 placeholder.
+            let days = if let Some(Value::Temporal(uni_common::TemporalValue::Date {
                 days_since_epoch,
             })) = val
             {
@@ -1684,6 +1917,46 @@ impl<'a> PropertyExtractor<'a> {
                         "flush: property '{}' row {}: {}; wrong-dimension vectors are rejected \
                          at write time as of issue #137 — this value was likely written by an \
                          older version",
+                        self.name,
+                        i,
+                        e
+                    )
+                })?;
+            for v in values {
+                builder.values().append_value(v);
+            }
+            builder.append(valid);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    /// Build a binary-vector column as `FixedSizeList<UInt8, dimensions>`.
+    ///
+    /// The `u8`-lane analogue of [`Self::build_vector_column`]: each row yields
+    /// exactly `dimensions` bytes (via [`extract_binary_vector_values_strict`]),
+    /// preserving the FixedSizeList stride. Fails closed on a present, wrong-shape
+    /// value — the write path validates lane counts (`check_vector_dims`), so
+    /// reaching one here means a bypass or an older-version WAL value.
+    fn build_binary_vector_column<F>(
+        &self,
+        len: usize,
+        deleted: &[bool],
+        get_props: F,
+        dimensions: usize,
+    ) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let mut builder = FixedSizeListBuilder::new(UInt8Builder::new(), dimensions as i32);
+
+        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+            let val = get_props(i);
+            let (values, valid) = extract_binary_vector_values_strict(val, is_deleted, dimensions)
+                .map_err(|e| {
+                    anyhow!(
+                        "flush: property '{}' row {}: {}; wrong-shape binary vectors are \
+                         rejected at write time — this value was likely written by an older \
+                         version",
                         self.name,
                         i,
                         e
@@ -3084,6 +3357,72 @@ mod tests {
         assert_eq!(child.value(3), 4.0);
         assert_eq!(child.value(4), 5.0);
         assert_eq!(child.value(5), 6.0);
+    }
+
+    #[test]
+    fn test_build_binary_vector_column_roundtrip() {
+        // A `BinaryVector(dim)` column is `FixedSizeList<UInt8, dim>`. Accepts a
+        // native `BinaryVector` or a `List` of byte-ints, decodes back with type
+        // fidelity as `Value::BinaryVector` (not a generic int list).
+        let data_type = DataType::BinaryVector { dimensions: 3 };
+        let extractor = PropertyExtractor::new("bits", &data_type);
+
+        let props = [
+            Some(Value::BinaryVector(vec![0x00, 0xFF, 0xA5])),
+            Some(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(255),
+            ])),
+            None, // deleted
+            None, // missing/null
+        ];
+        let deleted = [false, false, true, false];
+
+        let arr_ref = extractor
+            .build_binary_vector_column(4, &deleted, |i| props[i].as_ref(), 3)
+            .unwrap();
+
+        let arr = arr_ref
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(arr.len(), 4);
+        assert!(arr.is_valid(0));
+        assert!(arr.is_valid(1));
+        assert!(arr.is_valid(2)); // deleted rows are valid zeros
+        assert!(!arr.is_valid(3)); // null row
+
+        let child = arr.values().as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(child.value(0), 0x00);
+        assert_eq!(child.value(1), 0xFF);
+        assert_eq!(child.value(2), 0xA5);
+        assert_eq!(child.value(3), 1);
+        assert_eq!(child.value(5), 255);
+
+        // Read-back preserves type identity.
+        assert_eq!(
+            arrow_to_value(&arr_ref, 0, Some(&data_type)),
+            Value::BinaryVector(vec![0x00, 0xFF, 0xA5])
+        );
+        assert_eq!(
+            arrow_to_value(&arr_ref, 1, Some(&data_type)),
+            Value::BinaryVector(vec![1, 2, 255])
+        );
+        assert_eq!(arrow_to_value(&arr_ref, 3, Some(&data_type)), Value::Null);
+    }
+
+    #[test]
+    fn test_build_binary_vector_column_wrong_length_fails_closed() {
+        // A present, wrong-lane-count value must error at flush, not silently null.
+        let data_type = DataType::BinaryVector { dimensions: 3 };
+        let extractor = PropertyExtractor::new("bits", &data_type);
+        let props = [Some(Value::BinaryVector(vec![1, 2]))]; // only 2 lanes
+        let deleted = [false];
+        let err = extractor
+            .build_binary_vector_column(1, &deleted, |i| props[i].as_ref(), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("bits"), "got: {err}");
     }
 
     // Tests for multi-vector (ColBERT) `List<Vector>` columns (issue #96)

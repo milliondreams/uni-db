@@ -160,6 +160,71 @@ pub fn fuse_weighted_sources(sources: &[WeightedSource<'_>]) -> Vec<(Vid, f32)> 
     results
 }
 
+/// Distribution-Based Score Fusion (DBSF) across per-source-normalized lists.
+///
+/// Each source's raw scores are z-score normalized (`(score - mean) / std`)
+/// within that source, sign-flipped for [`NormKind::DistanceToSim`] so that
+/// higher always means more similar, then summed (weighted) across sources.
+/// Results are sorted by fused score descending. This is Qdrant's DBSF: unlike
+/// min-max ([`fuse_weighted_sources`]), z-scoring is robust to a single outlier
+/// stretching one list's range.
+///
+/// A vid absent from a source contributes zero from that source, which under
+/// z-scoring corresponds to that source's mean (an average, not worst-case,
+/// prior). A source with zero variance (a single hit, or all-identical scores)
+/// contributes zero for every vid — it cannot discriminate, so it is neutral.
+///
+/// # Examples
+/// ```
+/// # use uni_query_functions::fusion::{fuse_dbsf, NormKind};
+/// # use uni_common::Vid;
+/// let dense = [(Vid::from(1u64), 0.1_f32), (Vid::from(2u64), 0.9)];
+/// let text = [(Vid::from(1u64), 5.0_f32), (Vid::from(2u64), 1.0)];
+/// let fused = fuse_dbsf(&[
+///     (&dense, 1.0, NormKind::DistanceToSim),
+///     (&text, 1.0, NormKind::ScoreByMax),
+/// ]);
+/// assert_eq!(fused[0].0, Vid::from(1u64)); // closest distance + highest text score
+/// ```
+pub fn fuse_dbsf(sources: &[WeightedSource<'_>]) -> Vec<(Vid, f32)> {
+    let mut fused: HashMap<Vid, f32> = HashMap::new();
+
+    for (results, weight, norm) in sources {
+        if results.is_empty() {
+            continue;
+        }
+        // Distances are lower-is-better; flip the z-score sign so a below-mean
+        // distance becomes an above-mean (positive) contribution.
+        let sign = match norm {
+            NormKind::DistanceToSim => -1.0f32,
+            NormKind::ScoreByMax => 1.0f32,
+        };
+        let n = results.len() as f32;
+        let mean = results.iter().map(|(_, s)| *s).sum::<f32>() / n;
+        let variance = results
+            .iter()
+            .map(|(_, s)| {
+                let d = *s - mean;
+                d * d
+            })
+            .sum::<f32>()
+            / n;
+        let std = variance.sqrt();
+        // Zero variance (single hit or identical scores) → every z is 0, so this
+        // source is neutral. Guard the divide rather than emitting NaN/inf.
+        let inv_std = if std > f32::EPSILON { 1.0 / std } else { 0.0 };
+
+        for (vid, score) in results.iter() {
+            let z = sign * (*score - mean) * inv_std;
+            *fused.entry(*vid).or_default() += weight * z;
+        }
+    }
+
+    let mut results: Vec<(Vid, f32)> = fused.into_iter().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
 /// Multi-source weighted fusion for `similar_to`.
 ///
 /// Unlike the two-source `fuse_weighted`, this operates on pre-normalized
@@ -303,6 +368,59 @@ mod tests {
         assert!((v1 - 0.75).abs() < 1e-6);
         assert!((v2 - 0.50).abs() < 1e-6);
         assert_eq!(fused[0].0, Vid::from(1u64));
+    }
+
+    #[test]
+    fn test_fuse_dbsf_sign_flips_distance() {
+        // Dense arm is a distance (lower better); text is a score (higher better).
+        // VID1 has the lowest distance AND the highest text score → must win.
+        let dense = vec![(Vid::from(1u64), 0.1), (Vid::from(2u64), 0.9)];
+        let text = vec![(Vid::from(1u64), 5.0), (Vid::from(2u64), 1.0)];
+        let fused = fuse_dbsf(&[
+            (&dense, 1.0, NormKind::DistanceToSim),
+            (&text, 1.0, NormKind::ScoreByMax),
+        ]);
+        assert_eq!(fused[0].0, Vid::from(1u64));
+        // Symmetric two-point z-scores (±1) with the distance sign-flipped: VID1
+        // gets (+1)+(+1)=+2, VID2 gets (-1)+(-1)=-2.
+        let v1 = fused.iter().find(|(v, _)| *v == Vid::from(1u64)).unwrap().1;
+        let v2 = fused.iter().find(|(v, _)| *v == Vid::from(2u64)).unwrap().1;
+        assert!((v1 - 2.0).abs() < 1e-5);
+        assert!((v2 + 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_fuse_dbsf_zero_variance_source_is_neutral() {
+        // A single-hit (or identical-score) source has std=0 and must contribute
+        // 0 for every vid rather than emitting NaN/inf.
+        let dense = vec![(Vid::from(1u64), 0.1), (Vid::from(2u64), 0.9)];
+        let text = vec![(Vid::from(1u64), 3.0), (Vid::from(2u64), 3.0)]; // zero variance
+        let fused = fuse_dbsf(&[
+            (&dense, 1.0, NormKind::DistanceToSim),
+            (&text, 1.0, NormKind::ScoreByMax),
+        ]);
+        for (_, score) in &fused {
+            assert!(score.is_finite(), "no NaN/inf from a zero-variance source");
+        }
+        // Ranking is decided by the dense arm alone: VID1 (closer) ranks first.
+        assert_eq!(fused[0].0, Vid::from(1u64));
+    }
+
+    #[test]
+    fn test_fuse_dbsf_empty_source_is_noop() {
+        let dense = vec![(Vid::from(1u64), 0.1), (Vid::from(2u64), 0.9)];
+        let with_empty = fuse_dbsf(&[
+            (&dense, 1.0, NormKind::DistanceToSim),
+            (&[], 1.0, NormKind::ScoreByMax),
+        ]);
+        let without: HashMap<Vid, f32> = fuse_dbsf(&[(&dense, 1.0, NormKind::DistanceToSim)])
+            .into_iter()
+            .collect();
+        let with_empty_map: HashMap<Vid, f32> = with_empty.into_iter().collect();
+        assert_eq!(
+            with_empty_map, without,
+            "an empty source must not change fusion"
+        );
     }
 
     #[test]

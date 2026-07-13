@@ -145,6 +145,18 @@ impl PathContextWalker<'_> {
                 self.walk_expr(right)?;
             }
             Expr::UnaryOp { expr, .. } => self.walk_expr(expr)?,
+            // List/Map literals can hold model invocations (InvocationLifter lifts
+            // from them), so their elements must produce dependency edges too.
+            Expr::List(items) => {
+                for item in items {
+                    self.walk_expr(item)?;
+                }
+            }
+            Expr::Map(entries) => {
+                for (_, v) in entries {
+                    self.walk_expr(v)?;
+                }
+            }
             _ => {}
         }
         Ok(())

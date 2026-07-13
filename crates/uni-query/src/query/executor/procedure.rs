@@ -202,6 +202,54 @@ impl ProcedureRegistry {
         }
         None
     }
+
+    /// Look up an algorithm entry through the attached `PluginRegistry`.
+    ///
+    /// Dual-consult, mirroring [`Self::get_plugin`]: the per-task
+    /// session-local plugin registry first, then the executor's
+    /// instance-attached registry. Returns `None` if neither has `qname`.
+    pub fn get_plugin_algorithm(
+        &self,
+        qname: &uni_plugin::QName,
+    ) -> Option<std::sync::Arc<uni_plugin::registry::AlgorithmEntry>> {
+        if let Some(session_pr) = crate::current_session_plugin_registry()
+            && let Some(entry) = session_pr.algorithm_entry(qname)
+        {
+            return Some(entry);
+        }
+        self.plugin_registry
+            .read()
+            .expect("ProcedureRegistry plugin-registry lock poisoned")
+            .as_ref()
+            .and_then(|pr| pr.algorithm_entry(qname))
+    }
+
+    /// Resolve a user-facing `CALL` name to a registered
+    /// [`AlgorithmProvider`](uni_plugin::traits::algorithm::AlgorithmProvider)
+    /// entry, applying the same namespace rules as
+    /// [`Self::resolve_user_procedure`].
+    ///
+    /// Only reached on a procedure-table miss, so built-in `uni.algo.*`
+    /// (registered as procedures) never route here — only algorithms
+    /// registered purely as providers via `PluginRegistrar::algorithm`.
+    pub fn resolve_user_algorithm(
+        &self,
+        user_qname: &str,
+    ) -> Option<std::sync::Arc<uni_plugin::registry::AlgorithmEntry>> {
+        for q in uni_plugin::QName::candidate_splits(user_qname) {
+            if let Some(p) = self.get_plugin_algorithm(&q) {
+                return Some(p);
+            }
+        }
+        let stripped = user_qname.strip_prefix("uni.").unwrap_or(user_qname);
+        for plugin_id in ["uni", "builtin", "apoc-core", "custom"] {
+            if let Some(p) = self.get_plugin_algorithm(&uni_plugin::QName::new(plugin_id, stripped))
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
 }
 
 use crate::query::df_graph::procedure_call::value_to_columnar;
@@ -581,6 +629,27 @@ impl Executor {
                         .await;
                 }
 
+                // Algorithm-provider fallthrough (procedure-miss only): a
+                // plugin registered purely via `PluginRegistrar::algorithm`
+                // — e.g. a third-party graph algorithm under its own
+                // namespace. Built-in `uni.algo.*` register as procedures
+                // and are caught above, so they never reach here.
+                if let Some(registry) = &self.procedure_registry
+                    && let Some(entry) = registry.resolve_user_algorithm(name)
+                {
+                    return self
+                        .execute_algorithm_provider(
+                            name,
+                            &entry,
+                            args,
+                            yield_items,
+                            prop_manager,
+                            params,
+                            ctx,
+                        )
+                        .await;
+                }
+
                 // Legacy TCK mock-procedure registry.
                 if let Some(registry) = &self.procedure_registry
                     && let Some(proc_def) = registry.get(name)
@@ -677,6 +746,87 @@ impl Executor {
                     let arr = batch.column(col_idx);
                     let v = arrow_scalar_to_value(arr.as_ref(), row_idx)
                         .map_err(|e| anyhow!("Procedure '{name}': output decode: {e}"))?;
+                    row.insert(field.name().clone(), v);
+                }
+                rows.push(filter_yield_items(row, yield_items));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Executes a graph algorithm registered as an [`AlgorithmProvider`].
+    ///
+    /// Evaluates arguments into the provider's positional JSON
+    /// `config_json` contract, runs the provider against a host bridge
+    /// built from this executor's storage and L0 snapshot (so the
+    /// algorithm observes read-your-writes state), and drains the
+    /// resulting Arrow stream into the legacy row shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if argument evaluation fails, the provider cannot
+    /// start (e.g. the owning plugin lacks `HostQuery`), or an output
+    /// batch cannot be decoded.
+    #[allow(clippy::too_many_arguments)] // mirrors execute_plugin_procedure
+    async fn execute_algorithm_provider<'a>(
+        &'a self,
+        name: &str,
+        entry: &uni_plugin::registry::AlgorithmEntry,
+        args: &[Expr],
+        yield_items: &[String],
+        prop_manager: &'a PropertyManager,
+        params: &'a HashMap<String, Value>,
+        ctx: Option<&'a QueryContext>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        use futures::StreamExt;
+
+        // Evaluate args to a positional JSON array — the provider
+        // `config_json` contract shared with `AlgoProviderBridge`.
+        let empty_row: HashMap<String, Value> = HashMap::new();
+        let mut json_args: Vec<serde_json::Value> = Vec::with_capacity(args.len());
+        for arg in args {
+            let v = self
+                .evaluate_expr(arg, &empty_row, prop_manager, params, ctx)
+                .await?;
+            json_args.push(serde_json::Value::from(v));
+        }
+        let config_json = serde_json::Value::Array(json_args).to_string();
+
+        // Build the L0 snapshot from the query context (the simple
+        // executor's `l0_manager` field is unset on the session read
+        // path; L0 visibility flows through `QueryContext`). Mirrors the
+        // planner path's `graph_ctx.l0_context()` construction so a
+        // provider algorithm observes read-your-writes state.
+        let l0_manager = ctx.map(|qc| {
+            let mut pending = qc.pending_flush_l0s.clone();
+            if let Some(tx_l0) = &qc.transaction_l0 {
+                pending.push(tx_l0.clone());
+            }
+            Arc::new(uni_store::runtime::l0_manager::L0Manager::from_snapshot(
+                qc.l0.clone(),
+                pending,
+            ))
+        });
+
+        let mut stream = crate::procedures_plugin::algo::run_algorithm_provider(
+            entry,
+            self.effective_storage(),
+            l0_manager,
+            &config_json,
+        )
+        .map_err(|e| anyhow!("Algorithm '{name}': {e}"))?;
+
+        let mut rows: Vec<HashMap<String, Value>> = Vec::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| anyhow!("Algorithm '{name}' stream error: {e}"))?;
+            for row_idx in 0..batch.num_rows() {
+                let mut row: HashMap<String, Value> = HashMap::new();
+                let schema = batch.schema();
+                for col_idx in 0..batch.num_columns() {
+                    let field = schema.field(col_idx);
+                    let arr = batch.column(col_idx);
+                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx)
+                        .map_err(|e| anyhow!("Algorithm '{name}': output decode: {e}"))?;
                     row.insert(field.name().clone(), v);
                 }
                 rows.push(filter_yield_items(row, yield_items));

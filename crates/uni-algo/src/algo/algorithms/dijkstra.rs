@@ -165,10 +165,15 @@ impl Algorithm for Dijkstra {
             path = Some(p);
         }
 
+        // Exclude over-budget nodes from the output. The `max_distance` cutoff
+        // above only stops EXPANSION of over-budget nodes; their already-relaxed
+        // distances still sit in `dist`, so without this filter a node beyond
+        // `max_distance` would be reported in the SSSP rows.
         let results = dist
             .into_iter()
             .enumerate()
             .filter(|(_, d)| *d < f64::INFINITY)
+            .filter(|(_, d)| config.max_distance.is_none_or(|max_d| *d <= max_d))
             .map(|(slot, d)| (graph.to_vid(slot as u32), d))
             .collect();
 

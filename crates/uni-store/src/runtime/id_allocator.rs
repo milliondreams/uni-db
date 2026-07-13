@@ -90,11 +90,20 @@ impl IdAllocator {
             // exhaustion (defense-in-depth; ~1.8e19 ids — physically
             // unreachable, but wrapping silently would be a correctness
             // disaster). L13.
-            state.manifest.next_vid_batch = state
+            let reserved = state
                 .current_vid
                 .checked_add(self.batch_size)
                 .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
-            self.persist_manifest(&mut state).await?;
+            let prev = state.manifest.next_vid_batch;
+            state.manifest.next_vid_batch = reserved;
+            if let Err(e) = self.persist_manifest(&mut state).await {
+                // Roll back the in-memory advance so a retry re-attempts the
+                // DURABLE reservation. Leaving it advanced would let a retry skip
+                // the reservation and hand out ids from a batch a crash would lose
+                // (the on-disk manifest still points at `prev`) — risking id reuse.
+                state.manifest.next_vid_batch = prev;
+                return Err(e);
+            }
         }
 
         let vid = Vid::new(state.current_vid);
@@ -114,10 +123,16 @@ impl IdAllocator {
             .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
         if want > state.manifest.next_vid_batch {
             // Reserve enough for the request plus a full batch
-            state.manifest.next_vid_batch = want
+            let reserved = want
                 .checked_add(self.batch_size)
                 .ok_or_else(|| anyhow::anyhow!("VID space exhausted"))?;
-            self.persist_manifest(&mut state).await?;
+            let prev = state.manifest.next_vid_batch;
+            state.manifest.next_vid_batch = reserved;
+            if let Err(e) = self.persist_manifest(&mut state).await {
+                // Roll back so a retry re-attempts the durable reservation.
+                state.manifest.next_vid_batch = prev;
+                return Err(e);
+            }
         }
 
         let vids: Vec<Vid> = (0..count)
@@ -136,11 +151,17 @@ impl IdAllocator {
         // Check if we've exhausted our current batch (L13: checked).
         if state.current_eid >= state.manifest.next_eid_batch {
             // Reserve a new batch
-            state.manifest.next_eid_batch = state
+            let reserved = state
                 .current_eid
                 .checked_add(self.batch_size)
                 .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
-            self.persist_manifest(&mut state).await?;
+            let prev = state.manifest.next_eid_batch;
+            state.manifest.next_eid_batch = reserved;
+            if let Err(e) = self.persist_manifest(&mut state).await {
+                // Roll back so a retry re-attempts the durable reservation.
+                state.manifest.next_eid_batch = prev;
+                return Err(e);
+            }
         }
 
         let eid = Eid::new(state.current_eid);
@@ -160,10 +181,16 @@ impl IdAllocator {
             .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
         if want > state.manifest.next_eid_batch {
             // Reserve enough for the request plus a full batch
-            state.manifest.next_eid_batch = want
+            let reserved = want
                 .checked_add(self.batch_size)
                 .ok_or_else(|| anyhow::anyhow!("EID space exhausted"))?;
-            self.persist_manifest(&mut state).await?;
+            let prev = state.manifest.next_eid_batch;
+            state.manifest.next_eid_batch = reserved;
+            if let Err(e) = self.persist_manifest(&mut state).await {
+                // Roll back so a retry re-attempts the durable reservation.
+                state.manifest.next_eid_batch = prev;
+                return Err(e);
+            }
         }
 
         let eids: Vec<Eid> = (0..count)

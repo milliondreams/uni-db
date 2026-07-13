@@ -741,6 +741,32 @@ fn build_rule_condition(pair: Pair<LocyRule>) -> Result<RuleCondition, ParseErro
             let expr = reparse_as_cypher_expression(inner.as_str())?;
             Ok(RuleCondition::Expression(expr))
         }
+        LocyRule::generator_reference => {
+            let mut name = String::new();
+            let mut args = Vec::new();
+            let mut outputs = Vec::new();
+            for child in inner.into_inner() {
+                match child.as_rule() {
+                    LocyRule::generator_name => name = child.as_str().to_string(),
+                    LocyRule::generator_arg_list => {
+                        for arg in child.into_inner() {
+                            args.push(reparse_as_cypher_expression(arg.as_str())?);
+                        }
+                    }
+                    LocyRule::generator_outputs => {
+                        for out in child.into_inner() {
+                            outputs.push(out.as_str().to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(RuleCondition::Generator(GeneratorRef {
+                name,
+                args,
+                outputs,
+            }))
+        }
         other => Err(ParseError::new(format!(
             "Unexpected rule in rule_condition: {other:?}"
         ))),
@@ -1356,7 +1382,10 @@ fn build_derive_node_spec(pair: Pair<LocyRule>) -> Result<DeriveNodeSpec, ParseE
                             label_child.as_rule(),
                             LocyRule::identifier_or_keyword | LocyRule::identifier
                         ) {
-                            labels.push(label_child.as_str().to_string());
+                            // Strip backticks so a quoted DERIVE label (`My Label`)
+                            // matches the normalized MATCH-side label (My Label);
+                            // the raw `as_str()` would keep the backticks.
+                            labels.push(normalize_locy_identifier(label_child.as_str()));
                         }
                     }
                 }
@@ -1383,7 +1412,9 @@ fn build_derive_edge_spec(pair: Pair<LocyRule>) -> Result<DeriveEdgeSpec, ParseE
     for child in pair.into_inner() {
         match child.as_rule() {
             LocyRule::identifier_or_keyword => {
-                edge_type = Some(child.as_str().to_string());
+                // Strip backticks so a quoted DERIVE edge type (`HAS ITEM`)
+                // matches the normalized MATCH-side edge type (HAS ITEM).
+                edge_type = Some(normalize_locy_identifier(child.as_str()));
             }
             LocyRule::properties => {
                 properties = Some(reparse_as_cypher_properties(child.as_str())?);

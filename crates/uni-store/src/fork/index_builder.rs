@@ -144,11 +144,23 @@ pub async fn build_fork_local_index(
             let branch = lookup_branch()?;
             let uri = dataset_uri();
             let index_name = format!("fork_{}_{column}_fts", scope.fork_id());
+            // The fork-local build path does not carry the persisted
+            // `FullTextIndexConfig`, so we build with the default (standard)
+            // analyzer. A custom analyzer configured on the main index is not
+            // yet propagated to fork-local FTS indexes.
+            debug!(
+                fork_id = %scope.fork_id(),
+                column = %column,
+                "fork-local FTS index uses the default analyzer (custom analyzers are not \
+                 propagated to fork-local indexes yet)"
+            );
+            let tokenizer = uni_common::core::schema::TokenizerConfig::Standard;
             crate::backend::lance_branch::create_fts_index_on_branch(
                 &uri,
                 &branch,
                 column,
                 &index_name,
+                &tokenizer,
             )
             .await
             .with_context(|| {

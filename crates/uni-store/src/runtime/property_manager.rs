@@ -372,6 +372,99 @@ impl PropertyManager {
         Ok(None)
     }
 
+    /// Reports whether a *live* flushed edge of `edge_type` already carries the
+    /// given unique-key values, excluding `exclude_eid`.
+    ///
+    /// The committed-storage half of the edge-uniqueness full-horizon probe (the
+    /// in-memory L0 layers are checked separately via `has_edge_constraint_key`).
+    /// The per-type delta table is an LSM log — multiple versions per eid, later
+    /// `op = 0` writes overwrite properties, `op = 1` deletes — so a naive
+    /// `prop = val AND op = 0` count would wrongly flag an edge that was later
+    /// deleted or updated away from `val`. Instead this narrows to candidate eids
+    /// on ONE key property (guaranteed present in some `op = 0` row iff the edge
+    /// currently holds that value), then resolves each candidate's *current
+    /// merged* properties via `fetch_all_edge_props_from_storage_with_hint`
+    /// and confirms the full key still matches on a live edge. Correct — never
+    /// leaks a duplicate — without an O(edges) full scan.
+    ///
+    /// # Errors
+    /// Propagates backend scan errors — fails closed rather than treating a
+    /// conflict as absent.
+    pub async fn flushed_edge_key_conflict(
+        &self,
+        edge_type: &str,
+        key_values: &[(String, Value)],
+        exclude_eid: Option<Eid>,
+    ) -> Result<bool> {
+        if key_values.is_empty() {
+            return Ok(false);
+        }
+        use crate::backend::table_names;
+        use crate::backend::types::ScanRequest;
+
+        let table_name = table_names::delta_table_name(edge_type, "fwd");
+        let backend = self.storage.backend();
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(false);
+        }
+
+        // Narrow to candidate eids via the first key property. Any live edge whose
+        // current value of this property equals `probe_val` must have set it in an
+        // `op = 0` row, so this filter catches every genuine conflict; a candidate
+        // that was since deleted or updated is discarded by the per-eid resolution
+        // below.
+        let (probe_prop, probe_val) = &key_values[0];
+        let val_sql = match probe_val {
+            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            // A NULL/unsupported key value can't satisfy a UNIQUE key — nothing to
+            // probe (NodeKey's NOT-NULL half is enforced separately at the call site).
+            _ => return Ok(false),
+        };
+        let base_filter = format!("{probe_prop} = {val_sql} AND op = 0");
+        let filter_expr = self.storage.apply_version_filter(base_filter);
+
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+            .await?;
+
+        // Distinct candidate eids from the narrowed scan.
+        let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for batch in &batches {
+            let Some(eid_col) = batch
+                .column_by_name("eid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                if !eid_col.is_null(row) {
+                    candidates.insert(eid_col.value(row));
+                }
+            }
+        }
+
+        let exclude = exclude_eid.map(|e| e.as_u64());
+        for raw in candidates {
+            if Some(raw) == exclude {
+                continue;
+            }
+            let Some(props) = self
+                .fetch_all_edge_props_from_storage_with_hint(Eid::new(raw), Some(edge_type))
+                .await?
+            else {
+                continue; // deleted / not live
+            };
+            // The candidate's *current* value of every key property must match.
+            if key_values.iter().all(|(p, v)| props.get(p) == Some(v)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Batch load properties for multiple vertices
     pub async fn get_batch_vertex_props(
         &self,
@@ -384,6 +477,11 @@ impl PropertyManager {
         // Tracks vids seen as a per-label deletion tombstone, so the schemaless
         // main-table fallback below never resurrects a deleted vertex.
         let mut tombstoned: std::collections::HashSet<Vid> = std::collections::HashSet::new();
+        // MVCC: highest `_version` seen per vid across the storage scan. Rows are
+        // NOT guaranteed in version order, so we must rank — a stale older row
+        // arriving after a newer one must not overwrite it (finding [7], the
+        // batch analogue of the single-vid version-max fix).
+        let mut best_version: HashMap<Vid, u64> = HashMap::new();
         // `_all_props` is a wildcard sentinel meaning "every property" — used by
         // schemaless projections that cannot enumerate names. It widens the
         // per-label column set, overflow merge, and L0 overlay below.
@@ -499,9 +597,21 @@ impl PropertyManager {
                     Some(c) => c,
                     None => continue,
                 };
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
                 for row in 0..batch.num_rows() {
                     let vid = Vid::from(vid_col.value(row));
+                    let version = ver_col
+                        .map(|c| if c.is_null(row) { 0 } else { c.value(row) })
+                        .unwrap_or(0);
+
+                    // Skip rows older than the newest already applied for this vid.
+                    if best_version.get(&vid).is_some_and(|bv| version < *bv) {
+                        continue;
+                    }
+                    best_version.insert(vid, version);
 
                     if del_col.value(row) {
                         result.remove(&vid);
@@ -509,6 +619,8 @@ impl PropertyManager {
                         continue;
                     }
 
+                    // A newer live row un-tombstones the vid.
+                    tombstoned.remove(&vid);
                     let label_props = schema.properties.get(label_name);
                     let mut props =
                         Self::extract_row_properties(&batch, row, &valid_props, label_props)?;
@@ -568,8 +680,22 @@ impl PropertyManager {
         // they cannot enumerate property names up front.
         let wants_all = properties.contains(&"_all_props");
         for &vid in vids {
-            // If deleted in L0, remove from result
+            // If deleted in L0, remove from result.
             if l0.vertex_tombstones.contains(&vid) {
+                // Version-gate the tombstone exactly like the property branch
+                // below: a deletion committed *after* the pinned snapshot (its
+                // version is beyond the high-water mark) must not remove a
+                // vertex that is still visible at the pinned version. Without
+                // this gate a beyond-pin tombstone wrongly deletes a live row
+                // under a version-pinned / time-travel read.
+                let tombstone_version = l0.vertex_versions.get(&vid).copied().unwrap_or(0);
+                if self
+                    .storage
+                    .version_high_water_mark()
+                    .is_some_and(|hwm| tombstone_version > hwm)
+                {
+                    continue;
+                }
                 result.remove(&vid);
                 continue;
             }
@@ -629,6 +755,11 @@ impl PropertyManager {
         if eids.is_empty() {
             return Ok(result);
         }
+        // MVCC: highest `_version` seen per eid across the delta scan. Rows are
+        // not version-ordered, so a stale older row must not overwrite a newer
+        // one (finding [3]); without this, an out-of-order DELETE/live pair
+        // resurrected a deleted edge's props depending on scan order.
+        let mut best_version: HashMap<uni_common::core::id::Eid, u64> = HashMap::new();
 
         // In the new storage model, EIDs are pure auto-increment and don't embed type info.
         // We need to scan all edge type datasets to find the edges.
@@ -727,9 +858,21 @@ impl PropertyManager {
                     Some(c) => c,
                     None => continue,
                 };
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
                 for row in 0..batch.num_rows() {
                     let eid = uni_common::core::id::Eid::from(eid_col.value(row));
+                    let version = ver_col
+                        .map(|c| if c.is_null(row) { 0 } else { c.value(row) })
+                        .unwrap_or(0);
+
+                    // Skip rows older than the newest already applied for this eid.
+                    if best_version.get(&eid).is_some_and(|bv| version < *bv) {
+                        continue;
+                    }
+                    best_version.insert(eid, version);
 
                     // op=1 is Delete
                     if op_col.value(row) == 1 {

@@ -1136,7 +1136,10 @@ fn eval_size(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(arr) => Ok(Value::Int(arr.len() as i64)),
         Value::Map(map) => Ok(Value::Int(map.len() as i64)),
-        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        // Character count, not byte length: Cypher size()/length() count
+        // codepoints (matching the DataFusion `cypher_size_scalar` path), so a
+        // non-ASCII string like "café" is 4, not 5.
+        Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("size() expects a List, Map, or String")),
     }
@@ -1192,7 +1195,10 @@ fn eval_last(arg: &Value) -> Result<Value> {
 fn eval_length(arg: &Value) -> Result<Value> {
     match arg {
         Value::List(arr) => Ok(Value::Int(arr.len() as i64)),
-        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        // Character count, not byte length: Cypher size()/length() count
+        // codepoints (matching the DataFusion `cypher_size_scalar` path), so a
+        // non-ASCII string like "café" is 4, not 5.
+        Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Path(p) => Ok(Value::Int(p.edges.len() as i64)),
         Value::Map(map) => {
             // Path object encoded as map (legacy fallback)
@@ -1360,7 +1366,18 @@ fn eval_sqrt(arg: &Value) -> Result<Value> {
 fn eval_sign(arg: &Value) -> Result<Value> {
     match arg {
         Value::Int(i) => Ok(Value::Int(i.signum())),
-        Value::Float(f) => Ok(Value::Int(f.signum() as i64)),
+        // `f64::signum` returns +/-1.0 for +/-0.0, but Cypher's `sign(0.0)` must
+        // be 0. Classify explicitly so both signed zeros map to 0.
+        Value::Float(f) => {
+            let s = if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            };
+            Ok(Value::Int(s))
+        }
         Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("sign() expects a number")),
     }
@@ -2007,6 +2024,9 @@ fn eval_valid_at(args: &[Value]) -> Result<Value> {
 fn vector_arg_to_f64(v: &Value) -> Result<Vec<f64>> {
     match v {
         Value::Vector(a) => Ok(a.iter().map(|&f| f as f64).collect()),
+        // Binary-vector lanes as f64 byte values (`0.0..=255.0`); the binary
+        // metrics (`hamming`/`jaccard`) cast each lane back to `u8` for popcount.
+        Value::BinaryVector(b) => Ok(b.iter().map(|&byte| byte as f64).collect()),
         Value::List(a) => a
             .iter()
             .map(|e| {
@@ -2015,6 +2035,21 @@ fn vector_arg_to_f64(v: &Value) -> Result<Vec<f64>> {
             })
             .collect(),
         _ => Err(anyhow!("vector argument must be an array")),
+    }
+}
+
+/// Converts a binary-vector lane (an f64 byte value) back to `u8` for popcount.
+///
+/// # Errors
+/// Returns an error if the lane is not an integer in `[0, 255]` — i.e. the
+/// operands are not binary vectors, so `hamming`/`jaccard` do not apply.
+fn lane_to_u8(lane: f64) -> Result<u8> {
+    if lane.fract() == 0.0 && (0.0..=255.0).contains(&lane) {
+        Ok(lane as u8)
+    } else {
+        Err(anyhow!(
+            "hamming/jaccard require binary-vector operands (byte lanes 0..=255); got {lane}"
+        ))
     }
 }
 
@@ -2107,6 +2142,41 @@ pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Valu
                 dot += f1 * f2;
             }
             Ok(Value::Float(1.0 - dot))
+        }
+        "l1" | "manhattan" => {
+            // Manhattan distance = Σ|xᵢ − yᵢ|.
+            let mut sum_abs_diff = 0.0;
+            for (f1, f2) in pairs() {
+                sum_abs_diff += (f1 - f2).abs();
+            }
+            Ok(Value::Float(sum_abs_diff))
+        }
+        "hamming" => {
+            // Bit differences over binary-vector lanes: Σ popcount(aᵢ ⊕ bᵢ). Each
+            // lane is a byte value (`0..=255`); a non-byte lane is rejected.
+            let mut bits = 0u32;
+            for (f1, f2) in pairs() {
+                let (b1, b2) = (lane_to_u8(f1)?, lane_to_u8(f2)?);
+                bits += (b1 ^ b2).count_ones();
+            }
+            Ok(Value::Float(bits as f64))
+        }
+        "jaccard" => {
+            // Bitwise Jaccard distance = 1 − |A ∩ B| / |A ∪ B|; two all-zero
+            // vectors are defined as distance 0.
+            let mut inter = 0u32;
+            let mut union = 0u32;
+            for (f1, f2) in pairs() {
+                let (b1, b2) = (lane_to_u8(f1)?, lane_to_u8(f2)?);
+                inter += (b1 & b2).count_ones();
+                union += (b1 | b2).count_ones();
+            }
+            let dist = if union == 0 {
+                0.0
+            } else {
+                1.0 - f64::from(inter) / f64::from(union)
+            };
+            Ok(Value::Float(dist))
         }
         _ => Err(anyhow!("Unknown metric: {}", metric)),
     }
@@ -2525,6 +2595,58 @@ mod tests {
     /// Helper to create int values in tests (replaces json!(i))
     fn i(v: i64) -> Value {
         Value::Int(v)
+    }
+
+    #[test]
+    fn test_vector_distance_l1() {
+        let a = Value::List(vec![Value::Float(0.0), Value::Float(0.0)]);
+        let b = Value::List(vec![Value::Float(3.0), Value::Float(4.0)]);
+        // Manhattan: |0-3| + |0-4| = 7 (vs. 5 under l2).
+        let d = eval_vector_distance(&a, &b, "l1")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((d - 7.0).abs() < 1e-9, "l1 distance = 7, got {d}");
+        // `manhattan` is an accepted alias.
+        let d2 = eval_vector_distance(&a, &b, "manhattan")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((d2 - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_vector_distance_binary_hamming_jaccard() {
+        // BinaryVector operands: Hamming = differing bits.
+        let a = Value::BinaryVector(vec![0x00, 0xA5]);
+        let b = Value::BinaryVector(vec![0xFF, 0xA5]);
+        let h = eval_vector_distance(&a, &b, "hamming")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((h - 8.0).abs() < 1e-9, "hamming = 8, got {h}");
+
+        // Jaccard on 0b1100 vs 0b1010 = 1 − 1/3 = 2/3.
+        let a2 = Value::BinaryVector(vec![0b1100]);
+        let b2 = Value::BinaryVector(vec![0b1010]);
+        let j = eval_vector_distance(&a2, &b2, "jaccard")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((j - 2.0 / 3.0).abs() < 1e-9, "jaccard = 2/3, got {j}");
+
+        // A list of byte-ints works as the literal operand form too.
+        let la = Value::List(vec![Value::Int(0)]);
+        let lb = Value::List(vec![Value::Int(255)]);
+        let h2 = eval_vector_distance(&la, &lb, "hamming")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((h2 - 8.0).abs() < 1e-9);
+
+        // Non-byte operands are rejected for binary metrics.
+        let bad = Value::List(vec![Value::Float(0.5)]);
+        assert!(eval_vector_distance(&bad, &bad, "hamming").is_err());
     }
 
     #[test]

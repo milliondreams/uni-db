@@ -44,6 +44,7 @@ pub mod common;
 pub mod comprehension;
 pub mod expr_compiler;
 pub mod ext_id_lookup;
+pub mod iteration_driver;
 pub mod locy_abduce;
 pub mod locy_assume;
 pub mod locy_ast_builder;

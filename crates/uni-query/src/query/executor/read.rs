@@ -982,7 +982,7 @@ impl Executor {
 
             // Route DDL/Admin queries to the fallback executor.
             // All other queries (including similar_to) flow through DataFusion.
-            let res = if Self::is_ddl_or_admin(&plan) {
+            let res = if self.is_ddl_or_admin(&plan) {
                 self.execute_subplan(plan, prop_manager, params, ctx.as_ref())
                     .await
             } else {
@@ -1105,7 +1105,7 @@ impl Executor {
     /// DataFusion planner. Recurses through wrapper nodes (`Project`, `Sort`,
     /// `Limit`, etc.) to detect DDL/admin operations nested inside read
     /// wrappers (e.g. `CALL procedure(...) YIELD x RETURN x`).
-    pub(crate) fn is_ddl_or_admin(plan: &LogicalPlan) -> bool {
+    pub(crate) fn is_ddl_or_admin(&self, plan: &LogicalPlan) -> bool {
         match plan {
             // DDL / schema operations
             LogicalPlan::CreateLabel(_)
@@ -1142,23 +1142,48 @@ impl Executor {
             // Procedure calls: DF-eligible procedures go through DataFusion,
             // everything else (DDL, admin, unknown) stays on fallback.
             LogicalPlan::ProcedureCall { procedure_name, .. } => {
-                !Self::is_df_eligible_procedure(procedure_name)
+                !self.is_df_eligible_procedure(procedure_name)
             }
 
             // Recurse through children using plan_children
             _ => Self::plan_children(plan)
                 .iter()
-                .any(|child| Self::is_ddl_or_admin(child)),
+                .any(|child| self.is_ddl_or_admin(child)),
         }
     }
 
     /// Returns `true` if the procedure is a read-only, data-producing procedure
     /// that can be executed through the DataFusion engine.
     ///
-    /// This is a **positive allowlist** — unknown procedures default to the
-    /// fallback executor (safe for TCK test procedures, future DDL, and admin).
-    fn is_df_eligible_procedure(name: &str) -> bool {
-        matches!(
+    /// Eligibility qualifies a `CALL` for the DataFusion plan path from three
+    /// sources (plugin-compute proposal §6, DF-3):
+    ///
+    /// 1. A fixed set of **built-in DF-native procedures** (`uni.schema.*`,
+    ///    `uni.vector.query`, `uni.fts.query`, `uni.sparse.query`, `uni.search`,
+    ///    `uni.create.v*`).
+    /// 2. **First-party graph-algorithm procedures** under the reserved
+    ///    `uni.algo.*` namespace. These are DF-native algorithm adapters
+    ///    registered by the built-in `AlgorithmRegistry` as *procedures* (149
+    ///    of them share one `ProcedureSignature` code path). Third parties
+    ///    cannot register under the reserved `uni` plugin namespace, so this
+    ///    prefix is a first-party shortcut, not a squatting vector — the
+    ///    DF-3 concern (a third party reaching the DF path by *name*) is closed
+    ///    by source (3), which is the actual registration-driven flip.
+    /// 3. **The DF-3 registration-driven flip:** any registered *algorithm
+    ///    provider* (typically third-party `myco.algo.*`) that declares
+    ///    `df_composable` in its
+    ///    [`AlgorithmSignature`](uni_plugin::traits::algorithm::AlgorithmSignature).
+    ///    Previously a third-party algorithm provider could reach the DF path
+    ///    only by squatting the `uni.algo.` prefix; now it declares composability
+    ///    and is a first-class plan node, while a non-declaring one stays on the
+    ///    row path.
+    ///
+    /// Unknown procedures default to the row-based fallback executor (safe for TCK
+    /// test procedures, future DDL, and admin) — the fallback stays a correctness
+    /// twin (DF-2), so a wrong answer here only costs the vectorized path.
+    fn is_df_eligible_procedure(&self, name: &str) -> bool {
+        // (1) Built-in DF-native procedures (not registrable algorithm providers).
+        if matches!(
             name,
             "uni.schema.labels"
                 | "uni.schema.edgeTypes"
@@ -1178,7 +1203,18 @@ impl Executor {
                 // either path — list both for symmetry.)
                 | "uni.create.vNode"
                 | "uni.create.vEdge"
-        ) || name.starts_with("uni.algo.")
+        ) {
+            return true;
+        }
+        // (2) First-party graph-algorithm procedures (reserved namespace).
+        if name.starts_with("uni.algo.") {
+            return true;
+        }
+        // (3) Registration-driven (DF-3): a provider that declares df_composable.
+        self.procedure_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_user_algorithm(name))
+            .is_some_and(|entry| entry.provider.signature().df_composable)
     }
 
     /// Check if a plan contains write/mutation operations anywhere in the tree.
@@ -1225,7 +1261,7 @@ impl Executor {
                 let params = params.clone();
 
                 let fut = async move {
-                    if Self::is_ddl_or_admin(&plan) {
+                    if this.is_ddl_or_admin(&plan) {
                         this.execute_subplan(plan, &prop_manager, &params, ctx.as_ref())
                             .await
                     } else {

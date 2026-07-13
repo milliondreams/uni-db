@@ -1,0 +1,31 @@
+// uni-db plugin framework — Mode B-seq scratch-graph guest example world.
+//
+// A minimal Component Model world for a *sequential* (Mode B-seq) guest: it
+// imports the same `host-graph` JSON round-trip the Mode-A kernels use, and
+// exports a single `run(session)` entry the host drives directly (a bare
+// wasmtime harness, not the CALL adapter). The guest builds and walks a
+// session-local scratch graph through `graph-call` and returns a JSON summary.
+
+package uni:scratch@0.1.0;
+
+interface types {
+    record fn-error {
+        code: u32,
+        message: string,
+        retryable: bool,
+    }
+}
+
+interface host-graph {
+    use types.{fn-error};
+
+    graph-call: func(req: string) -> result<string, fn-error>;
+}
+
+world scratch-guest {
+    import host-graph;
+
+    /// Drive a Mode B-seq program against scratch session `session`, returning a
+    /// JSON summary of the result.
+    export run: func(session: u64) -> string;
+}

@@ -24,7 +24,7 @@ use uni_plugin::errors::FnError;
 
 use super::error;
 use super::handle::{Handle, HandleKind, MAX_GENERATION};
-use super::value::{PairList, Tensor, VertexSet, WalkMatrix};
+use super::value::{EdgeSet, PairList, Tensor, VertexSet, WalkMatrix};
 
 /// One slot in a per-kind slab: a generation plus an optional live value.
 #[derive(Debug)]
@@ -137,6 +137,7 @@ impl<T> Slab<T> {
 pub struct HandleTable {
     epoch: u16,
     sets: Slab<VertexSet>,
+    edge_sets: Slab<EdgeSet>,
     tensors: Slab<Tensor>,
     graphs: Slab<Arc<GraphProjection>>,
     walks: Slab<WalkMatrix>,
@@ -150,6 +151,7 @@ impl HandleTable {
         Self {
             epoch,
             sets: Slab::default(),
+            edge_sets: Slab::default(),
             tensors: Slab::default(),
             graphs: Slab::default(),
             walks: Slab::default(),
@@ -191,6 +193,12 @@ impl HandleTable {
     pub fn insert_pairs(&mut self, pairs: PairList) -> Handle {
         let (slot, generation) = self.pairs.insert(pairs);
         Handle::pack(self.epoch, HandleKind::Pairs, generation, slot)
+    }
+
+    /// Inserts an edge mask and returns its handle.
+    pub fn insert_edge_set(&mut self, set: EdgeSet) -> Handle {
+        let (slot, generation) = self.edge_sets.insert(set);
+        Handle::pack(self.epoch, HandleKind::EdgeSet, generation, slot)
     }
 
     /// Validates the epoch and kind of `h`, returning the resolved kind.
@@ -260,6 +268,17 @@ impl HandleTable {
         }
     }
 
+    /// Resolves an edge-mask handle.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
+    pub fn get_edge_set(&self, h: Handle) -> Result<&EdgeSet, FnError> {
+        match self.check_epoch_and_kind(h)? {
+            HandleKind::EdgeSet => self.edge_sets.get(h.slot(), h.generation()),
+            _ => Err(error::kind_mismatch("EdgeSet")),
+        }
+    }
+
     /// Frees any handle, returning the number of heap bytes reclaimed.
     ///
     /// Graph handles report zero bytes: the projection is shared behind an `Arc`
@@ -290,6 +309,10 @@ impl HandleTable {
                 let v = self.pairs.free(h.slot(), h.generation())?;
                 Ok(v.heap_bytes())
             }
+            HandleKind::EdgeSet => {
+                let v = self.edge_sets.free(h.slot(), h.generation())?;
+                Ok(v.heap_bytes())
+            }
             HandleKind::Levels => Err(error::kind_mismatch("a supported kind")),
         }
     }
@@ -298,6 +321,7 @@ impl HandleTable {
     #[must_use]
     pub fn live_handles(&self) -> usize {
         self.sets.live_count()
+            + self.edge_sets.live_count()
             + self.tensors.live_count()
             + self.graphs.live_count()
             + self.walks.live_count()

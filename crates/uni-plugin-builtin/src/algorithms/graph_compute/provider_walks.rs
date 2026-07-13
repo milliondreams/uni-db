@@ -142,6 +142,7 @@ impl GraphComputeWalksProvider {
                     .to_owned(),
                 args: gcwalks_args(),
                 slices: vec![graph_compute_slice_req()],
+                df_composable: true,
             },
         }
     }
@@ -259,12 +260,13 @@ impl AlgorithmProvider for GraphComputeWalksProvider {
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("gcwalks: {e}")))?;
 
-            // Install the native-work budget: min(declared cap, size-multiple).
-            let size_budget =
-                WorkBudget::from_graph_size(graph.vertex_count() as u64, graph.edge_count() as u64)
-                    .total();
-            let total = work_cap.map_or(size_budget, |w| w.min(size_budget));
-            let budget = WorkBudget::new(total.max(1));
+            // Install the native-work budget: an explicit grant is authoritative
+            // and may raise the ceiling; otherwise the size-derived default (§9).
+            let budget = WorkBudget::resolve(
+                work_cap,
+                graph.vertex_count() as u64,
+                graph.edge_count() as u64,
+            );
             let arena = Arena::new(arena_bytes, super::DEFAULT_ARENA_MAX_HANDLES);
             let deadline_at = deadline_ms
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));

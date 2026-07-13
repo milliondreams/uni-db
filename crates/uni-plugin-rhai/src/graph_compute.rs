@@ -461,6 +461,127 @@ impl GcSession {
             .map_err(rt)
     }
 
+    /// Draws a `Bernoulli(prob[v])` mask over a `[V]` probability tensor.
+    ///
+    /// `seed`/`iter` select the reproducible counter-hash stream; advancing
+    /// `iter` yields a fresh, decorrelated per-iteration mask (proposal §8).
+    /// Returns a vertex-set (mask) handle.
+    fn sample(&mut self, prob: i64, seed: i64, iter: i64) -> Result<i64, Box<EvalAltResult>> {
+        #[expect(clippy::cast_sign_loss, reason = "seed/iter round-trip bit-exact")]
+        let (seed, iter) = (seed as u64, iter as u64);
+        let mut s = self.session.lock();
+        s.sample(from_i64(prob), seed, iter).map(to_i64).map_err(rt)
+    }
+
+    /// Builds a `[E]` per-edge tensor of out-edge weights (proposal §5).
+    fn edge_weights(&mut self, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edge_weights(from_i64(g)).map(to_i64).map_err(rt)
+    }
+
+    /// The full edge mask — every edge of `g` active.
+    fn edges_all(&mut self, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edges_all(from_i64(g)).map(to_i64).map_err(rt)
+    }
+
+    /// Draws a `Bernoulli(prob[e])` edge mask from a `[E]` probability tensor.
+    fn sample_edges(&mut self, prob: i64, seed: i64, iter: i64) -> Result<i64, Box<EvalAltResult>> {
+        #[expect(clippy::cast_sign_loss, reason = "seed/iter round-trip bit-exact")]
+        let (seed, iter) = (seed as u64, iter as u64);
+        let mut s = self.session.lock();
+        s.sample_edges(from_i64(prob), seed, iter)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Cardinality of an edge mask.
+    fn edge_set_len(&mut self, m: i64) -> Result<i64, Box<EvalAltResult>> {
+        let s = self.session.lock();
+        s.edge_set_len(from_i64(m))
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .map_err(rt)
+    }
+
+    /// Edges whose `[E]` value lies in the window `[lo, hi]` (F-11 time windows).
+    fn edge_mask_window(
+        &mut self,
+        edge_vals: i64,
+        lo: f64,
+        hi: f64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edge_mask_window(from_i64(edge_vals), lo, hi)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Deterministic segmented reduce: per-group totals broadcast to members.
+    fn segmented_reduce(&mut self, values: i64, groups: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.segmented_reduce(from_i64(values), from_i64(groups))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Intersection of two edge masks.
+    fn edge_intersect(&mut self, a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edge_intersect(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Union of two edge masks.
+    fn edge_union(&mut self, a: i64, b: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edge_union(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// One-hop expansion over the masked out-edges, excluding a visited mask
+    /// (pass exclude `0` for none).
+    fn expand_masked(
+        &mut self,
+        g: i64,
+        frontier: i64,
+        d: ImmutableString,
+        exclude: i64,
+        edge_mask: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let direction = dir(d.as_str())?;
+        let mut s = self.session.lock();
+        s.expand_masked(
+            from_i64(g),
+            from_i64(frontier),
+            direction,
+            if exclude == 0 {
+                None
+            } else {
+                Some(from_i64(exclude))
+            },
+            from_i64(edge_mask),
+        )
+        .map(to_i64)
+        .map_err(rt)
+    }
+
+    /// `spmv` restricted to the masked out-edges (out-direction only).
+    fn spmv_masked(
+        &mut self,
+        g: i64,
+        vec: i64,
+        sr: ImmutableString,
+        edge_mask: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let semi = semiring(sr.as_str())?;
+        let mut s = self.session.lock();
+        s.spmv_masked(from_i64(g), from_i64(vec), semi, from_i64(edge_mask))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// Folds a walks handle into a per-vertex visit-count map.
     fn walk_visit_counts(&mut self, walks: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
@@ -592,6 +713,17 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("free", GcSession::free)
         .register_fn("emit", GcSession::emit)
         .register_fn("random_walks", GcSession::random_walks)
+        .register_fn("sample", GcSession::sample)
+        .register_fn("edge_weights", GcSession::edge_weights)
+        .register_fn("edges_all", GcSession::edges_all)
+        .register_fn("sample_edges", GcSession::sample_edges)
+        .register_fn("edge_set_len", GcSession::edge_set_len)
+        .register_fn("edge_mask_window", GcSession::edge_mask_window)
+        .register_fn("segmented_reduce", GcSession::segmented_reduce)
+        .register_fn("edge_intersect", GcSession::edge_intersect)
+        .register_fn("edge_union", GcSession::edge_union)
+        .register_fn("expand_masked", GcSession::expand_masked)
+        .register_fn("spmv_masked", GcSession::spmv_masked)
         .register_fn("walk_visit_counts", GcSession::walk_visit_counts)
         .register_fn("emit_walks", GcSession::emit_walks)
         .register_fn("neighborhood_overlap", GcSession::neighborhood_overlap)

@@ -5,6 +5,119 @@ the workspace version unless an entry is annotated otherwise — the
 workspace stays on `1.3.x` while individual crates publish additive
 v1.4 minor bumps when their ABI grows.
 
+## Unreleased — Plugin Compute ABI, Phase 0 (additive)
+
+First phase of the Plugin Compute ABI (`docs/proposals/plugin_compute_abi_2026-07-13.md`),
+which extends GraphCompute additively. No breaking changes.
+
+### Changed — GraphCompute native-work grant semantics (governance-posture change)
+
+- **`Capability::GraphComputeWork(w)` now *raises* the ceiling, not just lowers it.**
+  A grant is authoritative: when present it is the effective budget (it may exceed
+  the size-derived default `min(10_000·(|V|+|E|+1), 1e9)`); when absent, that default
+  applies. Previously the grant was `.min()`-clamped to the default, so no caller
+  could authorize a legitimately large job. The policy is now single-sourced in
+  `WorkBudget::resolve(work_cap, vertices, edges)`; the seven kernel/adapter install
+  sites each call it. **Grant-review note:** an explicit `GraphComputeWork` grant now
+  authorizes *more* native work — treat it as a real authorization. Arena-bytes and
+  wall-clock ceilings are unaffected (independent dimensions).
+
+### Added — seeded `sample` kernel + shared counter-hash
+
+- **`GraphCompute::sample(prob, seed, iter) -> Handle`** — a reproducible
+  `Bernoulli(prob[v])` mask (a `VertexSet`) over a `[V]` `f64` tensor, exposed to
+  every loader (Rhai/PyO3/Extism/WASM dispatch `"sample"` op; `KernelRequest` gains an
+  `iter` field). Charges `|V|` work in `BUDGET_CHECK_CHUNK` increments; rejects an
+  `i64`-backed tensor with `0x862`.
+- **`uni_algo::algo::rng`** — the counter-hash RNG (`counter_hash`, `splitmix64_finalize`,
+  `hash_to_unit_f64`, `sample_bernoulli`) promoted from the private `random_walks`
+  seeding into a shared, reproducible primitive. Stateless streams are order/partition/
+  thread-independent by construction. `random_walks` output is byte-identical (guarded).
+- **Conformance probe `graph.sample_determinism`** added to `run_probes()`.
+
+### Added — Mode A edge kernels (Phase 1, proposal §5)
+
+- **`[E]` per-edge tensor** (`Shape::E`, `Tensor::from_f64_edge`) indexed by CSR
+  out-edge order (`GraphProjection::out_edge_start`), and an **edge mask**
+  (`HandleKind::EdgeSet`, `value::EdgeSet`).
+- **New `GraphCompute` kernels**, exposed across all loaders (dispatch `op`s +
+  Rhai/PyO3 methods): `edge_weights`, `edges_all`, `sample_edges(prob, seed, iter)`,
+  `edge_set_len`, `edge_intersect`, `edge_union`, `expand_masked(g, frontier, dir,
+  exclude, edge_mask)`, `spmv_masked(g, vec, semiring, edge_mask)`. Masked traversal
+  is out-direction only (an `In` mask is `0x86E`); the result equals the kernel on
+  the subgraph of exactly the masked edges.
+- **`map_apply` is now shape-preserving** — an elementwise op on a `[E]` tensor
+  stays `[E]` (previously collapsed to `[V]`). `KernelRequest` gains a fourth handle
+  operand `c` and an `iter` field. New error constructor `error::arg_validation`
+  (`0x86E`).
+- **`segmented_reduce(values, groups)`** (A-4) — a deterministic grouped reduce
+  using the `deterministic_sum` accumulator (bitwise group totals independent of
+  vertex order/partitioning); **`edge_mask_window(vals, lo, hi)`** (F-11) — a
+  deterministic threshold from a `[E]` tensor to an edge mask (e.g. a temporal
+  event window). Both exposed across dispatch + Rhai/PyO3.
+
+### Changed — registration-driven DataFusion CALL eligibility (Phase 2, proposal §6, DF-3)
+
+- **`AlgorithmSignature` gains `df_composable: bool`** (default `false`, additive). A
+  provider sets it `true` to declare its `CALL` may be planned as a first-class
+  DataFusion `GraphProcedureCallExec` node (the vectorized path).
+- **Third-party algorithm providers can now reach the DataFusion plan path by
+  declaration** (the DF-3 registration-driven flip). `is_df_eligible_procedure`
+  qualifies a `CALL` from three sources: (1) the built-in DF-native procedure set
+  (`uni.schema.*`, `uni.{vector,fts,sparse}.query`, `uni.search`, `uni.create.v*`);
+  (2) first-party graph-algorithm procedures under the reserved `uni.algo.*`
+  namespace (DF-native adapters — third parties cannot register under `uni`, so this
+  is a first-party shortcut, not a squatting vector); and (3) **any registered
+  algorithm provider whose `AlgorithmSignature` declares `df_composable`** —
+  previously a third-party algorithm provider could reach the DF path *only* by
+  squatting the prefix; now it declares composability and is a first-class plan
+  node, while a non-declaring one stays on the row path. The row-based fallback
+  stays a correctness twin (DF-2). First-party GraphCompute/algo providers
+  (`gcpagerank`, `gcwalks`, `gcoverlap`, `reachability`, `pagerank`, `sssp`) declare
+  `df_composable = true`.
+- **Streaming lift (DF-4):** an algorithm-registry provider's `CALL` is now
+  forwarded batch-by-batch through `GraphProcedureCallExec` (per-batch `YIELD`
+  projection via a `RecordBatchStreamAdapter`) instead of buffered to one
+  `RecordBatch` via `concat_batches`. Non-algorithm procedures keep the buffered
+  single-batch path unchanged.
+
+### Added — iteration driver, determinism accumulator, Mode B cores
+
+- **`uni_algo::algo::reduce::deterministic_sum`** (DF-6) — a canonical-order +
+  Neumaier-compensated reduction, bitwise-identical across input permutations and
+  partition splits (the determinism-owning accumulator DataFusion's partitioned
+  float `SUM` cannot provide).
+- **`uni-query` `df_graph::iteration_driver`** (DF-5, Mode B-vec §7a) —
+  `IterationDriver` re-invokes a **cached** physical sub-plan once per round to a
+  graph fixpoint (`plan_count == 1`), feeding state back through a shared handle;
+  `PowerStepExec` (vertex-centric) and `GraphGatherStepExec` (message-passing
+  `edges → GROUP BY dst → pluggable MessageAggregate` — the guest-UDAF slot) are
+  reference round bodies, matching native PageRank to `1e-9`.
+- **`uni-plugin-builtin` `graph_compute::scratch::ScratchGraph`** (Mode B-seq
+  §7b) — a per-invocation, session-local **mutable** scratch graph with
+  budget-metered random-access ops (`0x865` on runaway) and a bounded arena
+  (`0x864` on growth); seeded sampling is reproducible (counter-hash). Includes
+  `require_compiled_body` (`Q-6` compiled-only gate, `0x86C`) and the host-side
+  guest ABI: `ScratchGraph::call_json` (single-session) and `ScratchRegistry`
+  (multi-session — unguessable ids, per-session mutex, panic isolation,
+  `open`/`call_json`/`close`, the `host-graph` surface a compiled WASM/Extism guest
+  drives, mirroring `GraphComputeRegistry`). Contracts `Q-1…Q-6` are all met, and
+  a **real `wasm32-wasip2` guest** (`examples/example-wasm-scratch`) drives the ABI
+  end-to-end through wasmtime (`crates/uni-plugin-wasm/tests/scratch_wasm_e2e.rs`).
+  The **live-store `Q-3` SSI contract** (proposal open question 3) is closed: a
+  Mode B-seq run is proven never observable by the store — a concurrent reader sees
+  no trace during/after — and a T0 `GraphProjection` stays pinned across a concurrent
+  commit (`q3_*` tests in `graph_compute_pagerank.rs`).
+- **Mode B-vec is complete** — the graph gather runs as a real DataFusion
+  `edges JOIN state → GROUP BY dst` aggregate, driven by the DF-5 driver, with the
+  aggregate authored either as built-in `sum` or an actual guest `AggregatePluginFn`
+  bridged via `PluginAggregateUdaf` (both matched to the hand-coded gather ≤1e-9);
+  plus the AT-ABM SIR scenario.
+- **`Q-5` perf-gate harness** — `crates/uni/benches/mode_b_seq_random_access.rs`
+  (host-resident baseline + JSON-ABI crossing cost). The Mode B-seq WASM guest
+  fixture and the live-store `Q-3` concurrent-reader isolation are both landed;
+  the whole proposal (Phases 0–4, open questions included) is now implemented.
+
 ## 3.0.0 — 2026-07-07 — BREAKING: remove dead surfaces + trigger honesty pass
 
 Plugin-framework honesty & subtraction (P0). This release makes the advertised

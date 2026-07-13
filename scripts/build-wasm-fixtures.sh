@@ -150,6 +150,20 @@ fi
 echo "    wasm-graph component size: $(du -h "$WASM_GRAPH_COMPONENT" | cut -f1)"
 echo "    (GraphCompute Personalized PageRank via the host-graph interface)"
 
+echo "==> Building example-wasm-scratch (wasm32-wasip2)"
+(
+    cd examples/example-wasm-scratch
+    cargo build --target wasm32-wasip2 --release
+)
+
+WASM_SCRATCH_COMPONENT="examples/example-wasm-scratch/target/wasm32-wasip2/release/example_wasm_scratch.wasm"
+if [[ ! -f "$WASM_SCRATCH_COMPONENT" ]]; then
+    echo "ERROR: expected $WASM_SCRATCH_COMPONENT after build" >&2
+    exit 1
+fi
+echo "    wasm-scratch component size: $(du -h "$WASM_SCRATCH_COMPONENT" | cut -f1)"
+echo "    (Mode B-seq mutable scratch graph via the host-graph interface)"
+
 echo "==> Done. Run tests with:"
 echo "    cargo nextest run -p uni-plugin-extism --test example_extism_geo_e2e"
 echo "    cargo nextest run -p uni-plugin-extism --test example_extism_net_e2e"

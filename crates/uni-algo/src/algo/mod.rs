@@ -34,6 +34,8 @@
 
 mod id_map;
 pub mod projection;
+pub mod reduce;
+pub mod rng;
 mod traversal;
 
 pub mod algorithms;

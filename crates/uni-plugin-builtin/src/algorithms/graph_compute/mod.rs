@@ -33,6 +33,7 @@ pub mod dispatch;
 pub mod error;
 pub mod first_party;
 pub mod handle;
+pub mod scratch;
 pub mod session;
 pub mod table;
 pub mod value;
@@ -47,6 +48,7 @@ pub mod provider_walks;
 pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
+pub use scratch::{LoaderClass, ScratchGraph, ScratchRegistry, ScratchRequest, ScratchResponse};
 pub use session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
@@ -246,6 +248,46 @@ impl WorkBudget {
     #[must_use]
     pub fn from_edge_count(edge_count: u64) -> Self {
         Self::from_graph_size(0, edge_count)
+    }
+
+    /// Resolves the effective native-work budget for one invocation (proposal §9).
+    ///
+    /// This is the single source of truth every kernel/adapter budget-install
+    /// site calls; no site re-derives the grant policy inline (test G-4).
+    ///
+    /// **Grant-semantics revision (deliberate v1 §12 revision, not a bug fix).**
+    /// GraphCompute v1 clamped a `Capability::GraphComputeWork(w)` grant with
+    /// `w.min(size_budget)`, so a grant could only *lower* the size-derived
+    /// default — meaning no caller could authorize a legitimately large job
+    /// (e.g. `N ≈ 1e5–1e6` reachability passes). Here the grant is
+    /// *authoritative*: when present it becomes the effective ceiling directly
+    /// and may **raise** the budget above the size-derived default (test G-1);
+    /// when absent, the size-derived
+    /// [`from_graph_size`](WorkBudget::from_graph_size) default applies unchanged
+    /// (test G-2). A raised ceiling still fails closed at exhaustion (`0x865`,
+    /// test G-5); the floor of `1` keeps a zero grant from admitting no work.
+    ///
+    /// This changes the governance model's security posture — an explicit grant
+    /// now authorizes *more* native work, not less — so callers minting a grant
+    /// above the default must treat it as a real authorization (§9 grant-review
+    /// note). Arena-bytes and wall-clock ceilings are independent dimensions and
+    /// are unaffected (test G-6).
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_plugin_builtin::algorithms::graph_compute::WorkBudget;
+    ///
+    /// // Ungranted: the size-derived default (here 10_000 * (1 + 1 + 1)).
+    /// assert_eq!(WorkBudget::resolve(None, 1, 1).total(), 30_000);
+    /// // A grant above the default raises the ceiling rather than being clamped.
+    /// assert_eq!(WorkBudget::resolve(Some(1_000_000_000_000), 1, 1).total(), 1_000_000_000_000);
+    /// // A grant of 0 is floored to 1 so some work is always admissible.
+    /// assert_eq!(WorkBudget::resolve(Some(0), 4, 8).total(), 1);
+    /// ```
+    #[must_use]
+    pub fn resolve(work_cap: Option<u64>, vertices: u64, edges: u64) -> Self {
+        let effective = work_cap.unwrap_or_else(|| Self::from_graph_size(vertices, edges).total());
+        Self::new(effective.max(1))
     }
 
     /// Charges `units` of native work, failing closed when the budget is exceeded.
@@ -548,5 +590,93 @@ mod tests {
         a.free(1_000);
         assert_eq!(a.bytes_live(), 0);
         assert_eq!(a.handles_live(), 0);
+    }
+
+    // --- G family: grant-semantics revision (proposal §9). ---
+    //
+    // `WorkBudget::resolve` is the single truth for how a
+    // `Capability::GraphComputeWork` grant combines with the size-derived
+    // default; the 7 kernel/adapter install sites are one call each (G-4). The
+    // sanctioned behavior flip is G-1: a grant above the default now *raises*
+    // the ceiling instead of being clamped down.
+
+    #[test]
+    fn grant_above_size_budget_is_honored() {
+        // G-1 (sanctioned flip): a grant `w > size_budget` yields an effective
+        // budget of exactly `w`, inverting the old `w.min(size_budget)` clamp.
+        let size_budget = WorkBudget::from_graph_size(10, 20).total();
+        let grant = size_budget * 1_000;
+        let resolved = WorkBudget::resolve(Some(grant), 10, 20);
+        assert_eq!(
+            resolved.total(),
+            grant,
+            "an explicit grant must raise the ceiling, not be clamped to size_budget"
+        );
+        assert!(resolved.total() > size_budget);
+    }
+
+    #[test]
+    fn ungranted_invocation_gets_the_size_budget_default() {
+        // G-2: with no grant the effective budget is exactly the size-derived
+        // default `min(10_000 * (|V| + |E| + 1), 1e9)` — unchanged from v1.
+        let resolved = WorkBudget::resolve(None, 400, 1_000);
+        assert_eq!(
+            resolved.total(),
+            (400 + 1_000 + 1) * DEFAULT_WORK_EDGE_MULTIPLIER
+        );
+        assert_eq!(
+            resolved.total(),
+            WorkBudget::from_graph_size(400, 1_000).total()
+        );
+    }
+
+    #[test]
+    fn a_grant_below_the_default_still_lowers_the_ceiling() {
+        // G-2 corollary: the grant is authoritative in both directions — a small
+        // grant (e.g. the `l1` 1-unit runaway probe) still caps below the default.
+        let size_budget = WorkBudget::from_graph_size(10, 20).total();
+        let resolved = WorkBudget::resolve(Some(1), 10, 20);
+        assert_eq!(resolved.total(), 1);
+        assert!(resolved.total() < size_budget);
+    }
+
+    #[test]
+    fn resolve_is_the_single_clamp_helper() {
+        // G-4: the resolve helper is the one place the grant policy lives; this
+        // pins its contract so no install site can drift back to a `.min()`
+        // clamp. Granted -> the grant verbatim (floored at 1); ungranted -> the
+        // size default. Never `grant.min(default)`.
+        let default = WorkBudget::from_graph_size(5, 5).total();
+        // Granted-high must NOT equal the old clamp result (which would be `default`).
+        assert_ne!(
+            WorkBudget::resolve(Some(default * 10), 5, 5).total(),
+            default
+        );
+        assert_eq!(
+            WorkBudget::resolve(Some(default * 10), 5, 5).total(),
+            default * 10
+        );
+        // Ungranted equals the default exactly.
+        assert_eq!(WorkBudget::resolve(None, 5, 5).total(), default);
+    }
+
+    #[test]
+    fn a_raised_budget_still_fails_closed() {
+        // G-5: raising the ceiling does not disable fail-closed — a loop against
+        // the granted budget still exhausts (surfaced as 0x865 at the kernel).
+        let mut b = WorkBudget::resolve(Some(120), 1_000, 1_000);
+        assert_eq!(b.total(), 120);
+        charge_in_chunks(&mut b, 60).unwrap();
+        let err = charge_in_chunks(&mut b, 100)
+            .expect_err("charging past the granted ceiling must fail closed");
+        assert_eq!(err.budget, 120);
+        assert!(b.is_exhausted());
+    }
+
+    #[test]
+    fn a_zero_grant_is_floored_to_one() {
+        // G-5 corollary: a zero grant is floored to 1 so `WorkBudget::new(0)`
+        // (which would make even the first charge fail) can't arise from resolve.
+        assert_eq!(WorkBudget::resolve(Some(0), 8, 8).total(), 1);
     }
 }

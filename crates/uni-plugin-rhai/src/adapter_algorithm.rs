@@ -118,14 +118,17 @@ impl AlgorithmProvider for RhaiAlgorithm {
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("rhai algorithm: {e}")))?;
 
-            let size_budget =
-                WorkBudget::from_graph_size(graph.vertex_count() as u64, graph.edge_count() as u64)
-                    .total();
-            let total = work_cap.map_or(size_budget, |w| w.min(size_budget));
+            // An explicit grant is authoritative and may raise the ceiling;
+            // otherwise the size-derived default (proposal §9).
+            let budget = WorkBudget::resolve(
+                work_cap,
+                graph.vertex_count() as u64,
+                graph.edge_count() as u64,
+            );
             let session = Arc::new(parking_lot::Mutex::new(
                 AlgoSession::new(
                     next_session_epoch(),
-                    WorkBudget::new(total.max(1)),
+                    budget,
                     Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
                 )
                 .with_expected_columns(expected_cols),

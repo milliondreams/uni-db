@@ -114,6 +114,8 @@ impl GraphComputePageRankProvider {
                     .to_owned(),
                 args: gcpagerank_args(),
                 slices: vec![graph_compute_slice_req()],
+                // First-party GraphCompute providers compose as DF plan nodes.
+                df_composable: true,
             },
         }
     }
@@ -198,12 +200,13 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("gcpagerank: {e}")))?;
 
-            // Install the native-work budget: min(declared cap, size-multiple).
-            let size_budget =
-                WorkBudget::from_graph_size(graph.vertex_count() as u64, graph.edge_count() as u64)
-                    .total();
-            let total = work_cap.map_or(size_budget, |w| w.min(size_budget));
-            let budget = WorkBudget::new(total.max(1));
+            // Install the native-work budget: an explicit grant is authoritative
+            // and may raise the ceiling; otherwise the size-derived default (§9).
+            let budget = WorkBudget::resolve(
+                work_cap,
+                graph.vertex_count() as u64,
+                graph.edge_count() as u64,
+            );
             let arena = Arena::new(arena_bytes, super::DEFAULT_ARENA_MAX_HANDLES);
             // Wall-clock deadline (proposal §5.2): the guest/native loop aborts
             // with Timeout (0x867) once this instant passes, checked in `charge`.

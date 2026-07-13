@@ -44,13 +44,14 @@ use std::sync::Arc;
 
 use uni_algo::algo::GraphProjection;
 use uni_algo::algo::algorithms::{Algorithm, RandomWalk, RandomWalkConfig};
+use uni_algo::algo::rng::sample_bernoulli;
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 
 use super::error;
 use super::handle::{Handle, HandleKind};
 use super::table::HandleTable;
-use super::value::{DType, PairList, Scalar, Tensor, VertexSet, WalkMatrix};
+use super::value::{DType, EdgeSet, PairList, Scalar, Tensor, VertexSet, WalkMatrix};
 use super::{Arena, BUDGET_CHECK_CHUNK, WorkBudget};
 
 /// Which adjacency direction a traversal or `spmv` follows.
@@ -340,6 +341,32 @@ impl AlgoSession {
             .to_vec()
     }
 
+    /// Reads an edge mask's member indices (ascending), for differential tests.
+    ///
+    /// # Panics
+    /// Panics if the handle does not resolve to an edge mask.
+    #[cfg(test)]
+    pub(crate) fn edge_set_members_for_test(&self, h: Handle) -> Vec<u32> {
+        self.table
+            .get_edge_set(h)
+            .expect("test edge-mask handle must resolve")
+            .iter()
+            .collect()
+    }
+
+    /// Reads a vertex set's member slots (ascending), for differential tests.
+    ///
+    /// # Panics
+    /// Panics if the handle does not resolve to a vertex set.
+    #[cfg(test)]
+    pub(crate) fn set_members_for_test(&self, h: Handle) -> Vec<u32> {
+        self.table
+            .get_set(h)
+            .expect("test vertex-set handle must resolve")
+            .iter()
+            .collect()
+    }
+
     /// Translates a slot to its external Vid via the primary graph's `IdMap`.
     fn slot_to_vid(&self, slot: u32) -> Vid {
         self.primary_graph
@@ -382,6 +409,12 @@ impl AlgoSession {
     fn alloc_set(&mut self, set: VertexSet) -> Result<Handle, FnError> {
         self.reserve(set.heap_bytes())?;
         Ok(self.table.insert_set(set))
+    }
+
+    /// Charges the arena and inserts an edge mask, returning its handle.
+    fn alloc_edge_set(&mut self, set: EdgeSet) -> Result<Handle, FnError> {
+        self.reserve(set.heap_bytes())?;
+        Ok(self.table.insert_edge_set(set))
     }
 
     /// Charges the arena and inserts a walk batch, returning its handle.
@@ -599,6 +632,142 @@ pub trait GraphCompute {
         p: f64,
         q: f64,
         seed: u64,
+    ) -> Result<Handle, FnError>;
+
+    /// Group 7 (S): draws a `Bernoulli(prob[v])` mask over a `[V]` tensor.
+    ///
+    /// Each vertex slot `v` is included with probability `prob[v]`, drawn from the
+    /// reproducible counter-hash stream `counter_hash(seed, iter, v)` (proposal
+    /// §8). The draw for a slot depends only on `(seed, iter, v)`, so the result
+    /// is bitwise-identical across runs, partitions, and thread counts, and
+    /// invariant under slot permutation (tests S-1/S-2). Advancing `iter` yields a
+    /// fresh, decorrelated mask — the per-iteration edge/vertex masks a
+    /// Monte-Carlo reliability or percolation loop needs. Returns a
+    /// [`HandleKind::VertexSet`] mask; charges `|V|` work in budget chunks.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle (not a `[V]` `f64` tensor) or an
+    /// exhausted budget/arena.
+    fn sample(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A, A-1): builds a `[E]` per-edge tensor of out-edge weights.
+    ///
+    /// Element `e` (CSR out-edge order) holds the weight of edge `e`, or `1.0` for
+    /// every edge on an unweighted projection. The natural source for a per-edge
+    /// probability/availability tensor the stochastic kernels sample (proposal
+    /// §5). Returns a [`Shape::E`](super::value::Shape::E) tensor.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget/arena.
+    fn edge_weights(&mut self, g: Handle) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A): the full edge mask — every edge of `g` active.
+    ///
+    /// The identity mask for masked traversal (equivalent to the unmasked kernel)
+    /// and the starting point a guest narrows by `sample_edges` or set ops.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget/arena.
+    fn edges_all(&mut self, g: Handle) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A, A-4): reduces `values` grouped by `groups`, deterministically.
+    ///
+    /// Both are `[V]` maps of equal length; `groups[v]` is `v`'s group label (a
+    /// component/label tensor, e.g. WCC labels). Returns a `[V]` map where each
+    /// vertex holds its **group's total** — the group sum broadcast back to its
+    /// members. The per-group summation uses the determinism-owning accumulator
+    /// ([`deterministic_sum`](uni_algo::algo::reduce::deterministic_sum)), so the
+    /// result is **bitwise-identical regardless of vertex order or partitioning**
+    /// (proposal §6/§8 — the segmented-reduce determinism contract that stock
+    /// partitioned `SUM` cannot meet; test A-4). f64-only.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an `i64` operand, or a
+    /// length mismatch, or an exhausted budget/arena.
+    fn segmented_reduce(&mut self, values: Handle, groups: Handle) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A, S over `[E]`): draws a `Bernoulli(prob[e])` edge mask.
+    ///
+    /// The per-edge analogue of [`sample`](GraphCompute::sample): edge `e` is
+    /// active with probability `prob[e]`, drawn from the reproducible counter-hash
+    /// stream `counter_hash(seed, iter, e)` (proposal §8). This is the per-iteration
+    /// random edge subset a Monte-Carlo reliability / percolation loop needs.
+    /// Returns a [`HandleKind::EdgeSet`] mask.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle (not a `[E]` `f64` tensor) or an
+    /// exhausted budget/arena.
+    fn sample_edges(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A): cardinality of an edge mask.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] if the handle does not resolve to an edge mask.
+    fn edge_set_len(&self, m: Handle) -> Result<u64, FnError>;
+
+    /// Group 9 (Mode A, F-11): edges whose `[E]` value lies in the window `[lo, hi]`.
+    ///
+    /// Thresholds a per-edge tensor (e.g. edge timestamps or weights) into an edge
+    /// mask — the deterministic (non-stochastic) counterpart of `sample_edges`.
+    /// Used for temporal edge-window masks: a time-respecting traversal expands
+    /// over `edge_mask_window(times, t, t)` for each event time `t` (proposal §5;
+    /// F-11 temporal reachability). Returns a
+    /// [`HandleKind::EdgeSet`] mask.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle (not a `[E]` `f64` tensor) or an
+    /// exhausted budget/arena.
+    fn edge_mask_window(&mut self, edge_vals: Handle, lo: f64, hi: f64) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A): intersection of two edge masks (`a ∩ b`).
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget/arena.
+    fn edge_intersect(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A): union of two edge masks (`a ∪ b`).
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle or an exhausted budget/arena.
+    fn edge_union(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A, A-2): expands a frontier one hop over the masked edges.
+    ///
+    /// The edge-masked analogue of [`expand`](GraphCompute::expand): only out-edges
+    /// whose CSR index is set in `edge_mask` are followed, so the result is exactly
+    /// the one-hop image over the subgraph containing precisely the masked edges
+    /// (proposal §5; the key A-2 equivalence). Restricted to
+    /// [`Direction::Out`] — the edge mask is defined on the out-CSR, so an
+    /// `In`-direction mask is ill-defined and rejected with `0x86E`.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an `In` direction, or an
+    /// exhausted budget/arena.
+    fn expand_masked(
+        &mut self,
+        g: Handle,
+        frontier: Handle,
+        dir: Direction,
+        exclude: Option<Handle>,
+        edge_mask: Handle,
+    ) -> Result<Handle, FnError>;
+
+    /// Group 9 (Mode A, A-3): `spmv` restricted to the masked edges.
+    ///
+    /// The edge-masked analogue of [`spmv`](GraphCompute::spmv): only out-edges set
+    /// in `edge_mask` contribute, so the result equals the same semiring `spmv` on
+    /// the masked subgraph. Restricted to [`Direction::Out`] for the same reason as
+    /// [`expand_masked`](GraphCompute::expand_masked).
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an `In` direction, a shape
+    /// mismatch, or an exhausted budget/arena.
+    fn spmv_masked(
+        &mut self,
+        g: Handle,
+        vec: Handle,
+        sr: Semiring,
+        edge_mask: Handle,
     ) -> Result<Handle, FnError>;
 
     /// Group 7 (F-8): folds a walks handle into a per-vertex visit-count map.
@@ -1052,6 +1221,9 @@ impl GraphCompute for AlgoSession {
         if t.is_i64() {
             return Err(error::shape_mismatch("map_apply requires an f64 map"));
         }
+        // Elementwise: the operation is shape-preserving, so a `[E]` tensor stays
+        // `[E]` rather than collapsing to the `[V]` default (proposal §5).
+        let shape = t.shape();
         let x = t.values();
         let n = x.len();
         let out: Vec<f64> = match op {
@@ -1076,7 +1248,7 @@ impl GraphCompute for AlgoSession {
             }
         };
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape))
     }
 
     fn reduce(
@@ -1373,6 +1545,300 @@ impl GraphCompute for AlgoSession {
             walks.push(slots);
         }
         self.alloc_walks(WalkMatrix::new(walks))
+    }
+
+    fn sample(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError> {
+        // Read the [V] probabilities. `sample` runs on the f64 probability path;
+        // an i64-backed tensor is a dtype mismatch (0x862), never a panic.
+        let probs = {
+            let t = self.table.get_tensor(prob)?;
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "sample expects an f64 [V] probability tensor, got i64",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let mut mask = VertexSet::with_capacity(probs.len());
+        // Charge |V| — one draw per element — checked every BUDGET_CHECK_CHUNK
+        // draws so a huge tensor against a small budget fails closed with at most
+        // one chunk of overshoot (proposal §5.1 / test S-5).
+        let mut since_check: u64 = 0;
+        for (slot, &p) in probs.iter().enumerate() {
+            if sample_bernoulli(p, seed, iter, slot as u64) {
+                // `slot` is bounded by the tensor length (the projection vertex
+                // count), which fits u32 by the same invariant `VertexSet` holds.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "slot index is bounded by the projection vertex count"
+                )]
+                mask.insert(slot as u32);
+            }
+            since_check += 1;
+            if since_check >= BUDGET_CHECK_CHUNK {
+                self.charge(since_check)?;
+                since_check = 0;
+            }
+        }
+        if since_check > 0 {
+            self.charge(since_check)?;
+        }
+        self.alloc_set(mask)
+    }
+
+    fn edge_weights(&mut self, g: Handle) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let e = graph.edge_count();
+        let has_w = graph.has_weights();
+        let mut vals = Vec::with_capacity(e);
+        for u in 0..graph.vertex_count() as u32 {
+            let deg = graph.out_degree(u) as usize;
+            for k in 0..deg {
+                vals.push(if has_w { graph.out_weight(u, k) } else { 1.0 });
+            }
+        }
+        self.charge(e as u64)?;
+        self.alloc_tensor(Tensor::from_f64_edge(vals))
+    }
+
+    fn edges_all(&mut self, g: Handle) -> Result<Handle, FnError> {
+        let e = self.table.get_graph(g)?.edge_count();
+        let mut mask = EdgeSet::with_capacity(e);
+        for edge in 0..e as u32 {
+            mask.insert(edge);
+        }
+        self.charge(e as u64)?;
+        self.alloc_edge_set(mask)
+    }
+
+    fn segmented_reduce(&mut self, values: Handle, groups: Handle) -> Result<Handle, FnError> {
+        let vals = {
+            let t = self.table.get_tensor(values)?;
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "segmented_reduce operates on the f64 path",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let grp = {
+            let t = self.table.get_tensor(groups)?;
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "segmented_reduce group labels must be an f64 map",
+                ));
+            }
+            t.values().to_vec()
+        };
+        if vals.len() != grp.len() {
+            return Err(error::shape_mismatch(
+                "segmented_reduce values and groups must be the same [V] length",
+            ));
+        }
+        // Bucket values by group label (exact f64 bits), preserving membership.
+        let mut buckets: std::collections::HashMap<u64, Vec<f64>> =
+            std::collections::HashMap::new();
+        for (&g, &v) in grp.iter().zip(vals.iter()) {
+            buckets.entry(g.to_bits()).or_default().push(v);
+        }
+        // Determinism-owning per-group total: order/partition-independent bits.
+        let totals: std::collections::HashMap<u64, f64> = buckets
+            .into_iter()
+            .map(|(k, group_vals)| (k, uni_algo::algo::reduce::deterministic_sum(&group_vals)))
+            .collect();
+        let out: Vec<f64> = grp.iter().map(|&g| totals[&g.to_bits()]).collect();
+        self.charge(vals.len() as u64)?;
+        self.alloc_tensor(Tensor::from_f64(out))
+    }
+
+    fn sample_edges(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError> {
+        // Read the [E] probabilities; reject a [V] map or an i64 buffer (0x862).
+        let probs = {
+            let t = self.table.get_tensor(prob)?;
+            if !t.is_edge_shaped() {
+                return Err(error::shape_mismatch(
+                    "sample_edges expects a [E] probability tensor, got a [V] map",
+                ));
+            }
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "sample_edges expects an f64 [E] probability tensor, got i64",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let mut mask = EdgeSet::with_capacity(probs.len());
+        let mut since_check: u64 = 0;
+        for (edge, &p) in probs.iter().enumerate() {
+            if sample_bernoulli(p, seed, iter, edge as u64) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "edge index is bounded by the projection edge count"
+                )]
+                mask.insert(edge as u32);
+            }
+            since_check += 1;
+            if since_check >= BUDGET_CHECK_CHUNK {
+                self.charge(since_check)?;
+                since_check = 0;
+            }
+        }
+        if since_check > 0 {
+            self.charge(since_check)?;
+        }
+        self.alloc_edge_set(mask)
+    }
+
+    fn edge_set_len(&self, m: Handle) -> Result<u64, FnError> {
+        Ok(self.table.get_edge_set(m)?.len() as u64)
+    }
+
+    fn edge_mask_window(&mut self, edge_vals: Handle, lo: f64, hi: f64) -> Result<Handle, FnError> {
+        let vals = {
+            let t = self.table.get_tensor(edge_vals)?;
+            if !t.is_edge_shaped() {
+                return Err(error::shape_mismatch(
+                    "edge_mask_window expects a [E] tensor, got a [V] map",
+                ));
+            }
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "edge_mask_window expects an f64 [E] tensor, got i64",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let mut mask = EdgeSet::with_capacity(vals.len());
+        for (edge, &v) in vals.iter().enumerate() {
+            if v >= lo && v <= hi {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "edge index bounded by the projection edge count"
+                )]
+                mask.insert(edge as u32);
+            }
+        }
+        self.charge(vals.len() as u64)?;
+        self.alloc_edge_set(mask)
+    }
+
+    fn edge_intersect(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        let sa = self.table.get_edge_set(a)?.clone();
+        let sb = self.table.get_edge_set(b)?;
+        let out = sa.intersect(sb);
+        self.charge(out.capacity() as u64)?;
+        self.alloc_edge_set(out)
+    }
+
+    fn edge_union(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        let sa = self.table.get_edge_set(a)?.clone();
+        let sb = self.table.get_edge_set(b)?;
+        let out = sa.union(sb);
+        self.charge(out.capacity() as u64)?;
+        self.alloc_edge_set(out)
+    }
+
+    fn expand_masked(
+        &mut self,
+        g: Handle,
+        frontier: Handle,
+        dir: Direction,
+        exclude: Option<Handle>,
+        edge_mask: Handle,
+    ) -> Result<Handle, FnError> {
+        if !matches!(dir, Direction::Out) {
+            return Err(error::arg_validation(
+                "expand_masked is defined on the out-CSR; use Direction::Out",
+            ));
+        }
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let front = self.table.get_set(frontier)?.clone();
+        let mask = self.table.get_edge_set(edge_mask)?.clone();
+        let excl = match exclude {
+            Some(h) => Some(self.table.get_set(h)?.clone()),
+            None => None,
+        };
+        let mut out = VertexSet::with_capacity(graph.vertex_count());
+        let mut since_check: u64 = 0;
+        for u in front.iter() {
+            let base = graph.out_edge_start(u);
+            for (k, &v) in graph.out_neighbors(u).iter().enumerate() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "edge index bounded by the projection edge count which fits u32"
+                )]
+                let active = mask.contains((base + k) as u32);
+                if active && excl.as_ref().is_none_or(|e| !e.contains(v)) {
+                    out.insert(v);
+                }
+                since_check += 1;
+                if since_check >= BUDGET_CHECK_CHUNK {
+                    self.charge(since_check)?;
+                    since_check = 0;
+                }
+            }
+        }
+        self.charge(since_check)?;
+        self.alloc_set(out)
+    }
+
+    fn spmv_masked(
+        &mut self,
+        g: Handle,
+        vec: Handle,
+        sr: Semiring,
+        edge_mask: Handle,
+    ) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let n = graph.vertex_count();
+        let input = self.table.get_tensor(vec)?;
+        if input.is_i64() {
+            return Err(error::shape_mismatch(
+                "spmv_masked supports only the f64 path",
+            ));
+        }
+        if input.len() != n {
+            return Err(error::shape_mismatch(
+                "spmv_masked input must be a [V] map matching the graph",
+            ));
+        }
+        let src = input.values().to_vec();
+        let mask = self.table.get_edge_set(edge_mask)?.clone();
+        let has_w = graph.has_weights();
+        self.charge(graph.edge_count() as u64)?;
+
+        let identity = match sr {
+            Semiring::Reachability | Semiring::LinearAlgebra => 0.0,
+            Semiring::ShortestPath | Semiring::Propagate => f64::INFINITY,
+            Semiring::MinMax => f64::NEG_INFINITY,
+        };
+        let mut out = vec![identity; n];
+        for u in 0..n as u32 {
+            let contrib = src[u as usize];
+            if matches!(sr, Semiring::LinearAlgebra) && contrib == 0.0 {
+                continue;
+            }
+            let base = graph.out_edge_start(u);
+            for (k, &v) in graph.out_neighbors(u).iter().enumerate() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "edge index bounded by the projection edge count which fits u32"
+                )]
+                if !mask.contains((base + k) as u32) {
+                    continue;
+                }
+                let w = if has_w { graph.out_weight(u, k) } else { 1.0 };
+                let acc = &mut out[v as usize];
+                match sr {
+                    Semiring::Reachability => *acc = if contrib != 0.0 { 1.0 } else { *acc },
+                    Semiring::LinearAlgebra => *acc += contrib * w,
+                    Semiring::ShortestPath => *acc = acc.min(contrib + w),
+                    Semiring::Propagate => *acc = acc.min(contrib),
+                    Semiring::MinMax => *acc = acc.max(contrib.min(w)),
+                }
+            }
+        }
+        self.alloc_tensor(Tensor::from_f64(out))
     }
 
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {

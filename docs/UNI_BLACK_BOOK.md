@@ -2619,6 +2619,18 @@ YIELD node, score
 RETURN node.title, score
 ```
 
+**Tokenizer / analyzer configuration (3.0.0).** Full-text indexes honor tokenizer, stemmer, and stop-word configuration set at index-create time — previously every FTS index used Lance's default "simple" tokenizer regardless of options, making CJK / multilingual text effectively unindexable:
+
+```cypher
+CREATE FULLTEXT INDEX ON :Article(content) OPTIONS {
+  analyzer: 'standard', language: 'English', stemmer: 'english',
+  stopwords: 'english', ascii_folding: true, lower_case: true,
+  max_token_length: 40, ngram_min: 2, ngram_max: 3
+};
+```
+
+18-language stemming and stop-words plus ngram tokenization are supported (`TokenizerConfig::Analyzer`); CJK requires dictionary files under `LANCE_LANGUAGE_MODEL_HOME`.
+
 ## Hybrid Search
 
 ```cypher
@@ -2632,7 +2644,7 @@ The `properties` argument is a map `{vector, fts, sparse}` selecting which prope
 
 | Option | Values | Description |
 |---|---|---|
-| `method` | `'rrf'` (default), `'weighted'` | Score fusion method |
+| `method` | `'rrf'` (default), `'weighted'`, `'dbsf'`, `'relative_score'` | Score fusion method (3.0.0 added `dbsf` = distribution-based z-score; `relative_score` = min-max + weighted) |
 | `alpha` | 0.0 - 1.0 | Vector-vs-FTS weight (2-way `weighted` mode only) |
 | `weights` | List\<Float\> `[vector, fts, sparse]` | Per-arm weights for 3-way `weighted` fusion |
 | `rrf_k` | Integer (default: `60`) | RRF constant (higher = less weight to rank position) |
@@ -2877,6 +2889,8 @@ CALL uni.plugin.declareFunction(
 // A procedure (WRITE mode requires Capability::ProcedureWrites):
 CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...');
 CALL uni.plugin.declareAggregate('myco.wmean', ...);
+// 3.0.0: declareTrigger installs a REAL firing TriggerPlugin (was a no-op procedure).
+// Event filter: CREATE|UPDATE|DELETE [ON :Label | -[:Type]-] [WHEN pred] [ASYNC]; binds $vid/$label/$event_kind.
 CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...);
 
 CALL uni.plugin.listDeclared();              // enumerate declared extensions
@@ -3184,6 +3198,15 @@ CALL algo.wcc({
 YIELD nodeId, componentId
 RETURN componentId, collect(nodeId) AS members
 ```
+
+## Extending the Catalog — GraphView & GraphCompute
+
+The 35 algorithms above are native. **Custom** graph algorithms are authored through the plugin framework's `AlgorithmProvider` surface ([Part XVII](#part-xvii-plugin-framework)), which offers two paths:
+
+- **In-process (`GraphView`)** — an algorithm authored in Rust obtains a read-only CSR topology snapshot via `AlgorithmHost::project(&GraphProjectionSpec) -> Arc<dyn GraphView>` and walks it with dense-slot accessors (`out_neighbors` / `out_degree` / `out_weight` / `to_vid` / …). First-party `uni.algo.reachability`, `uni.algo.pagerank`, `uni.algo.sssp`, and `uni.path.expand` are authored purely against this surface. Gated by `Capability::HostQuery`.
+- **Guest-authored (`GraphCompute`)** — the same graph algorithms can be authored in **Rhai, Python, WASM, or Extism**, driving coarse native kernels over opaque handles ("conductor, not worker"). First-party `uni.algo.gcpagerank` / `gcwalks` / `gcoverlap` dogfood it. See [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms) for the kernel catalog, determinism guarantees, and budgets.
+
+Both paths dispatch through `CALL` alongside the built-in `algo.*` procedures (miss-only, so a custom `uni.algo.*` never shadows a built-in).
 
 ## Algorithm Best Practices
 
@@ -5318,7 +5341,7 @@ Plugins are **not** configured through `UniConfig` — there is no `PluginConfig
 
 - **Host grants.** Each `load_*` call (and `uni plugin install --grants …`, and Python `grants=…`) supplies the capabilities the host is willing to grant. The plugin's *effective* set is `declared ∩ granted`; anything denied is reported back (sandboxed loaders expose `denied_capabilities`) and the corresponding host functions are not linked. Grant the minimum — `[ScalarFn]` is enough for a pure-compute fn.
 - **Resource quotas** ride on the same capability mechanism: `FuelPerCall(n)`, `WallClockMillisPerCall(n)`, `MemoryBytes(n)`, `ConcurrentInstances(n)`, `MaxResultRows(n)`.
-- **Trust.** `verify_hash_pin` checks a Blake3 `hash` in the manifest; `verify_signed_manifest` performs Ed25519 verification against a `TrustRoot` (the `ed25519` cargo feature is **on by default**). The host policy — `SignaturePolicy ∈ { Disabled, WarnIfUnsigned, RequireSigned }` plus the trust root of allowed keys — is configured via `Uni::open(...).plugin_trust(PluginTrustConfig { signature_policy, trust_root })`, a builder-level runtime object (`TrustRoot` is neither `Clone` nor `Serialize`, so it can't live in `UniConfig`). The default is `Disabled` + empty root — accept everything, as before. It is **enforced today on the compile-time `add_plugin` path**: under `RequireSigned`, an unsigned manifest or an untrusted key is rejected. The sandboxed/scripted loader manifest formats (`ComponentManifest`, `ExtismPluginManifest`, …) do **not yet carry signature fields**, so enforcing the policy on WASM/Extism/Rhai/Python *loads* is the remaining plugin-signing work (tracked follow-up — the deferred Phase-D signing subsystem); for those, hash-pinning recorded at install is the durable control.
+- **Trust.** `verify_hash_pin` checks a Blake3 `hash` in the manifest; `verify_signed_manifest` performs Ed25519 verification against a `TrustRoot` (Ed25519 verification is **always compiled in** — a non-optional dependency, no feature flag). The host policy — `SignaturePolicy ∈ { Disabled, WarnIfUnsigned, RequireSigned }` plus the trust root of allowed keys — is configured via `Uni::open(...).plugin_trust(PluginTrustConfig { signature_policy, trust_root })`, a builder-level runtime object (`TrustRoot` is neither `Clone` nor `Serialize`, so it can't live in `UniConfig`). The default is `Disabled` + empty root — accept everything, as before. It is **enforced today on the compile-time `add_plugin` path**: under `RequireSigned`, an unsigned manifest or an untrusted key is rejected. The sandboxed/scripted loader manifest formats (`ComponentManifest`, `ExtismPluginManifest`, …) do **not yet carry signature fields**, so enforcing the policy on WASM/Extism/Rhai/Python *loads* is the remaining plugin-signing work (tracked follow-up — the deferred Phase-D signing subsystem); for those, hash-pinning recorded at install is the durable control.
 
 There is intentionally **no global `PluginConfig` for grants or resource limits** — those are per-plugin capabilities resolved at load time (least privilege), not instance-wide defaults. The one instance-wide knob is the host **trust** policy (`plugin_trust`, above). See [Part XVII: Plugin Framework](#part-xvii-plugin-framework) for the capability model and manifest shape.
 
@@ -5584,7 +5607,7 @@ Carve-outs that have surfaced in user questions and are explicitly out of scope 
 
 # Part XVII: Plugin Framework
 
-Uni's extensibility is a single registry-backed plugin framework. Every extension — a scalar function, an aggregate, a Locy aggregate, a procedure, a storage backend, an index kind, a CRDT, a graph algorithm, a hook, a trigger, an auth provider — implements one of the surface traits in the foundation crate `uni-plugin`, is described by a `PluginManifest`, registers through a `PluginRegistrar`, and is resolved at call time from a shared `PluginRegistry`. The framework replaced roughly five separate ad-hoc registries (the old `CustomFunctionRegistry`, the closed `FoldAggKind` enum, the hardcoded procedure-dispatch match, the algorithm registry, and hardcoded index/storage dispatch) with one path. Built-in functionality is *dogfooded* through that same path: the built-in vector index is one `IndexKindProvider` among many, the Lance backend is one `StorageBackend` registration, and the Locy `MNOR`/`MPROD` aggregates are `LocyAggregate` registrations. If the framework cannot express a built-in, the framework is wrong and we fix the framework — that is the integrity invariant.
+Uni's extensibility is a single registry-backed plugin framework. Every extension — a scalar function, an aggregate, a Locy aggregate, a procedure, a storage backend, an index kind, a CRDT, a graph algorithm, a hook, a trigger, an auth provider — implements one of the surface traits in the foundation crate `uni-plugin`, is described by a `PluginManifest`, registers through a `PluginRegistrar`, and is resolved at call time from a shared `PluginRegistry`. The framework replaced roughly five separate ad-hoc registries (the old `CustomFunctionRegistry`, the closed `FoldAggKind` enum, the hardcoded procedure-dispatch match, the algorithm registry, and hardcoded index/storage dispatch) with one path. Built-in functionality is *dogfooded* through that same path: the built-in vector index is one `IndexKindProvider` among many, the Lance backend is one per-label `Storage` registration, and the Locy `MNOR`/`MPROD` aggregates are `LocyAggregate` registrations. If the framework cannot express a built-in, the framework is wrong and we fix the framework — that is the integrity invariant.
 
 ```mermaid
 graph TB
@@ -5628,14 +5651,14 @@ The foundation crate is `uni-plugin` (traits, manifest, capability, registry, re
 
 `CapabilitySet` (`crates/uni-plugin/src/capability.rs`) is the type that gates what a plugin may do. The `Capability` enum (`#[non_exhaustive]`, serde tag `kind`, kebab-case) has three families:
 
-**Extension surfaces** (gate which registrar method a plugin may call):
-`ScalarFn`, `AggregateFn`, `WindowFn`, `Procedure` (+ the finer `ProcedureWrites` / `ProcedureSchema` / `ProcedureDbms`), `LocyAggregate`, `LocyPredicate`, `Operator`, `Index`, `Storage`, `Algorithm`, `Crdt`, `Hook`, `Trigger`, `BackgroundJob { max_concurrent }`, `Type`, `Auth`, `Authz`, `Connector`, `Collation`, `Cdc`, `Catalog`, and the meta-capability `PluginDeclare`.
+**Extension surfaces** (gate which registrar method a plugin may call) — **26 variants**:
+`ScalarFn`, `AggregateFn`, `WindowFn`, `Procedure` (+ the finer `ProcedureWrites` / `ProcedureSchema` / `ProcedureDbms`), `LocyAggregate`, `LocyPredicate`, `LocyGenerator`, `Operator`, `Index`, `Storage`, `Algorithm`, `GraphCompute`, `Crdt`, `Hook`, `Trigger`, `BackgroundJob { max_concurrent }`, `Type`, `Auth`, `Authz`, `Collation`, `Cdc`, `Catalog`, and the meta-capability `PluginDeclare`. *(`Connector` was removed in 3.0.0; `LocyGenerator` and `GraphCompute` were added.)*
 
 **Host-import surfaces** (gate which host services the plugin may call):
-`Network { allow }`, `Filesystem { read, write }`, `HostQuery { read_only, scopes }`, `Kms { key_ids }`, `Secret { ids }`, `Lock { granularity }` (where `LockGranularity ∈ {Nodes, Edges, Both, Global}`), `Config { keys }`, `PluginStorage`.
+`Network { allow }`, `Filesystem { read, write }`, `HostQuery { read_only, scopes }`, `Kms { key_ids }`, `Secret { ids }`, `Lock { granularity }` (where `LockGranularity ∈ {Nodes, Edges, Both, Global}`), `Config { keys }`, `PluginStorage`. `HostQuery` additionally gates the GraphCompute data-read `project` kernel (the CSR topology snapshot).
 
 **Resource quotas:**
-`MemoryBytes(u64)`, `TotalMemoryBytes(u64)`, `FuelPerCall(u64)`, `WallClockMillisPerCall(u64)`, `ConcurrentInstances(u32)`, `MaxResultRows(u64)`.
+`MemoryBytes(u64)`, `TotalMemoryBytes(u64)`, `FuelPerCall(u64)`, `WallClockMillisPerCall(u64)`, `ConcurrentInstances(u32)`, `MaxResultRows(u64)`, and the GraphCompute-specific `GraphComputeWork(u64)` (native-work budget) and `GraphComputeArenaBytes(u64)` (per-session handle-memory arena) — both fail-closed.
 
 The **effective** capability set is `declared ∩ granted`, computed by `CapabilitySet::intersect` (`capability.rs`): every declared capability whose *variant* matches a granted one is retained (`contains_variant`); where the same variant carries different attenuations on each side, both are kept and the runtime enforces each. Denial is not silent — a registrar call that needs a capability absent from the effective set fails with `PluginError::CapabilityRequired`, and the sandboxed loaders surface a `denied_capabilities` list in their load outcome.
 
@@ -5667,8 +5690,8 @@ let effective = declared.intersect(&granted);
 
 - **ABI range.** `AbiRange::parse` (`manifest.rs`) delegates to semver `VersionReq`, so `^1`, `^2`, `>=1, <99` all parse; `matches(host_major)` probes whether a host major satisfies the range. The framework keys multi-version linking off the *major* (see [§XVII.13](#hot-reload--multi-version-abi)).
 - **Hash pinning.** `verify_hash_pin` (`crates/uni-plugin/src/verify.rs`) checks `manifest.hash == blake3(payload).to_hex()`. Unconditional, always available.
-- **Signed manifests.** `verify_signed_manifest` / `verify_ed25519` perform real Ed25519 verification (`ed25519_dalek`) against a `TrustRoot`. This lives behind the `ed25519` cargo feature, which is **on by default** (`default = ["ed25519"]`).
-- **`ProvidedSurfaces`** enumerates what `register()` will populate (`scalar_fns`, `aggregate_fns`, `procedures`, `locy_aggregates`, `storage_backends`, `index_kinds`, `crdt_kinds`, `logical_types`, `connectors` as name lists; `hooks` / `triggers` / `background_jobs` as bools) — used by the host to validate and route before registration runs.
+- **Signed manifests.** `verify_signed_manifest` / `verify_ed25519` perform real Ed25519 verification (`ed25519_dalek`) against a `TrustRoot`. Signing is a security primitive, so `ed25519-dalek` is a **non-optional dependency** — verification is always compiled in (there is no `ed25519` feature flag to disable it), and a signed manifest covers the whole manifest.
+- **`ProvidedSurfaces`** enumerates what `register()` will populate (`scalar_fns`, `aggregate_fns`, `window_fns`, `procedures`, `locy_aggregates`, `locy_predicates`, `algorithms`, `storage_backends`, `index_kinds`, `crdt_kinds`, `logical_types` as name lists; `hooks` / `triggers` / `background_jobs` as bools) — used by the host to validate and route before registration runs.
 
 ## Five Loaders — the Loader Matrix
 
@@ -5679,14 +5702,14 @@ All five loaders converge on `PluginRegistrar`; the execution layer is loader-ag
 | Crate | `uni-plugin-builtin` / `-apoc-core` | `uni-plugin-wasm` | `uni-plugin-extism` | `uni-plugin-rhai` | `uni-plugin-pyo3` |
 | Sandbox | none (trusted) | wasmtime + WIT | extism host-fn ABI | Rhai engine | none (trusted) |
 | Boundary | native trait | WIT bindings (Arrow IPC) | Arrow IPC / JSON over linear memory | `rhai::Engine` | PyCapsule (Arrow C Data Interface) |
-| Surfaces shipped | **all 23** | scalar / aggregate / procedure | scalar / aggregate / procedure | scalar / aggregate / procedure | scalar / aggregate / procedure |
+| Surfaces shipped | **all 26** | scalar / aggregate / procedure / **algorithm** | scalar / aggregate / procedure / **algorithm** | scalar / aggregate / procedure / **algorithm** | scalar / aggregate / procedure / **algorithm** |
 | Vectorized scalars | n/a | row/IPC-batch | row/IPC-batch | row | **yes** (`vectorized=True`) |
 | Cap. gating | compile-time | structural (linker omits imports) | runtime (host-fn filter) | runtime (engine factory) | manifest + runtime |
 | Parity tier | reference | byte-identical | byte-identical | ≤ 4 ULP | ≤ 4 ULP |
 | Reload | full | epoch-fenced | epoch-fenced | full | session-scope unregister |
 | Parity test | (reference) | `m6_cross_abi_parity.rs` | (same) | `m7_rhai_cross_loader_parity.rs` | `m8_pyo3_cross_loader_parity.rs` |
 
-> **Note:** Only the Rust path can author all 23 extension surfaces today. The WASM Component Model defines exactly three WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin` in `crates/uni-plugin-wasm/wit/world.wit`); Extism uses a host-fn ABI rather than WIT worlds; Rhai and PyO3 likewise author scalar/aggregate/procedure. Surfaces beyond those three are compile-time-Rust-only in v1 (proposal §19 criterion 30). Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
+> **Note:** Only the Rust path can author all 26 extension surfaces. As of 3.0.0 the four non-Rust loaders author **scalar, aggregate, procedure, and graph algorithms** — the WASM Component Model now defines *four* WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin`, and `algorithm-plugin` in `crates/uni-plugin-wasm/wit/world.wit`, the last importing the `host-graph` interface); Extism, Rhai, and PyO3 carry the matching GraphCompute host surface (`graph_compute` + `adapter_algorithm`). Guest graph algorithms drive the coarse GraphCompute kernels over opaque handles (see [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms)). The remaining surfaces are compile-time-Rust-only. Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
 
 ## Loading a Plugin (Host API)
 
@@ -5753,7 +5776,7 @@ Cross-loader byte-parity is a real test: `crates/uni/tests/m6_cross_abi_parity.r
 
 ## Surface Traits Reference
 
-Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 'static`, and speaks Arrow at the boundary. The registrable provider traits, with their real names (several differ from older docs — `LogicalTypeProvider` not "TypePlugin", `CollationProvider` not "Collation", `OperatorProvider`, `PregelProgramProvider`):
+Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 'static`, and speaks Arrow at the boundary. The registrable provider traits, with their real names (several differ from older docs — `LogicalTypeProvider` not "TypePlugin", `CollationProvider` not "Collation", `OptimizerRuleProvider` for planner extension). **3.0.0 removed four registrable-but-never-dispatched traits** — `PregelProgramProvider`, `OperatorProvider`, the plugin-level `StorageBackend` (the per-label `Storage` surface is retained), and `Connector` (its `AuthProvider` / `AuthzPolicy` siblings are retained) — see [§What's Not in the Plugin Framework](#whats-not-in-the-plugin-framework-current-scope):
 
 | Surface | Trait (file) | Key method(s) | Built-in impls shipped |
 |---|---|---|---|
@@ -5762,14 +5785,14 @@ Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 
 | Window fn | `WindowPluginFn` (window.rs) | `evaluate` | — |
 | Procedure | `ProcedurePlugin` + `ProcedureHost` (procedure.rs) | `signature`, `invoke` | 38 APOC + schema/algo/search |
 | Locy aggregate | `LocyAggregate` + `LocyAggState` (locy.rs) | `semilattice`, `create`, `ingest_indices`, `finalize` | **10** (MIN/MAX/SUM/MSUM/COUNT/COUNTALL/AVG/COLLECT/MNOR/MPROD) |
-| Locy predicate | `LocyPredicate` (locy.rs) | `evaluate` | — |
-| Operator | `OperatorProvider` (operator.rs) | `logical_name`, `plan`, `rule` | — |
-| Optimizer rule | `OptimizerRuleProvider` (operator.rs) | — | pushdown negotiation |
+| Locy predicate | `LocyPredicate` (locy.rs) | `evaluate` (1:1 row filter) | — |
+| Locy generator | `LocyGenerator` (locy.rs) | `signature`, `generate` (1:N table-valued binding) | — |
+| Optimizer rule | `OptimizerRuleProvider` (operator.rs) | `rule` (logical), `physical_rule` | pushdown negotiation |
 | Pushdown markers | `SupportsFilter/Projection/Limit/TopN/AggregatePushdown` (pushdown.rs) | negotiation | (5 markers) |
 | Index kind | `IndexKindProvider` + `IndexBuild`/`IndexHandle` (index.rs) | `kind`, `build`, `open` | vector index |
-| Storage | `StorageBackend` + `Storage` (storage.rs) | `scheme`, `supports_branching`, async read/write/fork | Lance backend |
-| Algorithm | `AlgorithmProvider` + `AlgorithmHost` (algorithm.rs) | `signature`, `run` | label propagation + 36 via adapter |
-| Pregel | `PregelProgramProvider` (algorithm.rs) | program steps | — |
+| Storage | `Storage` (storage.rs) | per-label async read / write | Lance backend |
+| Algorithm | `AlgorithmProvider` + `AlgorithmHost` (algorithm.rs) | `signature`, `run(AlgorithmContext)` | 35 native + guest-authored |
+| GraphCompute / GraphView | `AlgorithmProvider` + `AlgorithmHost::project → GraphView` (algorithm.rs) | typed `AlgorithmSignature { args, slices }`; `AlgoSession` kernels over handles | `uni.algo.gcpagerank` / `gcwalks` / `gcoverlap` |
 | CRDT | `CrdtKindProvider` + `CrdtState` (crdt.rs) | `kind`, `empty`, `from_persisted` | 5 (LWW/OR-Set/G-Counter/MV-Register/RGA) |
 | Hook | `SessionHook` (hook.rs) | `on_parse`/`on_analyze`/`on_plan`/`on_execute_start` | phased + legacy bridge |
 | Trigger | `TriggerPlugin` (trigger.rs) | `subscription`, `fire`, `on_deferred` | — |
@@ -5778,12 +5801,59 @@ Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 
 | Collation | `CollationProvider` (collation.rs) | `name`, `compare`, `normalize` | 5 (ascii ×2, unicode ×2, natural) |
 | Auth | `AuthProvider` (connector.rs) | `authenticate` | — |
 | Authz | `AuthzPolicy` (connector.rs) | `check` | — |
-| Connector | `Connector` (connector.rs) | `protocol`, `start`, `stop` | — |
 | CDC output | `CdcOutputProvider` + `CdcStream` (cdc.rs) | `name`, `start` | — |
 | Catalog | `CatalogProvider` + `CatalogTable` (catalog.rs) | `list_labels`, `resolve_label` | — |
 | Replacement scan | `ReplacementScanProvider` (catalog.rs) | — | — |
 
-The authoritative *surface count* is the `Capability` enum's 23 extension variants; the proposal's older "25 surfaces" prose predates that reconciliation.
+The authoritative *surface count* is the `Capability` enum's **26 extension variants** (3.0.0 removed `Connector` and added `LocyGenerator` + `GraphCompute`).
+
+## GraphCompute — Guest-Authorable Graph Algorithms
+
+**New in 3.0.0.** GraphCompute lets a third party author a *graph algorithm* — PageRank / Personalized PageRank, reachability/BFS, WCC, Bellman–Ford, k-core, eigenvector, HITS/Katz, random walks, neighbourhood similarity — as a plugin in **Rhai, Python, WASM (Component Model), or Extism**, with no forking and no shipping Rust. It complements the 35 native `algo.*` algorithms of [Part IX](#part-ix-graph-algorithms) with an *extensible* path.
+
+**"Conductor, not worker."** The guest runs only the O(iterations) control loop; native code does all O(V+E) work. Only **opaque handles and scalars** cross the plugin boundary — never frontiers, neighbour lists, or property columns. Because nothing heavy is marshalled, the identical design runs across every loader, and each ships a Personalized PageRank example that matches the native provider to **1e-9**.
+
+### The guest surface
+
+A guest implements **`AlgorithmProvider`** (`crates/uni-plugin/src/traits/algorithm.rs`):
+
+- **`signature() -> &AlgorithmSignature`** — declares `output_fields` (Arrow), `docs`, typed positional `args: Vec<NamedArgType>` (arity- and type-checked, default-filled at call time via `coerce_config_json`), and required host kernel-slices `slices: Vec<SliceReq>` (checked at registration via `check_slices`; the host implements `graph-compute@1`, `HOST_CAPABILITY_SLICES`).
+- **`run(ctx: AlgorithmContext) -> SendableRecordBatchStream`** — the control loop. `AlgorithmContext { config_json, host }` gives the parsed args and the `AlgorithmHost`.
+
+The guest builds a graph and drives kernels through an **`AlgoSession`** (the kernel session; `crates/uni-plugin-builtin/src/algorithms/graph_compute/session.rs`). JSON kernel requests are dispatched by `GraphComputeRegistry` (`KernelRequest` / `KernelResponse`), so the same coarse kernel catalog is reachable from any loader.
+
+### Kernel catalog & handles
+
+Values are Arrow-backed; **handles are opaque, generational, epoch-tagged, kind-checked, and session-scoped** (`handle.rs` / `value.rs`). The kernel families:
+
+- **Topology** — `bind_graph` / `project` a CSR snapshot (a `GraphView`); frontier/expand (direction-optimized, mask-fused).
+- **Linear algebra** — SpMV over named semirings; map / reduce / scatter.
+- **Set & selection** — set ops, arg-extreme / top-k, `next_bucket`.
+- **Edge kernels (Mode A, proposal §5)** — a `[E]` per-edge tensor (`edge_weights`, CSR out-edge order, `Shape::E`) and an **edge mask** handle (`HandleKind::EdgeSet`): `edges_all`, `sample_edges(prob, seed, iter)` (per-edge Bernoulli mask from the same counter-hash), `edge_mask_window(vals, lo, hi)` (deterministic threshold → edge mask, e.g. a temporal window), `edge_intersect` / `edge_union`, and edge-masked traversal `expand_masked` / `spmv_masked` (out-direction; result equals the kernel on the subgraph of exactly the masked edges). Together these express reachability/spmv over a per-iteration random edge subset (grid-reliability Monte-Carlo, percolation, influence-max) or a per-event-time subset (temporal reachability) with no guest per-element body.
+- **Deterministic segmented reduce (Mode A, §6/§8)** — `segmented_reduce(values, groups)` reduces a `[V]` map grouped by a label/component map, using the determinism-owning accumulator (`uni_algo::algo::reduce::deterministic_sum`), so each group's total is **bitwise-identical regardless of vertex order or partitioning** — the reproducible reduction stock partitioned float `SUM` cannot give.
+- **Sampling & similarity** — `random_walks`; `sample(prob, seed, iter)` — a reproducible `Bernoulli(prob[v])` mask over a `[V]` tensor drawn from a stateless counter-hash stream (`counter_hash(seed, iter, elem)`, shared with the walk seeding), so masks are bitwise-identical across runs/threads and a fresh `iter` decorrelates; all-pairs / neighbourhood overlap (Jaccard, cosine, Adamic–Adar, triangle count).
+- **Egress** — `emit` result rows, including ragged walk (`take_emitted_walks`) and pairwise (`take_emitted_pairs`) shapes.
+
+The read-only **`GraphView`** (topology accessors `vertex_count` / `edge_count` / `out_neighbors(slot)` / `out_degree` / `in_neighbors` / `out_weight` / `to_vid` / `to_slot` / …, vertices addressed by dense `u32` slots) is obtained via **`AlgorithmHost::project(&GraphProjectionSpec) -> Arc<dyn GraphView>`**.
+
+### Determinism, budgets & safety
+
+- **Deterministic** — deterministic CSR ordering and fixed-order reductions give bitwise-reproducible results across thread counts.
+- **Fail-closed budgets** — a native-work budget (`Capability::GraphComputeWork`, tracked by `AlgoSession::work_spent` / `work_budget`) and a per-session handle-memory arena (`Capability::GraphComputeArenaBytes`, `bytes_live` / `live_handles`) are enforced and fail-closed. The work budget resolves through one helper, `WorkBudget::resolve`: an explicit `GraphComputeWork` grant is **authoritative and may raise the ceiling** above the size-derived default `min(10_000·(|V|+|E|+1), 1e9)` (which applies only when ungranted). A grant that authorizes more native work is a real authorization to review — not a clamp that can only lower the default.
+- **Non-convergence is a hard error** — `GraphComputeIncomplete` with distinct Exhausted / IterationLimit / Timeout reasons (never a silent partial).
+- **Bounded guest loops** — Rhai `catch_unwind`, a Python `KeyboardInterrupt` watchdog, and WASM/Extism epoch interruption stop a runaway guest.
+
+### Capability gating
+
+`Capability::GraphCompute` gates the kernel surface; `Capability::HostQuery` **additionally** gates the data-read `project` kernel (the CSR topology snapshot). A guest granted only `GraphCompute` can compute over a graph it was handed but cannot itself project one.
+
+### First-party providers (dogfooding)
+
+Three GraphCompute `CALL` procedures dogfood the guest surface end-to-end: **`uni.algo.gcpagerank`** (`GraphComputePageRankProvider`), **`uni.algo.gcwalks`** (`GraphComputeWalksProvider`), **`uni.algo.gcoverlap`** (`GraphComputeOverlapProvider`) — all in `crates/uni-plugin-builtin/src/algorithms/graph_compute/`. Separately, the GraphView in-process path backs first-party native algorithms authored purely against the public trait (`personalized_pagerank`, `reachable_set`, `wcc_labels`, `bellman_ford`, `k_core`, `eigenvector_centrality`), and `AlgorithmProvider::run` is wired into `CALL` dispatch on both the planner and simple-executor paths (miss-only, so built-in `algo.*` never regress).
+
+### Loader surfaces
+
+The WASM Component Model adds an **`algorithm-plugin`** WIT world importing the `host-graph` interface (`graph-call: func(req: string) -> result<string, fn-error>`); Extism, Rhai, and PyO3 each carry the matching `graph_compute` host surface + `adapter_algorithm`. Design: `docs/proposals/graphcompute_plugin_api_2026-07-10.md`.
 
 ## The PluginRegistry — Read Side
 
@@ -5832,9 +5902,11 @@ The scheduler (M11) drives durable, recurring maintenance:
 `TriggerPlugin` (`crates/uni-plugin/src/traits/trigger.rs`) reacts to mutations:
 
 - **`fire(ctx: TriggerContext, events: &MutationBatch) -> Result<TriggerOutcome, FnError>`** plus `subscription()` (what the trigger watches) and `on_deferred()` (durable-retry callback).
-- **`TriggerPhase`**: `BeforeMutation`, `AfterMutation`, `BeforeCommit`, `AfterCommit`. Independently, **`FireMode`** ∈ `{ Synchronous, Async, EventualConsistency }` controls whether firing blocks the writer, runs on the runtime, or goes through a durable best-effort retry queue.
+- **`TriggerContext`** now carries an owned `Option<Arc<dyn ProcedureHost>>` (**3.0.0 breaking ABI change**; `with_host()` / `host()` accessors, `new()` defaults to `None`). This host handle is what lets a declared trigger execute its Cypher action body — recompile custom `TriggerPlugin` implementors against 3.0.0.
+- **`TriggerPhase`**: `BeforeMutation`, `AfterMutation`, `BeforeCommit`, `AfterCommit`. Independently, **`FireMode`** ∈ `{ Synchronous, Async, EventualConsistency }` controls whether firing blocks the writer, runs on the runtime, or is batched. As of 3.0.0 `EventualConsistency` is a **real batched queue** (coalescing per-trigger events, draining on interval/size thresholds through a `BackgroundJobProvider`) rather than an alias for `Async` — tune with `UniConfig::ec_flush_interval` (default 1 s) and `ec_flush_threshold` (default 10,000).
 - **`TriggerOutcome`**: `Continue`, `Reject { reason }` (aborts the commit when fired in a *before* phase), `Defer { until }` (re-enqueue).
 - **`MutationBatch`** wraps an Arrow `RecordBatch` (`events: Arc<RecordBatch>`) with columns `event_kind | vid_or_eid | label | property | old_value | new_value`; event kinds are `TriggerEventMask` bit-constants (`NODE_CREATE` … `LABEL_REMOVED`).
+- **`uni.plugin.declareTrigger`** now installs a real firing `TriggerPlugin` (previously a callable procedure that never fired). Declared triggers take an event filter (`CREATE|UPDATE|DELETE [ON :Label | -[:Type]-] [WHEN pred] [ASYNC]`), bind `$vid` / `$label` / `$event_kind`, run their declared Cypher action body, and replay across restart.
 
 ## Hot Reload & Multi-Version ABI
 
@@ -5894,9 +5966,26 @@ Explicit deferrals, matching the proposal §19 scorecard (▶ in place / ⏳ pen
 - **`oci://…` install** (⏳) and **`extism://hub/…` install** (⏳) — M12.
 - **Component-Model capability-gated host-fn body** — the structural gating (linker omits host-fs/host-net/host-kms imports) is in place; an end-to-end `host-fs.read` body is the remaining half of criterion 6 (▶/⏳).
 - **GUC config parameters** (`config_param`, `SHOW`/`SET <plugin>.<name>`, `host.config_get`) — not implemented; tracked as criterion 29 (⏳), to be designed against the first plugin that needs a tunable.
-- **Non-Rust authoring of surfaces beyond scalar/aggregate/procedure** — the other 20 surfaces are Rust-only in v1; `operator`/`storage` are infeasible across the Component Model (in-process trait objects, `&Expr` trees, async streams), `crdt`/`connector` WIT worlds are tractable but deferred. Criterion 30 (⏳).
+- **Non-Rust authoring of surfaces beyond scalar/aggregate/procedure/algorithm** — as of 3.0.0 **graph algorithms are guest-authorable across all four non-Rust loaders** via GraphCompute. The remaining surfaces stay Rust-only: `operator`/`storage` are infeasible across the Component Model (in-process trait objects, `&Expr` trees, async streams), and a `crdt` WIT world is tractable but deferred. Criterion 30.
+- **Removed in 3.0.0 (breaking):** the `PregelProgramProvider`, `OperatorProvider`, plugin `StorageBackend`, and `Connector` traits — registrable but never dispatched — were removed, along with `Capability::Connector`, `SurfaceKind::Connector`, and the `Uni::start_connector` / `stop_connector` / `ConnectorLifecycle` API. Migrate to `AlgorithmProvider`/GraphCompute, `OptimizerRuleProvider`, the per-label `Storage` surface, and `CatalogProvider` / `ReplacementScanProvider` respectively (`AuthProvider` / `AuthzPolicy` are retained).
 - **Secrets WIT membrane** (`host-secrets`) and **plugin-side `host.span_*` OTel imports** — Phase D (▶).
 - **APOC long tail** — 38 procedures across 6 namespaces ship; the broader APOC surface (refactor/load/export/periodic/cypher.run/…) is open-ended.
+
+> **Shipped — the Plugin Compute ABI (`docs/proposals/plugin_compute_abi_2026-07-13.md`).** GraphCompute previously covered *deterministic propagation over a fixed graph* well, but an outside author whose algorithm fell outside that envelope still had to write native Rust. The compute-ABI proposal closes that gap in phases; **all five phases (0–4) have landed**, including the §14 open questions (Q-3 SSI contract resolved live-store). The items below trace each phase to its landed surface:
+> - **Landed (Phase 0):** the `GraphComputeWork` grant now *raises* the ceiling rather than only lowering it (a governance-posture change — see Determinism, budgets & safety above), and the seeded `sample(prob, seed, iter)` counter-hash mask is a first-class kernel.
+> - **Landed (Phase 1, Mode A):** the `[E]` per-edge tensor + edge mask + edge-masked `expand`/`spmv` + `sample_edges` (see Edge kernels above), which express the stochastic-structural cluster (grid-reliability MC, percolation, influence-max) with no guest per-element body — validated by the AT-GRID flagship against a closed-form reliability.
+> - **Landed (Phase 2, eligibility + streaming):** a third-party algorithm provider now reaches the DataFusion plan path by **declaring `df_composable`** in its `AlgorithmSignature` (the DF-3 registration-driven flip) rather than by squatting the `uni.algo.` name — first-party `uni.algo.*` adapters keep the DF path via the reserved namespace (third parties cannot register there). Algorithm-provider CALLs also now **stream** batch-by-batch through `GraphProcedureCallExec` instead of buffering to one `RecordBatch` (DF-4). The row fallback stays a correctness twin (DF-2).
+> - **Landed (determinism accumulator, DF-6 core):** `uni_algo::algo::reduce::deterministic_sum` — a canonical-order + Neumaier-compensated reduction that is bitwise-identical across input permutations and partition splits (DataFusion's partitioned float `SUM` is not). This is the determinism-owning accumulator a reducing stage must use for a reproducible study number; wiring it into a DataFusion UDAF reducing-stage operator (the full DF-6 operator + A-4 segmented-reduce) is the remaining integration.
+> - **Landed (fixpoint iteration driver, DF-5):** `IterationDriver` + `PowerStepExec` (`uni-query` `df_graph::iteration_driver`) — a graph fixpoint driven by **re-invoking a cached physical sub-plan once per round** (`plan_count` stays 1; the round body reads swappable `[V]` state from a shared handle and feeds its output back), converging via L1 and matching an independent PageRank reference to `1e-9`. This is the lift the Mode B-vec message-passing iteration builds on.
+> - **Landed (Mode B-vec gather mechanism, §7a):** `GraphGatherStepExec` — the message-passing round the proposal names, `edges → GROUP BY dst → aggregate`, with the destination aggregate a **pluggable `MessageAggregate` monoid** (the guest-UDAF slot; `SumAggregate` reproduces PageRank). Driven by the DF-5 `IterationDriver`, it matches the native PageRank reference to `1e-9` and agrees bitwise with the vertex-centric formulation — proving the graph-gather + driver with a swappable aggregate body.
+> - **Landed (Mode B-seq runtime core, §7b):** `ScratchGraph` (`graph_compute::scratch`) — a per-invocation, session-local **mutable** graph a sequential guest builds and walks (`add_node`/`add_edge`/`neighbors`/`get`/`set`/`sample`), **metered per random-access op** (the §5.1 work meter extended to pointer-chasing; a runaway loop halts at `0x865`) with a **bounded mutable arena** (`0x864` on growth). Sampling is the reproducible counter-hash, so a seeded search is bitwise-repeatable (verified by an AT-MCTS-lite rollout). This is also the host-resident baseline the `Q-5` perf gate measures against.
+> - **Landed (A-4 segmented reduce, F-11 temporal reachability):** the deterministic `segmented_reduce` kernel (above) closes A-4's determinism contract as a bespoke Mode-A primitive; `edge_mask_window` + fixpoint edge-masked expansion closes F-11 (temporal reachability matches a naive time-respecting BFS oracle). *(The proposal also lists a UDAF-delegated segmented reduce as a §6 preference; the bespoke determinism-owning kernel satisfies the same §6/§8 contract, and the DataFusion-UDAF delegation remains an optional alternative.)*
+> - **Landed (AT-ABM SIR, Mode B-seq guest ABI):** a seeded SIR epidemic ABM tick on the message-passing kernels (`sample_edges` firing + `expand_masked` gather + `sample` recovery) matches an independent native SIR oracle exactly and is reproducible; and `ScratchGraph::call_json` / `ScratchResponse` — the host-side JSON ABI a compiled Mode B-seq guest drives (each random-access op metered, errors typed), the same `host-graph` dispatch shape the Mode-A kernels use.
+> - **Landed (Mode B-vec, complete):** the message-passing gather runs as a *real* DataFusion `edges JOIN state → GROUP BY dst` relational aggregate — first with built-in `sum`, then with an actual **guest-authored `AggregatePluginFn`** (`myco.gsum`) registered through the plugin registrar and bridged via `PluginAggregateUdaf` (both matched to the hand-coded gather ≤1e-9). With the DF-5 driver and the PageRank/SIR scenarios, **Mode B-vec is complete**: a per-loader guest UDAF drives the graph gather through the existing UDAF sandbox.
+> - **Landed (Q-5 perf-gate harness):** `crates/uni/benches/mode_b_seq_random_access.rs` — a criterion pointer-chasing microbench establishing the **host-resident baseline** (`ScratchGraph` native accessors) and the **JSON-ABI crossing cost** (the same walk via `call_json`, the boundary a compiled guest pays per op). The `json_abi / direct` ratio is the per-op host-boundary overhead Q-5 measures; the JIT'd-WASM arm plugs in once the WASM fixture lands.
+> - **Landed (Mode B-seq host-side WASM ABI):** `ScratchRegistry` — the multi-session host surface a WASM/Extism `host-graph` import wires to (unguessable session ids, per-session mutex, panic isolation, `open`/`call_json`/`close`), mirroring `GraphComputeRegistry` for Mode A. With `ScratchGraph::call_json` (single-session) this is the complete host half of the Mode B-seq guest binding; the runtime contracts `Q-1…Q-6` are all satisfied against the host-resident (Rust compiled-body) runtime.
+> - **Landed (Mode B-seq WASM guest, end-to-end):** `examples/example-wasm-scratch` — a real `wasm32-wasip2` guest that builds and walks a mutable scratch graph purely through the `host-graph` JSON ABI, driven through **wasmtime** by `crates/uni-plugin-wasm/tests/scratch_wasm_e2e.rs` (the host backs `host-graph` with a `ScratchRegistry`, opens the session, and reads back exactly what the guest built). Built by `build-wasm-fixtures.sh`; this is the compiled-body (WASM) arm of the Mode B-seq binding, the per-loader e2e analogous to Mode-A's `L`/`V` families.
+> - **Landed (Q-3 live-store SSI contract, closing open question 3):** against a real `Uni` store, a Mode B-seq `ScratchRegistry` run is proven **never observable by the store** — a concurrent `MATCH (n:Node) RETURN count(n)` reader sees only the seeded nodes during *and* after a 100-node scratch build (`q3_scratch_graph_is_never_observable_by_the_store`), because the scratch graph structurally holds no store handle and cannot write back. The companion arm (`q3_projected_reads_are_pinned_across_concurrent_commits`) proves the read side: a `GraphProjection` materialized at T0 stays pinned to its snapshot across a concurrent T1 commit — its `vertex_count`/`edge_count` are unchanged, so reads inside a run see the projection-time version stamp regardless of concurrent writers. This resolves the proposal's **open question 3** (§14): the isolation is by-construction (value ownership + no write-back path), not lock-based. All five phases are now implemented and verified.
 
 ---
 
@@ -6109,7 +6198,7 @@ Quick reference of all anti-patterns from every chapter:
 | **SimpleGraph** | Custom in-memory graph data structure (in `uni-common`) used for L0 buffer and algorithms |
 | **Snapshot** | JSON manifest capturing a consistent point-in-time view of all datasets |
 | **Stratum** | Group of mutually-recursive Locy rules evaluated together in fixpoint |
-| **Surface Trait** | One of the ~23 extension-point traits in `uni-plugin/src/traits/` (ScalarPluginFn, LocyAggregate, …) |
+| **Surface Trait** | One of the 26 extension-point traits in `uni-plugin/src/traits/` (ScalarPluginFn, LocyAggregate, LocyGenerator, AlgorithmProvider/GraphCompute, …) |
 | **Trigger** | A `TriggerPlugin` that fires on mutations with phase + outcome (Continue / Reject / Defer) |
 | **UniId** | Content-addressed identifier — SHA3-256 hash of (label, ext_id, properties) |
 | **VCRegister** | Vector-Clock Register CRDT — causally consistent register |

@@ -24,7 +24,8 @@ use uni_plugin::traits::algorithm::{AlgorithmSignature, HOST_CAPABILITY_SLICES, 
 
 use super::error;
 use super::handle::Handle;
-use super::session::{AlgoSession, Direction, GraphCompute};
+use super::session::{AlgoSession, Direction, GraphCompute, MapOp};
+use super::value::{DType, Scalar};
 use super::{Arena, WorkBudget};
 
 /// The outcome of one conformance probe.
@@ -90,6 +91,7 @@ pub fn run_probes() -> Vec<ProbeResult> {
         probe_budget(),
         probe_determinism(),
         probe_slice_version(),
+        probe_sample_determinism(),
     ]
 }
 
@@ -161,6 +163,35 @@ fn probe_slice_version() -> ProbeResult {
     }
 }
 
+/// `graph.sample_determinism` — the seeded `sample` mask is reproducible.
+///
+/// Self-certification for algorithm authors alongside `graph.determinism`: the
+/// promoted counter-hash `sample` primitive (proposal §8) must yield a
+/// byte-identical mask across independent runs on the same host, so a stochastic
+/// study built on it (grid-reliability, percolation) is reproducible.
+fn probe_sample_determinism() -> ProbeResult {
+    const ID: &str = "graph.sample_determinism";
+    // Build a constant p = 0.5 probability map, then sample it. Comparing the
+    // mask lowered back to a [V] map is a total, order-free equality check.
+    let run = || {
+        let (mut session, g) = probe_session(WorkBudget::new(1_000_000));
+        let zeros = session.zero_map(g, DType::F64).expect("zero_map runs");
+        let half = session
+            .map_apply(zeros, MapOp::AxPlusB(0.0, 0.5))
+            .expect("map_apply runs");
+        let mask = session.sample(half, 0xC0FFEE, 3).expect("sample runs");
+        let as_map = session
+            .set_to_map(mask, Scalar::F64(1.0))
+            .expect("set_to_map runs");
+        session.tensor_snapshot(as_map)
+    };
+    if run() == run() {
+        ProbeResult::pass(ID)
+    } else {
+        ProbeResult::fail(ID, "the seeded sample mask was not reproducible")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,7 +199,7 @@ mod tests {
     #[test]
     fn all_conformance_probes_pass_on_this_host() {
         let results = run_probes();
-        assert_eq!(results.len(), 4, "the stable probe set is append-only");
+        assert_eq!(results.len(), 5, "the stable probe set is append-only");
         for r in &results {
             assert!(r.passed, "probe {} failed: {}", r.id, r.detail);
         }
@@ -179,6 +210,7 @@ mod tests {
             "graph.budget",
             "graph.determinism",
             "graph.slice_version",
+            "graph.sample_determinism",
         ] {
             assert!(ids.contains(want), "missing stable probe id {want}");
         }

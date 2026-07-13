@@ -137,6 +137,10 @@ name = "algo_benchmarks"
 harness = false
 
 [[bench]]
+name = "mode_b_seq_random_access"
+harness = false
+
+[[bench]]
 name = "comprehensive"
 harness = false
 

@@ -61,6 +61,9 @@ pub struct KernelRequest {
     /// Third handle operand.
     #[serde(default)]
     pub b: i64,
+    /// Fourth handle operand (e.g. the edge mask of `expand_masked`); `0` = none.
+    #[serde(default)]
+    pub c: i64,
     /// A string enum operand (direction / predicate / norm / op).
     #[serde(default)]
     pub s: String,
@@ -91,9 +94,12 @@ pub struct KernelRequest {
     /// node2vec in-out bias `q` (`random_walks`).
     #[serde(default = "one_f64")]
     pub q: f64,
-    /// Deterministic RNG seed (`random_walks`).
+    /// Deterministic RNG seed (`random_walks`, `sample`).
     #[serde(default)]
     pub seed: u64,
+    /// Iteration counter mixed into the `sample` counter-hash stream.
+    #[serde(default)]
+    pub iter: u64,
     /// Seed vertex ids (for `frontier`).
     #[serde(default)]
     pub seeds: Vec<i64>,
@@ -428,6 +434,7 @@ impl GraphComputeRegistry {
                     )
                     .map(h)
             }
+            "sample" => session.sample(from_i64(req.g), req.seed, req.iter).map(h),
             "walk_visit_counts" => session
                 .walk_visit_counts(from_i64(req.a), from_i64(req.g))
                 .map(h),
@@ -475,6 +482,47 @@ impl GraphComputeRegistry {
                 .map(h),
             "set_union" => session.set_union(from_i64(req.a), from_i64(req.b)).map(h),
             "set_diff" => session.set_diff(from_i64(req.a), from_i64(req.b)).map(h),
+            // Mode A edge kernels (proposal §5). Handle `b == 0` means "no
+            // exclude mask" for expand_masked; the edge mask rides `c`.
+            "edge_weights" => session.edge_weights(from_i64(req.g)).map(h),
+            "edges_all" => session.edges_all(from_i64(req.g)).map(h),
+            "segmented_reduce" => session
+                .segmented_reduce(from_i64(req.a), from_i64(req.b))
+                .map(h),
+            "sample_edges" => session
+                .sample_edges(from_i64(req.g), req.seed, req.iter)
+                .map(h),
+            "edge_set_len" => session
+                .edge_set_len(from_i64(req.g))
+                .map(|v| KernelResponse::Float(v as f64)),
+            "edge_mask_window" => session
+                .edge_mask_window(from_i64(req.g), req.f, req.f2)
+                .map(h),
+            "edge_intersect" => session
+                .edge_intersect(from_i64(req.a), from_i64(req.b))
+                .map(h),
+            "edge_union" => session.edge_union(from_i64(req.a), from_i64(req.b)).map(h),
+            "expand_masked" => session
+                .expand_masked(
+                    from_i64(req.g),
+                    from_i64(req.a),
+                    dir(&req.s)?,
+                    if req.b == 0 {
+                        None
+                    } else {
+                        Some(from_i64(req.b))
+                    },
+                    from_i64(req.c),
+                )
+                .map(h),
+            "spmv_masked" => session
+                .spmv_masked(
+                    from_i64(req.g),
+                    from_i64(req.a),
+                    semiring(&req.s)?,
+                    from_i64(req.c),
+                )
+                .map(h),
             "set_intersect" => session
                 .set_intersect(from_i64(req.a), from_i64(req.b))
                 .map(h),
@@ -569,6 +617,7 @@ mod tests {
             g: 0,
             a: 0,
             b: 0,
+            c: 0,
             s: String::new(),
             s2: String::new(),
             f: 0.0,
@@ -580,6 +629,7 @@ mod tests {
             p: 1.0,
             q: 1.0,
             seed: 0,
+            iter: 0,
             seeds: vec![],
             name: String::new(),
         };
@@ -948,12 +998,13 @@ mod tests {
     impl Serialize for KernelRequest {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeStruct;
-            let mut st = s.serialize_struct("KernelRequest", 18)?;
+            let mut st = s.serialize_struct("KernelRequest", 20)?;
             st.serialize_field("session", &self.session)?;
             st.serialize_field("op", &self.op)?;
             st.serialize_field("g", &self.g)?;
             st.serialize_field("a", &self.a)?;
             st.serialize_field("b", &self.b)?;
+            st.serialize_field("c", &self.c)?;
             st.serialize_field("s", &self.s)?;
             st.serialize_field("s2", &self.s2)?;
             st.serialize_field("f", &self.f)?;
@@ -965,6 +1016,7 @@ mod tests {
             st.serialize_field("p", &self.p)?;
             st.serialize_field("q", &self.q)?;
             st.serialize_field("seed", &self.seed)?;
+            st.serialize_field("iter", &self.iter)?;
             st.serialize_field("seeds", &self.seeds)?;
             st.serialize_field("name", &self.name)?;
             st.end()

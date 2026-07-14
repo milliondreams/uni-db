@@ -479,6 +479,142 @@ impl GcSession {
             .map_err(py_err)
     }
 
+    /// Draws a `Bernoulli(prob[v])` mask over a `[V]` probability tensor.
+    ///
+    /// `seed`/`iter` select the reproducible counter-hash stream; advancing
+    /// `iter` yields a fresh, decorrelated per-iteration mask (proposal §8).
+    /// Returns a vertex-set (mask) handle.
+    #[pyo3(signature = (prob, seed = 0, iter = 0))]
+    fn sample(&self, prob: i64, seed: u64, iter: u64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .sample(from_i64(prob), seed, iter)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Builds a `[E]` per-edge tensor of out-edge weights (proposal §5).
+    fn edge_weights(&self, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_weights(from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// The full edge mask — every edge of `g` active.
+    fn edges_all(&self, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edges_all(from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Draws a `Bernoulli(prob[e])` edge mask from a `[E]` probability tensor.
+    #[pyo3(signature = (prob, seed = 0, iter = 0))]
+    fn sample_edges(&self, prob: i64, seed: u64, iter: u64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .sample_edges(from_i64(prob), seed, iter)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Cardinality of an edge mask.
+    fn edge_set_len(&self, m: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_set_len(from_i64(m))
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .map_err(py_err)
+    }
+
+    /// Edges whose `[E]` value lies in the window `[lo, hi]` (F-11 time windows).
+    fn edge_mask_window(&self, edge_vals: i64, lo: f64, hi: f64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_mask_window(from_i64(edge_vals), lo, hi)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Deterministic segmented reduce: per-group totals broadcast to members.
+    fn segmented_reduce(&self, values: i64, groups: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .segmented_reduce(from_i64(values), from_i64(groups))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Intersection of two edge masks.
+    fn edge_intersect(&self, a: i64, b: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_intersect(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Union of two edge masks.
+    fn edge_union(&self, a: i64, b: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_union(from_i64(a), from_i64(b))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// One-hop expansion over the masked out-edges (exclude `0` = none).
+    #[pyo3(signature = (g, frontier, direction, edge_mask, exclude = 0))]
+    fn expand_masked(
+        &self,
+        g: i64,
+        frontier: i64,
+        direction: &str,
+        edge_mask: i64,
+        exclude: i64,
+    ) -> PyResult<i64> {
+        self.check_deadline()?;
+        let d = dir(direction)?;
+        self.session
+            .lock()
+            .expand_masked(
+                from_i64(g),
+                from_i64(frontier),
+                d,
+                if exclude == 0 {
+                    None
+                } else {
+                    Some(from_i64(exclude))
+                },
+                from_i64(edge_mask),
+            )
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// `spmv` restricted to the masked out-edges (out-direction only).
+    fn spmv_masked(&self, g: i64, vec: i64, semiring_name: &str, edge_mask: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let sr = semiring(semiring_name)?;
+        self.session
+            .lock()
+            .spmv_masked(from_i64(g), from_i64(vec), sr, from_i64(edge_mask))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     /// Folds a walks handle into a per-vertex visit-count map.
     fn walk_visit_counts(&self, walks: i64, g: i64) -> PyResult<i64> {
         self.check_deadline()?;

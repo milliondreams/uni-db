@@ -991,7 +991,7 @@ impl Executor {
 
         // DDL/admin queries don't flow through DataFusion — fall back to
         // single aggregate stat.
-        let (results, stats) = if Self::is_ddl_or_admin(&plan) {
+        let (results, stats) = if self.is_ddl_or_admin(&plan) {
             let results = self
                 .execute_subplan(plan, &prop_manager, params, None)
                 .await?;

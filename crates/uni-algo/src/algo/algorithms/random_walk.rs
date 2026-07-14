@@ -55,15 +55,18 @@ pub struct RandomWalkResult {
 /// Derive a deterministic per-walk seed from the base seed, start slot and walk
 /// index. This makes the parallel (`par_iter`) walk generation independent of
 /// thread scheduling: each walk owns a fully determined RNG stream.
+///
+/// The input mixing and the shared [`splitmix64_finalize`](crate::algo::rng::splitmix64_finalize)
+/// avalanche are byte-identical to the pre-promotion inline version, so shipped
+/// walk streams are unchanged by hoisting the finalizer (proposal §8, test S-6).
 #[inline]
 fn walk_seed(base: u64, start_slot: u32, walk_idx: usize) -> u64 {
-    // SplitMix64-style mixing of the three inputs.
-    let mut s = base
+    // SplitMix64-style mixing of the three inputs (same constants as before the
+    // finalizer was hoisted into `algo::rng`).
+    let s = base
         .wrapping_add((start_slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
         .wrapping_add((walk_idx as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
-    s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    s ^ (s >> 31)
+    crate::algo::rng::splitmix64_finalize(s)
 }
 
 /// Unnormalized weight of the outbound edge at `edge_idx` from `curr`.
@@ -255,6 +258,36 @@ mod tests {
 
     fn vids(n: u64) -> Vec<Vid> {
         (0..n).map(Vid::from).collect()
+    }
+
+    /// S-6 (proposal §8, non-regression): hoisting the SplitMix64 finalizer into
+    /// [`crate::algo::rng`] must not shift shipped walk streams. Recompute the
+    /// exact pre-hoist inline formula and require byte-identical seeds — this
+    /// pins the guard so a future edit to the shared finalizer that changed the
+    /// mixing would fail here before it changed any user's walks.
+    #[test]
+    fn walk_seed_is_byte_identical_to_the_prehoist_formula() {
+        let prehoist = |base: u64, start_slot: u32, walk_idx: usize| -> u64 {
+            let mut s = base
+                .wrapping_add((start_slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_add((walk_idx as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            s ^ (s >> 31)
+        };
+        for (base, slot, idx) in [
+            (0u64, 0u32, 0usize),
+            (1, 2, 3),
+            (u64::MAX, 7, 11),
+            (0x9E37_79B9_7F4A_7C15, 100, 1000),
+            (DEFAULT_SEED, 42, 5),
+        ] {
+            assert_eq!(
+                walk_seed(base, slot, idx),
+                prehoist(base, slot, idx),
+                "walk_seed drifted for ({base}, {slot}, {idx})"
+            );
+        }
     }
 
     /// A line + a triangle, undirected (edges added both ways) so node2vec's

@@ -627,6 +627,70 @@ mod tests {
         assert!(inter.contains_variant(&Capability::Network { allow: vec![] }));
     }
 
+    /// G-3 (proposal §9): a `GraphComputeWork` grant is a resource quota with no
+    /// allow-list to narrow, so its declared value survives capability
+    /// attenuation verbatim — the host cannot silently shrink it. This is the
+    /// property `WorkBudget::resolve` relies on to treat the grant as
+    /// authoritative and *raise* the ceiling (the §9 revision would be defeated
+    /// if attenuation clamped the grant down).
+    #[test]
+    fn graph_compute_work_grant_survives_attenuation_verbatim() {
+        let big = 5_000_000_000u64; // deliberately above the 1e9 size ceiling
+        let guest = CapabilitySet::from_iter_of([
+            Capability::GraphCompute,
+            Capability::GraphComputeWork(big),
+        ]);
+        let host = CapabilitySet::from_iter_of([
+            Capability::GraphCompute,
+            Capability::GraphComputeWork(big),
+        ]);
+        let inter = guest.intersect(&host);
+        let work = inter.iter().find_map(|c| match c {
+            Capability::GraphComputeWork(w) => Some(*w),
+            _ => None,
+        });
+        assert_eq!(
+            work,
+            Some(big),
+            "the work grant must survive attenuation unchanged"
+        );
+    }
+
+    /// G-6 (proposal §9): the work grant, arena-bytes cap, and wall-clock
+    /// deadline are independent dimensions — attenuating a set carrying all three
+    /// preserves each verbatim and does not let one move another.
+    #[test]
+    fn work_grant_is_independent_of_arena_and_wallclock() {
+        let caps = CapabilitySet::from_iter_of([
+            Capability::GraphComputeWork(1_234),
+            Capability::GraphComputeArenaBytes(9_999),
+            Capability::WallClockMillisPerCall(42),
+        ]);
+        let inter = caps.intersect(&caps);
+        let mut work = None;
+        let mut arena = None;
+        let mut wall = None;
+        for c in inter.iter() {
+            match c {
+                Capability::GraphComputeWork(w) => work = Some(*w),
+                Capability::GraphComputeArenaBytes(b) => arena = Some(*b),
+                Capability::WallClockMillisPerCall(ms) => wall = Some(*ms),
+                _ => {}
+            }
+        }
+        assert_eq!(work, Some(1_234));
+        assert_eq!(
+            arena,
+            Some(9_999),
+            "arena cap must be untouched by the work grant"
+        );
+        assert_eq!(
+            wall,
+            Some(42),
+            "wall-clock must be untouched by the work grant"
+        );
+    }
+
     /// Regression for the 2026-06-10 review #6: `intersect` must bound the
     /// guest's allow-list by the host grant (the host is the ceiling), not clone
     /// the guest's broader list. A guest that declares `**` must not reach hosts

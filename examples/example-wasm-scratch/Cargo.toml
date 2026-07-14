@@ -1,0 +1,31 @@
+# Standalone example Component Model plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-wasm-scratch
+#   cargo build --target wasm32-wasip2 --release
+#
+# Produces target/wasm32-wasip2/release/example_wasm_scratch.wasm.
+#
+# A Mode B-seq (§7b) guest: builds and walks a session-local scratch graph
+# through the imported `host-graph` interface (one JSON op per call), driven by
+# a bare wasmtime harness that backs `host-graph` with a `ScratchRegistry`.
+[workspace]
+
+[package]
+name = "example-wasm-scratch"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Component Model plugin: Mode B-seq scratch graph via host-graph"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

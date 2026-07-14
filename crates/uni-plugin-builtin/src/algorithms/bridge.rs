@@ -218,8 +218,13 @@ impl AlgorithmHostBridge {
     ///
     /// Uses a plugin's declared [`Capability::GraphComputeWork`] /
     /// [`Capability::GraphComputeArenaBytes`] quota when present, otherwise the
-    /// pinned defaults (proposal §12). The work cap is combined with the
-    /// edge-count multiple by the caller.
+    /// pinned defaults (proposal §12). The work cap is returned verbatim (a
+    /// `Some(w)` grant survives capability attenuation unchanged, test G-3) and
+    /// resolved against the size-derived default by
+    /// [`WorkBudget::resolve`](crate::algorithms::graph_compute::WorkBudget::resolve),
+    /// where an explicit grant is authoritative and may *raise* the ceiling
+    /// (proposal §9). The work grant and the arena-byte cap are independent
+    /// dimensions (test G-6).
     #[must_use]
     pub fn graph_compute_caps(&self) -> (Option<u64>, usize) {
         let mut work = None;

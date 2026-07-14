@@ -69,6 +69,7 @@ impl ReachabilityProvider {
             signature: AlgorithmSignature {
                 output_fields,
                 docs: "uni.algo.reachability(sourceVid[, config]) — BFS reachable set".to_owned(),
+                df_composable: true,
                 ..Default::default()
             },
         }

@@ -82,6 +82,27 @@ pub fn shape_mismatch(cause: impl Into<String>) -> FnError {
     FnError::new(SHAPE_MISMATCH, cause.into())
 }
 
+/// Builds a `0x86C` capability-denied error from a formatted cause.
+///
+/// Raised when a guest requests a surface its capabilities/loader class does not
+/// permit — e.g. a Mode B-seq sequential body authored by an *interpreted* loader
+/// (Rhai row-mode), which is disqualified on perf (proposal §7b, test Q-6).
+#[must_use]
+pub fn capability_denied(cause: impl Into<String>) -> FnError {
+    FnError::new(CAPABILITY_DENIED, cause.into())
+}
+
+/// Builds a `0x86E` argument-validation error from a formatted cause.
+///
+/// Raised when a kernel is called with a structurally invalid argument that is
+/// not a shape/dtype fault — e.g. a masked-traversal kernel handed an
+/// `In` direction, which is undefined against the out-CSR edge mask (proposal
+/// §5). Distinct from `0x862` (operand shape) so a guest can tell the two apart.
+#[must_use]
+pub fn arg_validation(cause: impl Into<String>) -> FnError {
+    FnError::new(ARG_VALIDATION, cause.into())
+}
+
 /// Builds a `0x863` epoch-mismatch error (cross-session or forged handle).
 #[must_use]
 pub fn epoch_mismatch() -> FnError {

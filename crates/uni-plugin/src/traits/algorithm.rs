@@ -43,6 +43,20 @@ pub struct AlgorithmSignature {
     /// does not provide fails the load with a clear error (`0x86A`) rather than a
     /// mysterious runtime "unknown kernel op" trap.
     pub slices: Vec<SliceReq>,
+    /// Whether a `CALL` of this algorithm may be planned as a first-class
+    /// DataFusion `ExecutionPlan` node (the vectorized path), rather than only
+    /// through the row-based interpreter (proposal §6, DF-3).
+    ///
+    /// `false` (the default) preserves the row path. A provider sets this `true`
+    /// to *declare* it composes correctly as a leaf/source plan node — its `run`
+    /// returns a well-formed `RecordBatch` stream matching `output_fields`, and it
+    /// consumes MATCH-bound arguments via `outer_values` rather than a child plan.
+    /// This replaces the previous name-prefix allowlist (`uni.algo.*`): eligibility
+    /// is now **registration-driven**, so a third-party `myco.algo.*` provider that
+    /// declares `df_composable` is a first-class plan node like the first-party
+    /// ones, and a `uni.algo.`-named provider that does *not* declare it no longer
+    /// gets the DF path by prefix alone.
+    pub df_composable: bool,
 }
 
 /// A required capability-slice version an algorithm declares in its signature.

@@ -46,8 +46,10 @@ pub enum DType {
 /// reserved for embeddings and free weight matrices (proposal §4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    /// A `[V]` per-vertex scalar map — the only v1 shape.
+    /// A `[V]` per-vertex scalar map — the original v1 shape.
     V,
+    /// A `[E]` per-edge scalar map, indexed by CSR out-edge order (proposal §5).
+    E,
     /// A `[V, d]` per-vertex embedding matrix (reserved).
     Vd(u32),
     /// A `[d]` free vector (reserved).
@@ -241,6 +243,98 @@ impl VertexSet {
     }
 }
 
+/// A set of edge indices, stored as a fixed-capacity bitset (proposal §5).
+///
+/// Mirrors [`VertexSet`] but addresses `[E]` edges in CSR out-edge order rather
+/// than vertex slots, so it is the natural *edge mask*: the stochastic
+/// edge-subset kernels (grid reliability, percolation) and edge-masked traversal
+/// activate an edge iff its bit is set. Delegates to [`VertexSet`] for the
+/// word-wise bit logic, so membership and set ops inherit its determinism
+/// (ascending-index iteration, capacity-checked inserts).
+///
+/// # Examples
+/// ```
+/// use uni_plugin_builtin::algorithms::graph_compute::value::EdgeSet;
+///
+/// let mut m = EdgeSet::with_capacity(8);
+/// m.insert(2);
+/// m.insert(5);
+/// assert!(m.contains(2) && !m.contains(3));
+/// assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 5]);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeSet(VertexSet);
+
+impl EdgeSet {
+    /// Creates an empty edge mask able to hold edge indices `0..capacity`.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(VertexSet::with_capacity(capacity))
+    }
+
+    /// Returns the edge-index capacity (the projection edge count).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Inserts `edge` into the mask.
+    ///
+    /// # Panics
+    /// Panics if `edge >= capacity` (a host-side programming error, since edge
+    /// indices are always derived from the projection's own edge count).
+    pub fn insert(&mut self, edge: u32) {
+        self.0.insert(edge);
+    }
+
+    /// Returns `true` if `edge` is in the mask (and in range).
+    #[must_use]
+    pub fn contains(&self, edge: u32) -> bool {
+        self.0.contains(edge)
+    }
+
+    /// Returns the number of edges in the mask.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if the mask is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates mask edges in ascending index order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter()
+    }
+
+    /// Returns the union of `self` and `other` (capacities must match).
+    #[must_use]
+    pub fn union(&self, other: &EdgeSet) -> EdgeSet {
+        EdgeSet(self.0.union(&other.0))
+    }
+
+    /// Returns the intersection of `self` and `other`.
+    #[must_use]
+    pub fn intersect(&self, other: &EdgeSet) -> EdgeSet {
+        EdgeSet(self.0.intersect(&other.0))
+    }
+
+    /// Returns the set difference `self \ other`.
+    #[must_use]
+    pub fn difference(&self, other: &EdgeSet) -> EdgeSet {
+        EdgeSet(self.0.difference(&other.0))
+    }
+
+    /// Returns the number of bytes this mask holds live, for arena accounting.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.0.heap_bytes()
+    }
+}
+
 /// The physical Arrow buffer behind a [`Tensor`].
 ///
 /// The `f64` path is the v1 default; the `i64` path backs exact integer
@@ -310,6 +404,42 @@ impl Tensor {
             shape: Shape::V,
             dtype: DType::I64,
             buf: TensorBuf::I64(Int64Array::from(values)),
+        }
+    }
+
+    /// Builds a `[E]` per-edge `f64` tensor from a value vector (proposal §5).
+    ///
+    /// Values are indexed by CSR out-edge order
+    /// ([`GraphProjection::out_edge_start`](uni_algo::algo::projection::GraphProjection::out_edge_start)),
+    /// so element `e` is the value on the `e`-th edge. Shape [`Shape::E`]
+    /// distinguishes it from a `[V]` map at the kernel boundary; a kernel
+    /// expecting one shape rejects the other with `0x862`.
+    #[must_use]
+    pub fn from_f64_edge(values: Vec<f64>) -> Self {
+        Self {
+            shape: Shape::E,
+            dtype: DType::F64,
+            buf: TensorBuf::F64(Float64Array::from(values)),
+        }
+    }
+
+    /// Returns `true` if this is a `[E]` (per-edge) tensor.
+    #[must_use]
+    pub fn is_edge_shaped(&self) -> bool {
+        matches!(self.shape, Shape::E)
+    }
+
+    /// Builds an `f64` tensor from `values`, carrying an explicit `shape`.
+    ///
+    /// Used by shape-preserving elementwise kernels (e.g. `map_apply`) so an
+    /// operation on a `[E]` tensor stays `[E]` rather than collapsing to the
+    /// `[V]` default (proposal §5).
+    #[must_use]
+    pub fn from_f64_shaped(values: Vec<f64>, shape: Shape) -> Self {
+        Self {
+            shape,
+            dtype: DType::F64,
+            buf: TensorBuf::F64(Float64Array::from(values)),
         }
     }
 

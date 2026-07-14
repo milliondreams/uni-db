@@ -71,6 +71,8 @@ pub enum HandleKind {
     Levels = 4,
     /// A per-edge `(src, dst, value)` pair list (all-pairs overlap / k-truss).
     Pairs = 5,
+    /// A set of edge indices (an edge mask, proposal §5 `Shape::E`).
+    EdgeSet = 6,
 }
 
 impl HandleKind {
@@ -90,6 +92,7 @@ impl HandleKind {
             3 => Some(HandleKind::Walks),
             4 => Some(HandleKind::Levels),
             5 => Some(HandleKind::Pairs),
+            6 => Some(HandleKind::EdgeSet),
             _ => None,
         }
     }

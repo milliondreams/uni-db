@@ -483,12 +483,25 @@ impl ExecutionPlan for GraphProcedureCallExec {
 // Stream implementation
 // ---------------------------------------------------------------------------
 
+/// The outcome of dispatching a procedure: either a single materialized batch
+/// (the buffered path used by every non-algorithm procedure) or a live provider
+/// stream forwarded incrementally (the DF-4 streaming lift for algorithm
+/// providers).
+enum ProcStep {
+    /// A single (already-projected) result batch, or `None` for no rows.
+    Single(Option<RecordBatch>),
+    /// A live, per-batch-projected provider stream to drain incrementally.
+    Stream(SendableRecordBatchStream),
+}
+
 /// State machine for procedure call stream.
 enum ProcedureCallState {
     /// Initial state, ready to start execution.
     Init,
-    /// Executing the async procedure.
-    Executing(Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>>),
+    /// Executing the async dispatch, resolving to a [`ProcStep`].
+    Executing(Pin<Box<dyn std::future::Future<Output = DFResult<ProcStep>> + Send>>),
+    /// Draining a provider stream one batch at a time (DF-4).
+    Draining(SendableRecordBatchStream),
     /// Stream is done.
     Done,
 }
@@ -551,6 +564,25 @@ impl Stream for ProcedureCallStream {
                             datafusion::error::DataFusionError::Execution(e.to_string())
                         })?;
 
+                        // DF-4 streaming lift: an algorithm provider (procedure-
+                        // table miss + algorithm-registry hit) is forwarded
+                        // incrementally; every other procedure keeps the buffered
+                        // single-batch path unchanged.
+                        if let Some(reg) = graph_ctx.procedure_registry()
+                            && reg.resolve_user_procedure(&procedure_name).is_none()
+                            && let Some(entry) = reg.resolve_user_algorithm(&procedure_name)
+                        {
+                            let stream = execute_algorithm_provider_streaming(
+                                &graph_ctx,
+                                &procedure_name,
+                                &entry,
+                                &evaluated_args,
+                                &yield_items,
+                                &schema,
+                            )?;
+                            return Ok(ProcStep::Stream(stream));
+                        }
+
                         execute_procedure(
                             &graph_ctx,
                             &procedure_name,
@@ -560,16 +592,20 @@ impl Stream for ProcedureCallStream {
                             &schema,
                         )
                         .await
+                        .map(ProcStep::Single)
                     };
 
                     self.state = ProcedureCallState::Executing(Box::pin(fut));
                 }
                 ProcedureCallState::Executing(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(batch)) => {
+                    Poll::Ready(Ok(ProcStep::Single(batch))) => {
                         self.state = ProcedureCallState::Done;
                         self.metrics
                             .record_output(batch.as_ref().map(|b| b.num_rows()).unwrap_or(0));
                         return Poll::Ready(batch.map(Ok));
+                    }
+                    Poll::Ready(Ok(ProcStep::Stream(stream))) => {
+                        self.state = ProcedureCallState::Draining(stream);
                     }
                     Poll::Ready(Err(e)) => {
                         self.state = ProcedureCallState::Done;
@@ -577,6 +613,25 @@ impl Stream for ProcedureCallStream {
                     }
                     Poll::Pending => {
                         self.state = ProcedureCallState::Executing(fut);
+                        return Poll::Pending;
+                    }
+                },
+                ProcedureCallState::Draining(mut stream) => match stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(batch))) => {
+                        self.metrics.record_output(batch.num_rows());
+                        self.state = ProcedureCallState::Draining(stream);
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        self.state = ProcedureCallState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(None) => {
+                        self.state = ProcedureCallState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {
+                        self.state = ProcedureCallState::Draining(stream);
                         return Poll::Pending;
                     }
                 },
@@ -685,6 +740,23 @@ async fn execute_algorithm_provider(
     yield_items: &[(String, Option<String>)],
     schema: &SchemaRef,
 ) -> DFResult<Option<RecordBatch>> {
+    let stream = run_algorithm_provider_raw(graph_ctx, procedure_name, entry, args)?;
+    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
+}
+
+/// Runs an [`AlgorithmProvider`] and returns its **raw** `RecordBatch` stream.
+///
+/// Shared by the buffered path ([`execute_algorithm_provider`]) and the
+/// streaming path ([`execute_algorithm_provider_streaming`], proposal §6 DF-4):
+/// builds the positional `config_json`, snapshots L0 for read-your-writes
+/// visibility, and starts the provider. Neither finalization nor projection is
+/// applied here.
+fn run_algorithm_provider_raw(
+    graph_ctx: &GraphExecutionContext,
+    procedure_name: &str,
+    entry: &uni_plugin::registry::AlgorithmEntry,
+    args: &[Value],
+) -> DFResult<SendableRecordBatchStream> {
     // Positional JSON array — the provider `config_json` contract.
     let json_args: Vec<serde_json::Value> = args
         .iter()
@@ -706,7 +778,7 @@ async fn execute_algorithm_provider(
         ))
     });
 
-    let stream = crate::procedures_plugin::algo::run_algorithm_provider(
+    crate::procedures_plugin::algo::run_algorithm_provider(
         entry,
         Arc::clone(graph_ctx.storage()),
         l0_mgr,
@@ -714,9 +786,37 @@ async fn execute_algorithm_provider(
     )
     .map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Algorithm '{procedure_name}': {e}"))
-    })?;
+    })
+}
 
-    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
+/// Streams an [`AlgorithmProvider`]'s batches **incrementally** (proposal §6,
+/// DF-4), applying the per-batch `YIELD` projection without buffering the whole
+/// result into one `RecordBatch`.
+///
+/// The peak buffered batches stay bounded (« the total the provider emits),
+/// replacing the `concat_batches`-to-one materialization on the algorithm-
+/// provider path. Provider `Err` items are forwarded verbatim so their tagged
+/// `GraphComputeIncomplete` messages survive (the row/DF paths stay correctness
+/// twins, DF-2). This is the lift the Mode B-vec iteration driver builds on.
+fn execute_algorithm_provider_streaming(
+    graph_ctx: &GraphExecutionContext,
+    procedure_name: &str,
+    entry: &uni_plugin::registry::AlgorithmEntry,
+    args: &[Value],
+    yield_items: &[(String, Option<String>)],
+    schema: &SchemaRef,
+) -> DFResult<SendableRecordBatchStream> {
+    use futures::StreamExt;
+
+    let raw = run_algorithm_provider_raw(graph_ctx, procedure_name, entry, args)?;
+    let yield_items = yield_items.to_vec();
+    let procedure_name = procedure_name.to_string();
+    let projected = raw.map(move |item| {
+        item.and_then(|batch| project_procedure_batch(batch, &yield_items, &procedure_name))
+    });
+    Ok(Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema.clone(), projected),
+    ))
 }
 
 /// Execute a procedure via the plugin framework.
@@ -832,39 +932,53 @@ async fn finalize_procedure_stream(
         arrow::compute::concat_batches(&plugin_schema, &batches).map_err(arrow_err)?
     };
 
-    // Pass-through when the plugin already produced columns matching
-    // the planner-expected schema (search procedures do this — they
-    // expand `node` yields into `{alias}._vid` / `{alias}` etc.).
+    // Pass-through when the plugin already produced columns matching the
+    // planner-expected schema (search procedures do this — they expand `node`
+    // yields into `{alias}._vid` / `{alias}` etc.).
     if combined.schema().fields() == schema.fields() {
         return Ok(Some(combined));
     }
 
-    // Project the requested yield columns. If the caller asked for a
-    // subset (or different order), reproject; otherwise pass through.
+    project_procedure_batch(combined, yield_items, procedure_name).map(Some)
+}
+
+/// Projects one procedure-output batch onto the requested `YIELD` columns.
+///
+/// Deterministic per-batch (the provider's output schema is constant), so it is
+/// reused by both the buffered [`finalize_procedure_stream`] and the streaming
+/// path (proposal §6, DF-4): a passthrough when the batch already matches the
+/// planner schema or the yields are the identity, otherwise a by-name column
+/// reprojection. Factoring it out lets the streaming path apply the same
+/// projection to each batch without buffering the whole result.
+fn project_procedure_batch(
+    batch: RecordBatch,
+    yield_items: &[(String, Option<String>)],
+    procedure_name: &str,
+) -> DFResult<RecordBatch> {
+    // Identity passthrough: the yields already name the batch's columns in order.
     if yield_items.is_empty()
-        || (yield_items.len() == combined.num_columns()
+        || (yield_items.len() == batch.num_columns()
             && yield_items
                 .iter()
-                .zip(combined.schema().fields().iter())
+                .zip(batch.schema().fields().iter())
                 .all(|((name, _alias), field)| name == field.name()))
     {
-        return Ok(Some(combined));
+        return Ok(batch);
     }
 
     let mut projected_cols: Vec<ArrayRef> = Vec::with_capacity(yield_items.len());
     let mut projected_fields: Vec<Field> = Vec::with_capacity(yield_items.len());
     for (name, _alias) in yield_items {
-        let idx = combined.schema().index_of(name).map_err(|_| {
+        let idx = batch.schema().index_of(name).map_err(|_| {
             datafusion::error::DataFusionError::Execution(format!(
                 "Procedure '{procedure_name}': YIELD column `{name}` not in plugin output schema"
             ))
         })?;
-        projected_cols.push(combined.column(idx).clone());
-        projected_fields.push(combined.schema().field(idx).clone());
+        projected_cols.push(batch.column(idx).clone());
+        projected_fields.push(batch.schema().field(idx).clone());
     }
     let projected_schema = Arc::new(Schema::new(projected_fields));
-    let projected = RecordBatch::try_new(projected_schema, projected_cols).map_err(arrow_err)?;
-    Ok(Some(projected))
+    RecordBatch::try_new(projected_schema, projected_cols).map_err(arrow_err)
 }
 
 /// Convert a [`uni_common::Value`] into a DataFusion

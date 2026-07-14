@@ -107,6 +107,27 @@ impl GraphProjection {
         self.out_weights.as_ref().expect("no weights")[start + edge_idx]
     }
 
+    /// Global index of a vertex's first outbound edge in CSR edge order.
+    ///
+    /// Outbound edges are numbered `0..edge_count()` in CSR layout order, so
+    /// slot `u`'s `k`-th out-neighbor is edge `out_edge_start(u) + k`. This is the
+    /// canonical `[E]` edge index a per-edge tensor or edge mask addresses
+    /// (plugin-compute proposal §5, `Shape::E`).
+    ///
+    /// # Examples
+    /// ```
+    /// # use uni_algo::algo::projection::GraphProjection;
+    /// # fn demo(g: &GraphProjection) {
+    /// // The first out-edge of slot 0 is global edge index out_edge_start(0).
+    /// let e0 = g.out_edge_start(0);
+    /// assert_eq!(e0, 0);
+    /// # }
+    /// ```
+    #[inline]
+    pub fn out_edge_start(&self, slot: u32) -> usize {
+        self.out_offsets[slot as usize] as usize
+    }
+
     /// Check if weights are available.
     #[inline]
     pub fn has_weights(&self) -> bool {

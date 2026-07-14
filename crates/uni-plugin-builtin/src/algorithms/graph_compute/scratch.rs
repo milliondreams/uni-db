@@ -747,7 +747,9 @@ mod tests {
             // Build a small binary game tree (root 0 → {1,2}; 1 → {3,4}; 2 → {5,6}).
             // `add_node` returns the new node's dense slot id, so ids arrive 0..7.
             for expected in 0..7u32 {
-                let got = node(op(format!(r#"{{"session":{sid},"op":"add_node","f":0.0}}"#)));
+                let got = node(op(format!(
+                    r#"{{"session":{sid},"op":"add_node","f":0.0}}"#
+                )));
                 assert_eq!(got, expected, "add_node returns dense slot ids in order");
             }
             for (p, c) in [(0, 1), (0, 2), (1, 3), (1, 4), (2, 5), (2, 6)] {

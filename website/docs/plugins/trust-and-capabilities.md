@@ -115,19 +115,44 @@ effective = declared ∩ granted
 
 A capability the plugin never declared cannot be granted into existence, and a
 capability the host did not grant is stripped even if declared. On the load APIs,
-the `grants` argument is a list of capability *name* strings. The recognized
-names are:
+the `grants` argument is a list of capability *name* strings. Common grants:
 
 | Grant | Surface |
 | --- | --- |
 | `ScalarFn` | Register Cypher scalar functions |
 | `AggregateFn` | Register Cypher aggregate functions |
 | `Procedure` | Register Cypher procedures (read-only) |
+| `Algorithm` | Register graph algorithms |
+| `GraphCompute` | Drive the GraphCompute coarse kernels (guest-authored graph algorithms) |
 | `Filesystem` | Filesystem read/write host import |
 | `Network` | HTTP/TCP egress host import |
-| `HostQuery` | Query back into the host session |
+| `HostQuery` | Query back into the host session (also: project a graph for `GraphCompute`) |
 | `Kms` | KMS sign/verify host import |
 | `Secret` | Acquire named secret handles |
+
+The full grantable set — 21 extension registration-gates plus 7 allow-list host
+surfaces — is the single source of truth in `uni_plugin::Capability`; see the
+[reference](reference.md#capability-names) for the complete tables. A
+guest-authored graph algorithm needs the triple `Algorithm` + `GraphCompute` +
+`HostQuery`.
+
+### What is *not* grantable from a string
+
+Two classes of capability are deliberately unreachable through the `grants` list:
+
+- **Resource quotas** (`MemoryBytes`, `FuelPerCall`, `GraphComputeWork`, …) carry
+  a numeric value and are declared in the plugin **manifest's** `capabilities:`
+  list, never as a bare grant string.
+- **Internal / first-party** capabilities (`Auth`, `Authz`, `Cdc`, `Catalog`,
+  `PluginDeclare`) are never granted to a guest; only host code constructs them.
+
+Grant names are case- and separator-insensitive: `HostQuery` and `host-query`
+resolve identically. The strict load paths (Rhai, and the source-string Python
+plugin loader) raise on an unknown, quota, or internal name; the lenient
+decorator / WASM paths drop it. Adding a new `Capability` variant is caught by
+the `every_variant_classified_exactly_once` test in `uni-plugin`, which forces it
+to be classified as grantable, quota, or internal before it can ship — the
+mechanism that keeps this surface from drifting.
 
 ### How withheld capabilities take effect
 

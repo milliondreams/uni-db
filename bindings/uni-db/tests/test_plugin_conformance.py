@@ -137,9 +137,7 @@ def _loader(database, method):
 def test_builtin_gcpagerank_callable_from_python(db):
     """#150's premise: the native GraphCompute PageRank is CALL-able from Python."""
     vid_a = _build_pagerank_graph(db)
-    scores = _scores_by_node(
-        db.session(), f"CALL uni.algo.gcpagerank({vid_a}, 0.85)"
-    )
+    scores = _scores_by_node(db.session(), f"CALL uni.algo.gcpagerank({vid_a}, 0.85)")
     assert len(scores) == 4
     assert math.isclose(sum(scores.values()), 1.0, abs_tol=1e-6)
     assert all(math.isfinite(s) and s >= 0.0 for s in scores.values())
@@ -325,9 +323,7 @@ def test_pyo3_procedure_granted_registers_and_invokes(db):
     outcome = _register_pyo3_procedure(session)
     assert "ai.example.pyproc.evens" in outcome["procedures_registered"]
     # Procedures resolve by fully-qualified name.
-    rows = session.query(
-        "CALL ai.example.pyproc.evens() YIELD col0 RETURN col0"
-    )
+    rows = session.query("CALL ai.example.pyproc.evens() YIELD col0 RETURN col0")
     assert [int(r["col0"]) for r in rows] == [0, 2, 4]
 
 

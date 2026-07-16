@@ -258,6 +258,38 @@ impl CapabilitySet {
         out
     }
 
+    /// Capabilities this (guest-declared) set requested but the host withheld.
+    ///
+    /// Membership is tested by *variant* against the post-attenuation
+    /// `effective` set: a payload capability that survived
+    /// [`CapabilitySet::intersect`] with a narrowed allow-list (e.g. a
+    /// `HostQuery` whose `scopes` the host tightened) is **granted, not denied**,
+    /// even though its effective payload differs from what was declared. Exact
+    /// equality against the raw grant would misreport such a cap as denied; this
+    /// helper — shared by every loader — is the single correct derivation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use uni_plugin::{Capability, CapabilitySet};
+    ///
+    /// let declared = CapabilitySet::from_iter_of([
+    ///     Capability::ScalarFn,
+    ///     Capability::Algorithm,
+    /// ]);
+    /// let granted = CapabilitySet::from_iter_of([Capability::ScalarFn]);
+    /// let effective = declared.intersect(&granted);
+    /// assert_eq!(declared.denied_against(&effective), vec![Capability::Algorithm]);
+    /// ```
+    #[must_use]
+    pub fn denied_against(&self, effective: &CapabilitySet) -> Vec<Capability> {
+        self.set
+            .iter()
+            .filter(|c| !effective.contains_variant(c))
+            .cloned()
+            .collect()
+    }
+
     /// Returns an iterator over the contained capabilities.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.set.iter()
@@ -1010,6 +1042,32 @@ mod tests {
             Capability::parse_grant("NotARealCapability"),
             Err(GrantError::Unknown { .. })
         ));
+    }
+
+    #[test]
+    fn denied_against_ignores_attenuated_but_granted_payload() {
+        // Guest asks for a narrow HostQuery scope; host grants a broader one.
+        // After intersect the effective HostQuery survives (with the guest's
+        // narrowed payload), so it must NOT be reported denied — the bug the
+        // exact-`contains` derivation had.
+        let declared = CapabilitySet::from_iter_of([
+            Capability::HostQuery {
+                read_only: true,
+                scopes: vec![SmolStr::new("a")],
+            },
+            Capability::Algorithm,
+        ]);
+        let granted = CapabilitySet::from_iter_of([
+            Capability::HostQuery {
+                read_only: true,
+                scopes: vec![SmolStr::new("a"), SmolStr::new("b")],
+            },
+            // Algorithm withheld.
+        ]);
+        let effective = declared.intersect(&granted);
+        let denied = declared.denied_against(&effective);
+        // HostQuery is granted (attenuated), only the withheld Algorithm is denied.
+        assert_eq!(denied, vec![Capability::Algorithm]);
     }
 
     #[test]

@@ -319,9 +319,10 @@ impl ExtismLoader {
         // Effective = declared ∩ granted (retains per-variant attenuation).
         let declared = manifest.declared_capability_set();
         let effective = declared.intersect(grants);
+        // Shared variant-aware derivation via `CapabilitySet::denied_against`.
         let denied: Vec<String> = declared
+            .denied_against(&effective)
             .iter()
-            .filter(|c| !effective.contains_variant(c))
             .map(|c| format!("{c:?}"))
             .collect();
 
@@ -479,6 +480,7 @@ impl ExtismLoader {
         let mut scalars_registered: Vec<String> = Vec::new();
         let mut aggregates_registered: Vec<String> = Vec::new();
         let mut procedures_registered: Vec<String> = Vec::new();
+        let mut algorithms_registered: Vec<String> = Vec::new();
 
         for entry in registration.entries {
             match entry {
@@ -562,6 +564,7 @@ impl ExtismLoader {
                     registrar.algorithm(parsed_qname, adapter).map_err(|e| {
                         ExtismError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
                     })?;
+                    algorithms_registered.push(qname);
                 }
             }
         }
@@ -578,6 +581,7 @@ impl ExtismLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             pool,
         })
     }
@@ -716,6 +720,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Qnames registered as procedures.
     pub procedures_registered: Vec<String>,
+    /// Qnames registered as graph-compute algorithms.
+    pub algorithms_registered: Vec<String>,
     /// The instance pool, shared across every adapter bound to this
     /// plugin. Adapters hold an `Arc` clone; the pool is kept alive as
     /// long as any adapter remains in the registry.
@@ -732,6 +738,7 @@ impl std::fmt::Debug for LoadOutcome {
             .field("scalars_registered", &self.scalars_registered)
             .field("aggregates_registered", &self.aggregates_registered)
             .field("procedures_registered", &self.procedures_registered)
+            .field("algorithms_registered", &self.algorithms_registered)
             .finish_non_exhaustive()
     }
 }

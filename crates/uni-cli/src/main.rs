@@ -267,6 +267,9 @@ async fn install_plugin(db: &uni_db::Uni, source: &str, grants: Option<&str>) ->
                 if !outcome.procedures_registered.is_empty() {
                     println!("  procedures: {}", outcome.procedures_registered.join(", "));
                 }
+                if !outcome.algorithms_registered.is_empty() {
+                    println!("  algorithms: {}", outcome.algorithms_registered.join(", "));
+                }
                 if !outcome.denied_capabilities.is_empty() {
                     println!(
                         "{} denied capabilities: {:?}",

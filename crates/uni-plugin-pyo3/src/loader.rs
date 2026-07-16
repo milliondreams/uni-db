@@ -58,6 +58,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Procedure qnames registered (M8.7).
     pub procedures_registered: Vec<String>,
+    /// Algorithm qnames registered (gated on `Capability::Algorithm`).
+    pub algorithms_registered: Vec<String>,
     /// Strong reference to the per-plugin runtime. Adapters hold inner
     /// `Arc` clones; the host can drop this on unload to release the
     /// captured callables.
@@ -237,14 +239,16 @@ impl PyPluginLoader {
         } else {
             Vec::new()
         };
-        if effective.contains(&Capability::Algorithm) {
+        let algorithms_registered = if effective.contains(&Capability::Algorithm) {
             register_algorithms(
                 registrar,
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.algorithms,
-            )?;
-        }
+            )?
+        } else {
+            Vec::new()
+        };
 
         Ok(LoadOutcome {
             plugin_id: resolved_id,
@@ -254,6 +258,7 @@ impl PyPluginLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             runtime,
         })
     }
@@ -539,11 +544,10 @@ fn intersect_caps(
     granted: &CapabilitySet,
 ) -> (CapabilitySet, Vec<Capability>) {
     let effective = declared.intersect(granted);
-    let denied: Vec<Capability> = declared
-        .iter()
-        .filter(|c| !granted.contains(c))
-        .cloned()
-        .collect();
+    // Denied = declared minus effective, tested by variant so an
+    // attenuated-but-granted payload cap (e.g. a narrowed HostQuery) is not
+    // misreported as denied. See `CapabilitySet::denied_against`.
+    let denied = declared.denied_against(&effective);
     (effective, denied)
 }
 

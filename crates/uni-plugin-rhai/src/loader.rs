@@ -57,6 +57,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Procedure qnames registered.
     pub procedures_registered: Vec<String>,
+    /// Algorithm qnames registered (gated on `Capability::Algorithm`).
+    pub algorithms_registered: Vec<String>,
     /// Strong reference to the per-plugin runtime. Adapters hold inner
     /// `Arc` clones; the host can drop this on unload to release the
     /// engine.
@@ -259,12 +261,14 @@ impl RhaiLoader {
             }
         }
 
+        let mut algorithms_registered = Vec::new();
         if effective.contains(&Capability::Algorithm) {
             for entry in &manifest.algorithms {
                 let sig = build_algorithm_signature(entry)?;
                 let qname = QName::new(plugin_id.as_str(), entry.name.clone());
                 let adapter =
                     RhaiAlgorithm::new(Arc::clone(&runtime), entry.name.clone(), sig.clone());
+                algorithms_registered.push(qname.to_string());
                 registrar
                     .algorithm(qname, Arc::new(adapter))
                     .map_err(plugin_to_rhai_err)?;
@@ -279,6 +283,7 @@ impl RhaiLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             runtime,
         })
     }
@@ -389,11 +394,10 @@ fn intersect_caps(
     granted: &CapabilitySet,
 ) -> (CapabilitySet, Vec<Capability>) {
     let effective = declared.intersect(granted);
-    let denied: Vec<Capability> = declared
-        .iter()
-        .filter(|c| !granted.contains(c))
-        .cloned()
-        .collect();
+    // Denied = declared minus effective, tested by variant so an
+    // attenuated-but-granted payload cap (e.g. a narrowed HostQuery) is not
+    // misreported as denied. See `CapabilitySet::denied_against`.
+    let denied = declared.denied_against(&effective);
     (effective, denied)
 }
 

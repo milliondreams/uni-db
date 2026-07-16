@@ -574,10 +574,11 @@ impl WasmLoader {
         let declared = manifest.declared_capability_set();
         // Effective = declared ∩ granted (retains per-variant attenuation).
         let effective = declared.intersect(grants);
-        // Declared variants the host did not grant — diagnostics only.
+        // Declared variants the host did not grant — diagnostics only. Shared
+        // variant-aware derivation via `CapabilitySet::denied_against`.
         let denied: Vec<String> = declared
+            .denied_against(&effective)
             .iter()
-            .filter(|c| !effective.contains_variant(c))
             .map(|c| format!("{c:?}"))
             .collect();
         PreparedComponent {
@@ -671,6 +672,7 @@ impl WasmLoader {
             scalars_registered: names.scalars,
             aggregates_registered: names.aggregates,
             procedures_registered: names.procedures,
+            algorithms_registered: names.algorithms,
             pool,
         })
     }
@@ -738,6 +740,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Qnames registered as procedures.
     pub procedures_registered: Vec<String>,
+    /// Qnames registered as graph-compute algorithms.
+    pub algorithms_registered: Vec<String>,
     /// Scalar-plugin instance pool — `None` if no scalars registered.
     pub pool: Arc<WasmInstancePool<ScalarPluginInstance>>,
 }
@@ -752,6 +756,7 @@ impl std::fmt::Debug for LoadOutcome {
             .field("scalars_registered", &self.scalars_registered)
             .field("aggregates_registered", &self.aggregates_registered)
             .field("procedures_registered", &self.procedures_registered)
+            .field("algorithms_registered", &self.algorithms_registered)
             .finish_non_exhaustive()
     }
 }
@@ -995,6 +1000,7 @@ struct RegisteredQNames {
     scalars: Vec<String>,
     aggregates: Vec<String>,
     procedures: Vec<String>,
+    algorithms: Vec<String>,
 }
 
 /// Replay a parsed `register` manifest into `registrar`.
@@ -1013,6 +1019,7 @@ fn apply_registration(
     let mut scalars = Vec::new();
     let mut aggregates = Vec::new();
     let mut procedures = Vec::new();
+    let mut algorithms = Vec::new();
     let mut agg_pool: Option<Arc<WasmInstancePool<AggregatePluginInstance>>> = None;
     let mut proc_pool: Option<Arc<WasmInstancePool<ProcedurePluginInstance>>> = None;
     let mut algo_pool: Option<Arc<WasmInstancePool<AlgorithmPluginInstance>>> = None;
@@ -1115,6 +1122,7 @@ fn apply_registration(
                 registrar.algorithm(parsed_qname, adapter).map_err(|e| {
                     WasmError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
                 })?;
+                algorithms.push(qname);
             }
         }
     }
@@ -1123,6 +1131,7 @@ fn apply_registration(
         scalars,
         aggregates,
         procedures,
+        algorithms,
     })
 }
 

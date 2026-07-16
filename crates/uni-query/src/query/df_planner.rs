@@ -5087,9 +5087,26 @@ impl HybridPhysicalPlanner {
                     // ids that themselves contain dots (e.g. `ai.example`)
                     // resolve as well as single-segment ids. See
                     // `QName::candidate_splits`.
-                    let resolved = uni_plugin::QName::candidate_splits(&name_lower)
-                        .find_map(|q| self.plugin_registry.aggregate(&q).map(|e| (q, e)));
-                    if let Some((qname, entry)) = resolved {
+                    // Resolve against the instance/host registry first, then the
+                    // session-local registry — session-scoped aggregates (e.g.
+                    // registered via `session.finalize_plugin`) live only there,
+                    // mirroring the scalar wiring in `read.rs`. The matched
+                    // registry is threaded into `PluginAggregateUdaf` because its
+                    // accumulator re-fetches the plugin fn from that registry at
+                    // execution time (not from the task-local scope).
+                    let session_registry = crate::current_session_plugin_registry();
+                    let resolved = uni_plugin::QName::candidate_splits(&name_lower).find_map(|q| {
+                        if let Some(e) = self.plugin_registry.aggregate(&q) {
+                            return Some((q, e, Arc::clone(&self.plugin_registry)));
+                        }
+                        if let Some(sr) = session_registry.as_ref()
+                            && let Some(e) = sr.aggregate(&q)
+                        {
+                            return Some((q, e, Arc::clone(sr)));
+                        }
+                        None
+                    });
+                    if let Some((qname, entry, registry)) = resolved {
                         let arg_exprs: Vec<DfExpr> = args
                             .iter()
                             .map(|a| cypher_expr_to_df(a, Some(ctx)))
@@ -5097,7 +5114,7 @@ impl HybridPhysicalPlanner {
                         let udaf = Arc::new(datafusion::logical_expr::AggregateUDF::from(
                             crate::query::df_udaf_plugin::PluginAggregateUdaf::new(
                                 qname,
-                                Arc::clone(&self.plugin_registry),
+                                registry,
                                 entry.signature.clone(),
                             ),
                         ));
@@ -5592,9 +5609,20 @@ impl HybridPhysicalPlanner {
                 other => {
                     // Fall through to a registered plugin window function.
                     // Resolve the (possibly dotted) name against the registry via
-                    // every namespace/local split, mirroring the aggregate path.
-                    let resolved = uni_plugin::QName::candidate_splits(other)
-                        .find_map(|q| self.plugin_registry.window(&q).map(|e| (q, e)));
+                    // every namespace/local split, mirroring the aggregate path —
+                    // instance/host registry first, then the session-local one.
+                    let session_registry = crate::current_session_plugin_registry();
+                    let resolved = uni_plugin::QName::candidate_splits(other).find_map(|q| {
+                        if let Some(e) = self.plugin_registry.window(&q) {
+                            return Some((q, e));
+                        }
+                        if let Some(sr) = session_registry.as_ref()
+                            && let Some(e) = sr.window(&q)
+                        {
+                            return Some((q, e));
+                        }
+                        None
+                    });
                     match resolved {
                         Some((qname, entry)) => {
                             let udwf = datafusion::logical_expr::WindowUDF::from(

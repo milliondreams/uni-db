@@ -304,45 +304,14 @@ fn parse_grants(grants: Option<&str>) -> CapabilitySet {
     };
     let mut set = CapabilitySet::new();
     for n in names {
-        match n {
-            "ScalarFn" => {
-                set.insert(Capability::ScalarFn);
+        // Delegate to the single source of truth shared with the Python binding;
+        // warn and skip on anything not grantable from a bare string.
+        match Capability::parse_grant(n) {
+            Ok(cap) => {
+                set.insert(cap);
             }
-            "AggregateFn" => {
-                set.insert(Capability::AggregateFn);
-            }
-            "Procedure" => {
-                set.insert(Capability::Procedure);
-            }
-            "Filesystem" => {
-                set.insert(Capability::Filesystem {
-                    read: vec!["**".into()],
-                    write: vec!["**".into()],
-                });
-            }
-            "Network" => {
-                set.insert(Capability::Network {
-                    allow: vec!["**".into()],
-                });
-            }
-            "HostQuery" => {
-                set.insert(Capability::HostQuery {
-                    read_only: true,
-                    scopes: vec!["**".into()],
-                });
-            }
-            "Kms" => {
-                set.insert(Capability::Kms {
-                    key_ids: vec!["*".into()],
-                });
-            }
-            "Secret" => {
-                set.insert(Capability::Secret {
-                    ids: vec!["*".into()],
-                });
-            }
-            other => {
-                eprintln!("{} unknown grant `{other}` ignored", "warn:".yellow());
+            Err(e) => {
+                eprintln!("{} {e}", "warn:".yellow());
             }
         }
     }

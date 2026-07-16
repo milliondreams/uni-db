@@ -79,7 +79,7 @@ pub mod verify;
 
 #[doc(inline)]
 pub use crate::capability::{
-    Capability, CapabilitySet, Determinism, ManifestCapability, Scope, SideEffects,
+    Capability, CapabilitySet, Determinism, GrantError, ManifestCapability, Scope, SideEffects,
 };
 #[doc(inline)]
 pub use crate::errors::{FnError, PluginError, ReloadError};

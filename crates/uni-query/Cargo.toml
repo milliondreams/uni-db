@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+autotests = false
+
 [dependencies]
 uni-common = { workspace = true }
 uni-btic = { workspace = true }
@@ -68,3 +70,7 @@ default = []
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

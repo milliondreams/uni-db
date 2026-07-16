@@ -29,3 +29,11 @@ mod ssi_occ_test;
 #[cfg(feature = "lance-backend")]
 #[path = "common/storage/mod.rs"]
 mod storage;
+
+// --- consolidated from former standalone binaries (see docs/test_layout.md) ---
+#[path = "compaction_crdt_registry_dispatch.rs"]
+mod compaction_crdt_registry_dispatch;
+#[path = "l0_crdt_registry_dispatch.rs"]
+mod l0_crdt_registry_dispatch;
+#[path = "property_manager_registry_dispatch.rs"]
+mod property_manager_registry_dispatch;

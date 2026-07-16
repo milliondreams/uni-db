@@ -7,6 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+autotests = false
+
 [features]
 default = ["lance-backend"]
 lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linalg"]
@@ -86,3 +88,11 @@ proptest = { workspace = true }
 # Capture emitted `metrics` counters in-process so tests can assert on
 # freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
 metrics-util = "0.20"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "occ_model"
+path = "tests/occ_model.rs"

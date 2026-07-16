@@ -11,9 +11,15 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+autotests = false
+
 [dependencies]
 pest = "2.8"
 pest_derive = "2.8"
 serde = { workspace = true }
 thiserror = { workspace = true }
 uni-common = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

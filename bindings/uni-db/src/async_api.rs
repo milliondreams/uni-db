@@ -215,7 +215,11 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let cap_set = crate::builders::build_capability_set(grants);
-            let loader = uni_plugin_wasm::WasmLoader::new();
+            // Wire a fresh GraphCompute registry so guest `algorithm` entries can
+            // register; harmless for scalar-only plugins.
+            let loader = uni_plugin_wasm::WasmLoader::new().with_graph(std::sync::Arc::new(
+                uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+            ));
             let outcome = inner
                 .load_wasm_component(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -227,6 +231,7 @@ impl AsyncDatabase {
                     outcome.scalars_registered,
                     outcome.aggregates_registered,
                     outcome.procedures_registered,
+                    outcome.algorithms_registered,
                     outcome.effective_capabilities,
                     outcome.denied_capabilities,
                 )
@@ -251,6 +256,11 @@ impl AsyncDatabase {
             let cap_set = crate::builders::build_capability_set(grants);
             let mut loader = uni_plugin_extism::ExtismLoader::new();
             uni_plugin_extism::register_default_host_svc(&mut loader);
+            // Wire a fresh GraphCompute registry so guest `algorithm` entries can
+            // register; harmless for scalar-only plugins.
+            let loader = loader.with_graph(std::sync::Arc::new(
+                uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+            ));
             let outcome = inner
                 .load_wasm_extism(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -262,6 +272,7 @@ impl AsyncDatabase {
                     outcome.scalars_registered,
                     outcome.aggregates_registered,
                     outcome.procedures_registered,
+                    outcome.algorithms_registered,
                     outcome.effective_capabilities,
                     outcome.denied_capabilities,
                 )
@@ -304,6 +315,7 @@ impl AsyncDatabase {
                 dict.set_item("scalars_registered", outcome.scalars_registered)?;
                 dict.set_item("aggregates_registered", outcome.aggregates_registered)?;
                 dict.set_item("procedures_registered", outcome.procedures_registered)?;
+                dict.set_item("algorithms_registered", outcome.algorithms_registered)?;
                 let denied: Vec<String> = outcome
                     .denied_capabilities
                     .iter()

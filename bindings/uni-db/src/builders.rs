@@ -91,6 +91,10 @@ pub(crate) fn load_outcome_to_pydict(
         "procedures_registered",
         outcome.procedures_registered.clone(),
     )?;
+    dict.set_item(
+        "algorithms_registered",
+        outcome.algorithms_registered.clone(),
+    )?;
     let denied: Vec<String> = outcome
         .denied_capabilities
         .iter()

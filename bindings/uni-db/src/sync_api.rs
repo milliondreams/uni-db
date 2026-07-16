@@ -601,6 +601,7 @@ pub(crate) fn wasm_outcome_to_pydict(
     scalars_registered: Vec<String>,
     aggregates_registered: Vec<String>,
     procedures_registered: Vec<String>,
+    algorithms_registered: Vec<String>,
     effective_capabilities: Vec<String>,
     denied_capabilities: Vec<String>,
 ) -> PyResult<Py<PyAny>> {
@@ -610,6 +611,7 @@ pub(crate) fn wasm_outcome_to_pydict(
     dict.set_item("scalars_registered", scalars_registered)?;
     dict.set_item("aggregates_registered", aggregates_registered)?;
     dict.set_item("procedures_registered", procedures_registered)?;
+    dict.set_item("algorithms_registered", algorithms_registered)?;
     dict.set_item("effective_capabilities", effective_capabilities)?;
     dict.set_item("denied_capabilities", denied_capabilities)?;
     Ok(dict.into())
@@ -873,6 +875,7 @@ impl Database {
         dict.set_item("scalars_registered", outcome.scalars_registered)?;
         dict.set_item("aggregates_registered", outcome.aggregates_registered)?;
         dict.set_item("procedures_registered", outcome.procedures_registered)?;
+        dict.set_item("algorithms_registered", outcome.algorithms_registered)?;
         let denied: Vec<String> = outcome
             .denied_capabilities
             .iter()
@@ -892,7 +895,7 @@ impl Database {
     /// scalar / aggregate / procedure when omitted.
     ///
     /// Returns a dict with `plugin_id`, `version`, `scalars_registered`,
-    /// `aggregates_registered`, `procedures_registered`,
+    /// `aggregates_registered`, `procedures_registered`, `algorithms_registered`,
     /// `effective_capabilities`, `denied_capabilities`.
     #[cfg(feature = "wasm-plugins")]
     #[pyo3(signature = (wasm_bytes, grants=None))]
@@ -906,7 +909,12 @@ impl Database {
         // attenuated `Capability`; None → default scalar/agg/proc). It drives
         // both the registration gate and the guest host-fn grant set.
         let cap_set = crate::builders::build_capability_set(grants);
-        let loader = uni_plugin_wasm::WasmLoader::new();
+        // Wire a fresh GraphCompute registry so guest `algorithm` entries that
+        // drive `host-graph` kernels can register; harmless for scalar-only
+        // plugins (the registry is touched only when an algorithm is present).
+        let loader = uni_plugin_wasm::WasmLoader::new().with_graph(std::sync::Arc::new(
+            uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+        ));
         let outcome = self
             .inner
             .load_wasm_component(&loader, wasm_bytes, &cap_set, &cap_set)
@@ -918,6 +926,7 @@ impl Database {
             outcome.scalars_registered,
             outcome.aggregates_registered,
             outcome.procedures_registered,
+            outcome.algorithms_registered,
             outcome.effective_capabilities,
             outcome.denied_capabilities,
         )
@@ -941,6 +950,11 @@ impl Database {
         let cap_set = crate::builders::build_capability_set(grants);
         let mut loader = uni_plugin_extism::ExtismLoader::new();
         uni_plugin_extism::register_default_host_svc(&mut loader);
+        // Wire a fresh GraphCompute registry so guest `algorithm` entries that
+        // drive `uni_graph_call` can register; harmless for scalar-only plugins.
+        let loader = loader.with_graph(std::sync::Arc::new(
+            uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+        ));
         let outcome = self
             .inner
             .load_wasm_extism(&loader, wasm_bytes, &cap_set, &cap_set)
@@ -952,6 +966,7 @@ impl Database {
             outcome.scalars_registered,
             outcome.aggregates_registered,
             outcome.procedures_registered,
+            outcome.algorithms_registered,
             outcome.effective_capabilities,
             outcome.denied_capabilities,
         )

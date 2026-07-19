@@ -776,6 +776,7 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
         edge_types: vec!["LINKS".into()],
         include_reverse: false,
         weight_property: None,
+        ..GraphProjectionSpec::default()
     };
     let proj0 = bridge.project_for_graph_compute(&spec).await?;
     let v0 = proj0.vertex_count();
@@ -804,5 +805,57 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
         e0,
         "projection stays pinned to T0 edges"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fail_closed_unscoped_projection_under_restricted_scope() -> anyhow::Result<()> {
+    // Issue #151 (WS-2): a guest granted a *narrow* HostQuery scope must not be
+    // able to project the whole graph by leaving node_labels/edge_types empty.
+    // The bridge rejects an unscoped projection under a restricted scope (0x804)
+    // instead of silently handing over every label. A `**`/`*` scope (the
+    // default grant) stays unrestricted, exercised by every other test here.
+    use uni_plugin::traits::algorithm::GraphProjectionSpec;
+    use uni_plugin_builtin::algorithms::bridge::host_bridge_from_storage;
+
+    let db = Uni::in_memory().build().await?;
+    let _ = build_graph(&db).await?; // labels are ":Node", edges ":LINKS"
+    db.flush().await?;
+
+    let storage = db.storage();
+    // A genuinely narrow scope: only labels/edge-types starting with "Person".
+    // The seeded graph has none, so the whole graph is out of scope.
+    let caps = CapabilitySet::from_iter_of([
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: vec!["Person".into()],
+        },
+    ]);
+    let bridge = host_bridge_from_storage(storage, None, caps);
+
+    // Unscoped spec (empty labels/edge_types = "all") is rejected fail-closed.
+    let unscoped = GraphProjectionSpec {
+        include_reverse: false,
+        ..GraphProjectionSpec::default()
+    };
+    let err = bridge
+        .project_for_graph_compute(&unscoped)
+        .await
+        .expect_err("unscoped projection under a restricted HostQuery scope must be rejected");
+    assert_eq!(err.code, 0x804, "fail-closed reject uses 0x804");
+
+    // A named label outside the granted scope is also rejected (pre-existing).
+    let out_of_scope = GraphProjectionSpec {
+        node_labels: vec!["Node".into()],
+        include_reverse: false,
+        ..GraphProjectionSpec::default()
+    };
+    let err2 = bridge
+        .project_for_graph_compute(&out_of_scope)
+        .await
+        .expect_err("a label outside the granted scope must be rejected");
+    assert_eq!(err2.code, 0x804);
+
     Ok(())
 }

@@ -93,13 +93,16 @@ impl AlgorithmProvider for PyAlgorithm {
         })?;
         let local_name = self.local_name.clone();
 
-        let json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
+        let mut json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
             .map_err(|e| FnError::new(0x802, format!("python algorithm: bad config json: {e}")))?;
-
-        let spec = GraphProjectionSpec {
-            include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
-            ..GraphProjectionSpec::default()
-        };
+        // A trailing projection-config object scopes/weights the graph the guest
+        // sees (issue #151); strip it before the remaining args reach the guest.
+        let spec = GraphProjectionSpec::take_from_args(&mut json_args).unwrap_or_else(|| {
+            GraphProjectionSpec {
+                include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
+                ..GraphProjectionSpec::default()
+            }
+        });
         let projection = bridge.project_for_graph_compute(&spec);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
         let deadline_ms_cap = bridge.graph_compute_deadline_ms();

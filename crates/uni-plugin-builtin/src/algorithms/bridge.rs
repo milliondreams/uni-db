@@ -98,12 +98,33 @@ pub struct AlgorithmHostBridge {
     pub algo_ctx: AlgoContext,
     /// Effective capabilities of the plugin owning the running algorithm.
     pub effective_caps: CapabilitySet,
+    /// Cypher/Named `graphRef` + its resolver (issue #151 P3). When both are set,
+    /// `project_for_graph_compute` resolves the projection through the injected
+    /// resolver instead of scanning storage from the (empty) Native spec.
+    resolver: Option<Arc<dyn GraphProjectionResolver>>,
+    graph_ref: Option<serde_json::Value>,
+}
+
+/// Resolves a Cypher/Named `graphRef` into a materialized [`GraphProjection`].
+///
+/// Defined here (uni-plugin-builtin) so a uni-query type can implement it and be
+/// injected into the bridge (issue #151 P3): the bridge cannot reach query
+/// execution or the projection store across the `uni-query → uni-plugin-builtin`
+/// dependency edge, so the query-side machinery is supplied by inversion.
+pub trait GraphProjectionResolver: Send + Sync {
+    /// Materialize the projection named by `graph_ref` (a Cypher or Named
+    /// graphRef object). Runs in the bridge's async context.
+    fn resolve(
+        &self,
+        graph_ref: serde_json::Value,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>>;
 }
 
 impl std::fmt::Debug for AlgorithmHostBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlgorithmHostBridge")
             .field("effective_caps", &self.effective_caps)
+            .field("has_graph_ref", &self.graph_ref.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -115,7 +136,39 @@ impl AlgorithmHostBridge {
         Self {
             algo_ctx,
             effective_caps,
+            resolver: None,
+            graph_ref: None,
         }
+    }
+
+    /// Attach a Cypher/Named `graphRef` and the resolver that materializes it
+    /// (issue #151 P3). When set, `project_for_graph_compute` resolves through
+    /// `resolver` rather than scanning storage.
+    #[must_use]
+    pub fn with_graph_resolver(
+        mut self,
+        resolver: Arc<dyn GraphProjectionResolver>,
+        graph_ref: serde_json::Value,
+    ) -> Self {
+        self.resolver = Some(resolver);
+        self.graph_ref = Some(graph_ref);
+        self
+    }
+
+    /// Whether the effective `HostQuery` grant names a restricting scope (a
+    /// non-empty prefix list that is not the universal `**`/`*` wildcard).
+    fn host_query_scope_restricted(&self) -> bool {
+        let scopes: Vec<String> = self
+            .effective_caps
+            .iter()
+            .find_map(|c| match c {
+                Capability::HostQuery { scopes, .. } => {
+                    Some(scopes.iter().map(ToString::to_string).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        !scopes.is_empty() && !scopes.iter().any(|p| p == "**" || p == "*")
     }
 
     /// Builds a concrete projection for GraphCompute kernels, gated on caps.
@@ -159,6 +212,26 @@ impl AlgorithmHostBridge {
                 ))
             });
         }
+
+        // Cypher/Named graphRef (issue #151 P3): resolved by the injected
+        // uni-query resolver in this async context, since the bridge cannot reach
+        // query execution or the projection store. A restricting HostQuery scope
+        // cannot be checked against a query-defined subgraph, so reject
+        // fail-closed and require an unscoped grant.
+        if let (Some(resolver), Some(graph_ref)) = (self.resolver.clone(), self.graph_ref.clone()) {
+            let restricted = self.host_query_scope_restricted();
+            return Box::pin(async move {
+                if restricted {
+                    return Err(FnError::new(
+                        0x804,
+                        "GraphCompute: a Cypher/Named projection requires an unscoped HostQuery \
+                         grant (a restricting scope cannot gate a query-defined subgraph)",
+                    ));
+                }
+                resolver.resolve(graph_ref).await
+            });
+        }
+
         // Enforce the HostQuery scope restriction (E5): when the grant names
         // scopes (label / edge-type prefixes), every projected label and edge
         // type must match one — a plugin scoped to `Person` cannot project the
@@ -173,7 +246,28 @@ impl AlgorithmHostBridge {
                 _ => None,
             })
             .unwrap_or_default();
-        if !scope_prefixes.is_empty() {
+        // A `**`/`*` scope (the default `HostQuery` grant, and what the Python
+        // `"HostQuery"` grant string parses to) is unrestricted; only a narrower
+        // prefix list actually gates which labels a guest may project.
+        let scope_restricted =
+            !scope_prefixes.is_empty() && !scope_prefixes.iter().any(|p| p == "**" || p == "*");
+        if scope_restricted {
+            // Fail-closed (issue #151): an unscoped projection (empty node_labels
+            // AND edge_types = "all") under a restricted HostQuery grant would
+            // silently hand the guest the whole graph, defeating the scope. The
+            // guest must name the labels / edge types it wants.
+            if spec.node_labels.is_empty() && spec.edge_types.is_empty() {
+                let scopes = scope_prefixes.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: an unscoped projection is not allowed under restricted \
+                             HostQuery scopes [{scopes}]; name nodeLabels/edgeTypes explicitly"
+                        ),
+                    ))
+                });
+            }
             let in_scope = |name: &str| scope_prefixes.iter().any(|p| name.starts_with(p.as_str()));
             let denied = spec
                 .node_labels
@@ -199,11 +293,15 @@ impl AlgorithmHostBridge {
         Box::pin(async move {
             let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
             let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
+            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
             let mut builder = ProjectionBuilder::new(storage)
                 .l0_manager(l0)
                 .node_labels(&node_labels)
                 .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse);
+                .include_reverse(spec.include_reverse)
+                .node_properties(&node_props)
+                .edge_properties(&edge_props);
             if let Some(prop) = spec.weight_property.as_deref() {
                 builder = builder.weight_property(prop);
             }
@@ -290,11 +388,15 @@ impl AlgorithmHost for AlgorithmHostBridge {
         Box::pin(async move {
             let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
             let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
+            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
             let mut builder = ProjectionBuilder::new(storage)
                 .l0_manager(l0)
                 .node_labels(&node_labels)
                 .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse);
+                .include_reverse(spec.include_reverse)
+                .node_properties(&node_props)
+                .edge_properties(&edge_props);
             if let Some(prop) = spec.weight_property.as_deref() {
                 builder = builder.weight_property(prop);
             }

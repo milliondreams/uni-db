@@ -479,6 +479,22 @@ impl GcSession {
         s.edge_weights(from_i64(g)).map(to_i64).map_err(rt)
     }
 
+    /// Builds a `[E]` per-edge tensor of the named projected edge property (#151).
+    fn edge_property(&mut self, g: i64, name: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.edge_property(from_i64(g), name.as_str())
+            .map(to_i64)
+            .map_err(rt)
+    }
+
+    /// Builds a `[V]` per-vertex tensor of the named projected vertex property (#151).
+    fn node_property(&mut self, g: i64, name: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.node_property(from_i64(g), name.as_str())
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// The full edge mask — every edge of `g` active.
     fn edges_all(&mut self, g: i64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
@@ -715,6 +731,8 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("random_walks", GcSession::random_walks)
         .register_fn("sample", GcSession::sample)
         .register_fn("edge_weights", GcSession::edge_weights)
+        .register_fn("edge_property", GcSession::edge_property)
+        .register_fn("node_property", GcSession::node_property)
         .register_fn("edges_all", GcSession::edges_all)
         .register_fn("sample_edges", GcSession::sample_edges)
         .register_fn("edge_set_len", GcSession::edge_set_len)

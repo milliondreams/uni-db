@@ -222,6 +222,8 @@ mod tests {
             in_offsets,
             in_neighbors,
             out_weights: None,
+            node_properties: Default::default(),
+            edge_properties: Default::default(),
             id_map,
         }
     }

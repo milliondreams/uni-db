@@ -150,21 +150,17 @@ fn parse_config(config_json: &str) -> Result<(Vec<Vid>, f64, GraphProjectionSpec
         _ => DEFAULT_ALPHA,
     };
 
-    let mut spec = GraphProjectionSpec::default();
-    if let Some(serde_json::Value::Object(cfg)) = args.get(2) {
-        if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
-            spec.node_labels = labels
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-        }
-        if let Some(types) = cfg.get("edgeTypes").and_then(serde_json::Value::as_array) {
-            spec.edge_types = types
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-        }
-    }
+    // Native-mode projection knobs (nodeLabels / edgeTypes / weightProperty)
+    // parsed by the shared source-of-truth parser so the knob names cannot
+    // drift from the guest loaders. gcpagerank only traverses Direction::Out
+    // (see `personalized_pagerank`), so it never needs inbound adjacency —
+    // force no-reverse regardless of the includeReverse hint to avoid building
+    // an unused in-CSR.
+    let mut spec = match args.get(2) {
+        Some(serde_json::Value::Object(cfg)) => GraphProjectionSpec::from_config_object(cfg),
+        _ => GraphProjectionSpec::default(),
+    };
+    spec.include_reverse = false;
     Ok((seeds, alpha, spec))
 }
 

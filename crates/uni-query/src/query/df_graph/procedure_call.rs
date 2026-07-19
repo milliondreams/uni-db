@@ -778,11 +778,17 @@ fn run_algorithm_provider_raw(
         ))
     });
 
+    // Guest Cypher/Named projections (issue #151 P3) resolve through a query
+    // host snapshot of this execution context.
+    let resolver = Some(crate::procedures_plugin::algo::guest_graph_resolver(
+        crate::query::executor::procedure_host::QueryProcedureHost::from_graph_ctx(graph_ctx),
+    ));
     crate::procedures_plugin::algo::run_algorithm_provider(
         entry,
         Arc::clone(graph_ctx.storage()),
         l0_mgr,
         &config_json,
+        resolver,
     )
     .map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Algorithm '{procedure_name}': {e}"))

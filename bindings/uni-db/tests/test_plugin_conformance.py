@@ -124,6 +124,40 @@ def _scores_by_node(session, call):
     return {int(r["nodeId"]): float(r["score"]) for r in rows}
 
 
+def _build_weighted_graph(database):
+    """Issue #151 fixture: 3 ``:A`` + 1 ``:B``, 3 ``:LINK`` edges each ``w = 5.0``.
+
+    All three edges run among the ``:A`` nodes (a0->a1, a1->a2, a2->a0), so a
+    projection scoped to ``:A`` keeps every edge. Returns ``id(a0)``.
+    """
+    database.schema().label("A").property("name", "string").done().label("B").property(
+        "name", "string"
+    ).done().edge_type("LINK", ["A", "B"], ["A", "B"]).property("w", "float").done().apply()
+    session = database.session()
+    tx = session.tx()
+    tx.execute("CREATE (:A {name:'a0'}),(:A {name:'a1'}),(:A {name:'a2'}),(:B {name:'b0'})")
+    for src, dst in (("a0", "a1"), ("a1", "a2"), ("a2", "a0")):
+        tx.execute(
+            "MATCH (x {name:$s}),(y {name:$d}) CREATE (x)-[:LINK {w: 5.0}]->(y)",
+            {"s": src, "d": dst},
+        )
+    tx.commit()
+    # The graph projection reads edge/vertex *property values* from committed
+    # storage (it is a storage-time analytics view, not a serializable read), so
+    # a weightProperty projection sees L0-buffered weights only after a flush.
+    # This matches the native uni.algo.* weighted path, which shares the same
+    # ProjectionBuilder. (L0 property-value visibility is a separate, broader gap.)
+    database.flush()
+    rows = session.query("MATCH (n:A {name:'a0'}) RETURN id(n) AS vid")
+    return int(rows[0]["vid"])
+
+
+def _probe_rows(session, call):
+    return session.query(
+        f"{call} YIELD nodeId, total_edge_weight RETURN nodeId, total_edge_weight"
+    )
+
+
 def _loader(database, method):
     """Resolve a loader method (``load_wasm_component`` / ``load_wasm_extism``)."""
     return getattr(database, method)
@@ -236,6 +270,185 @@ def test_rhai_algorithm_denied_does_not_register(db):
         db.session().query(
             f"CALL ai.example.rhaigc.ppr({vid_a}) YIELD nodeId, score RETURN nodeId"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Projection shaping (issue #151): a guest scopes its projection to chosen
+# labels/edge-types and binds an edge property as the traversal weight, via a
+# trailing config object on the CALL — the same knobs native uni.algo.* accepts.
+#
+# The fail-closed scope invariant (an unscoped projection under a *narrow*
+# HostQuery grant is rejected, 0x804) is exercised in Rust
+# (crates/uni/tests/common/graph_algo/graph_compute_pagerank.rs) because the
+# Python grant string only yields the unrestricted "**" scope — narrow scopes
+# arise from host-side attenuation, which the string API can't express.
+# --------------------------------------------------------------------------- #
+
+# Sums gc.edge_weights over the projected graph and broadcasts the scalar to one
+# row per projected vertex (verbatim from the issue #151 standalone repro).
+RHAI_EDGE_PROBE = """
+fn uni_manifest() {
+    #{ id: "ai.example.gcprobe", version: "0.1.0", determinism: "pure",
+       algorithms: [ #{ name: "probe", args: [], yields: ["nodeId:int", "total_edge_weight:float"] } ] }
+}
+fn probe(gc) {
+    let g = gc.graph();
+    let ew = gc.edge_weights(g);
+    let total = gc.reduce_sum(ew);
+    gc.free(ew);
+    let deg = gc.degrees(g, "out");
+    let all = gc.map_to_set(deg, "gt", -1.0);
+    gc.free(deg);
+    let out = gc.set_to_map(all, total);
+    gc.emit("total_edge_weight", out);
+}
+"""
+
+
+def test_rhai_projection_scopes_to_labels(db):
+    """OBS1 (#151): a guest scopes its projection to chosen labels via nodeLabels."""
+    _build_weighted_graph(db)
+    db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
+    session = db.session()
+    # Default (unscoped) projects all 4 nodes.
+    assert len(_probe_rows(session, "CALL ai.example.gcprobe.probe()")) == 4
+    # Scoped to :A projects only the 3 :A nodes.
+    scoped = _probe_rows(session, 'CALL ai.example.gcprobe.probe({nodeLabels: ["A"]})')
+    assert len(scoped) == 3
+
+
+def test_rhai_projection_binds_edge_weight_property(db):
+    """OBS2 (#151): weightProperty makes edge_weights read the numeric property."""
+    _build_weighted_graph(db)
+    db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
+    session = db.session()
+    # Default: unit weights -> reduce_sum = edge count = 3.0.
+    unweighted = _probe_rows(session, "CALL ai.example.gcprobe.probe()")
+    assert math.isclose(float(unweighted[0]["total_edge_weight"]), 3.0, abs_tol=1e-9)
+    # weightProperty="w": reduce_sum = 3 edges * 5.0 = 15.0.
+    weighted = _probe_rows(session, 'CALL ai.example.gcprobe.probe({weightProperty: "w"})')
+    assert math.isclose(float(weighted[0]["total_edge_weight"]), 15.0, abs_tol=1e-9)
+
+
+def test_native_gcpagerank_honors_projection_config(db):
+    """The provider.rs shared-parser refactor: native gcpagerank honors nodeLabels."""
+    vid_a = _build_weighted_graph(db)
+    session = db.session()
+    scoped = _scores_by_node(
+        session, f'CALL uni.algo.gcpagerank({vid_a}, 0.85, {{nodeLabels: ["A"]}})'
+    )
+    # Scoped to :A -> only the 3 :A nodes appear in the result.
+    assert len(scoped) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Property tensors (issue #151 P2): a guest reads a named node/edge property
+# into a per-vertex / per-edge tensor via gc.node_property / gc.edge_property,
+# declared through nodeProperties / edgeProperties on the projection config.
+# --------------------------------------------------------------------------- #
+
+# Sums a node property and an edge property into one scalar broadcast per vertex.
+RHAI_PROP_PROBE = """
+fn uni_manifest() {
+    #{ id: "ai.example.gcprop", version: "0.1.0", determinism: "pure",
+       algorithms: [ #{ name: "sums", args: [], yields: ["nodeId:int", "total:float"] } ] }
+}
+fn sums(gc) {
+    let g = gc.graph();
+    let ep = gc.edge_property(g, "w");        // [E] tensor of edge property w
+    let es = gc.reduce_sum(ep);
+    gc.free(ep);
+    let np = gc.node_property(g, "score");    // [V] tensor of node property score
+    let ns = gc.reduce_sum(np);
+    gc.free(np);
+    let deg = gc.degrees(g, "out");
+    let all = gc.map_to_set(deg, "gt", -1.0);
+    gc.free(deg);
+    let out = gc.set_to_map(all, es + ns);
+    gc.emit("total", out);
+}
+"""
+
+
+def _build_property_graph(database):
+    """3 ``:A`` nodes with a numeric ``score`` + 3 ``:LINK`` edges with ``w = 5.0``.
+
+    ``score`` = 1.0/2.0/3.0 (sum 6.0); ``w`` sum over 3 edges = 15.0. Flushed so
+    the projection reads the property values from committed storage.
+    """
+    database.schema().label("A").property("name", "string").property(
+        "score", "float"
+    ).done().edge_type("LINK", ["A"], ["A"]).property("w", "float").done().apply()
+    session = database.session()
+    tx = session.tx()
+    tx.execute(
+        "CREATE (:A {name:'a0', score:1.0}),(:A {name:'a1', score:2.0}),"
+        "(:A {name:'a2', score:3.0})"
+    )
+    for src, dst in (("a0", "a1"), ("a1", "a2"), ("a2", "a0")):
+        tx.execute(
+            "MATCH (x:A {name:$s}),(y:A {name:$d}) CREATE (x)-[:LINK {w:5.0}]->(y)",
+            {"s": src, "d": dst},
+        )
+    tx.commit()
+    database.flush()
+
+
+def test_rhai_node_and_edge_property_tensors(db):
+    """P2 (#151): guest reads node + edge properties into per-vertex/-edge tensors."""
+    _build_property_graph(db)
+    db.load_rhai_plugin(RHAI_PROP_PROBE, grants=GC_GRANTS)
+    rows = db.session().query(
+        'CALL ai.example.gcprop.sums({nodeProperties:["score"], edgeProperties:["w"]}) '
+        "YIELD nodeId, total RETURN nodeId, total"
+    )
+    assert len(rows) == 3
+    # edge_property(w) sum = 3*5 = 15; node_property(score) sum = 1+2+3 = 6; total 21.
+    assert math.isclose(float(rows[0]["total"]), 21.0, abs_tol=1e-9)
+
+
+def test_rhai_property_tensor_not_projected_errors(db):
+    """A guest that reads a property it never declared (edgeProperties/nodeProperties) fails."""
+    _build_property_graph(db)
+    db.load_rhai_plugin(RHAI_PROP_PROBE, grants=GC_GRANTS)
+    with pytest.raises(Exception):
+        # No nodeProperties/edgeProperties in the config -> edge_property("w") errors.
+        db.session().query(
+            "CALL ai.example.gcprop.sums() YIELD nodeId, total RETURN nodeId"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Cypher / Named projection (issue #151 P3): a guest projects a subgraph defined
+# by inner Cypher queries, or a pre-registered named graph — resolved by the
+# uni-query projection seam and injected into the bridge.
+# --------------------------------------------------------------------------- #
+
+
+def test_rhai_projection_cypher_graphref(db):
+    """P3 (#151): a guest projects a Cypher-defined subgraph (nodeQuery/edgeQuery)."""
+    _build_weighted_graph(db)  # :A x3 + :B, :LINK edges among the :A nodes
+    db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
+    node_q = "MATCH (n:A) RETURN id(n) AS id"
+    edge_q = "MATCH (a:A)-[:LINK]->(b:A) RETURN id(a) AS source, id(b) AS target"
+    rows = _probe_rows(
+        db.session(),
+        f'CALL ai.example.gcprobe.probe({{nodeQuery: "{node_q}", edgeQuery: "{edge_q}"}})',
+    )
+    # The Cypher subgraph is exactly the 3 :A nodes (the :B node is excluded).
+    assert len(rows) == 3
+
+
+def test_rhai_projection_named_graphref(db):
+    """P3 (#151): a guest projects a pre-registered Named graph."""
+    _build_weighted_graph(db)
+    # Register a named projection scoped to :A via the native graph procedure.
+    db.session().query('CALL uni.graph.project("a_only", {nodeLabels: ["A"]})')
+    db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
+    rows = _probe_rows(
+        db.session(), 'CALL ai.example.gcprobe.probe({name: "a_only"})'
+    )
+    assert len(rows) == 3
 
 
 # --------------------------------------------------------------------------- #

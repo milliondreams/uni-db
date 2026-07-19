@@ -591,19 +591,123 @@ fn serde_json_to_scalar(v: &serde_json::Value, vt: &ValueType) -> Option<ScalarV
 /// Returns [`FnError`] if the provider cannot start — including when the
 /// owning plugin lacks the `HostQuery` capability the bridge's
 /// `project` gate requires.
+/// Resolves a Cypher/Named `graphRef` for a guest GraphCompute algorithm by
+/// reusing the native `uni.algo.*` projection machinery (issue #151 P3). It is
+/// injected into the `AlgorithmHostBridge`, which cannot reach query execution
+/// or the projection store across the `uni-query → uni-plugin-builtin` edge.
+struct GuestGraphResolver {
+    host: QueryProcedureHost,
+}
+
+impl uni_plugin_builtin::algorithms::bridge::GraphProjectionResolver for GuestGraphResolver {
+    fn resolve(
+        &self,
+        graph_ref: serde_json::Value,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Arc<uni_algo::algo::projection::GraphProjection>, FnError>,
+    > {
+        let host = self.host.clone();
+        Box::pin(async move {
+            match parse_graph_ref(&graph_ref)
+                .map_err(|e| FnError::new(0x820, format!("graphRef parse: {e}")))?
+            {
+                ProjectionInput::Cypher {
+                    node_query,
+                    edge_query,
+                    weight_column,
+                    include_reverse,
+                } => {
+                    let params = std::collections::HashMap::new();
+                    let node_rows = host
+                        .execute_inner_query(
+                            &node_query,
+                            &params,
+                            uni_plugin::traits::procedure::ProcedureMode::Read,
+                        )
+                        .await
+                        .map_err(|e| FnError::new(0x803, format!("Cypher node query: {e}")))?;
+                    let edge_rows = host
+                        .execute_inner_query(
+                            &edge_query,
+                            &params,
+                            uni_plugin::traits::procedure::ProcedureMode::Read,
+                        )
+                        .await
+                        .map_err(|e| FnError::new(0x803, format!("Cypher edge query: {e}")))?;
+                    let projection = uni_algo::algo::projection::GraphProjection::from_rows(
+                        &node_rows,
+                        &edge_rows,
+                        weight_column.as_deref(),
+                        include_reverse,
+                    )
+                    .map_err(|e| FnError::new(0x803, format!("Cypher projection schema: {e}")))?;
+                    Ok(Arc::new(projection))
+                }
+                ProjectionInput::Named { name } => {
+                    let store = crate::projection_store::for_storage(host.storage());
+                    let entry = store.get(&name).ok_or_else(|| {
+                        FnError::new(0x803, format!("named projection `{name}` not found"))
+                    })?;
+                    Ok(entry.projection)
+                }
+                ProjectionInput::Native { .. } => Err(FnError::new(
+                    0x820,
+                    "Native graphRef is handled by the spec scan, not the guest resolver",
+                )),
+            }
+        })
+    }
+}
+
+/// Build a resolver for guest Cypher/Named projections from a query host.
+pub(crate) fn guest_graph_resolver(
+    host: QueryProcedureHost,
+) -> Arc<dyn uni_plugin_builtin::algorithms::bridge::GraphProjectionResolver> {
+    Arc::new(GuestGraphResolver { host })
+}
+
+/// If the trailing config object is a Cypher/Named `graphRef` (bearing
+/// `nodeQuery`/`edgeQuery`/`name`) rather than a Native scoping object, extract
+/// it so the bridge resolves it through the injected resolver (issue #151 P3).
+fn extract_query_graph_ref(config_json: &str) -> Option<serde_json::Value> {
+    let args: Vec<serde_json::Value> = serde_json::from_str(config_json).ok()?;
+    let last = args.last()?;
+    let obj = last.as_object()?;
+    if obj.contains_key("nodeQuery") || obj.contains_key("edgeQuery") || obj.contains_key("name") {
+        Some(last.clone())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn run_algorithm_provider(
     entry: &uni_plugin::registry::AlgorithmEntry,
     storage: Arc<uni_store::storage::manager::StorageManager>,
     l0_manager: Option<Arc<uni_store::runtime::L0Manager>>,
     config_json: &str,
+    resolver: Option<Arc<dyn uni_plugin_builtin::algorithms::bridge::GraphProjectionResolver>>,
 ) -> Result<SendableRecordBatchStream, FnError> {
     use uni_plugin::traits::algorithm::AlgorithmContext;
 
-    let bridge = uni_plugin_builtin::algorithms::bridge::host_bridge_from_storage(
+    let mut bridge = uni_plugin_builtin::algorithms::bridge::host_bridge_from_storage(
         storage,
         l0_manager,
         entry.effective_caps.clone(),
     );
+    // Cypher/Named graphRef (issue #151 P3): route projection through the
+    // injected resolver instead of the Native storage scan. If no resolver is
+    // available on this execution path, fail clearly rather than silently
+    // projecting the whole graph.
+    if let Some(graph_ref) = extract_query_graph_ref(config_json) {
+        let resolver = resolver.ok_or_else(|| {
+            FnError::new(
+                0x820,
+                "Cypher/Named graph projection is not available on this execution path",
+            )
+        })?;
+        bridge = bridge.with_graph_resolver(resolver, graph_ref);
+    }
     // Host-side arg validation/coercion (proposal §4.6 / D7): a provider that
     // declares typed `args` gets arity + type checking and default-filling here,
     // before it runs; providers on the legacy untyped contract (empty `args`)

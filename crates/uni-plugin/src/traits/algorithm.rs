@@ -327,6 +327,266 @@ pub struct GraphProjectionSpec {
     pub weight_property: Option<String>,
     /// Whether to also build inbound adjacency.
     pub include_reverse: bool,
+    /// Vertex properties to materialize into per-vertex `[V]` tensors the guest
+    /// reads by name via `gc.node_property` (issue #151).
+    pub node_properties: Vec<String>,
+    /// Edge properties to materialize into per-edge `[E]` tensors the guest
+    /// reads by name via `gc.edge_property` (issue #151).
+    pub edge_properties: Vec<String>,
+}
+
+impl GraphProjectionSpec {
+    /// Parses the Native-mode projection knobs from a guest/procedure config
+    /// object. This is the single source of truth for `nodeLabels` /
+    /// `edgeTypes` (accepting the `relationshipTypes` alias) / `weightProperty`
+    /// / `includeReverse` — the native providers and all four guest loaders
+    /// funnel through it so the knob names cannot drift.
+    ///
+    /// `includeReverse` defaults to `true` (inbound adjacency is built unless
+    /// the caller opts out), matching the graphRef contract in `uni-algo` and
+    /// keeping In-direction kernels (WCC / k-core / HITS) working. Unknown keys
+    /// are ignored and malformed values fall back to the field default: this is
+    /// a best-effort projection hint, not a strict schema.
+    #[must_use]
+    pub fn from_config_object(cfg: &serde_json::Map<String, serde_json::Value>) -> Self {
+        fn string_array(v: &serde_json::Value) -> Vec<String> {
+            v.as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let node_labels = cfg.get("nodeLabels").map(string_array).unwrap_or_default();
+        // `relationshipTypes` is the openCypher-flavored alias the native
+        // procedures already accept as a synonym for `edgeTypes`.
+        let edge_types = cfg
+            .get("edgeTypes")
+            .or_else(|| cfg.get("relationshipTypes"))
+            .map(string_array)
+            .unwrap_or_default();
+        let weight_property = cfg
+            .get("weightProperty")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let include_reverse = cfg
+            .get("includeReverse")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let node_properties = cfg
+            .get("nodeProperties")
+            .map(string_array)
+            .unwrap_or_default();
+        let edge_properties = cfg
+            .get("edgeProperties")
+            .map(string_array)
+            .unwrap_or_default();
+
+        Self {
+            node_labels,
+            edge_types,
+            weight_property,
+            include_reverse,
+            node_properties,
+            edge_properties,
+        }
+    }
+
+    /// Keys that mark a trailing CALL argument as a projection-config object
+    /// (a "graphRef") rather than a guest algorithm argument. Covers the
+    /// Native knobs, the P2 property-tensor knobs, and the P3 Cypher/Named
+    /// graphRef knobs so the trailing object is stripped from the guest's
+    /// arguments consistently across every projection mode.
+    pub const CONFIG_KEYS: &'static [&'static str] = &[
+        "nodeLabels",
+        "edgeTypes",
+        "relationshipTypes",
+        "weightProperty",
+        "includeReverse",
+        "nodeProperties",
+        "edgeProperties",
+        "nodeQuery",
+        "edgeQuery",
+        "weightColumn",
+        "name",
+    ];
+
+    /// If the last element of `args` is a JSON object bearing at least one
+    /// [`Self::CONFIG_KEYS`] key, removes it from `args` and returns the parsed
+    /// Native spec; otherwise leaves `args` untouched and returns `None`.
+    ///
+    /// This is the single definition of the "trailing object is the projection
+    /// config" convention, shared by all four guest loaders. In P3 Cypher/Named
+    /// mode the returned Native spec is empty (the query/name keys are unknown
+    /// to [`Self::from_config_object`]) and is ignored by the bridge in favor of
+    /// the pre-built projection — but the object is still stripped here so it
+    /// never reaches the guest function.
+    #[must_use]
+    pub fn take_from_args(args: &mut Vec<serde_json::Value>) -> Option<Self> {
+        let is_config = args
+            .last()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|o| Self::CONFIG_KEYS.iter().any(|k| o.contains_key(*k)));
+        if !is_config {
+            return None;
+        }
+        match args.pop() {
+            Some(serde_json::Value::Object(cfg)) => Some(Self::from_config_object(&cfg)),
+            _ => None,
+        }
+    }
+}
+
+/// Every graph-projection knob, enumerated so the guest/native surface contract
+/// is checked at compile time: adding a knob forces a classification in
+/// [`ProjectionKnob::reach`] and a key in [`ProjectionKnob::config_key`] (both
+/// wildcard-free `match`es), mirroring the capability
+/// `every_variant_classified_exactly_once` exhaustiveness test. This is the
+/// anti-drift guard for the guest/native gap issue #151 exposed. See
+/// `docs/proposals/graphcompute_projection_parity_2026-07-19.md` §4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionKnob {
+    /// Scope to these vertex labels (`nodeLabels`).
+    NodeLabels,
+    /// Scope to these edge types (`edgeTypes` / `relationshipTypes`).
+    EdgeTypes,
+    /// Bind an edge property as the traversal weight (`weightProperty`).
+    WeightProperty,
+    /// Also build inbound adjacency (`includeReverse`).
+    IncludeReverse,
+    /// Materialize per-vertex property tensors (`nodeProperties`).
+    NodeProperties,
+    /// Materialize per-edge property tensors (`edgeProperties`).
+    EdgeProperties,
+    /// Cypher-mode node selection query (`nodeQuery`).
+    CypherNodeQuery,
+    /// Cypher-mode edge selection query (`edgeQuery`).
+    CypherEdgeQuery,
+    /// Cypher-mode weight column (`weightColumn`).
+    CypherWeightColumn,
+    /// Named pre-registered projection (`name`).
+    NamedGraph,
+}
+
+/// How a projection knob is reachable from a guest algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnobReach {
+    /// Parsed by the shared [`GraphProjectionSpec::from_config_object`] — the
+    /// Native + property-tensor knobs.
+    GuestNative,
+    /// Resolved by the uni-query projection seam from a Cypher/Named graphRef.
+    GuestQuerySeam,
+    /// Host/native-only — not expressible by a guest (none today; reserved for
+    /// future knobs such as orientation or parallel-edge aggregation).
+    HostOnly,
+}
+
+impl ProjectionKnob {
+    /// Every knob, the single source of truth the exhaustiveness test iterates.
+    pub const ALL: &'static [ProjectionKnob] = &[
+        ProjectionKnob::NodeLabels,
+        ProjectionKnob::EdgeTypes,
+        ProjectionKnob::WeightProperty,
+        ProjectionKnob::IncludeReverse,
+        ProjectionKnob::NodeProperties,
+        ProjectionKnob::EdgeProperties,
+        ProjectionKnob::CypherNodeQuery,
+        ProjectionKnob::CypherEdgeQuery,
+        ProjectionKnob::CypherWeightColumn,
+        ProjectionKnob::NamedGraph,
+    ];
+
+    /// The graphRef config key for this knob. Wildcard-free: a new variant fails
+    /// to compile here until it is given a key.
+    #[must_use]
+    pub fn config_key(self) -> &'static str {
+        match self {
+            ProjectionKnob::NodeLabels => "nodeLabels",
+            ProjectionKnob::EdgeTypes => "edgeTypes",
+            ProjectionKnob::WeightProperty => "weightProperty",
+            ProjectionKnob::IncludeReverse => "includeReverse",
+            ProjectionKnob::NodeProperties => "nodeProperties",
+            ProjectionKnob::EdgeProperties => "edgeProperties",
+            ProjectionKnob::CypherNodeQuery => "nodeQuery",
+            ProjectionKnob::CypherEdgeQuery => "edgeQuery",
+            ProjectionKnob::CypherWeightColumn => "weightColumn",
+            ProjectionKnob::NamedGraph => "name",
+        }
+    }
+
+    /// How a guest reaches this knob. Wildcard-free: a new variant fails to
+    /// compile here until it is classified.
+    #[must_use]
+    pub fn reach(self) -> KnobReach {
+        match self {
+            ProjectionKnob::NodeLabels
+            | ProjectionKnob::EdgeTypes
+            | ProjectionKnob::WeightProperty
+            | ProjectionKnob::IncludeReverse
+            | ProjectionKnob::NodeProperties
+            | ProjectionKnob::EdgeProperties => KnobReach::GuestNative,
+            ProjectionKnob::CypherNodeQuery
+            | ProjectionKnob::CypherEdgeQuery
+            | ProjectionKnob::CypherWeightColumn
+            | ProjectionKnob::NamedGraph => KnobReach::GuestQuerySeam,
+        }
+    }
+}
+
+#[cfg(test)]
+mod projection_knob_contract {
+    use super::{GraphProjectionSpec, KnobReach, ProjectionKnob};
+
+    #[test]
+    fn every_projection_knob_is_classified_and_keyed() {
+        // A knob added to the enum makes `reach`/`config_key` non-exhaustive
+        // (compile error) and must be appended to `ALL`. Keys must be unique and
+        // recognized as graphRef markers so the adapters strip them from guest
+        // args.
+        let mut keys = std::collections::HashSet::new();
+        for knob in ProjectionKnob::ALL {
+            let key = knob.config_key();
+            assert!(keys.insert(key), "duplicate projection config key {key}");
+            assert!(
+                GraphProjectionSpec::CONFIG_KEYS.contains(&key),
+                "{key} missing from GraphProjectionSpec::CONFIG_KEYS"
+            );
+            let _ = knob.reach(); // total by construction
+        }
+    }
+
+    #[test]
+    fn guest_native_knobs_round_trip_through_the_shared_parser() {
+        // Every GuestNative knob must actually be honored by from_config_object,
+        // so a knob can't be declared guest-reachable yet silently unparsed —
+        // the precise failure that produced issue #151.
+        for &knob in ProjectionKnob::ALL {
+            if knob.reach() != KnobReach::GuestNative {
+                continue;
+            }
+            let key = knob.config_key();
+            let sample = match knob {
+                ProjectionKnob::IncludeReverse => serde_json::json!(false),
+                ProjectionKnob::WeightProperty => serde_json::json!("w"),
+                _ => serde_json::json!(["X"]),
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert(key.to_string(), sample);
+            let spec = GraphProjectionSpec::from_config_object(&obj);
+            let honored = match knob {
+                ProjectionKnob::NodeLabels => spec.node_labels == ["X"],
+                ProjectionKnob::EdgeTypes => spec.edge_types == ["X"],
+                ProjectionKnob::WeightProperty => spec.weight_property.as_deref() == Some("w"),
+                ProjectionKnob::IncludeReverse => !spec.include_reverse,
+                ProjectionKnob::NodeProperties => spec.node_properties == ["X"],
+                ProjectionKnob::EdgeProperties => spec.edge_properties == ["X"],
+                _ => unreachable!("only GuestNative knobs reach here"),
+            };
+            assert!(honored, "from_config_object did not honor `{key}`");
+        }
+    }
 }
 
 /// Stable, read-only topology view handed to a plugin algorithm.

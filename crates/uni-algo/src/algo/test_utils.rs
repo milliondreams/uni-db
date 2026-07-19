@@ -35,6 +35,8 @@ pub fn build_test_graph(vids: Vec<Vid>, edges: Vec<(Vid, Vid)>) -> GraphProjecti
         in_offsets: vec![0; vertex_count + 1], // Empty inbound for these tests
         in_neighbors: Vec::new(),
         out_weights: None,
+        node_properties: Default::default(),
+        edge_properties: Default::default(),
         id_map,
     }
 }

@@ -808,11 +808,25 @@ impl Executor {
             ))
         });
 
+        // Guest Cypher/Named projections (issue #151 P3) resolve through a query
+        // host built from the executor's components (the simple-executor path has
+        // no GraphExecutionContext). The host's inner queries read committed
+        // storage, matching the projection's storage-view contract for property
+        // values.
+        let storage = self.effective_storage();
+        let resolver = crate::procedures_plugin::algo::guest_graph_resolver(
+            crate::query::executor::procedure_host::QueryProcedureHost::from_components(
+                Arc::clone(&storage),
+                Some(Arc::clone(&self.algo_registry)),
+                self.procedure_registry.clone(),
+            ),
+        );
         let mut stream = crate::procedures_plugin::algo::run_algorithm_provider(
             entry,
-            self.effective_storage(),
+            storage,
             l0_manager,
             &config_json,
+            Some(resolver),
         )
         .map_err(|e| anyhow!("Algorithm '{name}': {e}"))?;
 

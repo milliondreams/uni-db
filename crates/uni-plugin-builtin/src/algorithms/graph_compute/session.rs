@@ -661,6 +661,27 @@ pub trait GraphCompute {
     /// Returns a typed [`FnError`] on a bad handle or an exhausted budget/arena.
     fn edge_weights(&mut self, g: Handle) -> Result<Handle, FnError>;
 
+    /// Group 9 (issue #151): builds a `[E]` per-edge tensor of the named edge
+    /// property, materialized at projection time (CSR out-edge order). Distinct
+    /// from [`edge_weights`](Self::edge_weights), which reads the traversal-weight
+    /// column (defaulting to `1.0`); a missing property value here is `NaN`.
+    ///
+    /// # Errors
+    /// Returns `0x86E` if the projection was not built with this edge property
+    /// (add it to `edgeProperties`), or a typed [`FnError`] on a bad handle or an
+    /// exhausted budget/arena.
+    fn edge_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError>;
+
+    /// Group 9 (issue #151): builds a `[V]` per-vertex tensor of the named vertex
+    /// property, materialized at projection time (vertex-slot order). A missing
+    /// property value is `NaN`.
+    ///
+    /// # Errors
+    /// Returns `0x86E` if the projection was not built with this vertex property
+    /// (add it to `nodeProperties`), or a typed [`FnError`] on a bad handle or an
+    /// exhausted budget/arena.
+    fn node_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError>;
+
     /// Group 9 (Mode A): the full edge mask — every edge of `g` active.
     ///
     /// The identity mask for masked traversal (equivalent to the unmasked kernel)
@@ -1599,6 +1620,34 @@ impl GraphCompute for AlgoSession {
         }
         self.charge(e as u64)?;
         self.alloc_tensor(Tensor::from_f64_edge(vals))
+    }
+
+    fn edge_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let vals = graph
+            .edge_property(name)
+            .ok_or_else(|| {
+                error::arg_validation(format!(
+                    "edge_property: `{name}` was not projected (add it to edgeProperties)"
+                ))
+            })?
+            .to_vec();
+        self.charge(vals.len() as u64)?;
+        self.alloc_tensor(Tensor::from_f64_edge(vals))
+    }
+
+    fn node_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let vals = graph
+            .node_property(name)
+            .ok_or_else(|| {
+                error::arg_validation(format!(
+                    "node_property: `{name}` was not projected (add it to nodeProperties)"
+                ))
+            })?
+            .to_vec();
+        self.charge(vals.len() as u64)?;
+        self.alloc_tensor(Tensor::from_f64(vals))
     }
 
     fn edges_all(&mut self, g: Handle) -> Result<Handle, FnError> {

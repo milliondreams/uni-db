@@ -504,6 +504,26 @@ impl GcSession {
             .map_err(py_err)
     }
 
+    /// Builds a `[E]` per-edge tensor of the named projected edge property (#151).
+    fn edge_property(&self, g: i64, name: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_property(from_i64(g), name)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Builds a `[V]` per-vertex tensor of the named projected vertex property (#151).
+    fn node_property(&self, g: i64, name: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .node_property(from_i64(g), name)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     /// The full edge mask — every edge of `g` active.
     fn edges_all(&self, g: i64) -> PyResult<i64> {
         self.check_deadline()?;

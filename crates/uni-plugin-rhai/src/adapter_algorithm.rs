@@ -86,8 +86,16 @@ impl AlgorithmProvider for RhaiAlgorithm {
 
         // Convert the positional-JSON CALL args to Rhai Dynamic values; they are
         // passed to the guest after the injected `GcSession`.
-        let json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
+        let mut json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
             .map_err(|e| FnError::new(0x802, format!("rhai algorithm: bad config json: {e}")))?;
+        // A trailing projection-config object scopes/weights the graph the guest
+        // sees (issue #151); strip it before the remaining args reach the guest.
+        let spec = GraphProjectionSpec::take_from_args(&mut json_args).unwrap_or_else(|| {
+            GraphProjectionSpec {
+                include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
+                ..GraphProjectionSpec::default()
+            }
+        });
         let guest_args: Vec<Dynamic> = json_args
             .into_iter()
             .map(|v| {
@@ -96,12 +104,8 @@ impl AlgorithmProvider for RhaiAlgorithm {
             })
             .collect::<Result<_, _>>()?;
 
-        // v1: project the whole graph. Build the 'static projection future and
-        // read the caps BEFORE the stream so no borrow of `ctx.host` escapes.
-        let spec = GraphProjectionSpec {
-            include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
-            ..GraphProjectionSpec::default()
-        };
+        // Build the 'static projection future and read the caps BEFORE the
+        // stream so no borrow of `ctx.host` escapes.
         let projection = bridge.project_for_graph_compute(&spec);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
 

@@ -485,6 +485,8 @@ impl GraphComputeRegistry {
             // Mode A edge kernels (proposal §5). Handle `b == 0` means "no
             // exclude mask" for expand_masked; the edge mask rides `c`.
             "edge_weights" => session.edge_weights(from_i64(req.g)).map(h),
+            "edge_property" => session.edge_property(from_i64(req.g), &req.name).map(h),
+            "node_property" => session.node_property(from_i64(req.g), &req.name).map(h),
             "edges_all" => session.edges_all(from_i64(req.g)).map(h),
             "segmented_reduce" => session
                 .segmented_reduce(from_i64(req.a), from_i64(req.b))

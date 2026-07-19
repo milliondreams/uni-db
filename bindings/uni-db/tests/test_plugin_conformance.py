@@ -132,10 +132,14 @@ def _build_weighted_graph(database):
     """
     database.schema().label("A").property("name", "string").done().label("B").property(
         "name", "string"
-    ).done().edge_type("LINK", ["A", "B"], ["A", "B"]).property("w", "float").done().apply()
+    ).done().edge_type("LINK", ["A", "B"], ["A", "B"]).property(
+        "w", "float"
+    ).done().apply()
     session = database.session()
     tx = session.tx()
-    tx.execute("CREATE (:A {name:'a0'}),(:A {name:'a1'}),(:A {name:'a2'}),(:B {name:'b0'})")
+    tx.execute(
+        "CREATE (:A {name:'a0'}),(:A {name:'a1'}),(:A {name:'a2'}),(:B {name:'b0'})"
+    )
     for src, dst in (("a0", "a1"), ("a1", "a2"), ("a2", "a0")):
         tx.execute(
             "MATCH (x {name:$s}),(y {name:$d}) CREATE (x)-[:LINK {w: 5.0}]->(y)",
@@ -326,7 +330,9 @@ def test_rhai_projection_binds_edge_weight_property(db):
     unweighted = _probe_rows(session, "CALL ai.example.gcprobe.probe()")
     assert math.isclose(float(unweighted[0]["total_edge_weight"]), 3.0, abs_tol=1e-9)
     # weightProperty="w": reduce_sum = 3 edges * 5.0 = 15.0.
-    weighted = _probe_rows(session, 'CALL ai.example.gcprobe.probe({weightProperty: "w"})')
+    weighted = _probe_rows(
+        session, 'CALL ai.example.gcprobe.probe({weightProperty: "w"})'
+    )
     assert math.isclose(float(weighted[0]["total_edge_weight"]), 15.0, abs_tol=1e-9)
 
 
@@ -445,9 +451,7 @@ def test_rhai_projection_named_graphref(db):
     # Register a named projection scoped to :A via the native graph procedure.
     db.session().query('CALL uni.graph.project("a_only", {nodeLabels: ["A"]})')
     db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
-    rows = _probe_rows(
-        db.session(), 'CALL ai.example.gcprobe.probe({name: "a_only"})'
-    )
+    rows = _probe_rows(db.session(), 'CALL ai.example.gcprobe.probe({name: "a_only"})')
     assert len(rows) == 3
 
 

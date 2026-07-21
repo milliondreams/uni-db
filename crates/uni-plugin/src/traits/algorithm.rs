@@ -77,10 +77,11 @@ pub struct SliceReq {
 /// The capability slices this host implements, for load-time negotiation.
 ///
 /// A guest algorithm's declared [`SliceReq`]s are checked against this table
-/// when it loads. Today the host implements only `graph-compute@1`; a future
-/// slice (e.g. `tensor-compute@1`) is added here in lockstep with its kernels so
-/// negotiation stays a pure lookup (proposal §4.3 / §10).
-pub const HOST_CAPABILITY_SLICES: &[(&str, u16)] = &[("graph-compute", 1)];
+/// when it loads. The host implements `graph-compute@1` (the coarse read-only
+/// kernels over a projection) and `graph-arena@1` (mutable session-local
+/// structure, proposal §5.1). A future slice is added here in lockstep with its
+/// kernels so negotiation stays a pure lookup (proposal §4.3 / §10).
+pub const HOST_CAPABILITY_SLICES: &[(&str, u16)] = &[("graph-compute", 1), ("graph-arena", 1)];
 
 impl AlgorithmSignature {
     /// Validates the declared capability slices against `host_slices`.

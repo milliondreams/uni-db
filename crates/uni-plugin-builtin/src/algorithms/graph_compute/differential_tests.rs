@@ -23,7 +23,7 @@ use super::first_party::{
 };
 use super::handle::{Handle, HandleKind};
 use super::session::{AlgoSession, Direction, GraphCompute, MapOp, Semiring};
-use super::value::{DType, Scalar};
+use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
 
 // ---- test fixtures -------------------------------------------------------
@@ -2453,6 +2453,9 @@ fn at_flow_batched_max_flow_matches_a_native_oracle() {
     // serves *edge-mutating* algorithms and not only node-growing search
     // (issue #152 gap 2). Agreement is against an independent matrix-based
     // Edmonds-Karp, so a shared bug cannot produce a false pass.
+    // AT-FLOW still exercises the retiring scratch path until its arena
+    // rewrite lands; the deprecation is a staged removal, not a bug here.
+    #[allow(deprecated)]
     use super::scratch::ScratchGraph;
     use super::{Arena, WorkBudget};
 
@@ -2463,6 +2466,7 @@ fn at_flow_batched_max_flow_matches_a_native_oracle() {
         let edges = random_flow_edges(NODES, EDGES, seed);
         let (s, t) = (0usize, NODES - 1);
 
+        #[allow(deprecated)]
         let mut g = ScratchGraph::new(
             WorkBudget::new(u64::MAX / 4),
             Arena::new(1 << 24, 1 << 20),
@@ -2521,4 +2525,385 @@ fn at_flow_batched_max_flow_matches_a_native_oracle() {
             "seed {seed:x} k={k}: flow entering sink {into_t} != {total}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// AT-ARENA — batched arena search vs an independent oracle
+//
+// Replaces AT-MCTS (proposal §6), which proved determinism over the retired
+// scratch ABI on a structure that could not represent an MCTS node. This runs
+// the *kernel path* — handles, tensors, columns-by-index, work charging — and
+// compares against a plain-Rust tree walk that shares none of it.
+// ---------------------------------------------------------------------------
+
+/// A complete binary tree laid out as an adjacency list, the oracle's structure.
+fn oracle_tree(depth: u32) -> Vec<Vec<u32>> {
+    let n = (1usize << (depth + 1)) - 1;
+    let mut kids = vec![Vec::new(); n];
+    for (i, slot) in kids.iter_mut().enumerate() {
+        let (l, r) = (2 * i + 1, 2 * i + 2);
+        if r < n {
+            #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+            slot.extend_from_slice(&[l as u32, r as u32]);
+        }
+    }
+    kids
+}
+
+/// The oracle: descend from the root, greedily by score, applying one visit and
+/// the virtual loss at every step — the same *semantics* as the kernel, written
+/// independently and without handles, columns, or a work meter.
+fn oracle_descend(
+    kids: &[Vec<u32>],
+    score: &mut [f64],
+    visit: &mut [f64],
+    rollouts: usize,
+    vloss: f64,
+) -> Vec<u32> {
+    let mut leaves = Vec::with_capacity(rollouts);
+    for _ in 0..rollouts {
+        let mut cur = 0u32;
+        loop {
+            visit[cur as usize] += 1.0;
+            score[cur as usize] -= vloss;
+            let ks = &kids[cur as usize];
+            if ks.is_empty() {
+                break;
+            }
+            let mut best = ks[0];
+            for &k in &ks[1..] {
+                if score[k as usize] > score[best as usize] {
+                    best = k;
+                }
+            }
+            cur = best;
+        }
+        leaves.push(cur);
+    }
+    leaves
+}
+
+/// The kernel path and an independent oracle must agree exactly — on the leaves
+/// reached *and* on the resulting visit distribution.
+///
+/// Agreeing on the root visit count alone would be far too weak: a descent that
+/// silently ignored the score column would still visit the root every time.
+#[test]
+fn at_arena_batched_descent_matches_an_independent_oracle() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 6;
+    const ROLLOUTS: usize = 256;
+    const VLOSS: f64 = 0.35;
+
+    let kids = oracle_tree(DEPTH);
+    let n = kids.len();
+
+    let mut session = AlgoSession::new(11, WorkBudget::new(50_000_000), Arena::new(8 << 20, 4096));
+
+    // Build the same tree through the kernels.
+    #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+    let cap = n as u32;
+    let arena = session.arena_new(cap, 2).expect("arena");
+    let slots = session.arena_alloc(arena, cap).expect("alloc");
+    let mut parents: Vec<i64> = Vec::new();
+    let mut children: Vec<i64> = Vec::new();
+    for (i, ks) in kids.iter().enumerate() {
+        for &k in ks {
+            parents.push(i as i64);
+            children.push(i64::from(k));
+        }
+    }
+    let ph = session
+        .alloc_tensor_for_test(Tensor::from_i64(parents))
+        .expect("parents tensor");
+    let ch = session
+        .alloc_tensor_for_test(Tensor::from_i64(children))
+        .expect("children tensor");
+    session.arena_link(arena, ph, ch).expect("link");
+
+    let score_col = session.arena_column(arena).expect("score column");
+    let visit_col = session.arena_column(arena).expect("visit column");
+    assert_ne!(score_col, visit_col, "columns must be distinct");
+
+    // Seed the score column with a deterministic, non-uniform prior so the
+    // descent has something real to discriminate on.
+    let prior: Vec<f64> = (0..n).map(|i| ((i * 37) % 101) as f64 / 101.0).collect();
+    let all_slots = slots;
+    let prior_h = session
+        .alloc_tensor_for_test(Tensor::from_f64(prior.clone()))
+        .expect("prior tensor");
+    #[expect(clippy::cast_possible_truncation, reason = "column index is small")]
+    let sc = score_col as u32;
+    #[expect(clippy::cast_possible_truncation, reason = "column index is small")]
+    let vi = visit_col as u32;
+    session
+        .arena_scatter(arena, sc, all_slots, prior_h)
+        .expect("seed scores");
+
+    // One rollout per descend call, matching the oracle's sequential semantics.
+    let root_h = session
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0]))
+        .expect("root tensor");
+    let mut kernel_leaves = Vec::with_capacity(ROLLOUTS);
+    for _ in 0..ROLLOUTS {
+        let out = session
+            .arena_descend(arena, root_h, sc, vi, true, VLOSS)
+            .expect("descend");
+        let t = session.tensor_for_test(out).expect("leaf tensor");
+        kernel_leaves
+            .push(u32::try_from(t.values_i64().expect("i64 leaves")[0]).expect("leaf fits u32"));
+    }
+
+    let mut o_score = prior;
+    let mut o_visit = vec![0.0; n];
+    let oracle_leaves = oracle_descend(&kids, &mut o_score, &mut o_visit, ROLLOUTS, VLOSS);
+
+    assert_eq!(
+        kernel_leaves, oracle_leaves,
+        "kernel and oracle must reach the same leaf on every rollout"
+    );
+
+    let kernel_visits = session.arena_column_for_test(arena, vi).expect("visits");
+    assert_eq!(
+        kernel_visits, o_visit,
+        "the whole visit distribution must match, not merely the root count"
+    );
+    assert!(
+        (kernel_visits[0] - ROLLOUTS as f64).abs() < f64::EPSILON,
+        "every rollout must pass through the root"
+    );
+
+    // Virtual loss must actually spread the search: a descent without it would
+    // take the same path every time (proposal §12.2 measured 16 of 1024 leaves).
+    let distinct: HashSet<u32> = kernel_leaves.iter().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "virtual loss must diversify the batch; got {} distinct leaves",
+        distinct.len()
+    );
+}
+
+/// Design P5: batching amortizes the crossing, never the meter.
+///
+/// One `arena_descend` over B roots must charge exactly what B single-root
+/// descents charge. If batching bought a discount, a guest could evade the
+/// native-work budget simply by batching harder — the budget is the only thing
+/// bounding a runaway guest that never returns to the host.
+#[test]
+fn arena_batching_gives_no_budget_discount() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 5;
+    const ROOTS: usize = 16;
+
+    // Building the identical arena twice keeps the comparison honest: the only
+    // difference between the two runs is batched vs sequential descent.
+    let build = || {
+        let kids = oracle_tree(DEPTH);
+        #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+        let cap = kids.len() as u32;
+        let mut s = AlgoSession::new(12, WorkBudget::new(50_000_000), Arena::new(8 << 20, 4096));
+        let arena = s.arena_new(cap, 2).expect("arena");
+        let _ = s.arena_alloc(arena, cap).expect("alloc");
+        let mut ps = Vec::new();
+        let mut cs = Vec::new();
+        for (i, ks) in kids.iter().enumerate() {
+            for &k in ks {
+                ps.push(i as i64);
+                cs.push(i64::from(k));
+            }
+        }
+        let ph = s.alloc_tensor_for_test(Tensor::from_i64(ps)).expect("p");
+        let ch = s.alloc_tensor_for_test(Tensor::from_i64(cs)).expect("c");
+        s.arena_link(arena, ph, ch).expect("link");
+        let sc = u32::try_from(s.arena_column(arena).expect("score")).expect("fits");
+        let vi = u32::try_from(s.arena_column(arena).expect("visit")).expect("fits");
+        (s, arena, sc, vi)
+    };
+
+    let (mut batched, a1, sc1, vi1) = build();
+    let roots = batched
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0; ROOTS]))
+        .expect("roots");
+    let before = batched.spent_for_test();
+    batched
+        .arena_descend(a1, roots, sc1, vi1, true, 0.25)
+        .expect("batched descend");
+    let batched_cost = batched.spent_for_test() - before;
+
+    let (mut seq, a2, sc2, vi2) = build();
+    let one = seq
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0]))
+        .expect("root");
+    let before = seq.spent_for_test();
+    for _ in 0..ROOTS {
+        seq.arena_descend(a2, one, sc2, vi2, true, 0.25)
+            .expect("single descend");
+    }
+    let sequential_cost = seq.spent_for_test() - before;
+
+    assert_eq!(
+        batched_cost, sequential_cost,
+        "a batched descent must charge exactly what the same descents charge one at a time"
+    );
+    assert!(batched_cost > 0, "descent must charge something");
+}
+
+/// The typed host ABI must reach the same kernels as the JSON one, and fail the
+/// same way (proposal §13.7).
+///
+/// `with_session` is what the WASM `host-arena` functions call instead of
+/// encoding a JSON string. If it diverged from `call_json` in either result or
+/// error behaviour, the two loader classes would silently disagree — the exact
+/// class of split-surface defect the reachability contract exists to prevent.
+#[test]
+fn typed_session_access_matches_the_json_path_and_isolates_panics() {
+    use super::dispatch::GraphComputeRegistry;
+    use super::session::GraphArenaCompute;
+
+    let registry = GraphComputeRegistry::new();
+    let sid = registry.open(AlgoSession::new(
+        21,
+        WorkBudget::new(1_000_000),
+        Arena::new(1 << 20, 256),
+    ));
+
+    // The typed path drives a real kernel and returns a real handle.
+    let arena = registry
+        .with_session(sid, |s| s.arena_new(16, 2))
+        .expect("typed arena_new");
+    let slots = registry
+        .with_session(sid, |s| s.arena_alloc(arena, 4))
+        .expect("typed arena_alloc");
+
+    // The same session is visible through the JSON path — one substrate, two
+    // ABIs, not two stacks.
+    let json = serde_json::json!({
+        "session": sid, "op": "arena_column", "g": to_i64_for_test(arena)
+    })
+    .to_string();
+    let resp: super::dispatch::KernelResponse =
+        serde_json::from_str(&registry.call_json(&json)).expect("decodes");
+    assert!(
+        matches!(resp, super::dispatch::KernelResponse::Float(f) if f == 0.0),
+        "the JSON path must see the arena the typed path created, got {resp:?}"
+    );
+
+    // A stale/forged handle fails typed, not by panic or silent success.
+    let bogus = Handle::from_u64(0xDEAD_BEEF);
+    let err = registry
+        .with_session(sid, |s| s.arena_alloc(bogus, 1))
+        .expect_err("a forged handle must be rejected");
+    assert!(
+        err.code == 0x863 || err.code == 0x860 || err.code == 0x861,
+        "expected a handle-validation code, got 0x{:x}",
+        err.code
+    );
+
+    // An unknown session is a typed error, never a lookup panic.
+    assert_eq!(
+        registry
+            .with_session(sid.wrapping_add(1), |s| s.arena_new(4, 2))
+            .expect_err("unknown session")
+            .code,
+        0x86E
+    );
+
+    // A panicking kernel body is isolated exactly as on the JSON path.
+    let err = registry
+        .with_session(sid, |_| -> Result<Handle, uni_plugin::errors::FnError> {
+            panic!("simulated kernel panic")
+        })
+        .expect_err("panic must be caught");
+    assert_eq!(err.code, 0x86D, "a panic must surface as an isolated 0x86D");
+
+    // The session survives the panic and still works.
+    registry
+        .with_session(sid, |s| s.arena_alloc(arena, 1))
+        .expect("session is usable after an isolated panic");
+    let _ = slots;
+}
+
+/// Packs a handle the way a loader does, for the test above.
+fn to_i64_for_test(h: Handle) -> i64 {
+    #[expect(clippy::cast_possible_wrap, reason = "handle round-trips bit-exact")]
+    let v = h.as_u64() as i64;
+    v
+}
+
+/// Phase 4's north star: the whole `graph-compute@1` kernel library applies to
+/// structure a *guest grew*, not only to a projection read from the store.
+///
+/// Builds a tree through the arena kernels, freezes it, and then runs ordinary
+/// Mode-A kernels — `vertex_count`, `degrees`, `expand`, `spmv` — against the
+/// resulting handle. The oracle is the same tree walked in plain Rust.
+#[test]
+fn frozen_arena_is_an_ordinary_graph_to_every_mode_a_kernel() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 4;
+    let kids = oracle_tree(DEPTH);
+    let n = kids.len();
+
+    let mut s = AlgoSession::new(31, WorkBudget::new(10_000_000), Arena::new(8 << 20, 4096));
+    #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+    let cap = n as u32;
+    let arena = s.arena_new(cap, 2).expect("arena");
+    let _ = s.arena_alloc(arena, cap).expect("alloc");
+
+    let mut ps = Vec::new();
+    let mut cs = Vec::new();
+    for (i, ks) in kids.iter().enumerate() {
+        for &k in ks {
+            ps.push(i as i64);
+            cs.push(i64::from(k));
+        }
+    }
+    let edge_total = ps.len();
+    let ph = s.alloc_tensor_for_test(Tensor::from_i64(ps)).expect("p");
+    let ch = s.alloc_tensor_for_test(Tensor::from_i64(cs)).expect("c");
+    s.arena_link(arena, ph, ch).expect("link");
+
+    // The freeze is what unifies the two worlds.
+    let g = s.arena_freeze(arena).expect("freeze");
+
+    assert_eq!(
+        s.vertex_count(g).expect("vertex_count on a frozen arena") as usize,
+        n,
+        "a frozen arena must report its slots as vertices"
+    );
+    assert_eq!(
+        s.edge_count(g).expect("edge_count on a frozen arena") as usize,
+        edge_total,
+        "freezing must drop the CSR slack, leaving exactly the linked edges"
+    );
+
+    // `degrees` is a real Mode-A kernel with no arena awareness whatsoever.
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    let got = s.tensor_for_test(deg).expect("degree tensor").as_f64_vec();
+    let want: Vec<f64> = kids.iter().map(|k| k.len() as f64).collect();
+    assert_eq!(got, want, "out-degrees must match the tree that was grown");
+
+    // And a traversal kernel: expanding the root reaches exactly its children.
+    let root = s
+        .frontier(g, &[Vid::new(0)])
+        .expect("frontier over the frozen arena");
+    let nbrs = s.expand(g, root, Direction::Out, None).expect("expand");
+    let reached = s.set_len(nbrs).expect("set_len");
+    assert_eq!(
+        reached as usize,
+        kids[0].len(),
+        "expanding the root must reach exactly its linked children"
+    );
+
+    // The snapshot is stable: growing the arena afterwards must not mutate a
+    // graph handle already frozen.
+    let more = s.arena_alloc(arena, 0);
+    assert!(more.is_ok(), "arena remains usable after freezing");
+    assert_eq!(
+        s.vertex_count(g).expect("vertex_count again") as usize,
+        n,
+        "a frozen handle is a snapshot, not a live view"
+    );
 }

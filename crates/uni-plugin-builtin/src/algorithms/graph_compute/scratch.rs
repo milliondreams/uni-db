@@ -39,6 +39,10 @@
 //
 // Rust guideline compliant
 
+// The whole module is deprecated together (see the item attributes below), so its
+// own internal references must not re-trip the lint.
+#![allow(deprecated)]
+
 use serde::{Deserialize, Serialize};
 use uni_algo::algo::rng::sample_bernoulli;
 use uni_plugin::errors::FnError;
@@ -63,6 +67,12 @@ const EDGE_BYTES: usize = 4;
 /// interpretation, so it is disqualified on perf. Vectorized/bulk loaders remain
 /// fine for Mode A / Mode B-vec — this gate is specific to the B-seq step loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "3.1.0",
+    note = "superseded by the `arena_*` kernels (HandleKind::Arena); this parallel \
+            stack was unreachable from every loader, which is issue #152. Removal at the \
+            next major — see docs/proposals/guest_stateful_compute_2026-07-20.md §6/§13.4"
+)]
 pub enum LoaderClass {
     /// A compiled body (WASM / native Rust) — permitted for Mode B-seq.
     Compiled,
@@ -78,6 +88,12 @@ pub enum LoaderClass {
 ///
 /// # Errors
 /// Returns [`FnError`] `0x86C` when `loader` is [`LoaderClass::Interpreted`].
+#[deprecated(
+    since = "3.1.0",
+    note = "refuted by measurement: interpreted Rhai (1.97M rollouts/s) beats compiled \
+            WASM on JSON (575K), so loader class does not predict throughput. Dead code; \
+            removal at the next major — see the proposal §6"
+)]
 pub fn require_compiled_body(loader: LoaderClass) -> Result<(), FnError> {
     match loader {
         LoaderClass::Compiled => Ok(()),
@@ -97,6 +113,12 @@ pub fn require_compiled_body(loader: LoaderClass) -> Result<(), FnError> {
 /// tracked as `Q-3`). Every accessor is fallible so budget/arena exhaustion and
 /// out-of-range slots surface as typed errors rather than panics.
 #[derive(Debug)]
+#[deprecated(
+    since = "3.1.0",
+    note = "superseded by the `arena_*` kernels (HandleKind::Arena); this parallel \
+            stack was unreachable from every loader, which is issue #152. Removal at the \
+            next major — see docs/proposals/guest_stateful_compute_2026-07-20.md §6/§13.4"
+)]
 pub struct ScratchGraph {
     /// Out-adjacency per node slot.
     adjacency: Vec<Vec<u32>>,
@@ -545,6 +567,12 @@ impl ScratchGraph {
 /// [`ScratchGraph`] under its budget. All fields default so each op names only
 /// the ones it needs.
 #[derive(Debug, Deserialize)]
+#[deprecated(
+    since = "3.1.0",
+    note = "superseded by the `arena_*` kernels (HandleKind::Arena); this parallel \
+            stack was unreachable from every loader, which is issue #152. Removal at the \
+            next major — see docs/proposals/guest_stateful_compute_2026-07-20.md §6/§13.4"
+)]
 pub struct ScratchRequest {
     /// The session id (from [`ScratchRegistry::open`]); `0` for the single-graph
     /// [`ScratchGraph::call_json`] path.
@@ -572,6 +600,12 @@ pub struct ScratchRequest {
 /// A JSON response returned to a Mode B-seq guest.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", content = "v")]
+#[deprecated(
+    since = "3.1.0",
+    note = "superseded by the `arena_*` kernels (HandleKind::Arena); this parallel \
+            stack was unreachable from every loader, which is issue #152. Removal at the \
+            next major — see docs/proposals/guest_stateful_compute_2026-07-20.md §6/§13.4"
+)]
 pub enum ScratchResponse {
     /// A slot / count result.
     #[serde(rename = "i")]
@@ -1039,6 +1073,12 @@ impl ScratchGraph {
 /// concurrent CALL, and a kernel panic is isolated to a typed error rather than a
 /// worker crash (proposal §5.4 / §7b).
 #[derive(Debug, Default)]
+#[deprecated(
+    since = "3.1.0",
+    note = "superseded by the `arena_*` kernels (HandleKind::Arena); this parallel \
+            stack was unreachable from every loader, which is issue #152. Removal at the \
+            next major — see docs/proposals/guest_stateful_compute_2026-07-20.md §6/§13.4"
+)]
 pub struct ScratchRegistry {
     sessions: parking_lot::Mutex<
         std::collections::HashMap<u64, std::sync::Arc<parking_lot::Mutex<ScratchGraph>>>,

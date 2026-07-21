@@ -86,6 +86,49 @@ interface host-graph {
     graph-call: func(req: string) -> result<string, fn-error>;
 }
 
+/// Capability-gated mutable-arena kernels (`graph-arena@1`).
+///
+/// The typed counterpart to `host-graph`. `graph-call` marshals every operand
+/// through a JSON string, which measured a **32x** tax at batch granularity
+/// (proposal §12, §5.3): a batched kernel does microseconds of native work, so
+/// ~2 us of JSON encode/decode per crossing dominates it. These functions carry
+/// the same operands as raw handles (`u64`) and scalars, so a crossing costs
+/// ~134 ns instead.
+///
+/// This interface is **additive**. A guest built before it exists imports only
+/// `host-graph` and is unaffected; a guest that wants the arena declares the
+/// `graph-arena@1` capability slice and gets a typed `0x86A` at load time if the
+/// host does not implement it, rather than a link failure (proposal §10.4).
+///
+/// The generic JSON `graph-call` remains for the cold and generic surface —
+/// this is not a replacement, it is a fast path for the kernels that are hot.
+interface host-arena {
+    use types.{fn-error};
+
+    /// Create an arena of `capacity` slots with `branching` child slack.
+    arena-new: func(session: u64, capacity: u32, branching: u32) -> result<u64, fn-error>;
+    /// Bump-allocate `count` slots; returns an i64 tensor handle of their ids.
+    arena-alloc: func(session: u64, arena: u64, count: u32) -> result<u64, fn-error>;
+    /// Link each `kids[i]` as a child of `parents[i]`.
+    arena-link: func(session: u64, arena: u64, parents: u64, kids: u64) -> result<_, fn-error>;
+    /// Add a zero-filled per-slot state column; returns its index.
+    arena-column: func(session: u64, arena: u64) -> result<u32, fn-error>;
+    /// The children of every slot in `roots`, concatenated.
+    arena-candidates: func(session: u64, arena: u64, roots: u64) -> result<u64, fn-error>;
+    /// Gather `column` at `slots` into a compact tensor.
+    arena-gather: func(session: u64, arena: u64, column: u32, slots: u64) -> result<u64, fn-error>;
+    /// Scatter `values` into `column` at `slots`.
+    arena-scatter: func(session: u64, arena: u64, column: u32, slots: u64, values: u64)
+        -> result<_, fn-error>;
+    /// Allocate `fanout` children for every slot in `parents` and link them.
+    arena-expand: func(session: u64, arena: u64, parents: u64, fanout: u32) -> result<u64, fn-error>;
+    /// Compact the arena into an immutable graph handle.
+    arena-freeze: func(session: u64, arena: u64) -> result<u64, fn-error>;
+    /// Descend from each root to a leaf by the guest's `score` column.
+    arena-descend: func(session: u64, arena: u64, roots: u64, score: u32, visit: u32,
+        maximize: bool, vloss: f64) -> result<u64, fn-error>;
+}
+
 /// Host trace-context propagation.
 ///
 /// Always added to the `Linker` (no capability required — it leaks nothing).
@@ -182,6 +225,7 @@ world algorithm-plugin {
 
     import host-log;
     import host-graph;
+    import host-arena;
 
     export manifest: func() -> string;
     export register: func() -> string;

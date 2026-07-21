@@ -749,6 +749,54 @@ impl GraphProjection {
     }
 }
 
+impl GraphProjection {
+    /// Builds a projection from a dense, slot-indexed edge list.
+    ///
+    /// [`from_rows`](Self::from_rows) exists for storage-shaped input — row maps
+    /// keyed by external [`Vid`] that must be interned into slots. Synthetic
+    /// structure is already dense: a guest's mutable graph arena, frozen
+    /// (GraphCompute proposal §13.8), numbers its own slots `0..vertex_count`.
+    /// Routing it through row maps would mean fabricating `Vid`s purely to look
+    /// them straight back up, so this takes the slots directly and uses an
+    /// identity id map.
+    ///
+    /// Sharing [`build_csr`] with `from_rows` is the point: a frozen arena gets
+    /// the *same* canonical edge ordering as a stored projection, so every
+    /// existing kernel behaves identically on it.
+    #[must_use]
+    pub fn from_dense_edges(
+        vertex_count: usize,
+        edges: &[(u32, u32, f64)],
+        weighted: bool,
+        include_reverse: bool,
+    ) -> Self {
+        let mut id_map = IdMap::with_capacity(vertex_count);
+        for slot in 0..vertex_count {
+            id_map.insert(Vid::new(slot as u64));
+        }
+        let (out_offsets, out_neighbors, out_weights, _) =
+            build_csr(vertex_count, edges, weighted, &[]);
+        let (in_offsets, in_neighbors) = if include_reverse {
+            let rev: Vec<(u32, u32, f64)> = edges.iter().map(|&(s, d, w)| (d, s, w)).collect();
+            let (o, n, _, _) = build_csr(vertex_count, &rev, false, &[]);
+            (o, n)
+        } else {
+            (vec![0; vertex_count + 1], Vec::new())
+        };
+        GraphProjection {
+            vertex_count,
+            out_offsets,
+            out_neighbors,
+            in_offsets,
+            in_neighbors,
+            out_weights,
+            node_properties: std::collections::HashMap::new(),
+            edge_properties: std::collections::HashMap::new(),
+            id_map,
+        }
+    }
+}
+
 fn value_as_u64(v: &uni_common::Value) -> Option<u64> {
     use uni_common::Value;
     match v {

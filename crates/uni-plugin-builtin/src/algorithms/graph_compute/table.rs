@@ -22,6 +22,7 @@ use std::sync::Arc;
 use uni_algo::algo::GraphProjection;
 use uni_plugin::errors::FnError;
 
+use super::arena::GraphArena;
 use super::error;
 use super::handle::{Handle, HandleKind, MAX_GENERATION};
 use super::value::{EdgeSet, PairList, Tensor, VertexSet, WalkMatrix};
@@ -94,6 +95,29 @@ impl<T> Slab<T> {
         s.value.as_ref().ok_or_else(error::stale_handle)
     }
 
+    /// Resolves a `(slot, generation)` to a live *mutable* value reference.
+    ///
+    /// Every other handle kind is immutable once inserted; the graph arena
+    /// (proposal §5.1) is the first that a guest grows in place, which is why
+    /// this exists. The validation is deliberately identical to [`Slab::get`] —
+    /// a stale, wrapped, or forged handle must fail the same way whether the
+    /// caller intends to read or to write.
+    fn get_mut(&mut self, slot: u32, generation: u16) -> Result<&mut T, FnError> {
+        let s = self
+            .slots
+            .get_mut(slot as usize)
+            .ok_or_else(error::stale_handle)?;
+        if s.retired {
+            return Err(error::wrap_fail_closed(
+                "handle targets a slot retired after a generation wrap",
+            ));
+        }
+        if s.generation != generation {
+            return Err(error::stale_handle());
+        }
+        s.value.as_mut().ok_or_else(error::stale_handle)
+    }
+
     /// Frees a slot, bumping its generation and reclaiming it unless it wrapped.
     ///
     /// Returns the freed value so the caller can update arena accounting.
@@ -142,6 +166,7 @@ pub struct HandleTable {
     graphs: Slab<Arc<GraphProjection>>,
     walks: Slab<WalkMatrix>,
     pairs: Slab<PairList>,
+    arenas: Slab<GraphArena>,
 }
 
 impl HandleTable {
@@ -156,6 +181,7 @@ impl HandleTable {
             graphs: Slab::default(),
             walks: Slab::default(),
             pairs: Slab::default(),
+            arenas: Slab::default(),
         }
     }
 
@@ -199,6 +225,12 @@ impl HandleTable {
     pub fn insert_edge_set(&mut self, set: EdgeSet) -> Handle {
         let (slot, generation) = self.edge_sets.insert(set);
         Handle::pack(self.epoch, HandleKind::EdgeSet, generation, slot)
+    }
+
+    /// Inserts a mutable graph arena and returns its handle.
+    pub fn insert_arena(&mut self, arena: GraphArena) -> Handle {
+        let (slot, generation) = self.arenas.insert(arena);
+        Handle::pack(self.epoch, HandleKind::Arena, generation, slot)
     }
 
     /// Validates the epoch and kind of `h`, returning the resolved kind.
@@ -279,6 +311,28 @@ impl HandleTable {
         }
     }
 
+    /// Resolves an arena handle.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
+    pub fn get_arena(&self, h: Handle) -> Result<&GraphArena, FnError> {
+        match self.check_epoch_and_kind(h)? {
+            HandleKind::Arena => self.arenas.get(h.slot(), h.generation()),
+            _ => Err(error::kind_mismatch("Arena")),
+        }
+    }
+
+    /// Resolves an arena handle for mutation.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
+    pub fn get_arena_mut(&mut self, h: Handle) -> Result<&mut GraphArena, FnError> {
+        match self.check_epoch_and_kind(h)? {
+            HandleKind::Arena => self.arenas.get_mut(h.slot(), h.generation()),
+            _ => Err(error::kind_mismatch("Arena")),
+        }
+    }
+
     /// Frees any handle, returning the number of heap bytes reclaimed.
     ///
     /// Graph handles report zero bytes: the projection is shared behind an `Arc`
@@ -313,6 +367,10 @@ impl HandleTable {
                 let v = self.edge_sets.free(h.slot(), h.generation())?;
                 Ok(v.heap_bytes())
             }
+            HandleKind::Arena => {
+                let v = self.arenas.free(h.slot(), h.generation())?;
+                Ok(v.heap_bytes())
+            }
             HandleKind::Levels => Err(error::kind_mismatch("a supported kind")),
         }
     }
@@ -326,6 +384,7 @@ impl HandleTable {
             + self.graphs.live_count()
             + self.walks.live_count()
             + self.pairs.live_count()
+            + self.arenas.live_count()
     }
 }
 

@@ -31,9 +31,10 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 
 use super::handle::Handle;
+use super::kernel_id::KernelId;
 use super::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, OverlapMetric, Predicate, ReduceOp,
-    Semiring,
+    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm, OverlapMetric,
+    Predicate, ReduceOp, Semiring,
 };
 use super::value::Scalar;
 
@@ -106,6 +107,18 @@ pub struct KernelRequest {
     /// Column name (for `emit`).
     #[serde(default)]
     pub name: String,
+    /// Arena slot capacity (`arena_new`) or allocation count (`arena_alloc`).
+    #[serde(default)]
+    pub cap: u32,
+    /// Arena per-slot child slack (`arena_new`).
+    #[serde(default)]
+    pub branch: u32,
+    /// Arena state-column index (the score column for `arena_descend`).
+    #[serde(default)]
+    pub col: u32,
+    /// Second arena state-column index (the visit column for `arena_descend`).
+    #[serde(default)]
+    pub col2: u32,
 }
 
 /// The result of a kernel call, serialized to the response JSON.
@@ -320,14 +333,66 @@ impl GraphComputeRegistry {
         })
     }
 
+    /// Runs `f` against a live session, for the **typed** host ABI.
+    ///
+    /// The JSON path ([`call_json`](Self::call_json)) exists so one host import
+    /// can carry the whole kernel catalog; it costs ~2 us per crossing in
+    /// encode/decode, which dominates a batched kernel's actual native work by
+    /// **32x** (proposal §12, §5.3). Typed host functions call through here
+    /// instead and pay only the handle.
+    ///
+    /// Panic isolation matches the JSON path exactly: a panicking kernel becomes
+    /// a typed `0x86D`, never an unwind across the guest boundary.
+    ///
+    /// # Errors
+    /// Returns `0x86E` for an unknown session id, `0x86D` for an isolated panic,
+    /// or whatever typed error the kernel itself produced.
+    pub fn with_session<R>(
+        &self,
+        session: u64,
+        f: impl FnOnce(&mut AlgoSession) -> Result<R, FnError>,
+    ) -> Result<R, FnError> {
+        let cell = {
+            let map = self.sessions.lock();
+            map.get(&session).map(Arc::clone)
+        };
+        let Some(cell) = cell else {
+            return Err(FnError::new(
+                0x86E,
+                format!("graph-arena: unknown session id {session}"),
+            ));
+        };
+        let mut guard = cell.lock();
+        // Same isolation rationale as `call`: parking_lot locks don't poison, so
+        // the mutex releases cleanly on unwind, and the session is per-CALL and
+        // discarded afterwards, so partial state cannot outlive the invocation.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut guard))).unwrap_or_else(
+            |_| {
+                Err(FnError::new(
+                    0x86D,
+                    "graph-arena: kernel panicked; isolated by the host",
+                ))
+            },
+        )
+    }
+
     /// Maps one request to a kernel invocation on `session`.
+    ///
+    /// The op name is resolved to a [`KernelId`] first, so the match below is
+    /// over a closed enum with **no wildcard arm**: a kernel added to the
+    /// catalog fails to compile until it is dispatched here. Before this, op
+    /// names were bare string literals and a missing arm was a runtime "unknown
+    /// op" that nothing could catch (see `kernel_id` module docs).
     fn dispatch(session: &mut AlgoSession, req: &KernelRequest) -> Result<KernelResponse, FnError> {
         let h = |x: Handle| KernelResponse::Handle(to_i64(x));
-        match req.op.as_str() {
-            "vertex_count" => Ok(KernelResponse::Float(
+        let Some(kernel) = KernelId::from_op_name(req.op.as_str()) else {
+            return Err(super::unresolved_op_error(req.op.as_str()));
+        };
+        match kernel {
+            KernelId::VertexCount => Ok(KernelResponse::Float(
                 session.vertex_count(from_i64(req.g))? as f64,
             )),
-            "frontier" => {
+            KernelId::Frontier => {
                 let vids: Vec<Vid> = req
                     .seeds
                     .iter()
@@ -339,12 +404,12 @@ impl GraphComputeRegistry {
                     .collect();
                 session.frontier(from_i64(req.g), &vids).map(h)
             }
-            "degrees" => session.degrees(from_i64(req.g), dir(&req.s)?).map(h),
-            "vertex_ids" => session.vertex_ids(from_i64(req.g)).map(h),
-            "set_to_map" => session
+            KernelId::Degrees => session.degrees(from_i64(req.g), dir(&req.s)?).map(h),
+            KernelId::VertexIds => session.vertex_ids(from_i64(req.g)).map(h),
+            KernelId::SetToMap => session
                 .set_to_map(from_i64(req.g), Scalar::F64(req.f))
                 .map(h),
-            "map_to_set" => {
+            KernelId::MapToSet => {
                 let pred = match req.s.as_str() {
                     "is_zero" => Predicate::IsZero,
                     "gt" => Predicate::Gt(req.f),
@@ -354,11 +419,11 @@ impl GraphComputeRegistry {
                 };
                 session.map_to_set(from_i64(req.g), pred).map(h)
             }
-            "recip" => session.map_apply(from_i64(req.g), MapOp::Recip).map(h),
-            "scale" => session
+            KernelId::Recip => session.map_apply(from_i64(req.g), MapOp::Recip).map(h),
+            KernelId::Scale => session
                 .map_apply(from_i64(req.g), MapOp::Scale(req.f))
                 .map(h),
-            "normalize" => {
+            KernelId::Normalize => {
                 let norm = match req.s.as_str() {
                     "l1" => Norm::L1,
                     "l2" => Norm::L2,
@@ -368,7 +433,7 @@ impl GraphComputeRegistry {
                     .map_apply(from_i64(req.g), MapOp::Normalize(norm))
                     .map(h)
             }
-            "ewise" => {
+            KernelId::Ewise => {
                 let op = match req.s.as_str() {
                     "mul" => EwiseOp::Mul,
                     "add" => EwiseOp::Add,
@@ -379,7 +444,7 @@ impl GraphComputeRegistry {
                 };
                 session.ewise(from_i64(req.a), from_i64(req.b), op).map(h)
             }
-            "spmv" => session
+            KernelId::Spmv => session
                 .spmv(
                     from_i64(req.g),
                     from_i64(req.a),
@@ -388,7 +453,7 @@ impl GraphComputeRegistry {
                     None,
                 )
                 .map(h),
-            "zero_map" => {
+            KernelId::ZeroMap => {
                 // `s == "i64"` seeds an exact path-counting run; default f64.
                 let ty = if req.s == "i64" {
                     super::value::DType::I64
@@ -397,22 +462,22 @@ impl GraphComputeRegistry {
                 };
                 session.zero_map(from_i64(req.g), ty).map(h)
             }
-            "map_apply" => session
+            KernelId::MapApply => session
                 .map_apply(from_i64(req.g), map_op(&req.s, req.f, req.f2)?)
                 .map(h),
-            "edge_count" => Ok(KernelResponse::Float(
+            KernelId::EdgeCount => Ok(KernelResponse::Float(
                 session.edge_count(from_i64(req.g))? as f64
             )),
-            "scatter" => session
+            KernelId::Scatter => session
                 .scatter(from_i64(req.a), from_i64(req.b), Scalar::F64(req.f))
                 .map(h),
-            "arg_extreme" => {
+            KernelId::ArgExtreme => {
                 let (vid, s) = session.arg_extreme(from_i64(req.g), req.want_max)?;
                 #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
                 let vid = vid.as_u64() as i64;
                 Ok(KernelResponse::VidScalar { vid, f: s.as_f64() })
             }
-            "random_walks" => {
+            KernelId::RandomWalks => {
                 let seeds: Vec<Vid> = req
                     .seeds
                     .iter()
@@ -434,14 +499,14 @@ impl GraphComputeRegistry {
                     )
                     .map(h)
             }
-            "sample" => session.sample(from_i64(req.g), req.seed, req.iter).map(h),
-            "walk_visit_counts" => session
+            KernelId::Sample => session.sample(from_i64(req.g), req.seed, req.iter).map(h),
+            KernelId::WalkVisitCounts => session
                 .walk_visit_counts(from_i64(req.a), from_i64(req.g))
                 .map(h),
-            "emit_walks" => session
+            KernelId::EmitWalks => session
                 .emit_walks(from_i64(req.g))
                 .map(|()| KernelResponse::Unit),
-            "neighborhood_overlap" => {
+            KernelId::NeighborhoodOverlap => {
                 let source = req.seeds.first().copied().unwrap_or(0);
                 #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
                 let source = Vid::new(source as u64);
@@ -449,7 +514,7 @@ impl GraphComputeRegistry {
                     .neighborhood_overlap(from_i64(req.g), source, overlap_metric(&req.s)?)
                     .map(h)
             }
-            "all_pairs_overlap" => {
+            KernelId::AllPairsOverlap => {
                 let spec = match req.s2.as_str() {
                     // `topk` reads the count from `k`; anything else is all pairs.
                     "topk" => super::session::PairSpec::TopKCandidates(req.k),
@@ -459,11 +524,11 @@ impl GraphComputeRegistry {
                     .all_pairs_overlap(from_i64(req.g), spec, overlap_metric(&req.s)?)
                     .map(h)
             }
-            "emit_pairs" => session
+            KernelId::EmitPairs => session
                 .emit_pairs(from_i64(req.g))
                 .map(|()| KernelResponse::Unit),
-            "next_bucket" => session.next_bucket(from_i64(req.g), req.f, req.k).map(h),
-            "topk" => {
+            KernelId::NextBucket => session.next_bucket(from_i64(req.g), req.f, req.k).map(h),
+            KernelId::Topk => {
                 let ranked = session.topk(from_i64(req.g), req.k)?;
                 #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
                 let pairs = ranked
@@ -472,7 +537,7 @@ impl GraphComputeRegistry {
                     .collect();
                 Ok(KernelResponse::Pairs(pairs))
             }
-            "expand" => session
+            KernelId::Expand => session
                 .expand(
                     from_i64(req.g),
                     from_i64(req.a),
@@ -480,31 +545,31 @@ impl GraphComputeRegistry {
                     Some(from_i64(req.b)),
                 )
                 .map(h),
-            "set_union" => session.set_union(from_i64(req.a), from_i64(req.b)).map(h),
-            "set_diff" => session.set_diff(from_i64(req.a), from_i64(req.b)).map(h),
+            KernelId::SetUnion => session.set_union(from_i64(req.a), from_i64(req.b)).map(h),
+            KernelId::SetDiff => session.set_diff(from_i64(req.a), from_i64(req.b)).map(h),
             // Mode A edge kernels (proposal §5). Handle `b == 0` means "no
             // exclude mask" for expand_masked; the edge mask rides `c`.
-            "edge_weights" => session.edge_weights(from_i64(req.g)).map(h),
-            "edge_property" => session.edge_property(from_i64(req.g), &req.name).map(h),
-            "node_property" => session.node_property(from_i64(req.g), &req.name).map(h),
-            "edges_all" => session.edges_all(from_i64(req.g)).map(h),
-            "segmented_reduce" => session
+            KernelId::EdgeWeights => session.edge_weights(from_i64(req.g)).map(h),
+            KernelId::EdgeProperty => session.edge_property(from_i64(req.g), &req.name).map(h),
+            KernelId::NodeProperty => session.node_property(from_i64(req.g), &req.name).map(h),
+            KernelId::EdgesAll => session.edges_all(from_i64(req.g)).map(h),
+            KernelId::SegmentedReduce => session
                 .segmented_reduce(from_i64(req.a), from_i64(req.b))
                 .map(h),
-            "sample_edges" => session
+            KernelId::SampleEdges => session
                 .sample_edges(from_i64(req.g), req.seed, req.iter)
                 .map(h),
-            "edge_set_len" => session
+            KernelId::EdgeSetLen => session
                 .edge_set_len(from_i64(req.g))
                 .map(|v| KernelResponse::Float(v as f64)),
-            "edge_mask_window" => session
+            KernelId::EdgeMaskWindow => session
                 .edge_mask_window(from_i64(req.g), req.f, req.f2)
                 .map(h),
-            "edge_intersect" => session
+            KernelId::EdgeIntersect => session
                 .edge_intersect(from_i64(req.a), from_i64(req.b))
                 .map(h),
-            "edge_union" => session.edge_union(from_i64(req.a), from_i64(req.b)).map(h),
-            "expand_masked" => session
+            KernelId::EdgeUnion => session.edge_union(from_i64(req.a), from_i64(req.b)).map(h),
+            KernelId::ExpandMasked => session
                 .expand_masked(
                     from_i64(req.g),
                     from_i64(req.a),
@@ -517,7 +582,7 @@ impl GraphComputeRegistry {
                     from_i64(req.c),
                 )
                 .map(h),
-            "spmv_masked" => session
+            KernelId::SpmvMasked => session
                 .spmv_masked(
                     from_i64(req.g),
                     from_i64(req.a),
@@ -525,27 +590,68 @@ impl GraphComputeRegistry {
                     from_i64(req.c),
                 )
                 .map(h),
-            "set_intersect" => session
+            KernelId::SetIntersect => session
                 .set_intersect(from_i64(req.a), from_i64(req.b))
                 .map(h),
-            "reduce_sum" => session
+            KernelId::ReduceSum => session
                 .reduce(from_i64(req.g), ReduceOp::Sum, None)
                 .map(|s| KernelResponse::Float(s.as_f64())),
-            "reduce_sum_masked" => session
+            KernelId::ReduceSumMasked => session
                 .reduce(from_i64(req.g), ReduceOp::Sum, Some(from_i64(req.a)))
                 .map(|s| KernelResponse::Float(s.as_f64())),
-            "l1_diff" => session
+            KernelId::L1Diff => session
                 .l1_diff(from_i64(req.a), from_i64(req.b))
                 .map(KernelResponse::Float),
-            "set_len" => session
+            KernelId::SetLen => session
                 .set_len(from_i64(req.g))
                 .map(|v| KernelResponse::Float(v as f64)),
-            "is_empty" => session.is_empty(from_i64(req.g)).map(KernelResponse::Bool),
-            "free" => session.free(from_i64(req.g)).map(|()| KernelResponse::Unit),
-            "emit" => session
+            KernelId::IsEmpty => session.is_empty(from_i64(req.g)).map(KernelResponse::Bool),
+            KernelId::Free => session.free(from_i64(req.g)).map(|()| KernelResponse::Unit),
+            KernelId::Emit => session
                 .emit(&[(req.name.as_str(), from_i64(req.g))])
                 .map(|()| KernelResponse::Unit),
-            other => Err(super::unresolved_op_error(other)),
+            KernelId::ArenaNew => session.arena_new(req.cap, req.branch).map(h),
+            KernelId::ArenaAlloc => session.arena_alloc(from_i64(req.g), req.cap).map(h),
+            KernelId::ArenaLink => session
+                .arena_link(from_i64(req.g), from_i64(req.a), from_i64(req.b))
+                .map(|()| KernelResponse::Unit),
+            KernelId::ArenaColumn => session
+                .arena_column(from_i64(req.g))
+                .map(|i| KernelResponse::Float(i as f64)),
+            KernelId::ArenaCandidates => session
+                .arena_candidates(from_i64(req.g), from_i64(req.a))
+                .map(h),
+            KernelId::ArenaGather => session
+                .arena_gather(from_i64(req.g), req.col, from_i64(req.a))
+                .map(h),
+            KernelId::ArenaScatter => session
+                .arena_scatter(from_i64(req.g), req.col, from_i64(req.a), from_i64(req.b))
+                .map(|()| KernelResponse::Unit),
+            KernelId::ArenaDescend => session
+                .arena_descend(
+                    from_i64(req.g),
+                    from_i64(req.a),
+                    req.col,
+                    req.col2,
+                    req.want_max,
+                    req.f,
+                )
+                .map(h),
+
+            KernelId::ArenaExpand => session
+                .arena_expand(from_i64(req.g), from_i64(req.a), req.cap)
+                .map(h),
+            KernelId::ArenaFreeze => session.arena_freeze(from_i64(req.g)).map(h),
+
+            // Declared exceptions (see `KernelReach`). These are real catalog
+            // entries that deliberately have no wire form, so a guest reaching
+            // one is told *why* rather than that the name is unknown. Being
+            // explicit arms rather than a wildcard is what keeps this match
+            // exhaustive over the catalog.
+            KernelId::Graph => Err(super::error::arg_validation(
+                "`graph` is not a kernel op: the graph handle reaches sandboxed guests \
+                 through the invoke-algorithm arguments",
+            )),
         }
     }
 }
@@ -673,6 +779,10 @@ mod tests {
             iter: 0,
             seeds: vec![],
             name: String::new(),
+            cap: 0,
+            branch: 0,
+            col: 0,
+            col2: 0,
         };
 
         let alpha = 0.85;

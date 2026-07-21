@@ -15,7 +15,10 @@
 //! The fixture is built by `scripts/build-wasm-fixtures.sh`; a missing artifact
 //! panics with a build hint (no silent skip — the `e9e3784a1` freshness lesson).
 #![cfg(feature = "wasmtime-runtime")]
-
+// These measure the retiring `ScratchGraph` path on purpose: they are the
+// evidence the arena replaces it (proposal §12). They move to the arena
+// kernels when `scratch` is deleted at the next major (§13.4).
+#![allow(deprecated)]
 use std::sync::Arc;
 
 use uni_plugin_builtin::algorithms::graph_compute::scratch::{ScratchGraph, ScratchRegistry};

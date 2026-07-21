@@ -36,8 +36,8 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, OverlapMetric, PairSpec, Predicate,
-    ReduceOp, Semiring,
+    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm, OverlapMetric,
+    PairSpec, Predicate, ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -156,6 +156,16 @@ impl GcSession {
         self.session
             .lock()
             .vertex_count(from_i64(g))
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .map_err(py_err)
+    }
+
+    /// Edge count of a graph handle.
+    fn edge_count(&self, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .edge_count(from_i64(g))
             .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
             .map_err(py_err)
     }
@@ -707,6 +717,131 @@ impl GcSession {
             .emit_pairs(from_i64(pairs))
             .map_err(py_err)
     }
+
+    // --- `graph-arena@1`: mutable session-local structure (proposal §5.1) ---
+
+    /// Creates an arena of `capacity` slots with `branching` child slack.
+    fn arena_new(&self, capacity: i64, branching: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let (c, b) = (
+            u32_arg(capacity, "capacity")?,
+            u32_arg(branching, "branching")?,
+        );
+        self.session
+            .lock()
+            .arena_new(c, b)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Bump-allocates `count` slots, returning an `i64` tensor of their ids.
+    fn arena_alloc(&self, arena: i64, count: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let n = u32_arg(count, "count")?;
+        self.session
+            .lock()
+            .arena_alloc(from_i64(arena), n)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Links each `kids[i]` as a child of `parents[i]`.
+    fn arena_link(&self, arena: i64, parents: i64, kids: i64) -> PyResult<()> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .arena_link(from_i64(arena), from_i64(parents), from_i64(kids))
+            .map_err(py_err)
+    }
+
+    /// Adds a zero-filled per-slot state column, returning its index.
+    fn arena_column(&self, arena: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .arena_column(from_i64(arena))
+            .map_err(py_err)
+    }
+
+    /// The children of every slot in `roots`, concatenated.
+    fn arena_candidates(&self, arena: i64, roots: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .arena_candidates(from_i64(arena), from_i64(roots))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Gathers `column` at `slots` into a compact tensor.
+    fn arena_gather(&self, arena: i64, column: i64, slots: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let c = u32_arg(column, "column")?;
+        self.session
+            .lock()
+            .arena_gather(from_i64(arena), c, from_i64(slots))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Scatters `values` into `column` at `slots`.
+    fn arena_scatter(&self, arena: i64, column: i64, slots: i64, values: i64) -> PyResult<()> {
+        self.check_deadline()?;
+        let c = u32_arg(column, "column")?;
+        self.session
+            .lock()
+            .arena_scatter(from_i64(arena), c, from_i64(slots), from_i64(values))
+            .map_err(py_err)
+    }
+
+    /// Descends from each root to a leaf by the guest's `score` column.
+    fn arena_descend(
+        &self,
+        arena: i64,
+        roots: i64,
+        score: i64,
+        visit: i64,
+        maximize: bool,
+        vloss: f64,
+    ) -> PyResult<i64> {
+        self.check_deadline()?;
+        let (sc, vi) = (u32_arg(score, "score")?, u32_arg(visit, "visit")?);
+        self.session
+            .lock()
+            .arena_descend(from_i64(arena), from_i64(roots), sc, vi, maximize, vloss)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Allocates `fanout` children for every slot in `parents` and links them.
+    fn arena_expand(&self, arena: i64, parents: i64, fanout: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        let f = u32_arg(fanout, "fanout")?;
+        self.session
+            .lock()
+            .arena_expand(from_i64(arena), from_i64(parents), f)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Compacts the arena into an immutable graph handle.
+    fn arena_freeze(&self, arena: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .arena_freeze(from_i64(arena))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+}
+
+/// Narrows a guest `int` to the `u32` a kernel expects, or raises typed.
+fn u32_arg(v: i64, what: &str) -> PyResult<u32> {
+    u32::try_from(v).map_err(|_| {
+        PyRuntimeError::new_err(format!(
+            "GraphCompute (0x86E): {what} must be a non-negative 32-bit value, got {v}"
+        ))
+    })
 }
 
 impl GcSession {
@@ -719,5 +854,53 @@ impl GcSession {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uni_plugin_builtin::algorithms::graph_compute::kernel_id::{KernelId, KernelReach};
+
+    /// The reachability contract for the PyO3 surface (proposal §5.4 / §13.2).
+    ///
+    /// Every kernel the catalog declares `AllLoaders` must be an attribute of
+    /// the `GcSession` type. This is asserted against the *live* type object
+    /// rather than a maintained list, so it cannot be satisfied by updating a
+    /// declaration — the `#[pymethods]` block itself has to have the method.
+    ///
+    /// This is the assertion that was missing when `edge_count` shipped
+    /// dispatchable over JSON but invisible to Rhai and Python guests.
+    #[test]
+    fn every_all_loaders_kernel_is_reachable_from_python() {
+        Python::initialize();
+        Python::attach(|py| {
+            let ty = py.get_type::<GcSession>();
+            let missing: Vec<&str> = KernelId::all_loaders()
+                .filter(|k| !ty.hasattr(k.op_name()).unwrap_or(false))
+                .map(KernelId::op_name)
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "kernels dispatchable over JSON but absent from the Python surface: {missing:?}"
+            );
+
+            // `LoaderLocal` is reserved and currently empty, so this loop is
+            // vacuous today. It is kept as the guard that a future carve-out
+            // must actually exist rather than merely being declared — writing
+            // this check is what revealed that `check_deadline`, initially
+            // catalogued as LoaderLocal, is a private Rust helper in a plain
+            // `impl` block and never was guest-callable.
+            for k in KernelId::ALL
+                .iter()
+                .filter(|k| k.reach() == KernelReach::LoaderLocal)
+            {
+                assert!(
+                    ty.hasattr(k.op_name()).unwrap_or(false),
+                    "`{}` is classified LoaderLocal but is absent from GcSession",
+                    k.op_name()
+                );
+            }
+        });
     }
 }

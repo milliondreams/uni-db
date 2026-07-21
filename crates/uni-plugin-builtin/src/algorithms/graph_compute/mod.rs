@@ -28,11 +28,13 @@
 //
 // Rust guideline compliant
 
+pub mod arena;
 pub mod conformance;
 pub mod dispatch;
 pub mod error;
 pub mod first_party;
 pub mod handle;
+pub mod kernel_id;
 pub mod scratch;
 pub mod session;
 pub mod table;
@@ -45,9 +47,14 @@ pub mod provider;
 pub mod provider_pairs;
 pub mod provider_walks;
 
+pub use arena::GraphArena;
 pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
+pub use kernel_id::{KernelId, KernelReach};
+// Re-exported for one more minor release so downstream code gets a deprecation
+// warning rather than a hard break; removed at the next major (§13.4).
+#[allow(deprecated)]
 pub use scratch::{LoaderClass, ScratchGraph, ScratchRegistry, ScratchRequest, ScratchResponse};
 pub use session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
@@ -77,16 +84,20 @@ pub fn graph_compute_slice_req() -> uni_plugin::traits::algorithm::SliceReq {
 
 /// The capability-slice name the mutable-arena kernel family is versioned under.
 ///
-/// This host does **not** implement the slice yet. It is declared here so a
-/// guest reaching for an arena kernel gets a typed, actionable refusal naming
-/// the slice it needs, rather than a bare "unknown op" / "function not found"
-/// — the defect reported as issue #152.
+/// Implemented as of the arena kernels (`arena_*`); see
+/// [`KernelId`](kernel_id::KernelId). The constant remains the single place the
+/// slice name is written.
 pub const GRAPH_ARENA_SLICE: &str = "graph-arena";
 
 /// The arena slice version the kernels below will land under (proposal §5.5).
 pub const GRAPH_ARENA_SLICE_VERSION: u16 = 1;
 
-/// Op names belonging to `graph-arena@1`, which this host does not yet provide.
+/// Retired `ScratchGraph` op names, kept only to give a guest a useful redirect.
+///
+/// These were the per-op scratch API measured at 59 K rollouts/s and superseded
+/// by the batched `arena_*` kernels (proposal §6 / §12). A guest written against
+/// the old names is not making a typo, so it earns a pointer to the replacement
+/// rather than "unknown op" — the issue #152 defect, in its residual form.
 ///
 /// Names that also exist in the `graph-compute@1` catalog (`sample`,
 /// `edge_count`) are deliberately absent: a guest calling those resolves against
@@ -136,7 +147,10 @@ pub fn unresolved_op_error(op: &str) -> uni_plugin::errors::FnError {
         uni_plugin::errors::FnError::new(
             error::SLICE_VERSION_MISMATCH,
             format!(
-                "kernel `{op}` requires capability slice `{GRAPH_ARENA_SLICE}@{GRAPH_ARENA_SLICE_VERSION}`, which this host does not provide"
+                "kernel `{op}` is a retired scratch-graph op; use the batched \
+                 `arena_*` kernels of `{GRAPH_ARENA_SLICE}@{GRAPH_ARENA_SLICE_VERSION}` \
+                 (arena_new / arena_alloc / arena_link / arena_column / \
+                 arena_candidates / arena_gather / arena_scatter / arena_descend)"
             ),
         )
     } else {

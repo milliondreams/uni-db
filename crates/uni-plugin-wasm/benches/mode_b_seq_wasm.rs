@@ -1,3 +1,7 @@
+// These measure the retiring `ScratchGraph` path on purpose: they are the
+// evidence the arena replaces it (proposal §12). They move to the arena
+// kernels when `scratch` is deleted at the next major (§13.4).
+#![allow(deprecated)]
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 

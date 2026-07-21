@@ -48,6 +48,7 @@ use uni_algo::algo::rng::sample_bernoulli;
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 
+use super::arena::GraphArena;
 use super::error;
 use super::handle::{Handle, HandleKind};
 use super::table::HandleTable;
@@ -2163,4 +2164,363 @@ fn intersect_sorted_weight(a: &[u32], b: &[u32], weight: &[f64]) -> f64 {
         }
     }
     acc
+}
+
+/// The mutable-arena kernel catalog (`graph-arena@1`, proposal §5.1 / §13).
+///
+/// Kept separate from [`GraphCompute`] rather than bolted onto it: that trait is
+/// already 44 methods, and the split marks the real boundary — these kernels
+/// operate on session-local *synthetic* structure a guest grows, not on the
+/// immutable projection read from the store.
+///
+/// Every operand is a handle or a small scalar; no batch or column data crosses
+/// the boundary (design P2). Every kernel charges the full native work it does,
+/// with no discount for batching (design P5) — batching amortizes the crossing,
+/// never the meter.
+pub trait GraphArenaCompute {
+    /// Creates an arena sized for `capacity` slots with `branching` child slack.
+    ///
+    /// # Errors
+    /// `0x86E` for a zero or overflowing bound; `0x864` if the backing arrays
+    /// would exceed the session arena cap.
+    fn arena_new(&mut self, capacity: u32, branching: u32) -> Result<Handle, FnError>;
+
+    /// Bump-allocates `count` slots, returning their ids as an `i64` tensor.
+    ///
+    /// # Errors
+    /// `0x864` when the request would exceed the arena's capacity.
+    fn arena_alloc(&mut self, arena: Handle, count: u32) -> Result<Handle, FnError>;
+
+    /// Links each `kids[i]` as a child of `parents[i]`.
+    ///
+    /// # Errors
+    /// `0x862` if the two tensors differ in length; `0x86E` for an out-of-range
+    /// slot; `0x864` when a parent's child run is already full.
+    fn arena_link(&mut self, arena: Handle, parents: Handle, kids: Handle) -> Result<(), FnError>;
+
+    /// Adds a zero-filled `[capacity]` state column, returning its index.
+    ///
+    /// # Errors
+    /// `0x864` when the column would exceed the session arena cap.
+    fn arena_column(&mut self, arena: Handle) -> Result<i64, FnError>;
+
+    /// The children of every slot in `roots`, concatenated.
+    ///
+    /// This is what makes guest scoring candidate-scoped rather than
+    /// whole-column: the guest computes over `O(roots x branching)` entries
+    /// instead of `O(capacity)`. §12.7 measured whole-column scoring costing
+    /// **6.07x** the descent it feeds.
+    ///
+    /// # Errors
+    /// `0x86E` for an out-of-range root.
+    fn arena_candidates(&mut self, arena: Handle, roots: Handle) -> Result<Handle, FnError>;
+
+    /// Gathers `column` at `slots` into a compact `f64` tensor.
+    ///
+    /// # Errors
+    /// `0x86E` for an unknown column or an out-of-range slot.
+    fn arena_gather(
+        &mut self,
+        arena: Handle,
+        column: u32,
+        slots: Handle,
+    ) -> Result<Handle, FnError>;
+
+    /// Scatters `values` into `column` at `slots`.
+    ///
+    /// # Errors
+    /// `0x862` if `slots` and `values` differ in length; `0x86E` for an unknown
+    /// column or an out-of-range slot.
+    fn arena_scatter(
+        &mut self,
+        arena: Handle,
+        column: u32,
+        slots: Handle,
+        values: Handle,
+    ) -> Result<(), FnError>;
+
+    /// Descends from each root to a leaf, choosing the best-scoring child.
+    ///
+    /// Applies one visit and the virtual loss `vloss` at every step, in the
+    /// loop — see [`GraphArena::descend`] for why that is mandatory rather than
+    /// an optimization.
+    ///
+    /// # Errors
+    /// `0x86E` for an unknown column, an out-of-range root, or `score == visit`.
+    fn arena_descend(
+        &mut self,
+        arena: Handle,
+        roots: Handle,
+        score: u32,
+        visit: u32,
+        maximize: bool,
+        vloss: f64,
+    ) -> Result<Handle, FnError>;
+
+    /// Allocates `fanout` children for every slot in `parents` and links them.
+    ///
+    /// The tree-growth primitive. Without it a guest cannot grow structure at
+    /// all: [`arena_link`](Self::arena_link) needs two tensors of slot ids, and
+    /// no kernel lets a guest *construct* one — `arena_alloc` returns a flat
+    /// list with no parent association. Expansion is also the operation a search
+    /// actually performs, so fusing allocate-and-link is the coarse-grained
+    /// shape (design P3) rather than a convenience.
+    ///
+    /// Returns the new child slots, in parent order.
+    ///
+    /// # Errors
+    /// `0x864` if the expansion would exceed the arena's capacity or a parent's
+    /// branching limit; `0x86E` for an out-of-range parent.
+    fn arena_expand(
+        &mut self,
+        arena: Handle,
+        parents: Handle,
+        fanout: u32,
+    ) -> Result<Handle, FnError>;
+
+    /// Compacts the arena into an immutable graph handle.
+    ///
+    /// This is what makes the **whole** `graph-compute@1` kernel library apply
+    /// to synthetic structure (proposal §13.2 phase 4): the result is an
+    /// ordinary [`GraphProjection`] behind an ordinary `Graph` handle, so
+    /// PageRank, components, BFS and the rest operate on a guest-grown tree
+    /// exactly as they do on a stored projection.
+    ///
+    /// It is a **snapshot**, not a view: freezing copies. That is deliberate —
+    /// the kernels assume a graph that cannot change underneath them, and the
+    /// arena is by definition mutable. Later growth does not affect a handle
+    /// already frozen.
+    ///
+    /// # Errors
+    /// `0x861` if the handle is not an arena; `0x864` if the compacted copy
+    /// would exceed the session arena cap.
+    fn arena_freeze(&mut self, arena: Handle) -> Result<Handle, FnError>;
+}
+
+/// Reads a handle as a tensor of slot ids, accepting either backing type.
+///
+/// `arena_alloc` mints `i64` tensors, but a guest may well have built its root
+/// list with `f64`-producing kernels; rejecting that would be a papercut with no
+/// safety benefit, since both are bounds-checked against the arena below.
+fn slot_ids(t: &Tensor) -> Vec<u32> {
+    match t.values_i64() {
+        Some(v) => v
+            .iter()
+            .map(|&x| u32::try_from(x).unwrap_or(u32::MAX))
+            .collect(),
+        None => t
+            .as_f64_vec()
+            .iter()
+            .map(|&x| {
+                if x >= 0.0 && x <= f64::from(u32::MAX) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "range-checked immediately above"
+                    )]
+                    let v = x as u32;
+                    v
+                } else {
+                    u32::MAX
+                }
+            })
+            .collect(),
+    }
+}
+
+impl GraphArenaCompute for AlgoSession {
+    fn arena_new(&mut self, capacity: u32, branching: u32) -> Result<Handle, FnError> {
+        let arena = GraphArena::new(capacity, branching)?;
+        // Charge the zeroing work and reserve the backing arrays before the
+        // arena becomes reachable, so a rejected allocation leaves no trace.
+        self.charge(u64::from(capacity))?;
+        self.reserve(arena.heap_bytes())?;
+        Ok(self.table.insert_arena(arena))
+    }
+
+    fn arena_alloc(&mut self, arena: Handle, count: u32) -> Result<Handle, FnError> {
+        self.charge(u64::from(count))?;
+        let slots = self.table.get_arena_mut(arena)?.alloc(count)?;
+        let ids: Vec<i64> = slots.iter().map(|&s| i64::from(s)).collect();
+        self.alloc_tensor(Tensor::from_i64(ids))
+    }
+
+    fn arena_link(&mut self, arena: Handle, parents: Handle, kids: Handle) -> Result<(), FnError> {
+        let ps = slot_ids(self.table.get_tensor(parents)?);
+        let ks = slot_ids(self.table.get_tensor(kids)?);
+        if ps.len() != ks.len() {
+            return Err(error::shape_mismatch(
+                "arena_link requires parent and child lists of equal length",
+            ));
+        }
+        self.charge(ps.len() as u64)?;
+        let a = self.table.get_arena_mut(arena)?;
+        for (&p, &k) in ps.iter().zip(ks.iter()) {
+            a.link(p, k)?;
+        }
+        Ok(())
+    }
+
+    fn arena_column(&mut self, arena: Handle) -> Result<i64, FnError> {
+        let bytes = self.table.get_arena(arena)?.column_bytes();
+        let capacity = self.table.get_arena(arena)?.capacity();
+        self.charge(u64::from(capacity))?;
+        self.reserve(bytes)?;
+        Ok(i64::from(self.table.get_arena_mut(arena)?.column_new()))
+    }
+
+    fn arena_candidates(&mut self, arena: Handle, roots: Handle) -> Result<Handle, FnError> {
+        let rs = slot_ids(self.table.get_tensor(roots)?);
+        let a = self.table.get_arena(arena)?;
+        for &r in &rs {
+            a.check_slot(r)?;
+        }
+        let mut out: Vec<i64> = Vec::new();
+        for &r in &rs {
+            out.extend(a.children(r).iter().map(|&c| i64::from(c)));
+        }
+        // Charge per candidate produced, plus per root scanned.
+        let work = out.len() as u64 + rs.len() as u64;
+        self.charge(work)?;
+        self.alloc_tensor(Tensor::from_i64(out))
+    }
+
+    fn arena_gather(
+        &mut self,
+        arena: Handle,
+        column: u32,
+        slots: Handle,
+    ) -> Result<Handle, FnError> {
+        let ss = slot_ids(self.table.get_tensor(slots)?);
+        self.charge(ss.len() as u64)?;
+        let a = self.table.get_arena(arena)?;
+        let col = a.column(column)?;
+        let mut out = Vec::with_capacity(ss.len());
+        for &s in &ss {
+            a.check_slot(s)?;
+            out.push(col[s as usize]);
+        }
+        self.alloc_tensor(Tensor::from_f64(out))
+    }
+
+    fn arena_scatter(
+        &mut self,
+        arena: Handle,
+        column: u32,
+        slots: Handle,
+        values: Handle,
+    ) -> Result<(), FnError> {
+        let ss = slot_ids(self.table.get_tensor(slots)?);
+        let vs = self.table.get_tensor(values)?.as_f64_vec();
+        if ss.len() != vs.len() {
+            return Err(error::shape_mismatch(
+                "arena_scatter requires slot and value lists of equal length",
+            ));
+        }
+        self.charge(ss.len() as u64)?;
+        let a = self.table.get_arena_mut(arena)?;
+        for &s in &ss {
+            a.check_slot(s)?;
+        }
+        let col = a.column_mut(column)?;
+        for (&s, &v) in ss.iter().zip(vs.iter()) {
+            col[s as usize] = v;
+        }
+        Ok(())
+    }
+
+    fn arena_descend(
+        &mut self,
+        arena: Handle,
+        roots: Handle,
+        score: u32,
+        visit: u32,
+        maximize: bool,
+        vloss: f64,
+    ) -> Result<Handle, FnError> {
+        let rs = slot_ids(self.table.get_tensor(roots)?);
+        // Charge the roots up front, then the children actually inspected. A
+        // batched descent therefore costs exactly what the same descents would
+        // cost issued one at a time (design P5).
+        self.charge(rs.len() as u64)?;
+        let (leaves, inspected) = self
+            .table
+            .get_arena_mut(arena)?
+            .descend(&rs, score, visit, maximize, vloss)?;
+        self.charge(inspected)?;
+        let ids: Vec<i64> = leaves.iter().map(|&s| i64::from(s)).collect();
+        self.alloc_tensor(Tensor::from_i64(ids))
+    }
+
+    fn arena_expand(
+        &mut self,
+        arena: Handle,
+        parents: Handle,
+        fanout: u32,
+    ) -> Result<Handle, FnError> {
+        let ps = slot_ids(self.table.get_tensor(parents)?);
+        let total = ps.len() as u64 * u64::from(fanout);
+        self.charge(total)?;
+        let a = self.table.get_arena_mut(arena)?;
+        for &p in &ps {
+            a.check_slot(p)?;
+        }
+        let mut out: Vec<i64> = Vec::with_capacity(ps.len() * fanout as usize);
+        for &p in &ps {
+            let kids = a.alloc(fanout)?;
+            for &k in &kids {
+                a.link(p, k)?;
+            }
+            out.extend(kids.iter().map(|&k| i64::from(k)));
+        }
+        self.alloc_tensor(Tensor::from_i64(out))
+    }
+
+    fn arena_freeze(&mut self, arena: Handle) -> Result<Handle, FnError> {
+        let a = self.table.get_arena(arena)?;
+        let n = a.len() as usize;
+        let (offsets, neighbors) = a.freeze_csr();
+        // Charge the compaction as the O(V+E) copy it is.
+        self.charge(n as u64 + neighbors.len() as u64)?;
+
+        let mut edges: Vec<(u32, u32, f64)> = Vec::with_capacity(neighbors.len());
+        for slot in 0..n {
+            let (lo, hi) = (offsets[slot] as usize, offsets[slot + 1] as usize);
+            for &dst in &neighbors[lo..hi] {
+                #[expect(clippy::cast_possible_truncation, reason = "slot count is a u32")]
+                let src = slot as u32;
+                edges.push((src, dst, 1.0));
+            }
+        }
+        let projection = GraphProjection::from_dense_edges(n, &edges, false, true);
+        self.reserve(projection.memory_size())?;
+        Ok(self.table.insert_graph(Arc::new(projection)))
+    }
+}
+
+#[cfg(test)]
+impl AlgoSession {
+    /// Test-only: inserts a tensor so a differential test can build operands
+    /// without going through a kernel that would also charge work.
+    pub(crate) fn alloc_tensor_for_test(&mut self, t: Tensor) -> Result<Handle, FnError> {
+        self.alloc_tensor(t)
+    }
+
+    /// Test-only: reads back a tensor result.
+    pub(crate) fn tensor_for_test(&self, h: Handle) -> Result<&Tensor, FnError> {
+        self.table.get_tensor(h)
+    }
+
+    /// Test-only: reads a whole arena state column, for oracle comparison.
+    pub(crate) fn arena_column_for_test(&self, a: Handle, col: u32) -> Result<Vec<f64>, FnError> {
+        self.table.get_arena(a)?.column(col).map(<[f64]>::to_vec)
+    }
+}
+
+#[cfg(test)]
+impl AlgoSession {
+    /// Test-only: native-work units spent, for metering invariants.
+    pub(crate) fn spent_for_test(&self) -> u64 {
+        self.budget.spent()
+    }
 }

@@ -25,6 +25,11 @@ This proposal folds the scratch runtime into the existing GraphCompute substrate
 makes reachability structural rather than remembered, replaces a mis-specified
 acceptance gate, and retires a design policy the measurements contradict.
 
+> **Reading order.** §1–§11 are the original design. Two later sections supersede parts of
+> it and are authoritative where they conflict: **§12** closes the §10 gaps by
+> measurement, and **§13** is the implementation plan of record, replacing §8's phasing.
+> Current status is §13.5.
+
 ## 2. Evidence
 
 All numbers from benches added during the investigation. Identical search in every
@@ -186,6 +191,11 @@ Mirroring #151's `ProjectionKnob` and the capability `every_variant_classified_e
 
 This is the mechanism that makes #153 structurally impossible.
 
+> **Amended by §13.3:** `KernelId` carries a *second* wildcard-free classification,
+> `substrate()`, so a kernel is guarded both on which loaders reach it and on which graph
+> substrates it is valid over. **Amended by §13.1:** the contract has a live bug to catch —
+> `edge_count` is already JSON-reachable but absent from Rhai and PyO3.
+
 ### 5.5 Capability, metering, isolation
 
 - **Grant.** Mutable synthetic state is a distinct capability from read-only projection.
@@ -222,6 +232,11 @@ determinism itself is preserved: `descend_batch` breaks ties by lower slot, so a
 work-budget/arena metering, the isolation contract, and Mode B-vec (already complete and
 serving the ABM workload).
 
+> **Amended by §13.4:** retirement is *staged*. `scratch` is `pub use`d
+> (`graph_compute/mod.rs:51`), so deleting it is semver-breaking on a 3.0.2 workspace —
+> deprecate now, delete at the next major. The table's "delete" verdicts stand on merit;
+> only their timing changes.
+
 ## 7. Acceptance criteria (replacing the ratio gate)
 
 Absolute, workload-anchored, per-loader, in CI:
@@ -237,7 +252,10 @@ Absolute, workload-anchored, per-loader, in CI:
 Rationale: a sandboxed guest is *necessarily* slower than in-process native, so a ratio
 cannot decide whether a third party can ship an algorithm. Absolute throughput can.
 
-## 8. Phasing
+## 8. Phasing (superseded by §13)
+
+> Retained for the reasoning; **§13.2 is the order of record**. Reading the code moved the
+> reachability contract to the front and re-rated phase 4 from high to medium risk (§13.1).
 
 | Phase | Content | Risk |
 |---|---|---|
@@ -456,3 +474,325 @@ and `ln`/`sqrt`/`recip`/ewise column ops.
 > remain first-party native providers. This experiment does not rescue them, and was not
 > intended to. Per-batch scoring's search quality is also unmeasured (diversity was
 > measured on the per-level arm).
+
+---
+
+## 13. Implementation plan (supersedes §8)
+
+§1–§12 establish *what* to build and prove it works. This section is the plan of record
+for building it, written after reading the code the change lands in. Four findings from
+that reading altered the phasing materially, so §8's table should not be followed.
+
+### 13.1 What reading the code changed
+
+| Finding | Effect on the plan |
+|---|---|
+| **`GraphView` already exists** — `uni-plugin/src/traits/algorithm.rs:607`, object-safe, `Send + Sync`, implemented by `GraphViewImpl` (`bridge.rs:50`), consumed as `&dyn GraphView` by `pregel.rs`/`reachability.rs` | Phase 4 is an *extension*, not a new abstraction. It already has 12 of the 14 methods the call sites need |
+| **No session.rs site touches a `GraphProjection` field** — the fields are `pub(crate)` and `session.rs` is in another crate, so it was structurally impossible | 17 of 18 `get_graph` sites convert mechanically. §8's "high risk, 60+ kernels" over-rated this |
+| **The dispatch has no exhaustiveness and has already drifted** — `dispatch.rs:548` ends in `other => Err(...)`; op names exist only as string literals | The contract must move to the *front* of the plan (§13.2) |
+| **The `[E]` numbering assumption is the real phase-4 risk**, not the trait shape | Needs an explicit contract (§13.3) rather than late discovery |
+
+The drift is not hypothetical. **`edge_count` was dispatchable via JSON but had no Rhai
+`register_fn` and no PyO3 `#[pymethods]` method.** WASM and Extism guests could call it;
+Rhai and Python guests could not. That is #152's exact failure mode, alive in the
+production surface until §13.5 fixed it, and it is why §3's "same disease, third instance"
+reading is
+right: the surfaces are *split* — WASM/Extism share one generic `graph-call` entrypoint
+(`wit/world.wit:74-87`) and inherit new kernels for free, while Rhai (`register_fn`) and
+PyO3 (`#[pymethods]`) require per-kernel registration and therefore drift silently.
+
+### 13.2 Revised phase order
+
+| Phase | Content | Why here |
+|---|---|---|
+| **0** | Typed refusal for unresolved ops | ships #152's user-visible fix without waiting for the substrate |
+| **1** | Reachability contract (§5.4) on today's surface | **moved from §8 phase 3.** It is the guard that makes every later phase safe: once it exists, an arena kernel absent from Rhai/PyO3 fails CI instead of shipping dark. It also has `edge_count` to catch on first run |
+| **2** | `HandleKind::Arena` + columns + CSR-with-slack + batched kernels; Rhai/PyO3 registration | unchanged in content; registration is now compulsory because phase 1 fails the build without it |
+| **3** | Typed component ABI (`host-arena`) + `graph-arena@1` slice | unchanged |
+| **4** | Unify projection and arena behind `GraphView` (§13.3) | still last, but now med-risk rather than high |
+| **5** | Acceptance suite (§7), §6 retirements, max-flow as a first-party provider | the benches become the acceptance suite rather than scaffolding |
+
+The reorder is the point: §8 put the anti-drift contract *after* the work whose drift it
+exists to prevent.
+
+### 13.3 The edge-numbering contract (amends §5.1 and §5.4) — *superseded by §13.8*
+
+> **Not implemented as written.** The plan below assumed a live arena would be
+> exposed to Mode-A kernels directly, which is what forced the runtime
+> `substrate()` classification. §13.8 takes the snapshot route instead, which
+> makes the same guarantee structurally. Retained for the reasoning.
+
+`expand_masked`, `spmv_masked`, `edge_weights`, `edge_property` and the `EdgeSet` masks
+(`value.rs:413`) all assume a **stable dense `[E]` numbering** in which
+`out_edge_start(u) + k` is a global edge index. A live arena with CSR slack (§5.1) cannot
+honour that — slack leaves holes, so `edge_count()` is not the sum of degrees.
+
+Rather than let this fail subtly on synthetic structure:
+
+- `GraphView` gains **`has_dense_edge_ids() -> bool`** (true for `GraphProjection`).
+- `KernelId` (§5.4) carries a **second wildcard-free classification**,
+  `substrate() -> Substrate`: `AnyGraph` / `DenseEdgeIds` / `ConcreteProjection`.
+- `DenseEdgeIds` kernels **fail closed** on a live arena with a typed error naming
+  `arena_freeze`.
+- **`arena_freeze(arena) -> Graph`** compacts the arena to a dense immutable projection,
+  after which the full Mode-A kernel set applies.
+
+This also disposes of the one genuinely hard call site cheaply. `random_walks` calls
+`RandomWalk::run(&GraphProjection, …)` (`session.rs:1555`), and `Algorithm::run` is pinned
+to the concrete type across ~40 implementations
+(`uni-algo/src/algo/algorithms/mod.rs:91`). Classifying it `ConcreteProjection` — freeze
+first — avoids generifying 40 implementations to serve one call site. **One contract, two
+drift guards, and the 40-impl refactor is not needed.**
+
+Mechanical note: `AlgoSession` derives `Debug` and holds the graph, so `GraphView` needs a
+`Debug` supertrait or a hand-written impl.
+
+### 13.4 Scope decisions
+
+- **All four phases**, not §8's "phases 1–3 deliver the measured result". Phase 4 is in
+  scope because §13.1 makes it tractable.
+- **Candidate-scoped scoring from the start**, not as the §12.7 follow-up. It targets the
+  measured 6.07×, and adding it later would mean changing an ABI that phase 3 has frozen
+  into WIT and shipped to built guests.
+- **Max-flow ships as a first-party `AlgorithmProvider`.** §12.3 already built and
+  oracle-validated a Dinic implementation, and §12.6 showed it has no policy to plug. That
+  makes it honestly native, and shipping it that way turns bench code into user value,
+  correctly labelled.
+- **Retirement is staged, not immediate.** §6 says delete `scratch.rs`; but it is `pub
+  use`d at `graph_compute/mod.rs:51`, so removal is semver-breaking on a workspace at
+  3.0.2. Mark `#[deprecated]` in this cycle and delete at the next major, rather than
+  forcing a 4.0.0 to remove test scaffolding. **Verified safe to retire:** no production
+  path reaches any of it — the loaders wire `GraphComputeRegistry`, not `ScratchRegistry`,
+  and the test-only `uni:scratch/host-graph` WIT package is hand-linked by
+  `scratch_wasm_e2e.rs` specifically to bypass the real loader.
+
+### 13.5 Status
+
+**Phase 0 — landed.** An unresolved op is now classified by cause rather than lumped into
+an untyped `0x01`:
+
+| Guest calls | Before | After |
+|---|---|---|
+| an arena kernel (JSON, and Rhai) | `0x01 unknown kernel op` / `Function not found` | `0x86A` naming `graph-arena@1` as the slice this host does not provide |
+| a misspelled op | `0x01 unknown kernel op` | `0x86E`, an invalid `op` argument |
+
+Two deviations from the plan as approved, both deliberate:
+
+1. **`0x86A`, not `0x86C`.** Nothing is being *denied* — the grant is present and the
+   slice is simply unimplemented, which is what `SliceVersionMismatch` describes. Its own
+   contract (`error.rs:36-44`) is to report a missing slice "instead of trapping later on
+   an unknown kernel op"; this is that report, delivered where the trap would happen.
+2. **`Refs #152`, not `Fixes #152`.** Phase 0 makes the failure honest; it does not make
+   the kernels reachable. The closing keyword belongs on phase 3.
+
+The Rhai names are bound as **arity-correct stubs**, because Rhai resolves on name *and*
+arity — a stub with the wrong signature still yields `Function not found`, the very error
+being fixed. Phase 2 replaces the bodies without touching call sites.
+
+**Phase 1 — landed.** The catalog lives in
+`uni-plugin-builtin/src/algorithms/graph_compute/kernel_id.rs`. A `kernels!` macro
+generates the `KernelId` enum, `ALL`, `op_name`, `reach` and `from_op_name` from **one**
+declaration, so those five cannot drift from each other — a strengthening of the #151
+pattern, where `ALL` is hand-maintained and only a runtime test catches an un-appended
+variant.
+
+Three guards, each as strong as its surface allows:
+
+| Surface | Guard | Strength |
+|---|---|---|
+| JSON (WASM/Extism) | `dispatch.rs` matches on `KernelId` with **no wildcard** | compile error |
+| Rhai | `register_kernels` registers *and* reports from one declaration; the test compares the reported set to the catalog | test — cannot claim an unregistered kernel |
+| PyO3 | `hasattr` against the live `GcSession` type object | test — asserts the real type, not a list |
+
+**Fixed the drift:** `edge_count` now exists and is registered on both in-process loaders.
+The Rhai guard was **falsified before being trusted** — removing the fix makes it fail with
+`kernels dispatchable over JSON but absent from the Rhai surface: ["edge_count"]`.
+
+**The contract immediately caught an error in its own author.** `check_deadline` was
+catalogued as `LoaderLocal` on the strength of a text extraction that ran past the end of
+the `#[pymethods]` block; the PyO3 guard proved it is a private Rust helper in a plain
+`impl` and never was guest-callable. It is out of the catalog. `LoaderLocal` remains as a
+**reserved, empty** variant — the same shape as `KnobReach::HostOnly` in #151 — so a
+future carve-out is declared rather than tempting someone to weaken the assertion.
+
+Catalog totals after phase 1: **49 kernels — 48 `AllLoaders`, plus `graph` as
+`HostSuppliedOtherwise`.**
+
+### 13.6 Phase 2 — the arena substrate (landed)
+
+`HandleKind::Arena = 7` now lives in the same handle table, the same
+`dispatch.rs`, and the same host import as every other kernel — which was the
+whole point (§3). Eight kernels: `arena_new`, `arena_alloc`, `arena_link`,
+`arena_column`, `arena_candidates`, `arena_gather`, `arena_scatter`,
+`arena_descend`. `("graph-arena", 1)` is declared in `HOST_CAPABILITY_SLICES`,
+so guests negotiate it at load time through the already-wired `check_slices`.
+
+**Phase 1 proved itself immediately.** Adding the kernels made the reachability
+contract fail, naming all eight as *dispatchable over JSON but absent from the
+Rhai surface*. The arena was structurally unable to ship dark — which is exactly
+the defect (#152) that motivated this work.
+
+**Two design corrections, both forced by the code:**
+
+1. **Columns cannot be tensors** (§5.1 assumed they would be). `Tensor` is
+   Arrow-backed and immutable, so the per-step visit increment and virtual loss
+   that §12.2 proved mandatory would each copy the whole column — `O(N)` per
+   descent step, defeating candidate-scoped work entirely. Columns are therefore
+   `Vec<f64>` owned by the arena and addressed by index, which is what the
+   measured prototype did.
+2. **`Slab` needed a `get_mut`.** Every previous handle kind is immutable once
+   inserted; the arena is the first a guest grows in place. Its validation is
+   deliberately identical to `get` — a stale, wrapped or forged handle must fail
+   the same way whether the caller intends to read or to write.
+
+**Candidate-scoped scoring** is delivered by `arena_candidates` + `arena_gather`
+/ `arena_scatter`: the guest computes over `O(roots x branching)` entries rather
+than `O(capacity)`, which is the shape that addresses §12.7's measured 6.07x.
+
+**AT-ARENA replaces AT-MCTS** (§6). It drives the full kernel path — handles,
+tensors, columns-by-index, work charging — and compares against a plain-Rust
+tree walk sharing none of it, asserting the **entire visit distribution** and
+every leaf, not merely the root count (which a descent ignoring the score column
+would still satisfy). `arena_batching_gives_no_budget_discount` holds design P5
+directly: one descent over 16 roots charges exactly what 16 single-root descents
+charge.
+
+Deferred to phase 4 with its consumer: `arena_freeze` as a kernel. The
+compaction itself (`GraphArena::freeze_csr`) exists and is tested — dropping the
+slack is what gives the dense `[E]` numbering the `DenseEdgeIds` classification
+(§13.3) will depend on.
+
+Verification: 440 tests in `uni-plugin-{builtin,rhai}` + `uni-plugin`, 107 in
+`uni-plugin-{wasm,extism}`, PyO3 contract green; fmt and clippy `-D warnings`
+clean. (Two pre-existing `adapter_scalar` failures are environmental — `pyarrow`
+is absent locally; confirmed by reproducing them on the base commit.)
+
+### 13.7 Phase 3 — the typed ABI (landed)
+
+A new `uni:plugin/host-arena@0.1.0` WIT interface carries the eight arena
+kernels as typed component functions: handles as `u64`, scalars as `u32`/`f64`,
+no JSON. `graph-call` remains for the cold and generic surface — this is a fast
+path, not a replacement. Host side is `add_host_arena` in `linker.rs`, wired as
+hand-written `func_wrap` beside `add_host_graph` and gated on the same
+`Capability::GraphCompute`.
+
+Both ABIs reach the **same sessions in the same registry** via
+`GraphComputeRegistry::with_session`, which reproduces `call_json`'s panic
+isolation exactly (typed `0x86D`, `parking_lot` locks don't poison, session is
+per-CALL). `typed_session_access_matches_the_json_path_and_isolates_panics`
+asserts the two agree on results *and* on failure modes — a handle forged on the
+typed path must be rejected the same way it is on the JSON path, or the two
+loader classes would silently disagree.
+
+**The breaking-change risk (§10.4) was tested, not argued.** Adding a WIT import
+broke the e2e linker during the original investigation, which is why the
+interface is *additive*: a guest that does not import `host-arena` is unaffected
+by its existence. All 30 `uni-plugin-wasm` tests — including the **prebuilt**
+component fixtures — pass unchanged after the WIT change, which is the empirical
+form of that claim.
+
+**Extism keeps the JSON path, deliberately.** Its guests already reach every
+arena kernel through `uni_graph_call`, because `dispatch.rs` routes the whole
+catalog — so this is a *performance* gap, not a reachability one, and the
+reachability contract is satisfied. The 32x JSON tax was measured on WASM;
+Extism's typed multiplexer waits for a measured need rather than being built on
+the assumption that the number transfers.
+
+Verification: 548 tests across `uni-plugin{,-builtin,-rhai,-wasm,-extism}`; fmt
+and clippy `-D warnings` clean.
+
+### 13.8 Phase 4 — unification, by snapshot rather than by trait object
+
+**This supersedes §13.3, and the change is a simplification worth explaining.**
+
+§13.3 planned to retype the handle table to `Slab<Arc<dyn GraphView>>`, expose a
+*live* arena to Mode-A kernels, and add a runtime `substrate()` classification so
+the kernels that assume dense `[E]` numbering would fail closed on one. Building
+it surfaced the flaw in that plan: **Mode-A kernels assume a graph that cannot
+change while they iterate it.** Handing them a live, guest-mutable arena is a
+hazard the `substrate()` check does not address — the classification guards
+*edge numbering*, not *mutation during iteration*.
+
+So `arena_freeze` produces a **snapshot**: `GraphArena::freeze_csr` drops the
+slack, and `GraphProjection::from_dense_edges` (new, in `uni-algo`) builds an
+ordinary projection behind an ordinary `Graph` handle. Consequences:
+
+| §13.3 as planned | §13.8 as built |
+|---|---|
+| `Slab<Arc<dyn GraphView>>`, ~35 call sites retyped | handle table unchanged |
+| runtime `substrate()` check, fail-closed on live arenas | **structural** — a non-dense graph is never a graph handle at all |
+| `random_walks` needs `ConcreteProjection` carve-out (the `Algorithm` trait is pinned to `&GraphProjection` across ~40 impls) | no carve-out; it is a real projection |
+| zero-copy | one `O(V+E)` copy per freeze |
+
+The copy is the whole price, and it buys the stability guarantee. For the
+workloads in question — grow a search tree, then analyse it — freezing happens
+once against many kernel calls.
+
+`from_dense_edges` deliberately shares `build_csr` with `from_rows`, so a frozen
+arena gets the *same* canonical edge ordering as a stored projection and every
+kernel behaves identically on it.
+
+`frozen_arena_is_an_ordinary_graph_to_every_mode_a_kernel` is the north-star
+test: it grows a tree through the arena kernels, freezes it, and runs
+`vertex_count`, `edge_count`, `degrees`, `frontier`, `expand` and `set_len`
+against the result — kernels with no arena awareness whatsoever — checking each
+against a plain-Rust walk of the same tree. It also asserts the snapshot
+property: growing the arena afterwards does not mutate an already-frozen handle.
+
+### 13.9 Phase 5 — acceptance, retirement, and a correction
+
+**Max-flow already ships. §13.4's recommendation was wrong.** `uni.algo.maxFlow`
+(Dinic) and `uni.algo.fordFulkerson` are already registered first-party
+procedures in `AlgorithmRegistry`, alongside ~30 others. The scope question put
+to the user — "should the solution ship them?" — was premised on their absence,
+which was never checked. Nothing to build; the §12.3 AT-FLOW code stays
+test-only, as an oracle rather than a product. The *conclusion* stands (fixed
+structure algorithms have no policy to plug and are honestly native); only the
+proposed action was redundant.
+
+**Writing the acceptance test found a real expressiveness gap.** A guest could
+not grow a tree at all: `arena_link` takes two tensors of slot ids, and no kernel
+let a guest *construct* one — `arena_alloc` returns a flat list with no parent
+association. AT-ARENA missed this because it built its operands with a
+**test-only** escape hatch (`alloc_tensor_for_test`), which is precisely the
+failure mode of testing a surface through a door the user does not have. Closed
+by `arena_expand(arena, parents, fanout)`, which allocates and links in one
+coarse call — also the operation a search actually performs, so it is the right
+granularity (P3) rather than a convenience.
+
+**§7 acceptance, in CI:** `guest_authored_mcts_meets_the_absolute_throughput_floor`
+runs a genuinely guest-authored MCTS — the Rhai script owns the tree shape, the
+exploration constant, the UCB formula and the stopping rule, composing its score
+from `arena_candidates` + `arena_gather` + ordinary tensor kernels, so scoring is
+candidate-scoped rather than whole-column. The gate is **absolute**, per §7.
+
+Two things that test taught, both worth keeping:
+
+1. **The arena cap bounds a leaky guest, as designed.** The first run died at
+   `0x864` after a few hundred rollouts because the script allocated ~8 tensors
+   per iteration and never freed them. The script now frees its intermediates —
+   which is what a real guest must do, and the fail-closed bound is what tells
+   it so.
+2. **A perf floor set at the measured value is a flake.** The threshold was
+   first written at 25,000 rollouts/s and failed at 24,749 — while its own
+   comment claimed to sit "an order of magnitude below" the measurement. It is
+   now 5,000: the regression it guards (a kernel going accidentally quadratic)
+   costs orders of magnitude, so the margin loses no detection power. 5/5
+   consecutive runs pass.
+
+**Retirement is staged, per §13.4.** `ScratchGraph`, `ScratchRegistry`,
+`ScratchRequest`/`Response`, `LoaderClass` and `require_compiled_body` carry
+`#[deprecated(since = "3.1.0")]` naming the replacement, rather than being
+deleted — the module is `pub use`d and the workspace is at 3.0.2, so removal is
+a major-version change. The benches that measure the old path keep an explicit
+`#![allow(deprecated)]` with a note: they are the evidence the arena replaces
+it, and they move at the next major.
+
+**Final state:** 637 tests green across `uni-plugin{,-builtin,-rhai,-wasm,-extism}`
+and `uni-algo`, plus the PyO3 contract; fmt and clippy `-D warnings` clean on all
+seven crates. The catalog is **59 kernels** — 58 `AllLoaders` plus `graph` — of
+which **10 are the arena surface**: `arena_new`, `arena_alloc`, `arena_expand`,
+`arena_link`, `arena_column`, `arena_candidates`, `arena_gather`,
+`arena_scatter`, `arena_descend`, `arena_freeze`.
+
+All five phases are implemented.

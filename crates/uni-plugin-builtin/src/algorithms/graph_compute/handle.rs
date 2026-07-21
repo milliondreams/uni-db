@@ -73,6 +73,8 @@ pub enum HandleKind {
     Pairs = 5,
     /// A set of edge indices (an edge mask, proposal §5 `Shape::E`).
     EdgeSet = 6,
+    /// A mutable session-local graph arena (`graph-arena@1`, proposal §5.1).
+    Arena = 7,
 }
 
 impl HandleKind {
@@ -93,6 +95,7 @@ impl HandleKind {
             4 => Some(HandleKind::Levels),
             5 => Some(HandleKind::Pairs),
             6 => Some(HandleKind::EdgeSet),
+            7 => Some(HandleKind::Arena),
             _ => None,
         }
     }

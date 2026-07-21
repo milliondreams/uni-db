@@ -75,6 +75,75 @@ pub fn graph_compute_slice_req() -> uni_plugin::traits::algorithm::SliceReq {
     }
 }
 
+/// The capability-slice name the mutable-arena kernel family is versioned under.
+///
+/// This host does **not** implement the slice yet. It is declared here so a
+/// guest reaching for an arena kernel gets a typed, actionable refusal naming
+/// the slice it needs, rather than a bare "unknown op" / "function not found"
+/// — the defect reported as issue #152.
+pub const GRAPH_ARENA_SLICE: &str = "graph-arena";
+
+/// The arena slice version the kernels below will land under (proposal §5.5).
+pub const GRAPH_ARENA_SLICE_VERSION: u16 = 1;
+
+/// Op names belonging to `graph-arena@1`, which this host does not yet provide.
+///
+/// Names that also exist in the `graph-compute@1` catalog (`sample`,
+/// `edge_count`) are deliberately absent: a guest calling those resolves against
+/// the implemented kernel, and only an *unresolved* op ever consults this list.
+pub const GRAPH_ARENA_OPS: &[&str] = &[
+    "add_node",
+    "add_child",
+    "add_edge",
+    "add_flow_edge",
+    "neighbors",
+    "get_field",
+    "set_field",
+    "edge_field",
+    "node_count",
+    "descend_batch",
+    "visit_batch",
+    "batch_new",
+    "batch_slots",
+    "batch_distinct",
+    "advance_batch",
+    "advance_batch_scored",
+    "advance_array",
+    "augment_batch",
+    "column_new",
+    "column",
+    "visits",
+    "col_fill",
+    "col_ewise",
+    "col_map",
+    "col_load_visits",
+    "col_gather_parent",
+];
+
+/// Classifies an unresolved kernel op into a typed, actionable error.
+///
+/// An op in [`GRAPH_ARENA_OPS`] is not unknown — it is a real kernel belonging
+/// to a capability slice this host does not provide, so it earns `0x86A`
+/// (`SliceVersionMismatch`) naming that slice. Anything else is a genuine
+/// unknown name and earns `0x86E` (`ArgValidation`), since the `op` field is
+/// the invalid argument.
+///
+/// Both beat the previous untyped `0x01`, which told a guest author nothing
+/// about whether to fix their spelling or their host build (issue #152).
+#[must_use]
+pub fn unresolved_op_error(op: &str) -> uni_plugin::errors::FnError {
+    if GRAPH_ARENA_OPS.contains(&op) {
+        uni_plugin::errors::FnError::new(
+            error::SLICE_VERSION_MISMATCH,
+            format!(
+                "kernel `{op}` requires capability slice `{GRAPH_ARENA_SLICE}@{GRAPH_ARENA_SLICE_VERSION}`, which this host does not provide"
+            ),
+        )
+    } else {
+        error::arg_validation(format!("unknown kernel op `{op}`"))
+    }
+}
+
 /// Name of the host-generated vertex-id column, prepended to every result batch.
 ///
 /// The guest never emits it — the adapters synthesize it by slot→Vid translation

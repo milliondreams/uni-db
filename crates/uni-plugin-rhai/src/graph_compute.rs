@@ -748,4 +748,105 @@ pub fn register_graph_compute(engine: &mut Engine) {
         .register_fn("next_bucket", GcSession::next_bucket)
         .register_fn("all_pairs_overlap", GcSession::all_pairs_overlap)
         .register_fn("emit_pairs", GcSession::emit_pairs);
+    register_arena_stubs(engine);
+}
+
+/// Builds the typed "slice not provided" refusal for an arena kernel.
+fn arena_unavailable(op: &'static str) -> Box<EvalAltResult> {
+    rt(uni_plugin_builtin::algorithms::graph_compute::unresolved_op_error(op))
+}
+
+/// Registers the `graph-arena@1` kernel names as typed-refusal stubs.
+///
+/// A Rhai guest reaching for a mutable-arena primitive previously got Rhai's
+/// generic `Function not found`, which does not distinguish "you misspelled it"
+/// from "this host cannot do that" — the defect reported as issue #152. Binding
+/// the names with their real arities turns that into a `0x86A` naming the
+/// capability slice the guest needs.
+///
+/// These stubs are the surface arriving ahead of its implementation: the arena
+/// kernels replace the bodies, keeping the same names and arities.
+fn register_arena_stubs(engine: &mut Engine) {
+    engine
+        .register_fn("add_node", |_: &mut GcSession, _: f64| {
+            Err::<i64, _>(arena_unavailable("add_node"))
+        })
+        .register_fn("add_child", |_: &mut GcSession, _: i64, _: f64| {
+            Err::<i64, _>(arena_unavailable("add_child"))
+        })
+        .register_fn("add_edge", |_: &mut GcSession, _: i64, _: i64| {
+            Err::<(), _>(arena_unavailable("add_edge"))
+        })
+        .register_fn("neighbors", |_: &mut GcSession, _: i64| {
+            Err::<Array, _>(arena_unavailable("neighbors"))
+        })
+        .register_fn("get_field", |_: &mut GcSession, _: i64| {
+            Err::<f64, _>(arena_unavailable("get_field"))
+        })
+        .register_fn("set_field", |_: &mut GcSession, _: i64, _: f64| {
+            Err::<(), _>(arena_unavailable("set_field"))
+        })
+        .register_fn("node_count", |_: &mut GcSession| {
+            Err::<i64, _>(arena_unavailable("node_count"))
+        })
+        .register_fn("batch_new", |_: &mut GcSession, _: i64, _: i64, _: f64| {
+            Err::<i64, _>(arena_unavailable("batch_new"))
+        })
+        .register_fn(
+            "advance_batch",
+            |_: &mut GcSession, _: i64, _: f64, _: bool| {
+                Err::<(), _>(arena_unavailable("advance_batch"))
+            },
+        )
+        .register_fn("visit_batch", |_: &mut GcSession, _: Array, _: f64| {
+            Err::<(), _>(arena_unavailable("visit_batch"))
+        })
+        .register_fn("descend_batch", |_: &mut GcSession, _: Array| {
+            Err::<Array, _>(arena_unavailable("descend_batch"))
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uni_plugin_builtin::algorithms::graph_compute::{Arena, WorkBudget};
+
+    /// Issue #152: a Rhai guest reaching for an arena kernel must get a typed,
+    /// actionable refusal — not Rhai's generic `Function not found`.
+    ///
+    /// Asserts both halves of the fix: the name *resolves* (so the guest is told
+    /// about the host, not about its own spelling), and the refusal names the
+    /// capability slice the guest would have to declare.
+    #[test]
+    fn arena_kernels_resolve_and_refuse_with_a_typed_slice_error() {
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(1, 0),
+            Arena::new(1 << 16, 64),
+        )));
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(session, from_i64(0)));
+
+        // Each call must reach the stub and be refused by slice. An unregistered
+        // name would instead fail resolution with `Function not found`, which
+        // does not mention the slice — so this asserts registration too.
+        for script in [
+            "sess.node_count()",
+            "sess.add_node(1.0)",
+            "sess.descend_batch([])",
+            "sess.batch_new(4, 0, 1.0)",
+        ] {
+            let err = engine
+                .eval_with_scope::<rhai::Dynamic>(&mut scope, script)
+                .expect_err("an unprovided slice must fail, not return a value");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("graph-arena@1"),
+                "`{script}` must be refused by slice, got: {msg}"
+            );
+        }
+    }
 }

@@ -545,7 +545,7 @@ impl GraphComputeRegistry {
             "emit" => session
                 .emit(&[(req.name.as_str(), from_i64(req.g))])
                 .map(|()| KernelResponse::Unit),
-            other => Err(FnError::new(0x01, format!("unknown kernel op `{other}`"))),
+            other => Err(super::unresolved_op_error(other)),
         }
     }
 }
@@ -576,6 +576,45 @@ mod tests {
             })
             .collect();
         GraphProjection::from_rows(&node_rows, &edge_rows, None, false).expect("projection builds")
+    }
+
+    /// Issue #152: an unresolved op must say *why* it is unresolved.
+    ///
+    /// An arena kernel is a real kernel belonging to a slice this host does not
+    /// provide, so it earns `0x86A` naming that slice; a misspelling is an
+    /// invalid `op` argument and earns `0x86E`. The previous untyped `0x01`
+    /// conflated the two, leaving a guest author unable to tell "fix your
+    /// spelling" from "this host cannot do that".
+    #[test]
+    fn unresolved_ops_are_typed_by_cause() {
+        let registry = GraphComputeRegistry::new();
+        let sid = registry.open(AlgoSession::new(
+            7,
+            WorkBudget::from_graph_size(1, 0),
+            Arena::new(1 << 16, 64),
+        ));
+        let call = |op: &str| -> KernelResponse {
+            let json = serde_json::json!({ "session": sid, "op": op }).to_string();
+            serde_json::from_str(&registry.call_json(&json)).expect("response decodes")
+        };
+
+        match call("descend_batch") {
+            KernelResponse::Err { code, message } => {
+                assert_eq!(code, 0x86A, "an arena kernel must name a missing slice");
+                assert!(
+                    message.contains("graph-arena@1"),
+                    "the message must name the slice to declare: {message}"
+                );
+            }
+            other => panic!("expected a typed slice error, got {other:?}"),
+        }
+
+        match call("vertex_kount") {
+            KernelResponse::Err { code, .. } => {
+                assert_eq!(code, 0x86E, "a misspelled op is an argument fault");
+            }
+            other => panic!("expected a typed unknown-op error, got {other:?}"),
+        }
     }
 
     /// Drives a full PPR through the JSON dispatch protocol — no loader involved.

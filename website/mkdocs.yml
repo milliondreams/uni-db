@@ -91,6 +91,7 @@ nav:
           - PyO3: plugins/loaders/pyo3.md
       - Authoring: plugins/authoring.md
       - Authoring (Rust): plugins/authoring-rust.md
+      - Guest Graph Algorithms: plugins/graph-algorithms.md
       - Trust & Capabilities: plugins/trust-and-capabilities.md
       - Reference: plugins/reference.md
   - Use Cases:

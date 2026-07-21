@@ -66,6 +66,7 @@ Note the distinction: **trust** (whether to load a plugin at all — signature v
 | [Concepts](concepts.md) | The `Plugin` / `PluginManifest` / `PluginRegistrar` / `PluginRegistry` model and lifecycle. |
 | [Loaders](loaders/index.md) | The five loaders compared, with per-loader authoring guides and the loader matrix. |
 | [Authoring](authoring.md) | Writing a plugin against the surface traits, with the `geo.haversine` reference across loaders. |
+| [Graph Algorithms](graph-algorithms.md) | Authoring graph algorithms in any loader: the 59-kernel catalogue, the mutable arena, and a worked guest-authored MCTS. |
 | [Trust & Capabilities](trust-and-capabilities.md) | The capability model, `effective = declared ∩ granted`, and signing. |
 | [Reference](reference.md) | The full surface-trait, manifest, and host-API reference. |
 

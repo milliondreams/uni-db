@@ -236,7 +236,7 @@ register.
 | `Index` | Index kinds. |
 | `Storage` | Storage backends by URI scheme. |
 | `Algorithm` | Graph algorithms. |
-| `GraphCompute` | GraphCompute coarse kernels (the handle-table runtime that guest-authored graph algorithms drive). |
+| `GraphCompute` | GraphCompute coarse kernels (the handle-table runtime that guest-authored graph algorithms drive) — see [Graph Algorithms](graph-algorithms.md). |
 | `Crdt` | CRDT kinds. |
 | `Hook` | Session / query lifecycle hooks. |
 | `Trigger` | Fine-grained mutation triggers. |
@@ -247,8 +247,33 @@ register.
 The Python load methods default to `ScalarFn`, `AggregateFn`, `Procedure` when
 `grants` is omitted. A guest-authored graph algorithm needs the triple
 `Algorithm` (register the algorithm), `GraphCompute` (drive the kernels), and
-`HostQuery` (project the graph) — see the
-[GraphCompute example](../loaders/rhai.md).
+`HostQuery` (project the graph) — see
+[Graph Algorithms](graph-algorithms.md) for the kernel catalogue and a worked example.
+
+### Capability slices
+
+Separately from grants, an algorithm declares the **kernel slices** it needs, and
+the host checks them at registration. A slice is a versioned kernel family, so a
+guest written against a newer host fails to load with a clear typed error
+(`0x86A`) instead of trapping later on an unknown kernel.
+
+| Slice | Provides |
+| --- | --- |
+| `graph-compute@1` | The read-only coarse kernels over a projected graph: traversal, SpMV, set and edge-mask operations, sampling, similarity, emit. |
+| `graph-arena@1` | Mutable session-local structure a guest **grows** during a call — search trees, residual networks, agent populations — plus `arena_freeze` to turn one into an ordinary graph. |
+
+Declare them on your `AlgorithmSignature`:
+
+```rust
+slices: vec![
+    SliceReq { slice: "graph-compute".into(), version: 1 },
+    SliceReq { slice: "graph-arena".into(),   version: 1 },
+],
+```
+
+Omitting a slice you use is not an error today — the kernels are gated by the
+`GraphCompute` grant, not by the declaration. Declaring them is what buys you the
+load-time compatibility check, so declare what you use.
 
 ### Not guest-grantable (internal / first-party)
 

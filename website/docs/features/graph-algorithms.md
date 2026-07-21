@@ -1,5 +1,8 @@
 # Graph Algorithms
 
+> Looking to **author your own** graph algorithm as a plugin — in Rust, WASM, Rhai or Python?
+> See [Plugins → Guest Graph Algorithms](../plugins/graph-algorithms.md).
+
 Uni includes a built-in graph algorithm library exposed through Cypher procedures. Use it to compute centrality, clustering, paths, and connectivity without exporting data.
 
 ## What It Provides

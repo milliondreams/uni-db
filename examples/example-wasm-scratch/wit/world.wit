@@ -19,7 +19,17 @@ interface types {
 interface host-graph {
     use types.{fn-error};
 
+    /// The generic JSON round-trip: one string in, one string out. Covers every
+    /// scratch op, at the cost of encode/parse on both sides of the boundary.
     graph-call: func(req: string) -> result<string, fn-error>;
+
+    /// Typed batched ops (issue #152). Identical semantics to the `descend_batch`
+    /// / `visit_batch` JSON ops, but the batch crosses as a canonical-ABI
+    /// `list<u32>` instead of a serialized JSON array — no `serde_json` on the
+    /// guest side, no parse on the host side, just the list copy the component
+    /// model already performs.
+    descend-batch: func(session: u64, active: list<u32>) -> result<list<u32>, fn-error>;
+    visit-batch: func(session: u64, nodes: list<u32>, delta: f64) -> result<_, fn-error>;
 }
 
 world scratch-guest {
@@ -28,4 +38,30 @@ world scratch-guest {
     /// Drive a Mode B-seq program against scratch session `session`, returning a
     /// JSON summary of the result.
     export run: func(session: u64) -> string;
+
+    /// Pointer-chase `steps` random-access hops over the *host-built* scratch
+    /// graph behind `session`, returning the accumulated field sum.
+    ///
+    /// This is the JIT'd-WASM arm of the Mode B-seq perf gate (plugin-compute
+    /// proposal §14 Q1 / test Q-5): it performs exactly the same
+    /// `neighbors` → pick → `get_field` walk as the host-resident Rust baseline,
+    /// so the two timings are directly comparable and their ratio is the
+    /// quantity the ≤ 10× bound is applied to. The host builds and owns the
+    /// graph; the guest receives only the session id.
+    export walk: func(session: u64, steps: u32) -> f64;
+
+    /// Batched-descent MCTS over the host-built tree behind `session` (issue
+    /// #152): advances `batch` rollouts in lockstep — `visit-batch` then
+    /// `descend-batch`, two crossings per level regardless of batch width — for
+    /// `rollouts` total. Returns the root's visit count.
+    ///
+    /// This is the coarse-granularity counterpart of the per-op descent, and the
+    /// arm that tests whether amortizing the crossing brings a *real JIT'd guest*
+    /// inside the §14 Q1 bound.
+    export mcts-batched: func(session: u64, rollouts: u32, batch: u32, depth: u32) -> f64;
+
+    /// The same batched MCTS driven through the **typed** `descend-batch` /
+    /// `visit-batch` imports instead of JSON strings (issue #152). Isolates what
+    /// the JSON encoding was costing at batch granularity.
+    export mcts-batched-typed: func(session: u64, rollouts: u32, batch: u32, depth: u32) -> f64;
 }

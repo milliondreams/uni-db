@@ -2368,3 +2368,157 @@ impl std::ops::Deref for TensorView {
         &self.0
     }
 }
+
+// ---------------------------------------------------------------------------
+// AT-FLOW (issue #152 gap 2): edge-mutating workloads on the scratch substrate
+// ---------------------------------------------------------------------------
+
+/// A deterministic capacitated DAG-ish graph: `(u, v, capacity)` triples.
+///
+/// Fixed LCG so the oracle and the kernel see byte-identical input.
+fn random_flow_edges(nodes: usize, edges: usize, seed: u64) -> Vec<(usize, usize, f64)> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) as usize
+    };
+    let mut out = Vec::with_capacity(edges);
+    while out.len() < edges {
+        let u = next() % nodes;
+        let v = next() % nodes;
+        if u == v {
+            continue;
+        }
+        // Orient low->high so the graph stays acyclic and the max-flow is
+        // non-trivial but well-defined.
+        let (a, b) = if u < v { (u, v) } else { (v, u) };
+        let cap = ((next() % 20) + 1) as f64;
+        out.push((a, b, cap));
+    }
+    out
+}
+
+/// Independent max-flow oracle: matrix-based Edmonds-Karp.
+///
+/// Deliberately a *different* algorithm and a *different* data structure from
+/// the adjacency-list Dinic under test, so agreement is real evidence rather
+/// than a shared-bug artifact (the AT-ABM discipline).
+fn native_max_flow(nodes: usize, edges: &[(usize, usize, f64)], s: usize, t: usize) -> f64 {
+    let mut cap = vec![vec![0.0f64; nodes]; nodes];
+    for &(u, v, c) in edges {
+        cap[u][v] += c;
+    }
+    let mut flow = 0.0;
+    loop {
+        let mut parent = vec![usize::MAX; nodes];
+        parent[s] = s;
+        let mut q = VecDeque::new();
+        q.push_back(s);
+        while let Some(u) = q.pop_front() {
+            for v in 0..nodes {
+                if parent[v] == usize::MAX && cap[u][v] > 1e-12 {
+                    parent[v] = u;
+                    q.push_back(v);
+                }
+            }
+        }
+        if parent[t] == usize::MAX {
+            break;
+        }
+        let mut bottleneck = f64::INFINITY;
+        let mut v = t;
+        while v != s {
+            let u = parent[v];
+            bottleneck = bottleneck.min(cap[u][v]);
+            v = u;
+        }
+        let mut v = t;
+        while v != s {
+            let u = parent[v];
+            cap[u][v] -= bottleneck;
+            cap[v][u] += bottleneck;
+            v = u;
+        }
+        flow += bottleneck;
+    }
+    flow
+}
+
+#[test]
+fn at_flow_batched_max_flow_matches_a_native_oracle() {
+    // AT-FLOW: a guest conducting `while augment_batch(..) > 0` over the scratch
+    // substrate computes the true max flow, proving the batched/handle design
+    // serves *edge-mutating* algorithms and not only node-growing search
+    // (issue #152 gap 2). Agreement is against an independent matrix-based
+    // Edmonds-Karp, so a shared bug cannot produce a false pass.
+    use super::scratch::ScratchGraph;
+    use super::{Arena, WorkBudget};
+
+    const NODES: usize = 40;
+    const EDGES: usize = 160;
+
+    for (seed, k) in [(0xF10Au64, 1usize), (0xF10A, 8), (0xBEEF, 32)] {
+        let edges = random_flow_edges(NODES, EDGES, seed);
+        let (s, t) = (0usize, NODES - 1);
+
+        let mut g = ScratchGraph::new(
+            WorkBudget::new(u64::MAX / 4),
+            Arena::new(1 << 24, 1 << 20),
+            seed,
+        );
+        for _ in 0..NODES {
+            g.add_node(0.0).unwrap();
+        }
+        for &(u, v, c) in &edges {
+            g.add_flow_edge(u as u32, v as u32, c).unwrap();
+        }
+
+        // The guest program: conduct phases until no augmenting path remains.
+        let mut total = 0.0;
+        let mut crossings = 0u32;
+        loop {
+            let pushed = g.augment_batch(s as u32, t as u32, k).unwrap();
+            crossings += 1;
+            if pushed <= 0.0 {
+                break;
+            }
+            total += pushed;
+        }
+
+        let expected = native_max_flow(NODES, &edges, s, t);
+        assert!(
+            (total - expected).abs() < 1e-9,
+            "seed {seed:x} k={k}: batched max-flow {total} != oracle {expected} \
+             (after {crossings} crossings)"
+        );
+
+        // Conservation, readable from residuals alone. Edges are oriented
+        // low->high, so node `s` (0) is never a destination — every one of its
+        // arcs is a forward arc, in insertion order — and node `t` is never a
+        // source, so every one of its arcs is a *reverse* arc whose residual is
+        // exactly the flow that arrived along its pair.
+        let src_caps: Vec<f64> = edges
+            .iter()
+            .filter(|&&(u, _, _)| u == s)
+            .map(|&(_, _, c)| c)
+            .collect();
+        let out_of_s: f64 = src_caps
+            .iter()
+            .enumerate()
+            .map(|(k, cap)| cap - g.edge_field(s as u32, k).unwrap())
+            .sum();
+        let deg_t = g.neighbors(t as u32).unwrap().len();
+        let into_t: f64 = (0..deg_t).map(|k| g.edge_field(t as u32, k).unwrap()).sum();
+
+        assert!(
+            (out_of_s - total).abs() < 1e-9,
+            "seed {seed:x} k={k}: flow leaving source {out_of_s} != {total}"
+        );
+        assert!(
+            (into_t - total).abs() < 1e-9,
+            "seed {seed:x} k={k}: flow entering sink {into_t} != {total}"
+        );
+    }
+}

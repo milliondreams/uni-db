@@ -28,6 +28,11 @@
 //!
 //! Run: `cargo bench -p uni-db --bench mcts_batched`
 
+// Measures the retiring `ScratchGraph` path on purpose: it is the evidence the
+// arena replaces it (proposal §12). Moves to the arena kernels when `scratch`
+// is deleted at the next major (§13.4).
+#![allow(deprecated)]
+
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::{Duration, Instant};

@@ -683,6 +683,10 @@ async fn df4_multi_batch_provider_streams_every_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Exercises the retiring scratch path on purpose: the isolation property it
+/// proves is inherited by the arena, and the test moves to `arena_*` when
+/// `scratch` is deleted at the next major (proposal §13.4).
+#[allow(deprecated)]
 #[tokio::test]
 async fn q3_scratch_graph_is_never_observable_by_the_store() -> anyhow::Result<()> {
     // Q-3 (proposal §7b / §15.5, live-store): a Mode B-seq scratch graph is

@@ -85,7 +85,7 @@ pub fn graph_compute_slice_req() -> uni_plugin::traits::algorithm::SliceReq {
 /// The capability-slice name the mutable-arena kernel family is versioned under.
 ///
 /// Implemented as of the arena kernels (`arena_*`); see
-/// [`KernelId`](kernel_id::KernelId). The constant remains the single place the
+/// [`kernel_id::KernelId`]. The constant remains the single place the
 /// slice name is written.
 pub const GRAPH_ARENA_SLICE: &str = "graph-arena";
 

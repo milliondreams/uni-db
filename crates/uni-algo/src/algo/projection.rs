@@ -760,7 +760,7 @@ impl GraphProjection {
     /// them straight back up, so this takes the slots directly and uses an
     /// identity id map.
     ///
-    /// Sharing [`build_csr`] with `from_rows` is the point: a frozen arena gets
+    /// Sharing the private `build_csr` helper with `from_rows` is the point: a frozen arena gets
     /// the *same* canonical edge ordering as a stored projection, so every
     /// existing kernel behaves identically on it.
     #[must_use]

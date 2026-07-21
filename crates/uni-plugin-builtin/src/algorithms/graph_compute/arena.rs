@@ -47,7 +47,7 @@ use uni_plugin::errors::FnError;
 
 use super::error;
 
-/// Sentinel in [`GraphArena::parent`] for a slot with no parent.
+/// Sentinel stored in an arena's parent array for a slot with no parent.
 pub const NO_PARENT: u32 = u32::MAX;
 
 /// A mutable, session-local graph arena addressed by dense slots `0..len`.

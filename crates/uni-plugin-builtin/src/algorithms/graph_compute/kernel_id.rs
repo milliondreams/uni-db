@@ -11,7 +11,7 @@
 //! is the same defect issue #152 reported, and issue #151 before it.
 //!
 //! The fix mirrors [`ProjectionKnob`] (#151) and `every_variant_classified_exactly_once`
-//! (capability model), with one strengthening: the [`kernels!`] macro generates
+//! (capability model), with one strengthening: the `kernels!` macro generates
 //! the enum, [`KernelId::ALL`], [`KernelId::op_name`], [`KernelId::reach`] and
 //! [`KernelId::from_op_name`] from a *single* declaration, so those cannot drift
 //! from each other by construction. In the #151 pattern `ALL` is hand-maintained

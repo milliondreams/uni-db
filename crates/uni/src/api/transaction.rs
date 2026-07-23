@@ -146,6 +146,11 @@ pub struct Transaction {
     /// snapshot at execute time (it is pinned lazily on first freeze, so a
     /// value captured at prepare time could be stale).
     snapshot: Arc<parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>>,
+    /// Ephemeral ("scratch") transaction (G8/E2): writes go to a private L0 over
+    /// a pinned read base with an in-memory id allocator, and `commit()` is
+    /// refused — the writes are always discarded on drop. This is the cheap
+    /// write-isolated per-rollout fork (no Lance branch / registry / WAL).
+    ephemeral: bool,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -195,13 +200,21 @@ fn classify_verb(cypher: &str) -> &'static str {
 
 impl Transaction {
     pub(crate) async fn new(session: &Session) -> Result<Self> {
-        Self::new_with_options(session, None, IsolationLevel::default()).await
+        Self::new_with_options(session, None, IsolationLevel::default(), false).await
+    }
+
+    /// Begin an ephemeral ("scratch") transaction (G8/E2): write-isolated over a
+    /// pinned read base with an in-memory id allocator, `commit()` refused, all
+    /// writes discarded on drop.
+    pub(crate) async fn new_scratch(session: &Session) -> Result<Self> {
+        Self::new_with_options(session, None, IsolationLevel::default(), true).await
     }
 
     pub(crate) async fn new_with_options(
         session: &Session,
         timeout: Option<Duration>,
         _isolation: IsolationLevel,
+        ephemeral: bool,
     ) -> Result<Self> {
         // Ensure no other write context is active on this session
         if session
@@ -239,10 +252,32 @@ impl Transaction {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             let l0 = writer.create_transaction_l0();
             let version = l0.read().current_version;
-            let reservoir = Arc::new(uni_store::runtime::TxIdReservoir::new(
-                writer.allocator.clone(),
-                db.config.tx_id_reservoir_batch,
-            ));
+            let batch = db.config.tx_id_reservoir_batch;
+            // A scratch tx draws ids from a throwaway in-memory allocator seeded
+            // ABOVE the primary's live HWM, so its vids/eids can't collide with
+            // pinned base rows and the global `id_allocator.json` is never
+            // advanced or rewritten (G8/E2). A normal tx uses the global
+            // allocator.
+            let reservoir = if ephemeral {
+                let (vid_hwm, eid_hwm) = writer.allocator.current_hwm().await;
+                let scratch_alloc =
+                    uni_store::runtime::id_allocator::IdAllocator::in_memory_seeded(
+                        vid_hwm,
+                        eid_hwm,
+                        batch as u64,
+                    )
+                    .await
+                    .map_err(UniError::Internal)?;
+                Arc::new(uni_store::runtime::TxIdReservoir::new(
+                    Arc::new(scratch_alloc),
+                    batch,
+                ))
+            } else {
+                Arc::new(uni_store::runtime::TxIdReservoir::new(
+                    writer.allocator.clone(),
+                    batch,
+                ))
+            };
             (version, l0, reservoir)
         };
 
@@ -255,7 +290,11 @@ impl Transaction {
         // scans filter to `_version <= started_at_version`, so a flush
         // completing mid-transaction cannot leak post-snapshot rows. One per
         // transaction (the pinned manager carries a fresh AdjacencyManager).
-        let snapshot = if db.config.ssi_enabled {
+        // A scratch tx always pins (even with SSI off): its read base must be the
+        // version-pinned `pinned_at_version` storage (which SHARES the adjacency
+        // manager, so scratch edges written to tx_l0 are visible to traversal)
+        // rather than live L0, giving stable read-your-writes isolation (G8/E2).
+        let snapshot = if db.config.ssi_enabled || ephemeral {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             let mut snap = writer.l0_manager.pin_snapshot();
             snap.pinned_storage = Some(Arc::new(
@@ -297,6 +336,7 @@ impl Transaction {
             for_update_guards: parking_lot::Mutex::new(Vec::new()),
             for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
             snapshot,
+            ephemeral,
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -921,6 +961,14 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id, duration_ms), level = "info")]
     pub async fn commit(mut self) -> Result<CommitResult> {
         self.check_completed()?;
+
+        // G8/E2: a scratch transaction can never be committed — refuse before any
+        // writer lock or L0 merge, so its writes are always discarded on drop.
+        if self.ephemeral {
+            return Err(UniError::ReadOnly {
+                operation: "commit a scratch transaction (its writes are discarded on drop; use session.tx() to persist)".to_string(),
+            });
+        }
 
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "commit".to_string(),

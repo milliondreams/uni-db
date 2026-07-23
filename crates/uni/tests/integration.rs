@@ -52,6 +52,8 @@ mod perf;
 mod querygen;
 #[path = "common/runtime/mod.rs"]
 mod runtime;
+#[path = "common/scratch_tx.rs"]
+mod scratch_tx;
 #[path = "common/session_tx/mod.rs"]
 mod session_tx;
 // Shared infra for the SSI release-readiness suite (metrics capture, reopen

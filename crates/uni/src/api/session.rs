@@ -765,6 +765,29 @@ impl Session {
         Transaction::new(self).await
     }
 
+    /// Begin a **scratch** (ephemeral, write-isolated) transaction — the cheap
+    /// per-rollout fork (G8/E2).
+    ///
+    /// A scratch transaction behaves like [`tx`](Self::tx) — `execute`, `query`
+    /// (read-your-writes), `rollback`, and drop all work — with two differences:
+    /// its writes go to a private L0 over a *pinned* read base with an in-memory
+    /// id allocator, and **`commit()` is refused**, so the writes are always
+    /// discarded on drop. It costs a pinned-snapshot (~1ms), not a Lance-branch
+    /// fork (~10ms): no branch, no registry 2PC, no per-fork WAL, and the global
+    /// `id_allocator.json` is never advanced — so thousands of speculative
+    /// open-write-discard rollouts (e.g. an MCTS that *mutates* per rollout) are
+    /// affordable. For a read-only rollout, prefer
+    /// [`pin_to_version`](Self::pin_to_version) instead.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn scratch(&self) -> Result<Transaction> {
+        if self.is_pinned() {
+            return Err(UniError::ReadOnly {
+                operation: "start_scratch_transaction".to_string(),
+            });
+        }
+        Transaction::new_scratch(self).await
+    }
+
     /// Runs `f` in a transaction, retrying on retriable conflicts.
     ///
     /// Each attempt opens a fresh transaction, passes it to `f`, and commits on
@@ -1614,7 +1637,7 @@ impl<'a> TransactionBuilder<'a> {
                 operation: "start_transaction".to_string(),
             });
         }
-        Transaction::new_with_options(self.session, self.timeout, self.isolation).await
+        Transaction::new_with_options(self.session, self.timeout, self.isolation, false).await
     }
 }
 

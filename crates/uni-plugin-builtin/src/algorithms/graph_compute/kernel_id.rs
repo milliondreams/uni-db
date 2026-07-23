@@ -139,6 +139,7 @@ kernels! {
     EdgeIntersect => "edge_intersect", AllLoaders;
     EdgeUnion => "edge_union", AllLoaders;
     SampleEdges => "sample_edges", AllLoaders;
+    SampleEdgesUndirected => "sample_edges_undirected", AllLoaders;
     SegmentedReduce => "segmented_reduce", AllLoaders;
 
     // Walks.

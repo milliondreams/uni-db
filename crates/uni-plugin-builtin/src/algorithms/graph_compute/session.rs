@@ -62,6 +62,24 @@ pub enum Direction {
     Out,
     /// Follow in-edges (`v -> u`).
     In,
+    /// Follow both out- and in-edges (the union). Requires the projection to
+    /// carry the reverse adjacency (`includeReverse: true`); a `Both` kernel over
+    /// an out-only projection fails loud rather than silently degrading (G5).
+    Both,
+}
+
+/// Fail-closed guard for [`Direction::Both`]: it unions the out- and in-CSR, so
+/// it requires the projection's reverse adjacency. A guest asking for `Both` on
+/// an out-only projection (e.g. one built with `includeReverse: false`) gets a
+/// named error rather than a silent out-only result (G5, matching the WS-A
+/// no-silent-drop discipline). `Out`/`In` are unaffected.
+fn require_reverse_for_both(dir: Direction, graph: &GraphProjection) -> Result<(), FnError> {
+    if matches!(dir, Direction::Both) && !graph.has_reverse() {
+        return Err(error::arg_validation(
+            "Direction::Both requires a projection built with includeReverse: true",
+        ));
+    }
+    Ok(())
 }
 
 /// A closed, host-evaluated per-vertex value transform (proposal §4.3).
@@ -748,6 +766,26 @@ pub trait GraphCompute {
     /// exhausted budget/arena.
     fn sample_edges(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError>;
 
+    /// Undirected variant of [`sample_edges`](GraphCompute::sample_edges): both
+    /// half-edges of an undirected pair (`u->v` and `v->u`) share **one**
+    /// Bernoulli draw, keyed on the canonical unordered endpoint pair
+    /// `(min(u,v), max(u,v))` recomputed from the CSR — so an undirected link is
+    /// up or down *as a unit* (G5). Takes the graph handle `g` (unlike
+    /// `sample_edges`) to reach the CSR. With symmetric per-edge probabilities
+    /// the two halves fire together; the key collides on parallel edges
+    /// (multigraph). Returns a [`HandleKind::EdgeSet`] mask.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle (not a `[E]` `f64` tensor) or an
+    /// exhausted budget/arena.
+    fn sample_edges_undirected(
+        &mut self,
+        g: Handle,
+        prob: Handle,
+        seed: u64,
+        iter: u64,
+    ) -> Result<Handle, FnError>;
+
     /// Group 9 (Mode A): cardinality of an edge mask.
     ///
     /// # Errors
@@ -936,12 +974,14 @@ impl GraphCompute for AlgoSession {
 
     fn degrees(&mut self, g: Handle, dir: Direction) -> Result<Handle, FnError> {
         let graph = Arc::clone(self.table.get_graph(g)?);
+        require_reverse_for_both(dir, &graph)?;
         let n = graph.vertex_count();
         self.charge(n as u64)?;
         let values: Vec<f64> = (0..n as u32)
             .map(|s| match dir {
                 Direction::Out => f64::from(graph.out_degree(s)),
                 Direction::In => f64::from(graph.in_degree(s)),
+                Direction::Both => f64::from(graph.out_degree(s)) + f64::from(graph.in_degree(s)),
             })
             .collect();
         self.alloc_tensor(Tensor::from_f64(values))
@@ -1094,6 +1134,7 @@ impl GraphCompute for AlgoSession {
         exclude: Option<Handle>,
     ) -> Result<Handle, FnError> {
         let graph = Arc::clone(self.table.get_graph(g)?);
+        require_reverse_for_both(dir, &graph)?;
         let front = self.table.get_set(frontier)?.clone();
         let excl = match exclude {
             Some(h) => Some(self.table.get_set(h)?.clone()),
@@ -1104,11 +1145,19 @@ impl GraphCompute for AlgoSession {
         // single super-node expansion cannot overshoot by more than one chunk.
         let mut since_check: u64 = 0;
         for u in front.iter() {
-            let neighbors = match dir {
-                Direction::Out => graph.out_neighbors(u),
-                Direction::In => graph.in_neighbors(u),
+            // `Both` unions out+in neighbors without allocating (empty slice on
+            // the unused side); `Out`/`In` keep their exact single-slice walk.
+            let out_n: &[u32] = if matches!(dir, Direction::Out | Direction::Both) {
+                graph.out_neighbors(u)
+            } else {
+                &[]
             };
-            for &v in neighbors {
+            let in_n: &[u32] = if matches!(dir, Direction::In | Direction::Both) {
+                graph.in_neighbors(u)
+            } else {
+                &[]
+            };
+            for &v in out_n.iter().chain(in_n) {
                 if excl.as_ref().is_none_or(|e| !e.contains(v)) {
                     out.insert(v);
                 }
@@ -1159,6 +1208,7 @@ impl GraphCompute for AlgoSession {
         mask: Option<Handle>,
     ) -> Result<Handle, FnError> {
         let graph = Arc::clone(self.table.get_graph(g)?);
+        require_reverse_for_both(dir, &graph)?;
         let n = graph.vertex_count();
         let input = self.table.get_tensor(vec)?;
         if input.len() != n {
@@ -1202,11 +1252,17 @@ impl GraphCompute for AlgoSession {
                 if contrib == 0 {
                     continue;
                 }
-                let neighbors = match dir {
-                    Direction::Out => graph.out_neighbors(u),
-                    Direction::In => graph.in_neighbors(u),
+                let out_n: &[u32] = if matches!(dir, Direction::Out | Direction::Both) {
+                    graph.out_neighbors(u)
+                } else {
+                    &[]
                 };
-                for &v in neighbors {
+                let in_n: &[u32] = if matches!(dir, Direction::In | Direction::Both) {
+                    graph.in_neighbors(u)
+                } else {
+                    &[]
+                };
+                for &v in out_n.iter().chain(in_n) {
                     out[v as usize] = out[v as usize].saturating_add(contrib);
                 }
             }
@@ -1246,16 +1302,26 @@ impl GraphCompute for AlgoSession {
             if matches!(sr, Semiring::LinearAlgebra) && contrib == 0.0 {
                 continue; // sparse fast path
             }
-            let neighbors = match dir {
-                Direction::Out => graph.out_neighbors(u),
-                Direction::In => graph.in_neighbors(u),
+            // `Both` unions out+in; `idx` enumerates the combined walk, but the
+            // weight below is only read for `Out` (where in_n is empty, so idx is
+            // the true out-edge index). Both/In are unweighted, so idx is unused
+            // there.
+            let out_n: &[u32] = if matches!(dir, Direction::Out | Direction::Both) {
+                graph.out_neighbors(u)
+            } else {
+                &[]
             };
-            for (idx, &v) in neighbors.iter().enumerate() {
+            let in_n: &[u32] = if matches!(dir, Direction::In | Direction::Both) {
+                graph.in_neighbors(u)
+            } else {
+                &[]
+            };
+            for (idx, &v) in out_n.iter().chain(in_n).enumerate() {
                 // Edge weights are only stored for the OUT adjacency; the reverse
                 // CSR carries none. Fetching `out_weight(u, idx)` for an In-edge
                 // index reads the wrong (or an out-of-bounds) slot, so weighted
-                // In-direction is treated as unweighted (w = 1). Out-direction is
-                // exact.
+                // In- and Both-direction are treated as unweighted (w = 1).
+                // Out-direction is exact.
                 let w = if has_w && matches!(dir, Direction::Out) {
                     graph.out_weight(u, idx)
                 } else {
@@ -1841,6 +1907,64 @@ impl GraphCompute for AlgoSession {
             if since_check >= BUDGET_CHECK_CHUNK {
                 self.charge(since_check)?;
                 since_check = 0;
+            }
+        }
+        if since_check > 0 {
+            self.charge(since_check)?;
+        }
+        self.alloc_edge_set(mask)
+    }
+
+    fn sample_edges_undirected(
+        &mut self,
+        g: Handle,
+        prob: Handle,
+        seed: u64,
+        iter: u64,
+    ) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        // Same [E] probability validation as sample_edges.
+        let probs = {
+            let t = self.table.get_tensor(prob)?;
+            if !t.is_edge_shaped() {
+                return Err(error::shape_mismatch(
+                    "sample_edges_undirected expects a [E] probability tensor, got a [V] map",
+                ));
+            }
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "sample_edges_undirected expects an f64 [E] probability tensor, got i64",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let mut mask = EdgeSet::with_capacity(probs.len());
+        let mut since_check: u64 = 0;
+        for u in 0..graph.vertex_count() as u32 {
+            let base = graph.out_edge_start(u);
+            for (k, &v) in graph.out_neighbors(u).iter().enumerate() {
+                let edge = base + k;
+                // Canonical undirected key: both half-edges (u->v and v->u) hash
+                // the same unordered endpoint pair, so they share one Bernoulli
+                // draw — "the undirected link is up or down as a unit" (G5). With
+                // symmetric per-edge probabilities the two halves fire together;
+                // the key collides on parallel edges (multigraph), which the
+                // retained-Eid follow-up would resolve.
+                let (lo, hi) = if u <= v { (u, v) } else { (v, u) };
+                let key = (u64::from(lo) << 32) | u64::from(hi);
+                let p = probs.get(edge).copied().unwrap_or(0.0);
+                if sample_bernoulli(p, seed, iter, key) {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "edge index is bounded by the projection edge count"
+                    )]
+                    mask.insert(edge as u32);
+                }
+                since_check += 1;
+                if since_check >= BUDGET_CHECK_CHUNK {
+                    self.charge(since_check)?;
+                    since_check = 0;
+                }
             }
         }
         if since_check > 0 {

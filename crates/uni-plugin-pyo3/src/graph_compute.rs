@@ -94,6 +94,7 @@ fn dir(s: &str) -> PyResult<Direction> {
     match s {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
+        "both" => Ok(Direction::Both),
         other => Err(PyRuntimeError::new_err(format!("bad direction `{other}`"))),
     }
 }
@@ -567,6 +568,16 @@ impl GcSession {
         self.session
             .lock()
             .sample_edges(from_i64(prob), seed, iter)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Undirected edge sampler: both half-edges of a pair share one draw.
+    fn sample_edges_undirected(&self, g: i64, prob: i64, seed: u64, iter: u64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .sample_edges_undirected(from_i64(g), from_i64(prob), seed, iter)
             .map(to_i64)
             .map_err(py_err)
     }

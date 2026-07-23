@@ -177,6 +177,7 @@ fn dir(s: &str) -> Result<Direction, FnError> {
     match s {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
+        "both" => Ok(Direction::Both),
         other => Err(FnError::new(0x861, format!("bad direction `{other}`"))),
     }
 }
@@ -575,6 +576,9 @@ impl GraphComputeRegistry {
                 .map(h),
             KernelId::SampleEdges => session
                 .sample_edges(from_i64(req.g), req.seed, req.iter)
+                .map(h),
+            KernelId::SampleEdgesUndirected => session
+                .sample_edges_undirected(from_i64(req.g), from_i64(req.a), req.seed, req.iter)
                 .map(h),
             KernelId::EdgeSetLen => session
                 .edge_set_len(from_i64(req.g))
@@ -1184,6 +1188,97 @@ mod tests {
     }
 
     #[test]
+    fn expand_both_unions_out_and_in_neighbors() {
+        // G5a — Direction::Both walks out ∪ in. On 0->1->2, expanding {1}:
+        // out(1)={2}, in(1)={0}, so Both = {0, 2}. Needs the reverse CSR.
+        let node_rows: Vec<HashMap<String, Value>> = [0u64, 1, 2]
+            .iter()
+            .map(|&id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let edge_rows: Vec<HashMap<String, Value>> = [(0u64, 1u64), (1, 2)]
+            .iter()
+            .map(|&(s, t)| {
+                HashMap::from([
+                    ("source".to_string(), Value::Int(s as i64)),
+                    ("target".to_string(), Value::Int(t as i64)),
+                ])
+            })
+            .collect();
+        let graph = GraphProjection::from_rows(&node_rows, &edge_rows, None, true)
+            .expect("projection with reverse builds");
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(3, 2),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| {
+            serde_json::from_str::<KernelResponse>(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let set_len = |h: i64| match call(format!(r#"{{"session":{sid},"op":"set_len","g":{h}}}"#))
+        {
+            KernelResponse::Float(f) => f as usize,
+            other => panic!("set_len -> {other:?}"),
+        };
+        let front = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"frontier","g":{g},"seeds":[1]}}"#
+        )));
+        // exclude = the frontier itself (self-exclusion is harmless: 1 is not its
+        // own neighbor here).
+        let both = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"expand","g":{g},"a":{front},"b":{front},"s":"both"}}"#
+        )));
+        assert_eq!(set_len(both), 2, "Both = out{{2}} union in{{0}}");
+        let out = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"expand","g":{g},"a":{front},"b":{front},"s":"out"}}"#
+        )));
+        assert_eq!(set_len(out), 1, "Out = {{2}}");
+        let inn = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"expand","g":{g},"a":{front},"b":{front},"s":"in"}}"#
+        )));
+        assert_eq!(set_len(inn), 1, "In = {{0}}");
+    }
+
+    #[test]
+    fn expand_both_without_reverse_fails_loud() {
+        // G5a — Both over an out-only projection is a named error, not a silent
+        // out-only result. build_projection() builds without the reverse CSR.
+        let graph = build_projection(&[0, 1, 2], &[(0, 1), (1, 2)]);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(3, 2),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| {
+            serde_json::from_str::<KernelResponse>(&registry.call_json(&json)).unwrap()
+        };
+        let front = match call(format!(
+            r#"{{"session":{sid},"op":"frontier","g":{g},"seeds":[1]}}"#
+        )) {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        match call(format!(
+            r#"{{"session":{sid},"op":"expand","g":{g},"a":{front},"b":{front},"s":"both"}}"#
+        )) {
+            KernelResponse::Err { message, .. } => assert!(
+                message.contains("includeReverse"),
+                "the error must name includeReverse, got: {message}"
+            ),
+            other => panic!("expected a fail-loud error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reach_fixpoint_bfs_over_json() {
         // G6 — reach_fixpoint collapses the delta-frontier BFS into one native
         // call. On a chain 0->1->2->3 plus an isolated node 4, reachability from
@@ -1269,6 +1364,69 @@ mod tests {
             r#"{{"session":{sid},"op":"expand_sampled","g":{g},"a":{front},"s":"out","c":{zeros},"seed":7,"iter":0}}"#
         )));
         assert_eq!(set_len(none), 0, "prob=0 keeps nothing");
+    }
+
+    #[test]
+    fn sample_edges_undirected_fires_pairs_as_a_unit() {
+        // G5b — both half-edges of an undirected pair share one draw, so a mask
+        // over a graph of pure undirected pairs always has EVEN cardinality (each
+        // pair contributes 0 or 2). The directed sample_edges draws each half
+        // independently and can produce odd cardinality — the metamorphic
+        // contrast that proves the undirected keying works.
+        let nodes = vec![0u64, 1, 2, 3];
+        let edges = vec![(0, 1), (1, 0), (1, 2), (2, 1), (2, 3), (3, 2)]; // 3 pairs
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(4, 6),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| {
+            serde_json::from_str::<KernelResponse>(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let elen = |h: i64| match call(format!(
+            r#"{{"session":{sid},"op":"edge_set_len","g":{h}}}"#
+        )) {
+            KernelResponse::Float(f) => f as usize,
+            other => panic!("edge_set_len -> {other:?}"),
+        };
+        // Symmetric probability p = 0.5 on every half-edge.
+        let ones = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"edge_weights","g":{g}}}"#
+        )));
+        let half = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{ones},"s":"scale","f":0.5}}"#
+        )));
+
+        // Undirected: cardinality is always even across seeds.
+        for seed in 0..20u64 {
+            let m = as_handle(call(format!(
+                r#"{{"session":{sid},"op":"sample_edges_undirected","g":{g},"a":{half},"seed":{seed},"iter":0}}"#
+            )));
+            assert_eq!(
+                elen(m) % 2,
+                0,
+                "undirected mask must have even cardinality (seed {seed})"
+            );
+        }
+        // Directed sample_edges draws each half independently → some seed is odd.
+        let any_odd = (0..20u64).any(|seed| {
+            let m = as_handle(call(format!(
+                r#"{{"session":{sid},"op":"sample_edges","g":{half},"seed":{seed},"iter":0}}"#
+            )));
+            elen(m) % 2 == 1
+        });
+        assert!(
+            any_odd,
+            "directed sample_edges should draw half-edges independently (some odd cardinality)"
+        );
     }
 
     #[test]

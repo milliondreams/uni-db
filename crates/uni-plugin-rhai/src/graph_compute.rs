@@ -91,6 +91,7 @@ fn dir(s: &str) -> Result<Direction, Box<EvalAltResult>> {
     match s {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
+        "both" => Ok(Direction::Both),
         other => Err(rt(FnError::new(0x861, format!("bad direction `{other}`")))),
     }
 }
@@ -554,6 +555,22 @@ impl GcSession {
             .map_err(rt)
     }
 
+    /// Undirected edge sampler: both half-edges of a pair share one draw.
+    fn sample_edges_undirected(
+        &mut self,
+        g: i64,
+        prob: i64,
+        seed: i64,
+        iter: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        #[expect(clippy::cast_sign_loss, reason = "seed/iter round-trip bit-exact")]
+        let (seed, iter) = (seed as u64, iter as u64);
+        let mut s = self.session.lock();
+        s.sample_edges_undirected(from_i64(g), from_i64(prob), seed, iter)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// Cardinality of an edge mask.
     fn edge_set_len(&mut self, m: i64) -> Result<i64, Box<EvalAltResult>> {
         let s = self.session.lock();
@@ -970,6 +987,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         NodeProperty => GcSession::node_property,
         EdgesAll => GcSession::edges_all,
         SampleEdges => GcSession::sample_edges,
+        SampleEdgesUndirected => GcSession::sample_edges_undirected,
         EdgeSetLen => GcSession::edge_set_len,
         EdgeMaskWindow => GcSession::edge_mask_window,
         SegmentedReduce => GcSession::segmented_reduce,

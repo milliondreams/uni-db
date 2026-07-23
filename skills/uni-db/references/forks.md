@@ -31,11 +31,39 @@ tx.commit().await?;
 | `Uni::tag_fork(name, tag)` | Phase 4a. Tag a fork's branches with a Lance tag pinned to the current version. Tagged refs are GC-exempt — they survive Lance compaction *and* fork drops, which makes a tag-then-drop sequence safe for audit retention. |
 | `Uni::untag_fork(name, tag)` | Phase 4a. Idempotent — missing tags are no-ops. |
 | `Uni::list_fork_tags(name)` | Phase 4a. Returns the unique tag names applied to this fork. |
-| `Session::pin_to_version(snapshot_id)` / `pin_to_timestamp(ts)` / `refresh()` | Phase 4a now works on forked sessions. Pinned forked sessions read through the fork's branches at the pinned version; writes return `ReadOnly`. |
+| `Session::pin_to_version(snapshot_id)` / `pin_to_timestamp(ts)` / `refresh()` | Phase 4a now works on forked sessions. Pinned forked sessions read through the fork's branches at the pinned version; writes return `ReadOnly`. Also the cheap **read-only** rollout primitive — see "Cheaper alternatives" below. |
+| `Session::scratch()` | Open an ephemeral, write-isolated transaction — the cheap **write** rollout primitive. Behaves like `tx()` (`execute`, `query` with read-your-writes incl. edge traversal, `rollback`, drop) but `commit()` is refused, so writes are always discarded. See "Cheaper alternatives" below. |
 
 ## Errors
 
 `UniError::Fork*`: `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkInflightTx { name }`, `ForkHasChildren { name, children }`, `ForkSubtreeInUse { blockers }`, `ForkBudgetExceeded { current, max }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
+
+## Cheaper alternatives: pinned reads and scratch writes
+
+A full fork creates a Lance branch, a registry 2PC entry, and a per-fork WAL (~10ms) — the right cost when you want to **keep** or **promote** results, but overkill for throwaway per-iteration speculation (an MCTS rollout, a what-if scan). Two lighter primitives cover those cases at roughly **~1ms** each, with no branch, no registry, no WAL, and without advancing the global `id_allocator.json`:
+
+| Need | Use | What it gives you |
+|---|---|---|
+| Read-only rollout / what-if scan | `session.pin_to_version(snapshot_id)` | An in-memory pin to a read snapshot. Reads route as normal; writes return `ReadOnly`. `refresh()` releases the pin. |
+| Mutating rollout (write, read-your-writes, discard) | `session.scratch()` | An ephemeral write-isolated transaction over a pinned read base with an in-memory id allocator. |
+| Keep / promote the result | a real `fork(name)` | Durable branch you can diff, tag, promote, or drop. |
+
+```rust
+// Read-only speculation: pin, scan, refresh — no fork.
+let mut s = db.session();
+s.pin_to_version(&snapshot_id)?;
+let hits = s.query("MATCH (n:Node) WHERE n.score > 0.9 RETURN n").await?;
+s.refresh()?; // release the pin
+
+// Mutating speculation: scratch tx, read-your-writes, discard on drop.
+let scratch = session.scratch().await?;
+scratch.execute("CREATE (:Move {ply: 1})-[:LEADS_TO]->(:Move {ply: 2})").await?;
+let seen = scratch.query("MATCH (a:Move)-[:LEADS_TO]->(b:Move) RETURN b.ply").await?;
+// scratch.commit() would return an error — the writes are always thrown away.
+drop(scratch); // rolls back; the global id allocator is untouched
+```
+
+`scratch()` sees its own writes — including edges it just created via traversal — but the writes never leave the process, so thousands of open-write-discard rollouts stay affordable. Reach for `scratch()` for **mutating** rollouts, `pin_to_version` for **read-only** ones, and a real fork only when you need to promote or retain the results.
 
 ## What sibling sessions on the same fork see
 

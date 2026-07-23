@@ -550,3 +550,63 @@ YIELD nodeId, order
 RETURN nodeId, order
 ORDER BY order ASC
 ```
+
+---
+
+## 12. Guest-Authorable Graph Algorithms (GraphCompute)
+
+Beyond the built-in `uni.algo.*` catalog, third-party algorithms can be authored in a guest language (Rhai, Python/PyO3, WASM, Extism) and run inside the engine as a *conductor* that issues coarse **native kernels** over opaque graph handles. The guest never touches raw storage; it orchestrates O(V+E) native primitives (projection, SpMV, expand, arena / tree-search ops) and reads back only small result tensors. First-party guest algorithms ship under `uni.algo.gc*` (e.g. `uni.algo.gcpagerank`).
+
+### Kernel catalog highlights
+
+Element-wise / map kernels make composite scoring formulas expressible without a bespoke native op — e.g. the UCT exploration term `c * sqrt(ln N / n)` is now composable:
+
+| Kernel | Effect |
+|---|---|
+| `map_apply(m, "sqrt")` | Element-wise sqrt over a map handle |
+| `map_apply(m, "exp")` | Element-wise exp |
+| `ewise(a, b, "div")` | Element-wise `a / b`, with `x / 0 = 0` |
+
+Arena — the tree-search substrate, now **11 kernels**:
+
+| Kernel | Effect |
+|---|---|
+| `arena_backup(arena, value_col, leaves, deltas)` | Value backprop along each leaf's **full root path** (general-depth UCT, not just depth-1). |
+| `arena_descend(...)` | Selection descent. The virtual-loss (`vloss`) term is a flat linear score offset applied in the descent loop — **not** a per-visit UCB recompute. Run at `vloss = 0` for parity with a Python-engine reference. |
+
+Reachability and sampled expansion:
+
+| Kernel | Effect |
+|---|---|
+| `reach_fixpoint(g, seeds, dir)` | BFS-to-fixpoint reachable set in one native O(V+E) call. |
+| `expand_sampled(g, frontier, dir, exclude, prob, seed, iter)` | Fused frontier-scoped lazy sampled expansion — draws only the frontier's out-edges (out-only), applying the per-edge Bernoulli `prob` inline. |
+| `sample_edges_undirected(g, prob, seed, iter)` | Both half-edges of an undirected pair share one Bernoulli draw (canonical `(min, max)` key). Simple undirected graphs only. |
+
+Direction `"both"` — `expand`, `degrees`, and `spmv` accept `dir: "both"` (union of out + in edges). This **requires `includeReverse: true` in the projection config, or it errors** (fail-loud). `spmv` with `"both"` is unweighted.
+
+### Argument typing
+
+A guest algorithm's declared manifest `args` are now type- and arity-checked before the provider runs (previously the declaration was ignored). Tokens:
+
+| Token | Accepts |
+|---|---|
+| `value` / `cypherValue` | A scalar **or** an array — e.g. a variable-length seed set |
+| `list` / `array` | An array/list argument |
+| `int`, `float`, `string`, `bool`, ... | The corresponding primitive |
+
+A guest declaring `args: ["value"]` can be called with a Cypher list directly — no per-arity codegen:
+
+```cypher
+CALL p.spread([1, 2, 3], {nodeLabels: ['N'], edgeTypes: ['E']})
+```
+
+The trailing projection-config object (`{nodeLabels, edgeTypes, includeReverse, projectAll, ...}`) is an implicit optional last argument on every guest algorithm — it need not be declared in `args`.
+
+### Projection scoping is fail-loud (breaking change)
+
+An **unscoped** projection — no `nodeLabels` and no `edgeTypes` — now **errors** instead of silently projecting the whole graph. To project the entire graph, name the labels/types or set `projectAll: true` explicitly. First-party `uni.algo.gc*` procedures opt into whole-graph projection automatically.
+
+Additional fail-loud guarantees:
+- `emit` reports a clear length-mismatch error when the emitted column length doesn't match the projection.
+- A whole-graph projection errors on undeclared (schemaless) labels.
+- Stored property values now read correctly from **unflushed in-memory L0** — previously a projection built before a flush saw `NaN` values / default edge weight `1.0`.

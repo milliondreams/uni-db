@@ -275,6 +275,25 @@ Omitting a slice you use is not an error today — the kernels are gated by the
 `GraphCompute` grant, not by the declaration. Declaring them is what buys you the
 load-time compatibility check, so declare what you use.
 
+### Algorithm argument typing
+
+`AlgorithmSignature.args` declares the arguments the algorithm expects. The
+declared list is **type- and arity-checked at call time** (previously it was
+inert metadata). The arg-type token vocabulary:
+
+| Token | Accepts |
+| --- | --- |
+| `int` / `float` / `string` / `bool` | The corresponding primitive scalar. |
+| `value` / `cypherValue` | A scalar **or** an array — e.g. a variable-length seed set through one declared parameter. |
+| `list` / `array` | An array (required). |
+
+The trailing projection-config object (`{nodeLabels, edgeTypes, projectAll}`) is
+an implicit optional last argument and does **not** count against the declared
+arity. Note that an unscoped GraphCompute projection now errors — pass
+`projectAll: true` for the whole graph, or name `nodeLabels` / `edgeTypes`. See
+[Graph Algorithms → Arguments and projecting the graph](graph-algorithms.md#arguments-and-projecting-the-graph)
+for the full contract and the worked `CALL` examples.
+
 ### Not guest-grantable (internal / first-party)
 
 These capabilities exist but are **never** grantable from a bare grant string —

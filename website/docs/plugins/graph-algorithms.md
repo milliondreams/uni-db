@@ -39,9 +39,58 @@ The two compose. `arena_freeze` turns an arena into an ordinary graph handle, so
 
 ---
 
+## Arguments and projecting the graph
+
+A guest algorithm is invoked from Cypher with `CALL`, passing its arguments and — as an implicit optional last argument — a projection-config object that names which slice of the store to project.
+
+### Typed arguments
+
+A guest manifest's declared `args` are now **type- and arity-checked** at call time. (Before this initiative the declared list was inert metadata that the host ignored.) The arg-type vocabulary:
+
+| Token | Accepts |
+| --- | --- |
+| `int` / `float` / `string` / `bool` | The corresponding primitive scalar. |
+| `value` / `cypherValue` | A scalar **or** an array — e.g. a variable-length seed set. |
+| `list` / `array` | An array (required). |
+
+The `value` token is what lets an algorithm take a variable-length seed set through **one** declared parameter. Declare `args: ["value"]` and call it with a Cypher list:
+
+```cypher
+CALL myplugin.spread([1, 2, 3, 4], {nodeLabels: ['N'], edgeTypes: ['E']})
+```
+
+No more generating the plugin once per arity, and no more padding unused slots with a `-1` sentinel. The trailing `{nodeLabels, …}` projection-config object is the implicit optional last argument — it does **not** count against the declared arity.
+
+### Projection scoping is fail-loud
+
+!!! warning "Breaking change — unscoped projections now error"
+    A GraphCompute `CALL` with **neither** `nodeLabels` nor `edgeTypes` no longer silently projects every declared label and edge type. It now **errors**. To project the whole graph you must opt in explicitly with `projectAll: true`:
+
+    ```cypher
+    -- Was: implicitly the whole graph. Now: ERROR.
+    CALL myplugin.spread([1, 2, 3])
+
+    -- Whole graph, explicit:
+    CALL myplugin.spread([1, 2, 3], {projectAll: true})
+
+    -- Scoped (recommended, unchanged):
+    CALL myplugin.spread([1, 2, 3], {nodeLabels: ['N'], edgeTypes: ['E']})
+    ```
+
+    **Migration:** name `nodeLabels` / `edgeTypes` (the recommended pattern — unaffected), or add `{projectAll: true}` where you relied on the old whole-graph default. First-party `uni.algo.gc*` procedures opt into the whole graph automatically; third-party guests must scope explicitly or pass `projectAll: true`.
+
+Two further guardrails make a mis-scoped or mis-sized projection fail with a clear message instead of a downstream surprise:
+
+- A whole-graph (`projectAll`) projection **fails loud, naming the label**, if the store holds vertices under an undeclared (schemaless) label — declare it first, or scope the projection to the labels you mean.
+- `emit` reports a clear `emit column length N != projected node count M` error, instead of an opaque Arrow error, when a guest emits a wrong-length column.
+
+Stored property values also project faithfully from uncommitted-to-disk state: `gc.node_property` / `gc.edge_property` and edge weights now read committed-but-**unflushed** in-memory data correctly, rather than surfacing `NaN` (or defaulting edge weights to `1.0`) until the next flush.
+
+---
+
 ## Kernel catalogue
 
-59 kernels. Every one is reachable from every loader, except `graph` — sandboxed guests receive the graph handle in their invocation arguments rather than calling for it.
+63 kernels. Every one is reachable from every loader, except `graph` — sandboxed guests receive the graph handle in their invocation arguments rather than calling for it.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -51,7 +100,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | --- | --- |
 | `graph` | The bound graph handle (in-process loaders; sandboxed guests get it in their args). |
 | `vertex_count` / `edge_count` | Scalar counts. |
-| `degrees(g, dir)` | `[V]` degree map, `"out"` or `"in"`. |
+| `degrees(g, dir)` | `[V]` degree map, `"out"`, `"in"`, or `"both"` (the union of out+in edges). `"both"` requires a projection built with `includeReverse: true` — see [Direction `both`](#direction-both). |
 | `vertex_ids(g)` | `[V]` map of each vertex's own slot id — the initializer for label-propagation-style algorithms. |
 | `node_property(g, name)` | `[V]` column materialized from a stored vertex property. |
 | `edge_property(g, name)` / `edge_weights(g)` | `[E]` columns in CSR out-edge order. |
@@ -70,24 +119,32 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 
 | Kernel | Returns |
 | --- | --- |
-| `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy`. |
+| `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
 | `zero_map(g)` | A zeroed `[V]` map. |
 | `scatter(map, frontier, value)` | Write a scalar into the slots a vertex set selects. |
-| `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `affine`, `normalize_l1`, `normalize_l2`. |
+| `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `normalize_l1`, `normalize_l2`. |
 | `recip` / `scale` / `normalize` | Fixed-form shorthands for the above. |
 | `reduce_sum` / `reduce_sum_masked` | Deterministic sums (fixed-order, so bitwise-reproducible). |
 | `arg_extreme(m, want_max)` | The extremal `(vertexId, value)`. |
 | `topk(m, k)` | The ranked top-`k` pairs. |
 | `l1_diff(a, b)` | Convergence metric for fixpoint loops. |
 
+With `sqrt` and `exp` alongside `log` and `div`, the canonical UCT/UCB exploration term `c·√(ln N / n)` composes directly out of kernels — `map_apply(counts, "log")`, `ewise(…, visits, "div")`, then `map_apply(…, "sqrt")` — with no per-element guest code and no host round-trip.
+
 ### Traversal
 
 | Kernel | Returns |
 | --- | --- |
-| `expand(g, frontier, dir, exclude)` | Neighbor expansion, direction-optimized. `exclude` is a vertex set to skip — pass your visited mask to get a BFS step. |
-| `spmv(g, m, semiring, dir)` | Sparse matrix-vector product over a named semiring: `reachability`, `shortest_path`, `propagate`, `linear_algebra`, `min_max`. |
+| `expand(g, frontier, dir, exclude)` | Neighbor expansion, direction-optimized. `dir` is `"out"`, `"in"`, or `"both"`. `exclude` is a vertex set to skip — pass your visited mask to get a BFS step. |
+| `spmv(g, m, semiring, dir)` | Sparse matrix-vector product over a named semiring: `reachability`, `shortest_path`, `propagate`, `linear_algebra`, `min_max`. `dir` accepts `"both"`; with `"both"` the product is **unweighted** (the reverse CSR carries no weights). |
+| `reach_fixpoint(g, seeds, dir)` | The full reachable set from `seeds` — BFS run to fixpoint in one native `O(V+E)` call, so a guest never hand-writes the frontier loop (and can't accidentally write the `O(V·E)` version). |
 | `expand_masked(g, frontier, dir, exclude, edge_mask)` / `spmv_masked(g, vec, semiring, edge_mask)` | The same, restricted to an edge mask — the result equals the kernel run on the subgraph of exactly the masked edges. |
+| `expand_sampled(g, frontier, dir, exclude, prob, seed, iter)` | Frontier-scoped lazy sampled expansion: draws a Bernoulli only for the **current** frontier's out-edges (vs `sample_edges`, which eagerly draws all `E`). Out-direction only. The efficient percolation / influence-cascade primitive. |
 | `next_bucket(dist, delta, bucket)` | Delta-stepping bucket selection. |
+
+#### Direction `both`
+
+`expand`, `degrees`, and `spmv` accept `dir="both"` — the union of a vertex's out- and in-edges. It is **fail-loud**: `"both"` requires a projection built with `includeReverse: true`, and calling it against a projection without the reverse CSR raises a typed error naming `includeReverse`. Build the projection with the reverse adjacency, or use `"out"` / `"in"`. `spmv` with `"both"` is unweighted, because the reverse CSR carries no edge weights.
 
 ### Edge sets
 
@@ -95,6 +152,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | --- | --- |
 | `edge_set_len` | Cardinality of an edge mask. |
 | `sample_edges(prob, seed, iter)` | Per-edge Bernoulli mask from a reproducible counter-hash; `prob` is an `[E]` tensor. |
+| `sample_edges_undirected(g, prob, seed, iter)` | Like `sample_edges`, but both half-edges of an undirected pair (`u→v` and `v→u`) share **one** Bernoulli draw, keyed on the canonical unordered endpoint pair — so an undirected link is up-or-down as a unit. For simple undirected graphs (not multigraphs with parallel edges). |
 | `edge_mask_window(vals, lo, hi)` | Threshold an `[E]` column into a mask — e.g. a temporal window. |
 | `edge_intersect` / `edge_union` | Mask algebra. |
 | `segmented_reduce(values, groups)` | Group a `[V]` map by a label map and reduce, **bitwise-identical regardless of vertex order or partitioning**. |
@@ -129,7 +187,8 @@ Together these express reachability or SpMV over a random edge subset (percolati
 | `arena_column(a)` | A zeroed `[capacity]` `f64` state column; returns its index. Call it repeatedly — a search node needs *both* visits and value. |
 | `arena_candidates(a, roots)` | The children of a frontier, concatenated. |
 | `arena_gather(a, col, slots)` / `arena_scatter(a, col, slots, values)` | Move state between a column and a compact tensor. |
-| `arena_descend(a, roots, score, visit, maximize, vloss)` | Descend to a leaf choosing the best-scoring child, applying one visit and the virtual loss at every step. |
+| `arena_descend(a, roots, score, visit, maximize, vloss)` | Descend to a leaf choosing the best-scoring child, applying one visit and the virtual loss at every step. `vloss` is a flat linear offset applied in the descent loop, **not** a per-visit UCB recompute — see the [worked example](#worked-example-a-guest-authored-mcts). |
+| `arena_backup(a, value_col, leaves, deltas)` | Add each leaf's delta along its **full** root path, walking parents to the root — general-depth UCT / PUCT value backpropagation, not just a depth-1 bandit update. |
 | `arena_freeze(a)` | Compact into an ordinary graph handle. |
 
 ### Egress and lifecycle
@@ -189,6 +248,8 @@ Two details that matter more than they look:
 **Score the candidates, not the column.** `arena_candidates` returns only the children of the active frontier. Rescoring all `N` slots each level instead costs about **6×** more, because it does `O(N)` work where only `O(frontier × branching)` entries can possibly be chosen.
 
 **The virtual loss is not optional.** `arena_descend`'s `vloss` is applied *inside* the descent loop, not after the batch. Without it every rollout in a batch descends against identical statistics and follows the same path — in measurement, a 1024-rollout batch collapsed onto **16 distinct leaves**. With it, 1024.
+
+`vloss` is a **flat linear score offset** subtracted per step in the descent, not a per-visit UCB recompute against updated visit counts. It is deliberately cheap: it diversifies a batch without re-deriving the exploration term at every node. A guest that needs bit-exact parity with a hand-written per-visit engine — one that recomputes UCB against the incremented visit count on each step — should descend at `vloss=0` and update statistics itself between single-rollout descents. Value backpropagation up the chosen path is a separate step: `arena_backup` adds each leaf's delta along its full root path, so UCT/PUCT backprop is one native call rather than a guest-side parent walk.
 
 ---
 

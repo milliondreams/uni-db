@@ -81,3 +81,22 @@ session
 # Ok(())
 # }
 ```
+
+## Scratch transactions — throwaway write isolation
+
+`Session::scratch()` opens a **write-isolated, transient** transaction for speculation you intend to throw away — a "what if I applied these writes?" that never touches durable state. It is the cheap sibling of a [fork](forks.md): a private L0 buffer layered over a pinned base with an in-memory id allocator, so it gives full **read-your-writes** (including edge traversal over what you just wrote) while its writes stay invisible to every other session.
+
+Two properties make it disposable by design:
+
+- **`commit()` is refused.** A scratch transaction cannot be committed — all of its writes are discarded when it drops. There is no way to accidentally persist speculation.
+- **It never advances the global id allocator.** Because it allocates ids in-memory over a pinned snapshot, opening thousands of scratch transactions in a loop leaves the durable database — its versions, its id high-water mark — completely unmoved.
+
+It costs about **~1 ms** (a pinned snapshot) versus roughly ~10 ms for a full Lance-branch fork, and does no branch / registry / WAL work. That makes thousands of speculative *open → write → read → discard* rollouts affordable — the intended use is per-iteration speculation in search, planning, and simulation loops.
+
+Choose by what the rollout needs:
+
+| Need | Use |
+|---|---|
+| Speculate with **writes**, then discard | `Session::scratch()` |
+| **Read-only** snapshot rollout | `Session::pin_to_version(snapshot_id)` (in-memory pin, ~1 ms — no branch) |
+| **Keep / promote** the result | A real [fork](forks.md) |

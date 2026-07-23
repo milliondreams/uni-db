@@ -246,6 +246,21 @@ The same surface is available via `uni_db` in Python, sync and async.
 - Multi-edge promotion (parallel edges of the same type between the same endpoints with different property bags) — requires an edge-content UID; deferred.
 - Schema migration during promote — fork-only labels / edge types must be registered on primary before promote, or the call errors with `LabelNotFound` / `EdgeTypeNotFound`.
 
+## Cheaper alternatives for throwaway rollouts
+
+A named, durable fork is the right tool when you want to **keep** or **promote** the result. For per-iteration speculation you intend to *discard* — a search or planning loop that opens a scenario, writes into it, reads it back, and throws it away — a full fork (~10 ms of Lance branch + registry + WAL work) is overkill. Two lighter primitives cost ~1 ms:
+
+- **`Session::scratch()`** — a write-isolated, transient "fork" for speculation that **mutates**. It returns a transaction with a private L0 over a pinned base and an in-memory id allocator, giving read-your-writes (including edge traversal). Its `commit()` is **refused** — all writes are discarded on drop — and it never advances the global id allocator, so thousands of open-write-discard rollouts stay affordable. See [Scratch transactions](transactions-consistency.md#scratch-transactions--throwaway-write-isolation).
+- **`Session::pin_to_version(snapshot_id)`** — the fork-free **read-only** snapshot: an in-memory pin, no Lance branch / registry / WAL. Prefer it over creating-and-dropping a fork per read-only iteration.
+
+Reach for a real fork only when the result must survive — to diff, promote, tag, or keep across restarts.
+
+| Rollout need | Use |
+|---|---|
+| Speculate with writes, then discard | `Session::scratch()` (~1 ms) |
+| Read-only snapshot iteration | `Session::pin_to_version` (~1 ms) |
+| Keep / diff / promote / tag the result | A real fork (`session.fork(name)`) |
+
 ## Snapshot vs Fork
 
 | | Snapshot | Fork |

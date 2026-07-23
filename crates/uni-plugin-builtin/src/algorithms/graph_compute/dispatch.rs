@@ -406,6 +406,20 @@ impl GraphComputeRegistry {
                     .collect();
                 session.frontier(from_i64(req.g), &vids).map(h)
             }
+            KernelId::ReachFixpoint => {
+                let vids: Vec<Vid> = req
+                    .seeds
+                    .iter()
+                    .map(|&i| {
+                        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+                        let u = i as u64;
+                        Vid::new(u)
+                    })
+                    .collect();
+                session
+                    .reach_fixpoint(from_i64(req.g), &vids, dir(&req.s)?)
+                    .map(h)
+            }
             KernelId::Degrees => session.degrees(from_i64(req.g), dir(&req.s)?).map(h),
             KernelId::VertexIds => session.vertex_ids(from_i64(req.g)).map(h),
             KernelId::SetToMap => session
@@ -583,6 +597,21 @@ impl GraphComputeRegistry {
                         Some(from_i64(req.b))
                     },
                     from_i64(req.c),
+                )
+                .map(h),
+            KernelId::ExpandSampled => session
+                .expand_sampled(
+                    from_i64(req.g),
+                    from_i64(req.a),
+                    dir(&req.s)?,
+                    if req.b == 0 {
+                        None
+                    } else {
+                        Some(from_i64(req.b))
+                    },
+                    from_i64(req.c),
+                    req.seed,
+                    req.iter,
                 )
                 .map(h),
             KernelId::SpmvMasked => session
@@ -1152,6 +1181,94 @@ mod tests {
         )));
         let (_, f) = top1(q);
         assert!((f - 2.0).abs() < 1e-12, "6/3 = 2, got {f}");
+    }
+
+    #[test]
+    fn reach_fixpoint_bfs_over_json() {
+        // G6 — reach_fixpoint collapses the delta-frontier BFS into one native
+        // call. On a chain 0->1->2->3 plus an isolated node 4, reachability from
+        // {0} out is {0,1,2,3}; from the isolated {4} it is {4}.
+        let nodes = vec![0u64, 1, 2, 3, 4];
+        let edges = vec![(0, 1), (1, 2), (2, 3)];
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(5, 3),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| {
+            serde_json::from_str::<KernelResponse>(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let set_len = |h: i64| match call(format!(r#"{{"session":{sid},"op":"set_len","g":{h}}}"#))
+        {
+            KernelResponse::Float(f) => f as usize,
+            other => panic!("set_len -> {other:?}"),
+        };
+
+        let v = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"reach_fixpoint","g":{g},"seeds":[0],"s":"out"}}"#
+        )));
+        assert_eq!(set_len(v), 4, "0,1,2,3 reachable; 4 is isolated");
+        let v2 = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"reach_fixpoint","g":{g},"seeds":[4],"s":"out"}}"#
+        )));
+        assert_eq!(set_len(v2), 1, "an isolated node reaches only itself");
+    }
+
+    #[test]
+    fn expand_sampled_fuses_draw_and_expand_over_json() {
+        // G7 — expand_sampled draws only the frontier's out-edges. prob=1.0
+        // everywhere keeps every out-neighbor (== expand); prob=0.0 keeps none.
+        let nodes = vec![0u64, 1, 2, 3];
+        let edges = vec![(0, 1), (0, 2), (0, 3)]; // node 0 has out-degree 3
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(4, 3),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| {
+            serde_json::from_str::<KernelResponse>(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let set_len = |h: i64| match call(format!(r#"{{"session":{sid},"op":"set_len","g":{h}}}"#))
+        {
+            KernelResponse::Float(f) => f as usize,
+            other => panic!("set_len -> {other:?}"),
+        };
+
+        let front = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"frontier","g":{g},"seeds":[0]}}"#
+        )));
+        // prob = edge_weights (all 1.0): every out-edge fires.
+        let ones = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"edge_weights","g":{g}}}"#
+        )));
+        let all = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"expand_sampled","g":{g},"a":{front},"s":"out","c":{ones},"seed":7,"iter":0}}"#
+        )));
+        assert_eq!(set_len(all), 3, "prob=1 keeps every out-neighbor");
+        // prob = 0 everywhere: no edge fires.
+        let zeros = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{ones},"s":"scale","f":0.0}}"#
+        )));
+        let none = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"expand_sampled","g":{g},"a":{front},"s":"out","c":{zeros},"seed":7,"iter":0}}"#
+        )));
+        assert_eq!(set_len(none), 0, "prob=0 keeps nothing");
     }
 
     #[test]

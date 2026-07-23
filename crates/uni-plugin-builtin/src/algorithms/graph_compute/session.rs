@@ -546,6 +546,25 @@ pub trait GraphCompute {
         exclude: Option<Handle>,
     ) -> Result<Handle, FnError>;
 
+    /// BFS-to-fixpoint: the set of every vertex reachable from `seeds` along
+    /// `dir` edges, as one native call.
+    ///
+    /// Internally runs the correct O(V+E) *delta-frontier* loop — each hop
+    /// expands only the newly-discovered frontier, with the running `visited`
+    /// set as the `exclude` — so a guest cannot accidentally write the O(V·E)
+    /// version that re-expands all of `visited` every round (G6). Equivalent to
+    /// the first-party `reachable_set` composed loop, collapsed into a kernel.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, an unmapped seed, or an
+    /// exhausted budget.
+    fn reach_fixpoint(
+        &mut self,
+        g: Handle,
+        seeds: &[Vid],
+        dir: Direction,
+    ) -> Result<Handle, FnError>;
+
     /// Group 3: sparse mat-vec of a map under a named semiring.
     ///
     /// Charges nnz (the edge count). `mask`, when present, restricts the output
@@ -780,6 +799,36 @@ pub trait GraphCompute {
         dir: Direction,
         exclude: Option<Handle>,
         edge_mask: Handle,
+    ) -> Result<Handle, FnError>;
+
+    /// Fused frontier-scoped sampled expansion: for each out-edge of the current
+    /// `frontier`, draw a Bernoulli with the edge's `prob` and keep the target if
+    /// it fires (and is not `exclude`d).
+    ///
+    /// This fuses `sample_edges` + `expand_masked` but draws **only the current
+    /// frontier's out-edges** — an O(|frontier out-edges|) percolation step
+    /// instead of the O(E) eager whole-graph draw a guest gets from
+    /// `sample_edges` (G7). The per-edge Bernoulli is keyed identically to
+    /// `sample_edges` (by global out-edge index), so a fused percolation is
+    /// bit-identical to the composed `sample_edges` + `expand_masked` it
+    /// replaces. Out-direction only, matching `expand_masked`.
+    ///
+    /// # Errors
+    /// `0x86E` for a non-`Out` direction; `0x862` if `prob` is not an `f64` `[E]`
+    /// tensor; a typed [`FnError`] on a bad handle or exhausted budget.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "traversal-kernel arity mirrors the wire op"
+    )]
+    fn expand_sampled(
+        &mut self,
+        g: Handle,
+        frontier: Handle,
+        dir: Direction,
+        exclude: Option<Handle>,
+        prob: Handle,
+        seed: u64,
+        iter: u64,
     ) -> Result<Handle, FnError>;
 
     /// Group 9 (Mode A, A-3): `spmv` restricted to the masked edges.
@@ -1072,6 +1121,33 @@ impl GraphCompute for AlgoSession {
         }
         self.charge(since_check)?;
         self.alloc_set(out)
+    }
+
+    fn reach_fixpoint(
+        &mut self,
+        g: Handle,
+        seeds: &[Vid],
+        dir: Direction,
+    ) -> Result<Handle, FnError> {
+        // The correct O(V+E) delta-frontier loop (mirrors first_party::
+        // reachable_set): expand only the newly-discovered frontier each hop,
+        // with the running `visited` set as the exclude. `expand`/`set_union`
+        // charge the per-hop work, so no extra metering is needed here.
+        let mut visited = self.frontier(g, seeds)?;
+        let mut frontier = self.frontier(g, seeds)?;
+        loop {
+            let next = self.expand(g, frontier, dir, Some(visited))?;
+            self.free(frontier)?;
+            if self.is_empty(next)? {
+                self.free(next)?;
+                break;
+            }
+            let grown = self.set_union(visited, next)?;
+            self.free(visited)?;
+            visited = grown;
+            frontier = next;
+        }
+        Ok(visited)
     }
 
     fn spmv(
@@ -1853,6 +1929,67 @@ impl GraphCompute for AlgoSession {
                 )]
                 let active = mask.contains((base + k) as u32);
                 if active && excl.as_ref().is_none_or(|e| !e.contains(v)) {
+                    out.insert(v);
+                }
+                since_check += 1;
+                if since_check >= BUDGET_CHECK_CHUNK {
+                    self.charge(since_check)?;
+                    since_check = 0;
+                }
+            }
+        }
+        self.charge(since_check)?;
+        self.alloc_set(out)
+    }
+
+    fn expand_sampled(
+        &mut self,
+        g: Handle,
+        frontier: Handle,
+        dir: Direction,
+        exclude: Option<Handle>,
+        prob: Handle,
+        seed: u64,
+        iter: u64,
+    ) -> Result<Handle, FnError> {
+        if !matches!(dir, Direction::Out) {
+            return Err(error::arg_validation(
+                "expand_sampled is defined on the out-CSR; use Direction::Out",
+            ));
+        }
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let front = self.table.get_set(frontier)?.clone();
+        let probs = {
+            let t = self.table.get_tensor(prob)?;
+            if !t.is_edge_shaped() {
+                return Err(error::shape_mismatch(
+                    "expand_sampled expects a [E] probability tensor, got a [V] map",
+                ));
+            }
+            if t.is_i64() {
+                return Err(error::shape_mismatch(
+                    "expand_sampled expects an f64 [E] probability tensor, got i64",
+                ));
+            }
+            t.values().to_vec()
+        };
+        let excl = match exclude {
+            Some(h) => Some(self.table.get_set(h)?.clone()),
+            None => None,
+        };
+        let mut out = VertexSet::with_capacity(graph.vertex_count());
+        let mut since_check: u64 = 0;
+        for u in front.iter() {
+            let base = graph.out_edge_start(u);
+            for (k, &v) in graph.out_neighbors(u).iter().enumerate() {
+                let edge = base + k;
+                // Same per-edge Bernoulli keying as `sample_edges`, so a fused
+                // percolation equals `sample_edges` + `expand_masked` — but only
+                // the current frontier's out-edges are drawn (G7).
+                let p = probs.get(edge).copied().unwrap_or(0.0);
+                if sample_bernoulli(p, seed, iter, edge as u64)
+                    && excl.as_ref().is_none_or(|e| !e.contains(v))
+                {
                     out.insert(v);
                 }
                 since_check += 1;

@@ -126,7 +126,9 @@ kernels! {
 
     // Traversal.
     Expand => "expand", AllLoaders;
+    ReachFixpoint => "reach_fixpoint", AllLoaders;
     ExpandMasked => "expand_masked", AllLoaders;
+    ExpandSampled => "expand_sampled", AllLoaders;
     Spmv => "spmv", AllLoaders;
     SpmvMasked => "spmv_masked", AllLoaders;
     NextBucket => "next_bucket", AllLoaders;

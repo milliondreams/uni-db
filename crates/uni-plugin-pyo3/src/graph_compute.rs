@@ -184,6 +184,19 @@ impl GcSession {
             .map_err(py_err)
     }
 
+    /// BFS-to-fixpoint: the set of vertices reachable from `seeds` along `direction`.
+    fn reach_fixpoint(&self, g: i64, seeds: Vec<i64>, direction: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        let d = dir(direction)?;
+        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+        let vids: Vec<Vid> = seeds.into_iter().map(|i| Vid::new(i as u64)).collect();
+        self.session
+            .lock()
+            .reach_fixpoint(from_i64(g), &vids, d)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     /// Per-vertex degree map in `direction` (`"out"`/`"in"`).
     fn degrees(&self, g: i64, direction: &str) -> PyResult<i64> {
         self.check_deadline()?;
@@ -632,6 +645,42 @@ impl GcSession {
                     Some(from_i64(exclude))
                 },
                 from_i64(edge_mask),
+            )
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Fused frontier-scoped sampled expansion: draw + expand, out-edges only.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel arity mirrors the wire op"
+    )]
+    fn expand_sampled(
+        &self,
+        g: i64,
+        frontier: i64,
+        direction: &str,
+        exclude: i64,
+        prob: i64,
+        seed: u64,
+        iter: u64,
+    ) -> PyResult<i64> {
+        self.check_deadline()?;
+        let d = dir(direction)?;
+        self.session
+            .lock()
+            .expand_sampled(
+                from_i64(g),
+                from_i64(frontier),
+                d,
+                if exclude == 0 {
+                    None
+                } else {
+                    Some(from_i64(exclude))
+                },
+                from_i64(prob),
+                seed,
+                iter,
             )
             .map(to_i64)
             .map_err(py_err)

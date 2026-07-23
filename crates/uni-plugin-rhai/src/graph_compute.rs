@@ -169,6 +169,37 @@ impl GcSession {
         s.frontier(from_i64(g), &vids).map(to_i64).map_err(rt)
     }
 
+    /// BFS-to-fixpoint: the set of vertices reachable from `seeds` along `d`.
+    fn reach_fixpoint(
+        &mut self,
+        g: i64,
+        seeds: Array,
+        d: ImmutableString,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let vids: Vec<Vid> = seeds
+            .into_iter()
+            .map(|s| {
+                s.as_int()
+                    .map(|i| {
+                        #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
+                        let u = i as u64;
+                        Vid::new(u)
+                    })
+                    .map_err(|_| {
+                        rt(FnError::new(
+                            0x802,
+                            "reach_fixpoint: seed must be an integer",
+                        ))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let direction = dir(d.as_str())?;
+        let mut s = self.session.lock();
+        s.reach_fixpoint(from_i64(g), &vids, direction)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// Per-vertex degree map in `dir`.
     fn degrees(&mut self, g: i64, d: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
         let direction = dir(d.as_str())?;
@@ -595,6 +626,42 @@ impl GcSession {
         .map_err(rt)
     }
 
+    /// Fused frontier-scoped sampled expansion: draw + expand, out-edges only.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel arity mirrors the wire op"
+    )]
+    fn expand_sampled(
+        &mut self,
+        g: i64,
+        frontier: i64,
+        d: ImmutableString,
+        exclude: i64,
+        prob: i64,
+        seed: i64,
+        iter: i64,
+    ) -> Result<i64, Box<EvalAltResult>> {
+        let direction = dir(d.as_str())?;
+        #[expect(clippy::cast_sign_loss, reason = "seed/iter round-trip bit-exact")]
+        let (seed, iter) = (seed as u64, iter as u64);
+        let mut s = self.session.lock();
+        s.expand_sampled(
+            from_i64(g),
+            from_i64(frontier),
+            direction,
+            if exclude == 0 {
+                None
+            } else {
+                Some(from_i64(exclude))
+            },
+            from_i64(prob),
+            seed,
+            iter,
+        )
+        .map(to_i64)
+        .map_err(rt)
+    }
+
     /// `spmv` restricted to the masked out-edges (out-direction only).
     fn spmv_masked(
         &mut self,
@@ -870,6 +937,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         VertexCount => GcSession::vertex_count,
         EdgeCount => GcSession::edge_count,
         Frontier => GcSession::frontier,
+        ReachFixpoint => GcSession::reach_fixpoint,
         Degrees => GcSession::degrees,
         VertexIds => GcSession::vertex_ids,
         SetToMap => GcSession::set_to_map,
@@ -908,6 +976,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         EdgeIntersect => GcSession::edge_intersect,
         EdgeUnion => GcSession::edge_union,
         ExpandMasked => GcSession::expand_masked,
+        ExpandSampled => GcSession::expand_sampled,
         SpmvMasked => GcSession::spmv_masked,
         WalkVisitCounts => GcSession::walk_visit_counts,
         EmitWalks => GcSession::emit_walks,

@@ -1096,7 +1096,11 @@ fn apply_registration(
                     })?;
                 procedures.push(qname);
             }
-            RegistrationEntry::Algorithm { qname, yields, .. } => {
+            RegistrationEntry::Algorithm {
+                qname,
+                args,
+                yields,
+            } => {
                 let parsed_qname = parse_qname(&qname)?;
                 let registry = prepared.graph.clone().ok_or_else(|| {
                     WasmError::Internal(format!(
@@ -1104,7 +1108,7 @@ fn apply_registration(
                          (call WasmLoader::with_graph)"
                     ))
                 })?;
-                let sig = build_algorithm_signature(&yields)?;
+                let sig = build_algorithm_signature(&args, &yields)?;
                 let pool_ref = match &algo_pool {
                     Some(p) => Arc::clone(p),
                     None => {
@@ -1399,9 +1403,30 @@ fn build_algorithm_pool(
 
 /// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
 fn build_algorithm_signature(
+    args: &[WireArgType],
     yields: &[String],
 ) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, WasmError> {
     use arrow_schema::{DataType, Field};
+    use uni_plugin::traits::procedure::NamedArgType;
+    // Declared algorithm args are now typed and validated (G4): they were parsed
+    // then dropped, leaving `signature.args` empty so `coerce_config_json` was a
+    // no-op. `WireArgType::CypherValue` lets a guest declare a variable-length
+    // seed set without generating the plugin per-arity.
+    let mut named_args: Vec<NamedArgType> = args
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty: wire_arg(w)?,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, WasmError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (stripped by the adapter before the guest runs).
+    named_args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = yields
         .iter()
         .enumerate()
@@ -1424,6 +1449,7 @@ fn build_algorithm_signature(
         .collect::<Result<_, WasmError>>()?;
     Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
         output_fields,
+        args: named_args,
         docs: String::new(),
         ..Default::default()
     })

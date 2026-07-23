@@ -22,6 +22,7 @@ use uni_plugin::{
 
 use arrow_schema::Field;
 
+use uni_plugin::adapter_common::arrow_types::arg_type_from_token;
 use uni_plugin::capability::SideEffects;
 use uni_plugin::secrets::SecretStore;
 use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
@@ -344,6 +345,35 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
 }
 
 fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignature, RhaiError> {
+    // Declared algorithm args are now typed and validated (G4). Previously
+    // `entry.args` was parsed then silently ignored — `signature.args` was left
+    // empty, so `coerce_config_json` was a no-op and a guest got no arity/type
+    // checking. The shared token vocabulary also lets a guest declare a
+    // `value`/`list` argument (not just fixed scalars), so a variable-length seed
+    // set can be passed without generating the plugin per-arity.
+    let mut args: Vec<NamedArgType> = entry
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, tok)| {
+            let ty = arg_type_from_token(tok).ok_or_else(|| {
+                RhaiError::ManifestInvalid(format!(
+                    "unknown arg type `{tok}` for algorithm `{}`; supported: \
+                     float/int/string/bool/null/value/list",
+                    entry.name
+                ))
+            })?;
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, RhaiError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (the adapter strips it before the guest runs).
+    args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = entry
         .yields
         .iter()
@@ -356,6 +386,7 @@ fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignatur
         .collect::<Result<_, RhaiError>>()?;
     Ok(AlgorithmSignature {
         output_fields,
+        args,
         docs: String::new(),
         ..Default::default()
     })

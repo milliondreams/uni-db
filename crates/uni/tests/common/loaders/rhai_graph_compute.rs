@@ -159,3 +159,91 @@ async fn rhai_guest_ppr_via_call() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A guest algorithm declaring a single `value` argument, driven by a
+/// variable-length seed set. Proves the G4 capability: a Cypher list reaches the
+/// guest as one argument — no per-arity plugin codegen, no `-1` sentinel padding.
+const SET_ARG_SCRIPT: &str = r#"
+    fn uni_manifest() {
+        #{
+            id: "ai.example.gcset",
+            version: "0.1.0",
+            determinism: "pure",
+            algorithms: [
+                #{ name: "reach", args: ["value"], yields: ["nodeId:int", "seen:float"] },
+            ],
+        }
+    }
+
+    fn reach(gc, seeds) {
+        let g = gc.graph();
+        let front = gc.frontier(g, seeds);   // `seeds` is the whole list, one arg
+        let seen = gc.set_to_map(front, 1.0);
+        gc.free(front);
+        gc.emit("seen", seen);
+    }
+"#;
+
+/// G4 — a `value`-typed algorithm argument accepts a variable-length set, and
+/// declared args are now validated (they were silently-ignored dead metadata).
+#[tokio::test]
+async fn rhai_guest_value_arg_takes_variable_length_set() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let vid_b = db
+        .session()
+        .query("MATCH (b:Node {name: 'B'}) RETURN id(b) AS vid")
+        .await?
+        .rows()[0]
+        .get::<i64>("vid")?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    db.load_rhai_plugin(&loader, SET_ARG_SCRIPT, &caps)
+        .expect("load_rhai_plugin succeeds");
+
+    let session = db.session();
+    // Pass a variable-length seed set as ONE `value` argument (a Cypher list).
+    let res = session
+        .query(&format!(
+            "CALL ai.example.gcset.reach([{vid_a}, {vid_b}], \
+             {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, seen RETURN nodeId, seen"
+        ))
+        .await?;
+    let seen_count = res
+        .rows()
+        .iter()
+        .filter(|r| r.get::<f64>("seen").map(|v| v > 0.5).unwrap_or(false))
+        .count();
+    assert_eq!(
+        seen_count, 2,
+        "both seeds in the variable-length set are marked seen"
+    );
+
+    // Validation now activates (declared args were silently-ignored dead
+    // metadata before): a CALL with too many positional args — three seed lists
+    // plus the trailing config — exceeds the declared arity and is rejected
+    // before the guest runs.
+    let err = session
+        .query(&format!(
+            "CALL ai.example.gcset.reach([{vid_a}], [{vid_b}], [{vid_a}], \
+             {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, seen RETURN nodeId"
+        ))
+        .await
+        .expect_err("too many positional args must be rejected (args are validated now)");
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(
+        msg.contains("too many") || msg.contains("argument") || msg.contains("arg"),
+        "the arity mismatch must surface as an argument error, got: {err}"
+    );
+    Ok(())
+}

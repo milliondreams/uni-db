@@ -543,7 +543,7 @@ impl ExtismLoader {
                 }
                 crate::exports::RegistrationEntry::Algorithm {
                     qname,
-                    args: _,
+                    args,
                     yields,
                 } => {
                     let parsed_qname = parse_entry_qname(&qname)?;
@@ -553,7 +553,7 @@ impl ExtismLoader {
                              (call ExtismLoader::with_graph)"
                         ))
                     })?;
-                    let sig = build_algorithm_signature(&yields)?;
+                    let sig = build_algorithm_signature(&args, &yields)?;
                     let adapter =
                         std::sync::Arc::new(crate::adapter_algorithm::ExtismAlgorithm::new(
                             std::sync::Arc::clone(&pool),
@@ -597,11 +597,32 @@ fn parse_entry_qname(qname: &str) -> Result<uni_plugin::QName, ExtismError> {
         .map_err(|e| ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}")))
 }
 
-/// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
+/// Build an `AlgorithmSignature` from declared wire arg types + `"name:type"`
+/// yield strings. Declared args are now typed and validated (G4): they were
+/// parsed then dropped, leaving `signature.args` empty so `coerce_config_json`
+/// was a no-op. `WireArgType::CypherValue` lets a guest declare a
+/// variable-length seed set without generating the plugin per-arity.
 fn build_algorithm_signature(
+    args: &[crate::exports::WireArgType],
     yields: &[String],
 ) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, ExtismError> {
     use arrow_schema::{DataType, Field};
+    use uni_plugin::traits::procedure::NamedArgType;
+    let mut named_args: Vec<NamedArgType> = args
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty: crate::wire_translate::wire_arg_to_internal(w)?,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, ExtismError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (stripped by the adapter before the guest runs).
+    named_args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = yields
         .iter()
         .enumerate()
@@ -624,6 +645,7 @@ fn build_algorithm_signature(
         .collect::<Result<_, ExtismError>>()?;
     Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
         output_fields,
+        args: named_args,
         docs: String::new(),
         ..Default::default()
     })

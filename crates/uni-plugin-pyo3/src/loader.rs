@@ -500,10 +500,40 @@ fn register_algorithms(
     entries: &[crate::manifest::PyAlgorithmEntry],
 ) -> Result<Vec<String>, PyPluginError> {
     use arrow_schema::Field;
+    use uni_plugin::adapter_common::arrow_types::arg_type_from_token;
     use uni_plugin::traits::algorithm::AlgorithmSignature;
+    use uni_plugin::traits::procedure::NamedArgType;
 
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
+        // Declared algorithm args are now typed and validated (G4) — they were
+        // parsed then silently ignored, leaving `signature.args` empty so
+        // `coerce_config_json` was a no-op. The shared token vocabulary also lets
+        // a guest declare a `value`/`list` argument (a variable-length seed set)
+        // instead of generating the plugin per-arity.
+        let mut args: Vec<NamedArgType> = entry
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, tok)| {
+                let ty = arg_type_from_token(tok.as_str()).ok_or_else(|| {
+                    PyPluginError::ManifestInvalid(format!(
+                        "unknown arg type `{tok}` for algorithm `{}`; supported: \
+                         float/int/string/bool/null/value/list",
+                        entry.name
+                    ))
+                })?;
+                Ok(NamedArgType {
+                    name: SmolStr::from(format!("arg{i}")),
+                    ty,
+                    default: None,
+                    doc: String::new(),
+                })
+            })
+            .collect::<Result<_, PyPluginError>>()?;
+        // Accept the optional trailing projection-config object the CALL
+        // convention appends after the guest args (stripped by the adapter).
+        args.push(NamedArgType::projection_config());
         // Yields are declared `"name:type"` (e.g. `"score:float"`) so the
         // emitted column and the special `nodeId` column bind by name.
         let output_fields: Vec<Field> = entry
@@ -521,6 +551,7 @@ fn register_algorithms(
             .collect::<Result<_, PyPluginError>>()?;
         let sig = AlgorithmSignature {
             output_fields,
+            args,
             docs: String::new(),
             ..Default::default()
         };

@@ -76,6 +76,29 @@ pub struct NamedArgType {
     pub doc: String,
 }
 
+impl NamedArgType {
+    /// The optional trailing projection-config argument every GraphCompute
+    /// algorithm accepts (`{nodeLabels, edgeTypes, projectAll, ...}`).
+    ///
+    /// Guest-loader algorithm signatures append this so `coerce_config_json`
+    /// accounts for the config object the CALL convention places *after* the
+    /// guest's own arguments — the adapter strips it back off (via
+    /// `GraphProjectionSpec::take_from_args`) before invoking the guest. Without
+    /// it, declaring any typed `args` would reject every scoped CALL as having
+    /// one argument too many. Mirrors the first-party `gcpagerank` provider's
+    /// trailing `config` arg; opaque (`CypherValue`) and defaulted (`Null`) so it
+    /// is always optional and accepts any projection object.
+    #[must_use]
+    pub fn projection_config() -> Self {
+        Self {
+            name: "config".into(),
+            ty: ArgType::CypherValue,
+            default: Some(ScalarValue::Null),
+            doc: "Optional {nodeLabels, edgeTypes, projectAll, ...} projection config.".to_owned(),
+        }
+    }
+}
+
 /// Procedure-mode declaration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

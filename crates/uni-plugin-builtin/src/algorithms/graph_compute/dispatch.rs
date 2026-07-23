@@ -1087,6 +1087,54 @@ mod tests {
     }
 
     #[test]
+    fn emit_column_length_mismatch_is_named_not_opaque() {
+        // G10: `emit` keys its columns to the *primary* projected input graph's
+        // vertex count. A column whose length differs (e.g. an arena-slot-keyed
+        // tensor, or here a tensor over a second, larger graph) used to slip past
+        // `emit` and detonate downstream as an opaque Arrow "all columns in a
+        // record batch must have the same length" during the loader's batch
+        // assembly. It is now named at the `emit` call itself (error 0x869).
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            4,
+            WorkBudget::from_graph_size(3, 3),
+            Arena::new(1 << 20, 4096),
+        );
+        // The FIRST bound graph is the primary input space: 2 vertices.
+        let _primary =
+            to_i64(session.bind_graph(StdArc::new(build_projection(&[0, 1], &[(0, 1)]))));
+        // A second, larger graph (3 vertices) stands in for a differently-sized
+        // emit space — the arena-slot space in the real MCTS trap.
+        let g2 = to_i64(
+            session.bind_graph(StdArc::new(build_projection(&[0, 1, 2], &[(0, 1), (1, 2)]))),
+        );
+        let sid = registry.open(session);
+
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        // A [V]-length tensor over g2 => length 3, but the primary space is 2.
+        let deg3 = match call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g2},"s":"out"}}"#
+        )) {
+            KernelResponse::Handle(h) => h,
+            other => panic!("degrees -> {other:?}"),
+        };
+        match call(format!(
+            r#"{{"session":{sid},"op":"emit","g":{deg3},"name":"score"}}"#
+        )) {
+            KernelResponse::Err { code, message } => {
+                assert_eq!(code, 0x869, "emit length mismatch is a schema mismatch");
+                assert!(
+                    message.contains("projected input node count"),
+                    "the error must name the mismatch, got: {message}"
+                );
+            }
+            other => panic!("expected a named emit mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_session_is_typed_error_not_panic() {
         let registry = GraphComputeRegistry::new();
         let resp = registry.call_json(r#"{"session": 999, "op": "vertex_count", "g": 0}"#);

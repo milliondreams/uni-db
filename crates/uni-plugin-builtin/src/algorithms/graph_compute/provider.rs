@@ -161,6 +161,9 @@ fn parse_config(config_json: &str) -> Result<(Vec<Vid>, f64, GraphProjectionSpec
         _ => GraphProjectionSpec::default(),
     };
     spec.include_reverse = false;
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in).
+    // A named nodeLabels/edgeTypes still scopes the projection.
+    spec.project_all = true;
     Ok((seeds, alpha, spec))
 }
 

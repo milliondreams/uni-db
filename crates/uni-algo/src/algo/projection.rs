@@ -301,12 +301,18 @@ impl ProjectionBuilder {
         }
         let vertex_count = id_map.len();
 
-        // 4. Collect edges (with weights + requested edge-property columns)
-        let (out_edges, in_edges, out_edge_props) =
-            self.collect_edges(&id_map, &edge_type_ids).await?;
+        // 4. Collect edges (with weights + requested edge-property columns).
+        //    The pinned L0 snapshot is threaded through so property/weight reads
+        //    overlay committed-but-unflushed L0 (G12) exactly as the structure
+        //    read above already does.
+        let (out_edges, in_edges, out_edge_props) = self
+            .collect_edges(&id_map, &edge_type_ids, l0_snapshot.as_ref())
+            .await?;
 
         // 5. Materialize requested per-vertex property columns in slot order.
-        let node_properties = self.collect_node_properties(&id_map).await?;
+        let node_properties = self
+            .collect_node_properties(&id_map, l0_snapshot.as_ref())
+            .await?;
 
         // Compact IdMap (drops hash map, enables binary search)
         id_map.compact();
@@ -448,6 +454,7 @@ impl ProjectionBuilder {
         &self,
         id_map: &IdMap,
         edge_type_ids: &[u32],
+        l0_snapshot: Option<&uni_store::runtime::l0_manager::SnapshotView>,
     ) -> Result<(WeightedEdgeList, WeightedEdgeList, Vec<(String, Vec<f64>)>)> {
         // Phase 1: Collect topology from AdjacencyManager
         let mut raw_out_edges = Vec::new(); // (src_slot, dst_vid, eid)
@@ -481,9 +488,12 @@ impl ProjectionBuilder {
 
         // Phase 2: fetch the weight property AND any requested edge properties
         // (issue #151) in a single batch, then map destination slots. Property
-        // *values* are read from committed storage (the projection is a
-        // storage-time analytics view), so unflushed L0 weights fall back to the
-        // 1.0 default — the same contract the native weighted algorithms share.
+        // *values* are read through the same pinned L0 snapshot the structure
+        // read uses (G12), so committed-but-unflushed L0 weights/props are
+        // visible instead of silently falling back to the 1.0 / NaN default.
+        // Semantic limit: the snapshot carries no `transaction_l0`, so an
+        // *uncommitted* transaction's own writes stay invisible — GraphCompute
+        // runs over committed state by contract.
         let edge_prop_names = &self.config.edge_properties;
         let weight_prop = self.config.weight_property.as_deref();
         let need_props = weight_prop.is_some() || !edge_prop_names.is_empty();
@@ -528,8 +538,17 @@ impl ProjectionBuilder {
             all_eids.sort_unstable();
             all_eids.dedup();
 
+            // Overlay the pinned L0 snapshot (committed-but-unflushed) so edge
+            // weights/properties are read consistently with the structure read.
+            let edge_ctx = l0_snapshot.map(|snap| {
+                uni_store::runtime::QueryContext::new_with_pending(
+                    snap.main.clone(),
+                    None,
+                    snap.extra.clone(),
+                )
+            });
             let batch_props = pm
-                .get_batch_edge_props(&all_eids, &fetch_names, None)
+                .get_batch_edge_props(&all_eids, &fetch_names, edge_ctx.as_ref())
                 .await?;
             for eid in all_eids {
                 let vid_key = Vid::from(eid.as_u64());
@@ -598,6 +617,7 @@ impl ProjectionBuilder {
     async fn collect_node_properties(
         &self,
         id_map: &IdMap,
+        l0_snapshot: Option<&uni_store::runtime::l0_manager::SnapshotView>,
     ) -> Result<std::collections::HashMap<String, Vec<f64>>> {
         let names = &self.config.node_properties;
         if names.is_empty() {
@@ -611,7 +631,19 @@ impl ProjectionBuilder {
             self.storage.schema_manager_arc(),
             1000,
         );
-        let batch = pm.get_batch_vertex_props(&vids, &name_refs, None).await?;
+        // Overlay the pinned L0 snapshot (committed-but-unflushed) so stored
+        // node-property values are read consistently with the structure read
+        // (G12) instead of returning NaN until flush.
+        let node_ctx = l0_snapshot.map(|snap| {
+            uni_store::runtime::QueryContext::new_with_pending(
+                snap.main.clone(),
+                None,
+                snap.extra.clone(),
+            )
+        });
+        let batch = pm
+            .get_batch_vertex_props(&vids, &name_refs, node_ctx.as_ref())
+            .await?;
         let mut cols: std::collections::HashMap<String, Vec<f64>> = names
             .iter()
             .map(|n| (n.clone(), Vec::with_capacity(vids.len())))

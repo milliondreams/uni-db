@@ -251,11 +251,32 @@ impl AlgorithmHostBridge {
         // prefix list actually gates which labels a guest may project.
         let scope_restricted =
             !scope_prefixes.is_empty() && !scope_prefixes.iter().any(|p| p == "**" || p == "*");
+
+        // Fail-loud (G9): projecting the whole graph must be a deliberate choice,
+        // not the silent default. Regardless of grant width, an unscoped
+        // projection (empty node_labels AND edge_types) requires either explicit
+        // nodeLabels/edgeTypes or an explicit `projectAll: true`. The #151 guard
+        // below only fired under a *restricted* scope, so under the default `**`
+        // grant an unscoped projection used to silently pull in every declared
+        // label — corrupting index-keyed kernels when unrelated data (e.g. a
+        // coexisting MCTS search tree) shares the store. First-party providers
+        // opt into the whole graph by setting `project_all`; guests must pass
+        // `projectAll: true` in their config on purpose.
+        if spec.node_labels.is_empty() && spec.edge_types.is_empty() && !spec.project_all {
+            return Box::pin(async {
+                Err(FnError::new(
+                    0x804,
+                    "GraphCompute: an unscoped projection is not allowed; name \
+                     nodeLabels/edgeTypes explicitly, or set projectAll:true to \
+                     deliberately project the whole graph",
+                ))
+            });
+        }
         if scope_restricted {
-            // Fail-closed (issue #151): an unscoped projection (empty node_labels
-            // AND edge_types = "all") under a restricted HostQuery grant would
-            // silently hand the guest the whole graph, defeating the scope. The
-            // guest must name the labels / edge types it wants.
+            // Fail-closed (issue #151): a whole-graph projection under a restricted
+            // HostQuery grant defeats the scope, so it is rejected even when the
+            // caller opted in via `projectAll` — the opt-in cannot override a
+            // restricting scope. The guest must name in-scope labels / edge types.
             if spec.node_labels.is_empty() && spec.edge_types.is_empty() {
                 let scopes = scope_prefixes.join(", ");
                 return Box::pin(async move {
@@ -263,7 +284,8 @@ impl AlgorithmHostBridge {
                         0x804,
                         format!(
                             "GraphCompute: an unscoped projection is not allowed under restricted \
-                             HostQuery scopes [{scopes}]; name nodeLabels/edgeTypes explicitly"
+                             HostQuery scopes [{scopes}]; name nodeLabels/edgeTypes explicitly \
+                             (projectAll does not override a restricting scope)"
                         ),
                     ))
                 });
@@ -282,6 +304,51 @@ impl AlgorithmHostBridge {
                         0x804,
                         format!(
                             "GraphCompute: `{name}` is outside the granted HostQuery scopes [{scopes}]"
+                        ),
+                    ))
+                });
+            }
+        }
+        // G11: a whole-graph projection (no nodeLabels/edgeTypes named) must not
+        // silently omit vertices whose label is present in storage/L0 but absent
+        // from the schema — uni-db permits schemaless labels via `CREATE (:X)`
+        // without a prior `schema().label("X")`, and the projection enumerates
+        // only *declared* labels. Detect the drift and fail loud so "the whole
+        // graph" cannot quietly drop them. A *scoped* projection is exempt: it
+        // names exactly what it wants, and a named-but-undeclared label already
+        // errors in ProjectionBuilder::resolve_ids.
+        if spec.node_labels.is_empty() && spec.edge_types.is_empty() {
+            let schema = self.algo_ctx.storage.schema_manager().schema();
+            let declared: std::collections::HashSet<String> =
+                schema.labels.keys().cloned().collect();
+            // Sorted, deduped union of physically-present vertex labels: flushed
+            // (storage index) + unflushed (every live L0 generation).
+            let mut present: std::collections::BTreeSet<String> = self
+                .algo_ctx
+                .storage
+                .physical_vertex_label_names()
+                .into_iter()
+                .collect();
+            if let Some(l0) = &self.algo_ctx.l0_manager {
+                let mut bufs = l0.get_pending_flush();
+                bufs.push(l0.get_current());
+                for buf in bufs {
+                    present.extend(buf.read().label_to_vids.keys().cloned());
+                }
+            }
+            let undeclared: Vec<String> = present
+                .into_iter()
+                .filter(|n| !declared.contains(n))
+                .collect();
+            if !undeclared.is_empty() {
+                let names = undeclared.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: a whole-graph projection would silently omit vertices \
+                             with undeclared (schemaless) label(s) [{names}]; declare them via \
+                             schema().label(...) or name nodeLabels explicitly"
                         ),
                     ))
                 });

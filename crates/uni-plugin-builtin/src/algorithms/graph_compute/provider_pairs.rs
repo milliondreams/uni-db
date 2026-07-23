@@ -159,7 +159,12 @@ fn parse_config(config_json: &str) -> Result<OverlapArgs, FnError> {
         PairSpec::AdjacentPairs
     };
 
-    let mut projection = GraphProjectionSpec::default();
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut projection = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     if let Some(serde_json::Value::Object(cfg)) = args.get(3) {
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             projection.node_labels = labels

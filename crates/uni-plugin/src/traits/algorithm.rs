@@ -315,14 +315,18 @@ pub trait AlgorithmHost: Send + Sync {
 
 /// Selects which subgraph an [`AlgorithmHost::project`] call materializes.
 ///
-/// Empty `node_labels` / `edge_types` mean "all". `weight_property`
+/// Naming `node_labels` / `edge_types` scopes the projection to exactly those.
+/// Leaving BOTH empty means "the whole graph", but that is only honored when
+/// [`Self::project_all`] is `true` — otherwise the projection fails loud (G9),
+/// so an unscoped projection can never *silently* pull in unrelated labels (e.g.
+/// a coexisting search tree) and corrupt an index-keyed kernel. `weight_property`
 /// names an edge property to expose through [`GraphView::out_weight`];
 /// `include_reverse` requests inbound adjacency ([`GraphView::in_neighbors`]).
 #[derive(Clone, Debug, Default)]
 pub struct GraphProjectionSpec {
-    /// Vertex labels to include; empty selects every label.
+    /// Vertex labels to include; empty (with [`Self::project_all`]) selects every label.
     pub node_labels: Vec<String>,
-    /// Edge types to include; empty selects every type.
+    /// Edge types to include; empty (with [`Self::project_all`]) selects every type.
     pub edge_types: Vec<String>,
     /// Edge property surfaced as the traversal weight, if any.
     pub weight_property: Option<String>,
@@ -334,6 +338,13 @@ pub struct GraphProjectionSpec {
     /// Edge properties to materialize into per-edge `[E]` tensors the guest
     /// reads by name via `gc.edge_property` (issue #151).
     pub edge_properties: Vec<String>,
+    /// Deliberate opt-in to projecting the *whole* graph when neither
+    /// `node_labels` nor `edge_types` is named (G9). With both empty and this
+    /// `false`, [`AlgorithmHost::project`] fails loud instead of silently
+    /// pulling in every schema label/edge-type. First-party providers set this
+    /// to preserve the ergonomic whole-graph default; guest loaders must pass
+    /// `projectAll: true` in their config to project everything on purpose.
+    pub project_all: bool,
 }
 
 impl GraphProjectionSpec {
@@ -384,6 +395,12 @@ impl GraphProjectionSpec {
             .get("edgeProperties")
             .map(string_array)
             .unwrap_or_default();
+        // G9: explicit opt-in to a whole-graph projection. Absent/false means an
+        // unscoped projection is rejected fail-loud by the bridge.
+        let project_all = cfg
+            .get("projectAll")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         Self {
             node_labels,
@@ -392,6 +409,7 @@ impl GraphProjectionSpec {
             include_reverse,
             node_properties,
             edge_properties,
+            project_all,
         }
     }
 
@@ -408,6 +426,7 @@ impl GraphProjectionSpec {
         "includeReverse",
         "nodeProperties",
         "edgeProperties",
+        "projectAll",
         "nodeQuery",
         "edgeQuery",
         "weightColumn",

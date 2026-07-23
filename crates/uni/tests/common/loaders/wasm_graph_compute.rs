@@ -87,8 +87,12 @@ async fn wasm_guest_ppr_via_call() -> anyhow::Result<()> {
     assert_eq!(outcome.plugin_id.as_str(), "ai.example.wasmgc");
 
     let session = db.session();
-    let query =
-        format!("CALL ai.example.wasmgc.ppr({vid_a}) YIELD nodeId, score RETURN nodeId, score");
+    // A guest projection must be scoped explicitly (G9): an unscoped guest CALL
+    // now fails loud instead of silently projecting the whole graph.
+    let query = format!(
+        "CALL ai.example.wasmgc.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+         YIELD nodeId, score RETURN nodeId, score"
+    );
     let res = session.query(&query).await?;
     let rows = res.rows();
     assert_eq!(rows.len(), 4, "one score row per vertex");

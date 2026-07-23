@@ -1515,6 +1515,22 @@ impl GraphCompute for AlgoSession {
             // Widen an i64 (path-count) column to the f64 result sink.
             captured.push((name.to_owned(), t.as_f64_vec()));
         }
+        // The generic loader batch keys `nodeId` to the projected *input* graph's
+        // vertex count (adapter_algorithm::build_batch), so an emit column whose
+        // length differs from that count fails downstream as an opaque Arrow "all
+        // columns in a record batch must have the same length". Name the mismatch
+        // here, at the guest's `emit` call, instead of letting it surface far away
+        // (G10). Arena/set-keyed columns that intentionally differ from the input
+        // node space are exactly the case this catches — the guest must size its
+        // input projection to the emitted space.
+        if let (Some(len), Some(graph)) = (expected_len, self.primary_graph.as_ref()) {
+            let n = graph.vertex_count();
+            if len != n {
+                return Err(error::emit_schema_mismatch(format!(
+                    "emit column length {len} != projected input node count {n}"
+                )));
+            }
+        }
         self.charge(expected_len.unwrap_or(0) as u64 * cols.len() as u64)?;
         self.emitted = captured;
         Ok(())

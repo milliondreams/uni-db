@@ -1220,6 +1220,20 @@ impl StorageManager {
         index.get_labels(vid).map(|labels| labels.to_vec())
     }
 
+    /// Distinct vertex label names physically present in flushed storage (the
+    /// VID→labels index, which resolves labels for vertices aged out of L0 into
+    /// Lance). The GraphCompute projection compares this against the declared
+    /// schema to detect present-but-undeclared (schemaless) labels a whole-graph
+    /// projection would otherwise silently omit (G11). Unflushed labels still in
+    /// L0 are enumerated separately by the caller.
+    pub fn physical_vertex_label_names(&self) -> Vec<String> {
+        self.vid_labels_index
+            .read()
+            .labels()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Update the VID-to-labels mapping in the index.
     pub fn update_vid_labels_index(&self, vid: Vid, labels: Vec<String>) {
         let mut index = self.vid_labels_index.write();

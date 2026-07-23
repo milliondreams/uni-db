@@ -206,7 +206,12 @@ fn parse_config(config_json: &str) -> Result<WalksArgs, FnError> {
         _ => 0,
     };
 
-    let mut spec = GraphProjectionSpec::default();
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut spec = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     if let Some(serde_json::Value::Object(cfg)) = args.get(6) {
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             spec.node_labels = labels

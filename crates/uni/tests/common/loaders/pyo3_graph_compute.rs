@@ -106,8 +106,12 @@ async fn python_guest_ppr_via_call() -> anyhow::Result<()> {
     assert_eq!(outcome.plugin_id.as_str(), "ai.example.pygc");
 
     let session = db.session();
-    let query =
-        format!("CALL ai.example.pygc.ppr({vid_a}) YIELD nodeId, score RETURN nodeId, score");
+    // A guest projection must be scoped explicitly (G9): an unscoped guest CALL
+    // now fails loud instead of silently projecting the whole graph.
+    let query = format!(
+        "CALL ai.example.pygc.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+         YIELD nodeId, score RETURN nodeId, score"
+    );
     let res = session.query(&query).await?;
     let rows = res.rows();
     assert_eq!(rows.len(), 4, "one score row per vertex");
@@ -197,7 +201,8 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let err = session
         .query(&format!(
-            "CALL ai.example.pyspin.spin({vid_a}) YIELD nodeId, score RETURN nodeId"
+            "CALL ai.example.pyspin.spin({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, score RETURN nodeId"
         ))
         .await
         .expect_err("a runaway spin guest must be interrupted, not hang");
@@ -221,7 +226,8 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
     // Worker survived: a normal CALL on the same plugin still works.
     let ok = session
         .query(&format!(
-            "CALL ai.example.pyspin.noop({vid_a}) YIELD nodeId, score RETURN nodeId, score"
+            "CALL ai.example.pyspin.noop({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, score RETURN nodeId, score"
         ))
         .await?;
     assert_eq!(ok.rows().len(), 4, "worker must survive the interrupt");

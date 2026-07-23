@@ -120,6 +120,9 @@ interface host-arena {
     /// Scatter `values` into `column` at `slots`.
     arena-scatter: func(session: u64, arena: u64, column: u32, slots: u64, values: u64)
         -> result<_, fn-error>;
+    /// Add `deltas[i]` to `value-col` along the root path of every `leaves[i]`.
+    arena-backup: func(session: u64, arena: u64, value-col: u32, leaves: u64, deltas: u64)
+        -> result<_, fn-error>;
     /// Allocate `fanout` children for every slot in `parents` and link them.
     arena-expand: func(session: u64, arena: u64, parents: u64, fanout: u32) -> result<u64, fn-error>;
     /// Compact the arena into an immutable graph handle.

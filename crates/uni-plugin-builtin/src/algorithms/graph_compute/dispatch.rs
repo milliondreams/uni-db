@@ -213,6 +213,8 @@ fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, FnError> {
         "recip" => Ok(MapOp::Recip),
         "scale" => Ok(MapOp::Scale(a)),
         "log" => Ok(MapOp::Log),
+        "sqrt" => Ok(MapOp::Sqrt),
+        "exp" => Ok(MapOp::Exp),
         "affine" => Ok(MapOp::AxPlusB(a, b)),
         "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
         "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
@@ -440,6 +442,7 @@ impl GraphComputeRegistry {
                     "min" => EwiseOp::Min,
                     "max" => EwiseOp::Max,
                     "axpy" => EwiseOp::Axpy(req.f),
+                    "div" => EwiseOp::Div,
                     other => return Err(FnError::new(0x861, format!("bad ewise op `{other}`"))),
                 };
                 session.ewise(from_i64(req.a), from_i64(req.b), op).map(h)
@@ -626,6 +629,9 @@ impl GraphComputeRegistry {
                 .map(h),
             KernelId::ArenaScatter => session
                 .arena_scatter(from_i64(req.g), req.col, from_i64(req.a), from_i64(req.b))
+                .map(|()| KernelResponse::Unit),
+            KernelId::ArenaBackup => session
+                .arena_backup(from_i64(req.g), req.col, from_i64(req.a), from_i64(req.b))
                 .map(|()| KernelResponse::Unit),
             KernelId::ArenaDescend => session
                 .arena_descend(
@@ -1084,6 +1090,68 @@ mod tests {
             10,
             "walk sequences egress through the JSON path"
         );
+    }
+
+    #[test]
+    fn map_and_ewise_sqrt_exp_div_over_json() {
+        // G2 — `sqrt`/`exp` (MapOp) and `div` (EwiseOp) are decoded and evaluated
+        // over the loader-agnostic JSON wire (which serves WASM + Extism), so a
+        // guest can compose the canonical UCT term `c·√(ln N / n)`. The op-string
+        // decoders are NOT covered by the KernelId reach tests, so this
+        // differential test guards against a variant added to the enum but
+        // forgotten on a wire decoder.
+        let nodes = vec![0u64, 1, 2, 3];
+        // out-degrees: 0 -> 3, 1 -> 1, 2 -> 0, 3 -> 0.
+        let edges = vec![(0, 1), (0, 2), (0, 3), (1, 2)];
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            3,
+            WorkBudget::from_graph_size(4, 4),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let top1 = |h: i64| -> (i64, f64) {
+            match call(format!(r#"{{"session":{sid},"op":"topk","g":{h},"k":1}}"#)) {
+                KernelResponse::Pairs(p) => p[0],
+                other => panic!("topk -> {other:?}"),
+            }
+        };
+
+        let deg = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+        )));
+        // sqrt(deg): the top value is sqrt(3).
+        let sq = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{deg},"s":"sqrt"}}"#
+        )));
+        let (v, f) = top1(sq);
+        assert_eq!(v, 0, "node 0 has the largest degree");
+        assert!((f - 3.0_f64.sqrt()).abs() < 1e-12, "sqrt(3), got {f}");
+        // exp(deg): the top value is e^3.
+        let ex = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{deg},"s":"exp"}}"#
+        )));
+        let (_, f) = top1(ex);
+        assert!((f - 3.0_f64.exp()).abs() < 1e-9, "exp(3), got {f}");
+        // div: scale(deg,2) / deg = [6/3, 2/1, 0/0, 0/0] = [2, 2, 0, 0]; the
+        // zero-denominator rows follow the `x/0 = 0` convention (no NaN).
+        let dbl = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{deg},"s":"scale","f":2.0}}"#
+        )));
+        let q = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"ewise","a":{dbl},"b":{deg},"s":"div"}}"#
+        )));
+        let (_, f) = top1(q);
+        assert!((f - 2.0).abs() < 1e-12, "6/3 = 2, got {f}");
     }
 
     #[test]

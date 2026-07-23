@@ -77,6 +77,11 @@ pub enum MapOp {
     Recip,
     /// Natural logarithm.
     Log,
+    /// Square root (`sqrt(x)`; `NaN` for `x < 0`, per f64 semantics). With `Log`
+    /// and `Exp` this makes the canonical UCT term `c·√(ln N / n)` composable.
+    Sqrt,
+    /// Natural exponential (`e^x`), the inverse of [`MapOp::Log`].
+    Exp,
 }
 
 /// A vector norm used by [`MapOp::Normalize`] and [`ReduceOp`].
@@ -101,6 +106,9 @@ pub enum EwiseOp {
     Max,
     /// `a + coef * b` (the PageRank teleport blend).
     Axpy(f64),
+    /// Element-wise quotient with the convention `x / 0 = 0`, mirroring
+    /// [`MapOp::Recip`] so dangling (zero-denominator) rows drop out.
+    Div,
 }
 
 /// A closed reduction over a map, optionally masked (proposal §4.3).
@@ -922,6 +930,14 @@ impl GraphCompute for AlgoSession {
                     EwiseOp::Min => x.min(y),
                     EwiseOp::Max => x.max(y),
                     EwiseOp::Axpy(coef) => x + coef * y,
+                    // x / 0 = 0, mirroring MapOp::Recip's dangling-row convention.
+                    EwiseOp::Div => {
+                        if y == 0.0 {
+                            0.0
+                        } else {
+                            x / y
+                        }
+                    }
                 }
             })
             .collect();
@@ -1257,6 +1273,8 @@ impl GraphCompute for AlgoSession {
                 .map(|&v| if v == 0.0 { 0.0 } else { 1.0 / v })
                 .collect(),
             MapOp::Log => x.iter().map(|v| v.ln()).collect(),
+            MapOp::Sqrt => x.iter().map(|v| v.sqrt()).collect(),
+            MapOp::Exp => x.iter().map(|v| v.exp()).collect(),
             MapOp::Normalize(norm) => {
                 let denom = match norm {
                     Norm::L1 => x.iter().map(|v| v.abs()).sum::<f64>(),
@@ -2255,6 +2273,26 @@ pub trait GraphArenaCompute {
         values: Handle,
     ) -> Result<(), FnError>;
 
+    /// Adds `deltas[i]` to `value_col` along the full root path of every
+    /// `leaves[i]` — the MCTS value-backup primitive.
+    ///
+    /// Where [`arena_scatter`](Self::arena_scatter) writes only the leaf,
+    /// `arena_backup` propagates each leaf's delta to all its ancestors up to the
+    /// root, so a guest can run a general-depth UCT/PUCT value backup natively
+    /// (not just a depth-1 bandit). Pair it with the leaves
+    /// [`arena_descend`](Self::arena_descend) returns.
+    ///
+    /// # Errors
+    /// `0x862` if `leaves` and `deltas` differ in length; `0x86E` for an unknown
+    /// column or an out-of-range leaf.
+    fn arena_backup(
+        &mut self,
+        arena: Handle,
+        value_col: u32,
+        leaves: Handle,
+        deltas: Handle,
+    ) -> Result<(), FnError>;
+
     /// Descends from each root to a leaf, choosing the best-scoring child.
     ///
     /// Applies one visit and the virtual loss `vloss` at every step, in the
@@ -2442,6 +2480,27 @@ impl GraphArenaCompute for AlgoSession {
         for (&s, &v) in ss.iter().zip(vs.iter()) {
             col[s as usize] = v;
         }
+        Ok(())
+    }
+
+    fn arena_backup(
+        &mut self,
+        arena: Handle,
+        value_col: u32,
+        leaves: Handle,
+        deltas: Handle,
+    ) -> Result<(), FnError> {
+        let ls = slot_ids(self.table.get_tensor(leaves)?);
+        let ds = self.table.get_tensor(deltas)?.as_f64_vec();
+        // Charge one slot per leaf up front (fail fast if the budget is already
+        // drained), then the ancestor walk after — mirroring arena_descend's
+        // split of the root charge from the inspected-children charge.
+        self.charge(ls.len() as u64)?;
+        let visited = self
+            .table
+            .get_arena_mut(arena)?
+            .backup(value_col, &ls, &ds)?;
+        self.charge(visited.saturating_sub(ls.len() as u64))?;
         Ok(())
     }
 

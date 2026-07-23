@@ -135,6 +135,8 @@ fn map_op(s: &str, a: f64, b: f64) -> PyResult<MapOp> {
         "recip" => Ok(MapOp::Recip),
         "scale" => Ok(MapOp::Scale(a)),
         "log" => Ok(MapOp::Log),
+        "sqrt" => Ok(MapOp::Sqrt),
+        "exp" => Ok(MapOp::Exp),
         "affine" => Ok(MapOp::AxPlusB(a, b)),
         "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
         "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
@@ -275,6 +277,7 @@ impl GcSession {
             "min" => EwiseOp::Min,
             "max" => EwiseOp::Max,
             "axpy" => EwiseOp::Axpy(coef),
+            "div" => EwiseOp::Div,
             other => return Err(PyRuntimeError::new_err(format!("bad ewise op `{other}`"))),
         };
         self.session
@@ -791,6 +794,16 @@ impl GcSession {
         self.session
             .lock()
             .arena_scatter(from_i64(arena), c, from_i64(slots), from_i64(values))
+            .map_err(py_err)
+    }
+
+    /// Adds `deltas[i]` to `value_col` along the root path of every `leaves[i]`.
+    fn arena_backup(&self, arena: i64, value_col: i64, leaves: i64, deltas: i64) -> PyResult<()> {
+        self.check_deadline()?;
+        let c = u32_arg(value_col, "value_col")?;
+        self.session
+            .lock()
+            .arena_backup(from_i64(arena), c, from_i64(leaves), from_i64(deltas))
             .map_err(py_err)
     }
 

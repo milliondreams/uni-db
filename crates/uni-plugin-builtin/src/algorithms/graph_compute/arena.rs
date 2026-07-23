@@ -222,6 +222,51 @@ impl GraphArena {
         (p != NO_PARENT).then_some(p)
     }
 
+    /// Adds `deltas[i]` to `value_col` along the full root path of every
+    /// `leaves[i]` — the MCTS value-backup primitive.
+    ///
+    /// Each leaf is walked up its [`parent_of`](Self::parent_of) chain to the
+    /// root (inclusive), so a guest can propagate an evaluated leaf value to all
+    /// its ancestors, not only the leaf — lifting the depth-1 limit of
+    /// scatter-onto-leaf. Returns the total number of slots visited, for work
+    /// charging.
+    ///
+    /// # Errors
+    /// `0x862` if `leaves` and `deltas` differ in length; `0x86E` for an unknown
+    /// column or an out-of-range leaf.
+    pub fn backup(
+        &mut self,
+        value_col: u32,
+        leaves: &[u32],
+        deltas: &[f64],
+    ) -> Result<u64, FnError> {
+        if leaves.len() != deltas.len() {
+            return Err(error::shape_mismatch(
+                "arena_backup requires leaf and delta lists of equal length",
+            ));
+        }
+        for &leaf in leaves {
+            self.check_slot(leaf)?;
+        }
+        let mut visited = 0u64;
+        for (&leaf, &delta) in leaves.iter().zip(deltas.iter()) {
+            // Walk the root path first (immutable `parent_of`), then apply the
+            // delta — avoids overlapping a mutable column borrow with the walk.
+            let mut path = Vec::new();
+            let mut cur = Some(leaf);
+            while let Some(s) = cur {
+                path.push(s);
+                cur = self.parent_of(s);
+            }
+            let col = self.column_mut(value_col)?;
+            for &s in &path {
+                col[s as usize] += delta;
+            }
+            visited += path.len() as u64;
+        }
+        Ok(visited)
+    }
+
     /// Number of live slots.
     #[must_use]
     pub fn len(&self) -> u32 {
@@ -288,6 +333,16 @@ impl GraphArena {
     ///
     /// Ties break by lower slot, so a given (arena, scores) always yields the
     /// same result — kernel determinism is preserved under batching (§5.6).
+    ///
+    /// **Virtual-loss contract (G3).** The `vloss` adjustment is a *flat linear
+    /// offset* added to the precomputed `score` column in place — it is **not**
+    /// recomputed from `visits + vloss` the way a canonical MCTS re-derives each
+    /// child's UCB per selection. The guest owns the score formula (it composes
+    /// UCB/PUCT and scatters it into the score column); `descend` only perturbs
+    /// that column by `±vloss` per visited slot to diversify a batch. A guest
+    /// that assumes exact per-visit UCB virtual loss will see results diverge
+    /// from a Python engine once `vloss > 0` — run at `vloss = 0` (one root per
+    /// rollout) if bit-exact parity with such an engine is required.
     ///
     /// Returns the leaf reached per root, and the number of children inspected
     /// so the caller can charge the real work done.
@@ -431,6 +486,37 @@ mod tests {
         assert_eq!(a.parent_of(0), None, "slot 0 is the root");
         assert_eq!(a.parent_of(1), Some(0));
         assert_eq!(a.parent_of(2), Some(1));
+    }
+
+    #[test]
+    fn backup_propagates_delta_up_the_root_path() {
+        // A chain 0 -> 1 -> 2 -> 3 (root..leaf). Backing up a delta at the leaf
+        // adds it to every ancestor up to the root -- the value-backprop above
+        // depth-1 that scatter-onto-leaf cannot express (G1).
+        let mut a = GraphArena::new(8, 2).expect("arena builds");
+        a.alloc(5).expect("slots"); // slots 0..5
+        a.link(0, 1).expect("link");
+        a.link(1, 2).expect("link");
+        a.link(2, 3).expect("link");
+        let value = a.column_new();
+
+        let visited = a.backup(value, &[3], &[5.0]).expect("backup");
+        assert_eq!(visited, 4, "leaf 3's root path is [3, 2, 1, 0]");
+        assert_eq!(&a.column(value).unwrap()[0..5], &[5.0, 5.0, 5.0, 5.0, 0.0]);
+
+        // A second leaf sharing part of the path accumulates additively.
+        a.link(1, 4).expect("link"); // leaf 4 under 1; path [4, 1, 0]
+        let visited2 = a.backup(value, &[4], &[2.0]).expect("backup");
+        assert_eq!(visited2, 3, "leaf 4's root path is [4, 1, 0]");
+        let col = a.column(value).unwrap();
+        assert_eq!(col[0], 7.0, "root is on both paths (+5, +2)");
+        assert_eq!(col[1], 7.0, "slot 1 is on both paths");
+        assert_eq!(col[2], 5.0, "slot 2 only on the first path");
+        assert_eq!(col[4], 2.0, "slot 4 only on the second path");
+
+        // Length mismatch and out-of-range leaves are rejected.
+        assert!(a.backup(value, &[3], &[1.0, 2.0]).is_err(), "len mismatch");
+        assert!(a.backup(value, &[99], &[1.0]).is_err(), "out-of-range leaf");
     }
 
     /// Freezing must drop the slack: this is the property the `DenseEdgeIds`

@@ -108,6 +108,8 @@ fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, Box<EvalAltResult>> {
         "recip" => Ok(MapOp::Recip),
         "scale" => Ok(MapOp::Scale(a)),
         "log" => Ok(MapOp::Log),
+        "sqrt" => Ok(MapOp::Sqrt),
+        "exp" => Ok(MapOp::Exp),
         "affine" => Ok(MapOp::AxPlusB(a, b)),
         "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
         "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
@@ -249,6 +251,7 @@ impl GcSession {
             "min" => EwiseOp::Min,
             "max" => EwiseOp::Max,
             "axpy" => EwiseOp::Axpy(coef),
+            "div" => EwiseOp::Div,
             other => return Err(rt(FnError::new(0x861, format!("bad ewise op `{other}`")))),
         };
         let mut s = self.session.lock();
@@ -757,6 +760,20 @@ impl GcSession {
             .map_err(rt)
     }
 
+    /// Adds `deltas[i]` to `value_col` along the root path of every `leaves[i]`.
+    fn arena_backup(
+        &mut self,
+        arena: i64,
+        value_col: i64,
+        leaves: i64,
+        deltas: i64,
+    ) -> Result<(), Box<EvalAltResult>> {
+        let c = u32_arg(value_col, "value_col")?;
+        let mut s = self.session.lock();
+        s.arena_backup(from_i64(arena), c, from_i64(leaves), from_i64(deltas))
+            .map_err(rt)
+    }
+
     /// Descends from each root to a leaf by the guest's `score` column.
     fn arena_descend(
         &mut self,
@@ -905,6 +922,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         ArenaCandidates => GcSession::arena_candidates,
         ArenaGather => GcSession::arena_gather,
         ArenaScatter => GcSession::arena_scatter,
+        ArenaBackup => GcSession::arena_backup,
         ArenaDescend => GcSession::arena_descend,
         ArenaExpand => GcSession::arena_expand,
         ArenaFreeze => GcSession::arena_freeze,

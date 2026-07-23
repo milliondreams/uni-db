@@ -356,6 +356,9 @@ fn add_host_arena(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
     arena_fn!("arena-scatter", (arena: u64, column: u32, slots: u64, values: u64), (), |s: &mut AlgoSession, a, c, sl, v| {
         s.arena_scatter(Handle::from_u64(a), c, Handle::from_u64(sl), Handle::from_u64(v))
     });
+    arena_fn!("arena-backup", (arena: u64, value_col: u32, leaves: u64, deltas: u64), (), |s: &mut AlgoSession, a, vc, l, d| {
+        s.arena_backup(Handle::from_u64(a), vc, Handle::from_u64(l), Handle::from_u64(d))
+    });
     arena_fn!("arena-descend",
     (arena: u64, roots: u64, score: u32, visit: u32, maximize: bool, vloss: f64), u64,
     |s: &mut AlgoSession, a, r, sc, vi, mx, vl| {

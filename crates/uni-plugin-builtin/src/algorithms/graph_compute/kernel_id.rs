@@ -162,6 +162,7 @@ kernels! {
     ArenaCandidates => "arena_candidates", AllLoaders;
     ArenaGather => "arena_gather", AllLoaders;
     ArenaScatter => "arena_scatter", AllLoaders;
+    ArenaBackup => "arena_backup", AllLoaders;
     ArenaDescend => "arena_descend", AllLoaders;
     ArenaExpand => "arena_expand", AllLoaders;
     ArenaFreeze => "arena_freeze", AllLoaders;

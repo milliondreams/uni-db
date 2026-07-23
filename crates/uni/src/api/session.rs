@@ -976,6 +976,17 @@ impl Session {
     /// Pin this session to a specific snapshot version.
     ///
     /// All subsequent reads see data as of that version. Writes are rejected.
+    ///
+    /// **This is the fork-free read snapshot for read-only rollouts (G8).** A
+    /// repeated read-only workload — e.g. an MCTS `graph_readonly` rollout that
+    /// only *reads* the graph thousands of times — should pin a version here
+    /// rather than create-and-drop a Lance-branch fork per iteration. Pinning is
+    /// an in-memory `StorageManager` clone (`StorageManager::pinned`) — no
+    /// branch, no registry 2PC, no per-fork WAL — so it costs ~1ms against a
+    /// fork's ~10ms. A plain read session already gets MVCC snapshot isolation
+    /// without any fork; use this when you additionally need a *stable, durable*
+    /// version across many queries. Write-isolated speculative rollouts (mutate
+    /// then discard) still need a fork.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn pin_to_version(&mut self, snapshot_id: &str) -> Result<()> {
         let pinned = self.live_db().at_snapshot(snapshot_id).await?;

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uni_common::core::id::Vid;
@@ -103,6 +103,41 @@ fn vid_to_i64(vid: Vid) -> i64 {
 
 #[pymethods]
 impl GcSession {
+    /// Explains an attribute that does not exist, when we can say something useful.
+    ///
+    /// Python's default `AttributeError` says the name is unknown; it cannot say
+    /// the operation is *expressible by another spelling*. Three consecutive
+    /// field reports asked for kernels that were already composable, so this
+    /// attaches the published recipe — and, for `graph-arena@1` names, the typed
+    /// slice error the Rhai loader has raised since issue #152. PyO3 had no
+    /// equivalent of Rhai's arena stubs at all, so this closes that asymmetry too.
+    ///
+    /// Deliberately an `AttributeError`, not the `PyRuntimeError` the kernels
+    /// use: `hasattr()` only swallows `AttributeError`, so anything else would
+    /// make a routine feature probe explode. Names starting with `_` get the
+    /// plain message untouched — CPython and IPython probe `__iter__`,
+    /// `__deepcopy__`, `_ipython_canary_method_*` and friends constantly, and
+    /// answering those with kernel advice would be noise at best.
+    fn __getattr__(&self, name: &str) -> PyResult<()> {
+        let base = format!("'GcSession' object has no attribute '{name}'");
+        if name.starts_with('_') {
+            return Err(PyAttributeError::new_err(base));
+        }
+        let hint = uni_plugin_builtin::algorithms::graph_compute::unknown_method_message(name)
+            .or_else(|| {
+                uni_plugin_builtin::algorithms::graph_compute::GRAPH_ARENA_OPS
+                    .contains(&name)
+                    .then(|| {
+                        uni_plugin_builtin::algorithms::graph_compute::unresolved_op_error(name)
+                            .message
+                    })
+            });
+        Err(PyAttributeError::new_err(match hint {
+            Some(msg) => format!("{base}. {msg}"),
+            None => base,
+        }))
+    }
+
     /// The bound graph handle.
     fn graph(&self) -> PyResult<i64> {
         self.check_deadline()?;
@@ -965,6 +1000,7 @@ impl GcSession {
 mod tests {
     use super::*;
     use uni_plugin_builtin::algorithms::graph_compute::kernel_id::{KernelId, KernelReach};
+    use uni_plugin_builtin::algorithms::graph_compute::{Arena, WorkBudget};
 
     /// The reachability contract for the PyO3 surface (proposal §5.4 / §13.2).
     ///
@@ -975,6 +1011,71 @@ mod tests {
     ///
     /// This is the assertion that was missing when `edge_count` shipped
     /// dispatchable over JSON but invisible to Rhai and Python guests.
+    /// An absent method earns its recipe, without breaking `hasattr` probing.
+    #[test]
+    fn an_unknown_attribute_earns_its_composition_recipe() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sess = Py::new(
+                py,
+                new_session(
+                    Arc::new(Mutex::new(AlgoSession::new(
+                        5,
+                        WorkBudget::from_edge_count(1000),
+                        Arena::new(1 << 20, 64),
+                    ))),
+                    from_i64(0),
+                    None,
+                    Vec::new(),
+                ),
+            )
+            .expect("GcSession");
+            let obj = sess.bind(py);
+
+            for (name, needle) in [
+                ("select", "ewise"),
+                ("arena_spmv", "arena_freeze"),
+                ("sub", "axpy"),
+            ] {
+                let err = obj.getattr(name).expect_err("absent attribute must raise");
+                assert!(
+                    err.is_instance_of::<PyAttributeError>(py),
+                    "`{name}` must raise AttributeError so hasattr() still works"
+                );
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(needle),
+                    "`{name}` must carry the recipe (expected `{needle}`), got: {msg}"
+                );
+            }
+
+            // A `graph-arena@1` name earns the typed slice message, matching the
+            // Rhai loader's stubs — PyO3 previously had no equivalent at all.
+            let err = obj
+                .getattr("add_node")
+                .expect_err("arena op is unavailable");
+            assert!(
+                err.to_string().contains("graph-arena"),
+                "an arena op must name the slice it needs: {err}"
+            );
+
+            // Dunder and private probes must stay plain, or every `hasattr`
+            // sweep by CPython/IPython would collect kernel advice.
+            let err = obj.getattr("__deepcopy__").expect_err("dunder is absent");
+            assert!(
+                !err.to_string().contains("compose"),
+                "a dunder probe must not be answered with kernel advice: {err}"
+            );
+
+            // And an ordinary typo earns no invented advice.
+            let err = obj.getattr("wibble").expect_err("typo is absent");
+            assert!(
+                !err.to_string().contains("compose"),
+                "an unkeyed name must not be given a made-up recipe: {err}"
+            );
+        });
+    }
+
     #[test]
     fn every_in_process_kernel_is_reachable_from_python() {
         Python::initialize();

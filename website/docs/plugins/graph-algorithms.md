@@ -168,6 +168,22 @@ It accepts `[V]` tensors and vertex sets. `[E]` values are refused: CSR edge ord
 
 ---
 
+## When a kernel you reached for isn't there
+
+The catalogue is closed on purpose — every kernel is native `O(V+E)` work, so the set is small and each addition is deliberate. That means you will sometimes reach for a name that does not exist. When the operation is nonetheless *expressible*, the error tells you how:
+
+```
+gc.select(m, a, b)
+→ `select` is not a kernel. For a conditional blend, compose it:
+  ewise(b, ewise(m, ewise(a, b, "sub"), "mul"), "add")
+
+gc.arena_spmv(a, col)
+→ `arena_spmv` is not a kernel. For aggregation over links you grew, compose it:
+  spmv(arena_freeze(a), col, "linear_algebra", "out")
+```
+
+This fires on both the op-string form (`ewise(a, b, "gt")`) and the method form (`gc.gt(a, b)`), in every loader. A name with no published composition gets the ordinary "not found" message rather than invented advice — the hint exists to point at real compositions, not to guess.
+
 ## Kernel catalogue
 
 69 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.

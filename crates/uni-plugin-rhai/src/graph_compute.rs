@@ -951,10 +951,50 @@ fn u32_arg(v: i64, what: &str) -> Result<u32, Box<EvalAltResult>> {
 /// Always registered when the GraphCompute surface is available; the capability
 /// gate is enforced at projection time on the host side (proposal §4.6), and a
 /// guest that never receives a [`GcSession`] cannot call any method.
+/// Turns "function not found" into a composition hint where one is published.
+///
+/// A guest reaching for `gc.select(..)` or `gc.arena_spmv(..)` previously got
+/// Rhai's generic `Function not found: select (GcSession, i64, i64)`, which says
+/// the name is unknown but not that the operation is *expressible*. Three
+/// consecutive field reports asked for capabilities that were already
+/// composable, so the gap this closes is discoverability, not surface.
+///
+/// Arity-independent, unlike the [`register_arena_stubs`] approach: the hook
+/// fires for any signature, so a guest that also gets the argument count wrong
+/// still gets the recipe.
+///
+/// The hook fires on *any* native call failure, not only an unknown name, and it
+/// is not handed the error. Two things keep that safe: it only speaks when the
+/// receiver is a [`GcSession`], and `no_method_recipe_shadows_a_real_kernel`
+/// guarantees no hint key names a registered kernel — so a genuine error raised
+/// from inside a working kernel can never be answered by a hint.
+fn register_missing_kernel_hints(engine: &mut Engine) {
+    #[expect(
+        deprecated,
+        reason = "on_missing_function is marked volatile, not deprecated; it is the                   only arity-independent hook for this"
+    )]
+    engine.on_missing_function(|name, args, _is_method, _ctx| {
+        let on_session = args.first().is_some_and(|a| a.is::<GcSession>());
+        if !on_session {
+            return Ok(None);
+        }
+        match uni_plugin_builtin::algorithms::graph_compute::unknown_method_message(name) {
+            Some(msg) => Err(rt(FnError::new(0x86E, msg))),
+            None => Ok(None),
+        }
+    });
+}
+
+/// Registers the [`GcSession`] type and its kernel methods on `engine`.
+///
+/// Always registered when the GraphCompute surface is available; the capability
+/// gate is enforced at projection time on the host side (proposal §4.6), and a
+/// guest that never receives a [`GcSession`] cannot call any method.
 pub fn register_graph_compute(engine: &mut Engine) {
     engine.register_type_with_name::<GcSession>("GcSession");
     let _ = register_kernels(engine);
     register_arena_stubs(engine);
+    register_missing_kernel_hints(engine);
 }
 
 /// Registers every catalog kernel on `engine` and returns the set registered.
@@ -1123,6 +1163,50 @@ mod tests {
     ///
     /// It is meaningful because `register_kernels` registers and reports from
     /// one declaration: it cannot claim a kernel it did not register.
+    /// A guest reaching for a composable-but-absent kernel gets the recipe.
+    ///
+    /// This is the discoverability gap three consecutive field reports fell into:
+    /// asking for an operation that was already expressible. Rhai's own message
+    /// says the name is unknown; it cannot say the operation is available by
+    /// another spelling.
+    #[test]
+    fn an_unknown_kernel_name_earns_its_composition_recipe() {
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            5,
+            WorkBudget::from_edge_count(1000),
+            Arena::new(1 << 20, 64),
+        )));
+        let mut scope = rhai::Scope::new();
+        scope.push("gc", new_session(session, from_i64(0), Arc::default()));
+
+        for (call, needle) in [
+            ("gc.select(1, 2, 3)", "ewise"),
+            ("gc.arena_spmv(1, 2)", "arena_freeze"),
+            ("gc.sub(1, 2)", "axpy"),
+        ] {
+            let err = engine
+                .eval_with_scope::<rhai::Dynamic>(&mut scope, call)
+                .expect_err("an absent kernel must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(needle),
+                "`{call}` must carry the composition recipe (expected `{needle}`), got: {msg}"
+            );
+        }
+
+        // A name with no published composition keeps Rhai's own wording rather
+        // than earning invented advice.
+        let err = engine
+            .eval_with_scope::<rhai::Dynamic>(&mut scope, "gc.wibble(1)")
+            .expect_err("an unknown name still fails");
+        assert!(
+            err.to_string().contains("Function not found"),
+            "an unkeyed name must not be given a made-up recipe: {err}"
+        );
+    }
+
     #[test]
     fn every_in_process_kernel_is_reachable_from_rhai() {
         let mut engine = Engine::new();

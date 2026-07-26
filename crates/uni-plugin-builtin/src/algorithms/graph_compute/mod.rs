@@ -55,7 +55,10 @@ pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
 pub use kernel_id::{KernelId, KernelReach};
-pub use op_parse::{OpFamily, RECIPES, recipe_for, rejection};
+pub use op_parse::{
+    METHOD_RECIPES, OpFamily, RECIPES, method_recipe_for, recipe_for, rejection,
+    unknown_method_message,
+};
 // Re-exported for one more minor release so downstream code gets a deprecation
 // warning rather than a hard break; removed at the next major (§13.4).
 #[allow(deprecated)]

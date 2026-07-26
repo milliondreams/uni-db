@@ -264,6 +264,81 @@ recipes! {
         "edge_mask_window(edge_property(g, prop), 0.5, 1.5)";
 }
 
+/// Compositions published against a *method* name a guest reached for.
+///
+/// [`RECIPES`] fires when an op **string** is rejected (`ewise(a, b, "gt")`).
+/// This fires one layer out, when a guest calls a **method** that does not exist
+/// at all (`gc.select(..)`, `gc.arena_spmv(..)`) — a failure the loader's own
+/// function resolution produces, which the op parser never sees.
+///
+/// It is a separate table rather than a reindexing of [`RECIPES`] for three
+/// reasons. A method call carries no [`OpFamily`], and `"sub"` composes
+/// differently as an `ewise` op than as a `map_apply` op, so a single answer has
+/// to be chosen. Some [`RECIPES`] keys are *also* real kernel names now
+/// (`compare`, `normalize`), which is fine for op strings but would be a lie
+/// here. And the most useful entry — `arena_spmv` — has no op-string form at all.
+///
+/// Every key must be a name that is **not** a kernel, or the hint would shadow a
+/// working method; `no_method_recipe_shadows_a_real_kernel` enforces that.
+pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
+    (
+        &["select", "where", "blend", "ifelse"],
+        "a conditional blend",
+        "ewise(b, ewise(m, ewise(a, b, \"sub\"), \"mul\"), \"add\")",
+    ),
+    (
+        &["sub", "subtract", "minus"],
+        "subtraction",
+        "ewise(a, b, \"axpy\", -1.0)",
+    ),
+    (
+        &["abs", "fabs"],
+        "absolute value",
+        "ewise(a, map_apply(a, \"scale\", -1.0), \"max\")",
+    ),
+    (&["relu"], "rectification", "ewise(a, zero_map(g), \"max\")"),
+    (
+        &["clip", "clamp"],
+        "clamping to a range",
+        "ewise(map_apply(a, \"min_const\", hi), map_apply(a, \"max_const\", lo), \"max\")",
+    ),
+    (
+        &["step", "heaviside", "threshold", "indicator"],
+        "thresholding against a constant",
+        "set_to_map(map_to_set(a, \"gt\", theta), 1.0)",
+    ),
+    (
+        &["edge_mask", "nonzero"],
+        "an exact edge mask from a stored selector column",
+        "edge_mask_window(edge_property(g, prop), 0.5, 1.5)",
+    ),
+    (
+        &["arena_spmv", "arena_neighbour_sum", "arena_aggregate"],
+        "aggregation over links you grew",
+        "spmv(arena_freeze(a), col, \"linear_algebra\", \"out\")",
+    ),
+];
+
+/// Returns the published composition for a method name a guest reached for.
+#[must_use]
+pub fn method_recipe_for(requested: &str) -> Option<(&'static str, &'static str)> {
+    METHOD_RECIPES
+        .iter()
+        .find(|(keys, _, _)| keys.contains(&requested))
+        .map(|(_, label, recipe)| (*label, *recipe))
+}
+
+/// Builds the message for a method a guest called that does not exist.
+///
+/// Returns `None` when the name has no published composition, so the caller
+/// keeps its own (loader-specific) wording rather than inventing advice.
+#[must_use]
+pub fn unknown_method_message(requested: &str) -> Option<String> {
+    method_recipe_for(requested).map(|(label, recipe)| {
+        format!("`{requested}` is not a kernel. For {label}, compose it: {recipe}")
+    })
+}
+
 /// The published composition for `requested` in `family`, if there is one.
 #[must_use]
 pub fn recipe_for(family: OpFamily, requested: &str) -> Option<(&'static str, &'static str)> {
@@ -341,6 +416,72 @@ mod tests {
         for &n in OverlapMetric::ALL_NAMES {
             assert_eq!(OverlapMetric::parse(n).expect(n).op_name(), n);
         }
+    }
+
+    /// A method hint must never shadow a kernel that actually exists.
+    ///
+    /// This is the safety precondition for wiring the table into a loader's
+    /// unknown-function hook: those hooks fire on resolution failure generally,
+    /// so a hint keyed to a *registered* name could start answering for real
+    /// errors raised from inside that kernel. `compare` and `normalize` are the
+    /// live examples — both are `RECIPES` keys (legal, they are op strings) and
+    /// both are now real kernels, so neither may appear here.
+    #[test]
+    fn no_method_recipe_shadows_a_real_kernel() {
+        let kernels: HashSet<&str> = super::super::KernelId::ALL
+            .iter()
+            .map(|k| k.op_name())
+            .collect();
+        for (keys, _, _) in METHOD_RECIPES {
+            for k in *keys {
+                assert!(
+                    !kernels.contains(k),
+                    "`{k}` is a real kernel; a method hint for it would shadow the \
+                     working method and could answer for errors raised inside it"
+                );
+            }
+        }
+    }
+
+    /// Every method hint composes from kernels that exist.
+    #[test]
+    fn method_recipes_only_name_real_kernels() {
+        let kernels: HashSet<&str> = super::super::KernelId::ALL
+            .iter()
+            .map(|k| k.op_name())
+            .collect();
+        for (keys, _, recipe) in METHOD_RECIPES {
+            for call in called_identifiers(recipe) {
+                assert!(
+                    kernels.contains(call.as_str()),
+                    "method recipe for {keys:?} calls `{call}`, which is not a kernel"
+                );
+            }
+        }
+    }
+
+    /// A method hint must not be offered for a name with no composition, and
+    /// must be offered for every name that has one.
+    #[test]
+    fn method_recipe_lookup_round_trips() {
+        for (keys, label, recipe) in METHOD_RECIPES {
+            for k in *keys {
+                assert_eq!(
+                    method_recipe_for(k),
+                    Some((*label, *recipe)),
+                    "`{k}` must resolve to its own entry"
+                );
+                let msg = unknown_method_message(k).expect("a keyed name has a message");
+                assert!(
+                    msg.contains(recipe),
+                    "the message must carry the recipe: {msg}"
+                );
+            }
+        }
+        assert!(
+            method_recipe_for("definitely_not_a_thing").is_none(),
+            "an unknown name earns no invented advice"
+        );
     }
 
     /// T2a — every kernel a recipe calls actually exists.

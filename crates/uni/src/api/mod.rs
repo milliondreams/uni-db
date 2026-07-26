@@ -496,6 +496,16 @@ pub struct UniInner {
     pub(crate) schema: Arc<SchemaManager>,
     pub(crate) properties: Arc<PropertyManager>,
     pub(crate) writer: Option<Arc<Writer>>,
+    /// The L0 tier this view reads through when it has no [`Writer`].
+    ///
+    /// `Some` on every live view. It is redundant when `writer` is `Some`
+    /// (`Executor::get_context` prefers the writer's manager) and load-bearing
+    /// on a **read-only open**, where the WAL was replayed into this manager and
+    /// the writer was then dropped.
+    ///
+    /// `None` means *deliberately L0-free*: a pinned snapshot view
+    /// ([`UniInner::at_snapshot`]), whose rows are entirely in L1.
+    pub(crate) l0_manager: Option<Arc<uni_store::runtime::l0_manager::L0Manager>>,
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
     pub(crate) config: UniConfig,
     pub(crate) procedure_registry: Arc<uni_query::ProcedureRegistry>,
@@ -739,6 +749,7 @@ fn build_executor_template(
     storage: Arc<StorageManager>,
     config: UniConfig,
     writer: Option<Arc<uni_store::runtime::writer::Writer>>,
+    l0_manager: Option<Arc<uni_store::runtime::l0_manager::L0Manager>>,
     xervo_runtime: Option<Arc<ModelRuntime>>,
     procedure_registry: Arc<uni_query::ProcedureRegistry>,
     properties: Arc<PropertyManager>,
@@ -750,6 +761,11 @@ fn build_executor_template(
     e.set_procedure_registry(procedure_registry);
     if let Some(w) = writer {
         e.set_writer(w);
+    }
+    // Only reachable when there is no writer; `get_context` prefers the writer's
+    // manager. This is what keeps a read-only open's WAL-replayed L0 visible.
+    if let Some(m) = l0_manager {
+        e.set_l0_manager(m);
     }
     e.set_prop_manager(properties);
     e.set_df_session_template(df_session_template);
@@ -781,12 +797,14 @@ impl UniInner {
     /// per-view isolation contract (cancellation token, broadcast channel,
     /// metrics counters). Used by both [`Self::at_snapshot`] and
     /// [`Self::at_fork`] so a new field is added in exactly one place.
+    #[allow(clippy::too_many_arguments)]
     fn derived_clone(
         &self,
         storage: Arc<StorageManager>,
         schema: Arc<SchemaManager>,
         properties: Arc<PropertyManager>,
         writer: Option<Arc<Writer>>,
+        l0_manager: Option<Arc<uni_store::runtime::l0_manager::L0Manager>>,
         locy_rule_registry: Arc<std::sync::RwLock<impl_locy::LocyRuleRegistry>>,
         executor_template: Arc<uni_query::Executor>,
     ) -> UniInner {
@@ -796,6 +814,7 @@ impl UniInner {
             schema,
             properties,
             writer,
+            l0_manager,
             xervo_runtime: self.xervo_runtime.clone(),
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
@@ -856,9 +875,15 @@ impl UniInner {
             self.plugin_registry.clone(),
         ));
 
+        // Both `None`s below are load-bearing, not oversight. `create_snapshot`
+        // flushes before pinning, so a pinned view's rows are entirely in L1 and
+        // the live L0 holds only post-snapshot writes that MUST stay invisible
+        // here. Do not "fix" these to the live L0 — see the detached-L0 guard in
+        // `ProjectionBuilder::build`, which exempts exactly this case.
         let executor_template = build_executor_template(
             pinned_storage.clone(),
             self.config.clone(),
+            None,
             None,
             self.xervo_runtime.clone(),
             self.procedure_registry.clone(),
@@ -869,6 +894,7 @@ impl UniInner {
             pinned_storage,
             self.schema.clone(),
             prop_manager,
+            None,
             None,
             Arc::new(std::sync::RwLock::new(
                 impl_locy::LocyRuleRegistry::default(),
@@ -983,6 +1009,7 @@ impl UniInner {
             forked_storage.clone(),
             self.config.clone(),
             Some(forked_writer_arc.clone()),
+            Some(Arc::clone(&forked_writer_arc.l0_manager)),
             self.xervo_runtime.clone(),
             self.procedure_registry.clone(),
             prop_manager.clone(),
@@ -992,7 +1019,8 @@ impl UniInner {
             forked_storage,
             merged_schema,
             prop_manager,
-            Some(forked_writer_arc),
+            Some(Arc::clone(&forked_writer_arc)),
+            Some(Arc::clone(&forked_writer_arc.l0_manager)),
             rule_registry,
             executor_template,
         ))
@@ -3500,8 +3528,11 @@ impl UniBuilder {
                 .map_err(UniError::Internal)?;
         }
 
-        // Replay WAL to restore any uncommitted mutations from previous session
-        // Only replay mutations with LSN > wal_high_water_mark to avoid double-applying
+        // Replay the WAL to restore *committed* mutations that had not yet been
+        // flushed to L1. The WAL is appended at commit time, and only entries
+        // with LSN > wal_high_water_mark (the snapshot manifest's mark) are
+        // replayed, so this is exactly the committed-but-unflushed suffix and
+        // cannot double-apply.
         {
             let replayed = writer
                 .replay_wal(wal_high_water_mark)
@@ -3513,7 +3544,7 @@ impl UniBuilder {
         }
 
         // Wire up IndexRebuildManager for post-flush automatic rebuild scheduling
-        if self.config.index_rebuild.auto_rebuild_enabled {
+        if !self.read_only && self.config.index_rebuild.auto_rebuild_enabled {
             let rebuild_manager = Arc::new(
                 uni_store::storage::IndexRebuildManager::new(
                     storage.clone(),
@@ -3535,7 +3566,11 @@ impl UniBuilder {
         }
 
         // Start background flush checker for time-based auto-flush
-        if let Some(interval) = self.config.auto_flush_interval {
+        // A read-only open must not write L1: the auto-flush task calls
+        // `flush_to_l1` on tick and on shutdown.
+        if !self.read_only
+            && let Some(interval) = self.config.auto_flush_interval
+        {
             let writer_clone = writer.clone();
             let mut shutdown_rx = shutdown_handle.subscribe();
 
@@ -3574,6 +3609,12 @@ impl UniBuilder {
         }
 
         let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+        // Lift the L0 tier out BEFORE the writer is dropped on a read-only open.
+        // The WAL replay above landed committed-but-unflushed mutations in it;
+        // dropping the only handle would make every read on this database
+        // silently miss them — a partially-flushed database would answer from
+        // its flushed half alone, with no error.
+        let l0_manager_field = Some(Arc::clone(&writer.l0_manager));
         let writer_field = if self.read_only { None } else { Some(writer) };
 
         // Build the fork registry from the metadata store (the same
@@ -3645,6 +3686,7 @@ impl UniBuilder {
             storage.clone(),
             self.config.clone(),
             writer_field.clone(),
+            l0_manager_field.clone(),
             xervo_runtime.clone(),
             procedure_registry.clone(),
             prop_manager.clone(),
@@ -3799,6 +3841,7 @@ impl UniBuilder {
                 schema: schema_manager,
                 properties: prop_manager,
                 writer: writer_field,
+                l0_manager: l0_manager_field,
                 xervo_runtime,
                 config: self.config,
                 procedure_registry,

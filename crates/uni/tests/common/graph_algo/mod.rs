@@ -6,3 +6,4 @@ pub mod named_projection;
 pub mod pregel_algos;
 pub mod projection_contract;
 pub mod reachability_provider;
+pub mod read_only_l0_recovery;

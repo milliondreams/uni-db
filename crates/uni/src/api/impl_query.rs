@@ -309,6 +309,12 @@ impl crate::api::UniInner {
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
+        // A read-only open has no writer but does carry the WAL-replayed L0
+        // (`UniInner::l0_manager`); without this the executor's `get_context`
+        // returns `None` and every read on the session is L0-blind.
+        if let Some(m) = &self.l0_manager {
+            executor.set_l0_manager(Arc::clone(m));
+        }
     }
 
     /// Explain a Cypher query plan without executing it.

@@ -125,9 +125,13 @@ class TestGraphComputePlugin(unittest.TestCase):
         self.assertEqual(outcome["plugin_id"], "ai.example.gc")
 
         session = self.db.session()
-        guest = _scores_by_node(session, f"CALL ai.example.gc.ppr({self.vid_a})")
+        guest = _scores_by_node(
+            session,
+            f"CALL ai.example.gc.ppr({self.vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+        )
         native = _scores_by_node(
-            session, f"CALL uni.algo.gcpagerank({self.vid_a}, 0.85)"
+            session,
+            f"CALL uni.algo.gcpagerank({self.vid_a}, 0.85, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
         )
 
         # One score row per vertex; probability mass sums to 1.
@@ -150,7 +154,7 @@ class TestGraphComputePlugin(unittest.TestCase):
         session = self.db.session()
         with self.assertRaises(Exception):
             session.query(
-                f"CALL ai.example.gc.ppr({self.vid_a}) YIELD nodeId, score "
+                f"CALL ai.example.gc.ppr({self.vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) YIELD nodeId, score "
                 "RETURN nodeId"
             )
 

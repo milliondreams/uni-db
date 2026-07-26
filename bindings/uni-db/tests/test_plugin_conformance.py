@@ -175,7 +175,10 @@ def _loader(database, method):
 def test_builtin_gcpagerank_callable_from_python(db):
     """#150's premise: the native GraphCompute PageRank is CALL-able from Python."""
     vid_a = _build_pagerank_graph(db)
-    scores = _scores_by_node(db.session(), f"CALL uni.algo.gcpagerank({vid_a}, 0.85)")
+    scores = _scores_by_node(
+        db.session(),
+        f"CALL uni.algo.gcpagerank({vid_a}, 0.85, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+    )
     assert len(scores) == 4
     assert math.isclose(sum(scores.values()), 1.0, abs_tol=1e-6)
     assert all(math.isfinite(s) and s >= 0.0 for s in scores.values())
@@ -259,8 +262,14 @@ def test_rhai_algorithm_granted_matches_native(db):
     assert "ai.example.rhaigc.ppr" in outcome["algorithms_registered"]
 
     session = db.session()
-    guest = _scores_by_node(session, f"CALL ai.example.rhaigc.ppr({vid_a})")
-    native = _scores_by_node(session, f"CALL uni.algo.gcpagerank({vid_a}, 0.85)")
+    guest = _scores_by_node(
+        session,
+        f"CALL ai.example.rhaigc.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+    )
+    native = _scores_by_node(
+        session,
+        f"CALL uni.algo.gcpagerank({vid_a}, 0.85, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+    )
     assert set(guest) == set(native)
     for node_id, score in guest.items():
         assert math.isclose(score, native[node_id], abs_tol=1e-9)
@@ -272,7 +281,7 @@ def test_rhai_algorithm_denied_does_not_register(db):
     assert outcome["algorithms_registered"] == []
     with pytest.raises(Exception):
         db.session().query(
-            f"CALL ai.example.rhaigc.ppr({vid_a}) YIELD nodeId, score RETURN nodeId"
+            f"CALL ai.example.rhaigc.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) YIELD nodeId, score RETURN nodeId"
         )
 
 
@@ -314,8 +323,12 @@ def test_rhai_projection_scopes_to_labels(db):
     _build_weighted_graph(db)
     db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
     session = db.session()
-    # Default (unscoped) projects all 4 nodes.
-    assert len(_probe_rows(session, "CALL ai.example.gcprobe.probe()")) == 4
+    # Whole-graph now requires the explicit `projectAll` opt-in (G9): an
+    # unscoped projection fails loud rather than silently taking everything.
+    everything = _probe_rows(
+        session, "CALL ai.example.gcprobe.probe({projectAll: true})"
+    )
+    assert len(everything) == 4
     # Scoped to :A projects only the 3 :A nodes.
     scoped = _probe_rows(session, 'CALL ai.example.gcprobe.probe({nodeLabels: ["A"]})')
     assert len(scoped) == 3
@@ -327,11 +340,14 @@ def test_rhai_projection_binds_edge_weight_property(db):
     db.load_rhai_plugin(RHAI_EDGE_PROBE, grants=GC_GRANTS)
     session = db.session()
     # Default: unit weights -> reduce_sum = edge count = 3.0.
-    unweighted = _probe_rows(session, "CALL ai.example.gcprobe.probe()")
+    unweighted = _probe_rows(
+        session, "CALL ai.example.gcprobe.probe({projectAll: true})"
+    )
     assert math.isclose(float(unweighted[0]["total_edge_weight"]), 3.0, abs_tol=1e-9)
     # weightProperty="w": reduce_sum = 3 edges * 5.0 = 15.0.
     weighted = _probe_rows(
-        session, 'CALL ai.example.gcprobe.probe({weightProperty: "w"})'
+        session,
+        'CALL ai.example.gcprobe.probe({projectAll: true, weightProperty: "w"})',
     )
     assert math.isclose(float(weighted[0]["total_edge_weight"]), 15.0, abs_tol=1e-9)
 
@@ -405,7 +421,8 @@ def test_rhai_node_and_edge_property_tensors(db):
     _build_property_graph(db)
     db.load_rhai_plugin(RHAI_PROP_PROBE, grants=GC_GRANTS)
     rows = db.session().query(
-        'CALL ai.example.gcprop.sums({nodeProperties:["score"], edgeProperties:["w"]}) '
+        'CALL ai.example.gcprop.sums({nodeLabels:["A"], edgeTypes:["LINK"], '
+        'nodeProperties:["score"], edgeProperties:["w"]}) '
         "YIELD nodeId, total RETURN nodeId, total"
     )
     assert len(rows) == 3
@@ -418,9 +435,12 @@ def test_rhai_property_tensor_not_projected_errors(db):
     _build_property_graph(db)
     db.load_rhai_plugin(RHAI_PROP_PROBE, grants=GC_GRANTS)
     with pytest.raises(Exception):
-        # No nodeProperties/edgeProperties in the config -> edge_property("w") errors.
+        # Scoped, but with no nodeProperties/edgeProperties -> edge_property("w")
+        # errors. The scope is supplied so the failure is the undeclared
+        # property rather than G9 rejecting an unscoped projection.
         db.session().query(
-            "CALL ai.example.gcprop.sums() YIELD nodeId, total RETURN nodeId"
+            'CALL ai.example.gcprop.sums({nodeLabels:["A"], edgeTypes:["LINK"]}) '
+            "YIELD nodeId, total RETURN nodeId"
         )
 
 
@@ -641,8 +661,14 @@ def test_wasm_algorithm_granted_matches_native(db, method, path, prefix):
     assert f"{prefix}.ppr" in outcome["algorithms_registered"]
 
     session = db.session()
-    guest = _scores_by_node(session, f"CALL {prefix}.ppr({vid_a})")
-    native = _scores_by_node(session, f"CALL uni.algo.gcpagerank({vid_a}, 0.85)")
+    guest = _scores_by_node(
+        session,
+        f"CALL {prefix}.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+    )
+    native = _scores_by_node(
+        session,
+        f"CALL uni.algo.gcpagerank({vid_a}, 0.85, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}})",
+    )
     assert len(guest) == 4
     assert math.isclose(sum(guest.values()), 1.0, abs_tol=1e-6)
     assert set(guest) == set(native)

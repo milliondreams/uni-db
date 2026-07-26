@@ -175,6 +175,7 @@ kernels! {
     ArenaDescend => "arena_descend", AllLoaders;
     ArenaExpand => "arena_expand", AllLoaders;
     ArenaFreeze => "arena_freeze", AllLoaders;
+    ArenaSeed => "arena_seed", AllLoaders;
 }
 
 impl KernelId {

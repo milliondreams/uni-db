@@ -3943,6 +3943,64 @@ fn freeing_a_bound_graph_does_not_mint_budget() {
     );
 }
 
+/// Seeding an arena from a projection gives newborns real neighbours.
+///
+/// The completion of dynamic populations: import an existing network, grow into
+/// it, freeze, aggregate. Before this a guest could grow structure or read the
+/// store, never both — an agent created during a CALL could hold state but had
+/// no way to acquire graph neighbours.
+#[test]
+fn an_arena_seeded_from_a_projection_grows_into_it() {
+    // 0→1, 1→2: a path. Max out-degree 1.
+    let (mut s, g) = session_with(build_projection(
+        &[10, 11, 12],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    ));
+    let arena = s.arena_new(8, 2).expect("arena");
+    let seeded = s.arena_seed(arena, g).expect("seed from the projection");
+
+    // The frozen arena reproduces the imported topology...
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    assert_eq!(s.vertex_count(frozen).expect("V"), 3, "one slot per vertex");
+    assert_eq!(s.edge_count(frozen).expect("E"), 2, "the links came across");
+
+    // ...and a newborn linked into it extends the graph rather than colliding.
+    let newborn = s.arena_alloc(arena, 1).expect("newborn");
+    s.arena_link(arena, seeded, newborn).ok();
+    let grown = s.arena_freeze(arena).expect("freeze again");
+    assert_eq!(
+        s.vertex_count(grown).expect("V"),
+        4,
+        "the newborn extends the vertex set, it does not overwrite a slot"
+    );
+
+    // A second seed into a used arena would silently break slot correspondence.
+    let err = s
+        .arena_seed(arena, g)
+        .expect_err("seeding a non-empty arena must be refused");
+    assert_eq!(err.code, super::error::ARG_VALIDATION);
+
+    // And a projection whose fan-out exceeds `branching` is named up front,
+    // rather than failing partway through the import.
+    let (mut s2, hub) = session_with(build_projection(
+        &[0, 1, 2, 3, 4],
+        &[(0, 1, 1.0), (0, 2, 1.0), (0, 3, 1.0), (0, 4, 1.0)],
+        false,
+        false,
+    ));
+    let narrow = s2.arena_new(8, 2).expect("arena");
+    let err = s2
+        .arena_seed(narrow, hub)
+        .expect_err("out-degree 4 must not fit branching 2");
+    assert!(
+        err.message.contains("arena_new(capacity, 4)"),
+        "the error must name the branching needed, got: {}",
+        err.message
+    );
+}
+
 /// `rekey` is a verified move between projections, not a cast.
 ///
 /// It is the escape hatch that makes named scopes useful: two edge layers over

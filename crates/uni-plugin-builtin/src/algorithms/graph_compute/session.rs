@@ -3377,6 +3377,29 @@ pub trait GraphArenaCompute {
     /// `0x861` if the handle is not an arena; `0x864` if the compacted copy
     /// would exceed the session arena cap.
     fn arena_freeze(&mut self, arena: Handle) -> Result<Handle, FnError>;
+
+    /// Copies a projection's topology into an **empty** arena.
+    ///
+    /// The missing half of dynamic populations. `arena_expand` grows structure
+    /// from nothing, and `arena_freeze` turns it back into a graph — but a guest
+    /// simulating births and deaths over an *existing* network had no way to get
+    /// that network into the arena in the first place, so newborns could hold
+    /// state and never have neighbours.
+    ///
+    /// Slot `i` of the arena becomes slot `i` of `g`, which is why the arena must
+    /// be empty: seeding a partly-used arena would silently break that
+    /// correspondence, and with it `arena_freeze`'s equivalence to `g`'s index
+    /// space. Newborns allocated afterwards take slots `V..`, so they extend the
+    /// vertex set rather than colliding with it.
+    ///
+    /// Returns the `[V]` slot-id tensor for the imported vertices, keyed to the
+    /// arena. Charges `O(V + E)`.
+    ///
+    /// # Errors
+    /// `0x86E` if the arena is non-empty or its `branching` is below the
+    /// projection's maximum out-degree (naming the value needed); `0x864` if the
+    /// arena's capacity cannot hold `g`'s vertices.
+    fn arena_seed(&mut self, arena: Handle, g: Handle) -> Result<Handle, FnError>;
 }
 
 /// Reads a handle as a tensor of slot ids, accepting either backing type.
@@ -3577,6 +3600,53 @@ impl GraphArenaCompute for AlgoSession {
             out.extend(kids.iter().map(|&k| i64::from(k)));
         }
         self.alloc_tensor(Tensor::from_i64(out), Origin::Arena(arena))
+    }
+
+    fn arena_seed(&mut self, arena: Handle, g: Handle) -> Result<Handle, FnError> {
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let n = graph.vertex_count();
+        {
+            let a = self.table.get_arena(arena)?;
+            if !a.is_empty() {
+                return Err(error::arg_validation(format!(
+                    "arena_seed requires an empty arena so slot i of the arena is \
+                     slot i of the projection; this one already holds {} slots",
+                    a.len()
+                )));
+            }
+            // Check the fan-out up front: `link` would otherwise fail partway
+            // through, leaving a half-imported arena the guest cannot inspect.
+            let max_degree = (0..n as u32)
+                .map(|u| graph.out_degree(u))
+                .max()
+                .unwrap_or(0);
+            if max_degree > a.branching() {
+                return Err(error::arg_validation(format!(
+                    "arena_seed: the projection has a vertex of out-degree {max_degree} \
+                     but the arena's branching is {}; create it with \
+                     arena_new(capacity, {max_degree})",
+                    a.branching()
+                )));
+            }
+        }
+        self.charge(n as u64 + graph.edge_count() as u64)?;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "vertex count is bounded by the projection, which fits u32"
+        )]
+        let count = n as u32;
+        let slots = self.table.get_arena_mut(arena)?.alloc(count)?;
+        {
+            let a = self.table.get_arena_mut(arena)?;
+            for u in 0..count {
+                for &v in graph.out_neighbors(u) {
+                    a.link(u, v)?;
+                }
+            }
+        }
+        let ids: Vec<i64> = slots.iter().map(|&s| i64::from(s)).collect();
+        self.alloc_tensor(Tensor::from_i64(ids), Origin::Arena(arena))
     }
 
     fn arena_freeze(&mut self, arena: Handle) -> Result<Handle, FnError> {

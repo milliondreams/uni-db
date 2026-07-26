@@ -37,6 +37,20 @@ See [Reference → Capability slices](reference.md#capability-slices) for the de
 
 The two compose. `arena_freeze` turns an arena into an ordinary graph handle, so the entire read-only kernel catalogue applies to structure you grew yourself.
 
+**Growing an existing network.** `arena_expand` builds structure from nothing, which is right for a search tree but not for a simulation over a network that already exists. `arena_seed` imports one:
+
+```rhai
+let a  = gc.arena_new(capacity, max_degree);
+let s  = gc.arena_seed(a, g);        // the store's network, slot-for-slot
+let n  = gc.arena_alloc(a, births);  // newborns take slots V..
+gc.arena_link(a, parents, n);        // and link into the real topology
+let gg = gc.arena_freeze(a);         // aggregate over the whole thing
+```
+
+The arena must be empty when seeded, because slot `i` of the arena becoming vertex `i` of `g` is what makes the frozen graph's index space meaningful. Size `branching` to the projection's maximum out-degree — `arena_seed` checks it up front and names the value you need rather than failing partway through the import.
+
+One boundary to know: `emit` keys its `nodeId` column to the primary projection, so newborns — which exist only inside the CALL and have no store identity — have no per-row egress. Emit for the imported vertices, or carry newborn results out as aggregates.
+
 That composition is how you aggregate over links you grew. There is no `arena_spmv`, and there does not need to be: freeze the arena, then use `spmv` on the result. The frozen graph's slot `i` **is** the arena's slot `i` — `arena_freeze` walks live slots in order — so an arena-keyed column and the graph frozen from that arena share one index space and combine without a `rekey`:
 
 ```rhai
@@ -186,7 +200,7 @@ This fires on both the op-string form (`ewise(a, b, "gt")`) and the method form 
 
 ## Kernel catalogue
 
-69 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
+70 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -380,6 +394,7 @@ Together these express reachability or SpMV over a random edge subset (percolati
 | `arena_gather(a, col, slots)` / `arena_scatter(a, col, slots, values)` | Move state between a column and a compact tensor. |
 | `arena_descend(a, roots, score, visit, maximize, vloss)` | Descend to a leaf choosing the best-scoring child, applying one visit and the virtual loss at every step. `vloss` is a flat linear offset applied in the descent loop, **not** a per-visit UCB recompute — see the [worked example](#worked-example-a-guest-authored-mcts). |
 | `arena_backup(a, value_col, leaves, deltas)` | Add each leaf's delta along its **full** root path, walking parents to the root — general-depth UCT / PUCT value backpropagation, not just a depth-1 bandit update. |
+| `arena_seed(a, g)` | Copy a projection's topology into an **empty** arena — slot `i` becomes vertex `i` of `g`. The way an existing network enters a growable arena, so newborns allocated afterwards extend it rather than starting from nothing. |
 | `arena_freeze(a)` | Compact into an ordinary graph handle. Slot `i` of the frozen graph is slot `i` of the arena, so arena-keyed values aggregate over it directly — see below. |
 
 ### Egress and lifecycle

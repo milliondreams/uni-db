@@ -765,6 +765,16 @@ impl GcSession {
     }
 
     /// Folds a walks handle into a per-vertex visit-count map.
+    /// Copies a projection's topology into an empty arena.
+    fn arena_seed(&self, arena: i64, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .arena_seed(from_i64(arena), from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     /// Re-keys a `[V]` value into another projection's index space, verified.
     fn rekey(&self, value: i64, g: i64) -> PyResult<i64> {
         self.check_deadline()?;

@@ -727,6 +727,14 @@ impl GcSession {
     }
 
     /// Folds a walks handle into a per-vertex visit-count map.
+    /// Copies a projection's topology into an empty arena.
+    fn arena_seed(&mut self, arena: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.arena_seed(from_i64(arena), from_i64(g))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// Re-keys a `[V]` value into another projection's index space, verified.
     fn rekey(&mut self, value: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
@@ -1068,6 +1076,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         SpmvMasked => GcSession::spmv_masked,
         WalkVisitCounts => GcSession::walk_visit_counts,
         Rekey => GcSession::rekey,
+        ArenaSeed => GcSession::arena_seed,
         EmitWalks => GcSession::emit_walks,
         NeighborhoodOverlap => GcSession::neighborhood_overlap,
         NextBucket => GcSession::next_bucket,

@@ -655,6 +655,7 @@ impl GraphComputeRegistry {
                 .arena_expand(from_i64(req.g), from_i64(req.a), req.cap)
                 .map(h),
             KernelId::ArenaFreeze => session.arena_freeze(from_i64(req.g)).map(h),
+            KernelId::ArenaSeed => session.arena_seed(from_i64(req.a), from_i64(req.g)).map(h),
 
             // Declared exceptions (see `KernelReach`). These are real catalog
             // entries that deliberately have no wire form, so a guest reaching

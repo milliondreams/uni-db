@@ -22,6 +22,8 @@
 
 use arrow_array::{Array, Float64Array, Int64Array};
 
+use super::handle::Handle;
+
 /// A logical element type for a [`Tensor`].
 ///
 /// v1 computes in `f64` regardless of tag (see module docs); the tag is retained
@@ -346,6 +348,63 @@ enum TensorBuf {
     I64(Int64Array),
 }
 
+/// Which index space a tensor's slots belong to.
+///
+/// Slot `i` of a `[V]` map means "the i-th vertex *of some projection*", and
+/// nothing in the value itself said which one — so two tensors from different
+/// graphs combined silently whenever their lengths coincided, computing correct
+/// arithmetic over two different vertex sets.
+///
+/// The graph [`Handle`] is the identity rather than a new id: it is what
+/// `bind_graph` already returns, and its generation makes recycling fail closed —
+/// free a graph, bind another into the same slot, and older tensors stop matching,
+/// which is right, because slot `i` now means a different vertex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Keyed to a bound projection's vertex or edge space.
+    Graph(Handle),
+    /// Keyed to a mutable arena's slot space, which is not any graph's.
+    ///
+    /// Distinct from [`Origin::Untracked`] on purpose: arena tensors are tagged
+    /// `Shape::V` while being slot-keyed, so without a separate origin a slot
+    /// list would combine happily with a real `[V]` map.
+    Arena(Handle),
+    /// No index space is known — a value derived from something that carries no
+    /// provenance of its own (today: a set, which is untagged).
+    Untracked,
+}
+
+impl Origin {
+    /// Whether two operands may be combined.
+    ///
+    /// [`Origin::Untracked`] means *unknown*, not "a third space": it unifies
+    /// with anything. Treating it as a distinct value would reject ordinary
+    /// compositions — PageRank's teleport vector comes from `set_to_map`, and
+    /// sets carry no provenance, so every `ewise` against it would fail.
+    ///
+    /// Only two *known* and *different* spaces are incompatible.
+    #[must_use]
+    pub fn compatible_with(self, other: Origin) -> bool {
+        matches!(
+            (self, other),
+            (Origin::Untracked, _) | (_, Origin::Untracked)
+        ) || self == other
+    }
+
+    /// The more specific of two compatible origins.
+    ///
+    /// A result derived from a known space and an unknown one belongs to the
+    /// known space — that is what lets provenance survive a `set_to_map` hop
+    /// instead of decaying to `Untracked` at the first composition.
+    #[must_use]
+    pub fn unify(self, other: Origin) -> Origin {
+        match (self, other) {
+            (Origin::Untracked, o) | (o, Origin::Untracked) => o,
+            (a, _) => a,
+        }
+    }
+}
+
 /// A shaped, Arrow-backed per-vertex value map.
 ///
 /// v1 is [`Shape::V`] backed by a [`Float64Array`] by default; the exact
@@ -367,6 +426,7 @@ pub struct Tensor {
     shape: Shape,
     dtype: DType,
     buf: TensorBuf,
+    origin: Origin,
 }
 
 impl Tensor {
@@ -375,6 +435,7 @@ impl Tensor {
     pub fn from_f64(values: Vec<f64>) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -389,6 +450,7 @@ impl Tensor {
     pub fn from_f64_typed(values: Vec<f64>, dtype: DType) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -402,6 +464,7 @@ impl Tensor {
     pub fn from_i64(values: Vec<i64>) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype: DType::I64,
             buf: TensorBuf::I64(Int64Array::from(values)),
         }
@@ -418,6 +481,7 @@ impl Tensor {
     pub fn from_f64_edge(values: Vec<f64>) -> Self {
         Self {
             shape: Shape::E,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -438,9 +502,23 @@ impl Tensor {
     pub fn from_f64_shaped(values: Vec<f64>, shape: Shape) -> Self {
         Self {
             shape,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
+    }
+
+    /// Returns the index space this tensor's slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
+    }
+
+    /// Stamps the index space this tensor's slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Returns the tensor shape (always [`Shape::V`] in v1).

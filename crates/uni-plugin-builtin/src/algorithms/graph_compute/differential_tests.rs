@@ -22,7 +22,7 @@ use super::first_party::{
     bellman_ford, eigenvector_centrality, k_core, personalized_pagerank, reachable_set, wcc_labels,
 };
 use super::handle::{Handle, HandleKind};
-use super::session::{AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Semiring};
+use super::session::{AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Predicate, Semiring};
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
 
@@ -3011,9 +3011,7 @@ fn reqd1_compare_and_select_are_composable_from_shipped_kernels() {
 
     // compare(a, b, "gt")  ==  set_to_map(map_to_set(axpy(a, b, -1), "gt", 0), 1)
     let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
-    let hits = s
-        .map_to_set(diff, super::session::Predicate::Gt(0.0))
-        .expect("map_to_set");
+    let hits = s.map_to_set(diff, Predicate::Gt(0.0)).expect("map_to_set");
     let mask = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
 
     let got = read_tensor(&s, mask).to_vec();
@@ -3040,7 +3038,7 @@ fn reqd1_compare_and_select_are_composable_from_shipped_kernels() {
 
     // A scalar threshold needs no difference at all: one map_to_set + set_to_map.
     let thr = s
-        .map_to_set(a, super::session::Predicate::Gt(2.5))
+        .map_to_set(a, Predicate::Gt(2.5))
         .expect("map_to_set scalar");
     let thr_map = s.set_to_map(thr, Scalar::F64(1.0)).expect("set_to_map");
     assert_eq!(
@@ -3149,8 +3147,6 @@ fn pin_d4b_sample_edges_matches_the_per_edge_counter_hash_oracle() {
 /// unconditionally. Asserts the desired behaviour: an `[E]` input produces an
 /// edge mask usable by `spmv_masked`.
 #[test]
-#[ignore = "REPRO (red on 254b4c26c, 0x861 `expected EdgeSet`): flips when Phase 4 \
-              makes map_to_set shape-polymorphic. Run with --run-ignored all."]
 fn repro_d1e_map_to_set_on_an_edge_tensor_must_yield_an_edge_mask() {
     let nodes: Vec<u64> = (0..4).collect();
     let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
@@ -3158,7 +3154,7 @@ fn repro_d1e_map_to_set_on_an_edge_tensor_must_yield_an_edge_mask() {
 
     let sel = s.edge_weights(g).expect("edge_weights gives an [E] tensor");
     let mask = s
-        .map_to_set(sel, super::session::Predicate::Gt(0.5))
+        .map_to_set(sel, Predicate::Gt(0.5))
         .expect("map_to_set accepts the [E] tensor");
 
     let vec = s.zero_map(g, DType::F64).expect("zero_map runs");
@@ -3177,8 +3173,6 @@ fn repro_d1e_map_to_set_on_an_edge_tensor_must_yield_an_edge_mask() {
 /// A silent wrong answer, independent of any consumer ask, and materially more
 /// likely once a session carries more than one projection.
 #[test]
-#[ignore = "REPRO (red on 254b4c26c: ewise silently computes): flips when Phase 4 \
-              validates Shape, not just len. Run with --run-ignored all."]
 fn repro_ew_ewise_must_reject_mixed_vertex_and_edge_shapes() {
     // A 4-cycle: |V| == |E| == 4, so the length check cannot separate them.
     let nodes: Vec<u64> = (0..4).collect();
@@ -3209,8 +3203,6 @@ fn repro_ew_ewise_must_reject_mixed_vertex_and_edge_shapes() {
 /// and re-callable), so this is reachable today; it becomes the default hazard
 /// once guests can ask for a second projection.
 #[test]
-#[ignore = "REPRO (red on 254b4c26c: silently computes): flips when Phase 4 adds a \
-              graph-provenance tag to tensor handles. Run with --run-ignored all."]
 fn repro_prov_tensors_must_not_cross_projections() {
     let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
     // Same vertex count, disjoint vertex ids: slot 0 is vid 0 in `a` and vid 10
@@ -3238,8 +3230,6 @@ fn repro_prov_tensors_must_not_cross_projections() {
 /// probability tensor yields a mask that is quietly missing those edges. Every
 /// other numeric fault in this surface is loud — this one should be too.
 #[test]
-#[ignore = "REPRO (red on 254b4c26c: NaN silently never fires): flips when the \
-              sampler rejects NaN. Run with --run-ignored all."]
 fn repro_nan_sample_edges_must_reject_a_nan_probability() {
     // log(-1.0) = NaN, giving a genuinely NaN-valued [E] tensor.
     let nodes: Vec<u64> = (0..4).collect();
@@ -3258,4 +3248,251 @@ fn repro_nan_sample_edges_must_reject_a_nan_probability() {
         out.is_err(),
         "a NaN probability must be rejected, not silently treated as never-fire"
     );
+}
+
+/// `ewise` must preserve `[E]` all the way to an edge consumer.
+///
+/// The input check and the output tag are one change, not two. Validating shape
+/// on the way in while collapsing it to `[V]` on the way out would accept
+/// `ewise([E], [E])` and hand back a tensor that `sample_edges`,
+/// `edge_mask_window`, `expand_sampled` and `sample_edges_undirected` all
+/// reject — a kernel that type-checks its inputs and then lies about its result.
+#[test]
+fn ewise_preserves_edge_shape_through_to_a_consumer() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("[E] tensor");
+    // An [E] op with an [E] operand stays [E]...
+    let doubled = s
+        .ewise(w, w, EwiseOp::Add)
+        .expect("ewise over two [E] tensors");
+    // ...which only an edge consumer will accept.
+    let mask = s
+        .edge_mask_window(doubled, 1.5, 2.5)
+        .expect("the [E] tag must survive ewise");
+    assert_eq!(
+        s.edge_set_len(mask).expect("len"),
+        2,
+        "the two weight-1.0 edges double to 2.0 and fall inside the window"
+    );
+}
+
+/// A guest must not be able to abort the host with ordinary input.
+///
+/// Three kernels combined values from two differently-sized graphs and reached a
+/// `panic!` rather than a typed error. `bind_graph` is public and re-callable and
+/// `arena_freeze` mints a second graph mid-session, so all three were reachable.
+/// `VertexSet::zip_with`'s own doc comment asserted the invariant that made it
+/// safe — "sets from the same session always share the projection vertex count" —
+/// which is exactly why nobody noticed it had stopped being true.
+#[test]
+fn cross_graph_operands_error_instead_of_panicking() {
+    let small = build_projection(&[0, 1], &[(0, 1, 1.0)], false, false);
+    let large = build_projection(&[0, 1, 2, 3, 4], &[(0, 1, 1.0)], false, false);
+    let (mut s, gs) = session_with(small);
+    let gl = s.bind_graph(Arc::new(large));
+
+    // Set algebra over two capacities used to hit an assert! inside zip_with.
+    let fs = s.frontier(gs, &[Vid::new(0)]).expect("frontier on small");
+    let fl = s.frontier(gl, &[Vid::new(0)]).expect("frontier on large");
+    for (name, res) in [
+        ("set_union", s.set_union(fs, fl)),
+        ("set_diff", s.set_diff(fs, fl)),
+        ("set_intersect", s.set_intersect(fs, fl)),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name} over mismatched capacities must error, not abort the host"
+        );
+    }
+
+    // `walk_visit_counts` sized its counter from `g` and indexed it with slots
+    // from `walks`, so walks over the larger graph ran off the end.
+    let walks = s
+        .random_walks(gl, 3, 1, &[Vid::new(4)], 1.0, 1.0, 7)
+        .expect("walks over the large graph");
+    assert!(
+        s.walk_visit_counts(walks, gs).is_err(),
+        "walks from a larger graph must be rejected, not indexed out of bounds"
+    );
+}
+
+/// `expand_sampled` indexes its probability tensor by global CSR edge index, so
+/// a tensor shorter than the edge count would read past its end.
+#[test]
+fn expand_sampled_rejects_a_short_probability_tensor() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let wide = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &wide, true, false));
+    // A [E] tensor from a *different*, smaller projection.
+    let narrow = s.bind_graph(Arc::new(build_projection(
+        &nodes,
+        &[(0, 1, 1.0)],
+        true,
+        false,
+    )));
+    let short = s.edge_weights(narrow).expect("[E] over one edge");
+    let front = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+
+    assert!(
+        s.expand_sampled(g, front, Direction::Out, None, short, 1, 0)
+            .is_err(),
+        "a probability tensor shorter than the edge count must be rejected"
+    );
+}
+
+/// Arena-derived tensors must not combine with graph-derived ones.
+///
+/// The arena family tags its slot-keyed tensors `Shape::V` — the tag is already
+/// lying, because arena slots are not vertex slots — so a strict shape check
+/// cannot catch this. Provenance can: `Origin::Arena` is deliberately distinct
+/// from `Origin::Graph` rather than collapsing to `Untracked`.
+#[test]
+fn arena_tensors_do_not_combine_with_graph_tensors() {
+    use super::session::GraphArenaCompute as _;
+    let nodes: Vec<u64> = (0..3).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let deg = s.degrees(g, Direction::Out).expect("[V] over the graph");
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 3).expect("3 arena slots");
+    assert_eq!(
+        s.tensor_values_for_test(deg).len(),
+        3,
+        "same length, so only provenance separates them"
+    );
+
+    assert!(
+        s.ewise(deg, slots, EwiseOp::Add).is_err(),
+        "an arena slot list must not combine with a vertex map"
+    );
+}
+
+/// `Untracked` means unknown, not a third space: it unifies with anything.
+///
+/// Set-derived tensors carry no provenance, and PageRank's teleport vector is
+/// exactly that (`set_to_map` over a frontier). Treating `Untracked` as distinct
+/// would reject every `ewise` against it and break ordinary compositions.
+#[test]
+fn untracked_provenance_unifies_rather_than_conflicting() {
+    let nodes: Vec<u64> = (0..3).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let deg = s.degrees(g, Direction::Out).expect("graph-derived");
+    let front = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+    let from_set = s
+        .set_to_map(front, Scalar::F64(1.0))
+        .expect("set-derived, so untracked");
+
+    let mixed = s
+        .ewise(deg, from_set, EwiseOp::Add)
+        .expect("an untracked operand must not block the composition");
+    // ...and the result adopts the known space, so provenance survives the hop.
+    let again = s.ewise(mixed, deg, EwiseOp::Add);
+    assert!(
+        again.is_ok(),
+        "the unified result must still be usable with its own graph's tensors"
+    );
+}
+
+/// `compare` matches a scalar oracle across every operator.
+#[test]
+fn compare_matches_the_scalar_oracle() {
+    use super::session::CmpOp;
+    let a_vals = [1.0, 5.0, 3.0, 4.0, f64::NAN];
+    let b_vals = [4.0, 4.0, 3.0, 4.0, 4.0];
+    let nodes: Vec<u64> = (0..5).collect();
+
+    for (op, oracle) in [
+        (CmpOp::Gt, (|x: f64, y: f64| x > y) as fn(f64, f64) -> bool),
+        (CmpOp::Ge, |x, y| x >= y),
+        (CmpOp::Lt, |x, y| x < y),
+        (CmpOp::Le, |x, y| x <= y),
+        (CmpOp::Eq, |x, y| x == y),
+        (CmpOp::Ne, |x, y| x != y),
+    ] {
+        let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+        let a = load_vals(&mut s, g, &a_vals);
+        let b = load_vals(&mut s, g, &b_vals);
+        let m = s.compare(a, b, op).expect("compare runs");
+        let want: Vec<f64> = a_vals
+            .iter()
+            .zip(&b_vals)
+            .map(|(&x, &y)| f64::from(u8::from(oracle(x, y))))
+            .collect();
+        assert_eq!(
+            s.tensor_values_for_test(m),
+            want,
+            "{op:?} disagreed with the scalar oracle (NaN included)"
+        );
+    }
+}
+
+/// `compare` is exactly the composition it replaces — the proof that the
+/// ergonomic shortcut did not change semantics.
+#[test]
+fn compare_agrees_with_the_composition_it_replaces() {
+    let a_vals = [1.0, 5.0, 3.0, 9.0, 2.0];
+    let b_vals = [4.0; 5];
+    let nodes: Vec<u64> = (0..5).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let a = load_vals(&mut s, g, &a_vals);
+    let b = load_vals(&mut s, g, &b_vals);
+
+    let direct = s
+        .compare(a, b, super::session::CmpOp::Gt)
+        .expect("the kernel");
+    let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
+    let hits = s.map_to_set(diff, Predicate::Gt(0.0)).expect("map_to_set");
+    let composed = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
+
+    assert_eq!(
+        s.tensor_values_for_test(direct),
+        s.tensor_values_for_test(composed),
+        "the kernel and the published composition must agree bit for bit"
+    );
+}
+
+/// An `[E]` comparison lowers to an `EdgeSet` and drives `spmv_masked`.
+///
+/// This is the case that was genuinely composition-blocked: `map_to_set` used to
+/// hand back a `VertexSet` for an `[E]` input, so an edge threshold could not
+/// reach an edge consumer at all.
+#[test]
+fn compare_on_edges_feeds_spmv_masked() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 5.0), (1, 2, 1.0), (2, 3, 5.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("[E] weights");
+    let threshold = s
+        .map_apply(w, MapOp::AxPlusB(0.0, 3.0))
+        .expect("[E] of 3.0");
+    let mask = s
+        .compare(w, threshold, super::session::CmpOp::Gt)
+        .expect("[E] comparison");
+    let edge_set = s
+        .map_to_set(mask, Predicate::Gt(0.5))
+        .expect("an [E] mask lowers to an EdgeSet");
+    assert_eq!(
+        s.edge_set_len(edge_set).expect("len"),
+        2,
+        "the two weight-5.0 edges exceed the threshold"
+    );
+
+    let vec = s.zero_map(g, DType::F64).expect("zero_map");
+    s.spmv_masked(g, vec, Semiring::LinearAlgebra, edge_set)
+        .expect("the EdgeSet must be accepted by spmv_masked");
+}
+
+/// Loads an explicit `[V]` map by scattering each value onto a zero map.
+fn load_vals(s: &mut AlgoSession, g: Handle, vals: &[f64]) -> Handle {
+    let mut m = s.zero_map(g, DType::F64).expect("zero_map");
+    for (i, &v) in vals.iter().enumerate() {
+        let f = s.frontier(g, &[Vid::new(i as u64)]).expect("frontier");
+        m = s.scatter(m, f, Scalar::F64(v)).expect("scatter");
+    }
+    m
 }

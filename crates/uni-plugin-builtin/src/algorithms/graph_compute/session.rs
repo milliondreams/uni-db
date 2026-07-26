@@ -52,7 +52,7 @@ use super::arena::GraphArena;
 use super::error;
 use super::handle::{Handle, HandleKind};
 use super::table::HandleTable;
-use super::value::{DType, EdgeSet, PairList, Scalar, Tensor, VertexSet, WalkMatrix};
+use super::value::{DType, EdgeSet, Origin, PairList, Scalar, Tensor, VertexSet, WalkMatrix};
 use super::{Arena, BUDGET_CHECK_CHUNK, WorkBudget};
 
 /// Which adjacency direction a traversal or `spmv` follows.
@@ -144,6 +144,28 @@ pub enum ReduceOp {
     NormL1,
     /// L2 norm (Euclidean).
     NormL2,
+}
+
+/// A closed elementwise comparison producing a 0.0/1.0 mask (proposal §4.3).
+///
+/// Composable from shipped kernels — `set_to_map(map_to_set(axpy(a,b,-1), ..))` —
+/// but that costs three passes of the native-work meter and, because
+/// `map_to_set` lowers to a set, it cannot produce an `[E]` mask usable by
+/// `spmv_masked`. This is the direct form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `a > b`.
+    Gt,
+    /// `a >= b`.
+    Ge,
+    /// `a < b`.
+    Lt,
+    /// `a <= b`.
+    Le,
+    /// `a == b` (exact bit-for-bit f64 equality).
+    Eq,
+    /// `a != b`.
+    Ne,
 }
 
 /// A closed predicate lifting a map into a set (proposal §4.3).
@@ -376,6 +398,22 @@ impl AlgoSession {
         self.arena.bytes_live()
     }
 
+    /// Rejects two set operands that do not share a capacity.
+    ///
+    /// Bitset algebra is only meaningful within one index space, and the
+    /// underlying `zip_with` asserts rather than erroring — so without this a
+    /// guest could abort the host by combining sets from two differently-sized
+    /// graphs, which `bind_graph` and `arena_freeze` both make reachable.
+    fn require_same_capacity(a: usize, b: usize, kernel: &str) -> Result<(), FnError> {
+        if a == b {
+            return Ok(());
+        }
+        Err(error::shape_mismatch(format!(
+            "{kernel}: set capacities differ ({a} vs {b}) — the operands come from \
+             different index spaces and cannot be combined"
+        )))
+    }
+
     /// Snapshots a tensor handle's values, or `None` if it is not a tensor.
     ///
     /// Used by the conformance probes (and reachable outside `cfg(test)`) to read
@@ -457,9 +495,9 @@ impl AlgoSession {
     }
 
     /// Charges the arena and inserts a tensor, returning its handle.
-    fn alloc_tensor(&mut self, tensor: Tensor) -> Result<Handle, FnError> {
+    fn alloc_tensor(&mut self, tensor: Tensor, origin: Origin) -> Result<Handle, FnError> {
         self.reserve(tensor.heap_bytes())?;
-        Ok(self.table.insert_tensor(tensor))
+        Ok(self.table.insert_tensor(tensor.with_origin(origin)))
     }
 
     /// Charges the arena and inserts a vertex set, returning its handle.
@@ -523,6 +561,17 @@ pub trait GraphCompute {
     /// Returns a typed [`FnError`] on a bad handle, a length mismatch, or an
     /// exhausted budget/arena.
     fn ewise(&mut self, a: Handle, b: Handle, op: EwiseOp) -> Result<Handle, FnError>;
+
+    /// Group 0: elementwise comparison, yielding 1.0 where it holds else 0.0.
+    ///
+    /// Shape- and provenance-preserving, so an `[E]` comparison yields an `[E]`
+    /// mask that `map_to_set` lowers to an `EdgeSet`. NaN compares false under
+    /// every operator except `Ne`, matching IEEE semantics.
+    ///
+    /// # Errors
+    /// Returns a typed [`FnError`] on a bad handle, mismatched shape or index
+    /// space, an i64 operand, or an exhausted budget/arena.
+    fn compare(&mut self, a: Handle, b: Handle, op: CmpOp) -> Result<Handle, FnError>;
 
     /// Group 0: lifts a set into a map, assigning `value` to set members.
     ///
@@ -1014,7 +1063,7 @@ impl GraphCompute for AlgoSession {
                 Direction::Both => f64::from(graph.out_degree(s)) + f64::from(graph.in_degree(s)),
             })
             .collect();
-        self.alloc_tensor(Tensor::from_f64(values))
+        self.alloc_tensor(Tensor::from_f64(values), Origin::Graph(g))
     }
 
     fn vertex_ids(&mut self, g: Handle) -> Result<Handle, FnError> {
@@ -1024,12 +1073,22 @@ impl GraphCompute for AlgoSession {
         // Each vertex holds its own slot id (WCC min-label init). Slot ids fit
         // exactly in f64 below 2^53 (see value.rs dtype note).
         let values: Vec<f64> = (0..n).map(|s| s as f64).collect();
-        self.alloc_tensor(Tensor::from_f64_typed(values, DType::U32))
+        self.alloc_tensor(Tensor::from_f64_typed(values, DType::U32), Origin::Graph(g))
     }
 
     fn ewise(&mut self, a: Handle, b: Handle, op: EwiseOp) -> Result<Handle, FnError> {
         let ta = self.table.get_tensor(a)?;
         let tb = self.table.get_tensor(b)?;
+        // Shape, not just length. A `[V]` map and an `[E]` tensor of coincidentally
+        // equal length (any graph where |V| == |E|, e.g. a cycle) used to combine
+        // silently into arithmetic over two different index spaces.
+        if ta.shape() != tb.shape() {
+            return Err(error::shape_mismatch(format!(
+                "ewise requires two tensors of the same shape, got {:?} and {:?}",
+                ta.shape(),
+                tb.shape()
+            )));
+        }
         if ta.len() != tb.len() {
             return Err(error::shape_mismatch(
                 "ewise requires two maps of equal length",
@@ -1038,6 +1097,19 @@ impl GraphCompute for AlgoSession {
         if ta.is_i64() || tb.is_i64() {
             return Err(error::shape_mismatch("ewise requires f64 maps"));
         }
+        // Provenance, not just shape. Slot `i` names a different vertex in each
+        // projection, so two same-length maps from different graphs are not
+        // comparable even when both are `[V]`.
+        if !ta.origin().compatible_with(tb.origin()) {
+            return Err(error::shape_mismatch(format!(
+                "ewise operands come from different index spaces ({:?} and {:?}); \
+                 slot i does not name the same element in both",
+                ta.origin(),
+                tb.origin()
+            )));
+        }
+        let origin = ta.origin().unify(tb.origin());
+        let shape = ta.shape();
         let n = ta.len();
         let (xa, xb) = (ta.values(), tb.values());
         let out: Vec<f64> = (0..n)
@@ -1061,7 +1133,60 @@ impl GraphCompute for AlgoSession {
             })
             .collect();
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        // Shape-preserving, like `map_apply`: validating the shape on the way in
+        // and collapsing it to `[V]` on the way out would leave an `[E]` result
+        // that every edge consumer rejects.
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
+    }
+
+    fn compare(&mut self, a: Handle, b: Handle, op: CmpOp) -> Result<Handle, FnError> {
+        let ta = self.table.get_tensor(a)?;
+        let tb = self.table.get_tensor(b)?;
+        if ta.shape() != tb.shape() {
+            return Err(error::shape_mismatch(format!(
+                "compare requires two tensors of the same shape, got {:?} and {:?}",
+                ta.shape(),
+                tb.shape()
+            )));
+        }
+        if !ta.origin().compatible_with(tb.origin()) {
+            return Err(error::shape_mismatch(
+                "compare operands come from different index spaces",
+            ));
+        }
+        if ta.len() != tb.len() {
+            return Err(error::shape_mismatch(
+                "compare requires two maps of equal length",
+            ));
+        }
+        if ta.is_i64() || tb.is_i64() {
+            return Err(error::shape_mismatch("compare requires f64 maps"));
+        }
+        let origin = ta.origin().unify(tb.origin());
+        let shape = ta.shape();
+        let n = ta.len();
+        // Charged before the loop, as admission control — `spmv`'s discipline
+        // rather than `ewise`'s charge-after-compute.
+        self.charge(n as u64)?;
+        let ta = self.table.get_tensor(a)?;
+        let tb = self.table.get_tensor(b)?;
+        let out: Vec<f64> = ta
+            .values()
+            .iter()
+            .zip(tb.values().iter())
+            .map(|(&x, &y)| {
+                let hit = match op {
+                    CmpOp::Gt => x > y,
+                    CmpOp::Ge => x >= y,
+                    CmpOp::Lt => x < y,
+                    CmpOp::Le => x <= y,
+                    CmpOp::Eq => x == y,
+                    CmpOp::Ne => x != y,
+                };
+                f64::from(u8::from(hit))
+            })
+            .collect();
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
     }
 
     fn set_to_map(&mut self, s: Handle, value: Scalar) -> Result<Handle, FnError> {
@@ -1073,7 +1198,7 @@ impl GraphCompute for AlgoSession {
             out[slot as usize] = v;
         }
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), Origin::Untracked)
     }
 
     fn map_to_set(&mut self, m: Handle, pred: Predicate) -> Result<Handle, FnError> {
@@ -1082,23 +1207,42 @@ impl GraphCompute for AlgoSession {
             return Err(error::shape_mismatch("map_to_set requires an f64 map"));
         }
         let n = t.len();
-        let mut set = VertexSet::with_capacity(n);
-        for (i, &x) in t.values().iter().enumerate() {
-            let hit = match pred {
+        let edge_shaped = t.is_edge_shaped();
+        let hits: Vec<u32> = t
+            .values()
+            .iter()
+            .enumerate()
+            .filter(|&(_, &x)| match pred {
                 Predicate::IsZero => x == 0.0,
                 Predicate::Gt(k) => x > k,
                 Predicate::Lt(k) => x < k,
                 Predicate::Eq(k) => x == k,
-            };
-            if hit {
+            })
+            .map(|(i, _)| {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "index bounded by tensor length which fits u32"
                 )]
-                set.insert(i as u32);
-            }
-        }
+                let idx = i as u32;
+                idx
+            })
+            .collect();
         self.charge(n as u64)?;
+        // Shape-polymorphic: an `[E]` tensor lowers to an `EdgeSet`, which is
+        // what `spmv_masked` / `expand_masked` consume. Always allocating a
+        // `VertexSet` left an edge threshold dead-ending in a wrong-kind handle,
+        // the one genuinely composition-blocked case behind the comparison ask.
+        if edge_shaped {
+            let mut mask = EdgeSet::with_capacity(n);
+            for idx in hits {
+                mask.insert(idx);
+            }
+            return self.alloc_edge_set(mask);
+        }
+        let mut set = VertexSet::with_capacity(n);
+        for idx in hits {
+            set.insert(idx);
+        }
         self.alloc_set(set)
     }
 
@@ -1131,18 +1275,48 @@ impl GraphCompute for AlgoSession {
     }
 
     fn set_union(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        // Set algebra is bitwise over equal-capacity word arrays, and the
+        // underlying `zip_with` *asserts* on a mismatch. Its doc comment says
+        // sets from one session always share the projection vertex count —
+        // which stopped being true once a session could bind more than one
+        // graph, making that assert reachable from guest input.
+        Self::require_same_capacity(
+            self.table.get_set(a)?.capacity(),
+            self.table.get_set(b)?.capacity(),
+            "set_union",
+        )?;
         let out = self.table.get_set(a)?.union(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
         self.alloc_set(out)
     }
 
     fn set_diff(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        // Set algebra is bitwise over equal-capacity word arrays, and the
+        // underlying `zip_with` *asserts* on a mismatch. Its doc comment says
+        // sets from one session always share the projection vertex count —
+        // which stopped being true once a session could bind more than one
+        // graph, making that assert reachable from guest input.
+        Self::require_same_capacity(
+            self.table.get_set(a)?.capacity(),
+            self.table.get_set(b)?.capacity(),
+            "set_diff",
+        )?;
         let out = self.table.get_set(a)?.difference(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
         self.alloc_set(out)
     }
 
     fn set_intersect(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        // Set algebra is bitwise over equal-capacity word arrays, and the
+        // underlying `zip_with` *asserts* on a mismatch. Its doc comment says
+        // sets from one session always share the projection vertex count —
+        // which stopped being true once a session could bind more than one
+        // graph, making that assert reachable from guest input.
+        Self::require_same_capacity(
+            self.table.get_set(a)?.capacity(),
+            self.table.get_set(b)?.capacity(),
+            "set_intersect",
+        )?;
         let out = self.table.get_set(a)?.intersect(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
         self.alloc_set(out)
@@ -1308,7 +1482,7 @@ impl GraphCompute for AlgoSession {
                 }
             }
             self.charge(graph.edge_count() as u64)?;
-            return self.alloc_tensor(Tensor::from_i64(out));
+            return self.alloc_tensor(Tensor::from_i64(out), Origin::Graph(g));
         }
 
         let src = src_f64.expect("non-i64 tensor captured an f64 source");
@@ -1388,7 +1562,7 @@ impl GraphCompute for AlgoSession {
         }
 
         self.charge(graph.edge_count() as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), Origin::Graph(g))
     }
 
     fn zero_map(&mut self, g: Handle, ty: DType) -> Result<Handle, FnError> {
@@ -1401,11 +1575,19 @@ impl GraphCompute for AlgoSession {
         } else {
             Tensor::from_f64(vec![0.0; n])
         };
-        self.alloc_tensor(tensor)
+        self.alloc_tensor(tensor, Origin::Graph(g))
     }
 
     fn scatter(&mut self, map: Handle, frontier: Handle, value: Scalar) -> Result<Handle, FnError> {
         let t = self.table.get_tensor(map)?;
+        // The frontier is a `VertexSet`, so its members are vertex slots. Writing
+        // them into an `[E]` tensor would index edges by vertex slot.
+        if t.is_edge_shaped() {
+            return Err(error::shape_mismatch(
+                "scatter writes vertex slots, so it expects a [V] map, got a [E] tensor",
+            ));
+        }
+        let origin = t.origin();
         if let Some(ivals) = t.values_i64() {
             let mut out = ivals.to_vec();
             let v = value.as_i64();
@@ -1414,7 +1596,7 @@ impl GraphCompute for AlgoSession {
                 out[slot as usize] = v;
             }
             self.charge(out.len() as u64)?;
-            return self.alloc_tensor(Tensor::from_i64(out));
+            return self.alloc_tensor(Tensor::from_i64(out), origin);
         }
         let mut out = t.values().to_vec();
         let set = self.table.get_set(frontier)?;
@@ -1423,7 +1605,7 @@ impl GraphCompute for AlgoSession {
             out[slot as usize] = v;
         }
         self.charge(out.len() as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), origin)
     }
 
     fn map_apply(&mut self, map: Handle, op: MapOp) -> Result<Handle, FnError> {
@@ -1434,6 +1616,7 @@ impl GraphCompute for AlgoSession {
         // Elementwise: the operation is shape-preserving, so a `[E]` tensor stays
         // `[E]` rather than collapsing to the `[V]` default (proposal §5).
         let shape = t.shape();
+        let origin = t.origin();
         let x = t.values();
         let n = x.len();
         let out: Vec<f64> = match op {
@@ -1460,7 +1643,7 @@ impl GraphCompute for AlgoSession {
             }
         };
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64_shaped(out, shape))
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
     }
 
     fn reduce(
@@ -1799,6 +1982,17 @@ impl GraphCompute for AlgoSession {
             }
             t.values().to_vec()
         };
+        // A NaN probability satisfies neither endpoint guard in
+        // `sample_bernoulli` and then loses `unit < prob`, so those draws would
+        // silently never fire. Reject before charging any budget. The check
+        // lives here rather than in `sample_bernoulli`, which is the
+        // differential suite's independent oracle and must stay a plain `bool`.
+        if probs.iter().any(|p| p.is_nan()) {
+            return Err(error::arg_validation(
+                "sampling probabilities must not contain NaN: a NaN draw never fires, \
+                 which would silently drop those elements from the mask",
+            ));
+        }
         let mut mask = VertexSet::with_capacity(probs.len());
         // Charge |V| — one draw per element — checked every BUDGET_CHECK_CHUNK
         // draws so a huge tensor against a small budget fails closed with at most
@@ -1838,7 +2032,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(e as u64)?;
-        self.alloc_tensor(Tensor::from_f64_edge(vals))
+        self.alloc_tensor(Tensor::from_f64_edge(vals), Origin::Graph(g))
     }
 
     fn edge_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError> {
@@ -1852,7 +2046,7 @@ impl GraphCompute for AlgoSession {
             })?
             .to_vec();
         self.charge(vals.len() as u64)?;
-        self.alloc_tensor(Tensor::from_f64_edge(vals))
+        self.alloc_tensor(Tensor::from_f64_edge(vals), Origin::Graph(g))
     }
 
     fn node_property(&mut self, g: Handle, name: &str) -> Result<Handle, FnError> {
@@ -1866,7 +2060,7 @@ impl GraphCompute for AlgoSession {
             })?
             .to_vec();
         self.charge(vals.len() as u64)?;
-        self.alloc_tensor(Tensor::from_f64(vals))
+        self.alloc_tensor(Tensor::from_f64(vals), Origin::Graph(g))
     }
 
     fn edges_all(&mut self, g: Handle) -> Result<Handle, FnError> {
@@ -1889,11 +2083,24 @@ impl GraphCompute for AlgoSession {
             }
             t.values().to_vec()
         };
+        let shape = self.table.get_tensor(values)?.shape();
+        let origin = self.table.get_tensor(values)?.origin();
         let grp = {
             let t = self.table.get_tensor(groups)?;
             if t.is_i64() {
                 return Err(error::shape_mismatch(
                     "segmented_reduce group labels must be an f64 map",
+                ));
+            }
+            if t.shape() != shape {
+                return Err(error::shape_mismatch(format!(
+                    "segmented_reduce values and groups must share a shape, got {shape:?} and {:?}",
+                    t.shape()
+                )));
+            }
+            if !t.origin().compatible_with(origin) {
+                return Err(error::shape_mismatch(
+                    "segmented_reduce values and groups come from different index spaces",
                 ));
             }
             t.values().to_vec()
@@ -1916,7 +2123,9 @@ impl GraphCompute for AlgoSession {
             .collect();
         let out: Vec<f64> = grp.iter().map(|&g| totals[&g.to_bits()]).collect();
         self.charge(vals.len() as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        // The result is keyed to the same space as its operands, one total per
+        // element — so it keeps their shape rather than collapsing to `[V]`.
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
     }
 
     fn sample_edges(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError> {
@@ -1935,6 +2144,17 @@ impl GraphCompute for AlgoSession {
             }
             t.values().to_vec()
         };
+        // A NaN probability satisfies neither endpoint guard in
+        // `sample_bernoulli` and then loses `unit < prob`, so those draws would
+        // silently never fire. Reject before charging any budget. The check
+        // lives here rather than in `sample_bernoulli`, which is the
+        // differential suite's independent oracle and must stay a plain `bool`.
+        if probs.iter().any(|p| p.is_nan()) {
+            return Err(error::arg_validation(
+                "sampling probabilities must not contain NaN: a NaN draw never fires, \
+                 which would silently drop those elements from the mask",
+            ));
+        }
         let mut mask = EdgeSet::with_capacity(probs.len());
         let mut since_check: u64 = 0;
         for (edge, &p) in probs.iter().enumerate() {
@@ -1980,6 +2200,17 @@ impl GraphCompute for AlgoSession {
             }
             t.values().to_vec()
         };
+        // A NaN probability satisfies neither endpoint guard in
+        // `sample_bernoulli` and then loses `unit < prob`, so those draws would
+        // silently never fire. Reject before charging any budget. The check
+        // lives here rather than in `sample_bernoulli`, which is the
+        // differential suite's independent oracle and must stay a plain `bool`.
+        if probs.iter().any(|p| p.is_nan()) {
+            return Err(error::arg_validation(
+                "sampling probabilities must not contain NaN: a NaN draw never fires, \
+                 which would silently drop those elements from the mask",
+            ));
+        }
         let mut mask = EdgeSet::with_capacity(probs.len());
         let mut since_check: u64 = 0;
         for u in 0..graph.vertex_count() as u32 {
@@ -2139,6 +2370,29 @@ impl GraphCompute for AlgoSession {
             }
             t.values().to_vec()
         };
+        // A NaN probability satisfies neither endpoint guard in
+        // `sample_bernoulli` and then loses `unit < prob`, so those draws would
+        // silently never fire. Reject before charging any budget. The check
+        // lives here rather than in `sample_bernoulli`, which is the
+        // differential suite's independent oracle and must stay a plain `bool`.
+        if probs.iter().any(|p| p.is_nan()) {
+            return Err(error::arg_validation(
+                "sampling probabilities must not contain NaN: a NaN draw never fires, \
+                 which would silently drop those elements from the mask",
+            ));
+        }
+        // The draw is keyed by global CSR out-edge index, so a probability tensor
+        // shorter than the edge count would index past its end. `sample_edges`
+        // derives its mask capacity from the tensor and is safe; here the graph
+        // supplies the indices, so the tensor must cover them.
+        if probs.len() != graph.edge_count() {
+            return Err(error::shape_mismatch(format!(
+                "expand_sampled: probability tensor has {} entries but the \
+                 projection has {} edges",
+                probs.len(),
+                graph.edge_count()
+            )));
+        }
         let excl = match exclude {
             Some(h) => Some(self.table.get_set(h)?.clone()),
             None => None,
@@ -2225,13 +2479,27 @@ impl GraphCompute for AlgoSession {
                 }
             }
         }
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), Origin::Graph(g))
     }
 
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {
         let n = self.table.get_graph(g)?.vertex_count();
         let wm = self.table.get_walks(walks)?;
         let total_steps: usize = wm.walks().iter().map(Vec::len).sum();
+        // The counter is sized from `g`, but the slots come from `walks`. A
+        // `Walks` handle produced over a larger graph indexed out of bounds and
+        // panicked the host; name the mismatch instead.
+        if let Some(bad) = wm
+            .walks()
+            .iter()
+            .flat_map(|w| w.iter())
+            .find(|&&slot| slot as usize >= n)
+        {
+            return Err(error::shape_mismatch(format!(
+                "walk_visit_counts: walk slot {bad} is outside the projection's \
+                 {n} vertices — the walks were produced over a different graph"
+            )));
+        }
         let mut counts = vec![0.0f64; n];
         for walk in wm.walks() {
             for &slot in walk {
@@ -2239,7 +2507,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(total_steps as u64)?;
-        self.alloc_tensor(Tensor::from_f64(counts))
+        self.alloc_tensor(Tensor::from_f64(counts), Origin::Graph(g))
     }
 
     fn emit_walks(&mut self, walks: Handle) -> Result<(), FnError> {
@@ -2312,7 +2580,7 @@ impl GraphCompute for AlgoSession {
             out[v as usize] = overlap_value(&src_nbrs, &v_nbrs, metric, aa_weight.as_deref());
         }
         self.charge(charged.max(n as u64))?;
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), Origin::Graph(g))
     }
 
     fn all_pairs_overlap(
@@ -2699,7 +2967,7 @@ impl GraphArenaCompute for AlgoSession {
         self.charge(u64::from(count))?;
         let slots = self.table.get_arena_mut(arena)?.alloc(count)?;
         let ids: Vec<i64> = slots.iter().map(|&s| i64::from(s)).collect();
-        self.alloc_tensor(Tensor::from_i64(ids))
+        self.alloc_tensor(Tensor::from_i64(ids), Origin::Arena(arena))
     }
 
     fn arena_link(&mut self, arena: Handle, parents: Handle, kids: Handle) -> Result<(), FnError> {
@@ -2739,7 +3007,7 @@ impl GraphArenaCompute for AlgoSession {
         // Charge per candidate produced, plus per root scanned.
         let work = out.len() as u64 + rs.len() as u64;
         self.charge(work)?;
-        self.alloc_tensor(Tensor::from_i64(out))
+        self.alloc_tensor(Tensor::from_i64(out), Origin::Arena(arena))
     }
 
     fn arena_gather(
@@ -2757,7 +3025,7 @@ impl GraphArenaCompute for AlgoSession {
             a.check_slot(s)?;
             out.push(col[s as usize]);
         }
-        self.alloc_tensor(Tensor::from_f64(out))
+        self.alloc_tensor(Tensor::from_f64(out), Origin::Arena(arena))
     }
 
     fn arena_scatter(
@@ -2827,7 +3095,7 @@ impl GraphArenaCompute for AlgoSession {
             .descend(&rs, score, visit, maximize, vloss)?;
         self.charge(inspected)?;
         let ids: Vec<i64> = leaves.iter().map(|&s| i64::from(s)).collect();
-        self.alloc_tensor(Tensor::from_i64(ids))
+        self.alloc_tensor(Tensor::from_i64(ids), Origin::Arena(arena))
     }
 
     fn arena_expand(
@@ -2851,7 +3119,7 @@ impl GraphArenaCompute for AlgoSession {
             }
             out.extend(kids.iter().map(|&k| i64::from(k)));
         }
-        self.alloc_tensor(Tensor::from_i64(out))
+        self.alloc_tensor(Tensor::from_i64(out), Origin::Arena(arena))
     }
 
     fn arena_freeze(&mut self, arena: Handle) -> Result<Handle, FnError> {
@@ -2881,7 +3149,7 @@ impl AlgoSession {
     /// Test-only: inserts a tensor so a differential test can build operands
     /// without going through a kernel that would also charge work.
     pub(crate) fn alloc_tensor_for_test(&mut self, t: Tensor) -> Result<Handle, FnError> {
-        self.alloc_tensor(t)
+        self.alloc_tensor(t, Origin::Untracked)
     }
 
     /// Test-only: reads back a tensor result.

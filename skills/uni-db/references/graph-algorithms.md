@@ -633,7 +633,7 @@ valid ewise ops: add, mul, min, max, axpy, div
 | `a ** 2`, integer powers | `repeat ewise(x, x, "mul"); x squared is ewise(a, a, "mul")` |
 | `-a` | `map_apply(a, "scale", -1.0)` |
 | `normalize(m)` | `map_apply(m, "normalize_l1") or map_apply(m, "normalize_l2")` |
-| an exact edge mask | `edge_mask_window(edge_property(g, prop), 0.5, 1.5)` |
+| an exact edge mask (edge-type / class selector) | `edge_mask_window(edge_property(g, prop), 0.5, 1.5)` — deterministic, no RNG. `sample_edges(sel, seed, iter)` yields the same mask because `prob = 0.0` never fires and `prob = 1.0` always does, **for every seed** — that endpoint behaviour is a guarantee, not an accident. Prefer the window: it says what it means. |
 
 Two caveats worth knowing before you rely on them:
 

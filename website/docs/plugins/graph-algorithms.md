@@ -314,10 +314,22 @@ quietly misleading you.
 | Kernel | Returns |
 | --- | --- |
 | `edge_set_len` | Cardinality of an edge mask. |
-| `sample_edges(prob, seed, iter)` | Per-edge Bernoulli mask from a reproducible counter-hash; `prob` is an `[E]` tensor. |
+| `sample_edges(prob, seed, iter)` | Per-edge Bernoulli mask from a reproducible counter-hash; `prob` is an `[E]` tensor. **Guaranteed** exact at the endpoints — `prob = 0.0` never fires, `prob = 1.0` always does, for every seed. |
 | `sample_edges_undirected(g, prob, seed, iter)` | Like `sample_edges`, but both half-edges of an undirected pair (`u→v` and `v→u`) share **one** Bernoulli draw, keyed on the canonical unordered endpoint pair — so an undirected link is up-or-down as a unit. For simple undirected graphs (not multigraphs with parallel edges). |
 | `edge_mask_window(vals, lo, hi)` | Threshold an `[E]` column into a mask — e.g. a temporal window. |
 | `edge_intersect` / `edge_union` | Mask algebra. |
+
+!!! note "Selecting edges by a stored class — use `edge_mask_window`"
+
+    A common need is restricting an operation to one edge class inside a single projection: store a 1.0/0.0 selector property per edge, then build a mask from it. `edge_mask_window` does this directly and deterministically, with no RNG in the path:
+
+    ```rhai
+    let sel = gc.edge_property(g, "sel_agg");        // 1.0 on :AGGREGATES, 0.0 elsewhere
+    let m   = gc.edge_mask_window(sel, 0.5, 1.5);    // exactly the 1.0 edges
+    let agg = gc.spmv_masked(g, contrib, "linear_algebra", m);
+    ```
+
+    `sample_edges(sel, seed, iter)` gives the same mask, because the endpoint behaviour above is a guarantee rather than an accident. Prefer `edge_mask_window` anyway: it says what it means, and it cannot be misread as depending on the seed.
 | `segmented_reduce(values, groups)` | Group a `[V]` map by a label map and reduce, **bitwise-identical regardless of vertex order or partitioning**. |
 
 Together these express reachability or SpMV over a random edge subset (percolation, influence maximization) or a per-event-time subset (temporal reachability) — with no per-element guest code.

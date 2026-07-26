@@ -3819,6 +3819,64 @@ fn an_arena_can_be_frozen_and_aggregated_over() {
     );
 }
 
+/// Degenerate sampling probabilities are exact, and seed-independent.
+///
+/// `sample_edges(p, ..)` at `p` of exactly 0.0 or 1.0 is deterministic: the draw
+/// is `unit < prob` with `unit ∈ [0,1)`, plus explicit endpoint short-circuits in
+/// `sample_bernoulli`. Downstream users build **edge-type masks** on this — a
+/// stored 1.0/0.0 selector column sampled at those endpoints — so it is a
+/// contract, not an implementation detail, and this test is what stops it being
+/// optimised away.
+///
+/// It also pins the better spelling: `edge_mask_window` selects the same edges
+/// deterministically by construction, with no RNG in the path at all.
+#[test]
+fn degenerate_sampling_probabilities_are_exact_and_seed_independent() {
+    // Edge weights double as a 1.0/0.0 selector column, exactly as a caller's
+    // stored `sel_*` edge property would.
+    let (mut s, g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)],
+        true, // the weights ARE the selector column
+        false,
+    ));
+    let sel = s.edge_weights(g).expect("selector column");
+
+    // The endpoints hold for every seed and every iteration counter.
+    for seed in [0u64, 1, 7, 42, u64::MAX] {
+        for iter in [0u64, 3] {
+            let picked = s.sample_edges(sel, seed, iter).expect("sample");
+            assert_eq!(
+                s.edge_set_len(picked).expect("len"),
+                2,
+                "p∈{{0,1}} must select exactly the 1.0 edges (seed {seed}, iter {iter})"
+            );
+        }
+    }
+
+    // The deterministic spelling selects the same set — so a caller needing an
+    // edge-type mask never has to route through the sampler at all.
+    let windowed = s.edge_mask_window(sel, 0.5, 1.5).expect("window");
+    let sampled = s.sample_edges(sel, 9, 0).expect("sample");
+    let both = s.edge_intersect(windowed, sampled).expect("intersect");
+    assert_eq!(
+        s.edge_set_len(both).expect("len"),
+        2,
+        "edge_mask_window and endpoint-sampling must agree edge for edge"
+    );
+
+    // An all-zero column selects nothing, again for any seed.
+    let zeros = s
+        .map_apply(sel, MapOp::Scale(0.0))
+        .expect("zero the column");
+    let none = s.sample_edges(zeros, 3, 0).expect("sample");
+    assert_eq!(
+        s.edge_set_len(none).expect("len"),
+        0,
+        "p = 0.0 must never fire"
+    );
+}
+
 /// `rekey` is a verified move between projections, not a cast.
 ///
 /// It is the escape hatch that makes named scopes useful: two edge layers over

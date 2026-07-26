@@ -157,7 +157,10 @@ fn parse_config(config_json: &str) -> Result<(Vec<Vid>, f64, GraphProjectionSpec
     // force no-reverse regardless of the includeReverse hint to avoid building
     // an unused in-CSR.
     let mut spec = match args.get(2) {
-        Some(serde_json::Value::Object(cfg)) => GraphProjectionSpec::from_config_object(cfg),
+        Some(serde_json::Value::Object(cfg)) => {
+            GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcpagerank")?;
+            GraphProjectionSpec::from_config_object(cfg)
+        }
         _ => GraphProjectionSpec::default(),
     };
     spec.include_reverse = false;

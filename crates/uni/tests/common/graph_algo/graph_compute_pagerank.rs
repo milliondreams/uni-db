@@ -874,3 +874,61 @@ async fn fail_closed_unscoped_projection_under_restricted_scope() -> anyhow::Res
 
     Ok(())
 }
+
+/// A first-party provider rejects a `scopes` map instead of ignoring it.
+///
+/// `scopes` had to join `CONFIG_KEYS` so a scopes-only object is stripped from a
+/// guest's positional arguments — but that stripping applies to *every*
+/// algorithm, while only the guest loader adapters build the declared
+/// projections. Without this, `uni.algo.gc*` would accept a `scopes` map, project
+/// nothing, and run as though it had never been asked: the same silent-ignore
+/// the unscoped-projection change made loud.
+///
+/// Covering all three first-party providers here is the anti-drift device — a
+/// fourth one that forgets the check fails this test rather than shipping the
+/// silent behaviour.
+#[tokio::test]
+async fn first_party_providers_reject_named_scopes() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let session = db.session();
+    let scopes = "scopes: {agg: {nodeLabels: ['Node'], edgeTypes: ['LINKS']}}";
+
+    for (label, query) in [
+        (
+            "uni.algo.gcpagerank",
+            format!(
+                "CALL uni.algo.gcpagerank({vid_a}, 0.85, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD nodeId, score RETURN nodeId"
+            ),
+        ),
+        (
+            "uni.algo.gcwalks",
+            format!(
+                "CALL uni.algo.gcwalks([{vid_a}], 2, 1, 1.0, 1.0, 7, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD walkId RETURN walkId"
+            ),
+        ),
+        (
+            "uni.algo.gcoverlap",
+            format!(
+                "CALL uni.algo.gcoverlap('count', 'adjacent', 0, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD sourceNodeId RETURN sourceNodeId"
+            ),
+        ),
+    ] {
+        let err = session
+            .query(&query)
+            .await
+            .expect_err("a fixed-algorithm provider must refuse named scopes");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not take named `scopes`"),
+            "{label} must name the reason it refuses, got: {msg}"
+        );
+    }
+    Ok(())
+}

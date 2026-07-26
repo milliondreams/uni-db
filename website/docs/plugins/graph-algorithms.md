@@ -108,9 +108,24 @@ let g    = gc.graph();              // the primary projection
 let agg  = gc.graph_named("agg");   // a pre-declared scope
 ```
 
-Each scope takes the **full** projection-config vocabulary independently — Native `nodeLabels` / `edgeTypes` / `weightProperty` / `nodeProperties`, or a Cypher `nodeQuery` / `edgeQuery`, or a `name` for a stored named graph. WASM and Extism guests receive the scope handles as a `graphs` object in their invocation JSON alongside the existing `graph` key; the key is additive, so a guest written before scopes existed ignores it.
+```python
+g   = gc.graph()                    # the primary projection
+agg = gc.graph_named("agg")         # a pre-declared scope
+```
+
+Sandboxed guests do not call `graph_named` at all — the handles arrive beside `graph` in the invocation JSON, keyed by their CALL-site names:
+
+```json
+{"session": 3, "graph": 12884901888, "args": [], "graphs": {"agg": 12884901889}}
+```
+
+The `graphs` key is additive, so a guest written before named scopes existed ignores it and behaves exactly as before.
+
+Each scope takes the **full** projection-config vocabulary independently — Native `nodeLabels` / `edgeTypes` / `weightProperty` / `nodeProperties`, or a Cypher `nodeQuery` / `edgeQuery`, or a `name` for a stored named graph.
 
 Three properties are worth being precise about.
+
+Named scopes are a *guest-authored-algorithm* feature: the guest is what decides which scope to read. The first-party `uni.algo.gc*` procedures run a fixed algorithm over one projection, so passing them a `scopes` map is an error rather than a silently ignored hint.
 
 **Scopes are built before your algorithm runs.** `graph_named` is a lookup, not a projection. This is deliberate: projection is `O(V+E)` storage work that the native-work meter does not govern, so a guest able to project on demand could project in a loop and escape the budget entirely. Declaring scopes at the call site keeps the cost bounded and visible to the caller.
 
@@ -154,6 +169,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | Kernel | Returns |
 | --- | --- |
 | `graph` | The bound graph handle (in-process loaders; sandboxed guests get it in their args). |
+| `graph_named(name)` | The handle of a pre-declared [named scope](#more-than-one-graph-named-scopes) (in-process loaders; sandboxed guests get the scope handles in their `graphs` map). |
 | `vertex_count` / `edge_count` | Scalar counts. |
 | `degrees(g, dir)` | `[V]` degree map, `"out"`, `"in"`, or `"both"` (the union of out+in edges). `"both"` requires a projection built with `includeReverse: true` — see [Direction `both`](#direction-both). |
 | `vertex_ids(g)` | `[V]` map of each vertex's own slot id — the initializer for label-propagation-style algorithms. |
@@ -497,6 +513,7 @@ raising it — an explicit grant is authoritative in both directions.
 | `sample_edges`, `sample_edges_undirected` | `|E|`, checked in chunks |
 | `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce_sum`, `reduce_sum_masked`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
 | `frontier` | one unit per seed |
+| `rekey` | `|V|` — it walks both projections' slot→Vid maps to verify the correspondence |
 | `set_union` / `set_diff` / `set_intersect` | one unit per 64-bit *word*, not per element |
 | `emit` | `rows x columns` |
 | `random_walks`, `walk_visit_counts`, `emit_walks` | total steps |

@@ -1086,9 +1086,60 @@ kept, and the `UNI_GC_TRACE` gate was falsified by deleting the env read — a p
 test proves nothing about a feature until it has been seen to fail without it, which
 is the specific lesson of §24.
 
-## 27. Still open
+## 27. Closing the follow-up review
+
+A second review after landing §25 found the feature shipped further than it was
+verified, plus one defect I introduced.
+
+**`scopes` was accepted and silently ignored by every first-party provider.**
+`scopes` had to join `CONFIG_KEYS` so a scopes-only object is stripped from a
+guest's positional arguments — but that stripping applies to *every* algorithm,
+while only the guest loader adapters build the declared projections. So
+`CALL uni.algo.gcpagerank(..., {scopes: {...}})` ran successfully and projected
+nothing, and a Cypher scope on such a call could even fail with a confusing
+`0x820` for a projection that would have been discarded anyway. All three
+first-party providers now reject `scopes` naming the reason, with one test
+covering all three so a fourth provider that forgets fails rather than shipping
+the silent behaviour.
+
+**The sandboxed half was write-only.** The host emitted `"graphs"` into the WASM
+and Extism invoke payloads and *nothing read it* — no guest, no test, at any
+level. Both example guests gained a `layers` algorithm that reads the map and
+crosses index spaces with `rekey`, the fixtures were rebuilt, and both loaders now
+have an e2e test. This was the one item where "it compiles and the docs describe
+it" could have passed for done.
+
+**`HostSuppliedOtherwise` was a blanket reachability exemption.** Both in-process
+loaders' kernel-reachability tripwires filtered on `all_loaders()`, which excludes
+that bucket — so deleting `graph_named` from either loader broke nothing in CI,
+and `graph` had been in the same position since the bucket was introduced. But the
+bucket means "a *sandboxed* guest receives this in its arguments", which is a
+statement about WASM and Extism only: Rhai and Python guests call these as ordinary
+methods. Both tests now filter on a new `KernelId::in_process()`, and the Rhai one
+was falsified by deleting the registration line.
+
+**PyO3 named scopes had no e2e coverage at all** — shipped, plumbed, and
+unexercised. Now tested end-to-end, as are all four loaders.
+
+Two smaller defects in `rekey` itself: it charged the `O(V)` correspondence walk
+*before* rejecting a value kind that could never be re-keyed, so the meter was
+debited for a call that was always going to fail; and its `# Errors` doc listed
+only `0x862` while the already-keyed-to-this-projection path returns `0x86E`. Both
+fixed, both now pinned by assertions on the code rather than `is_err()`.
+
+Also removed `has_resolver` (added speculatively, no caller), corrected
+`take_from_args`' doc claim to be "the single definition" of a convention it no
+longer solely defines, and added tests for the two `is not a kernel op` refusals
+and the doc tables that omitted `graph_named` and `rekey`.
+
+## 28. Still open
 
 - **Version bump and release notes.** Six breaking commits are now unreleased.
+- **Two pyo3 failures are pre-existing** and unrelated to GraphCompute:
+  `adapter_scalar::scalar_vec_*` and
+  `m8_pyo3_cross_loader_parity::pyo3_haversine_vectorized_matches_native_within_4_ulp`.
+  All three were re-confirmed against a stashed tree; they are a scalar-vectorization
+  family, not touched by this work.
 - **`from_rows` does not sort.** Making it sort would give Cypher projections slot
   correspondence, but changes the `nodeId` row ordering of every existing
   Cypher-projection algorithm — an observable output change, not a free fix. `rekey`

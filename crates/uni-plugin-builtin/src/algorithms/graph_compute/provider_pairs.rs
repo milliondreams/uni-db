@@ -166,6 +166,7 @@ fn parse_config(config_json: &str) -> Result<OverlapArgs, FnError> {
         ..GraphProjectionSpec::default()
     };
     if let Some(serde_json::Value::Object(cfg)) = args.get(3) {
+        GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcoverlap")?;
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             projection.node_labels = labels
                 .iter()

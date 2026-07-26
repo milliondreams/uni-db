@@ -185,6 +185,26 @@ impl KernelId {
             .copied()
             .filter(|k| k.reach() == KernelReach::AllLoaders)
     }
+
+    /// The kernels an **in-process** loader (Rhai, PyO3) must expose.
+    ///
+    /// [`KernelReach::HostSuppliedOtherwise`] means "a *sandboxed* guest receives
+    /// this in its invocation arguments instead of calling for it" — it is a
+    /// statement about WASM and Extism, not a blanket exemption. Rhai and PyO3
+    /// guests hold a session object and call `graph()` / `graph_named(..)` on it,
+    /// so for them these are ordinary methods that must exist.
+    ///
+    /// Filtering the in-process reachability tests on [`Self::all_loaders`] alone
+    /// let `graph_named` ship with no assertion that either loader registered it;
+    /// `graph` had been in the same position since the bucket was introduced.
+    pub fn in_process() -> impl Iterator<Item = KernelId> {
+        Self::ALL.iter().copied().filter(|k| {
+            matches!(
+                k.reach(),
+                KernelReach::AllLoaders | KernelReach::HostSuppliedOtherwise
+            )
+        })
+    }
 }
 
 #[cfg(test)]

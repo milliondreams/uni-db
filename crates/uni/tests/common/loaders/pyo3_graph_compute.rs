@@ -296,3 +296,103 @@ async fn python_guest_emits_two_declared_columns() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A Python guest reading a pre-declared named scope, and crossing index spaces.
+///
+/// The PyO3 `graph_named` shipped with no end-to-end coverage, and its
+/// reachability tripwire filtered on `all_loaders()` — which excludes the
+/// host-supplied bucket — so deleting the method broke nothing in CI. That
+/// tripwire now covers the in-process bucket; this proves the method works.
+const SCOPES_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pyscopes")
+db.set_version("0.1.0")
+
+@db.algorithm("layers", args=[], yields=["nodeId:int", "both:float"])
+def layers(gc):
+    g = gc.graph()
+    agg = gc.graph_named("agg")
+    a = gc.degrees(g, "out")
+    b = gc.degrees(agg, "out")
+    # `b` is keyed to `agg`; crossing index spaces needs a verified rekey.
+    moved = gc.rekey(b, g)
+    total = gc.ewise(a, moved, "add")
+    gc.free(a)
+    gc.free(b)
+    gc.free(moved)
+    gc.emit("both", total)
+"#;
+
+async fn build_two_layer_graph(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Node")
+        .property("name", DataType::String)
+        .done()
+        .edge_type("LINKS", &["Node"], &["Node"])
+        .done()
+        .edge_type("SECOND", &["Node"], &["Node"])
+        .done()
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    for name in ["A", "B", "C", "D"] {
+        tx.execute(&format!("CREATE (:Node {{name: '{name}'}})"))
+            .await?;
+    }
+    for (a, b) in [("A", "B"), ("B", "C"), ("C", "A"), ("A", "D")] {
+        tx.execute(&format!(
+            "MATCH (a:Node {{name: '{a}'}}), (b:Node {{name: '{b}'}}) CREATE (a)-[:LINKS]->(b)"
+        ))
+        .await?;
+    }
+    for (a, b) in [("A", "C"), ("C", "D")] {
+        tx.execute(&format!(
+            "MATCH (a:Node {{name: '{a}'}}), (b:Node {{name: '{b}'}}) CREATE (a)-[:SECOND]->(b)"
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pyo3_guest_reads_a_named_scope() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pyscopes");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    Python::attach(|py| {
+        db.load_python_plugin(py, &loader, SCOPES_MODULE, "ai.example.pyscopes", &caps)
+            .expect("load_python_plugin succeeds")
+    });
+
+    let res = db
+        .session()
+        .query(
+            "CALL ai.example.pyscopes.layers({\
+               nodeLabels: ['Node'], edgeTypes: ['LINKS'], \
+               scopes: {agg: {nodeLabels: ['Node'], edgeTypes: ['SECOND']}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await?;
+    assert_eq!(res.rows().len(), 4, "one row per projected vertex");
+    let total: f64 = res
+        .rows()
+        .iter()
+        .map(|r| r.get::<f64>("both").unwrap_or(f64::NAN))
+        .sum();
+    assert!(
+        (total - 6.0).abs() < 1e-9,
+        "the scope must contribute its 2 SECOND edges on top of the primary's 4 \
+         LINKS edges, got {total}"
+    );
+    Ok(())
+}

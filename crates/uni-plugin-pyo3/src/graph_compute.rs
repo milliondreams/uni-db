@@ -976,17 +976,21 @@ mod tests {
     /// This is the assertion that was missing when `edge_count` shipped
     /// dispatchable over JSON but invisible to Rhai and Python guests.
     #[test]
-    fn every_all_loaders_kernel_is_reachable_from_python() {
+    fn every_in_process_kernel_is_reachable_from_python() {
         Python::initialize();
         Python::attach(|py| {
             let ty = py.get_type::<GcSession>();
-            let missing: Vec<&str> = KernelId::all_loaders()
+            // `in_process`, not `all_loaders`: a Python guest holds the session
+            // object and calls `graph()` / `graph_named(..)` on it, so the
+            // host-supplied bucket must exist here too. Filtering on
+            // `all_loaders` let `graph_named` ship unasserted.
+            let missing: Vec<&str> = KernelId::in_process()
                 .filter(|k| !ty.hasattr(k.op_name()).unwrap_or(false))
                 .map(KernelId::op_name)
                 .collect();
             assert!(
                 missing.is_empty(),
-                "kernels dispatchable over JSON but absent from the Python surface: {missing:?}"
+                "kernels in the catalog but absent from the Python surface: {missing:?}"
             );
 
             // `LoaderLocal` is reserved and currently empty, so this loop is

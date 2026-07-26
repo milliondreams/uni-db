@@ -1124,19 +1124,22 @@ mod tests {
     /// It is meaningful because `register_kernels` registers and reports from
     /// one declaration: it cannot claim a kernel it did not register.
     #[test]
-    fn every_all_loaders_kernel_is_reachable_from_rhai() {
+    fn every_in_process_kernel_is_reachable_from_rhai() {
         let mut engine = Engine::new();
         engine.register_type_with_name::<GcSession>("GcSession");
         let registered: std::collections::HashSet<KernelId> =
             register_kernels(&mut engine).into_iter().collect();
 
-        let missing: Vec<&str> = KernelId::all_loaders()
+        // `in_process`, not `all_loaders`: Rhai guests call `graph()` and
+        // `graph_named(..)` on the session object, so the host-supplied bucket is
+        // reachable here even though sandboxed guests get those handles in args.
+        let missing: Vec<&str> = KernelId::in_process()
             .filter(|k| !registered.contains(k))
             .map(KernelId::op_name)
             .collect();
         assert!(
             missing.is_empty(),
-            "kernels dispatchable over JSON but absent from the Rhai surface: {missing:?}"
+            "kernels in the catalog but absent from the Rhai surface: {missing:?}"
         );
     }
 

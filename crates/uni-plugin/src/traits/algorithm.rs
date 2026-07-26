@@ -508,6 +508,39 @@ impl GraphProjectionSpec {
         Ok(out)
     }
 
+    /// Rejects a `scopes` map on an algorithm that does not consume one.
+    ///
+    /// `scopes` joined [`Self::CONFIG_KEYS`] so a scopes-only object is stripped
+    /// from the guest's positional arguments. That stripping applies to *every*
+    /// algorithm, but only the guest loader adapters build the declared
+    /// projections — so without this a first-party provider would accept a
+    /// `scopes` map, project nothing, and run as if it had never been asked.
+    /// Silently ignoring a projection the caller asked for is the same failure
+    /// the unscoped-projection change (G9) made loud; this keeps it loud.
+    ///
+    /// # Errors
+    /// Returns `0x86E` naming `algorithm` when `cfg` carries a non-empty `scopes`.
+    pub fn reject_scopes(
+        cfg: &serde_json::Map<String, serde_json::Value>,
+        algorithm: &str,
+    ) -> Result<(), FnError> {
+        let has_scopes = cfg
+            .get("scopes")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|m| !m.is_empty());
+        if !has_scopes {
+            return Ok(());
+        }
+        Err(FnError::new(
+            0x86E,
+            format!(
+                "{algorithm} does not take named `scopes`: it runs a fixed algorithm over \
+                 one projection. Named scopes are a guest-authored-algorithm feature -- \
+                 the guest is what decides which scope to read."
+            ),
+        ))
+    }
+
     /// Like [`Self::take_from_args`] but also returns the raw config object.
     ///
     /// [`Self::take_from_args`] discards the object after parsing, which is fine
@@ -534,8 +567,13 @@ impl GraphProjectionSpec {
     /// [`Self::CONFIG_KEYS`] key, removes it from `args` and returns the parsed
     /// Native spec; otherwise leaves `args` untouched and returns `None`.
     ///
-    /// This is the single definition of the "trailing object is the projection
-    /// config" convention, shared by all four guest loaders. In P3 Cypher/Named
+    /// The Native-spec half of the "trailing object is the projection config"
+    /// convention. The guest loaders now go through
+    /// [`ProjectionPlan`](../../../uni_plugin_builtin/algorithms/bridge/struct.ProjectionPlan.html),
+    /// which needs the raw object to parse `scopes`; this remains for callers
+    /// that want only the Native knobs. Both share
+    /// [`Self::take_config_from_args`], so the recognition rule cannot drift.
+    /// In P3 Cypher/Named
     /// mode the returned Native spec is empty (the query/name keys are unknown
     /// to [`Self::from_config_object`]) and is ignored by the bridge in favor of
     /// the pre-built projection — but the object is still stripped here so it

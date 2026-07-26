@@ -3820,10 +3820,31 @@ fn rekey_moves_a_value_between_projections_only_when_they_correspond() {
         err.message
     );
 
-    // Re-keying to the value's own projection is a caller mistake, not a no-op.
+    // Re-keying to the value's own projection is a caller mistake, not a no-op,
+    // and reports as an argument fault rather than a shape one.
+    let err = s
+        .rekey(deg_a, ga)
+        .expect_err("rekey to the same projection must be reported");
+    assert_eq!(
+        err.code,
+        super::error::ARG_VALIDATION,
+        "a same-projection rekey is an argument fault (0x86E), not a shape one"
+    );
+
+    // A value that could never be re-keyed must not debit the work meter for the
+    // O(V) correspondence walk it was never going to reach.
+    let walks = s
+        .random_walks(ga, 2, 1, &[Vid::new(0)], 1.0, 1.0, 3)
+        .expect("walks on a");
+    let before = s.work_spent_units();
     assert!(
-        s.rekey(deg_a, ga).is_err(),
-        "rekey to the same projection must be reported rather than silently ignored"
+        s.rekey(walks, gb).is_err(),
+        "a walk matrix has no [V] keying to move"
+    );
+    assert_eq!(
+        s.work_spent_units(),
+        before,
+        "a rejected rekey must not charge the correspondence walk"
     );
 }
 

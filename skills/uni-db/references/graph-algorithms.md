@@ -750,6 +750,7 @@ raising it — an explicit grant is authoritative in both directions.
 | `sample_edges`, `sample_edges_undirected` | `|E|`, checked in chunks |
 | `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce_sum`, `reduce_sum_masked`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
 | `frontier` | one unit per seed |
+| `rekey` | `|V|` — it walks both projections' slot→Vid maps to verify the correspondence |
 | `set_union` / `set_diff` / `set_intersect` | one unit per 64-bit *word*, not per element |
 | `emit` | `rows x columns` |
 | `random_walks`, `walk_visit_counts`, `emit_walks` | total steps |

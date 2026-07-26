@@ -167,12 +167,6 @@ impl AlgorithmHostBridge {
         self
     }
 
-    /// Whether a Cypher/Named resolver is installed on this bridge.
-    #[must_use]
-    pub fn has_resolver(&self) -> bool {
-        self.resolver.is_some()
-    }
-
     /// Whether the effective `HostQuery` grant names a restricting scope (a
     /// non-empty prefix list that is not the universal `**`/`*` wildcard).
     fn host_query_scope_restricted(&self) -> bool {

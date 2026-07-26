@@ -904,6 +904,43 @@ mod tests {
         );
     }
 
+    /// The two host-supplied kernels refuse the JSON path, and say why.
+    ///
+    /// `graph` and `graph_named` sit in the catalog so every loader surface is
+    /// checked against one list, but a sandboxed guest receives those handles in
+    /// its invocation arguments. Dispatching them explains that rather than
+    /// reporting an unknown op — and neither arm had a test, so the wording could
+    /// have decayed into the generic message unnoticed.
+    #[test]
+    fn the_host_supplied_kernels_refuse_the_json_path_with_a_reason() {
+        let registry = GraphComputeRegistry::new();
+        let session = AlgoSession::new(
+            7,
+            WorkBudget::from_graph_size(4, 4),
+            Arena::new(1 << 20, 4096),
+        );
+        let sid = registry.open(session);
+
+        for (op, needle) in [
+            ("graph", "invoke-algorithm arguments"),
+            ("graph_named", "`graphs` map"),
+        ] {
+            let raw = registry.call_json(&format!(r#"{{"session":{sid},"op":"{op}"}}"#));
+            let resp: KernelResponse = serde_json::from_str(&raw).expect("a typed response");
+            match resp {
+                KernelResponse::Err { code, message } => {
+                    assert_eq!(code, super::super::error::ARG_VALIDATION, "{op} code");
+                    assert!(
+                        message.contains(needle),
+                        "the `{op}` refusal must say where the handle actually comes \
+                         from, got: {message}"
+                    );
+                }
+                other => panic!("`{op}` over JSON must be refused, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn new_kernels_reachable_via_json() {
         // W3 (B2): edge_count / topk / arg_extreme / scatter / generic map_apply

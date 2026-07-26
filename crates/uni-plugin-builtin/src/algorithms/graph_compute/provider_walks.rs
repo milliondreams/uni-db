@@ -213,6 +213,7 @@ fn parse_config(config_json: &str) -> Result<WalksArgs, FnError> {
         ..GraphProjectionSpec::default()
     };
     if let Some(serde_json::Value::Object(cfg)) = args.get(6) {
+        GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcwalks")?;
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             spec.node_labels = labels
                 .iter()

@@ -1147,8 +1147,11 @@ pub trait GraphCompute {
     /// Charges `O(V)` for the comparison.
     ///
     /// # Errors
-    /// Returns `0x862` if the value is `[E]`-shaped, if the vertex counts differ,
-    /// or if any slot maps to a different Vid in the two projections.
+    /// Returns `0x862` if the value is `[E]`-shaped or of a kind with no vertex
+    /// keying, if the vertex counts differ, or if any slot maps to a different
+    /// Vid in the two projections. Returns `0x86E` if the value is already keyed
+    /// to `g` — a caller mistake worth naming rather than silently accepting,
+    /// since it usually means the wrong handle was passed.
     fn rekey(&mut self, value: Handle, g: Handle) -> Result<Handle, FnError>;
 
     /// Group 8 (egress): emits each walk as `(walk_id, step, nodeId)` rows.
@@ -2826,6 +2829,24 @@ impl GraphCompute for AlgoSession {
                 "rekey: the value is already keyed to this projection",
             ));
         }
+        // Reject an unusable value *before* charging the correspondence walk: a
+        // call that could never succeed must not debit the meter.
+        match value.kind() {
+            Some(HandleKind::VertexSet) => {}
+            Some(HandleKind::Tensor) => {
+                if self.table.get_tensor(value)?.is_edge_shaped() {
+                    return Err(error::shape_mismatch(
+                        "rekey accepts [V] values only: CSR edge order belongs to one \
+                         projection's topology and does not carry across",
+                    ));
+                }
+            }
+            other => {
+                return Err(error::shape_mismatch(format!(
+                    "rekey accepts [V] tensors and vertex sets, got {other:?}"
+                )));
+            }
+        }
         let source = Arc::clone(self.table.get_graph(src_h)?);
         if source.vertex_count() != target.vertex_count() {
             return Err(error::shape_mismatch(format!(
@@ -2847,26 +2868,17 @@ impl GraphCompute for AlgoSession {
                 )));
             }
         }
-        // Verified: reproduce the value under the target's identity.
+        // Verified: reproduce the value under the target's identity. The kind was
+        // narrowed to these two above, so anything else is unreachable.
         match value.kind() {
             Some(HandleKind::Tensor) => {
-                let t = self.table.get_tensor(value)?;
-                if t.is_edge_shaped() {
-                    return Err(error::shape_mismatch(
-                        "rekey accepts [V] values only: CSR edge order belongs to one \
-                         projection's topology and does not carry across",
-                    ));
-                }
-                let copy = t.clone();
+                let copy = self.table.get_tensor(value)?.clone();
                 self.alloc_tensor(copy, Origin::Graph(g))
             }
-            Some(HandleKind::VertexSet) => {
+            _ => {
                 let copy = self.table.get_set(value)?.clone();
                 self.alloc_set(copy, Origin::Graph(g))
             }
-            other => Err(error::shape_mismatch(format!(
-                "rekey accepts [V] tensors and vertex sets, got {other:?}"
-            ))),
         }
     }
 

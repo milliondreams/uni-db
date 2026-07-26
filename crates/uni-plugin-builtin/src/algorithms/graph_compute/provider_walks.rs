@@ -278,8 +278,13 @@ impl AlgorithmProvider for GraphComputeWalksProvider {
             // Walks emit their own `nodeId` data column, so — unlike gcpagerank —
             // the session installs NO expected-columns contract (the host does
             // not prepend a `nodeId` here).
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at);
+            let mut session = AlgoSession::new(
+                super::next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("gcwalks: {e}")))?,
+                budget,
+                arena,
+            )
+            .with_deadline(deadline_at);
             let g = session.bind_graph(Arc::clone(&graph));
 
             let started = std::time::Instant::now();

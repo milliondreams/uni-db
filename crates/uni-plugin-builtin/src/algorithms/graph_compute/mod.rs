@@ -243,21 +243,61 @@ pub const DEFAULT_MAX_SUPERSTEPS: usize = 10_000;
 /// the epoch is defense-in-depth, not the primary lifetime bound.
 static SESSION_EPOCH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
 
-/// Returns the next per-process session epoch, never `0`.
+/// Returns the next per-process session epoch, or fails closed once exhausted.
 ///
-/// Epoch `0` is skipped so the all-zeros handle `Handle::from_u64(0)` (epoch 0,
-/// kind `VertexSet`, gen 0, slot 0) can never match a live session — closing a
-/// forged-handle alias on epoch wrap (proposal §4.2 fail-closed intent). Full
-/// wrap *rejection* (erroring after 65_535 sessions) remains a follow-up; this
-/// removes the acute aliasing without changing the infallible signature.
-#[must_use]
-pub fn next_session_epoch() -> u16 {
-    let e = SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if e == 0 {
-        SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    } else {
-        e
+/// The epoch is what makes a handle minted in one invocation structurally
+/// unusable in another. It is 16 bits, so it can only name 65_535 sessions; the
+/// previous implementation wrapped silently, after which two concurrently-live
+/// sessions could share an epoch. On the JSON registry path (Extism/WASM), where
+/// the guest supplies both the session id and the handle, the epoch is the *only*
+/// cross-session guard — a collision there resolves one session's handle against
+/// another's table.
+///
+/// So the counter now saturates rather than wrapping, and the factory refuses.
+/// [`MAX_EPOCH`](handle::MAX_EPOCH) has always documented this behaviour; this
+/// makes it true.
+///
+/// Epoch `0` is never handed out, so the all-zeros handle `Handle::from_u64(0)`
+/// (epoch 0, kind `VertexSet`, gen 0, slot 0) can never match a live session.
+///
+/// # Errors
+/// Returns `0x86B` (`WRAP_FAIL_CLOSED`) once the process has exhausted its
+/// epochs — the same code the generational slot wrap uses, for the same reason.
+pub fn next_session_epoch() -> Result<u16, uni_plugin::errors::FnError> {
+    // A compare-and-swap so the ceiling is observed atomically: a blind
+    // `fetch_add` would let a racing thread wrap past the check.
+    let mut cur = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        // `MAX_EPOCH` is `u16::MAX`, so equality is the whole condition.
+        if cur == handle::MAX_EPOCH {
+            return Err(error::wrap_fail_closed(format!(
+                "session epochs exhausted after {} sessions in this process; \
+                 a new epoch would alias a live session's handles",
+                handle::MAX_EPOCH
+            )));
+        }
+        // Skip 0 so the all-zeros handle can never match a live session. The
+        // counter starts at 1, so this only matters if it is ever reset.
+        let next = if cur == 0 { 1 } else { cur };
+        match SESSION_EPOCH.compare_exchange_weak(
+            cur,
+            next + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(next),
+            Err(observed) => cur = observed,
+        }
     }
+}
+
+/// Resets the session-epoch counter. Tests only.
+///
+/// The counter is a process-global that a test cannot exercise by burning
+/// 65_535 sessions, so the wrap boundary is only reachable by setting it.
+#[cfg(test)]
+pub(crate) fn set_session_epoch_for_test(value: u16) {
+    SESSION_EPOCH.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The native-work meter for a single GraphCompute invocation.
@@ -577,6 +617,65 @@ impl Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session factory refuses once epochs are exhausted.
+    ///
+    /// A 16-bit epoch names only 65_535 sessions. Wrapping used to be silent,
+    /// after which two concurrently-live sessions could share one — and on the
+    /// JSON registry path the epoch is the only thing keeping one session's
+    /// handles out of another's table. `MAX_EPOCH`'s doc always claimed the
+    /// factory failed closed here; this is that claim, tested.
+    ///
+    /// Serialized against the other epoch test: both move a process-global.
+    #[test]
+    fn session_epochs_fail_closed_when_exhausted() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+
+        set_session_epoch_for_test(super::handle::MAX_EPOCH - 1);
+        let last = next_session_epoch().expect("the final epoch is still handed out");
+        assert_eq!(last, super::handle::MAX_EPOCH - 1);
+
+        let err = next_session_epoch().expect_err("the next one must be refused");
+        assert_eq!(
+            err.code,
+            error::WRAP_FAIL_CLOSED,
+            "exhaustion is fail-closed, not a generic error"
+        );
+        assert!(
+            err.message.contains("alias"),
+            "the error must say why it refuses: {}",
+            err.message
+        );
+        // Still refused on a second attempt: the counter saturates, it does not wrap.
+        assert_eq!(
+            next_session_epoch().expect_err("still refused").code,
+            error::WRAP_FAIL_CLOSED
+        );
+
+        SESSION_EPOCH.store(restore, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Epoch `0` is never handed out, so the all-zeros forged handle cannot
+    /// match a live session.
+    #[test]
+    fn session_epochs_never_hand_out_zero() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+
+        set_session_epoch_for_test(0);
+        assert_eq!(
+            next_session_epoch().expect("a zero counter is still serviceable"),
+            1,
+            "epoch 0 must never be handed out, or `Handle::from_u64(0)` would \
+             match a live session"
+        );
+
+        SESSION_EPOCH.store(restore, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Both epoch tests move a process-global counter, so they must not overlap.
+    static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn work_budget_charges_and_reports_remaining() {

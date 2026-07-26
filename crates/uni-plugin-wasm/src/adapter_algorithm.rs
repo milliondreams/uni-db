@@ -126,7 +126,8 @@ impl AlgorithmProvider for ComponentAlgorithm {
                 graph.edge_count() as u64,
             );
             let mut session = AlgoSession::new(
-                next_session_epoch(),
+                next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("wasm algorithm: {e}")))?,
                 budget,
                 Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
             )

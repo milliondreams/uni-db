@@ -152,6 +152,22 @@ impl<T> Slab<T> {
     }
 }
 
+/// How many handle resolutions a session remembers when tracing is on.
+///
+/// Bounded on purpose: a long-running guest resolves handles in the millions, and
+/// the point is the tail leading up to a failure, not the whole history.
+const TRACE_CAPACITY: usize = 64;
+
+/// Whether `UNI_GC_TRACE` was set, read once per process.
+///
+/// A per-resolution `env::var` would dominate the cost of the resolution itself.
+/// Always compiled rather than feature-gated: forensics you cannot switch on in a
+/// shipped build are no use against a field report you cannot reproduce.
+fn tracing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("UNI_GC_TRACE").is_some())
+}
+
 /// The per-invocation handle table: generational slabs keyed by value kind.
 ///
 /// Holds vertex sets, tensors, and projected graphs behind opaque handles. All
@@ -160,6 +176,12 @@ impl<T> Slab<T> {
 #[derive(Debug)]
 pub struct HandleTable {
     epoch: u16,
+    /// Recent handle resolutions, newest last. Empty unless `UNI_GC_TRACE` is set.
+    ///
+    /// Behind a `Mutex` only so the `&self` resolution path can record into it;
+    /// the table is already externally serialized, and when tracing is off the
+    /// lock is never taken.
+    trace: std::sync::Mutex<std::collections::VecDeque<(u16, u8, u16, u32)>>,
     sets: Slab<VertexSet>,
     edge_sets: Slab<EdgeSet>,
     tensors: Slab<Tensor>,
@@ -175,6 +197,7 @@ impl HandleTable {
     pub fn new(epoch: u16) -> Self {
         Self {
             epoch,
+            trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             sets: Slab::default(),
             edge_sets: Slab::default(),
             tensors: Slab::default(),
@@ -240,9 +263,70 @@ impl HandleTable {
     /// when the packed kind tag is not a known kind.
     fn check_epoch_and_kind(&self, h: Handle) -> Result<HandleKind, FnError> {
         if h.epoch() != self.epoch {
-            return Err(error::epoch_mismatch());
+            return Err(self.with_trace(error::epoch_mismatch()));
         }
-        h.kind().ok_or_else(|| error::kind_mismatch("a known kind"))
+        h.kind()
+            .ok_or_else(|| self.with_trace(error::kind_mismatch("a known kind")))
+    }
+
+    /// Appends the recent-resolution trace to a failing handle error.
+    ///
+    /// A rejected handle is the moment the trace is worth most — what it aliased,
+    /// and what was resolved just before. Riding the error means it reaches the
+    /// caller through the machinery that already carries diagnostics out, with no
+    /// new surfacing mechanism. Inert unless `UNI_GC_TRACE` is set.
+    fn with_trace(&self, mut err: FnError) -> FnError {
+        if !tracing_enabled() {
+            return err;
+        }
+        let crumbs = self.trace_breadcrumbs();
+        if !crumbs.is_empty() {
+            err.message = format!(
+                "{} [gc-trace, oldest first, epoch:kind:gen:slot — {}]",
+                err.message,
+                crumbs.join(" ")
+            );
+        }
+        err
+    }
+
+    /// Records a handle resolution when tracing is on.
+    ///
+    /// Hooked here rather than in the JSON dispatcher because the Rhai loader
+    /// never goes through it — `GcSession` calls `AlgoSession` directly — so a
+    /// dispatcher-level hook would be blind to the surface guests most often
+    /// write.
+    fn trace_resolution(&self, h: Handle) {
+        if !tracing_enabled() {
+            return;
+        }
+        let Ok(mut ring) = self.trace.lock() else {
+            return; // a poisoned trace must never fail a real kernel
+        };
+        if ring.len() == TRACE_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back((
+            h.epoch(),
+            h.kind().map_or(u8::MAX, |k| k as u8),
+            h.generation(),
+            h.slot(),
+        ));
+    }
+
+    /// The recorded resolutions, oldest first, as `epoch:kind:gen:slot`.
+    ///
+    /// Empty unless `UNI_GC_TRACE` is set. Drained into a failing invocation's
+    /// error so it reaches the caller through the existing incomplete-tag path,
+    /// rather than needing a surfacing mechanism of its own.
+    #[must_use]
+    pub fn trace_breadcrumbs(&self) -> Vec<String> {
+        let Ok(ring) = self.trace.lock() else {
+            return Vec::new();
+        };
+        ring.iter()
+            .map(|(e, k, g, s)| format!("{e:04x}:{k}:{g:03x}:{s}"))
+            .collect()
     }
 
     /// Resolves a vertex-set handle.
@@ -250,6 +334,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_set(&self, h: Handle) -> Result<&VertexSet, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::VertexSet => self.sets.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("VertexSet")),
@@ -261,6 +346,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_tensor(&self, h: Handle) -> Result<&Tensor, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Tensor => self.tensors.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Tensor")),
@@ -272,6 +358,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_graph(&self, h: Handle) -> Result<&Arc<GraphProjection>, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Graph => self.graphs.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Graph")),
@@ -283,6 +370,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_walks(&self, h: Handle) -> Result<&WalkMatrix, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Walks => self.walks.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Walks")),
@@ -294,6 +382,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_pairs(&self, h: Handle) -> Result<&PairList, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Pairs => self.pairs.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Pairs")),
@@ -305,6 +394,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_edge_set(&self, h: Handle) -> Result<&EdgeSet, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::EdgeSet => self.edge_sets.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("EdgeSet")),
@@ -316,6 +406,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_arena(&self, h: Handle) -> Result<&GraphArena, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Arena => self.arenas.get(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Arena")),
@@ -327,6 +418,7 @@ impl HandleTable {
     /// # Errors
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_arena_mut(&mut self, h: Handle) -> Result<&mut GraphArena, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::Arena => self.arenas.get_mut(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Arena")),
@@ -342,6 +434,7 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch,
     /// including a double free (the generation will already have advanced).
     pub fn free(&mut self, h: Handle) -> Result<usize, FnError> {
+        self.trace_resolution(h);
         match self.check_epoch_and_kind(h)? {
             HandleKind::VertexSet => {
                 let v = self.sets.free(h.slot(), h.generation())?;
@@ -451,5 +544,68 @@ mod tests {
         let mut t = t;
         let h = t.insert_set(VertexSet::with_capacity(4));
         assert_eq!(h.epoch(), 0xABCD);
+    }
+
+    /// With `UNI_GC_TRACE` unset the trace is invisible: nothing recorded, and
+    /// error messages are byte-identical to what they were before it existed.
+    ///
+    /// This is the property that lets the hook ship always-compiled. It is
+    /// asserted rather than assumed because the check sits on the hottest path in
+    /// the module — every handle resolution.
+    #[test]
+    fn the_trace_is_invisible_when_unset() {
+        // The suite does not set UNI_GC_TRACE; `tracing_enabled` is cached
+        // per-process, so this observes the default.
+        if std::env::var_os("UNI_GC_TRACE").is_some() {
+            return; // exercised by the UNI_GC_TRACE=1 gate run instead
+        }
+        let mut t = HandleTable::new(7);
+        let h = t.insert_set(VertexSet::with_capacity(4));
+        for _ in 0..10 {
+            let _ = t.get_set(h);
+        }
+        assert!(
+            t.trace_breadcrumbs().is_empty(),
+            "nothing may be recorded when tracing is off"
+        );
+
+        let forged = Handle::pack(9, HandleKind::VertexSet, 0, 0);
+        let err = t
+            .get_set(forged)
+            .expect_err("cross-epoch handle is rejected");
+        assert!(
+            !err.message.contains("gc-trace"),
+            "the error must be unchanged when tracing is off: {}",
+            err.message
+        );
+    }
+
+    /// With tracing on, a rejected handle carries the resolutions that preceded
+    /// it, and the ring stays bounded.
+    #[test]
+    fn the_trace_is_bounded_and_rides_the_error() {
+        if std::env::var_os("UNI_GC_TRACE").is_none() {
+            return; // only meaningful under the UNI_GC_TRACE=1 gate run
+        }
+        let mut t = HandleTable::new(7);
+        let h = t.insert_set(VertexSet::with_capacity(4));
+        for _ in 0..(TRACE_CAPACITY * 3) {
+            let _ = t.get_set(h);
+        }
+        assert_eq!(
+            t.trace_breadcrumbs().len(),
+            TRACE_CAPACITY,
+            "the ring must not grow with a long-running guest"
+        );
+
+        let forged = Handle::pack(9, HandleKind::VertexSet, 0, 0);
+        let err = t
+            .get_set(forged)
+            .expect_err("cross-epoch handle is rejected");
+        assert!(
+            err.message.contains("gc-trace"),
+            "a rejected handle must carry what preceded it: {}",
+            err.message
+        );
     }
 }

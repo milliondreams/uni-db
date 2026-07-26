@@ -223,8 +223,13 @@ impl AlgorithmProvider for GraphComputeOverlapProvider {
             let deadline_at = deadline_ms
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
             // srcId/dstId are real data columns, so no expected-columns contract.
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at);
+            let mut session = AlgoSession::new(
+                super::next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("gcoverlap: {e}")))?,
+                budget,
+                arena,
+            )
+            .with_deadline(deadline_at);
             let g = session.bind_graph(Arc::clone(&graph));
 
             let started = std::time::Instant::now();

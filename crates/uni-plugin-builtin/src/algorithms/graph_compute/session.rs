@@ -374,6 +374,16 @@ impl AlgoSession {
         std::mem::take(&mut self.emitted_pairs)
     }
 
+    /// Recent handle resolutions, oldest first, as `epoch:kind:gen:slot`.
+    ///
+    /// Empty unless `UNI_GC_TRACE` is set. A failing handle resolution already
+    /// carries these in its message; this accessor is for callers that want them
+    /// without an error.
+    #[must_use]
+    pub fn trace_breadcrumbs(&self) -> Vec<String> {
+        self.table.trace_breadcrumbs()
+    }
+
     /// Returns the work units charged so far (for accounting tests).
     #[must_use]
     pub fn work_spent_units(&self) -> u64 {

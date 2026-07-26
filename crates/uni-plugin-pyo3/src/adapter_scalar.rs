@@ -249,6 +249,30 @@ mod tests {
         true
     }
 
+    /// Whether the *embedded* interpreter can import `pyarrow`.
+    ///
+    /// The vectorized scalar path hands the guest an Arrow array, and a guest
+    /// that wants to compute on it needs `pyarrow` — that is a real part of the
+    /// contract, not a test artifact. But pyo3's `auto-initialize` links the
+    /// system interpreter, whose `sys.path` does not include the project venv,
+    /// so a bare local checkout has the package installed and still cannot see
+    /// it. Skip loudly there and enforce it in CI (`pr.yml`, the pyo3 step in
+    /// the Python job), rather than failing every local run with an unrelated
+    /// `ModuleNotFoundError` — which is how these tests stayed broken while
+    /// looking like a pyo3-version problem.
+    fn have_pyarrow() -> bool {
+        Python::initialize();
+        let ok = Python::attach(|py| py.import("pyarrow").is_ok());
+        if !ok {
+            eprintln!(
+                "SKIPPED: the embedded interpreter cannot import `pyarrow`.\n\
+                 Run with: PYTHONPATH=$(cd bindings/uni-db && uv run python -c \
+                 'import site; print(site.getsitepackages()[0])')"
+            );
+        }
+        ok
+    }
+
     fn runtime_with_python_fn(name: &str, body: &str) -> Arc<PyPluginRuntime> {
         let rt = PyPluginRuntime::new(PluginId::new("ai.test.pyo3"));
         Python::attach(|py| {
@@ -278,7 +302,9 @@ mod tests {
 
     #[test]
     fn scalar_vec_two_floats_add() {
-        if !ensure_python() {
+        // This guest body computes with `pyarrow`, so it needs the package in
+        // the *embedded* interpreter — see `have_pyarrow`.
+        if !have_pyarrow() {
             return;
         }
         let rt = runtime_with_python_fn(
@@ -376,7 +402,9 @@ mod tests {
 
     #[test]
     fn scalar_vec_returns_wrong_length_errors() {
-        if !ensure_python() {
+        // This guest body computes with `pyarrow`, so it needs the package in
+        // the *embedded* interpreter — see `have_pyarrow`.
+        if !have_pyarrow() {
             return;
         }
         // Python returns a single-element array — adapter must surface as FnError.
@@ -387,7 +415,11 @@ mod tests {
         let adapter = PyScalarFn::new_vectorized(rt, "shrink", float_sig(1));
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1.0_f64, 2.0, 3.0]));
         let err = adapter.invoke(&[ColumnarValue::Array(a)], 3).unwrap_err();
-        assert!(err.message.contains("returned 1 rows, expected 3"));
+        assert!(
+            err.message.contains("returned 1 rows, expected 3"),
+            "expected a row-count mismatch, got: {}",
+            err.message
+        );
     }
 
     #[test]

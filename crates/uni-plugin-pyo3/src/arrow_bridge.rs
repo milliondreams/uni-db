@@ -8,12 +8,12 @@
 //! # Why we don't use `pyo3-arrow`
 //!
 //! The published `pyo3-arrow` 0.15.x requires Python buffer-protocol
-//! exports that pyo3 0.27 gates behind `Py_3_11` or `not(Py_LIMITED_API)`.
-//! Our workspace pin is `pyo3 = "0.27"` with `abi3-py310`, so the
+//! exports that pyo3 gates behind `Py_3_11` or `not(Py_LIMITED_API)`.
+//! Our workspace pin is `pyo3 = "0.29"` with `abi3-py310`, so the
 //! buffer-protocol exports are unavailable and `pyo3-arrow` fails to
 //! compile. The Arrow PyCapsule Interface itself does not need the
 //! buffer protocol — only [`pyo3::types::PyCapsule`] and the FFI
-//! structs — so the bridge below is portable across pyo3 0.26–0.28 and
+//! structs — so the bridge below is portable across pyo3 0.26–0.29 and
 //! abi3-py310+.
 //!
 //! [protocol]: https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html

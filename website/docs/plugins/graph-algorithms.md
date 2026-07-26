@@ -111,7 +111,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | Kernel | Returns |
 | --- | --- |
 | `frontier(g, seeds)` | A vertex set from external vertex ids. |
-| `set_to_map(s, value)` / `map_to_set(m, pred, threshold)` | Lift and lower between sets and `[V]` maps. Predicates: `is_zero`, `gt`, `lt`, `eq`. |
+| `set_to_map(s, value)` / `map_to_set(m, pred, threshold)` | Lift and lower between sets and maps. Predicates: `is_zero`, `gt`, `lt`, `eq`. `map_to_set` is shape-polymorphic: a `[V]` map lowers to a `VertexSet`, an `[E]` tensor to an `EdgeSet` that `spmv_masked` / `expand_masked` accept. |
 | `set_union` / `set_diff` / `set_intersect` | Set algebra. |
 | `set_len` / `is_empty` | Cardinality and emptiness. |
 
@@ -120,6 +120,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | Kernel | Returns |
 | --- | --- |
 | `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
+| `compare(a, b, op)` | Elementwise `gt` / `ge` / `lt` / `le` / `eq` / `ne`, yielding a 1.0/0.0 mask. Shape-preserving, so an `[E]` comparison yields an `[E]` mask. |
 | `zero_map(g)` | A zeroed `[V]` map. |
 | `scatter(map, frontier, value)` | Write a scalar into the slots a vertex set selects. |
 | `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `normalize_l1`, `normalize_l2`. |
@@ -186,7 +187,7 @@ valid ewise ops: add, mul, min, max, axpy, div
 
 | You wanted | Compose it as |
 | --- | --- |
-| `a > b` (also `ge`/`lt`/`le`/`ne`) | `set_to_map(map_to_set(ewise(a, b, "axpy", -1.0), "gt", 0.0), 1.0)` |
+| `a > b` (also `ge`/`lt`/`le`/`eq`/`ne`) | `compare(a, b, "gt")` — a kernel since 3.0; the older `set_to_map(map_to_set(...))` composition still works but costs three passes of the work meter |
 | `step(a, theta)` / `heaviside` | `set_to_map(map_to_set(a, "gt", theta), 1.0)` |
 | `select(m, a, b)` | `ewise(b, ewise(m, ewise(a, b, "axpy", -1.0), "mul"), "add")` |
 | `a - b` | `ewise(a, b, "axpy", -1.0)` |
@@ -366,3 +367,22 @@ Batching is *not* semantically free: rollouts in one batch descend against the s
 A guest built before `host-arena` existed is unaffected by it — the interface is additive, and a component that does not import it links exactly as before.
 
 The kernel catalogue is a *type* in the host, not a list of strings: adding a kernel fails to compile until it is dispatched, and a per-loader test asserts every kernel is exposed by Rhai and PyO3. A kernel cannot be callable from one loader and silently invisible to another.
+
+### Tensor identity: shape and index space
+
+A tensor is not just a length. It carries the **shape** it was built with (`[V]` per-vertex or
+`[E]` per-edge) and the **index space** its slots belong to — the projection or arena it came
+from. Both are enforced:
+
+- Combining a `[V]` map with an `[E]` tensor fails, even when the lengths coincide (any graph
+  where `|V| == |E|`, such as a cycle, used to make that silent).
+- Combining tensors from two different projections fails. Slot `i` names a different vertex in
+  each, so equal lengths do not make them comparable. Arena-derived tensors are keyed to arena
+  slots, which is a third space again.
+- `ewise`, `map_apply`, `compare` and `segmented_reduce` all *preserve* shape and index space, so
+  an `[E]` pipeline stays `[E]` all the way to `sample_edges` or `edge_mask_window`.
+
+A value derived from a set (`set_to_map`) has no index space of its own, since sets are untagged.
+That is treated as *unknown*, not as a third space: it combines with anything, and the result
+adopts whichever space is known. This is what keeps ordinary compositions working — a
+personalized-PageRank teleport vector is exactly such a value.

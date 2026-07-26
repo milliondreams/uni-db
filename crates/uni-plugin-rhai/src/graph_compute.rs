@@ -29,8 +29,8 @@ use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::kernel_id::KernelId;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm, OverlapMetric,
-    PairSpec, Predicate, ReduceOp, Semiring,
+    AlgoSession, CmpOp, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm,
+    OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -350,6 +350,15 @@ impl GcSession {
             .collect();
         let mut s = self.session.lock();
         s.emit(&borrowed).map_err(rt)
+    }
+
+    /// Elementwise comparison, yielding a 1.0/0.0 mask.
+    fn compare(&mut self, a: i64, b: i64, op: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
+        let o = CmpOp::parse(op.as_str()).map_err(rt)?;
+        let mut s = self.session.lock();
+        s.compare(from_i64(a), from_i64(b), o)
+            .map(to_i64)
+            .map_err(rt)
     }
 
     /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);
@@ -918,6 +927,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         Scale => GcSession::scale,
         Normalize => GcSession::normalize,
         Ewise => GcSession::ewise,
+        Compare => GcSession::compare,
         Spmv => GcSession::spmv,
         ReduceSum => GcSession::reduce_sum,
         ReduceSumMasked => GcSession::reduce_sum_masked,
@@ -1319,7 +1329,7 @@ mod tests {
     }
 
     /// T4 — the shared vocabulary is accepted, and a rejection carries the
-    /// shared recipe, *through the Rhai guest surface*.
+    /// shared remedy, *through the Rhai guest surface*.
     ///
     /// A loader that re-introduced its own match could still accept every valid
     /// name; what it could not do is produce the recipe, because only
@@ -1345,7 +1355,10 @@ mod tests {
             .expect_err("`gt` must be rejected")
             .to_string();
         assert!(err.contains("composable"), "no recipe in: {err}");
-        assert!(err.contains("set_to_map"), "no recipe in: {err}");
+        assert!(
+            err.contains("compare(a, b, \"gt\")"),
+            "the guest must be pointed at the compare kernel: {err}"
+        );
         for name in OpFamily::Ewise.valid_names() {
             assert!(err.contains(name), "missing valid op `{name}` in: {err}");
         }

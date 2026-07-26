@@ -112,6 +112,7 @@ kernels! {
 
     // Tensors and maps.
     Ewise => "ewise", AllLoaders;
+    Compare => "compare", AllLoaders;
     ZeroMap => "zero_map", AllLoaders;
     Scatter => "scatter", AllLoaders;
     MapApply => "map_apply", AllLoaders;

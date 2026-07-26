@@ -566,6 +566,7 @@ Element-wise / map kernels make composite scoring formulas expressible without a
 | `map_apply(m, "sqrt")` | Element-wise sqrt over a map handle |
 | `map_apply(m, "exp")` | Element-wise exp |
 | `ewise(a, b, "div")` | Element-wise `a / b`, with `x / 0 = 0` |
+| `compare(a, b, "gt")` | Element-wise comparison (`gt`/`ge`/`lt`/`le`/`eq`/`ne`) to a 1.0/0.0 mask; shape-preserving, so an `[E]` comparison yields an `[E]` mask |
 
 ### When `node_property` / `edge_property` return NaN
 
@@ -611,17 +612,16 @@ The kernel set is deliberately coarse and the op vocabularies are closed, so `ew
 of reach: `map_to_set` carries a closed predicate enum and `set_to_map` lifts the resulting
 bitset back to a `[V]` map, which composes with `ewise mul` into an ordinary masked blend.
 
-Ask for an op that is not in a vocabulary and the engine now answers with the composition:
+Ask for an op that is not in a vocabulary and the engine answers with the remedy:
 
 ```
-bad ewise op `gt` — elementwise comparison is composable:
-set_to_map(map_to_set(ewise(a, b, "axpy", -1.0), "gt", 0.0), 1.0);
+bad ewise op `gt` — elementwise comparison is composable: compare(a, b, "gt");
 valid ewise ops: add, mul, min, max, axpy, div
 ```
 
 | You wanted | Compose it as |
 | --- | --- |
-| `a > b` (also `ge`/`lt`/`le`/`ne`) | `set_to_map(map_to_set(ewise(a, b, "axpy", -1.0), "gt", 0.0), 1.0)` |
+| `a > b` (also `ge`/`lt`/`le`/`eq`/`ne`) | `compare(a, b, "gt")` — a kernel since 3.0; the older `set_to_map(map_to_set(...))` composition still works but costs three passes of the work meter |
 | `step(a, theta)` / `heaviside` | `set_to_map(map_to_set(a, "gt", theta), 1.0)` |
 | `select(m, a, b)` | `ewise(b, ewise(m, ewise(a, b, "axpy", -1.0), "mul"), "add")` |
 | `a - b` | `ewise(a, b, "axpy", -1.0)` |
@@ -689,3 +689,16 @@ Additional fail-loud guarantees:
 - `emit` reports a clear length-mismatch error when the emitted column length doesn't match the projection.
 - A whole-graph projection errors on undeclared (schemaless) labels.
 - Stored property values now read correctly from **unflushed in-memory L0** — previously a projection built before a flush saw `NaN` values / default edge weight `1.0`.
+
+### Tensor identity: shape and index space
+
+A tensor carries the **shape** it was built with (`[V]` or `[E]`) and the **index space** its
+slots belong to — the projection or arena it came from. Both are enforced, so a `[V]` map cannot
+combine with an `[E]` tensor of equal length, and tensors from two projections cannot combine at
+all (slot `i` names a different vertex in each). `ewise`, `map_apply`, `compare` and
+`segmented_reduce` preserve both, so an `[E]` pipeline stays `[E]` through to `sample_edges`.
+
+Set-derived values (`set_to_map`) have no index space of their own; that is treated as *unknown*
+rather than a third space, so it unifies with anything and the result adopts the known space.
+`map_to_set` is shape-polymorphic — an `[E]` tensor lowers to an `EdgeSet` that `spmv_masked`
+accepts.

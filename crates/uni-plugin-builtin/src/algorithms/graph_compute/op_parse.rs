@@ -40,7 +40,7 @@
 
 use uni_plugin::errors::FnError;
 
-use super::session::{Direction, EwiseOp, MapOp, Norm, OverlapMetric, Predicate, Semiring};
+use super::session::{CmpOp, Direction, EwiseOp, MapOp, Norm, OverlapMetric, Predicate, Semiring};
 
 /// Declares each string vocabulary once and derives every projection of it.
 ///
@@ -148,6 +148,15 @@ op_families! {
         "div"  => EwiseOp::Div,     EwiseOp::Div;
     }
 
+    Cmp: CmpOp, noun = "comparison", scalars = () {
+        "gt" => CmpOp::Gt, CmpOp::Gt;
+        "ge" => CmpOp::Ge, CmpOp::Ge;
+        "lt" => CmpOp::Lt, CmpOp::Lt;
+        "le" => CmpOp::Le, CmpOp::Le;
+        "eq" => CmpOp::Eq, CmpOp::Eq;
+        "ne" => CmpOp::Ne, CmpOp::Ne;
+    }
+
     Predicate: Predicate, noun = "predicate", scalars = (threshold) {
         "is_zero" => Predicate::IsZero, Predicate::IsZero;
         "gt"      => Predicate::Gt(_),  Predicate::Gt(threshold);
@@ -206,7 +215,7 @@ macro_rules! recipes {
 recipes! {
     ["gt", "ge", "lt", "le", "eq", "ne", "cmp", "compare"] in [Ewise] =>
         "elementwise comparison",
-        "set_to_map(map_to_set(ewise(a, b, \"axpy\", -1.0), \"gt\", 0.0), 1.0)";
+        "compare(a, b, \"gt\")";
 
     ["gt", "ge", "lt", "le", "ne", "cmp", "compare", "step", "heaviside", "threshold", "indicator"]
         in [Map] =>
@@ -320,6 +329,9 @@ mod tests {
         for &n in Predicate::ALL_NAMES {
             assert_eq!(Predicate::parse(n, 0.5).expect(n).op_name(), n);
         }
+        for &n in CmpOp::ALL_NAMES {
+            assert_eq!(CmpOp::parse(n).expect(n).op_name(), n);
+        }
         for &n in Norm::ALL_NAMES {
             assert_eq!(Norm::parse(n).expect(n).op_name(), n);
         }
@@ -428,7 +440,12 @@ mod tests {
             "the code is ABI; only the message changed"
         );
         assert!(err.message.contains("composable"), "{}", err.message);
-        assert!(err.message.contains("set_to_map"), "{}", err.message);
+        assert!(
+            err.message.contains("compare(a, b, \"gt\")"),
+            "the rejection must point at the compare kernel, not the 3-pass \
+             composition it replaced: {}",
+            err.message
+        );
         for &n in EwiseOp::ALL_NAMES {
             assert!(err.message.contains(n), "missing `{n}`: {}", err.message);
         }

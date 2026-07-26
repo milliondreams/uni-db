@@ -37,8 +37,8 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm, OverlapMetric,
-    PairSpec, Predicate, ReduceOp, Semiring,
+    AlgoSession, CmpOp, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm,
+    OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -354,6 +354,17 @@ impl GcSession {
             .map(|(n, handle)| (n.as_str(), from_i64(*handle)))
             .collect();
         self.session.lock().emit(&cols).map_err(py_err)
+    }
+
+    /// Elementwise comparison, yielding a 1.0/0.0 mask.
+    fn compare(&self, a: i64, b: i64, op: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        let o = CmpOp::parse(op).map_err(py_err)?;
+        self.session
+            .lock()
+            .compare(from_i64(a), from_i64(b), o)
+            .map(to_i64)
+            .map_err(py_err)
     }
 
     /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);

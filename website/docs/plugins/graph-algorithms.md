@@ -37,6 +37,16 @@ See [Reference → Capability slices](reference.md#capability-slices) for the de
 
 The two compose. `arena_freeze` turns an arena into an ordinary graph handle, so the entire read-only kernel catalogue applies to structure you grew yourself.
 
+That composition is how you aggregate over links you grew. There is no `arena_spmv`, and there does not need to be: freeze the arena, then use `spmv` on the result. The frozen graph's slot `i` **is** the arena's slot `i` — `arena_freeze` walks live slots in order — so an arena-keyed column and the graph frozen from that arena share one index space and combine without a `rekey`:
+
+```rhai
+let g   = gc.arena_freeze(arena);            // arena links become a CSR
+let col = gc.arena_gather(arena, 0, slots);  // an arena-keyed [V] column
+let agg = gc.spmv(g, col, "linear_algebra", "out");
+```
+
+The equivalence is scoped to *that* arena's own frozen graph: the same column against an unrelated projection, or against a graph frozen from a different arena, is still rejected.
+
 ---
 
 ## Arguments and projecting the graph
@@ -342,7 +352,7 @@ Together these express reachability or SpMV over a random edge subset (percolati
 | `arena_gather(a, col, slots)` / `arena_scatter(a, col, slots, values)` | Move state between a column and a compact tensor. |
 | `arena_descend(a, roots, score, visit, maximize, vloss)` | Descend to a leaf choosing the best-scoring child, applying one visit and the virtual loss at every step. `vloss` is a flat linear offset applied in the descent loop, **not** a per-visit UCB recompute — see the [worked example](#worked-example-a-guest-authored-mcts). |
 | `arena_backup(a, value_col, leaves, deltas)` | Add each leaf's delta along its **full** root path, walking parents to the root — general-depth UCT / PUCT value backpropagation, not just a depth-1 bandit update. |
-| `arena_freeze(a)` | Compact into an ordinary graph handle. |
+| `arena_freeze(a)` | Compact into an ordinary graph handle. Slot `i` of the frozen graph is slot `i` of the arena, so arena-keyed values aggregate over it directly — see below. |
 
 ### Egress and lifecycle
 

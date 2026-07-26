@@ -254,6 +254,14 @@ pub struct AlgoSession {
     /// The handle of [`Self::primary_graph`], so output kernels can check a
     /// value's `Origin` rather than merely its length.
     primary_graph_handle: Option<Handle>,
+    /// Graphs produced by `arena_freeze`, paired with the arena they came from.
+    ///
+    /// `arena_freeze` walks the arena's live slots in order, so slot `i` of the
+    /// frozen graph *is* slot `i` of the arena — one index space wearing two
+    /// `Origin` variants. Without this the provenance check would reject
+    /// aggregating an arena column over the graph frozen from that same arena,
+    /// which is the composition that makes a bespoke `arena_spmv` unnecessary.
+    frozen_from: Vec<(Handle, Handle)>,
     /// Captured `emit` output: `(column_name, values)` per emitted column.
     emitted: Vec<(String, Vec<f64>)>,
     /// Captured `emit_walks` output: `(walk_id, step, nodeId)` rows, row-major
@@ -281,6 +289,7 @@ impl AlgoSession {
             arena,
             primary_graph: None,
             primary_graph_handle: None,
+            frozen_from: Vec::new(),
             emitted: Vec::new(),
             emitted_walks: Vec::new(),
             emitted_pairs: Vec::new(),
@@ -417,7 +426,28 @@ impl AlgoSession {
     /// Rejects two operands from different index spaces, returning the unified one.
     ///
     /// `Untracked` unifies with anything — it means *unknown*, not a third space.
-    fn require_compatible_origins(a: Origin, b: Origin, kernel: &str) -> Result<Origin, FnError> {
+    /// Resolves a frozen-arena graph origin back to the arena it was frozen from.
+    ///
+    /// Identity for every other origin. This is what lets an `Origin::Arena`
+    /// value meet an `Origin::Graph` operand when the graph *is* that arena.
+    fn canonical_origin(&self, o: Origin) -> Origin {
+        match o {
+            Origin::Graph(g) => self
+                .frozen_from
+                .iter()
+                .find(|(frozen, _)| *frozen == g)
+                .map_or(o, |(_, arena)| Origin::Arena(*arena)),
+            other => other,
+        }
+    }
+
+    fn require_compatible_origins(
+        &self,
+        a: Origin,
+        b: Origin,
+        kernel: &str,
+    ) -> Result<Origin, FnError> {
+        let (a, b) = (self.canonical_origin(a), self.canonical_origin(b));
         if a.compatible_with(b) {
             return Ok(a.unify(b));
         }
@@ -445,7 +475,7 @@ impl AlgoSession {
         match exclude {
             Some(h) => {
                 let set = self.table.get_set(h)?;
-                Self::require_compatible_origins(
+                self.require_compatible_origins(
                     set.origin(),
                     Origin::Graph(g),
                     &format!("{kernel} exclude"),
@@ -1490,7 +1520,7 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_union",
         )?;
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             self.table.get_set(a)?.origin(),
             self.table.get_set(b)?.origin(),
             "set_union",
@@ -1511,7 +1541,7 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_diff",
         )?;
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             self.table.get_set(a)?.origin(),
             self.table.get_set(b)?.origin(),
             "set_diff",
@@ -1532,7 +1562,7 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_intersect",
         )?;
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             self.table.get_set(a)?.origin(),
             self.table.get_set(b)?.origin(),
             "set_intersect",
@@ -1557,7 +1587,7 @@ impl GraphCompute for AlgoSession {
         dir: Direction,
         exclude: Option<Handle>,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_set(frontier)?.origin(),
             Origin::Graph(g),
             "expand",
@@ -1633,7 +1663,7 @@ impl GraphCompute for AlgoSession {
         dir: Direction,
         mask: Option<Handle>,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_tensor(vec)?.origin(),
             Origin::Graph(g),
             "spmv",
@@ -1666,7 +1696,7 @@ impl GraphCompute for AlgoSession {
         };
         let mask_set = match mask {
             Some(h) => {
-                Self::require_compatible_origins(
+                self.require_compatible_origins(
                     self.table.get_set(h)?.origin(),
                     Origin::Graph(g),
                     "spmv mask",
@@ -1823,7 +1853,7 @@ impl GraphCompute for AlgoSession {
         }
         // The frontier's slots index the map, so both must name the same
         // vertices; the result carries the unified space.
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             t.origin(),
             self.table.get_set(frontier)?.origin(),
             "scatter",
@@ -1896,7 +1926,7 @@ impl GraphCompute for AlgoSession {
         // out-of-range slot reads `false` and the reduction quietly returns a
         // partial answer — the worst shape in this family.
         if let Some(m) = mask {
-            Self::require_compatible_origins(
+            self.require_compatible_origins(
                 self.table.get_tensor(map)?.origin(),
                 self.table.get_set(m)?.origin(),
                 "reduce",
@@ -2460,7 +2490,7 @@ impl GraphCompute for AlgoSession {
         seed: u64,
         iter: u64,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_tensor(prob)?.origin(),
             Origin::Graph(g),
             "sample_edges_undirected",
@@ -2569,7 +2599,7 @@ impl GraphCompute for AlgoSession {
             self.table.get_edge_set(b)?.capacity(),
             "edge_intersect",
         )?;
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             self.table.get_edge_set(a)?.origin(),
             self.table.get_edge_set(b)?.origin(),
             "edge_intersect",
@@ -2589,7 +2619,7 @@ impl GraphCompute for AlgoSession {
             self.table.get_edge_set(b)?.capacity(),
             "edge_union",
         )?;
-        let origin = Self::require_compatible_origins(
+        let origin = self.require_compatible_origins(
             self.table.get_edge_set(a)?.origin(),
             self.table.get_edge_set(b)?.origin(),
             "edge_union",
@@ -2609,7 +2639,7 @@ impl GraphCompute for AlgoSession {
         exclude: Option<Handle>,
         edge_mask: Handle,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_set(frontier)?.origin(),
             Origin::Graph(g),
             "expand_masked",
@@ -2619,7 +2649,7 @@ impl GraphCompute for AlgoSession {
                 "expand_masked is defined on the out-CSR; use Direction::Out",
             ));
         }
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_edge_set(edge_mask)?.origin(),
             Origin::Graph(g),
             "expand_masked edge mask",
@@ -2662,12 +2692,12 @@ impl GraphCompute for AlgoSession {
         seed: u64,
         iter: u64,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_set(frontier)?.origin(),
             Origin::Graph(g),
             "expand_sampled",
         )?;
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_tensor(prob)?.origin(),
             Origin::Graph(g),
             "expand_sampled probabilities",
@@ -2750,12 +2780,12 @@ impl GraphCompute for AlgoSession {
         sr: Semiring,
         edge_mask: Handle,
     ) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_tensor(vec)?.origin(),
             Origin::Graph(g),
             "spmv_masked",
         )?;
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_edge_set(edge_mask)?.origin(),
             Origin::Graph(g),
             "spmv_masked edge mask",
@@ -2883,7 +2913,7 @@ impl GraphCompute for AlgoSession {
     }
 
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {
-        Self::require_compatible_origins(
+        self.require_compatible_origins(
             self.table.get_walks(walks)?.origin(),
             Origin::Graph(g),
             "walk_visit_counts",
@@ -3553,7 +3583,9 @@ impl GraphArenaCompute for AlgoSession {
         }
         let projection = GraphProjection::from_dense_edges(n, &edges, false, true);
         self.reserve(projection.memory_size())?;
-        Ok(self.table.insert_graph(Arc::new(projection)))
+        let frozen = self.table.insert_graph(Arc::new(projection));
+        self.frozen_from.push((frozen, arena));
+        Ok(frozen)
     }
 }
 

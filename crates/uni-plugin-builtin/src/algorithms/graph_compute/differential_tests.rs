@@ -23,8 +23,8 @@ use super::first_party::{
 };
 use super::handle::{Handle, HandleKind};
 use super::session::{
-    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, OverlapMetric, PairSpec, Predicate,
-    Semiring,
+    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, OverlapMetric,
+    PairSpec, Predicate, Semiring,
 };
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
@@ -3752,6 +3752,71 @@ fn ragged_egress_labels_rows_with_the_values_own_projection() {
             "emit_pairs must label b's slots with b's vids, got ({src}, {dst})"
         );
     }
+}
+
+/// The arena→graph composition still works after tensors gained provenance.
+///
+/// `arena_freeze` turns grown structure into an ordinary graph handle, which is
+/// what makes neighbour aggregation over arena links expressible without a
+/// bespoke `arena_spmv`: freeze, then `spmv`. Tensor provenance could plausibly
+/// have broken exactly this — an arena-gathered column carries `Origin::Arena`
+/// while the frozen graph is an `Origin::Graph`, and the two do not unify.
+#[test]
+fn an_arena_can_be_frozen_and_aggregated_over() {
+    let (mut s, _g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    ));
+
+    let arena = s.arena_new(8, 2).expect("arena");
+    // `arena_alloc` yields a tensor of the allocated slot ids, keyed to the
+    // arena — the natural thing to aggregate over grown structure.
+    let slots = s.arena_alloc(arena, 3).expect("alloc 3 slots");
+
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    assert_eq!(
+        s.vertex_count(frozen).expect("frozen vertex count"),
+        3,
+        "the frozen graph spans the arena's live slots"
+    );
+
+    // The value is `Origin::Arena`; the graph it is aggregated over is
+    // `Origin::Graph(frozen)`. If provenance rejected this pairing, freezing an
+    // arena and aggregating over it — the composition that makes a bespoke
+    // `arena_spmv` unnecessary — would be unreachable.
+    let out = s.spmv(frozen, slots, Semiring::LinearAlgebra, Direction::Out, None);
+    assert!(
+        out.is_ok(),
+        "an arena-keyed value must be aggregable over the graph frozen FROM that \
+         arena: {:?}",
+        out.err()
+    );
+
+    // The relaxation is bounded to *that* arena's own frozen graph. An arena
+    // value must still be refused against an unrelated projection, and against a
+    // graph frozen from a different arena, or the check would be decorative.
+    let other = s.bind_graph(Arc::new(build_projection(&[0, 1, 2], &[], false, false)));
+    assert!(
+        s.spmv(other, slots, Semiring::LinearAlgebra, Direction::Out, None)
+            .is_err(),
+        "an arena value must not aggregate over an unrelated projection"
+    );
+    let arena2 = s.arena_new(8, 2).expect("second arena");
+    let _ = s.arena_alloc(arena2, 3).expect("alloc in the second arena");
+    let frozen2 = s.arena_freeze(arena2).expect("freeze the second arena");
+    assert!(
+        s.spmv(
+            frozen2,
+            slots,
+            Semiring::LinearAlgebra,
+            Direction::Out,
+            None
+        )
+        .is_err(),
+        "an arena value must not aggregate over a graph frozen from a DIFFERENT arena"
+    );
 }
 
 /// `rekey` is a verified move between projections, not a cast.

@@ -190,9 +190,13 @@ async fn g11_undeclared_label_fails_whole_graph_projection() -> anyhow::Result<(
 /// Before the fix, `collect_edges` / `collect_node_properties` passed `ctx =
 /// None` to the batch property reads, skipping the L0 overlay that the structure
 /// read already applied — so topology projected but property values were poison.
-#[tokio::test]
-async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Result<()> {
-    let db = Uni::in_memory().build().await?;
+/// The property fixture shared by the L0 ladder: four `:Node` rows carrying
+/// distinct `score` values and four `:LINKS` edges carrying distinct `w`
+/// weights, committed but **deliberately not flushed**.
+///
+/// The values are non-default on purpose — a silent NaN or a defaulted `1.0`
+/// weight cannot be mistaken for a real read.
+async fn seed_property_graph(db: &Uni) -> anyhow::Result<([f64; 4], [f64; 4])> {
     db.schema()
         .label("Node")
         .property("score", DataType::Float)
@@ -203,8 +207,6 @@ async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Resul
         .apply()
         .await?;
 
-    // Distinct, non-default property values so a silent NaN / 1.0 fallback is
-    // impossible to mistake for a real read.
     let node_scores = [10.0_f64, 20.0, 30.0, 40.0];
     let edge_weights = [1.5_f64, 2.5, 3.5, 4.5];
 
@@ -227,10 +229,12 @@ async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Resul
         .await?;
     }
     tx.commit().await?;
-    // Deliberately NO flush — the projection must read property values from L0.
+    Ok((node_scores, edge_weights))
+}
 
-    let bridge = l0_aware_bridge(&db, broad_caps())?;
-    let spec = GraphProjectionSpec {
+/// The spec the ladder projects with: scoped, weighted, both property columns.
+fn property_spec() -> GraphProjectionSpec {
+    GraphProjectionSpec {
         node_labels: vec!["Node".into()],
         edge_types: vec!["LINKS".into()],
         include_reverse: false,
@@ -238,8 +242,73 @@ async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Resul
         node_properties: vec!["score".into()],
         edge_properties: vec!["w".into()],
         ..GraphProjectionSpec::default()
-    };
-    let proj = bridge.project_for_graph_compute(&spec).await?;
+    }
+}
+
+/// **Rung 2 of the L0 ladder** — the same fixture and the same spec as `g12`,
+/// projected through a bridge built with `l0 = None`.
+///
+/// This is the construction the CALL path produces whenever the procedure host
+/// is assembled from an `L0Context::empty()` — i.e. whenever
+/// `Executor::get_context()` yields `None`. The projection then pins no L0
+/// snapshot (`ProjectionBuilder::build`) and property reads see flushed storage
+/// only, which for a write-back march means *an earlier step's value*: correct
+/// arithmetic over stale inputs, no error anywhere.
+///
+/// `g12` closed this for the L0-aware construction. The degrade one layer up is
+/// still silent, which is the Theme-C gap and the leading candidate for the
+/// rare wrong-value report (REQ-D3 candidate C1).
+#[tokio::test]
+#[ignore = "REPRO (red on 254b4c26c: reads flushed storage only, silently): flips \
+            when Phase 2 makes the detached construction loud. \
+            Run with --run-ignored all."]
+async fn repro_c1_l0_detached_projection_must_not_silently_read_stale_properties()
+-> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let (node_scores, _edge_weights) = seed_property_graph(&db).await?;
+
+    // The degrade under test: `None` where `l0_aware_bridge` passes `Some(l0)`.
+    let bridge = host_bridge_from_storage(db.storage(), None, broad_caps());
+    let proj = bridge.project_for_graph_compute(&property_spec()).await?;
+
+    // Measured on baseline: the projection succeeds and reports ZERO vertices —
+    // every row is still in unflushed L0. Nothing errors. A partially-flushed
+    // database (the shape a write-back march produces) would instead project the
+    // rows that happen to have been flushed, carrying an *earlier step's* values.
+    // Both outcomes are silent; this one is simply the fully-unflushed extreme.
+    assert_eq!(
+        proj.vertex_count(),
+        4,
+        "an L0-detached projection must see committed-but-unflushed rows or fail \
+         loud; it silently projected an empty graph instead"
+    );
+
+    let scores = proj
+        .node_property("score")
+        .expect("score column materialized")
+        .to_vec();
+    assert!(
+        scores.iter().all(|v| v.is_finite()),
+        "an L0-detached projection must not silently yield NaN scores: {scores:?}"
+    );
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    assert_eq!(
+        sorted, node_scores,
+        "an L0-detached projection must either read committed L0 or fail loud — \
+         never return plausible-but-stale values"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let (node_scores, edge_weights) = seed_property_graph(&db).await?;
+    // Deliberately NO flush — the projection must read property values from L0.
+
+    let bridge = l0_aware_bridge(&db, broad_caps())?;
+    let proj = bridge.project_for_graph_compute(&property_spec()).await?;
     assert_eq!(proj.vertex_count(), 4, "all four nodes project");
     assert_eq!(proj.edge_count(), 4, "all four edges project");
 

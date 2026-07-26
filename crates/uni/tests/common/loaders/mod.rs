@@ -12,4 +12,5 @@ pub mod multi_version_abi;
 pub mod pyo3_graph_compute;
 pub mod req2_req4_rhai_cypher;
 pub mod rhai_graph_compute;
+pub mod rhai_multi_emit_repro;
 pub mod wasm_graph_compute;

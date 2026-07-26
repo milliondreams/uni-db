@@ -22,7 +22,7 @@ use super::first_party::{
     bellman_ford, eigenvector_centrality, k_core, personalized_pagerank, reachable_set, wcc_labels,
 };
 use super::handle::{Handle, HandleKind};
-use super::session::{AlgoSession, Direction, GraphCompute, MapOp, Semiring};
+use super::session::{AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Semiring};
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
 
@@ -622,9 +622,7 @@ fn next_bucket_selects_the_distance_band() {
         let relaxed = s
             .spmv(g, dist, Semiring::ShortestPath, Direction::Out, None)
             .unwrap();
-        let next = s
-            .ewise(dist, relaxed, super::session::EwiseOp::Min)
-            .unwrap();
+        let next = s.ewise(dist, relaxed, EwiseOp::Min).unwrap();
         s.free(relaxed).unwrap();
         s.free(dist).unwrap();
         dist = next;
@@ -1088,9 +1086,7 @@ fn m4_spmv_mask_fuses_with_filter() {
         .spmv(g, src, Semiring::LinearAlgebra, Direction::Out, None)
         .unwrap();
     let indicator = s.set_to_map(mask, Scalar::F64(1.0)).unwrap();
-    let filtered = s
-        .ewise(full, indicator, super::session::EwiseOp::Mul)
-        .unwrap();
+    let filtered = s.ewise(full, indicator, EwiseOp::Mul).unwrap();
 
     let a = read_tensor(&s, fused);
     let b = read_tensor(&s, filtered);
@@ -1194,7 +1190,7 @@ fn p0_8_kernels_charge_their_exact_work() {
     let inv = s.map_apply(deg, MapOp::Scale(2.0)).unwrap();
     assert_eq!(charged(&s, &mut last), v, "map_apply charges |V|");
 
-    let sum = s.ewise(deg, inv, super::session::EwiseOp::Add).unwrap();
+    let sum = s.ewise(deg, inv, EwiseOp::Add).unwrap();
     assert_eq!(charged(&s, &mut last), v, "ewise charges |V|");
 
     let _ = s.reduce(sum, ReduceOp::Sum, None).unwrap();
@@ -2905,5 +2901,286 @@ fn frozen_arena_is_an_ordinary_graph_to_every_mode_a_kernel() {
         s.vertex_count(g).expect("vertex_count again") as usize,
         n,
         "a frozen handle is a snapshot, not a live view"
+    );
+}
+
+// ---- REQ-D1 probe: comparison + select are composable from shipped kernels --
+
+/// Loads an explicit `[V]` map by scattering each value onto a zero map.
+fn load_map(s: &mut AlgoSession, g: Handle, vals: &[f64]) -> Handle {
+    let mut m = s.zero_map(g, DType::F64).expect("zero_map");
+    for (i, &v) in vals.iter().enumerate() {
+        let f = s
+            .frontier(g, &[Vid::new(i as u64)])
+            .expect("frontier for slot");
+        m = s.scatter(m, f, Scalar::F64(v)).expect("scatter");
+    }
+    m
+}
+
+#[test]
+fn reqd1_compare_and_select_are_composable_from_shipped_kernels() {
+    // The uniscape stepped-dynamics track reports "no comparison -> mask op"
+    // as a milestone blocker. It is already expressible: `map_to_set` carries
+    // the closed `Predicate` enum and `set_to_map` lifts the resulting bitset
+    // back to a 0/1 `[V]` map. Tensor-vs-tensor compare reduces to a
+    // scalar-vs-zero compare on the difference, which `axpy(a, b, -1.0)`
+    // supplies exactly.
+    let nodes: Vec<u64> = (0..5).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let a_vals = [1.0, 5.0, 3.0, 9.0, 2.0];
+    let b_vals = [4.0, 4.0, 4.0, 4.0, 4.0];
+    let a = load_map(&mut s, g, &a_vals);
+    let b = load_map(&mut s, g, &b_vals);
+
+    // compare(a, b, "gt")  ==  set_to_map(map_to_set(axpy(a, b, -1), "gt", 0), 1)
+    let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
+    let hits = s
+        .map_to_set(diff, super::session::Predicate::Gt(0.0))
+        .expect("map_to_set");
+    let mask = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
+
+    let got = read_tensor(&s, mask).to_vec();
+    let want: Vec<f64> = a_vals
+        .iter()
+        .zip(&b_vals)
+        .map(|(x, y)| if x > y { 1.0 } else { 0.0 })
+        .collect();
+    assert_eq!(
+        got, want,
+        "compare(a,b,\"gt\") must match the scalar oracle"
+    );
+
+    // select(mask, a, b) == b + mask * (a - b), using only shipped ewise ops.
+    let scaled = s.ewise(mask, diff, EwiseOp::Mul).expect("mul");
+    let sel = s.ewise(b, scaled, EwiseOp::Add).expect("add");
+    let got_sel = read_tensor(&s, sel).to_vec();
+    let want_sel: Vec<f64> = a_vals
+        .iter()
+        .zip(&b_vals)
+        .map(|(x, y)| if x > y { *x } else { *y })
+        .collect();
+    assert_eq!(got_sel, want_sel, "select must blend on the mask");
+
+    // A scalar threshold needs no difference at all: one map_to_set + set_to_map.
+    let thr = s
+        .map_to_set(a, super::session::Predicate::Gt(2.5))
+        .expect("map_to_set scalar");
+    let thr_map = s.set_to_map(thr, Scalar::F64(1.0)).expect("set_to_map");
+    assert_eq!(
+        read_tensor(&s, thr_map).to_vec(),
+        vec![0.0, 1.0, 1.0, 1.0, 0.0],
+        "step(a, 2.5) must match"
+    );
+}
+
+#[test]
+fn reqd4_edge_mask_window_is_an_exact_selector_without_sampling() {
+    // The same track builds edge-type masks with `sample_edges(sel, 1, 0)`,
+    // relying on p in {0,1} being degenerate. `edge_mask_window` states the
+    // same intent directly and is not a sampler at all.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let sel = s
+        .edge_weights(g)
+        .expect("edge_weights doubles as the selector");
+    let win = s.edge_mask_window(sel, 0.5, 1.5).expect("edge_mask_window");
+    assert_eq!(
+        s.edge_set_len(win).expect("len"),
+        2,
+        "exactly the 1.0 edges"
+    );
+
+    let drawn = s.sample_edges(sel, 1, 0).expect("sample_edges");
+    assert_eq!(
+        s.edge_set_len(drawn).expect("len"),
+        s.edge_set_len(win).expect("len"),
+        "the sampler at degenerate p agrees with the explicit window"
+    );
+}
+
+// ---- Phase 0 reproductions ------------------------------------------------
+//
+// Every test below the PIN marker asserts the *desired* contract, not the
+// current one, and is expected to FAIL on baseline `254b4c26c`. They are the
+// red-first evidence that each gap is real; a fix is only credible once the
+// matching test here flips. See
+// `docs/proposals/graphcompute_dynamics_requirements_response_2026-07-25.md` §12.
+
+/// PIN-D4b: `sample_edges` is bitwise reproducible across independent sessions.
+///
+/// `sample` has S-1/S-2 (`s1_…`, `s2_…` above); `sample_edges` had neither, and
+/// was covered only transitively through the SIR end-to-end test. The `[E]`
+/// sampler is what fork/hybrid coupling masks are built from, so it earns the
+/// same direct guarantee.
+#[test]
+fn pin_d4b_sample_edges_is_bitwise_reproducible_across_sessions() {
+    let fixture = || {
+        let nodes: Vec<u64> = (0..201).collect();
+        let edges: Vec<(u64, u64, f64)> = (0..200).map(|i| (i, i + 1, i as f64 / 200.0)).collect();
+        let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+        let prob = s.edge_weights(g).expect("edge_weights runs");
+        (s, prob)
+    };
+
+    let (mut a, pa) = fixture();
+    let (mut b, pb) = fixture();
+    let ma = a.sample_edges(pa, 0xC0FF_EE01, 3).expect("sample_edges a");
+    let mb = b.sample_edges(pb, 0xC0FF_EE01, 3).expect("sample_edges b");
+    assert_eq!(
+        a.edge_set_members_for_test(ma),
+        b.edge_set_members_for_test(mb),
+        "two independent sessions must draw the identical edge mask"
+    );
+}
+
+/// PIN-D4b (cont.): each edge's inclusion is exactly `sample_bernoulli` keyed on
+/// its CSR out-edge index — order- and partition-independent by construction.
+#[test]
+fn pin_d4b_sample_edges_matches_the_per_edge_counter_hash_oracle() {
+    use uni_algo::algo::rng::sample_bernoulli;
+
+    let nodes: Vec<u64> = (0..201).collect();
+    let edges: Vec<(u64, u64, f64)> = (0..200).map(|i| (i, i + 1, i as f64 / 200.0)).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+    let prob = s.edge_weights(g).expect("edge_weights runs");
+
+    // Read the probabilities the kernel actually saw, so the oracle does not
+    // have to assume the projection's edge ordering.
+    let probs = s.tensor_values_for_test(prob);
+    let (seed, iter) = (0x1234_5678, 11);
+    let mask = s.sample_edges(prob, seed, iter).expect("sample_edges runs");
+    let got: std::collections::HashSet<u32> =
+        s.edge_set_members_for_test(mask).into_iter().collect();
+
+    for (edge, &p) in probs.iter().enumerate() {
+        assert_eq!(
+            got.contains(&(edge as u32)),
+            sample_bernoulli(p, seed, iter, edge as u64),
+            "edge {edge} (p={p}) disagreed with the counter-hash oracle"
+        );
+    }
+}
+
+/// REPRO-D1E: `map_to_set` ignores `Shape`, so thresholding an `[E]` tensor
+/// yields a `VertexSet` that every edge-mask consumer rejects.
+///
+/// This is the one genuinely composition-blocked case behind REQ-D1: a guest can
+/// build a `[V]` mask from a predicate today (`set_to_map(map_to_set(…))`), but
+/// the `[E]` equivalent dead-ends, because `map_to_set` calls `alloc_set`
+/// unconditionally. Asserts the desired behaviour: an `[E]` input produces an
+/// edge mask usable by `spmv_masked`.
+#[test]
+#[ignore = "REPRO (red on 254b4c26c, 0x861 `expected EdgeSet`): flips when Phase 4 \
+              makes map_to_set shape-polymorphic. Run with --run-ignored all."]
+fn repro_d1e_map_to_set_on_an_edge_tensor_must_yield_an_edge_mask() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let sel = s.edge_weights(g).expect("edge_weights gives an [E] tensor");
+    let mask = s
+        .map_to_set(sel, super::session::Predicate::Gt(0.5))
+        .expect("map_to_set accepts the [E] tensor");
+
+    let vec = s.zero_map(g, DType::F64).expect("zero_map runs");
+    let out = s.spmv_masked(g, vec, Semiring::LinearAlgebra, mask);
+    assert!(
+        out.is_ok(),
+        "an [E] tensor thresholded by map_to_set must produce an EdgeSet that \
+         spmv_masked accepts; got {:?}",
+        out.err()
+    );
+}
+
+/// REPRO-EW: `ewise` validates operand *length* but not *shape*, so a `[V]` map
+/// and an `[E]` tensor that happen to be the same length compute silently.
+///
+/// A silent wrong answer, independent of any consumer ask, and materially more
+/// likely once a session carries more than one projection.
+#[test]
+#[ignore = "REPRO (red on 254b4c26c: ewise silently computes): flips when Phase 4 \
+              validates Shape, not just len. Run with --run-ignored all."]
+fn repro_ew_ewise_must_reject_mixed_vertex_and_edge_shapes() {
+    // A 4-cycle: |V| == |E| == 4, so the length check cannot separate them.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 0, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let vmap = s.zero_map(g, DType::F64).expect("[V] map");
+    let emap = s.edge_weights(g).expect("[E] tensor");
+    assert_eq!(
+        s.tensor_values_for_test(vmap).len(),
+        s.tensor_values_for_test(emap).len(),
+        "fixture must make the two shapes indistinguishable by length alone"
+    );
+
+    let out = s.ewise(vmap, emap, EwiseOp::Add);
+    assert!(
+        out.is_err(),
+        "ewise must reject a [V] map combined with an [E] tensor even when the \
+         lengths coincide; it silently computed instead"
+    );
+}
+
+/// REPRO-PROV: a tensor carries no record of the projection it came from, so a
+/// value derived from graph A can be combined with one from graph B whenever the
+/// vertex counts coincide — slot `i` means a different vertex in each.
+///
+/// The session layer already supports many projections (`bind_graph` is public
+/// and re-callable), so this is reachable today; it becomes the default hazard
+/// once guests can ask for a second projection.
+#[test]
+#[ignore = "REPRO (red on 254b4c26c: silently computes): flips when Phase 4 adds a \
+              graph-provenance tag to tensor handles. Run with --run-ignored all."]
+fn repro_prov_tensors_must_not_cross_projections() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    // Same vertex count, disjoint vertex ids: slot 0 is vid 0 in `a` and vid 10
+    // in `b`, so combining them elementwise is meaningless.
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let da = s.degrees(ga, Direction::Out).expect("degrees on a");
+    let db = s.degrees(gb, Direction::Out).expect("degrees on b");
+
+    let out = s.ewise(da, db, EwiseOp::Add);
+    assert!(
+        out.is_err(),
+        "a tensor from one projection must not combine with a tensor from \
+         another; it silently computed instead"
+    );
+}
+
+/// REPRO-NAN: a NaN probability silently never fires.
+///
+/// `sample_bernoulli` early-returns on `p <= 0.0` and `p >= 1.0`; NaN satisfies
+/// neither guard and then fails the `unit < prob` comparison, so a NaN-poisoned
+/// probability tensor yields a mask that is quietly missing those edges. Every
+/// other numeric fault in this surface is loud — this one should be too.
+#[test]
+#[ignore = "REPRO (red on 254b4c26c: NaN silently never fires): flips when the \
+              sampler rejects NaN. Run with --run-ignored all."]
+fn repro_nan_sample_edges_must_reject_a_nan_probability() {
+    // log(-1.0) = NaN, giving a genuinely NaN-valued [E] tensor.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, -1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("edge_weights runs");
+    let probs = s.map_apply(w, MapOp::Log).expect("map_apply log runs");
+    assert!(
+        s.tensor_values_for_test(probs).iter().any(|v| v.is_nan()),
+        "fixture must actually contain a NaN probability"
+    );
+
+    let out = s.sample_edges(probs, 7, 1);
+    assert!(
+        out.is_err(),
+        "a NaN probability must be rejected, not silently treated as never-fire"
     );
 }

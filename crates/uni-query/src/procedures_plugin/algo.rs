@@ -672,13 +672,33 @@ pub(crate) fn guest_graph_resolver(
 /// it so the bridge resolves it through the injected resolver (issue #151 P3).
 fn extract_query_graph_ref(config_json: &str) -> Option<serde_json::Value> {
     let args: Vec<serde_json::Value> = serde_json::from_str(config_json).ok()?;
-    let last = args.last()?;
-    let obj = last.as_object()?;
-    if obj.contains_key("nodeQuery") || obj.contains_key("edgeQuery") || obj.contains_key("name") {
-        Some(last.clone())
-    } else {
-        None
-    }
+    let obj = args.last()?.as_object()?;
+    uni_plugin::traits::algorithm::GraphProjectionSpec::is_query_graph_ref(obj)
+        .then(|| args.last().cloned())
+        .flatten()
+}
+
+/// Whether any **named scope** on the trailing config object is Cypher/Named.
+///
+/// The primary projection and each scope choose their mode independently, so a
+/// Native primary with a Cypher scope still needs the resolver installed. Without
+/// this check that scope would fall through to a Native storage scan of an empty
+/// spec and silently project the wrong graph — the drift the shared
+/// `is_query_graph_ref` predicate exists to prevent.
+fn has_query_scope(config_json: &str) -> bool {
+    let Ok(args) = serde_json::from_str::<Vec<serde_json::Value>>(config_json) else {
+        return false;
+    };
+    args.last()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|o| o.get("scopes"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scopes| {
+            scopes
+                .values()
+                .filter_map(serde_json::Value::as_object)
+                .any(uni_plugin::traits::algorithm::GraphProjectionSpec::is_query_graph_ref)
+        })
 }
 
 pub(crate) fn run_algorithm_provider(
@@ -699,14 +719,20 @@ pub(crate) fn run_algorithm_provider(
     // injected resolver instead of the Native storage scan. If no resolver is
     // available on this execution path, fail clearly rather than silently
     // projecting the whole graph.
-    if let Some(graph_ref) = extract_query_graph_ref(config_json) {
+    let primary_ref = extract_query_graph_ref(config_json);
+    if primary_ref.is_some() || has_query_scope(config_json) {
         let resolver = resolver.ok_or_else(|| {
             FnError::new(
                 0x820,
                 "Cypher/Named graph projection is not available on this execution path",
             )
         })?;
-        bridge = bridge.with_graph_resolver(resolver, graph_ref);
+        // A Cypher *scope* under a Native primary installs the resolver without a
+        // primary ref, so the primary still takes the storage-scan path.
+        bridge = match primary_ref {
+            Some(graph_ref) => bridge.with_graph_resolver(resolver, graph_ref),
+            None => bridge.with_resolver(resolver),
+        };
     }
     // Host-side arg validation/coercion (proposal §4.6 / D7): a provider that
     // declares typed `args` gets arity + type checking and default-filling here,

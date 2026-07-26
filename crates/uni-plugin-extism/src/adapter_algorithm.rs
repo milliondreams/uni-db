@@ -25,10 +25,10 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use uni_plugin::QName;
 use uni_plugin::errors::FnError;
-use uni_plugin::traits::algorithm::{
-    AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
+use uni_plugin::traits::algorithm::{AlgorithmContext, AlgorithmProvider, AlgorithmSignature};
+use uni_plugin_builtin::algorithms::bridge::{
+    AlgorithmHostBridge, ProjectionPlan, await_projections, build_projections,
 };
-use uni_plugin_builtin::algorithms::bridge::AlgorithmHostBridge;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::{
     AlgoSession, Arena, DEFAULT_ARENA_MAX_HANDLES, SharedRegistry, WorkBudget, next_session_epoch,
@@ -106,14 +106,10 @@ impl AlgorithmProvider for ExtismAlgorithm {
         let mut json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
             .map_err(|e| FnError::new(0x802, format!("extism algorithm: bad config json: {e}")))?;
         // A trailing projection-config object scopes/weights the graph the guest
-        // sees (issue #151); strip it before the remaining args reach the guest.
-        let spec = GraphProjectionSpec::take_from_args(&mut json_args).unwrap_or_else(|| {
-            GraphProjectionSpec {
-                include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
-                ..GraphProjectionSpec::default()
-            }
-        });
-        let projection = bridge.project_for_graph_compute(&spec);
+        // sees (issue #151) and may pre-declare named `scopes`; strip it before
+        // the remaining args reach the guest.
+        let plan = ProjectionPlan::take_from_args(&mut json_args)?;
+        let projections = build_projections(bridge, &plan);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
 
         let out_schema: SchemaRef = Arc::new(Schema::new(self.signature.output_fields.clone()));
@@ -127,17 +123,16 @@ impl AlgorithmProvider for ExtismAlgorithm {
         );
 
         let stream = futures::stream::once(async move {
-            let graph = projection
+            let bound = await_projections(projections)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("extism algorithm: {e}")))?;
+            let graph = Arc::clone(&bound.primary);
 
             // An explicit grant is authoritative and may raise the ceiling;
-            // otherwise the size-derived default (proposal §9).
-            let budget = WorkBudget::resolve(
-                work_cap,
-                graph.vertex_count() as u64,
-                graph.edge_count() as u64,
-            );
+            // otherwise the size-derived default (proposal §9), sized across
+            // *every* bound projection — a guest with named scopes can do O(V+E)
+            // work on each, so sizing from the primary alone under-budgets it.
+            let budget = WorkBudget::resolve(work_cap, bound.total_vertices(), bound.total_edges());
             let mut session = AlgoSession::new(
                 next_session_epoch()
                     .map_err(|e| DataFusionError::Execution(format!("extism algorithm: {e}")))?,
@@ -145,7 +140,19 @@ impl AlgorithmProvider for ExtismAlgorithm {
                 Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
             )
             .with_expected_columns(expected_cols);
+            // The primary binds FIRST: `bind_graph` treats the first bind as the
+            // primary projection, which `emit` keys its `nodeId` column to.
             let g = to_i64(session.bind_graph(Arc::clone(&graph)));
+            let graphs: serde_json::Map<String, serde_json::Value> = bound
+                .named
+                .iter()
+                .map(|(name, proj)| {
+                    (
+                        name.clone(),
+                        serde_json::Value::from(to_i64(session.bind_graph(Arc::clone(proj)))),
+                    )
+                })
+                .collect();
             let sid = registry.open(session);
 
             // Everything that can fail between open and close is wrapped so the
@@ -153,8 +160,10 @@ impl AlgorithmProvider for ExtismAlgorithm {
             // process-global registry), even if input-build or `acquire` fails.
             let started = std::time::Instant::now();
             let call_result: Result<(), DataFusionError> = (|| {
+                // `graphs` is additive: a guest that predates named scopes
+                // ignores the key, so no existing manifest needs a change.
                 let input = serde_json::to_vec(&serde_json::json!({
-                    "session": sid, "graph": g, "args": json_args,
+                    "session": sid, "graph": g, "args": json_args, "graphs": graphs,
                 }))
                 .map_err(|e| DataFusionError::Execution(format!("extism algorithm input: {e}")))?;
                 let mut leased = acquire(&pool)

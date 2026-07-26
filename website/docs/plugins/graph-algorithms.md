@@ -86,11 +86,66 @@ Two further guardrails make a mis-scoped or mis-sized projection fail with a cle
 
 Stored property values also project faithfully from uncommitted-to-disk state: `gc.node_property` / `gc.edge_property` and edge weights now read committed-but-**unflushed** in-memory data correctly, rather than surfacing `NaN` (or defaulting edge weights to `1.0`) until the next flush.
 
+### More than one graph: named scopes
+
+Some algorithms need two views of the store at once — a detail graph and an aggregate graph, a structural layer and a flow layer, the same nodes under two edge types. Declare them as **named scopes** on the projection-config object:
+
+```cypher
+CALL myplugin.compare([], {
+    nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'],     -- the primary projection
+    scopes: {
+        agg:  {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']},
+        flow: {nodeQuery: 'MATCH (c:Cell) RETURN id(c) AS id',
+               edgeQuery: 'MATCH (a:Cell)-[r:FLOWS]->(b:Cell) RETURN id(a) AS src, id(b) AS dst'}
+    }
+})
+```
+
+The guest reaches them by name:
+
+```rhai
+let g    = gc.graph();              // the primary projection
+let agg  = gc.graph_named("agg");   // a pre-declared scope
+```
+
+Each scope takes the **full** projection-config vocabulary independently — Native `nodeLabels` / `edgeTypes` / `weightProperty` / `nodeProperties`, or a Cypher `nodeQuery` / `edgeQuery`, or a `name` for a stored named graph. WASM and Extism guests receive the scope handles as a `graphs` object in their invocation JSON alongside the existing `graph` key; the key is additive, so a guest written before scopes existed ignores it.
+
+Three properties are worth being precise about.
+
+**Scopes are built before your algorithm runs.** `graph_named` is a lookup, not a projection. This is deliberate: projection is `O(V+E)` storage work that the native-work meter does not govern, so a guest able to project on demand could project in a loop and escape the budget entirely. Declaring scopes at the call site keeps the cost bounded and visible to the caller.
+
+**The budget is sized across all of them.** A guest with three scopes can do `O(V+E)` work on each, so the size-derived default work budget sums every bound projection rather than measuring the primary alone.
+
+**The primary is still the primary.** `emit` keys its `nodeId` column to the primary projection, and rejects a column derived from a scope — see [index space](#value-identity-shape-and-index-space) below. To return per-vertex results *about* a scope, re-key them (below) or make that scope the primary.
+
+#### Combining values across scopes: `rekey`
+
+Values from different projections do not combine — that is the whole point of the index-space check, and it holds between scopes exactly as it holds between any two graphs. But comparing two layers over the same vertices is the reason named scopes exist, so there is an explicit way to say so:
+
+```rhai
+let deg_here  = gc.degrees(g, "out");
+let deg_there = gc.degrees(agg, "out");
+let moved     = gc.rekey(deg_there, g);        // verified, not a cast
+let total     = gc.ewise(deg_here, moved, "add");
+```
+
+`rekey` is not a reinterpretation. It walks both projections' slot→Vid maps and succeeds only if they agree vertex for vertex; otherwise it fails naming the first slot where they diverge. So the claim "these two projections describe the same vertices" is checked at the point your algorithm depends on it, rather than assumed — and the check costs `O(V)`, charged to the work budget like any other kernel.
+
+It accepts `[V]` tensors and vertex sets. `[E]` values are refused: CSR edge order is a property of one projection's topology and carries no meaning in another, even when every vertex lines up.
+
+!!! warning "Slot correspondence is a Native-only guarantee"
+
+    Two **Native** projections over the same node set agree slot-for-slot: `ProjectionBuilder` sorts and dedups vids before interning, so slot `i` is the i-th smallest Vid in both. That is what makes a value from one scope meaningful against another *when you have checked the node sets match*.
+
+    **Cypher and Named projections carry no such guarantee.** They intern vids in row order and are not sorted, so slot `i` in a Cypher scope is simply the i-th row its query returned. Never assume a Cypher scope's slots line up with anything — move between them by vertex id (`frontier`, `topk`), not by slot.
+
+    The kernels enforce the *space*, not the correspondence: mixing values across scopes is rejected outright with `0x862`, which is why the check protects you here rather than merely warning.
+
 ---
 
 ## Kernel catalogue
 
-67 kernels. Every one is reachable from every loader, except `graph` — sandboxed guests receive the graph handle in their invocation arguments rather than calling for it.
+69 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -124,6 +179,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | `work_budget()` / `work_spent()` / `work_remaining()` | The native-work meter. Reading costs nothing — see the budget section below. |
 | `zero_map(g)` | A zeroed `[V]` map. |
 | `scatter(map, frontier, value)` | Write a scalar into the slots a vertex set selects. |
+| `rekey(value, g)` | Move a `[V]` tensor or vertex set into another projection's index space, **verified** — fails unless both projections name the same vertices slot for slot. See [named scopes](#more-than-one-graph-named-scopes). |
 | `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `normalize_l1`, `normalize_l2`. |
 | `recip` / `scale` / `normalize` | Fixed-form shorthands for the above. |
 | `reduce_sum` / `reduce_sum_masked` | Deterministic sums (fixed-order, so bitwise-reproducible). |

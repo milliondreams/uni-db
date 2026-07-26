@@ -492,8 +492,9 @@ mod tests {
         );
         assert_eq!(
             total,
-            all_loaders + 1,
-            "exactly one kernel (`graph`) is host-supplied rather than AllLoaders"
+            all_loaders + 2,
+            "exactly two kernels (`graph`, `graph_named`) are host-supplied rather than \
+             AllLoaders -- both hand the guest a projection handle the host already built"
         );
     }
 

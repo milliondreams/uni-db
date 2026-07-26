@@ -28,7 +28,7 @@ use uni_algo::algo::projection::{GraphProjection, ProjectionBuilder};
 use uni_common::core::id::Vid;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmHost, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
-    GraphView,
+    GraphScopeSpec, GraphView,
 };
 use uni_plugin::{Capability, CapabilitySet, FnError};
 
@@ -155,6 +155,24 @@ impl AlgorithmHostBridge {
         self
     }
 
+    /// Attach the resolver without a primary `graphRef`.
+    ///
+    /// Needed when the primary projection is Native but a **named scope** is
+    /// Cypher/Named: the resolver must be present for the scope, while the
+    /// primary still takes the storage-scan path. Without this the scope would
+    /// silently fall through to a Native scan of an empty spec.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn GraphProjectionResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Whether a Cypher/Named resolver is installed on this bridge.
+    #[must_use]
+    pub fn has_resolver(&self) -> bool {
+        self.resolver.is_some()
+    }
+
     /// Whether the effective `HostQuery` grant names a restricting scope (a
     /// non-empty prefix list that is not the universal `**`/`*` wildcard).
     fn host_query_scope_restricted(&self) -> bool {
@@ -187,6 +205,28 @@ impl AlgorithmHostBridge {
         &self,
         spec: &GraphProjectionSpec,
     ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
+        self.project_scope(spec, self.graph_ref.clone())
+    }
+
+    /// Projects one scope, taking its Cypher/Named `graphRef` per call.
+    ///
+    /// [`Self::project_for_graph_compute`] reads the bridge's single stored
+    /// `graph_ref`, which is right for the primary projection but cannot express
+    /// a `scopes` map where each entry may be Native or Cypher independently.
+    /// This takes the ref as an argument instead; passing `None` forces the
+    /// Native storage scan even when the bridge holds a ref for the primary.
+    ///
+    /// Returns a `'static` future that clones everything it needs, so N scopes
+    /// can be built by collecting N futures before entering the result stream —
+    /// which is what the loader adapters do, so no borrow of the host escapes.
+    ///
+    /// # Errors
+    /// As [`Self::project_for_graph_compute`].
+    pub fn project_scope(
+        &self,
+        spec: &GraphProjectionSpec,
+        graph_ref: Option<serde_json::Value>,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
         if !self
             .effective_caps
             .contains_variant(&Capability::GraphCompute)
@@ -218,7 +258,7 @@ impl AlgorithmHostBridge {
         // query execution or the projection store. A restricting HostQuery scope
         // cannot be checked against a query-defined subgraph, so reject
         // fail-closed and require an unscoped grant.
-        if let (Some(resolver), Some(graph_ref)) = (self.resolver.clone(), self.graph_ref.clone()) {
+        if let (Some(resolver), Some(graph_ref)) = (self.resolver.clone(), graph_ref) {
             let restricted = self.host_query_scope_restricted();
             return Box::pin(async move {
                 if restricted {
@@ -678,4 +718,159 @@ pub fn host_bridge_from_storage(
     effective_caps: CapabilitySet,
 ) -> AlgorithmHostBridge {
     AlgorithmHostBridge::new(AlgoContext::new(storage, l0), effective_caps)
+}
+
+/// The primary projection plus every pre-declared named scope for one CALL.
+///
+/// Parsed once from the trailing config object and consumed identically by all
+/// four loader adapters. Sharing this rather than hand-writing the same steps per
+/// loader is deliberate: the guest shims drifting from the host contract is the
+/// defect class this subsystem has hit most, and four copies of "parse config,
+/// build futures, bind primary first" is exactly how it happens.
+#[derive(Debug)]
+pub struct ProjectionPlan {
+    /// Knobs for the primary projection — the one `emit` keys its `nodeId` to.
+    pub primary: GraphProjectionSpec,
+    /// Cypher/Named `graphRef` for the primary, if it named one.
+    pub primary_graph_ref: Option<serde_json::Value>,
+    /// Named scopes, in declaration order.
+    pub scopes: Vec<GraphScopeSpec>,
+}
+
+impl ProjectionPlan {
+    /// Strips the trailing projection-config object from `args` and parses it.
+    ///
+    /// With no config object, yields the loader default (`include_reverse: true`,
+    /// so the In-direction kernels work) and no scopes.
+    ///
+    /// # Errors
+    /// Returns `0x86E` when a `scopes` map is malformed — an unnamed scope, a
+    /// non-object scope value, or a scope called `graph`.
+    pub fn take_from_args(args: &mut Vec<serde_json::Value>) -> Result<Self, FnError> {
+        let Some(cfg) = GraphProjectionSpec::take_config_from_args(args) else {
+            return Ok(Self {
+                primary: GraphProjectionSpec {
+                    include_reverse: true,
+                    ..GraphProjectionSpec::default()
+                },
+                primary_graph_ref: None,
+                scopes: Vec::new(),
+            });
+        };
+        let scopes = GraphProjectionSpec::scopes_from_config_object(&cfg).map_err(|e| {
+            FnError::new(crate::algorithms::graph_compute::error::ARG_VALIDATION, e)
+        })?;
+        let primary_graph_ref = GraphProjectionSpec::is_query_graph_ref(&cfg)
+            .then(|| serde_json::Value::Object(cfg.clone()));
+        Ok(Self {
+            primary: GraphProjectionSpec::from_config_object(&cfg),
+            primary_graph_ref,
+            scopes,
+        })
+    }
+}
+
+impl std::fmt::Debug for BoundProjections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundProjections")
+            .field("vertices", &self.primary.vertex_count())
+            .field(
+                "scopes",
+                &self.named.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Every projection a CALL needs, built and bound.
+///
+/// Returned by [`build_projections`] after all the futures resolve.
+pub struct BoundProjections {
+    /// The primary projection.
+    pub primary: Arc<GraphProjection>,
+    /// Named scopes in declaration order, paired with their projections.
+    pub named: Vec<(String, Arc<GraphProjection>)>,
+}
+
+impl BoundProjections {
+    /// Total vertices across every projection, for sizing the work budget.
+    #[must_use]
+    pub fn total_vertices(&self) -> u64 {
+        self.named
+            .iter()
+            .map(|(_, g)| g.vertex_count() as u64)
+            .sum::<u64>()
+            + self.primary.vertex_count() as u64
+    }
+
+    /// Total edges across every projection, for sizing the work budget.
+    #[must_use]
+    pub fn total_edges(&self) -> u64 {
+        self.named
+            .iter()
+            .map(|(_, g)| g.edge_count() as u64)
+            .sum::<u64>()
+            + self.primary.edge_count() as u64
+    }
+}
+
+/// Builds the futures for every projection in `plan`, ready to be awaited.
+///
+/// Called **before** the adapter enters its result stream, so no borrow of the
+/// host escapes into the `'static` future — the same reason the single-projection
+/// path built its future early. Awaiting is sequential inside
+/// [`await_projections`]: `ProjectionBuilder::build` scans storage, and running N
+/// of those concurrently buys little while making the work accounting racy.
+#[must_use]
+pub fn build_projections(bridge: &AlgorithmHostBridge, plan: &ProjectionPlan) -> ProjectionFutures {
+    ProjectionFutures {
+        primary: bridge.project_scope(&plan.primary, plan.primary_graph_ref.clone()),
+        named: plan
+            .scopes
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    bridge.project_scope(&s.spec, s.graph_ref.clone()),
+                )
+            })
+            .collect(),
+    }
+}
+
+impl std::fmt::Debug for ProjectionFutures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionFutures")
+            .field(
+                "scopes",
+                &self.named.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// A projection being built.
+type PendingProjection = BoxFuture<'static, Result<Arc<GraphProjection>, FnError>>;
+
+/// Pending projections for one CALL, awaited by [`await_projections`].
+pub struct ProjectionFutures {
+    primary: PendingProjection,
+    named: Vec<(String, PendingProjection)>,
+}
+
+/// Awaits every projection, naming the scope that failed.
+///
+/// # Errors
+/// Propagates the first projection failure, prefixed with the scope name so a
+/// broken scope is not reported as if the primary projection failed.
+pub async fn await_projections(futures: ProjectionFutures) -> Result<BoundProjections, FnError> {
+    let primary = futures.primary.await?;
+    let mut named = Vec::with_capacity(futures.named.len());
+    for (name, fut) in futures.named {
+        let g = fut
+            .await
+            .map_err(|e| FnError::new(e.code, format!("graph scope `{name}`: {}", e.message)))?;
+        named.push((name, g));
+    }
+    Ok(BoundProjections { primary, named })
 }

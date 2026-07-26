@@ -30,10 +30,10 @@ use pyo3::prelude::*;
 use smol_str::SmolStr;
 
 use uni_plugin::errors::FnError;
-use uni_plugin::traits::algorithm::{
-    AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
+use uni_plugin::traits::algorithm::{AlgorithmContext, AlgorithmProvider, AlgorithmSignature};
+use uni_plugin_builtin::algorithms::bridge::{
+    AlgorithmHostBridge, ProjectionPlan, await_projections, build_projections,
 };
-use uni_plugin_builtin::algorithms::bridge::AlgorithmHostBridge;
 use uni_plugin_builtin::algorithms::graph_compute::{
     AlgoSession, Arena, DEFAULT_ARENA_MAX_HANDLES, WorkBudget, next_session_epoch,
 };
@@ -96,14 +96,10 @@ impl AlgorithmProvider for PyAlgorithm {
         let mut json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
             .map_err(|e| FnError::new(0x802, format!("python algorithm: bad config json: {e}")))?;
         // A trailing projection-config object scopes/weights the graph the guest
-        // sees (issue #151); strip it before the remaining args reach the guest.
-        let spec = GraphProjectionSpec::take_from_args(&mut json_args).unwrap_or_else(|| {
-            GraphProjectionSpec {
-                include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
-                ..GraphProjectionSpec::default()
-            }
-        });
-        let projection = bridge.project_for_graph_compute(&spec);
+        // sees (issue #151) and may pre-declare named `scopes`; strip it before
+        // the remaining args reach the guest.
+        let plan = ProjectionPlan::take_from_args(&mut json_args)?;
+        let projections = build_projections(bridge, &plan);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
         let deadline_ms_cap = bridge.graph_compute_deadline_ms();
 
@@ -114,17 +110,16 @@ impl AlgorithmProvider for PyAlgorithm {
         );
 
         let stream = futures::stream::once(async move {
-            let graph = projection
+            let bound = await_projections(projections)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("python algorithm: {e}")))?;
+            let graph = Arc::clone(&bound.primary);
 
             // An explicit grant is authoritative and may raise the ceiling;
-            // otherwise the size-derived default (proposal §9).
-            let budget = WorkBudget::resolve(
-                work_cap,
-                graph.vertex_count() as u64,
-                graph.edge_count() as u64,
-            );
+            // otherwise the size-derived default (proposal §9), sized across
+            // *every* bound projection — a guest with named scopes can do O(V+E)
+            // work on each, so sizing from the primary alone under-budgets it.
+            let budget = WorkBudget::resolve(work_cap, bound.total_vertices(), bound.total_edges());
             let session = Arc::new(parking_lot::Mutex::new(
                 AlgoSession::new(
                     next_session_epoch().map_err(|e| {
@@ -135,7 +130,23 @@ impl AlgorithmProvider for PyAlgorithm {
                 )
                 .with_expected_columns(expected_cols),
             ));
-            let g = session.lock().bind_graph(Arc::clone(&graph));
+            // The primary binds FIRST: `bind_graph` treats the first bind as the
+            // primary projection, which `emit` keys its `nodeId` column to.
+            let (g, scopes) = {
+                let mut sess = session.lock();
+                let g = sess.bind_graph(Arc::clone(&graph));
+                let scopes: Vec<(String, i64)> = bound
+                    .named
+                    .iter()
+                    .map(|(name, proj)| {
+                        (
+                            name.clone(),
+                            crate::graph_compute::to_i64(sess.bind_graph(Arc::clone(proj))),
+                        )
+                    })
+                    .collect();
+                (g, scopes)
+            };
             let deadline_ms = deadline_ms_cap.unwrap_or(DEFAULT_DEADLINE_SECS * 1000);
             let started = Instant::now();
             let deadline_at = started.checked_add(Duration::from_millis(deadline_ms));
@@ -152,7 +163,7 @@ impl AlgorithmProvider for PyAlgorithm {
             // Drive the guest under the GIL. No await happens inside this block,
             // so the GIL is held only for the synchronous guest run.
             let call_result: Result<(), DataFusionError> = Python::attach(|py| {
-                let gc = new_session(Arc::clone(&session), g, deadline_at);
+                let gc = new_session(Arc::clone(&session), g, deadline_at, scopes.clone());
                 let gc_obj = Py::new(py, gc)
                     .map_err(|e| DataFusionError::Execution(format!("GcSession: {e}")))?;
                 let mut py_args: Vec<Py<PyAny>> = vec![gc_obj.into_any()];

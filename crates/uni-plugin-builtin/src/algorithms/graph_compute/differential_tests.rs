@@ -3754,6 +3754,79 @@ fn ragged_egress_labels_rows_with_the_values_own_projection() {
     }
 }
 
+/// `rekey` is a verified move between projections, not a cast.
+///
+/// It is the escape hatch that makes named scopes useful: two edge layers over
+/// the same vertices are a real thing to want to combine. What keeps it honest is
+/// that it *checks* the correspondence rather than trusting the caller — so the
+/// failure mode is a named error, not a plausible wrong number.
+#[test]
+fn rekey_moves_a_value_between_projections_only_when_they_correspond() {
+    // Same vids, different topology — the case named scopes exist for.
+    let layer_a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let layer_b = build_projection(&[0, 1, 2, 3], &[(2, 3, 1.0)], false, false);
+    let (mut s, ga) = session_with(layer_a);
+    let gb = s.bind_graph(Arc::new(layer_b));
+
+    let deg_b = s.degrees(gb, Direction::Out).expect("degrees on b");
+    // Without rekey the layers cannot be combined at all.
+    let deg_a = s.degrees(ga, Direction::Out).expect("degrees on a");
+    assert!(
+        s.ewise(deg_a, deg_b, EwiseOp::Add).is_err(),
+        "combining across projections must require an explicit rekey"
+    );
+
+    let moved = s.rekey(deg_b, ga).expect("same vid set, so rekey succeeds");
+    let sum = s
+        .ewise(deg_a, moved, EwiseOp::Add)
+        .expect("after rekey the layers combine");
+    let total: f64 = s.tensor_values_for_test(sum).iter().sum();
+    assert!(
+        (total - 2.0).abs() < 1e-9,
+        "both layers must contribute one edge each, got {total}"
+    );
+
+    // A different vid set is refused, naming where they diverge.
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[0, 1, 2, 9],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    )));
+    let err = s
+        .rekey(deg_a, other)
+        .expect_err("differing vid sets must not be re-keyed");
+    assert!(
+        err.message.contains("slot 3"),
+        "the error must name the first divergent slot, got: {}",
+        err.message
+    );
+
+    // Differing sizes are refused before the walk.
+    let smaller = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+    assert!(
+        s.rekey(deg_a, smaller).is_err(),
+        "projections of different sizes cannot describe the same vertex set"
+    );
+
+    // [E] values have no cross-projection meaning even when the vertices match.
+    let edge_vals = s.edge_weights(ga).expect("edge weights");
+    let err = s
+        .rekey(edge_vals, gb)
+        .expect_err("an [E] value must not be re-keyed");
+    assert!(
+        err.message.contains("[V]") || err.message.contains("edge order"),
+        "the error must explain why [E] cannot carry across, got: {}",
+        err.message
+    );
+
+    // Re-keying to the value's own projection is a caller mistake, not a no-op.
+    assert!(
+        s.rekey(deg_a, ga).is_err(),
+        "rekey to the same projection must be reported rather than silently ignored"
+    );
+}
+
 /// Provenance survives the set→map hop, so a real composition still works.
 ///
 /// `set_to_map` used to return `Untracked`. Now it inherits, which is what makes

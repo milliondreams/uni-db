@@ -48,6 +48,8 @@ pub struct GcSession {
     session: Arc<Mutex<AlgoSession>>,
     graph: i64,
     deadline: Option<Instant>,
+    /// Pre-declared named scopes, built by the host before the guest ran.
+    scopes: Vec<(String, i64)>,
 }
 
 impl std::fmt::Debug for GcSession {
@@ -64,15 +66,17 @@ pub fn new_session(
     session: Arc<Mutex<AlgoSession>>,
     graph: Handle,
     deadline: Option<Instant>,
+    scopes: Vec<(String, i64)>,
 ) -> GcSession {
     GcSession {
         session,
         graph: to_i64(graph),
         deadline,
+        scopes,
     }
 }
 
-fn to_i64(h: Handle) -> i64 {
+pub(crate) fn to_i64(h: Handle) -> i64 {
     #[expect(
         clippy::cast_possible_wrap,
         reason = "opaque handle round-trips bit-exact"
@@ -103,6 +107,35 @@ impl GcSession {
     fn graph(&self) -> PyResult<i64> {
         self.check_deadline()?;
         Ok(self.graph)
+    }
+
+    /// The handle of a pre-declared named scope.
+    ///
+    /// Scopes are built by the host before the guest runs, so this is a lookup
+    /// rather than a projection: a guest cannot reach storage in a loop.
+    fn graph_named(&self, name: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.scopes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
+            .ok_or_else(|| {
+                let declared: Vec<&str> = self.scopes.iter().map(|(n, _)| n.as_str()).collect();
+                py_err(FnError::new(
+                    0x86E,
+                    if declared.is_empty() {
+                        format!(
+                            "no graph scope `{name}`: this CALL declared no `scopes` map, so \
+                             only the primary projection (`graph()`) exists"
+                        )
+                    } else {
+                        format!(
+                            "no graph scope `{name}`: declared scopes are {}",
+                            declared.join(", ")
+                        )
+                    },
+                ))
+            })
     }
 
     /// Vertex count of a graph handle.
@@ -697,6 +730,16 @@ impl GcSession {
     }
 
     /// Folds a walks handle into a per-vertex visit-count map.
+    /// Re-keys a `[V]` value into another projection's index space, verified.
+    fn rekey(&self, value: i64, g: i64) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .rekey(from_i64(value), from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     fn walk_visit_counts(&self, walks: i64, g: i64) -> PyResult<i64> {
         self.check_deadline()?;
         self.session
@@ -1016,7 +1059,7 @@ mod tests {
             uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
         );
         let g = session.bind_graph(Arc::new(graph));
-        let gc = new_session(Arc::new(Mutex::new(session)), g, None);
+        let gc = new_session(Arc::new(Mutex::new(session)), g, None, Vec::new());
 
         assert_eq!(gc.work_budget().expect("budget"), 250.0);
         assert_eq!(gc.work_spent().expect("spent"), 0.0);

@@ -431,7 +431,104 @@ impl GraphProjectionSpec {
         "edgeQuery",
         "weightColumn",
         "name",
+        "scopes",
     ];
+
+    /// Keys that mark a config object as a **Cypher/Named** `graphRef` rather
+    /// than a Native label/edge-type scoping object.
+    ///
+    /// Single-sourced so the query layer's graphRef sniffing and the per-scope
+    /// parsing below cannot drift: a scope routed to the Native storage scan
+    /// when it names a Cypher query would silently project the wrong graph.
+    pub const QUERY_CONFIG_KEYS: &'static [&'static str] = &["nodeQuery", "edgeQuery", "name"];
+
+    /// Whether a config object names a Cypher/Named projection.
+    #[must_use]
+    pub fn is_query_graph_ref(cfg: &serde_json::Map<String, serde_json::Value>) -> bool {
+        Self::QUERY_CONFIG_KEYS.iter().any(|k| cfg.contains_key(*k))
+    }
+
+    /// Parses the `scopes` map into pre-declared named projections.
+    ///
+    /// A guest that needs more than one view of the store declares them at the
+    /// CALL site rather than projecting on demand, because projection is the one
+    /// thing a guest must not be able to trigger in a loop:
+    ///
+    /// ```cypher
+    /// CALL myplugin.compare([], {
+    ///   nodeLabels: ['Cell'], edgeTypes: ['ADJ'],
+    ///   scopes: {
+    ///     agg:  {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']},
+    ///     flow: {nodeQuery: 'MATCH (c:Cell) RETURN id(c) AS id'}
+    ///   }
+    /// })
+    /// ```
+    ///
+    /// The outer object stays the *primary* projection — the one `emit` keys its
+    /// `nodeId` column to. Each scope value is parsed by the same
+    /// [`Self::from_config_object`], so every Native knob works per scope; a
+    /// scope bearing a Cypher/Named key is carried through verbatim for the
+    /// resolver instead.
+    ///
+    /// # Errors
+    /// Returns a message naming the offending scope when `scopes` is not an
+    /// object, a scope name is empty, a scope value is not an object, or a scope
+    /// is named `graph` (which would shadow the primary handle's own accessor).
+    pub fn scopes_from_config_object(
+        cfg: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<GraphScopeSpec>, String> {
+        let Some(raw) = cfg.get("scopes") else {
+            return Ok(Vec::new());
+        };
+        let map = raw
+            .as_object()
+            .ok_or_else(|| "`scopes` must be an object of {name: projection-config}".to_string())?;
+        let mut out = Vec::with_capacity(map.len());
+        for (name, value) in map {
+            if name.is_empty() {
+                return Err("a scope name must not be empty".to_string());
+            }
+            if name == "graph" {
+                return Err(
+                    "`graph` is not a valid scope name: it is the primary projection, \
+                     reached with `gc.graph()` rather than `gc.graph_named(..)`"
+                        .to_string(),
+                );
+            }
+            let obj = value.as_object().ok_or_else(|| {
+                format!("scope `{name}` must be a projection-config object, got {value}")
+            })?;
+            let graph_ref = Self::is_query_graph_ref(obj).then(|| value.clone());
+            out.push(GraphScopeSpec {
+                name: name.clone(),
+                spec: Self::from_config_object(obj),
+                graph_ref,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::take_from_args`] but also returns the raw config object.
+    ///
+    /// [`Self::take_from_args`] discards the object after parsing, which is fine
+    /// for the Native knobs but loses `scopes` (whose values must be re-parsed
+    /// per scope, and whose Cypher entries must survive verbatim).
+    #[must_use]
+    pub fn take_config_from_args(
+        args: &mut Vec<serde_json::Value>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let is_config = args
+            .last()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|o| Self::CONFIG_KEYS.iter().any(|k| o.contains_key(*k)));
+        if !is_config {
+            return None;
+        }
+        match args.pop() {
+            Some(serde_json::Value::Object(cfg)) => Some(cfg),
+            _ => None,
+        }
+    }
 
     /// If the last element of `args` is a JSON object bearing at least one
     /// [`Self::CONFIG_KEYS`] key, removes it from `args` and returns the parsed
@@ -445,18 +542,26 @@ impl GraphProjectionSpec {
     /// never reaches the guest function.
     #[must_use]
     pub fn take_from_args(args: &mut Vec<serde_json::Value>) -> Option<Self> {
-        let is_config = args
-            .last()
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|o| Self::CONFIG_KEYS.iter().any(|k| o.contains_key(*k)));
-        if !is_config {
-            return None;
-        }
-        match args.pop() {
-            Some(serde_json::Value::Object(cfg)) => Some(Self::from_config_object(&cfg)),
-            _ => None,
-        }
+        Self::take_config_from_args(args).map(|cfg| Self::from_config_object(&cfg))
     }
+}
+
+/// One pre-declared named projection from a CALL-site `scopes` map.
+///
+/// Named scopes are how a guest algorithm reaches more than one view of the
+/// store. They are declared at the call site and built by the host *before* the
+/// guest runs, which is the point: a guest that could project on demand could
+/// project in a loop, and projection is `O(V+E)` storage work that the native
+/// work meter does not govern.
+#[derive(Clone, Debug)]
+pub struct GraphScopeSpec {
+    /// The name the guest passes to `graph_named`.
+    pub name: String,
+    /// Native knobs for this scope, parsed by [`GraphProjectionSpec::from_config_object`].
+    pub spec: GraphProjectionSpec,
+    /// The raw scope object when it names a Cypher/Named projection, to be
+    /// resolved through the host's injected resolver rather than scanned.
+    pub graph_ref: Option<serde_json::Value>,
 }
 
 /// Every graph-projection knob, enumerated so the guest/native surface contract
@@ -720,6 +825,85 @@ mod tests {
             ty,
             default,
             doc: String::new(),
+        }
+    }
+
+    fn cfg(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::from_str(json).expect("valid json") {
+            serde_json::Value::Object(o) => o,
+            other => panic!("expected an object, got {other}"),
+        }
+    }
+
+    /// A `scopes`-only object must still be recognised as the projection config.
+    ///
+    /// If `scopes` were missing from `CONFIG_KEYS`, this object would not be
+    /// stripped and would arrive at the guest as a positional argument — a
+    /// silent arity shift rather than an error.
+    #[test]
+    fn a_scopes_only_object_is_recognised_as_the_projection_config() {
+        let mut args: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[1, {"scopes": {"agg": {"nodeLabels": ["N"]}}}]"#)
+                .expect("valid json");
+        let spec = super::GraphProjectionSpec::take_from_args(&mut args);
+        assert!(
+            spec.is_some(),
+            "the trailing object must be taken as config"
+        );
+        assert_eq!(args.len(), 1, "only the guest's own arg may remain");
+    }
+
+    /// Each scope is parsed by the same Native parser as the primary, and a
+    /// Cypher/Named scope is carried through verbatim for the resolver.
+    #[test]
+    fn scopes_parse_per_scope_and_keep_their_mode() {
+        let scopes = super::GraphProjectionSpec::scopes_from_config_object(&cfg(r#"{"scopes": {
+                 "agg": {"nodeLabels": ["Cell"], "edgeTypes": ["AGG"], "weightProperty": "w"},
+                 "flow": {"nodeQuery": "MATCH (c) RETURN id(c) AS id"}
+               }}"#))
+        .expect("well-formed scopes");
+        assert_eq!(scopes.len(), 2);
+
+        let agg = scopes.iter().find(|s| s.name == "agg").expect("agg");
+        assert_eq!(agg.spec.node_labels, vec!["Cell".to_string()]);
+        assert_eq!(agg.spec.weight_property.as_deref(), Some("w"));
+        assert!(
+            agg.graph_ref.is_none(),
+            "a Native scope must not be routed to the resolver"
+        );
+
+        let flow = scopes.iter().find(|s| s.name == "flow").expect("flow");
+        assert!(
+            flow.graph_ref.is_some(),
+            "a Cypher scope must reach the resolver verbatim"
+        );
+    }
+
+    /// No `scopes` key is not an error — it is the ordinary single-graph CALL.
+    #[test]
+    fn an_absent_scopes_key_yields_no_scopes() {
+        let scopes =
+            super::GraphProjectionSpec::scopes_from_config_object(&cfg(r#"{"nodeLabels": ["N"]}"#))
+                .expect("no scopes is fine");
+        assert!(scopes.is_empty());
+    }
+
+    /// Malformed scope maps are named, not silently dropped.
+    #[test]
+    fn a_malformed_scopes_map_is_rejected_with_the_offending_name() {
+        for (json, needle) in [
+            (r#"{"scopes": ["agg"]}"#, "must be an object"),
+            (r#"{"scopes": {"agg": 7}}"#, "agg"),
+            (r#"{"scopes": {"": {}}}"#, "must not be empty"),
+            // `graph` would shadow the primary handle's own accessor.
+            (r#"{"scopes": {"graph": {}}}"#, "primary projection"),
+        ] {
+            let err = super::GraphProjectionSpec::scopes_from_config_object(&cfg(json))
+                .expect_err("must be rejected");
+            assert!(
+                err.contains(needle),
+                "error for {json} must mention `{needle}`, got: {err}"
+            );
         }
     }
 

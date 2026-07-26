@@ -247,3 +247,317 @@ async fn rhai_guest_value_arg_takes_variable_length_set() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// A guest that reads two pre-declared named scopes over the same vertices.
+///
+/// Counts each vertex's out-degree in the primary layer and in the `agg` layer,
+/// and emits both. The point is that `deg_agg` is computed from a *different*
+/// projection and combined with the primary's — which is only legal because both
+/// scopes cover the same node set, and is only *safe* because slot correspondence
+/// holds for Native projections.
+const SCOPES_SCRIPT: &str = r#"
+    fn uni_manifest() {
+        #{
+            id: "ai.example.gcscopes",
+            version: "0.1.0",
+            determinism: "pure",
+            algorithms: [
+                #{ name: "layers", args: [], yields: ["nodeId:int", "both:float"] },
+            ],
+        }
+    }
+
+    fn layers(gc) {
+        let g   = gc.graph();
+        let agg = gc.graph_named("agg");
+        let a = gc.degrees(g, "out");
+        let b = gc.degrees(agg, "out");
+        // `b` is keyed to `agg`. Combining it with `a` requires an explicit,
+        // verified re-key: `rekey` walks both slot->Vid maps and fails if the
+        // projections do not describe the same vertices.
+        let b_here = gc.rekey(b, g);
+        let sum = gc.ewise(a, b_here, "add", 0.0);
+        gc.free(a);
+        gc.free(b);
+        gc.free(b_here);
+        gc.emit("both", sum);
+    }
+"#;
+
+/// The same guest, but mixing a scope's value into a kernel bound to the primary.
+const SCOPES_CROSS_SCRIPT: &str = r#"
+    fn uni_manifest() {
+        #{
+            id: "ai.example.gccross",
+            version: "0.1.0",
+            determinism: "pure",
+            algorithms: [
+                #{ name: "cross", args: [], yields: ["nodeId:int", "v:float"] },
+            ],
+        }
+    }
+
+    fn cross(gc) {
+        let g   = gc.graph();
+        let agg = gc.graph_named("agg");
+        let from_agg = gc.degrees(agg, "out");
+        // Illegal: `from_agg` is keyed to `agg`'s vertices, not `g`'s.
+        let spread = gc.spmv(g, from_agg, "linear_algebra", "out");
+        gc.emit("v", spread);
+    }
+"#;
+
+async fn build_two_layer_graph(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Cell")
+        .property("name", DataType::String)
+        .done()
+        .edge_type("ADJACENT", &["Cell"], &["Cell"])
+        .done()
+        .edge_type("AGGREGATES", &["Cell"], &["Cell"])
+        .done()
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    for name in ["A", "B", "C", "D"] {
+        tx.execute(&format!("CREATE (:Cell {{name: '{name}'}})"))
+            .await?;
+    }
+    // Two edge layers over the SAME four vertices, with different topology, so a
+    // result that ignored one layer would be indistinguishable from a bug.
+    for (a, b) in [("A", "B"), ("B", "C")] {
+        tx.execute(&format!(
+            "MATCH (a:Cell {{name: '{a}'}}), (b:Cell {{name: '{b}'}}) CREATE (a)-[:ADJACENT]->(b)"
+        ))
+        .await?;
+    }
+    for (a, b) in [("A", "C"), ("A", "D"), ("C", "D")] {
+        tx.execute(&format!(
+            "MATCH (a:Cell {{name: '{a}'}}), (b:Cell {{name: '{b}'}}) CREATE (a)-[:AGGREGATES]->(b)"
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+fn gc_caps() -> CapabilitySet {
+    CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ])
+}
+
+/// A guest reads a second projection by name and combines it with the primary.
+///
+/// This is the fixture the multi-projection work needed and nothing had: two
+/// projections with identical vertex counts **and** identical vid sets, so slot
+/// `i` names the same vertex in both. Every earlier two-graph test relied on
+/// differing sizes, which is exactly the case a length check already catches.
+#[tokio::test]
+async fn rhai_guest_reads_a_named_scope() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, SCOPES_SCRIPT, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let session = db.session();
+    let res = session
+        .query(
+            "CALL ai.example.gcscopes.layers({\
+               nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'], \
+               scopes: {agg: {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await?;
+    let rows = res.rows();
+    assert_eq!(
+        rows.len(),
+        4,
+        "one row per vertex of the primary projection"
+    );
+
+    // ADJACENT out-degrees: A=1, B=1, C=0, D=0.  AGGREGATES: A=2, B=0, C=1, D=0.
+    // Sum per vertex: A=3, B=1, C=1, D=0 -> total 5 = 2 + 3 edges.
+    let total: f64 = rows
+        .iter()
+        .map(|r| r.get::<f64>("both").unwrap_or(f64::NAN))
+        .sum();
+    assert!(
+        (total - 5.0).abs() < 1e-9,
+        "both layers must contribute (2 ADJACENT + 3 AGGREGATES edges), got {total}"
+    );
+
+    // The per-vertex split proves the scope is a genuinely different topology
+    // rather than the primary projected twice.
+    let mut by_id: Vec<f64> = rows
+        .iter()
+        .map(|r| r.get::<f64>("both").unwrap_or(f64::NAN))
+        .collect();
+    by_id.sort_by(f64::total_cmp);
+    assert_eq!(
+        by_id
+            .iter()
+            .map(|v| format!("{v:.0}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        "0,1,1,3",
+        "degree sums must be the two layers combined, not one layer doubled"
+    );
+    Ok(())
+}
+
+/// Mixing a scope's value into a kernel bound to another graph is rejected.
+///
+/// Both projections have four vertices, so no length or capacity check can
+/// separate them. Only the index space can — and without it the guest would get
+/// a plausible number computed against the wrong adjacency.
+#[tokio::test]
+async fn rhai_guest_cannot_mix_values_across_scopes() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, SCOPES_CROSS_SCRIPT, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let err = db
+        .session()
+        .query(
+            "CALL ai.example.gccross.cross({\
+               nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'], \
+               scopes: {agg: {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']}}\
+             }) YIELD nodeId, v RETURN nodeId, v",
+        )
+        .await
+        .expect_err("a cross-projection spmv must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different index spaces") || msg.contains("spmv"),
+        "the error must name the index-space fault, got: {msg}"
+    );
+    Ok(())
+}
+
+/// An unknown scope name is an error that lists what was declared.
+#[tokio::test]
+async fn rhai_guest_gets_a_helpful_error_for_an_unknown_scope() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let script = SCOPES_SCRIPT.replace("gc.graph_named(\"agg\")", "gc.graph_named(\"typo\")");
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, &script, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let err = db
+        .session()
+        .query(
+            "CALL ai.example.gcscopes.layers({\
+               nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'], \
+               scopes: {agg: {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await
+        .expect_err("an undeclared scope name must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("typo") && msg.contains("agg"),
+        "the error must name the miss and list the declared scopes, got: {msg}"
+    );
+    Ok(())
+}
+
+/// A **Cypher** named scope alongside a Native primary.
+///
+/// This is the path that forced `graph_ref` off the bridge and into a per-call
+/// parameter: each scope picks its own mode, so a Native primary with a Cypher
+/// scope needs the resolver installed *without* a primary ref. Before that, the
+/// scope fell through to a Native storage scan of an empty spec.
+///
+/// The scope's edge query selects the AGGREGATES layer, so a result matching the
+/// ADJACENT layer would prove the Cypher scope had been ignored.
+#[tokio::test]
+async fn rhai_guest_reads_a_cypher_named_scope() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, SCOPES_SCRIPT, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let res = db
+        .session()
+        .query(
+            "CALL ai.example.gcscopes.layers({\
+               nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'], \
+               scopes: {agg: {\
+                 nodeQuery: 'MATCH (n:Cell) RETURN id(n) AS id', \
+                 edgeQuery: 'MATCH (a:Cell)-[:AGGREGATES]->(b:Cell) \
+                             RETURN id(a) AS source, id(b) AS target'}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await?;
+    let rows = res.rows();
+    assert_eq!(
+        rows.len(),
+        4,
+        "one row per vertex of the primary projection"
+    );
+
+    let total: f64 = rows
+        .iter()
+        .map(|r| r.get::<f64>("both").unwrap_or(f64::NAN))
+        .sum();
+    assert!(
+        (total - 5.0).abs() < 1e-9,
+        "the Cypher scope must contribute its 3 AGGREGATES edges on top of the \
+         primary's 2 ADJACENT edges, got {total}"
+    );
+    Ok(())
+}
+
+/// A Cypher scope whose rows do not correspond is caught by `rekey`, not trusted.
+///
+/// `GraphProjection::from_rows` interns in row order and deliberately does not
+/// sort, so a Cypher scope has no slot correspondence with a Native projection in
+/// general. The guarantee is not "Cypher scopes are unusable" — it is that the
+/// claim gets *checked* where a guest relies on it. Here the scope covers only
+/// three of the four vertices, so `rekey` refuses rather than producing a
+/// right-looking wrong answer.
+#[tokio::test]
+async fn a_non_corresponding_cypher_scope_is_refused_by_rekey() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, SCOPES_SCRIPT, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let err = db
+        .session()
+        .query(
+            "CALL ai.example.gcscopes.layers({\
+               nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'], \
+               scopes: {agg: {\
+                 nodeQuery: 'MATCH (n:Cell) WHERE n.name <> \"D\" RETURN id(n) AS id', \
+                 edgeQuery: 'MATCH (a:Cell)-[:AGGREGATES]->(b:Cell) \
+                             RETURN id(a) AS source, id(b) AS target'}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await
+        .expect_err("a scope over a different vertex set must not be re-keyed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rekey"),
+        "the failure must come from the correspondence check, got: {msg}"
+    );
+    Ok(())
+}

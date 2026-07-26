@@ -710,6 +710,19 @@ under-expands the traversal instead of failing.
 element of unification — nothing a guest can build lands there. `map_to_set` is shape-polymorphic:
 an `[E]` tensor lowers to an `EdgeSet` that `spmv_masked` accepts.
 
+A guest can pre-declare extra projections at the CALL site with a `scopes` map
+(`{nodeLabels: [...], scopes: {agg: {nodeLabels: [...], edgeTypes: [...]}}}`) and reach them with
+`gc.graph_named("agg")`. Scopes are built by the host before the guest runs — `graph_named` is a
+lookup, so a guest cannot project in a loop and escape the work meter — and the size-derived work
+budget is summed across every bound projection. Each scope takes the full config vocabulary
+independently, Native or Cypher/Named. Slot correspondence between projections is a **Native-only**
+guarantee: `ProjectionBuilder` sorts and dedups vids, `GraphProjection::from_rows` does not.
+
+To combine values across scopes, use `rekey(value, g)`. It is a *verified* move, not a cast: it
+walks both slot→Vid maps and fails naming the first divergent slot unless the projections describe
+the same vertices. `[V]` tensors and vertex sets only — `[E]` values have no cross-projection
+meaning.
+
 Egress is keyed to the value: `topk`, `arg_extreme`, `emit_walks` and `emit_pairs` return the vids
 of *their own* value's projection, not the first graph bound; an arena-keyed value is rejected.
 `emit` checks identity before length, so a wrong-projection column is named as such.

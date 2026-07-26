@@ -43,6 +43,9 @@ use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 pub struct GcSession {
     session: Arc<Mutex<AlgoSession>>,
     graph: i64,
+    /// Pre-declared named scopes (`Arc` because Rhai's `sync` feature clones the
+    /// receiver on every method call — a bare map would be copied per kernel).
+    scopes: Arc<Vec<(String, i64)>>,
 }
 
 impl std::fmt::Debug for GcSession {
@@ -53,10 +56,15 @@ impl std::fmt::Debug for GcSession {
 
 /// Wraps a shared session and its bound graph handle for the Rhai entrypoint.
 #[must_use]
-pub fn new_session(session: Arc<Mutex<AlgoSession>>, graph: Handle) -> GcSession {
+pub fn new_session(
+    session: Arc<Mutex<AlgoSession>>,
+    graph: Handle,
+    scopes: Arc<Vec<(String, i64)>>,
+) -> GcSession {
     GcSession {
         session,
         graph: to_i64(graph),
+        scopes,
     }
 }
 
@@ -97,6 +105,36 @@ impl GcSession {
     /// Returns the bound graph handle.
     fn graph_handle(&mut self) -> i64 {
         self.graph
+    }
+
+    /// Returns the handle of a pre-declared named scope.
+    ///
+    /// Scopes are built by the host before the guest runs, so this is a lookup,
+    /// not a projection — there is nothing here a guest could call in a loop to
+    /// escape the work meter. An unknown name lists what was declared, since the
+    /// usual cause is a typo against the CALL site.
+    fn graph_named(&mut self, name: &str) -> Result<i64, Box<EvalAltResult>> {
+        self.scopes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
+            .ok_or_else(|| {
+                let declared: Vec<&str> = self.scopes.iter().map(|(n, _)| n.as_str()).collect();
+                rt(FnError::new(
+                    0x86E,
+                    if declared.is_empty() {
+                        format!(
+                            "no graph scope `{name}`: this CALL declared no `scopes` map, so \
+                             only the primary projection (`graph()`) exists"
+                        )
+                    } else {
+                        format!(
+                            "no graph scope `{name}`: declared scopes are {}",
+                            declared.join(", ")
+                        )
+                    },
+                ))
+            })
     }
 
     /// Vertex count of a graph handle.
@@ -689,6 +727,14 @@ impl GcSession {
     }
 
     /// Folds a walks handle into a per-vertex visit-count map.
+    /// Re-keys a `[V]` value into another projection's index space, verified.
+    fn rekey(&mut self, value: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
+        let mut s = self.session.lock();
+        s.rekey(from_i64(value), from_i64(g))
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     fn walk_visit_counts(&mut self, walks: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
         s.walk_visit_counts(from_i64(walks), from_i64(g))
@@ -930,6 +976,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
     }
     reg!(
         Graph => GcSession::graph_handle,
+        GraphNamed => GcSession::graph_named,
         VertexCount => GcSession::vertex_count,
         EdgeCount => GcSession::edge_count,
         Frontier => GcSession::frontier,
@@ -980,6 +1027,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         ExpandSampled => GcSession::expand_sampled,
         SpmvMasked => GcSession::spmv_masked,
         WalkVisitCounts => GcSession::walk_visit_counts,
+        Rekey => GcSession::rekey,
         EmitWalks => GcSession::emit_walks,
         NeighborhoodOverlap => GcSession::neighborhood_overlap,
         NextBucket => GcSession::next_bucket,
@@ -1130,7 +1178,10 @@ mod tests {
             uni_plugin_builtin::algorithms::graph_compute::Arena::new(64 << 20, 8192),
         )));
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(Arc::clone(&session), from_i64(0)));
+        scope.push(
+            "sess",
+            new_session(Arc::clone(&session), from_i64(0), Arc::default()),
+        );
         scope.push("rollouts", ROLLOUTS);
 
         // The guest's own program. Note what it owns: the tree shape, the
@@ -1219,7 +1270,7 @@ mod tests {
             Arena::new(1 << 16, 64),
         )));
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(session, from_i64(0)));
+        scope.push("sess", new_session(session, from_i64(0), Arc::default()));
 
         // Each call must reach the stub and be refused by slice. An unregistered
         // name would instead fail resolution with `Function not found`, which
@@ -1272,7 +1323,7 @@ mod tests {
         let g = session.lock().bind_graph(Arc::new(graph));
 
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(Arc::clone(&session), g));
+        scope.push("sess", new_session(Arc::clone(&session), g, Arc::default()));
         scope.push("g", to_i64(g));
 
         // a = [1,5,3,9,2], b = 4 everywhere; the guest wants `a > b` and
@@ -1365,7 +1416,10 @@ mod tests {
             uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
         )));
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(Arc::clone(&session), from_i64(0)));
+        scope.push(
+            "sess",
+            new_session(Arc::clone(&session), from_i64(0), Arc::default()),
+        );
 
         // `gt` is not an ewise op; the guest must be told how to get one.
         let err = engine
@@ -1410,7 +1464,7 @@ mod tests {
         )));
         let g = session.lock().bind_graph(Arc::new(graph));
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(Arc::clone(&session), g));
+        scope.push("sess", new_session(Arc::clone(&session), g, Arc::default()));
         scope.push("g", to_i64(g));
 
         let script = r#"
@@ -1463,7 +1517,10 @@ mod tests {
             uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
         )));
         let mut scope = rhai::Scope::new();
-        scope.push("sess", new_session(Arc::clone(&session), from_i64(0)));
+        scope.push(
+            "sess",
+            new_session(Arc::clone(&session), from_i64(0), Arc::default()),
+        );
 
         force_tracing_for_test(true);
         // Allocate, free, then use — a use-after-free from guest code.

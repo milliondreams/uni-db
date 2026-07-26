@@ -978,3 +978,122 @@ than syntax, because G9 changed their *intent*:
   asserts is the one it names.
 
 `bindings/uni-db`: 916 passed, 2 xfailed, 2 xpassed; `ruff format` + `ruff check` clean.
+
+---
+
+# Part VI — REQ-D5 closed, and a gap found in Parts B/C
+
+## 24. Reviewing the previous two commits found them incomplete
+
+Before starting multi-projection I reviewed the set-provenance and output-identity
+commits. Both had landed less than their messages claimed, and the difference was
+exactly what multi-projection would have made reachable:
+
+- `require_compatible_origins` reached nine call sites, but **`spmv`, `spmv_masked`,
+  `scatter` and `walk_visit_counts` had no identity check at all**, and the `expand`
+  family guarded only its `frontier` — not `exclude`, not the edge mask, not the
+  sampling probabilities.
+- `emit_walks` and `emit_pairs` still translated slots through the first-bound
+  projection. The commit message for the output-identity change *named both as
+  broken* and then fixed only `topk`/`arg_extreme`. `PairList` carried no `Origin`
+  at all, so there was nothing to route through, and `WalkMatrix::origin()` had zero
+  readers.
+
+Two of these deserve calling out because they are the shapes that stay silent.
+
+**`exclude` is fed every iteration.** `reach_fixpoint` passes its accumulated
+visited-set back as `exclude` on each round. A foreign set there does not produce
+one wrong answer — it prunes the frontier every round and returns a plausible
+under-approximation, with no error anywhere.
+
+**`walk_visit_counts` already had a guard whose comment claimed to catch this.** It
+checks that every walk slot is within the target's vertex range. That check
+structurally cannot separate two projections of equal `|V|`: their valid slot ranges
+are identical. This is the fifth doc-or-comment in this workstream asserting an
+invariant the code does not hold, and the second I wrote myself.
+
+Two trace gaps from the same review: the `UNI_GC_TRACE=1` CI step could not fail
+(every trace test forces the override, short-circuiting the env read, so deleting
+the read outright left them green), and the incomplete-tag drain had no tests at
+all — its "a suffix survives the typed round trip" claim lived only in a doc
+comment, so a future switch from the streaming deserializer to
+`serde_json::from_str` would have silently downgraded every traced abort.
+
+All closed before Part D began, because every one of them becomes a live
+silent-wrong-answer path the moment a second projection is bound.
+
+## 25. What REQ-D5 shipped
+
+Named scopes, declared at the CALL site and built by the host before the guest runs:
+
+```cypher
+CALL myplugin.compare([], {
+  nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'],
+  scopes: {agg: {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']}}
+})
+```
+
+Reached with `gc.graph_named("agg")` in-process, or through an additive `graphs` map
+in the invoke JSON for WASM/Extism. Each scope independently chooses Native or
+Cypher/Named mode, which is what forced `AlgorithmHostBridge` to take the `graphRef`
+per call (`project_scope`) rather than holding one; `uni-query` now installs the
+resolver when the primary **or** any scope is Cypher, since a Cypher scope under a
+Native primary would otherwise have fallen through to a storage scan of an empty
+spec.
+
+Three design points, each of which the implementation forced rather than the plan
+predicting:
+
+**Scopes are pre-declared because projection is ungoverned work.** `graph_named` is a
+lookup. A guest able to project on demand could project in a loop, and projection is
+`O(V+E)` storage work the native-work meter does not charge. Declaring at the call
+site keeps the cost bounded and visible to the caller.
+
+**The budget spans every projection.** `WorkBudget::resolve` was sized from one
+graph. With N scopes a guest can do `O(V+E)` work on each, so it now sums them.
+
+**`rekey` — the check that made the feature usable.** The first end-to-end test
+failed immediately, and correctly: the guest combined a degree map from `agg` with
+one from the primary, and the index-space check rejected it. That is the feature's
+real design question, not a bug. Comparing two layers over the same vertices is *the
+reason* scopes exist, yet the check that makes multi-projection safe forbids exactly
+that.
+
+The wrong fix is relaxing the check when vertex counts match — that makes
+correctness depend on a coincidence. The right one is an explicit primitive that
+converts the assumption into a check: `rekey(value, g)` walks both projections'
+slot→Vid maps and re-tags the value only if they agree vertex for vertex, naming the
+first divergent slot otherwise. It charges `O(V)`, and refuses `[E]` values outright
+because CSR edge order belongs to one projection's topology.
+
+This also resolves the slot-correspondence question cleanly. Correspondence is
+enforced by construction for **Native** projections only (`ProjectionBuilder` sorts
+and dedups; `IdMap::compact`'s sortedness check is a `debug_assert!`), while
+`GraphProjection::from_rows` interns in row order and deliberately does not sort. The
+plan proposed documenting that as a caveat. With `rekey` it does not need to be one:
+a Cypher scope whose rows happen not to correspond simply fails the check.
+
+## 26. Verification
+
+6008 workspace tests (up from 5993 across Parts VI's two commits), clippy
+`-D warnings`, fmt, `cargo doc`, the Rhai/Extism/WASM e2e suites, and the trace
+suite in both `UNI_GC_TRACE` modes. The two `uni-plugin-pyo3
+adapter_scalar::scalar_vec_*` failures are pre-existing and were re-confirmed
+against a stashed tree.
+
+Both new provenance tests were falsified against a reverted guard before being
+kept, and the `UNI_GC_TRACE` gate was falsified by deleting the env read — a passing
+test proves nothing about a feature until it has been seen to fail without it, which
+is the specific lesson of §24.
+
+## 27. Still open
+
+- **Version bump and release notes.** Six breaking commits are now unreleased.
+- **`from_rows` does not sort.** Making it sort would give Cypher projections slot
+  correspondence, but changes the `nodeId` row ordering of every existing
+  Cypher-projection algorithm — an observable output change, not a free fix. `rekey`
+  makes it unnecessary rather than merely deferred.
+- **Scope count is unbounded.** Nothing caps how many scopes a CALL may declare. The
+  work budget covers the *kernel* cost of using them, not the projection cost of
+  building them; a caller declaring fifty scopes pays fifty projections up front.
+  Worth a cap if it shows up in practice.

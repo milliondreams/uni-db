@@ -471,6 +471,7 @@ impl GraphComputeRegistry {
             KernelId::WalkVisitCounts => session
                 .walk_visit_counts(from_i64(req.a), from_i64(req.g))
                 .map(h),
+            KernelId::Rekey => session.rekey(from_i64(req.a), from_i64(req.g)).map(h),
             KernelId::EmitWalks => session
                 .emit_walks(from_i64(req.g))
                 .map(|()| KernelResponse::Unit),
@@ -663,6 +664,10 @@ impl GraphComputeRegistry {
             KernelId::Graph => Err(super::error::arg_validation(
                 "`graph` is not a kernel op: the graph handle reaches sandboxed guests \
                  through the invoke-algorithm arguments",
+            )),
+            KernelId::GraphNamed => Err(super::error::arg_validation(
+                "`graph_named` is not a kernel op: named scopes reach sandboxed guests \
+                 through the `graphs` map in the invoke-algorithm arguments",
             )),
         }
     }

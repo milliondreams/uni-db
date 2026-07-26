@@ -561,6 +561,22 @@ impl AlgoSession {
         }
     }
 
+    /// Reads a value's index space, whatever kind of value it is.
+    ///
+    /// # Errors
+    /// Returns a typed error if the handle does not resolve, or names a kind that
+    /// carries no index space (a graph or an arena handle).
+    fn origin_of(&self, h: Handle) -> Result<Origin, FnError> {
+        match h.kind() {
+            Some(HandleKind::Tensor) => Ok(self.table.get_tensor(h)?.origin()),
+            Some(HandleKind::VertexSet) => Ok(self.table.get_set(h)?.origin()),
+            Some(HandleKind::EdgeSet) => Ok(self.table.get_edge_set(h)?.origin()),
+            Some(HandleKind::Walks) => Ok(self.table.get_walks(h)?.origin()),
+            Some(HandleKind::Pairs) => Ok(self.table.get_pairs(h)?.origin()),
+            _ => Err(error::kind_mismatch("a value carrying an index space")),
+        }
+    }
+
     fn slot_to_vid_in(&self, slot: u32, origin: Origin) -> Result<Vid, FnError> {
         match origin {
             Origin::Graph(h) => Ok(self.table.get_graph(h)?.to_vid(slot)),
@@ -1109,6 +1125,31 @@ pub trait GraphCompute {
     /// # Errors
     /// Returns a typed [`FnError`] on a bad handle or exhausted resources.
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError>;
+
+    /// Re-keys a `[V]` value into another projection's index space, **verified**.
+    ///
+    /// Named scopes make it useful to combine a value computed over one
+    /// projection with one computed over another — comparing two edge layers over
+    /// the same vertices is the motivating case. The index-space checks forbid
+    /// that outright, and rightly: slot `i` usually names different vertices in
+    /// two projections, and a wrong answer there is silent.
+    ///
+    /// This is the explicit escape hatch, and it is not a cast. It walks both
+    /// slot→Vid maps and only succeeds when the projections agree vertex for
+    /// vertex; otherwise it names the first slot where they diverge. So the claim
+    /// "these two projections describe the same vertices" becomes checked at the
+    /// point a guest relies on it, rather than assumed.
+    ///
+    /// Accepts `[V]` tensors and vertex sets. `[E]` values are rejected: CSR edge
+    /// order is a property of one projection's topology and has no cross-graph
+    /// meaning even when the vertices correspond.
+    ///
+    /// Charges `O(V)` for the comparison.
+    ///
+    /// # Errors
+    /// Returns `0x862` if the value is `[E]`-shaped, if the vertex counts differ,
+    /// or if any slot maps to a different Vid in the two projections.
+    fn rekey(&mut self, value: Handle, g: Handle) -> Result<Handle, FnError>;
 
     /// Group 8 (egress): emits each walk as `(walk_id, step, nodeId)` rows.
     ///
@@ -2766,6 +2807,67 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.alloc_tensor(Tensor::from_f64(out), Origin::Graph(g))
+    }
+
+    fn rekey(&mut self, value: Handle, g: Handle) -> Result<Handle, FnError> {
+        let target = Arc::clone(self.table.get_graph(g)?);
+        // Resolve the source projection from the value's own origin. An
+        // arena-keyed value has no vertices to correspond, and an untracked one
+        // is already permissive -- neither needs (or can have) a verified re-key.
+        let origin = self.origin_of(value)?;
+        let Origin::Graph(src_h) = origin else {
+            return Err(error::shape_mismatch(
+                "rekey moves a value between projections, but this value is not \
+                 keyed to one (arena-slot or untracked values combine already)",
+            ));
+        };
+        if src_h == g {
+            return Err(error::arg_validation(
+                "rekey: the value is already keyed to this projection",
+            ));
+        }
+        let source = Arc::clone(self.table.get_graph(src_h)?);
+        if source.vertex_count() != target.vertex_count() {
+            return Err(error::shape_mismatch(format!(
+                "rekey: the projections have {} and {} vertices, so they cannot \
+                 describe the same vertex set",
+                source.vertex_count(),
+                target.vertex_count()
+            )));
+        }
+        self.charge(source.vertex_count() as u64)?;
+        for slot in 0..source.vertex_count() as u32 {
+            let (a, b) = (source.to_vid(slot), target.to_vid(slot));
+            if a != b {
+                return Err(error::shape_mismatch(format!(
+                    "rekey: slot {slot} is vertex {} in the source projection but {} \
+                     in the target, so the two do not describe the same vertices",
+                    a.as_u64(),
+                    b.as_u64()
+                )));
+            }
+        }
+        // Verified: reproduce the value under the target's identity.
+        match value.kind() {
+            Some(HandleKind::Tensor) => {
+                let t = self.table.get_tensor(value)?;
+                if t.is_edge_shaped() {
+                    return Err(error::shape_mismatch(
+                        "rekey accepts [V] values only: CSR edge order belongs to one \
+                         projection's topology and does not carry across",
+                    ));
+                }
+                let copy = t.clone();
+                self.alloc_tensor(copy, Origin::Graph(g))
+            }
+            Some(HandleKind::VertexSet) => {
+                let copy = self.table.get_set(value)?.clone();
+                self.alloc_set(copy, Origin::Graph(g))
+            }
+            other => Err(error::shape_mismatch(format!(
+                "rekey accepts [V] tensors and vertex sets, got {other:?}"
+            ))),
+        }
     }
 
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {

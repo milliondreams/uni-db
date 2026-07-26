@@ -91,6 +91,8 @@ use KernelReach::{AllLoaders, HostSuppliedOtherwise};
 kernels! {
     // Graph shape and stored properties.
     Graph => "graph", HostSuppliedOtherwise;
+    GraphNamed => "graph_named", HostSuppliedOtherwise;
+    Rekey => "rekey", AllLoaders;
     VertexCount => "vertex_count", AllLoaders;
     EdgeCount => "edge_count", AllLoaders;
     Degrees => "degrees", AllLoaders;
@@ -224,7 +226,7 @@ mod kernel_catalog_contract {
             .collect();
         assert_eq!(
             host_supplied,
-            vec!["graph"],
+            vec!["graph", "graph_named"],
             "if this bucket changes, the reachability contract's carve-outs changed too"
         );
     }

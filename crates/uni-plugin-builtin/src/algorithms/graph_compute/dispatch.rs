@@ -351,6 +351,9 @@ impl GraphComputeRegistry {
             return Err(super::unresolved_op_error(req.op.as_str()));
         };
         match kernel {
+            KernelId::WorkBudget => Ok(KernelResponse::Float(session.work_budget()?)),
+            KernelId::WorkSpent => Ok(KernelResponse::Float(session.work_spent()?)),
+            KernelId::WorkRemaining => Ok(KernelResponse::Float(session.work_remaining()?)),
             KernelId::VertexCount => Ok(KernelResponse::Float(
                 session.vertex_count(from_i64(req.g))? as f64,
             )),

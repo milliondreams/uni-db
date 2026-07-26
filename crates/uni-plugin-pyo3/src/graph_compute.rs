@@ -356,6 +356,21 @@ impl GcSession {
         self.session.lock().emit(&cols).map_err(py_err)
     }
 
+    /// The native-work budget this invocation started with.
+    fn work_budget(&self) -> PyResult<f64> {
+        self.session.lock().work_budget().map_err(py_err)
+    }
+
+    /// Native-work units charged so far.
+    fn work_spent(&self) -> PyResult<f64> {
+        self.session.lock().work_spent().map_err(py_err)
+    }
+
+    /// Native-work units still available. Reading it is free.
+    fn work_remaining(&self) -> PyResult<f64> {
+        self.session.lock().work_remaining().map_err(py_err)
+    }
+
     /// Elementwise comparison, yielding a 1.0/0.0 mask.
     fn compare(&self, a: i64, b: i64, op: &str) -> PyResult<i64> {
         self.check_deadline()?;

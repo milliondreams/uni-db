@@ -234,8 +234,8 @@ impl AlgorithmProvider for GraphComputeOverlapProvider {
                     "uni.algo.gcoverlap",
                     started.elapsed().as_millis() as u64,
                     0,
-                    session.work_spent(),
-                    session.work_budget(),
+                    session.work_spent_units(),
+                    session.work_budget_units(),
                 )
                 .map_or_else(
                     || DataFusionError::Execution(format!("gcoverlap: {e}")),

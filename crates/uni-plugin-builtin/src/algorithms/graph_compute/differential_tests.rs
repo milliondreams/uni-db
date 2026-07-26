@@ -1251,9 +1251,9 @@ fn p0_8_kernels_charge_their_exact_work() {
     let e = edges.len() as u64;
     let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
 
-    let mut last = s.work_spent();
+    let mut last = s.work_spent_units();
     let charged = |s: &AlgoSession, last: &mut u64| -> u64 {
-        let now = s.work_spent();
+        let now = s.work_spent_units();
         let delta = now - *last;
         *last = now;
         delta
@@ -1585,9 +1585,9 @@ fn s5_sample_charges_one_work_unit_per_element() {
     // work spent across the call so the tensor-build charges are excluded.
     let n = 5000;
     let (mut s, _g, prob) = constant_prob_fixture(n, 0.5);
-    let before = s.work_spent();
+    let before = s.work_spent_units();
     let _mask = s.sample(prob, 3, 0).expect("sample runs");
-    let charged = s.work_spent() - before;
+    let charged = s.work_spent_units() - before;
     assert_eq!(
         charged, n as u64,
         "sample must charge exactly |V| work units"
@@ -3495,4 +3495,75 @@ fn load_vals(s: &mut AlgoSession, g: Handle, vals: &[f64]) -> Handle {
         m = s.scatter(m, f, Scalar::F64(v)).expect("scatter");
     }
     m
+}
+
+/// The budget accessors report the real meter and cost nothing to read.
+///
+/// Free is the load-bearing part: a guest sizing its own work must be able to
+/// poll without the polling itself consuming what it is measuring.
+#[test]
+fn budget_accessors_are_free_and_track_the_meter() {
+    let nodes: Vec<u64> = (0..8).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let total = s.work_budget().expect("budget");
+    assert!(total > 0.0, "a session starts with a budget");
+    assert_eq!(s.work_spent().expect("spent"), 0.0, "nothing charged yet");
+    assert_eq!(
+        s.work_remaining().expect("remaining"),
+        total,
+        "remaining starts at the total"
+    );
+
+    // Reading is free.
+    for _ in 0..5 {
+        let _ = s.work_budget().expect("budget");
+        let _ = s.work_spent().expect("spent");
+        let _ = s.work_remaining().expect("remaining");
+    }
+    assert_eq!(
+        s.work_spent().expect("spent"),
+        0.0,
+        "the accessors must not charge the meter they report"
+    );
+
+    // A real kernel moves it, and the three stay consistent.
+    s.degrees(g, Direction::Out).expect("degrees charges |V|");
+    let spent = s.work_spent().expect("spent");
+    assert_eq!(spent, 8.0, "degrees charges one unit per vertex");
+    assert_eq!(
+        s.work_budget().expect("budget"),
+        total,
+        "the total is fixed"
+    );
+    assert_eq!(
+        s.work_remaining().expect("remaining"),
+        total - spent,
+        "remaining is total minus spent"
+    );
+}
+
+/// The published budget formula must match the code.
+///
+/// The consumer reverse-engineered `10_000 * (V + E + 1)` from aborted CALLs,
+/// which is right below the ceiling and wrong above it. Now that the formula is
+/// documented, this keeps the doc honest.
+#[test]
+fn the_documented_budget_formula_matches_the_code() {
+    use super::{DEFAULT_WORK_ABS_CEILING, DEFAULT_WORK_EDGE_MULTIPLIER, WorkBudget};
+    for (v, e) in [(0, 0), (1, 1), (10, 40), (1_000, 5_000), (100_000, 500_000)] {
+        let want = (DEFAULT_WORK_EDGE_MULTIPLIER * (v + e + 1)).min(DEFAULT_WORK_ABS_CEILING);
+        assert_eq!(
+            WorkBudget::from_graph_size(v, e).total(),
+            want,
+            "min(10_000 * (V + E + 1), 1e9) is the documented rule"
+        );
+    }
+    // Above ~100k elements the ceiling binds, which is the half the consumer's
+    // empirical rule missed.
+    assert_eq!(
+        WorkBudget::from_graph_size(10_000_000, 10_000_000).total(),
+        DEFAULT_WORK_ABS_CEILING,
+        "the absolute ceiling clamps large projections"
+    );
 }

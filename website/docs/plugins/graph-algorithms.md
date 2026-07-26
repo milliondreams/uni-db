@@ -386,3 +386,51 @@ A value derived from a set (`set_to_map`) has no index space of its own, since s
 That is treated as *unknown*, not as a third space: it combines with anything, and the result
 adopts whichever space is known. This is what keeps ordinary compositions working — a
 personalized-PageRank teleport vector is exactly such a value.
+
+### The native-work budget
+
+Every invocation gets a finite budget of *native-work units*, and each kernel
+charges roughly the work it does. Exceeding it aborts the CALL with `0x865`
+(`GraphComputeIncomplete`, reason `Exhausted`) — never a silently truncated result.
+
+**The default is `min(10_000 x (|V| + |E| + 1), 1_000_000_000)`.** Both `|V|` and
+`|E|` appear because the meter charges the `O(V)` kernels as well as the `O(E)`
+ones. The absolute ceiling binds above roughly 100k projected elements, so the
+linear term alone is not the whole rule.
+
+A `GraphComputeWork` capability grant **replaces** that default rather than
+raising it — an explicit grant is authoritative in both directions.
+
+**What each kernel charges:**
+
+| Kernel family | Charge |
+| --- | --- |
+| `spmv`, `spmv_masked`, `edge_weights`, `edges_all` | `|E|` |
+| `expand`, `expand_masked`, `expand_sampled` | the frontier's total degree |
+| `sample_edges`, `sample_edges_undirected` | `|E|`, checked in chunks |
+| `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
+| `frontier` | one unit per seed |
+| `set_union` / `set_diff` / `set_intersect` | one unit per 64-bit *word*, not per element |
+| `emit` | `rows x columns` |
+| `random_walks`, `walk_visit_counts`, `emit_walks` | total steps |
+| `neighborhood_overlap`, `all_pairs_overlap` | work done, at least `|V|` |
+| arena kernels | their own footprint (capacity, path length, or neighbours touched) |
+| `work_budget` / `work_spent` / `work_remaining`, `set_len`, `is_empty`, `free`, `vertex_count`, `edge_count` | nothing |
+
+Expensive kernels re-check mid-loop, so a single celebrity-vertex `expand` cannot
+blow past the cap. Batching amortizes the boundary crossing but never the meter:
+a batched kernel charges the same as the calls it replaces.
+
+**Reading the meter from a guest:**
+
+```rhai
+let left = gc.work_remaining();   // free; so are work_budget and work_spent
+```
+
+Sizing work ahead of a run is better done from the formula than from the meter:
+branching on `work_remaining()` makes a kernel's *result* depend on the capability
+grant, so the same program under two grants can return different answers. That
+does not violate the determinism contract, which is per-configuration, but it does
+forfeit cross-grant reproducibility — and a differential oracle would see it as
+drift. Discovering the ceiling by deliberately triggering aborted CALLs is never
+necessary: it is a pure function of `|V|` and `|E|`.

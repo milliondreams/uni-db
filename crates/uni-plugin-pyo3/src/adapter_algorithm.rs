@@ -181,7 +181,7 @@ impl AlgorithmProvider for PyAlgorithm {
             if let Err(orig) = call_result {
                 let (spent, budget) = {
                     let s = session.lock();
-                    (s.work_spent(), s.work_budget())
+                    (s.work_spent_units(), s.work_budget_units())
                 };
                 let deadline_elapsed = deadline_at.is_some_and(|d| Instant::now() >= d);
                 return Err(

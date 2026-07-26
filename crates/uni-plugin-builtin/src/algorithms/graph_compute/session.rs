@@ -376,13 +376,13 @@ impl AlgoSession {
 
     /// Returns the work units charged so far (for accounting tests).
     #[must_use]
-    pub fn work_spent(&self) -> u64 {
+    pub fn work_spent_units(&self) -> u64 {
         self.budget.spent()
     }
 
     /// Returns the session's total native-work budget (for incomplete diagnostics).
     #[must_use]
-    pub fn work_budget(&self) -> u64 {
+    pub fn work_budget_units(&self) -> u64 {
         self.budget.total()
     }
 
@@ -561,6 +561,37 @@ pub trait GraphCompute {
     /// Returns a typed [`FnError`] on a bad handle, a length mismatch, or an
     /// exhausted budget/arena.
     fn ewise(&mut self, a: Handle, b: Handle, op: EwiseOp) -> Result<Handle, FnError>;
+
+    /// The native-work budget this invocation started with.
+    ///
+    /// `min(10_000 * (|V| + |E| + 1), 1_000_000_000)` by default; a
+    /// `GraphComputeWork` capability grant *replaces* that value rather than
+    /// raising it.
+    ///
+    /// # Errors
+    /// Never fails; the `Result` keeps the kernel signature uniform.
+    fn work_budget(&self) -> Result<f64, FnError>;
+
+    /// Native-work units charged so far in this invocation.
+    ///
+    /// # Errors
+    /// Never fails; the `Result` keeps the kernel signature uniform.
+    fn work_spent(&self) -> Result<f64, FnError>;
+
+    /// Native-work units still available before the invocation is aborted.
+    ///
+    /// Reading it is free — these three accessors charge nothing, so polling
+    /// cannot itself exhaust the budget.
+    ///
+    /// Branching on this makes a kernel's *result* depend on the capability
+    /// grant, so the same program under two grants may return different answers.
+    /// That does not break the determinism contract, which is per-configuration,
+    /// but it does forfeit cross-grant reproducibility — for sizing work ahead of
+    /// time, compute the budget from `|V|` and `|E|` instead.
+    ///
+    /// # Errors
+    /// Never fails; the `Result` keeps the kernel signature uniform.
+    fn work_remaining(&self) -> Result<f64, FnError>;
 
     /// Group 0: elementwise comparison, yielding 1.0 where it holds else 0.0.
     ///
@@ -1137,6 +1168,30 @@ impl GraphCompute for AlgoSession {
         // and collapsing it to `[V]` on the way out would leave an `[E]` result
         // that every edge consumer rejects.
         self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
+    }
+
+    fn work_budget(&self) -> Result<f64, FnError> {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "budgets are far below f64's exact-integer range"
+        )]
+        Ok(self.budget.total() as f64)
+    }
+
+    fn work_spent(&self) -> Result<f64, FnError> {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "budgets are far below f64's exact-integer range"
+        )]
+        Ok(self.budget.spent() as f64)
+    }
+
+    fn work_remaining(&self) -> Result<f64, FnError> {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "budgets are far below f64's exact-integer range"
+        )]
+        Ok(self.budget.remaining() as f64)
     }
 
     fn compare(&mut self, a: Handle, b: Handle, op: CmpOp) -> Result<Handle, FnError> {

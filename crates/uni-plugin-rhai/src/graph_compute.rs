@@ -352,6 +352,21 @@ impl GcSession {
         s.emit(&borrowed).map_err(rt)
     }
 
+    /// The native-work budget this invocation started with.
+    fn work_budget(&mut self) -> Result<f64, Box<EvalAltResult>> {
+        self.session.lock().work_budget().map_err(rt)
+    }
+
+    /// Native-work units charged so far.
+    fn work_spent(&mut self) -> Result<f64, Box<EvalAltResult>> {
+        self.session.lock().work_spent().map_err(rt)
+    }
+
+    /// Native-work units still available. Reading it is free.
+    fn work_remaining(&mut self) -> Result<f64, Box<EvalAltResult>> {
+        self.session.lock().work_remaining().map_err(rt)
+    }
+
     /// Elementwise comparison, yielding a 1.0/0.0 mask.
     fn compare(&mut self, a: i64, b: i64, op: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
         let o = CmpOp::parse(op.as_str()).map_err(rt)?;
@@ -928,6 +943,9 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         Normalize => GcSession::normalize,
         Ewise => GcSession::ewise,
         Compare => GcSession::compare,
+        WorkBudget => GcSession::work_budget,
+        WorkSpent => GcSession::work_spent,
+        WorkRemaining => GcSession::work_remaining,
         Spmv => GcSession::spmv,
         ReduceSum => GcSession::reduce_sum,
         ReduceSumMasked => GcSession::reduce_sum_masked,

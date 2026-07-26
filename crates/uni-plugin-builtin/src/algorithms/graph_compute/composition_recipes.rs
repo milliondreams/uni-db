@@ -264,11 +264,11 @@ fn the_comparison_recipe_charges_three_passes() {
     let a = load(&mut s, g, &vec![1.0; n]);
     let b = load(&mut s, g, &vec![0.0; n]);
 
-    let before = s.work_spent();
+    let before = s.work_spent_units();
     let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
     let hits = s.map_to_set(diff, Predicate::Gt(0.0)).expect("map_to_set");
     let _mask = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
-    let charged = s.work_spent() - before;
+    let charged = s.work_spent_units() - before;
 
     assert_eq!(
         charged,

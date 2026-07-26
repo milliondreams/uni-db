@@ -165,7 +165,7 @@ impl AlgorithmProvider for RhaiAlgorithm {
                     // Timeout is never inferred here. Other faults report verbatim.
                     let (spent, budget) = {
                         let s = session.lock();
-                        (s.work_spent(), s.work_budget())
+                        (s.work_spent_units(), s.work_budget_units())
                     };
                     return Err(
                         uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(

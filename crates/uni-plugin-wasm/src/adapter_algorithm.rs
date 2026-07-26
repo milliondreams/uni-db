@@ -162,7 +162,7 @@ impl AlgorithmProvider for ComponentAlgorithm {
                 // deadline, so a Timeout is never inferred. Other faults verbatim.
                 let (spent, budget) = closed
                     .as_ref()
-                    .map_or((0, 0), |s| (s.work_spent(), s.work_budget()));
+                    .map_or((0, 0), |s| (s.work_spent_units(), s.work_budget_units()));
                 return Err(
                     uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
                         &qname_str,

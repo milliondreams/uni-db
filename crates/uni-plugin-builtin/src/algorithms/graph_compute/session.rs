@@ -254,14 +254,14 @@ pub struct AlgoSession {
     /// The handle of [`Self::primary_graph`], so output kernels can check a
     /// value's `Origin` rather than merely its length.
     primary_graph_handle: Option<Handle>,
-    /// Graphs produced by `arena_freeze`, paired with the arena they came from.
+    /// Graphs produced by `arena_freeze`: `(frozen, source arena, reserved bytes)`.
     ///
     /// `arena_freeze` walks the arena's live slots in order, so slot `i` of the
     /// frozen graph *is* slot `i` of the arena — one index space wearing two
     /// `Origin` variants. Without this the provenance check would reject
     /// aggregating an arena column over the graph frozen from that same arena,
     /// which is the composition that makes a bespoke `arena_spmv` unnecessary.
-    frozen_from: Vec<(Handle, Handle)>,
+    frozen_from: Vec<(Handle, Handle, usize)>,
     /// Captured `emit` output: `(column_name, values)` per emitted column.
     emitted: Vec<(String, Vec<f64>)>,
     /// Captured `emit_walks` output: `(walk_id, step, nodeId)` rows, row-major
@@ -435,8 +435,8 @@ impl AlgoSession {
             Origin::Graph(g) => self
                 .frozen_from
                 .iter()
-                .find(|(frozen, _)| *frozen == g)
-                .map_or(o, |(_, arena)| Origin::Arena(*arena)),
+                .find(|(frozen, _, _)| *frozen == g)
+                .map_or(o, |(_, arena, _)| Origin::Arena(*arena)),
             other => other,
         }
     }
@@ -1482,14 +1482,28 @@ impl GraphCompute for AlgoSession {
     }
 
     fn free(&mut self, h: Handle) -> Result<(), FnError> {
-        // Graph handles are never counted against the arena (they share an `Arc`
-        // and are not `try_alloc`-ed on bind), so freeing one must NOT decrement
-        // the arena's live-handle counter — doing so would let a guest that
-        // binds+frees graphs drive the count below zero and breach the cap.
+        // A *bound* graph is never counted against the arena — it shares an `Arc`
+        // and is not `try_alloc`-ed — so freeing one must not decrement the live
+        // handle counter, or a bind/free loop would drive the count below zero
+        // and breach the cap.
+        //
+        // A *frozen* graph is the exception: `arena_freeze` builds a projection
+        // and reserves it. Under the blanket rule every freeze leaked a handle
+        // slot and its bytes for the life of the CALL, so a grow/freeze loop —
+        // the natural shape for a per-tick simulation — aborted with `0x864` for
+        // no reason the guest could see. Releasing the entry here also bounds
+        // `frozen_from`, which `canonical_origin` scans on every origin check.
         let is_graph = h.kind() == Some(HandleKind::Graph);
+        let frozen_bytes = self
+            .frozen_from
+            .iter()
+            .position(|(frozen, _, _)| *frozen == h)
+            .map(|i| self.frozen_from.swap_remove(i).2);
         let bytes = self.table.free(h)?;
-        if !is_graph {
-            self.arena.free(bytes);
+        match frozen_bytes {
+            Some(reserved) => self.arena.free(reserved),
+            None if !is_graph => self.arena.free(bytes),
+            None => {}
         }
         Ok(())
     }
@@ -3582,9 +3596,10 @@ impl GraphArenaCompute for AlgoSession {
             }
         }
         let projection = GraphProjection::from_dense_edges(n, &edges, false, true);
-        self.reserve(projection.memory_size())?;
+        let bytes = projection.memory_size();
+        self.reserve(bytes)?;
         let frozen = self.table.insert_graph(Arc::new(projection));
-        self.frozen_from.push((frozen, arena));
+        self.frozen_from.push((frozen, arena, bytes));
         Ok(frozen)
     }
 }

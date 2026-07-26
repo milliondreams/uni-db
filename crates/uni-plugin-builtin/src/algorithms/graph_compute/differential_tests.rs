@@ -3877,6 +3877,72 @@ fn degenerate_sampling_probabilities_are_exact_and_seed_independent() {
     );
 }
 
+/// Freezing an arena repeatedly must not leak the arena budget.
+///
+/// `free` deliberately does not return bytes for a graph handle, because
+/// `bind_graph` never reserves any — it shares an `Arc`. But `arena_freeze`
+/// *does* reserve the projection it builds, so under that rule every freeze
+/// permanently consumed a handle slot and its bytes for the life of the CALL.
+/// A grow/freeze loop — the natural shape for a per-tick simulation — would hit
+/// the cap and abort with `0x864` for no reason the guest could see.
+#[test]
+fn repeated_arena_freezing_reclaims_its_budget() {
+    // A deliberately tiny handle cap, so a leak shows up in a few iterations
+    // rather than after four thousand.
+    let mut s = AlgoSession::new(
+        11,
+        WorkBudget::from_edge_count(1_000_000),
+        Arena::new(1 << 20, 16),
+    );
+    let arena = s.arena_new(8, 2).expect("arena");
+    let _slots = s.arena_alloc(arena, 4).expect("slots");
+
+    for round in 0..64 {
+        let frozen = s
+            .arena_freeze(arena)
+            .unwrap_or_else(|e| panic!("freeze {round} must not exhaust the budget: {e:?}"));
+        s.free(frozen)
+            .unwrap_or_else(|e| panic!("free {round}: {e:?}"));
+    }
+}
+
+/// Freeing a *bound* graph must not hand back budget it never took.
+///
+/// The sibling of the freeze-leak test, and the invariant the blanket
+/// graph carve-out in `free` existed to protect. `bind_graph` shares an `Arc`
+/// and reserves nothing, so a bind/free loop that credited the arena each time
+/// would mint handle budget from nothing and let a guest walk past the cap.
+#[test]
+fn freeing_a_bound_graph_does_not_mint_budget() {
+    let mut s = AlgoSession::new(
+        11,
+        WorkBudget::from_edge_count(1_000_000),
+        Arena::new(1 << 20, 8),
+    );
+    let g = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+    for _ in 0..32 {
+        let extra = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+        s.free(extra).expect("free a bound graph");
+    }
+    // The cap must still bite after all that binding and freeing: eight handles,
+    // so a ninth live allocation fails. If the loop had credited the arena, this
+    // would succeed and the cap would be decorative.
+    let mut allocated = 0;
+    let err = loop {
+        match s.frontier(g, &[Vid::new(0)]) {
+            Ok(_) => allocated += 1,
+            Err(e) => break e,
+        }
+        assert!(allocated <= 8, "the handle cap must still be enforced");
+    };
+    assert_eq!(
+        err.code,
+        super::error::ARENA_CAP_EXCEEDED,
+        "exhaustion must report as an arena cap, got: {}",
+        err.message
+    );
+}
+
 /// `rekey` is a verified move between projections, not a cast.
 ///
 /// It is the escape hatch that makes named scopes useful: two edge layers over

@@ -408,6 +408,19 @@ impl AlgoSession {
         self.arena.bytes_live()
     }
 
+    /// Rejects two operands from different index spaces, returning the unified one.
+    ///
+    /// `Untracked` unifies with anything — it means *unknown*, not a third space.
+    fn require_compatible_origins(a: Origin, b: Origin, kernel: &str) -> Result<Origin, FnError> {
+        if a.compatible_with(b) {
+            return Ok(a.unify(b));
+        }
+        Err(error::shape_mismatch(format!(
+            "{kernel}: operands come from different index spaces ({a:?} and {b:?}); \
+             slot i does not name the same element in both"
+        )))
+    }
+
     /// Rejects two set operands that do not share a capacity.
     ///
     /// Bitset algebra is only meaningful within one index space, and the
@@ -511,21 +524,21 @@ impl AlgoSession {
     }
 
     /// Charges the arena and inserts a vertex set, returning its handle.
-    fn alloc_set(&mut self, set: VertexSet) -> Result<Handle, FnError> {
+    fn alloc_set(&mut self, set: VertexSet, origin: Origin) -> Result<Handle, FnError> {
         self.reserve(set.heap_bytes())?;
-        Ok(self.table.insert_set(set))
+        Ok(self.table.insert_set(set.with_origin(origin)))
     }
 
     /// Charges the arena and inserts an edge mask, returning its handle.
-    fn alloc_edge_set(&mut self, set: EdgeSet) -> Result<Handle, FnError> {
+    fn alloc_edge_set(&mut self, set: EdgeSet, origin: Origin) -> Result<Handle, FnError> {
         self.reserve(set.heap_bytes())?;
-        Ok(self.table.insert_edge_set(set))
+        Ok(self.table.insert_edge_set(set.with_origin(origin)))
     }
 
     /// Charges the arena and inserts a walk batch, returning its handle.
-    fn alloc_walks(&mut self, walks: WalkMatrix) -> Result<Handle, FnError> {
+    fn alloc_walks(&mut self, walks: WalkMatrix, origin: Origin) -> Result<Handle, FnError> {
         self.reserve(walks.heap_bytes())?;
-        Ok(self.table.insert_walks(walks))
+        Ok(self.table.insert_walks(walks.with_origin(origin)))
     }
 
     /// Charges the arena and inserts a pair list, returning its handle.
@@ -1256,6 +1269,7 @@ impl GraphCompute for AlgoSession {
 
     fn set_to_map(&mut self, s: Handle, value: Scalar) -> Result<Handle, FnError> {
         let set = self.table.get_set(s)?;
+        let origin = set.origin();
         let n = set.capacity();
         let v = value.as_f64();
         let mut out = vec![0.0; n];
@@ -1263,7 +1277,7 @@ impl GraphCompute for AlgoSession {
             out[slot as usize] = v;
         }
         self.charge(n as u64)?;
-        self.alloc_tensor(Tensor::from_f64(out), Origin::Untracked)
+        self.alloc_tensor(Tensor::from_f64(out), origin)
     }
 
     fn map_to_set(&mut self, m: Handle, pred: Predicate) -> Result<Handle, FnError> {
@@ -1272,6 +1286,7 @@ impl GraphCompute for AlgoSession {
             return Err(error::shape_mismatch("map_to_set requires an f64 map"));
         }
         let n = t.len();
+        let origin = t.origin();
         let edge_shaped = t.is_edge_shaped();
         let hits: Vec<u32> = t
             .values()
@@ -1302,13 +1317,13 @@ impl GraphCompute for AlgoSession {
             for idx in hits {
                 mask.insert(idx);
             }
-            return self.alloc_edge_set(mask);
+            return self.alloc_edge_set(mask, origin);
         }
         let mut set = VertexSet::with_capacity(n);
         for idx in hits {
             set.insert(idx);
         }
-        self.alloc_set(set)
+        self.alloc_set(set, origin)
     }
 
     fn free(&mut self, h: Handle) -> Result<(), FnError> {
@@ -1336,7 +1351,7 @@ impl GraphCompute for AlgoSession {
             set.insert(slot);
         }
         self.charge(seeds.len() as u64)?;
-        self.alloc_set(set)
+        self.alloc_set(set, Origin::Graph(g))
     }
 
     fn set_union(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
@@ -1350,9 +1365,14 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_union",
         )?;
+        let origin = Self::require_compatible_origins(
+            self.table.get_set(a)?.origin(),
+            self.table.get_set(b)?.origin(),
+            "set_union",
+        )?;
         let out = self.table.get_set(a)?.union(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
-        self.alloc_set(out)
+        self.alloc_set(out, origin)
     }
 
     fn set_diff(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
@@ -1366,9 +1386,14 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_diff",
         )?;
+        let origin = Self::require_compatible_origins(
+            self.table.get_set(a)?.origin(),
+            self.table.get_set(b)?.origin(),
+            "set_diff",
+        )?;
         let out = self.table.get_set(a)?.difference(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
-        self.alloc_set(out)
+        self.alloc_set(out, origin)
     }
 
     fn set_intersect(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
@@ -1382,9 +1407,14 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(b)?.capacity(),
             "set_intersect",
         )?;
+        let origin = Self::require_compatible_origins(
+            self.table.get_set(a)?.origin(),
+            self.table.get_set(b)?.origin(),
+            "set_intersect",
+        )?;
         let out = self.table.get_set(a)?.intersect(self.table.get_set(b)?);
         self.charge(out.capacity() as u64 / 64 + 1)?;
-        self.alloc_set(out)
+        self.alloc_set(out, origin)
     }
 
     fn set_len(&self, s: Handle) -> Result<u64, FnError> {
@@ -1402,6 +1432,11 @@ impl GraphCompute for AlgoSession {
         dir: Direction,
         exclude: Option<Handle>,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_set(frontier)?.origin(),
+            Origin::Graph(g),
+            "expand",
+        )?;
         let graph = Arc::clone(self.table.get_graph(g)?);
         require_reverse_for_both(dir, &graph)?;
         let front = self.table.get_set(frontier)?.clone();
@@ -1438,7 +1473,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(since_check)?;
-        self.alloc_set(out)
+        self.alloc_set(out, Origin::Graph(g))
     }
 
     fn reach_fixpoint(
@@ -1717,6 +1752,16 @@ impl GraphCompute for AlgoSession {
         op: ReduceOp,
         mask: Option<Handle>,
     ) -> Result<Scalar, FnError> {
+        // A foreign mask is range-guarded rather than rejected, so every
+        // out-of-range slot reads `false` and the reduction quietly returns a
+        // partial answer — the worst shape in this family.
+        if let Some(m) = mask {
+            Self::require_compatible_origins(
+                self.table.get_tensor(map)?.origin(),
+                self.table.get_set(m)?.origin(),
+                "reduce",
+            )?;
+        }
         // Charge |V| before scanning (§5.1): read-only reductions run every
         // convergence iteration, so an unmetered reduce is an amplification hole.
         let n = self.table.get_tensor(map)?.len();
@@ -2032,10 +2077,11 @@ impl GraphCompute for AlgoSession {
             }
             walks.push(slots);
         }
-        self.alloc_walks(WalkMatrix::new(walks))
+        self.alloc_walks(WalkMatrix::new(walks), Origin::Graph(g))
     }
 
     fn sample(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError> {
+        let origin = self.table.get_tensor(prob)?.origin();
         // Read the [V] probabilities. `sample` runs on the f64 probability path;
         // an i64-backed tensor is a dtype mismatch (0x862), never a panic.
         let probs = {
@@ -2082,7 +2128,7 @@ impl GraphCompute for AlgoSession {
         if since_check > 0 {
             self.charge(since_check)?;
         }
-        self.alloc_set(mask)
+        self.alloc_set(mask, origin)
     }
 
     fn edge_weights(&mut self, g: Handle) -> Result<Handle, FnError> {
@@ -2135,7 +2181,7 @@ impl GraphCompute for AlgoSession {
             mask.insert(edge);
         }
         self.charge(e as u64)?;
-        self.alloc_edge_set(mask)
+        self.alloc_edge_set(mask, Origin::Graph(g))
     }
 
     fn segmented_reduce(&mut self, values: Handle, groups: Handle) -> Result<Handle, FnError> {
@@ -2194,6 +2240,7 @@ impl GraphCompute for AlgoSession {
     }
 
     fn sample_edges(&mut self, prob: Handle, seed: u64, iter: u64) -> Result<Handle, FnError> {
+        let origin = self.table.get_tensor(prob)?.origin();
         // Read the [E] probabilities; reject a [V] map or an i64 buffer (0x862).
         let probs = {
             let t = self.table.get_tensor(prob)?;
@@ -2239,7 +2286,7 @@ impl GraphCompute for AlgoSession {
         if since_check > 0 {
             self.charge(since_check)?;
         }
-        self.alloc_edge_set(mask)
+        self.alloc_edge_set(mask, origin)
     }
 
     fn sample_edges_undirected(
@@ -2308,7 +2355,7 @@ impl GraphCompute for AlgoSession {
         if since_check > 0 {
             self.charge(since_check)?;
         }
-        self.alloc_edge_set(mask)
+        self.alloc_edge_set(mask, Origin::Graph(g))
     }
 
     fn edge_set_len(&self, m: Handle) -> Result<u64, FnError> {
@@ -2316,6 +2363,7 @@ impl GraphCompute for AlgoSession {
     }
 
     fn edge_mask_window(&mut self, edge_vals: Handle, lo: f64, hi: f64) -> Result<Handle, FnError> {
+        let origin = self.table.get_tensor(edge_vals)?.origin();
         let vals = {
             let t = self.table.get_tensor(edge_vals)?;
             if !t.is_edge_shaped() {
@@ -2341,23 +2389,47 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(vals.len() as u64)?;
-        self.alloc_edge_set(mask)
+        self.alloc_edge_set(mask, origin)
     }
 
     fn edge_intersect(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        // The vertex-set trio got this guard when multi-graph sessions made
+        // `zip_with`'s assert reachable; the edge-set pair was missed.
+        Self::require_same_capacity(
+            self.table.get_edge_set(a)?.capacity(),
+            self.table.get_edge_set(b)?.capacity(),
+            "edge_intersect",
+        )?;
+        let origin = Self::require_compatible_origins(
+            self.table.get_edge_set(a)?.origin(),
+            self.table.get_edge_set(b)?.origin(),
+            "edge_intersect",
+        )?;
         let sa = self.table.get_edge_set(a)?.clone();
         let sb = self.table.get_edge_set(b)?;
         let out = sa.intersect(sb);
         self.charge(out.capacity() as u64)?;
-        self.alloc_edge_set(out)
+        self.alloc_edge_set(out, origin)
     }
 
     fn edge_union(&mut self, a: Handle, b: Handle) -> Result<Handle, FnError> {
+        // The vertex-set trio got this guard when multi-graph sessions made
+        // `zip_with`'s assert reachable; the edge-set pair was missed.
+        Self::require_same_capacity(
+            self.table.get_edge_set(a)?.capacity(),
+            self.table.get_edge_set(b)?.capacity(),
+            "edge_union",
+        )?;
+        let origin = Self::require_compatible_origins(
+            self.table.get_edge_set(a)?.origin(),
+            self.table.get_edge_set(b)?.origin(),
+            "edge_union",
+        )?;
         let sa = self.table.get_edge_set(a)?.clone();
         let sb = self.table.get_edge_set(b)?;
         let out = sa.union(sb);
         self.charge(out.capacity() as u64)?;
-        self.alloc_edge_set(out)
+        self.alloc_edge_set(out, origin)
     }
 
     fn expand_masked(
@@ -2368,6 +2440,11 @@ impl GraphCompute for AlgoSession {
         exclude: Option<Handle>,
         edge_mask: Handle,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_set(frontier)?.origin(),
+            Origin::Graph(g),
+            "expand_masked",
+        )?;
         if !matches!(dir, Direction::Out) {
             return Err(error::arg_validation(
                 "expand_masked is defined on the out-CSR; use Direction::Out",
@@ -2401,7 +2478,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(since_check)?;
-        self.alloc_set(out)
+        self.alloc_set(out, Origin::Graph(g))
     }
 
     fn expand_sampled(
@@ -2414,6 +2491,11 @@ impl GraphCompute for AlgoSession {
         seed: u64,
         iter: u64,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_set(frontier)?.origin(),
+            Origin::Graph(g),
+            "expand_sampled",
+        )?;
         if !matches!(dir, Direction::Out) {
             return Err(error::arg_validation(
                 "expand_sampled is defined on the out-CSR; use Direction::Out",
@@ -2485,7 +2567,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(since_check)?;
-        self.alloc_set(out)
+        self.alloc_set(out, Origin::Graph(g))
     }
 
     fn spmv_masked(
@@ -2739,6 +2821,7 @@ impl GraphCompute for AlgoSession {
     }
 
     fn next_bucket(&mut self, dist: Handle, delta: f64, bucket: u32) -> Result<Handle, FnError> {
+        let origin = self.table.get_tensor(dist)?.origin();
         let t = self.table.get_tensor(dist)?;
         if t.is_i64() {
             return Err(error::shape_mismatch(
@@ -2762,7 +2845,7 @@ impl GraphCompute for AlgoSession {
             }
         }
         self.charge(n as u64)?;
-        self.alloc_set(set)
+        self.alloc_set(set, origin)
     }
 }
 

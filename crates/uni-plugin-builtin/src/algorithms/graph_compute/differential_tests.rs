@@ -3567,3 +3567,99 @@ fn the_documented_budget_formula_matches_the_code() {
         "the absolute ceiling clamps large projections"
     );
 }
+
+/// Sets carry their index space, so cross-graph combinations are rejected.
+///
+/// Before this, `VertexSet` / `EdgeSet` carried no graph, so `set_to_map` yielded
+/// `Untracked` and every set-derived value was provenance-blind. Two projections
+/// of the *same size* — where the capacity guard cannot help — combined silently.
+#[test]
+fn sets_carry_provenance_across_equal_sized_graphs() {
+    // Same vertex count, disjoint vids: capacity checks cannot separate these.
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let fa = s.frontier(ga, &[Vid::new(0)]).expect("frontier on a");
+    let fb = s.frontier(gb, &[Vid::new(10)]).expect("frontier on b");
+
+    for (name, res) in [
+        ("set_union", s.set_union(fa, fb)),
+        ("set_diff", s.set_diff(fa, fb)),
+        ("set_intersect", s.set_intersect(fa, fb)),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name} across two projections must be rejected even at equal capacity"
+        );
+    }
+
+    // A frontier from another graph cannot drive a traversal.
+    assert!(
+        s.expand(ga, fb, Direction::Out, None).is_err(),
+        "expand must reject a frontier from a different projection"
+    );
+
+    // Nor mask a reduction — the case that used to read zero silently.
+    let deg = s.degrees(ga, Direction::Out).expect("degrees on a");
+    assert!(
+        s.reduce(deg, super::session::ReduceOp::Sum, Some(fb))
+            .is_err(),
+        "a masked reduce must reject a foreign mask rather than reading zero"
+    );
+}
+
+/// Provenance survives the set→map hop, so a real composition still works.
+///
+/// `set_to_map` used to return `Untracked`. Now it inherits, which is what makes
+/// `Untracked` unreachable from guest code — while the unification rule keeps
+/// ordinary pipelines (PageRank's teleport vector) working.
+#[test]
+fn set_to_map_carries_the_sets_provenance() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0)],
+        false,
+        false,
+    )));
+
+    let f = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+    let m = s.set_to_map(f, Scalar::F64(1.0)).expect("set_to_map");
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    // Same graph: still composes.
+    s.ewise(m, deg, EwiseOp::Add)
+        .expect("a set-derived map must still combine with its own graph");
+
+    // Different graph: now caught, where it previously slipped through as Untracked.
+    let foreign = s.degrees(other, Direction::Out).expect("degrees on other");
+    assert!(
+        s.ewise(m, foreign, EwiseOp::Add).is_err(),
+        "a set-derived map must not combine with another projection"
+    );
+}
+
+/// Edge-set algebra must not abort the host on mismatched capacities.
+///
+/// The vertex-set trio got this guard when multi-graph sessions made `zip_with`'s
+/// assert reachable; the edge-set pair sitting beside them was missed.
+#[test]
+fn edge_set_algebra_errors_instead_of_panicking() {
+    let a = build_projection(&[0, 1, 2], &[(0, 1, 1.0), (1, 2, 1.0)], true, false);
+    let b = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], true, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let ea = s.edges_all(ga).expect("all edges of a");
+    let eb = s.edges_all(gb).expect("all edges of b");
+    assert!(
+        s.edge_union(ea, eb).is_err(),
+        "edge_union across differing edge counts must error, not abort"
+    );
+    assert!(
+        s.edge_intersect(ea, eb).is_err(),
+        "edge_intersect across differing edge counts must error, not abort"
+    );
+}

@@ -130,10 +130,24 @@ impl Scalar {
 /// assert_eq!(s.len(), 2);
 /// assert_eq!(s.iter().collect::<Vec<_>>(), vec![3, 7]);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct VertexSet {
+    /// Which index space these slots belong to. See [`Origin`].
+    origin: Origin,
     words: Vec<u64>,
     capacity: usize,
+}
+
+impl PartialEq for VertexSet {
+    /// Compares membership only.
+    ///
+    /// Deliberately ignores [`Origin`]: two sets with the same members are the
+    /// same set, and a provenance difference is a fault the kernels report rather
+    /// than a difference in contents. Deriving this would have silently changed
+    /// the meaning of set equality when provenance landed.
+    fn eq(&self, other: &Self) -> bool {
+        self.capacity == other.capacity && self.words == other.words
+    }
 }
 
 impl VertexSet {
@@ -141,9 +155,23 @@ impl VertexSet {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            origin: Origin::Untracked,
             words: vec![0; capacity.div_ceil(64)],
             capacity,
         }
+    }
+
+    /// Stamps the index space these slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space these slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the slot capacity (the projection vertex count).
@@ -220,14 +248,18 @@ impl VertexSet {
     /// Applies `op` word-wise against `other`, producing a new set.
     ///
     /// # Panics
-    /// Panics on a capacity mismatch — sets from the same session always share
-    /// the projection vertex count, so a mismatch is a host programming error.
+    /// Panics on a capacity mismatch. Callers must check first — a session can
+    /// bind several graphs, so operands of different capacities are reachable
+    /// from guest input, and every set-algebra kernel guards this before calling.
     fn zip_with(&self, other: &VertexSet, op: impl Fn(u64, u64) -> u64) -> VertexSet {
         assert_eq!(
             self.capacity, other.capacity,
             "vertex-set capacity mismatch"
         );
         VertexSet {
+            // The result of combining two sets belongs to whichever space is
+            // known; the kernels reject a genuine mismatch before reaching here.
+            origin: self.origin.unify(other.origin),
             words: self
                 .words
                 .iter()
@@ -264,10 +296,30 @@ impl VertexSet {
 /// assert!(m.contains(2) && !m.contains(3));
 /// assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 5]);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct EdgeSet(VertexSet);
 
+impl PartialEq for EdgeSet {
+    /// Compares membership only, like [`VertexSet`]'s.
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
 impl EdgeSet {
+    /// Stamps the index space these edge slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.0 = self.0.with_origin(origin);
+        self
+    }
+
+    /// Returns the index space these edge slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.0.origin()
+    }
+
     /// Creates an empty edge mask able to hold edge indices `0..capacity`.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -628,6 +680,8 @@ impl Tensor {
 /// so a reduction can index per-vertex arrays directly.
 #[derive(Clone, Debug)]
 pub struct WalkMatrix {
+    /// Which index space the recorded slots belong to. See [`Origin`].
+    origin: Origin,
     walks: Vec<Vec<u32>>,
 }
 
@@ -635,7 +689,23 @@ impl WalkMatrix {
     /// Wraps a batch of slot-sequence walks.
     #[must_use]
     pub fn new(walks: Vec<Vec<u32>>) -> Self {
-        Self { walks }
+        Self {
+            origin: Origin::Untracked,
+            walks,
+        }
+    }
+
+    /// Stamps the index space the recorded slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space the recorded slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the walks as slot sequences.

@@ -763,9 +763,15 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
 
     let db = Uni::in_memory().build().await?;
     let _ = build_graph(&db).await?; // 4 nodes, 4 edges at T0
-    db.flush().await?; // land the seed in storage so the None-L0 projection sees it
+    db.flush().await?;
 
     // Project a read-only graph snapshot at T0 through the host bridge.
+    //
+    // The bridge carries a real L0 tier: a live storage view with none is the
+    // silent-stale-read shape and is now rejected. That is incidental to what
+    // this test asserts — the pinning below is a property of the *materialized*
+    // projection, so an L0-aware bridge exercises it identically (and the seed
+    // was flushed above, so L0 is empty at T0 either way).
     let storage = db.storage();
     let caps = CapabilitySet::from_iter_of([
         Capability::GraphCompute,
@@ -774,7 +780,12 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
             scopes: Vec::new(),
         },
     ]);
-    let bridge = host_bridge_from_storage(storage, None, caps);
+    let writer = db.writer().expect("in-memory db has a writer");
+    let l0 = std::sync::Arc::new(uni_db::runtime::l0_manager::L0Manager::from_snapshot(
+        writer.l0_manager.get_current(),
+        writer.l0_manager.get_pending_flush(),
+    ));
+    let bridge = host_bridge_from_storage(storage, Some(l0), caps);
     let spec = GraphProjectionSpec {
         node_labels: vec!["Node".into()],
         edge_types: vec!["LINKS".into()],

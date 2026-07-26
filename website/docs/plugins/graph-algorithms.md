@@ -132,6 +132,43 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 With `sqrt` and `exp` alongside `log` and `div`, the canonical UCT/UCB exploration term `c·√(ln N / n)` composes directly out of kernels — `map_apply(counts, "log")`, `ewise(…, visits, "div")`, then `map_apply(…, "sqrt")` — with no per-element guest code and no host round-trip.
 
 
+### When `node_property` / `edge_property` return NaN
+
+The consumer-facing rule has two halves, and they behave differently:
+
+- A property you **did not request** in the projection spec is an **error**:
+  `edge_property: \`w\` was not projected (add it to edgeProperties)`. The
+  `nodeProperties` / `edgeProperties` config keys are what make a column exist at
+  all — a kernel cannot read a column the projection never materialized.
+- A property you **did** request but which has no value for a given element is
+  `NaN`, per element, silently. That is deliberate: `NaN` is an honest "no value
+  here", distinct from a real `0.0`, and it propagates visibly into `reduce_sum`.
+
+A requested name that is declared on **none** of the projected labels/edge types
+*and* resolves for **no** projected element is rejected outright — that is a typo,
+not data. A name declared on at least one projected label is accepted across a
+heterogeneous projection; the labels that do not carry it yield `NaN`. The same
+check covers `weightProperty`, where the old failure mode was worse: an unknown
+weight name silently defaulted every edge weight to `1.0`, which is
+indistinguishable from real data.
+
+So, after that check, the remaining ways to see `NaN` are:
+
+| Cause | Detail |
+| --- | --- |
+| Heterogeneous projection | The element's label does not declare the property. |
+| Non-numeric value | Only `Float` and `Int` convert; `Bool`, `String`, `Null` and `Bytes` all read `NaN`. |
+| Deleted element | A tombstone in a newer L0 generation removes the entry. |
+| Time-travel pin | A pinned snapshot drops entries above its version high-water mark. |
+
+Two related contracts worth knowing:
+
+- **Cypher / Named projections carry no property columns at all**, so
+  `node_property` / `edge_property` against one always *error* — they never return
+  `NaN`. Use a label/edge-type-scoped projection when you need property tensors.
+- **Edge weight is not an edge property.** A missing weight falls back to `1.0`
+  (the traversal default), never `NaN`.
+
 ### Composing operations the catalog does not name
 
 The kernel set is deliberately coarse and the op vocabularies are closed, so `ewise` has no

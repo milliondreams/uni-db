@@ -214,6 +214,9 @@ pub struct ProjectionBuilder {
     storage: Arc<StorageManager>,
     /// L0 manager for scanning in-memory vertices not yet flushed.
     l0_manager: Option<Arc<L0Manager>>,
+    /// Opt-in escape hatch for a caller that genuinely wants flushed-only data
+    /// from a live storage view. Off by default — see [`Self::build`].
+    allow_detached_l0: bool,
     config: ProjectionConfig,
 }
 
@@ -223,8 +226,20 @@ impl ProjectionBuilder {
         Self {
             storage,
             l0_manager: None,
+            allow_detached_l0: false,
             config: ProjectionConfig::default(),
         }
+    }
+
+    /// Permit building with no L0 tier against a *live* storage view.
+    ///
+    /// Off by default. A live view with no L0 is the silent-degrade shape:
+    /// committed-but-unflushed rows vanish and the algorithm computes correct
+    /// arithmetic over stale inputs, with no error anywhere. Set this only when
+    /// flushed-only data is the deliberate contract.
+    pub fn allow_detached_l0(mut self, allow: bool) -> Self {
+        self.allow_detached_l0 = allow;
+        self
     }
 
     /// Set the L0 manager for scanning in-memory vertices.
@@ -277,6 +292,29 @@ impl ProjectionBuilder {
     /// data committed *during* the build may still be picked up by the scan
     /// — the projection is an analytics view, not a serializable read.
     pub async fn build(self) -> Result<GraphProjection> {
+        // Typed intent: no L0 tier is legitimate for exactly one kind of storage
+        // view — a manifest-pinned time-travel snapshot. `create_snapshot`
+        // flushes before pinning, so such a view's rows are entirely in L1 and
+        // the live L0 holds only post-snapshot writes that must stay invisible.
+        // `snapshot_version_hwm` is `Some` iff that is the case; it deliberately
+        // excludes transaction-level version pins, which DO carry L0 (see its
+        // rustdoc — `version_high_water_mark` would be the wrong signal here).
+        //
+        // Any other detached construction is the silent-stale-read shape, so it
+        // fails loud instead of quietly projecting a partially-flushed graph.
+        if self.l0_manager.is_none()
+            && self.storage.snapshot_version_hwm().is_none()
+            && !self.allow_detached_l0
+        {
+            return Err(anyhow!(
+                "projection has no L0 tier and its storage view is not a pinned \
+                 snapshot: committed-but-unflushed rows would be silently \
+                 omitted. Pass the query's L0Manager via \
+                 ProjectionBuilder::l0_manager, or opt in with \
+                 allow_detached_l0(true) if flushed-only data is intended."
+            ));
+        }
+
         let schema = self.storage.schema_manager().schema();
 
         // Pin the L0 view for the whole build. Holding the SnapshotView's
@@ -305,7 +343,7 @@ impl ProjectionBuilder {
         //    The pinned L0 snapshot is threaded through so property/weight reads
         //    overlay committed-but-unflushed L0 (G12) exactly as the structure
         //    read above already does.
-        let (out_edges, in_edges, out_edge_props) = self
+        let (out_edges, in_edges, out_edge_props, weight_resolved) = self
             .collect_edges(&id_map, &edge_type_ids, l0_snapshot.as_ref())
             .await?;
 
@@ -313,6 +351,74 @@ impl ProjectionBuilder {
         let node_properties = self
             .collect_node_properties(&id_map, l0_snapshot.as_ref())
             .await?;
+
+        // 5b. A requested name that is declared on none of the projected
+        //     labels/edge types AND resolved for none of the projected elements
+        //     is a typo, not data. Left unchecked it produces an all-`NaN`
+        //     column, or — worse, for a weight — a column of silent `1.0`s that
+        //     is indistinguishable from real weights. Both are the
+        //     plausible-but-wrong shape this contract exists to prevent.
+        //
+        //     Only names Tier 1 could not confirm reach the data check, so a
+        //     schemaless property that genuinely resolves at runtime (via
+        //     `overflow_json`) still passes. Empty element sets are skipped —
+        //     nothing can be concluded from a graph with no rows.
+        let label_scope = self.scoped_label_names(&schema);
+        let edge_scope = self.scoped_edge_type_names(&schema);
+
+        if vertex_count > 0 {
+            for name in Self::undeclared_names(&schema, &self.config.node_properties, &label_scope)
+            {
+                let unresolved = node_properties
+                    .get(&name)
+                    .is_none_or(|col| col.iter().all(|v| !v.is_finite()));
+                if unresolved {
+                    return Err(anyhow!(
+                        "nodeProperties `{name}` is declared on none of the projected \
+                         labels [{}] and no projected vertex carries a value for it — \
+                         every value would be NaN. Check the spelling, or declare it \
+                         via schema().label(..).property(..).",
+                        label_scope.join(", ")
+                    ));
+                }
+            }
+        }
+
+        if !out_edges.is_empty() {
+            for name in Self::undeclared_names(&schema, &self.config.edge_properties, &edge_scope) {
+                let unresolved = out_edge_props
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .is_none_or(|(_, col)| col.iter().all(|v| !v.is_finite()));
+                if unresolved {
+                    return Err(anyhow!(
+                        "edgeProperties `{name}` is declared on none of the projected \
+                         edge types [{}] and no projected edge carries a value for it — \
+                         every value would be NaN. Check the spelling, or declare it \
+                         via schema().edge_type(..).property(..).",
+                        edge_scope.join(", ")
+                    ));
+                }
+            }
+
+            if let Some(weight) = self.config.weight_property.as_deref()
+                && !weight_resolved
+                && !Self::undeclared_names(
+                    &schema,
+                    std::slice::from_ref(&weight.to_owned()),
+                    &edge_scope,
+                )
+                .is_empty()
+            {
+                return Err(anyhow!(
+                    "weightProperty `{weight}` is declared on none of the projected \
+                     edge types [{}] and no projected edge carries a value for it — \
+                     every weight would silently default to 1.0. Check the spelling, \
+                     or declare it via schema().edge_type(..).property(..).",
+                    edge_scope.join(", ")
+                ));
+            }
+        }
 
         // Compact IdMap (drops hash map, enables binary search)
         id_map.compact();
@@ -376,6 +482,54 @@ impl ProjectionBuilder {
         }
 
         Ok((label_ids, edge_type_ids))
+    }
+
+    /// Names from `requested` that no entry in `scope` declares.
+    ///
+    /// The rule is a **union**, not an intersection: a property declared on at
+    /// least one projected label/edge type is accepted, and the entries that do
+    /// not carry it yield `NaN` — the honest "no value on this label". Demanding
+    /// it everywhere would break ordinary heterogeneous projections.
+    ///
+    /// A name declared *nowhere* is not necessarily a typo: uni-db permits
+    /// schemaless properties, which land in `overflow_json` and are still
+    /// readable by name. So this returns candidates for the data check in
+    /// [`Self::build`] rather than an error on its own.
+    fn undeclared_names(
+        schema: &uni_common::core::schema::Schema,
+        requested: &[String],
+        scope: &[String],
+    ) -> Vec<String> {
+        requested
+            .iter()
+            .filter(|name| {
+                !scope.iter().any(|owner| {
+                    schema
+                        .properties
+                        .get(owner)
+                        .is_some_and(|props| props.contains_key(name.as_str()))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The label names this projection covers (explicit scope, else the schema).
+    fn scoped_label_names(&self, schema: &uni_common::core::schema::Schema) -> Vec<String> {
+        if self.config.node_labels.is_empty() {
+            schema.labels.keys().cloned().collect()
+        } else {
+            self.config.node_labels.clone()
+        }
+    }
+
+    /// The edge-type names this projection covers (explicit scope, else schema).
+    fn scoped_edge_type_names(&self, schema: &uni_common::core::schema::Schema) -> Vec<String> {
+        if self.config.edge_types.is_empty() {
+            schema.edge_types.keys().cloned().collect()
+        } else {
+            self.config.edge_types.clone()
+        }
     }
 
     /// Warm adjacency manager for all requested edge types.
@@ -455,7 +609,12 @@ impl ProjectionBuilder {
         id_map: &IdMap,
         edge_type_ids: &[u32],
         l0_snapshot: Option<&uni_store::runtime::l0_manager::SnapshotView>,
-    ) -> Result<(WeightedEdgeList, WeightedEdgeList, Vec<(String, Vec<f64>)>)> {
+    ) -> Result<(
+        WeightedEdgeList,
+        WeightedEdgeList,
+        Vec<(String, Vec<f64>)>,
+        bool,
+    )> {
         // Phase 1: Collect topology from AdjacencyManager
         let mut raw_out_edges = Vec::new(); // (src_slot, dst_vid, eid)
         let mut raw_in_edges = Vec::new();
@@ -566,6 +725,12 @@ impl ProjectionBuilder {
             }
         }
 
+        // Did the requested weight name resolve for ANY projected edge? An
+        // all-defaulted weight column is indistinguishable from real 1.0 weights,
+        // so the caller cannot infer this from the values — it has to be reported.
+        let weight_resolved =
+            weight_prop.is_some_and(|w| props_cache.values().any(|m| m.contains_key(w)));
+
         // Missing weight -> 1.0 (traversal default); missing edge property -> NaN
         // (an honest "no value", distinct from a real 0.0 weight).
         let weight_of = |eid: &Eid| -> f64 {
@@ -608,7 +773,7 @@ impl ProjectionBuilder {
         let out_edge_props: Vec<(String, Vec<f64>)> =
             edge_prop_names.iter().cloned().zip(out_prop_cols).collect();
 
-        Ok((out_edges, in_edges, out_edge_props))
+        Ok((out_edges, in_edges, out_edge_props, weight_resolved))
     }
 
     /// Fetch the configured per-vertex property columns in vertex-slot order

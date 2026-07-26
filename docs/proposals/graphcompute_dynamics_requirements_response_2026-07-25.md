@@ -825,3 +825,84 @@ cargo nextest run --run-ignored all -E 'test(repro_)'     # must be RED until it
 Two tests deliberately pin *current* behaviour as Phase 0 evidence and are scheduled for
 deletion by the phase that fixes them: `d2_diagnosis_the_first_emit_is_what_fails` (Phase 3) and
 the `#[ignore]` reasons themselves.
+
+---
+
+# Part IV — Phase 2 result, and a second correction to §16
+
+## 19. §16 was wrong on both of its load-bearing claims
+
+Part III concluded that the L0-detached degrade had "no user-reachable path found" and downgraded
+candidate C1 accordingly. Phase 2 investigated the two supporting claims and **both are refuted**.
+Recorded here rather than edited into §16, so the reasoning trail stays visible.
+
+**Claim 1 — "the sole production caller takes its L0 from the query context, `None` only for a
+read-only session, which cannot hold unflushed writes of its own."**
+
+The second half is false. WAL replay is **not** gated on `read_only`: `crates/uni/src/api/mod.rs`
+replays the WAL suffix above the snapshot manifest's high-water mark into the writer's
+`L0Manager`, and only afterwards discards the writer for a read-only open. The WAL is appended at
+*commit* time, so that suffix is exactly the committed-but-unflushed set — a read-only session
+holds precisely the data §16 said it could not.
+
+Measured: an on-disk database with two nodes flushed and two more committed-but-unflushed,
+reopened read-only, returned **2 of 4** nodes to a plain `MATCH`, with no error. Not
+GraphCompute-specific — every read on the session was affected.
+
+**Claim 2 — "the Cypher `graphRef` hypothesis is falsified."**
+
+True for the **DF path** only, which is the one the pin test exercised: `uni.algo.gcpagerank` is
+DF-eligible by name prefix and takes a host carrying a real `L0Context`. The **row path** —
+reached by any `AlgorithmProvider` that is not `df_composable` — builds its resolver host from
+`QueryProcedureHost::from_components`, which hardcodes `L0Context::empty()`. Its `nodeQuery` /
+`edgeQuery` therefore selected from flushed storage only, while the *outer* projection on the same
+call was correct. A mode-dependent wrong answer: label-scoped worked, Cypher-scoped silently did
+not. The same defect sat on `execute_plugin_procedure`, affecting every row-path plugin procedure
+including `uni.graph.project`'s Cypher mode.
+
+**Lesson worth keeping.** Both errors ran the same way: a test passed, and the passing test was
+read as evidence about a *class* when it only covered one member of it. The `gcpagerank` pin
+proved the DF path and was written up as proving "the graphRef path". Choosing a fixture that is
+representative of the class — here, a provider on each dispatch path — is what the second attempt
+did differently.
+
+**Status of C1 for REQ-D3:** the degrade was genuinely reachable, on two paths, both now closed.
+Whether either explains the consumer's rare wrong value is still unknown — their workload would
+have to have used a read-only session or a non-`df_composable` provider with a Cypher graphRef.
+Worth asking; not worth assuming.
+
+## 20. What Phase 2 changed
+
+| | |
+|---|---|
+| **Bug A** | A read-only open keeps its WAL-replayed L0. Also fixes the writer-less `get_context` branch, which built its `QueryContext` without `pending_flush_l0s` and so would have missed rows after a background rotation. Read-only opens no longer run background flush / index rebuild — they were writing L1. |
+| **Bug B** | `QueryProcedureHost::with_l0_context`, applied at both row-path host constructions. |
+| **Guard** | `ProjectionBuilder::build` rejects a detached L0 on a live storage view. Pinned snapshots are exempt via `snapshot_version_hwm()`, which is `Some` iff a manifest snapshot is pinned and deliberately excludes transaction-level pins. Opt-out: `allow_detached_l0(true)`, unused in-tree. |
+| **Bug C** | `nodeProperties` / `edgeProperties` / `weightProperty` names that are declared on no projected label **and** resolve for no projected element now fail loud. Two tiers, so schemaless properties that resolve at runtime still pass. Union across labels, not intersection. |
+
+`repro_c1_l0_detached_projection_must_not_silently_read_stale_properties` was **retargeted, not
+deleted**: its contract sentence was always "see committed-but-unflushed rows *or fail loud*", and
+it now asserts the second branch. `pinned_snapshot_projection_is_legitimately_l0_free` is its
+positive control — without it, simplifying the guard to `l0.is_none() => error` would look safe and
+would break `pin_to_version` / `AS OF`.
+
+One in-tree test changed: `q3_projected_reads_are_pinned_across_concurrent_commits` built its
+bridge with `l0 = None` as fixture convenience. It now passes a real L0; the pinning property it
+asserts is unaffected (it concerns an already-materialized projection, and the fixture flushes
+first).
+
+**Gate:** 5962/5962 workspace tests, clippy `-D warnings`, fmt, `cargo doc`, and TCK 3925/3926
+with zero failures and no change against the previous run.
+
+## 21. Still open
+
+- The 2a/2b telemetry-then-enforce gate in §13 is **superseded**. There was nothing to measure once
+  the reachable paths were known, and the one legitimate detached construction (a pinned snapshot)
+  is detectable structurally rather than by opt-in.
+- `projection.rs`'s comment claims uncommitted transaction writes "stay invisible … by contract".
+  Whether the host paths in fact fold a transaction's own L0 into `pending` — making them visible
+  and the comment wrong — was raised during this phase but **not verified**, so nothing was changed.
+  It needs its own test before either the comment or the wiring is touched.
+- `nodeProperties` passed together with `nodeQuery` is silently ignored: the resolver returns before
+  the Native spec is read. Separate ergonomics gap.
+- The version bump and release notes for the breaking change in this phase are not done.

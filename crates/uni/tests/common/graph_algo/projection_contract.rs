@@ -245,58 +245,83 @@ fn property_spec() -> GraphProjectionSpec {
     }
 }
 
-/// **Rung 2 of the L0 ladder** — the same fixture and the same spec as `g12`,
-/// projected through a bridge built with `l0 = None`.
+/// **Rung 2 of the L0 ladder** — a bridge built with `l0 = None` against a
+/// *live* storage view must fail loud.
 ///
-/// This is the construction the CALL path produces whenever the procedure host
-/// is assembled from an `L0Context::empty()` — i.e. whenever
-/// `Executor::get_context()` yields `None`. The projection then pins no L0
-/// snapshot (`ProjectionBuilder::build`) and property reads see flushed storage
-/// only, which for a write-back march means *an earlier step's value*: correct
-/// arithmetic over stale inputs, no error anywhere.
+/// Measured on `254b4c26c`, this construction silently projected an **empty**
+/// graph over committed-but-unflushed rows. A partially-flushed database — the
+/// shape a write-back march produces — would instead project the flushed subset
+/// carrying an earlier step's values: correct arithmetic over stale inputs, no
+/// error anywhere.
 ///
-/// `g12` closed this for the L0-aware construction. The degrade one layer up is
-/// still silent, which is the Theme-C gap and the leading candidate for the
-/// rare wrong-value report (REQ-D3 candidate C1).
+/// The contract this test has always asserted is "see committed-but-unflushed
+/// rows **or fail loud**". `g12` covers the first branch for the L0-aware
+/// construction; Phase 2 makes the detached construction take the second, so
+/// this now asserts the loud failure rather than the (unreachable) success.
 #[tokio::test]
-#[ignore = "REPRO (red on 254b4c26c: reads flushed storage only, silently): flips \
-            when Phase 2 makes the detached construction loud. \
-            Run with --run-ignored all."]
 async fn repro_c1_l0_detached_projection_must_not_silently_read_stale_properties()
 -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
-    let (node_scores, _edge_weights) = seed_property_graph(&db).await?;
+    let (_node_scores, _edge_weights) = seed_property_graph(&db).await?;
 
     // The degrade under test: `None` where `l0_aware_bridge` passes `Some(l0)`.
     let bridge = host_bridge_from_storage(db.storage(), None, broad_caps());
-    let proj = bridge.project_for_graph_compute(&property_spec()).await?;
+    let err = bridge
+        .project_for_graph_compute(&property_spec())
+        .await
+        .expect_err("a detached projection over a live view must not succeed");
 
-    // Measured on baseline: the projection succeeds and reports ZERO vertices —
-    // every row is still in unflushed L0. Nothing errors. A partially-flushed
-    // database (the shape a write-back march produces) would instead project the
-    // rows that happen to have been flushed, carrying an *earlier step's* values.
-    // Both outcomes are silent; this one is simply the fully-unflushed extreme.
-    assert_eq!(
-        proj.vertex_count(),
-        4,
-        "an L0-detached projection must see committed-but-unflushed rows or fail \
-         loud; it silently projected an empty graph instead"
-    );
-
-    let scores = proj
-        .node_property("score")
-        .expect("score column materialized")
-        .to_vec();
+    let msg = err.to_string();
     assert!(
-        scores.iter().all(|v| v.is_finite()),
-        "an L0-detached projection must not silently yield NaN scores: {scores:?}"
+        msg.contains("not a pinned snapshot") && msg.contains("silently"),
+        "the failure must name the missing L0 tier and why it matters, got: {msg}"
     );
-    let mut sorted = scores.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    Ok(())
+}
+
+/// The positive control for the guard above: a **pinned** snapshot view is
+/// legitimately L0-free and must still project.
+///
+/// `create_snapshot` flushes before pinning, so such a view's rows are entirely
+/// in L1 and the live L0 holds only post-snapshot writes that must stay
+/// invisible. Without this test, "simplifying" the guard to
+/// `l0.is_none() => error` would look safe and would break `pin_to_version`,
+/// `pin_to_timestamp` and Cypher `AS OF`.
+#[tokio::test]
+async fn pinned_snapshot_projection_is_legitimately_l0_free() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let (node_scores, _edge_weights) = seed_property_graph(&db).await?;
+    let snapshot = db.create_snapshot("phase2_pin").await?;
+
+    let mut session = db.session();
+    session.pin_to_version(&snapshot).await?;
+
+    // Reading through the pinned session must work — and must see exactly the
+    // pre-snapshot rows, which `create_snapshot` flushed to L1.
+    let rows = session.query("MATCH (n:Node) RETURN count(n) AS c").await?;
+    let count: i64 = rows.rows()[0].get("c")?;
     assert_eq!(
-        sorted, node_scores,
-        "an L0-detached projection must either read committed L0 or fail loud — \
-         never return plausible-but-stale values"
+        count,
+        node_scores.len() as i64,
+        "a pinned snapshot must project its flushed state"
+    );
+
+    let vid: i64 = session
+        .query("MATCH (n:Node) RETURN id(n) AS vid LIMIT 1")
+        .await?
+        .rows()[0]
+        .get("vid")?;
+    let res = session
+        .query(&format!(
+            "CALL uni.algo.gcpagerank({vid}, 0.85, \
+             {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, score RETURN nodeId, score"
+        ))
+        .await?;
+    assert_eq!(
+        res.rows().len(),
+        node_scores.len(),
+        "the detached-L0 guard must exempt pinned snapshots, not break time travel"
     );
     Ok(())
 }
@@ -348,6 +373,127 @@ async fn g12_stored_property_values_project_over_unflushed_l0() -> anyhow::Resul
     assert!(
         weights.iter().any(|&w| (w - 1.0).abs() > 1e-9),
         "at least one weight differs from the 1.0 default"
+    );
+    Ok(())
+}
+
+// ---- Phase 2, bug C: unresolvable property/weight names fail loud ---------
+
+/// A typo'd `nodeProperties` name used to produce an all-`NaN` column silently.
+#[tokio::test]
+async fn c_typo_node_property_fails_loud() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    seed_property_graph(&db).await?;
+    let bridge = l0_aware_bridge(&db, broad_caps())?;
+
+    let spec = GraphProjectionSpec {
+        node_properties: vec!["scoer".into()],
+        ..property_spec()
+    };
+    let err = bridge
+        .project_for_graph_compute(&spec)
+        .await
+        .expect_err("an unresolvable node property must not silently yield NaN");
+    let msg = err.to_string();
+    assert!(msg.contains("scoer"), "must name the property: {msg}");
+    assert!(msg.contains("Node"), "must name the projected scope: {msg}");
+    Ok(())
+}
+
+/// Same for `edgeProperties`.
+#[tokio::test]
+async fn c_typo_edge_property_fails_loud() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    seed_property_graph(&db).await?;
+    let bridge = l0_aware_bridge(&db, broad_caps())?;
+
+    let spec = GraphProjectionSpec {
+        edge_properties: vec!["ww".into()],
+        ..property_spec()
+    };
+    let err = bridge
+        .project_for_graph_compute(&spec)
+        .await
+        .expect_err("an unresolvable edge property must not silently yield NaN");
+    assert!(err.to_string().contains("ww"), "must name it: {err}");
+    Ok(())
+}
+
+/// The worst of the three: a typo'd `weightProperty` silently defaulted every
+/// weight to `1.0`, which is indistinguishable from real data — unlike NaN,
+/// which at least propagates visibly into `reduce_sum`.
+#[tokio::test]
+async fn c_typo_weight_property_fails_loud() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    seed_property_graph(&db).await?;
+    let bridge = l0_aware_bridge(&db, broad_caps())?;
+
+    let spec = GraphProjectionSpec {
+        weight_property: Some("wieght".into()),
+        ..property_spec()
+    };
+    let err = bridge
+        .project_for_graph_compute(&spec)
+        .await
+        .expect_err("an unresolvable weight property must not silently default to 1.0");
+    let msg = err.to_string();
+    assert!(msg.contains("wieght"), "must name the property: {msg}");
+    assert!(
+        msg.contains("1.0"),
+        "must say what it would have done: {msg}"
+    );
+    Ok(())
+}
+
+/// **The union rule, pinned.** A property declared on *one* projected label is
+/// accepted across a heterogeneous projection; labels that do not carry it yield
+/// `NaN`, which is the honest "no value on this label".
+///
+/// Without this test, tightening the rule to an intersection would look safe and
+/// would break every ordinary multi-label projection.
+#[tokio::test]
+async fn c_multi_label_partial_declaration_is_accepted() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    seed_property_graph(&db).await?;
+    // A second label that does NOT declare `score`.
+    db.schema()
+        .label("Other")
+        .property("tag", DataType::String)
+        .done()
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Other {tag: 'x'})").await?;
+    tx.commit().await?;
+
+    let bridge = l0_aware_bridge(&db, broad_caps())?;
+    let spec = GraphProjectionSpec {
+        node_labels: vec!["Node".into(), "Other".into()],
+        node_properties: vec!["score".into()],
+        edge_properties: vec![],
+        weight_property: None,
+        ..property_spec()
+    };
+    let proj = bridge
+        .project_for_graph_compute(&spec)
+        .await
+        .expect("a property declared on one projected label must be accepted");
+    assert_eq!(proj.vertex_count(), 5, "four :Node plus one :Other");
+
+    let scores = proj
+        .node_property("score")
+        .expect("score column materialized")
+        .to_vec();
+    assert_eq!(
+        scores.iter().filter(|v| v.is_finite()).count(),
+        4,
+        "the four :Node rows carry a score"
+    );
+    assert_eq!(
+        scores.iter().filter(|v| v.is_nan()).count(),
+        1,
+        "the :Other row honestly reports no value"
     );
     Ok(())
 }

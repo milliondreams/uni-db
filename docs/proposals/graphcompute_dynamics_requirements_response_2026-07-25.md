@@ -1148,3 +1148,116 @@ and the doc tables that omitted `graph_named` and `rekey`.
   work budget covers the *kernel* cost of using them, not the projection cost of
   building them; a caller declaring fifty scopes pays fifty projections up front.
   Worth a cap if it shows up in practice.
+
+---
+
+# Part VII — response to the third round (REQ-D1…D8)
+
+## 29. Status of every ask
+
+All eight are addressed. Seven ship; the eighth ships in part, with its remaining
+boundary named rather than guessed at.
+
+| ask | status |
+|---|---|
+| **D1** comparison→mask | **shipped** — `compare(a, b, op)` for `gt/ge/lt/le/eq/ne`, shape-preserving |
+| **D2** multi-emit | **shipped** — batch `emit`, with ≥2-yield fixtures on all four loaders |
+| **D3** localise the rare wrong value | **both questions answered** (below) |
+| **D4** guarantee `sample_edges` at p∈{0,1} | **shipped** — and you never needed it (below) |
+| **D5** second scoped projection | **shipped** — named `scopes` + `graph_named`, plus `rekey` |
+| **D6** the work budget | **shipped** — `work_budget()` / `work_spent()` / `work_remaining()` |
+| **D7** `edge_property` → NaN | **fixed** — not fork-specific; a detached L0 tier, now fail-loud |
+| **D8** arena aggregation / dynamic adjacency | **mostly shipped** (below) |
+
+## 30. D3 — the two questions, answered
+
+**Is anything process-global across independent `Uni` instances?** One thing: a
+`static AtomicU16` session-epoch counter. It is inert on the Rhai path — the
+guest holds the session `Arc` directly, there is no session-id routing, and each
+CALL gets a fresh scope. No arena pool, no shared Rhai engine, no thread-local,
+no `unsafe` in the three crates involved.
+
+**Could there be a handle-integrity mode?** There is now: `UNI_GC_TRACE=1`
+records a bounded ring of handle resolutions and attaches it to any handle error
+*and* to budget/timeout aborts — the shape where a guest loops on a wrong value
+until the meter runs out, which otherwise arrives with no history at all.
+
+Handle recycling is structurally ruled out independently: the generation is
+bumped *before* the slot returns to the free list, behind six resolution gates,
+so a stale handle fails closed with `0x860` rather than resolving to a recycled
+value.
+
+## 31. D4 — guaranteed, and unnecessary
+
+The endpoints are now a documented contract, pinned by a test across five seeds
+and two iteration counters, so they cannot be optimised away.
+
+But you offered to switch to a dedicated `edge_mask` if we preferred, and that
+already shipped: `edge_mask_window(sel, 0.5, 1.5)` selects exactly the 1.0 edges
+with no RNG in the path. Prefer it — it says what it means. The recipe was in the
+skills reference and not in the user-facing docs, which is presumably why it went
+unfound; both carry it now.
+
+## 32. D8 — two of the three stated facts were wrong
+
+**"No aggregation over arena links"** — `arena_freeze` compacts an arena into an
+ordinary graph handle, so the composition is *freeze, then `spmv`*. No
+`arena_spmv` is needed.
+
+**"`spmv` is restricted to the projected node set"** — true of the CALL-site
+projection, but the frozen arena graph is a *different* graph whose `V` is the
+arena's live slot count.
+
+**"Capacity is a hard ceiling"** — correct, and it is the real constraint. But it
+is *guest-chosen* at `arena_new(capacity, branching)`, bounded by a 256 MB byte
+budget, not the `4` you hit. So the conclusion that "the arena would not have
+lifted either" is half wrong.
+
+What genuinely was missing is the thing your Tier-C actually needs: a way to get
+the *existing* network into the arena. `arena_seed(a, g)` now does that, so the
+loop closes — import, grow into it, freeze, aggregate — and newborns extend the
+vertex set rather than inheriting a recycled slot's graph position.
+
+**The boundary that remains.** `emit` keys `nodeId` to the primary projection, so
+newborns — which exist only inside the CALL and have no store identity — have no
+per-row egress. Emit for the imported vertices, or carry newborn results out as
+aggregates. This is a modelling question (what *is* the id of a node that was
+never persisted?), and we would rather name it than invent an answer. If you have
+a preferred semantics, that is the input we need.
+
+**Also, correcting our own record as you asked:** you are right that `arena_link`
+exists and works for DAG cross-links.
+
+## 33. The pattern, said plainly
+
+Three consecutive rounds have led with an ask that was already expressible: D1's
+comparison was composable from shipped ops, D8's `arena_spmv` is `arena_freeze`
+then `spmv`. That is our failure, not yours — a capability nobody can find has
+not shipped.
+
+The structural fix landed with this round. Composition recipes previously fired
+only when an op *string* was rejected; they now also fire when a *method* does
+not exist, in every loader:
+
+```
+gc.arena_spmv(a, col)
+→ `arena_spmv` is not a kernel. For aggregation over links you grew, compose it:
+  spmv(arena_freeze(a), col, "linear_algebra", "out")
+```
+
+Guarded so a hint can never shadow a working kernel, and so an unkeyed name earns
+the ordinary "not found" rather than invented advice.
+
+## 34. One regression this review caught
+
+Checking D8's premise rather than asserting it found that our own index-space
+work had **broken** `arena_freeze` + `spmv`: an arena column is `Origin::Arena`,
+a frozen graph is `Origin::Graph`, and the two did not unify. The composition
+that answers D8 had stopped working. Fixed, bounded to that arena's own frozen
+graph, and tested — along with a second defect found alongside it, where every
+`arena_freeze` permanently leaked a handle slot, capping any grow/freeze loop at
+the handle budget for no reason a guest could see.
+
+Both are the kind of thing a field report surfaces only indirectly. Thank you for
+the precision of these — the repro paths and the "measured, not inferred"
+discipline are what made them actionable.

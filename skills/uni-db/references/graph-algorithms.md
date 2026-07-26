@@ -687,22 +687,32 @@ The trailing projection-config object (`{nodeLabels, edgeTypes, includeReverse, 
 An **unscoped** projection — no `nodeLabels` and no `edgeTypes` — now **errors** instead of silently projecting the whole graph. To project the entire graph, name the labels/types or set `projectAll: true` explicitly. First-party `uni.algo.gc*` procedures opt into whole-graph projection automatically.
 
 Additional fail-loud guarantees:
-- `emit` reports a clear length-mismatch error when the emitted column length doesn't match the projection.
+- `emit` names the fault at the guest's call: a column from the wrong projection is rejected by identity, and a wrong-length column by length.
 - A whole-graph projection errors on undeclared (schemaless) labels.
 - Stored property values now read correctly from **unflushed in-memory L0** — previously a projection built before a flush saw `NaN` values / default edge weight `1.0`.
 
-### Tensor identity: shape and index space
+### Value identity: shape and index space
 
-A tensor carries the **shape** it was built with (`[V]` or `[E]`) and the **index space** its
+Every value carries the **shape** it was built with (`[V]` or `[E]`) and the **index space** its
 slots belong to — the projection or arena it came from. Both are enforced, so a `[V]` map cannot
-combine with an `[E]` tensor of equal length, and tensors from two projections cannot combine at
+combine with an `[E]` tensor of equal length, and values from two projections cannot combine at
 all (slot `i` names a different vertex in each). `ewise`, `map_apply`, `compare` and
 `segmented_reduce` preserve both, so an `[E]` pipeline stays `[E]` through to `sample_edges`.
 
-Set-derived values (`set_to_map`) have no index space of their own; that is treated as *unknown*
-rather than a third space, so it unifies with anything and the result adopts the known space.
-`map_to_set` is shape-polymorphic — an `[E]` tensor lowers to an `EdgeSet` that `spmv_masked`
-accepts.
+Sets, walk matrices and pair lists are tagged too, so a foreign operand is rejected wherever one
+meets a graph or another set: the set algebra, `expand` / `expand_masked` / `expand_sampled`
+(frontier, `exclude` **and** edge mask), `spmv` / `spmv_masked`, `scatter`, a masked `reduce`,
+`walk_visit_counts`, and `sample_edges_undirected`. The `exclude` case matters most:
+`reach_fixpoint` passes the visited-set as `exclude` every iteration, so a foreign one silently
+under-expands the traversal instead of failing.
+
+`set_to_map` therefore **inherits** its set's space. *Unknown* survives only as the permissive
+element of unification — nothing a guest can build lands there. `map_to_set` is shape-polymorphic:
+an `[E]` tensor lowers to an `EdgeSet` that `spmv_masked` accepts.
+
+Egress is keyed to the value: `topk`, `arg_extreme`, `emit_walks` and `emit_pairs` return the vids
+of *their own* value's projection, not the first graph bound; an arena-keyed value is rejected.
+`emit` checks identity before length, so a wrong-projection column is named as such.
 
 ### The native-work budget
 

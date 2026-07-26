@@ -411,7 +411,7 @@ enum TensorBuf {
 /// `bind_graph` already returns, and its generation makes recycling fail closed —
 /// free a graph, bind another into the same slot, and older tensors stop matching,
 /// which is right, because slot `i` now means a different vertex.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Origin {
     /// Keyed to a bound projection's vertex or edge space.
     Graph(Handle),
@@ -421,8 +421,15 @@ pub enum Origin {
     /// `Shape::V` while being slot-keyed, so without a separate origin a slot
     /// list would combine happily with a real `[V]` map.
     Arena(Handle),
-    /// No index space is known — a value derived from something that carries no
-    /// provenance of its own (today: a set, which is untagged).
+    /// No index space is known — the constructor default, before `with_origin`
+    /// stamps the real one.
+    ///
+    /// Every value kind now carries provenance, so this is unreachable from
+    /// guest code: it survives only as the pre-stamp default and as the
+    /// permissive element of [`Origin::unify`], which is what keeps a
+    /// mixed-provenance program working rather than failing on a value nothing
+    /// could have tagged.
+    #[default]
     Untracked,
 }
 
@@ -748,6 +755,7 @@ pub struct PairList {
     src: Vec<u32>,
     dst: Vec<u32>,
     val: Vec<f64>,
+    origin: Origin,
 }
 
 impl PairList {
@@ -761,7 +769,28 @@ impl PairList {
             src.len() == dst.len() && dst.len() == val.len(),
             "PairList columns must be equal length"
         );
-        Self { src, dst, val }
+        Self {
+            src,
+            dst,
+            val,
+            origin: Origin::Untracked,
+        }
+    }
+
+    /// Stamps the index space these `(src, dst)` slots are keyed to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space these `(src, dst)` slots are keyed to.
+    ///
+    /// `emit_pairs` translates both endpoint columns to external Vids through
+    /// this, not through the primary projection.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the source-slot column.

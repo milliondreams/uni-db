@@ -82,7 +82,7 @@ No more generating the plugin once per arity, and no more padding unused slots w
 Two further guardrails make a mis-scoped or mis-sized projection fail with a clear message instead of a downstream surprise:
 
 - A whole-graph (`projectAll`) projection **fails loud, naming the label**, if the store holds vertices under an undeclared (schemaless) label — declare it first, or scope the projection to the labels you mean.
-- `emit` reports a clear `emit column length N != projected node count M` error, instead of an opaque Arrow error, when a guest emits a wrong-length column.
+- `emit` names the fault at the guest's call instead of detonating as an opaque Arrow error in batch assembly: a column from the wrong projection is reported as such, and a wrong-length column as `emit column length N != projected node count M`.
 
 Stored property values also project faithfully from uncommitted-to-disk state: `gc.node_property` / `gc.edge_property` and edge weights now read committed-but-**unflushed** in-memory data correctly, rather than surfacing `NaN` (or defaulting edge weights to `1.0`) until the next flush.
 
@@ -371,7 +371,16 @@ The kernel catalogue is a *type* in the host, not a list of strings: adding a ke
 
 ### Tensor identity: shape and index space
 
-A tensor is not just a length. It carries the **shape** it was built with (`[V]` per-vertex or
+!!! warning "Breaking change — index space is enforced on every value kind"
+
+    Provenance began on tensors. It now covers **vertex sets, edge sets, walk matrices and pair
+    lists** as well, and the kernels that egress vertex ids (`emit`, `topk`, `arg_extreme`,
+    `emit_walks`, `emit_pairs`) label their output using *the value's own* projection rather than
+    the first one bound. A program that mixed values from two projections previously returned
+    right-looking, wrong answers; it now fails with `0x862`. Single-projection algorithms — which
+    is every algorithm expressible before this release — are unaffected.
+
+A value is not just a length. It carries the **shape** it was built with (`[V]` per-vertex or
 `[E]` per-edge) and the **index space** its slots belong to — the projection or arena it came
 from. Both are enforced:
 
@@ -383,10 +392,31 @@ from. Both are enforced:
 - `ewise`, `map_apply`, `compare` and `segmented_reduce` all *preserve* shape and index space, so
   an `[E]` pipeline stays `[E]` all the way to `sample_edges` or `edge_mask_window`.
 
-A value derived from a set (`set_to_map`) has no index space of its own, since sets are untagged.
-That is treated as *unknown*, not as a third space: it combines with anything, and the result
-adopts whichever space is known. This is what keeps ordinary compositions working — a
-personalized-PageRank teleport vector is exactly such a value.
+**Sets carry an index space too**, and so do walk matrices and pair lists. A `VertexSet` is keyed
+to the vertices of the projection it came from, an `EdgeSet` to that projection's CSR edge order.
+So a foreign operand is rejected wherever one is mixed with a graph or another set: the set
+algebra, `expand` / `expand_masked` / `expand_sampled` (frontier, `exclude` *and* edge mask),
+`spmv` and `spmv_masked`, `scatter`, a masked `reduce`, `walk_visit_counts`, and
+`sample_edges_undirected`.
+
+The `exclude` operand is worth calling out. `reach_fixpoint` feeds the accumulated visited-set
+back as `exclude` on every iteration, so a foreign set there would not produce one wrong answer —
+it would prune the frontier each round and return a plausible under-approximation with no error
+at all.
+
+Because every value kind is now tagged, `set_to_map` **inherits** the set's space rather than
+producing an untagged value. The *unknown* space still exists as the permissive element — it
+unifies with anything and the result adopts whichever space is known — but nothing a guest can
+build lands there any more.
+
+Two consequences worth knowing:
+
+- **Egress is keyed to the value, not to the session.** `topk` and `arg_extreme` return the vids
+  of the projection *their tensor* came from; `emit_walks` and `emit_pairs` translate their slots
+  the same way. An arena-keyed value is rejected outright, since arena slots are not any
+  projection's vertices.
+- **`emit` checks identity before length.** A column from the wrong projection is reported as
+  such, rather than passing the length check and silently mislabelling every row.
 
 ### The native-work budget
 

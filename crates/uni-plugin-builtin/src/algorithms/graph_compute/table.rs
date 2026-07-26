@@ -204,6 +204,14 @@ pub fn force_tracing_for_test(on: bool) {
     FORCE_TRACE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Clears the override so [`tracing_enabled`] consults the environment. Tests only.
+///
+/// Needed by the one test that must exercise the *real* `UNI_GC_TRACE` read.
+#[doc(hidden)]
+pub fn reset_tracing_override_for_test() {
+    FORCE_TRACE.store(FORCE_UNSET, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Appends a breadcrumb trail to an error message.
 ///
 /// A free function rather than a method because `HandleTable::free` holds
@@ -650,6 +658,35 @@ mod tests {
         assert!(
             !err.message.contains("gc-trace"),
             "the error must be unchanged when tracing is off: {}",
+            err.message
+        );
+    }
+
+    /// The only assertion in the repo that depends on the real `UNI_GC_TRACE` read.
+    ///
+    /// Every other trace test calls `force_tracing_for_test`, which short-circuits
+    /// the env lookup — so deleting that lookup outright would leave them all
+    /// green and make the CI job that sets `UNI_GC_TRACE=1` pure decoration. This
+    /// one deliberately does not force, and asserts the behaviour *matches* the
+    /// environment, so it is a live gate in both runs: tracing must appear when
+    /// the variable is set and stay absent when it is not.
+    #[test]
+    fn the_env_var_is_what_switches_tracing() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_tracing_override_for_test();
+
+        let want = std::env::var_os("UNI_GC_TRACE").is_some();
+        let mut t = HandleTable::new(7);
+        let h = t.insert_set(VertexSet::with_capacity(4));
+        let _ = t.get_set(h);
+        let forged = Handle::pack(9, HandleKind::VertexSet, 0, 0);
+        let err = t
+            .get_set(forged)
+            .expect_err("cross-epoch handle is rejected");
+        assert_eq!(
+            err.message.contains("gc-trace"),
+            want,
+            "tracing must follow UNI_GC_TRACE (set: {want}) — message: {}",
             err.message
         );
     }

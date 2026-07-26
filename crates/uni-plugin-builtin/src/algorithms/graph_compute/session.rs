@@ -427,6 +427,35 @@ impl AlgoSession {
         )))
     }
 
+    /// Resolves an optional `exclude` set, checking it against the graph.
+    ///
+    /// Shared by the three `expand*` kernels. The `exclude` operand is the one
+    /// [`GraphCompute::reach_fixpoint`] feeds on every iteration, so a foreign
+    /// visited-set silently under-expands the whole traversal rather than
+    /// failing once — the reason it is checked as strictly as the frontier.
+    ///
+    /// # Errors
+    /// Returns `0x862` if the set comes from a different index space than `g`.
+    fn exclude_set_for(
+        &self,
+        exclude: Option<Handle>,
+        g: Handle,
+        kernel: &str,
+    ) -> Result<Option<VertexSet>, FnError> {
+        match exclude {
+            Some(h) => {
+                let set = self.table.get_set(h)?;
+                Self::require_compatible_origins(
+                    set.origin(),
+                    Origin::Graph(g),
+                    &format!("{kernel} exclude"),
+                )?;
+                Ok(Some(set.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Rejects two set operands that do not share a capacity.
     ///
     /// Bitset algebra is only meaningful within one index space, and the
@@ -594,9 +623,9 @@ impl AlgoSession {
     }
 
     /// Charges the arena and inserts a pair list, returning its handle.
-    fn alloc_pairs(&mut self, pairs: PairList) -> Result<Handle, FnError> {
+    fn alloc_pairs(&mut self, pairs: PairList, origin: Origin) -> Result<Handle, FnError> {
         self.reserve(pairs.heap_bytes())?;
-        Ok(self.table.insert_pairs(pairs))
+        Ok(self.table.insert_pairs(pairs.with_origin(origin)))
     }
 }
 
@@ -1492,10 +1521,7 @@ impl GraphCompute for AlgoSession {
         let graph = Arc::clone(self.table.get_graph(g)?);
         require_reverse_for_both(dir, &graph)?;
         let front = self.table.get_set(frontier)?.clone();
-        let excl = match exclude {
-            Some(h) => Some(self.table.get_set(h)?.clone()),
-            None => None,
-        };
+        let excl = self.exclude_set_for(exclude, g, "expand")?;
         let mut out = VertexSet::with_capacity(graph.vertex_count());
         // Charge Σ frontier degree, checked every BUDGET_CHECK_CHUNK edges so a
         // single super-node expansion cannot overshoot by more than one chunk.
@@ -1563,6 +1589,11 @@ impl GraphCompute for AlgoSession {
         dir: Direction,
         mask: Option<Handle>,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_tensor(vec)?.origin(),
+            Origin::Graph(g),
+            "spmv",
+        )?;
         let graph = Arc::clone(self.table.get_graph(g)?);
         require_reverse_for_both(dir, &graph)?;
         let n = graph.vertex_count();
@@ -1590,7 +1621,14 @@ impl GraphCompute for AlgoSession {
             Some(input.values().to_vec())
         };
         let mask_set = match mask {
-            Some(h) => Some(self.table.get_set(h)?.clone()),
+            Some(h) => {
+                Self::require_compatible_origins(
+                    self.table.get_set(h)?.origin(),
+                    Origin::Graph(g),
+                    "spmv mask",
+                )?;
+                Some(self.table.get_set(h)?.clone())
+            }
             None => None,
         };
         // Admission control: charge nnz (edge count) BEFORE doing the O(E)
@@ -1739,7 +1777,13 @@ impl GraphCompute for AlgoSession {
                 "scatter writes vertex slots, so it expects a [V] map, got a [E] tensor",
             ));
         }
-        let origin = t.origin();
+        // The frontier's slots index the map, so both must name the same
+        // vertices; the result carries the unified space.
+        let origin = Self::require_compatible_origins(
+            t.origin(),
+            self.table.get_set(frontier)?.origin(),
+            "scatter",
+        )?;
         if let Some(ivals) = t.values_i64() {
             let mut out = ivals.to_vec();
             let v = value.as_i64();
@@ -2372,6 +2416,11 @@ impl GraphCompute for AlgoSession {
         seed: u64,
         iter: u64,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_tensor(prob)?.origin(),
+            Origin::Graph(g),
+            "sample_edges_undirected",
+        )?;
         let graph = Arc::clone(self.table.get_graph(g)?);
         // Same [E] probability validation as sample_edges.
         let probs = {
@@ -2526,13 +2575,15 @@ impl GraphCompute for AlgoSession {
                 "expand_masked is defined on the out-CSR; use Direction::Out",
             ));
         }
+        Self::require_compatible_origins(
+            self.table.get_edge_set(edge_mask)?.origin(),
+            Origin::Graph(g),
+            "expand_masked edge mask",
+        )?;
         let graph = Arc::clone(self.table.get_graph(g)?);
         let front = self.table.get_set(frontier)?.clone();
         let mask = self.table.get_edge_set(edge_mask)?.clone();
-        let excl = match exclude {
-            Some(h) => Some(self.table.get_set(h)?.clone()),
-            None => None,
-        };
+        let excl = self.exclude_set_for(exclude, g, "expand_masked")?;
         let mut out = VertexSet::with_capacity(graph.vertex_count());
         let mut since_check: u64 = 0;
         for u in front.iter() {
@@ -2571,6 +2622,11 @@ impl GraphCompute for AlgoSession {
             self.table.get_set(frontier)?.origin(),
             Origin::Graph(g),
             "expand_sampled",
+        )?;
+        Self::require_compatible_origins(
+            self.table.get_tensor(prob)?.origin(),
+            Origin::Graph(g),
+            "expand_sampled probabilities",
         )?;
         if !matches!(dir, Direction::Out) {
             return Err(error::arg_validation(
@@ -2616,10 +2672,7 @@ impl GraphCompute for AlgoSession {
                 graph.edge_count()
             )));
         }
-        let excl = match exclude {
-            Some(h) => Some(self.table.get_set(h)?.clone()),
-            None => None,
-        };
+        let excl = self.exclude_set_for(exclude, g, "expand_sampled")?;
         let mut out = VertexSet::with_capacity(graph.vertex_count());
         let mut since_check: u64 = 0;
         for u in front.iter() {
@@ -2653,6 +2706,16 @@ impl GraphCompute for AlgoSession {
         sr: Semiring,
         edge_mask: Handle,
     ) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_tensor(vec)?.origin(),
+            Origin::Graph(g),
+            "spmv_masked",
+        )?;
+        Self::require_compatible_origins(
+            self.table.get_edge_set(edge_mask)?.origin(),
+            Origin::Graph(g),
+            "spmv_masked edge mask",
+        )?;
         let graph = Arc::clone(self.table.get_graph(g)?);
         let n = graph.vertex_count();
         let input = self.table.get_tensor(vec)?;
@@ -2706,12 +2769,18 @@ impl GraphCompute for AlgoSession {
     }
 
     fn walk_visit_counts(&mut self, walks: Handle, g: Handle) -> Result<Handle, FnError> {
+        Self::require_compatible_origins(
+            self.table.get_walks(walks)?.origin(),
+            Origin::Graph(g),
+            "walk_visit_counts",
+        )?;
         let n = self.table.get_graph(g)?.vertex_count();
         let wm = self.table.get_walks(walks)?;
         let total_steps: usize = wm.walks().iter().map(Vec::len).sum();
         // The counter is sized from `g`, but the slots come from `walks`. A
         // `Walks` handle produced over a larger graph indexed out of bounds and
-        // panicked the host; name the mismatch instead.
+        // panicked the host; name the mismatch instead. The origin check above
+        // catches the equal-`|V|` case this range check structurally cannot.
         if let Some(bad) = wm
             .walks()
             .iter()
@@ -2736,13 +2805,14 @@ impl GraphCompute for AlgoSession {
     fn emit_walks(&mut self, walks: Handle) -> Result<(), FnError> {
         // Copy the slot rows out first, releasing the `&WalkMatrix` borrow of
         // `self.table` before the `&self` slot→Vid translation below.
+        let origin = self.table.get_walks(walks)?.origin();
         let rows: Vec<Vec<u32>> = self.table.get_walks(walks)?.walks().to_vec();
         let total_steps: usize = rows.iter().map(Vec::len).sum();
         self.charge(total_steps as u64)?;
         let mut out = Vec::with_capacity(total_steps);
         for (walk_id, walk) in rows.iter().enumerate() {
             for (step, &slot) in walk.iter().enumerate() {
-                let vid = self.slot_to_vid(slot);
+                let vid = self.slot_to_vid_in(slot, origin)?;
                 #[expect(
                     clippy::cast_possible_wrap,
                     reason = "walk_id/step and Cypher vids fit i64 in practice"
@@ -2873,22 +2943,27 @@ impl GraphCompute for AlgoSession {
             let s2 = order.iter().map(|&i| src[i]).collect();
             let d2 = order.iter().map(|&i| dst[i]).collect();
             let v2 = order.iter().map(|&i| val[i]).collect();
-            return self.alloc_pairs(PairList::new(s2, d2, v2));
+            return self.alloc_pairs(PairList::new(s2, d2, v2), Origin::Graph(g));
         }
-        self.alloc_pairs(PairList::new(src, dst, val))
+        self.alloc_pairs(PairList::new(src, dst, val), Origin::Graph(g))
     }
 
     fn emit_pairs(&mut self, pairs: Handle) -> Result<(), FnError> {
         // Copy the columns out before the `&self` slot→Vid translation below.
-        let (src, dst, val) = {
+        let (src, dst, val, origin) = {
             let p = self.table.get_pairs(pairs)?;
-            (p.src().to_vec(), p.dst().to_vec(), p.val().to_vec())
+            (
+                p.src().to_vec(),
+                p.dst().to_vec(),
+                p.val().to_vec(),
+                p.origin(),
+            )
         };
         self.charge(val.len() as u64)?;
         let mut out = Vec::with_capacity(val.len());
         for i in 0..val.len() {
-            let s = self.slot_to_vid(src[i]);
-            let d = self.slot_to_vid(dst[i]);
+            let s = self.slot_to_vid_in(src[i], origin)?;
+            let d = self.slot_to_vid_in(dst[i], origin)?;
             #[expect(clippy::cast_possible_wrap, reason = "Cypher vids fit i64 in practice")]
             out.push((s.as_u64() as i64, d.as_u64() as i64, val[i]));
         }

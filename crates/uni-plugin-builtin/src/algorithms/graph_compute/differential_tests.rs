@@ -22,7 +22,10 @@ use super::first_party::{
     bellman_ford, eigenvector_centrality, k_core, personalized_pagerank, reachable_set, wcc_labels,
 };
 use super::handle::{Handle, HandleKind};
-use super::session::{AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Predicate, Semiring};
+use super::session::{
+    AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, OverlapMetric, PairSpec, Predicate,
+    Semiring,
+};
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
 
@@ -3608,6 +3611,147 @@ fn sets_carry_provenance_across_equal_sized_graphs() {
             .is_err(),
         "a masked reduce must reject a foreign mask rather than reading zero"
     );
+}
+
+/// Every kernel that mixes a value with a graph checks the index space.
+///
+/// The test above covers the set algebra, the `expand` *frontier* and the masked
+/// `reduce`. These are the rest — sites where a foreign operand reached the
+/// kernel body with no identity check at all. The fixtures share a vertex count
+/// **and** an edge count, so no length or capacity guard can separate them; only
+/// provenance can.
+#[test]
+fn every_graph_taking_kernel_rejects_a_foreign_operand() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0), (1, 2, 1.0)], false, false);
+    let b = build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    );
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let fa = s.frontier(ga, &[Vid::new(0)]).expect("frontier on a");
+    let fb = s.frontier(gb, &[Vid::new(10)]).expect("frontier on b");
+    let va = s.degrees(ga, Direction::Out).expect("degrees on a");
+    let vb = s.degrees(gb, Direction::Out).expect("degrees on b");
+    let ea = s.edge_weights(ga).expect("edge weights on a");
+    let eb = s.edge_weights(gb).expect("edge weights on b");
+    let ma = s.edges_all(ga).expect("edges_all on a");
+    let mb = s.edges_all(gb).expect("edges_all on b");
+
+    let sr = Semiring::LinearAlgebra;
+    let out = Direction::Out;
+    for (name, res) in [
+        // `spmv` — the [V] operand, then the optional vertex mask.
+        ("spmv vec", s.spmv(ga, vb, sr, out, None).map(|_| ())),
+        ("spmv mask", s.spmv(ga, va, sr, out, Some(fb)).map(|_| ())),
+        // `spmv_masked` — both operands.
+        ("spmv_masked vec", s.spmv_masked(ga, vb, sr, ma).map(|_| ())),
+        (
+            "spmv_masked mask",
+            s.spmv_masked(ga, va, sr, mb).map(|_| ()),
+        ),
+        // `scatter` writes the frontier's slots into the map.
+        ("scatter", s.scatter(va, fb, Scalar::F64(1.0)).map(|_| ())),
+        // The `expand` family's `exclude` — the operand `reach_fixpoint` feeds on
+        // every iteration, so a foreign set silently under-expands the traversal
+        // rather than failing once.
+        (
+            "expand exclude",
+            s.expand(ga, fa, out, Some(fb)).map(|_| ()),
+        ),
+        (
+            "expand_masked exclude",
+            s.expand_masked(ga, fa, out, Some(fb), ma).map(|_| ()),
+        ),
+        (
+            "expand_masked edge mask",
+            s.expand_masked(ga, fa, out, None, mb).map(|_| ()),
+        ),
+        (
+            "expand_sampled exclude",
+            s.expand_sampled(ga, fa, out, Some(fb), ea, 1, 0)
+                .map(|_| ()),
+        ),
+        (
+            "expand_sampled prob",
+            s.expand_sampled(ga, fa, out, None, eb, 1, 0).map(|_| ()),
+        ),
+        // The undirected sampler reaches the CSR, so its [E] tensor must match.
+        (
+            "sample_edges_undirected",
+            s.sample_edges_undirected(ga, eb, 1, 0).map(|_| ()),
+        ),
+        // Edge-set algebra at *equal* capacity, where the capacity guard added in
+        // Phase 4 cannot fire.
+        ("edge_intersect", s.edge_intersect(ma, mb).map(|_| ())),
+        ("edge_union", s.edge_union(ma, mb).map(|_| ())),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name}: a foreign operand must be rejected even when every length matches"
+        );
+    }
+
+    // Walks carry their graph too. The slot-range check in `walk_visit_counts`
+    // structurally cannot see this: equal vertex counts mean equal valid ranges.
+    let wb = s
+        .random_walks(gb, 2, 1, &[Vid::new(10)], 1.0, 1.0, 7)
+        .expect("walks on b");
+    assert!(
+        s.walk_visit_counts(wb, ga).is_err(),
+        "walk_visit_counts must reject walks produced over a different projection"
+    );
+}
+
+/// The ragged egress kernels label rows with their *own* projection's vids.
+///
+/// `emit_walks` and `emit_pairs` translated slots through the first-bound graph
+/// unconditionally, so a value derived from a second projection came back with
+/// right-looking, wrong vertices — and no error. Both now resolve through the
+/// value's own `Origin`, which is what `PairList`/`WalkMatrix` provenance is for.
+#[test]
+fn ragged_egress_labels_rows_with_the_values_own_projection() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0), (1, 2, 1.0)], false, false);
+    let b = build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    );
+    let (mut s, _ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let walks = s
+        .random_walks(gb, 3, 1, &[Vid::new(10)], 1.0, 1.0, 7)
+        .expect("walks on b");
+    s.emit_walks(walks).expect("emit walks from b");
+    let rows = s.take_emitted_walks();
+    assert!(
+        !rows.is_empty(),
+        "the fixture must produce at least one step"
+    );
+    for (_, _, vid) in &rows {
+        assert!(
+            *vid >= 10,
+            "emit_walks must label b's slots with b's vids, got {vid} \
+             (a's vids are 0..=3, so a leak is unambiguous)"
+        );
+    }
+
+    let pairs = s
+        .all_pairs_overlap(gb, PairSpec::AdjacentPairs, OverlapMetric::Count)
+        .expect("overlap on b");
+    s.emit_pairs(pairs).expect("emit pairs from b");
+    let out = s.take_emitted_pairs();
+    for (src, dst, _) in &out {
+        assert!(
+            *src >= 10 && *dst >= 10,
+            "emit_pairs must label b's slots with b's vids, got ({src}, {dst})"
+        );
+    }
 }
 
 /// Provenance survives the set→map hop, so a real composition still works.

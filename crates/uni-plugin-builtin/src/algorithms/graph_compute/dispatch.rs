@@ -1442,9 +1442,14 @@ mod tests {
             r#"{{"session":{sid},"op":"emit","g":{deg3},"name":"score"}}"#
         )) {
             KernelResponse::Err { code, message } => {
-                assert_eq!(code, 0x869, "emit length mismatch is a schema mismatch");
+                assert_eq!(code, 0x869, "an emit mismatch is a schema mismatch");
+                // Identity is now checked before length, and it is the stronger
+                // statement: this column is keyed to a different projection, of
+                // which the differing length is only a symptom. The same check
+                // also catches a second projection of *equal* size, which the
+                // length comparison never could.
                 assert!(
-                    message.contains("projected input node count"),
+                    message.contains("different projection"),
                     "the error must name the mismatch, got: {message}"
                 );
             }

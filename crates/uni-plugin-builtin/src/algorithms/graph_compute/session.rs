@@ -251,6 +251,9 @@ pub struct AlgoSession {
     arena: Arena,
     /// The first graph bound, used by `emit` for slot→Vid `nodeId` translation.
     primary_graph: Option<Arc<GraphProjection>>,
+    /// The handle of [`Self::primary_graph`], so output kernels can check a
+    /// value's `Origin` rather than merely its length.
+    primary_graph_handle: Option<Handle>,
     /// Captured `emit` output: `(column_name, values)` per emitted column.
     emitted: Vec<(String, Vec<f64>)>,
     /// Captured `emit_walks` output: `(walk_id, step, nodeId)` rows, row-major
@@ -277,6 +280,7 @@ impl AlgoSession {
             budget,
             arena,
             primary_graph: None,
+            primary_graph_handle: None,
             emitted: Vec::new(),
             emitted_walks: Vec::new(),
             emitted_pairs: Vec::new(),
@@ -313,10 +317,12 @@ impl AlgoSession {
     /// `project(spec)` path (which additionally requires `HostQuery`) is wired at
     /// the loader bridge in a later phase (proposal §4.3, §4.6).
     pub fn bind_graph(&mut self, graph: Arc<GraphProjection>) -> Handle {
+        let handle = self.table.insert_graph(Arc::clone(&graph));
         if self.primary_graph.is_none() {
-            self.primary_graph = Some(Arc::clone(&graph));
+            self.primary_graph = Some(graph);
+            self.primary_graph_handle = Some(handle);
         }
-        self.table.insert_graph(graph)
+        handle
     }
 
     /// Consumes the session's captured `emit` output.
@@ -459,6 +465,15 @@ impl AlgoSession {
             .to_vec()
     }
 
+    /// The vertex count of a bound graph, for differential tests.
+    #[cfg(test)]
+    pub(crate) fn table_vertex_count_for_test(&self, g: Handle) -> usize {
+        self.table
+            .get_graph(g)
+            .expect("test graph handle must resolve")
+            .vertex_count()
+    }
+
     /// Reads an edge mask's member indices (ascending), for differential tests.
     ///
     /// # Panics
@@ -491,6 +506,43 @@ impl AlgoSession {
             .as_ref()
             .expect("emit/arg kernels require a bound graph")
             .to_vid(slot)
+    }
+
+    /// Translates a slot to a Vid **in the space the value came from**.
+    ///
+    /// [`Self::slot_to_vid`] always reads the primary projection, so a value
+    /// derived from a second graph was silently labelled with the primary's
+    /// Vids — right-looking ids, wrong vertices, no error. Kernels that egress
+    /// vertex ids resolve through the value's own `Origin` instead.
+    ///
+    /// # Errors
+    /// Returns `0x862` when the origin names no bound graph.
+    fn projection_of(&self, origin: Origin) -> Result<Arc<GraphProjection>, FnError> {
+        match origin {
+            Origin::Graph(h) => Ok(Arc::clone(self.table.get_graph(h)?)),
+            Origin::Untracked => {
+                Ok(Arc::clone(self.primary_graph.as_ref().ok_or_else(
+                    || error::shape_mismatch("no bound graph to key vertex ids to"),
+                )?))
+            }
+            Origin::Arena(_) => Err(error::shape_mismatch(
+                "this kernel egresses vertex ids, but the value is keyed to arena \
+                 slots, which are not any projection's vertices",
+            )),
+        }
+    }
+
+    fn slot_to_vid_in(&self, slot: u32, origin: Origin) -> Result<Vid, FnError> {
+        match origin {
+            Origin::Graph(h) => Ok(self.table.get_graph(h)?.to_vid(slot)),
+            // A value with no known space can only mean the primary projection;
+            // that is the pre-provenance behaviour and stays correct for it.
+            Origin::Untracked => Ok(self.slot_to_vid(slot)),
+            Origin::Arena(_) => Err(error::shape_mismatch(
+                "this kernel egresses vertex ids, but the value is keyed to arena \
+                 slots, which are not any projection's vertices",
+            )),
+        }
     }
 
     /// Charges `units` of native work, mapping exhaustion to error `0x865`.
@@ -1842,6 +1894,7 @@ impl GraphCompute for AlgoSession {
     }
 
     fn arg_extreme(&mut self, map: Handle, want_max: bool) -> Result<(Vid, Scalar), FnError> {
+        let vid_origin = self.table.get_tensor(map)?.origin();
         let n = self.table.get_tensor(map)?.len();
         self.charge(n as u64)?;
         let t = self.table.get_tensor(map)?;
@@ -1863,7 +1916,10 @@ impl GraphCompute for AlgoSession {
                 clippy::cast_possible_truncation,
                 reason = "slot index bounded by tensor length which fits u32"
             )]
-            return Ok((self.slot_to_vid(best_slot as u32), Scalar::I64(best)));
+            return Ok((
+                self.slot_to_vid_in(best_slot as u32, vid_origin)?,
+                Scalar::I64(best),
+            ));
         }
         let vals = t.values();
         if vals.is_empty() {
@@ -1885,12 +1941,17 @@ impl GraphCompute for AlgoSession {
             clippy::cast_possible_truncation,
             reason = "slot index bounded by tensor length which fits u32"
         )]
-        Ok((self.slot_to_vid(best_slot as u32), Scalar::F64(best)))
+        Ok((
+            self.slot_to_vid_in(best_slot as u32, vid_origin)?,
+            Scalar::F64(best),
+        ))
     }
 
     fn topk(&mut self, map: Handle, k: u32) -> Result<Vec<(Vid, Scalar)>, FnError> {
+        let vid_origin = self.table.get_tensor(map)?.origin();
         let n = self.table.get_tensor(map)?.len();
         self.charge(n as u64)?;
+        let vid_graph = self.projection_of(vid_origin)?;
         let t = self.table.get_tensor(map)?;
         if let Some(ivals) = t.values_i64() {
             // Sort by value desc, lowest-slot-id tie-break, then take k.
@@ -1904,7 +1965,7 @@ impl GraphCompute for AlgoSession {
                         clippy::cast_possible_truncation,
                         reason = "slot index bounded by tensor length which fits u32"
                     )]
-                    (self.slot_to_vid(slot as u32), Scalar::I64(v))
+                    (vid_graph.to_vid(slot as u32), Scalar::I64(v))
                 })
                 .collect());
         }
@@ -1923,7 +1984,7 @@ impl GraphCompute for AlgoSession {
                     clippy::cast_possible_truncation,
                     reason = "slot index bounded by tensor length which fits u32"
                 )]
-                (self.slot_to_vid(slot as u32), Scalar::F64(v))
+                (vid_graph.to_vid(slot as u32), Scalar::F64(v))
             })
             .collect())
     }
@@ -2015,6 +2076,21 @@ impl GraphCompute for AlgoSession {
         // (G10). Arena/set-keyed columns that intentionally differ from the input
         // node space are exactly the case this catches — the guest must size its
         // input projection to the emitted space.
+        // Identity first: `build_batch` keys `nodeId` to the primary projection's
+        // IdMap, so a column from a *different* graph of the same vertex count
+        // used to pass the length check below and then be labelled with the
+        // primary graph's Vids — right shape, wrong rows.
+        if let Some(primary) = self.primary_graph_handle {
+            for &(name, h) in cols {
+                let origin = self.table.get_tensor(h)?.origin();
+                if !origin.compatible_with(Origin::Graph(primary)) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "emit column `{name}` comes from a different projection \
+                         ({origin:?}) than the one the output rows are keyed to"
+                    )));
+                }
+            }
+        }
         if let (Some(len), Some(graph)) = (expected_len, self.primary_graph.as_ref()) {
             let n = graph.vertex_count();
             if len != n {

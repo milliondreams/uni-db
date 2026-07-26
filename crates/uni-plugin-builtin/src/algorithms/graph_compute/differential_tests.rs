@@ -3663,3 +3663,64 @@ fn edge_set_algebra_errors_instead_of_panicking() {
         "edge_intersect across differing edge counts must error, not abort"
     );
 }
+
+/// Output kernels must key their vertex ids to the value's own projection.
+///
+/// `emit` tied output to a graph by *length*, and `topk` / `arg_extreme`
+/// translated slots through the first-bound projection unconditionally. So with
+/// two projections of the same vertex count, a value from the second was
+/// labelled with the first's Vids — plausible ids, wrong vertices, no error.
+#[test]
+fn output_kernels_reject_or_relabel_by_the_values_own_graph() {
+    // Same vertex count, disjoint vids: length can never separate these.
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+    assert_eq!(
+        s.table_vertex_count_for_test(ga),
+        s.table_vertex_count_for_test(gb),
+        "the fixture must make the two graphs indistinguishable by length"
+    );
+
+    // `topk` and `arg_extreme` label ids from the tensor's own graph, so a
+    // second-projection tensor yields *that* graph's vids, not the primary's.
+    let deg_b = s.degrees(gb, Direction::Out).expect("degrees on b");
+    let (vid, _) = s.arg_extreme(deg_b, true).expect("arg_extreme");
+    assert!(
+        vid.as_u64() >= 10,
+        "arg_extreme must return graph b's vids, got {vid:?}"
+    );
+    let top = s.topk(deg_b, 1).expect("topk");
+    assert!(
+        top[0].0.as_u64() >= 10,
+        "topk must return graph b's vids, got {:?}",
+        top[0].0
+    );
+
+    // `emit` keys its rows to the primary projection, so a column from the
+    // second graph is rejected outright rather than mislabelled.
+    let mut s2 = {
+        let a2 = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+        let (mut inner, _) = session_with(a2);
+        inner = inner.with_expected_columns(vec!["score".to_string()]);
+        inner
+    };
+    let g2 = s2.bind_graph(Arc::new(build_projection(
+        &[20, 21, 22, 23],
+        &[(20, 21, 1.0)],
+        false,
+        false,
+    )));
+    let foreign = s2
+        .degrees(g2, Direction::Out)
+        .expect("degrees on the second");
+    let err = s2
+        .emit(&[("score", foreign)])
+        .expect_err("emitting a foreign column must be rejected");
+    assert!(
+        err.message.contains("different projection"),
+        "the error must name the mismatch, got: {}",
+        err.message
+    );
+}

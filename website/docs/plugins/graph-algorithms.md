@@ -90,7 +90,7 @@ Stored property values also project faithfully from uncommitted-to-disk state: `
 
 ## Kernel catalogue
 
-63 kernels. Every one is reachable from every loader, except `graph` — sandboxed guests receive the graph handle in their invocation arguments rather than calling for it.
+67 kernels. Every one is reachable from every loader, except `graph` — sandboxed guests receive the graph handle in their invocation arguments rather than calling for it.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -121,6 +121,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | --- | --- |
 | `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
 | `compare(a, b, op)` | Elementwise `gt` / `ge` / `lt` / `le` / `eq` / `ne`, yielding a 1.0/0.0 mask. Shape-preserving, so an `[E]` comparison yields an `[E]` mask. |
+| `work_budget()` / `work_spent()` / `work_remaining()` | The native-work meter. Reading costs nothing — see the budget section below. |
 | `zero_map(g)` | A zeroed `[V]` map. |
 | `scatter(map, frontier, value)` | Write a scalar into the slots a vertex set selects. |
 | `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `normalize_l1`, `normalize_l2`. |
@@ -408,7 +409,7 @@ raising it — an explicit grant is authoritative in both directions.
 | `spmv`, `spmv_masked`, `edge_weights`, `edges_all` | `|E|` |
 | `expand`, `expand_masked`, `expand_sampled` | the frontier's total degree |
 | `sample_edges`, `sample_edges_undirected` | `|E|`, checked in chunks |
-| `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
+| `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce_sum`, `reduce_sum_masked`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
 | `frontier` | one unit per seed |
 | `set_union` / `set_diff` / `set_intersect` | one unit per 64-bit *word*, not per element |
 | `emit` | `rows x columns` |
@@ -434,3 +435,23 @@ does not violate the determinism contract, which is per-configuration, but it do
 forfeit cross-grant reproducibility — and a differential oracle would see it as
 drift. Discovering the ceiling by deliberately triggering aborted CALLs is never
 necessary: it is a pure function of `|V|` and `|E|`.
+
+### Tracing handle resolutions
+
+Setting `UNI_GC_TRACE` makes a session remember its recent handle resolutions, and
+attaches them to any handle error it raises:
+
+```
+GraphComputeError: stale handle [gc-trace, oldest first, epoch:kind:gen:slot —
+0007:1:000:0 0007:2:000:1 0007:1:001:0]
+```
+
+The trace is bounded (the tail leading up to a failure, not the whole history) and
+rides the error rather than a separate log, so it reaches whoever ran the query
+without any extra plumbing. It is recorded at the point every loader shares, so a
+Rhai guest is covered as well as the sandboxed ones.
+
+It is always compiled and inert unless the variable is set — with it unset,
+nothing is recorded and error messages are byte-identical. That is deliberate:
+diagnostics you cannot switch on in an already-shipped build are no help against a
+problem that only appears in production.

@@ -1609,4 +1609,54 @@ mod tests {
             other => panic!("expected a duplicate-column error, got {other:?}"),
         }
     }
+
+    /// The budget accessors are reachable over the JSON wire.
+    ///
+    /// WASM and Extism reach kernels only through `call_json`, so without this
+    /// the `KernelResponse::Float` decode is unasserted on both surfaces.
+    #[test]
+    fn budget_accessors_are_reachable_via_json() {
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(12, WorkBudget::new(500), Arena::new(1 << 20, 256));
+        let g = to_i64(session.bind_graph(StdArc::new(build_projection(
+            &[0, 1, 2, 3],
+            &[(0, 1), (1, 2)],
+        ))));
+        let sid = registry.open(session);
+
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        let float_of = |r: KernelResponse| match r {
+            KernelResponse::Float(v) => v,
+            other => panic!("expected a float, got {other:?}"),
+        };
+
+        let total = float_of(call(format!(r#"{{"session":{sid},"op":"work_budget"}}"#)));
+        assert_eq!(total, 500.0, "the wire reports the configured budget");
+        assert_eq!(
+            float_of(call(format!(r#"{{"session":{sid},"op":"work_spent"}}"#))),
+            0.0
+        );
+        assert_eq!(
+            float_of(call(format!(
+                r#"{{"session":{sid},"op":"work_remaining"}}"#
+            ))),
+            total,
+            "reading the meter over the wire must not charge it"
+        );
+
+        // A real kernel moves it, and remaining tracks.
+        let _ = call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+        ));
+        let spent = float_of(call(format!(r#"{{"session":{sid},"op":"work_spent"}}"#)));
+        assert_eq!(spent, 4.0, "degrees charges one unit per vertex");
+        assert_eq!(
+            float_of(call(format!(
+                r#"{{"session":{sid},"op":"work_remaining"}}"#
+            ))),
+            total - spent
+        );
+    }
 }

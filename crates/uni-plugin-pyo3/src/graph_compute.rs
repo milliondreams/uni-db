@@ -992,4 +992,46 @@ mod tests {
             );
         }
     }
+
+    /// The budget accessors *return values* from Python, not merely exist.
+    ///
+    /// `every_all_loaders_kernel_is_reachable_from_python` proves the attribute
+    /// is present; a registered-but-broken kernel would satisfy it unchanged.
+    #[test]
+    fn budget_accessors_return_values_from_python() {
+        use std::collections::HashMap;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+
+        Python::initialize();
+        let node_rows: Vec<HashMap<String, Value>> = (0..4u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let graph =
+            GraphProjection::from_rows(&node_rows, &[], None, false).expect("projection builds");
+
+        let mut session = AlgoSession::new(
+            21,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(250),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        );
+        let g = session.bind_graph(Arc::new(graph));
+        let gc = new_session(Arc::new(Mutex::new(session)), g, None);
+
+        assert_eq!(gc.work_budget().expect("budget"), 250.0);
+        assert_eq!(gc.work_spent().expect("spent"), 0.0);
+        // Reading is free.
+        let _ = gc.work_remaining().expect("remaining");
+        let _ = gc.work_budget().expect("budget");
+        assert_eq!(
+            gc.work_spent().expect("spent"),
+            0.0,
+            "the accessors must not charge the meter they report"
+        );
+
+        gc.degrees(to_i64(g), "out").expect("degrees");
+        let spent = gc.work_spent().expect("spent");
+        assert_eq!(spent, 4.0, "degrees charges one unit per vertex");
+        assert_eq!(gc.work_remaining().expect("remaining"), 250.0 - spent);
+    }
 }

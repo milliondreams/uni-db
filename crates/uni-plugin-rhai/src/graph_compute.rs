@@ -1381,4 +1381,62 @@ mod tests {
             assert!(err.contains(name), "missing valid op `{name}` in: {err}");
         }
     }
+
+    /// The budget accessors work *from a guest script*, which is the surface the
+    /// published example uses.
+    ///
+    /// The reachability test above proves the names are registered; it never
+    /// invokes them. A registered-but-broken kernel would pass it, and the docs
+    /// ship `let left = gc.work_remaining();` as a runnable snippet, so this is
+    /// the test that actually backs it.
+    #[test]
+    fn budget_accessors_work_from_a_guest_script() {
+        use std::collections::HashMap;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+
+        let node_rows: Vec<HashMap<String, Value>> = (0..6u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let graph =
+            GraphProjection::from_rows(&node_rows, &[], None, false).expect("projection builds");
+
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            31,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(1_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        )));
+        let g = session.lock().bind_graph(Arc::new(graph));
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), g));
+        scope.push("g", to_i64(g));
+
+        let script = r#"
+            let total = sess.work_budget();
+            let before = sess.work_spent();
+            // Reading is free: three more polls must not move the meter.
+            sess.work_remaining();
+            sess.work_budget();
+            sess.work_spent();
+            let still = sess.work_spent();
+
+            // A real kernel does move it.
+            sess.degrees(g, "out");
+            let after = sess.work_spent();
+            [total, before, still, after, sess.work_remaining()]
+        "#;
+        let out = engine
+            .eval_with_scope::<rhai::Array>(&mut scope, script)
+            .expect("the guest can read its own budget");
+        let v: Vec<f64> = out.into_iter().map(|d| d.cast::<f64>()).collect();
+        let (total, before, still, after, remaining) = (v[0], v[1], v[2], v[3], v[4]);
+
+        assert_eq!(total, 1_000.0, "the guest sees the budget it was given");
+        assert_eq!(before, 0.0, "nothing charged yet");
+        assert_eq!(still, 0.0, "reading the meter must not charge it");
+        assert_eq!(after, 6.0, "degrees charges one unit per vertex");
+        assert_eq!(remaining, total - after, "remaining is total minus spent");
+    }
 }

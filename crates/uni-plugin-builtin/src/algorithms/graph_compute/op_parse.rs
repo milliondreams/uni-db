@@ -474,6 +474,29 @@ mod tests {
         assert!(recipe_for(OpFamily::Semiring, "sub").is_none());
     }
 
+    /// The kernel count in the published reference is the real one.
+    ///
+    /// It had rotted across two consecutive kernel-adding commits before this
+    /// guard existed — the same drift the `kernels!` catalog was built to close,
+    /// one level up. Derived from `KernelId::ALL`, so the number cannot be typed
+    /// wrong again.
+    #[test]
+    fn the_published_kernel_count_is_the_real_one() {
+        const REFERENCE: &str =
+            include_str!("../../../../../website/docs/plugins/graph-algorithms.md");
+        let total = super::super::KernelId::ALL.len();
+        let all_loaders = super::super::KernelId::all_loaders().count();
+        assert!(
+            REFERENCE.contains(&format!("{total} kernels.")),
+            "website/docs/plugins/graph-algorithms.md must say `{total} kernels.`"
+        );
+        assert_eq!(
+            total,
+            all_loaders + 1,
+            "exactly one kernel (`graph`) is host-supplied rather than AllLoaders"
+        );
+    }
+
     /// T7 — every published recipe appears verbatim in the user-facing docs.
     ///
     /// The whole point of this module is that a guest author is told the truth

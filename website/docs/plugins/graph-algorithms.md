@@ -131,6 +131,48 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 
 With `sqrt` and `exp` alongside `log` and `div`, the canonical UCT/UCB exploration term `c·√(ln N / n)` composes directly out of kernels — `map_apply(counts, "log")`, `ewise(…, visits, "div")`, then `map_apply(…, "sqrt")` — with no per-element guest code and no host round-trip.
 
+
+### Composing operations the catalog does not name
+
+The kernel set is deliberately coarse and the op vocabularies are closed, so `ewise` has no
+`gt` and `map_apply` has no `step`. That does **not** mean thresholds and conditionals are out
+of reach: `map_to_set` carries a closed predicate enum and `set_to_map` lifts the resulting
+bitset back to a `[V]` map, which composes with `ewise mul` into an ordinary masked blend.
+
+Ask for an op that is not in a vocabulary and the engine now answers with the composition:
+
+```
+bad ewise op `gt` — elementwise comparison is composable:
+set_to_map(map_to_set(ewise(a, b, "axpy", -1.0), "gt", 0.0), 1.0);
+valid ewise ops: add, mul, min, max, axpy, div
+```
+
+| You wanted | Compose it as |
+| --- | --- |
+| `a > b` (also `ge`/`lt`/`le`/`ne`) | `set_to_map(map_to_set(ewise(a, b, "axpy", -1.0), "gt", 0.0), 1.0)` |
+| `step(a, theta)` / `heaviside` | `set_to_map(map_to_set(a, "gt", theta), 1.0)` |
+| `select(m, a, b)` | `ewise(b, ewise(m, ewise(a, b, "axpy", -1.0), "mul"), "add")` |
+| `a - b` | `ewise(a, b, "axpy", -1.0)` |
+| `a - c` (constant) | `map_apply(a, "affine", 1.0, -c)` |
+| `relu(a)` | `ewise(a, set_to_map(map_to_set(a, "gt", 0.0), 1.0), "mul")` |
+| `abs(a)` | `ewise(a, map_apply(a, "scale", -1.0), "max")` |
+| `clip(a, lo, hi)` | `ewise(ewise(a, lo, "max"), hi, "min")` |
+| `a ** 2`, integer powers | `repeat ewise(x, x, "mul"); x squared is ewise(a, a, "mul")` |
+| `-a` | `map_apply(a, "scale", -1.0)` |
+| `normalize(m)` | `map_apply(m, "normalize_l1") or map_apply(m, "normalize_l2")` |
+| an exact edge mask | `edge_mask_window(edge_property(g, prop), 0.5, 1.5)` |
+
+Two caveats worth knowing before you rely on them:
+
+- **The `select` blend poisons on NaN.** `0.0 * NaN = NaN`, so a NaN in the *unselected* branch
+  propagates. Where either branch may be NaN, `scatter` over the `VertexSet` instead of
+  multiplying by its lowered mask.
+- **A composed comparison charges the native-work meter three times** (`ewise` + `map_to_set` +
+  `set_to_map`, each `|V|`), where a primitive comparison would charge once.
+
+These identities are executed against an independent scalar oracle on every CI run
+(`composition_recipes.rs`), so a recipe that stops being true breaks the build rather than
+quietly misleading you.
 ### Traversal
 
 | Kernel | Returns |

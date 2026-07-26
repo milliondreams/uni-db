@@ -173,56 +173,6 @@ fn from_i64(v: i64) -> Handle {
     Handle::from_u64(bits)
 }
 
-fn dir(s: &str) -> Result<Direction, FnError> {
-    match s {
-        "out" => Ok(Direction::Out),
-        "in" => Ok(Direction::In),
-        "both" => Ok(Direction::Both),
-        other => Err(FnError::new(0x861, format!("bad direction `{other}`"))),
-    }
-}
-
-fn overlap_metric(s: &str) -> Result<OverlapMetric, FnError> {
-    match s {
-        "count" => Ok(OverlapMetric::Count),
-        "jaccard" => Ok(OverlapMetric::Jaccard),
-        "overlap" => Ok(OverlapMetric::Overlap),
-        "cosine" => Ok(OverlapMetric::Cosine),
-        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
-        other => Err(FnError::new(0x861, format!("bad overlap metric `{other}`"))),
-    }
-}
-
-fn semiring(s: &str) -> Result<Semiring, FnError> {
-    match s {
-        "reachability" => Ok(Semiring::Reachability),
-        "shortest_path" => Ok(Semiring::ShortestPath),
-        "propagate" => Ok(Semiring::Propagate),
-        "linear_algebra" => Ok(Semiring::LinearAlgebra),
-        "min_max" => Ok(Semiring::MinMax),
-        other => Err(FnError::new(0x861, format!("bad semiring `{other}`"))),
-    }
-}
-
-/// Decodes a generic `map_apply` op string plus its scalar operands.
-///
-/// Covers every [`MapOp`] variant so a guest can express affine (`ax+b`) and
-/// `log` maps that the fixed `scale`/`recip`/`normalize` ops cannot reach; `a`
-/// is the first scalar (`req.f`), `b` the second (`req.f2`).
-fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, FnError> {
-    match s {
-        "recip" => Ok(MapOp::Recip),
-        "scale" => Ok(MapOp::Scale(a)),
-        "log" => Ok(MapOp::Log),
-        "sqrt" => Ok(MapOp::Sqrt),
-        "exp" => Ok(MapOp::Exp),
-        "affine" => Ok(MapOp::AxPlusB(a, b)),
-        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
-        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
-        other => Err(FnError::new(0x861, format!("bad map op `{other}`"))),
-    }
-}
-
 /// A per-process registry of live GraphCompute sessions keyed by session id.
 ///
 /// Shared (behind an `Arc`) by a loader's single graph host function and its
@@ -418,22 +368,18 @@ impl GraphComputeRegistry {
                     })
                     .collect();
                 session
-                    .reach_fixpoint(from_i64(req.g), &vids, dir(&req.s)?)
+                    .reach_fixpoint(from_i64(req.g), &vids, Direction::parse(&req.s)?)
                     .map(h)
             }
-            KernelId::Degrees => session.degrees(from_i64(req.g), dir(&req.s)?).map(h),
+            KernelId::Degrees => session
+                .degrees(from_i64(req.g), Direction::parse(&req.s)?)
+                .map(h),
             KernelId::VertexIds => session.vertex_ids(from_i64(req.g)).map(h),
             KernelId::SetToMap => session
                 .set_to_map(from_i64(req.g), Scalar::F64(req.f))
                 .map(h),
             KernelId::MapToSet => {
-                let pred = match req.s.as_str() {
-                    "is_zero" => Predicate::IsZero,
-                    "gt" => Predicate::Gt(req.f),
-                    "lt" => Predicate::Lt(req.f),
-                    "eq" => Predicate::Eq(req.f),
-                    other => return Err(FnError::new(0x861, format!("bad predicate `{other}`"))),
-                };
+                let pred = Predicate::parse(&req.s, req.f)?;
                 session.map_to_set(from_i64(req.g), pred).map(h)
             }
             KernelId::Recip => session.map_apply(from_i64(req.g), MapOp::Recip).map(h),
@@ -441,33 +387,21 @@ impl GraphComputeRegistry {
                 .map_apply(from_i64(req.g), MapOp::Scale(req.f))
                 .map(h),
             KernelId::Normalize => {
-                let norm = match req.s.as_str() {
-                    "l1" => Norm::L1,
-                    "l2" => Norm::L2,
-                    other => return Err(FnError::new(0x861, format!("bad norm `{other}`"))),
-                };
+                let norm = Norm::parse(&req.s)?;
                 session
                     .map_apply(from_i64(req.g), MapOp::Normalize(norm))
                     .map(h)
             }
             KernelId::Ewise => {
-                let op = match req.s.as_str() {
-                    "mul" => EwiseOp::Mul,
-                    "add" => EwiseOp::Add,
-                    "min" => EwiseOp::Min,
-                    "max" => EwiseOp::Max,
-                    "axpy" => EwiseOp::Axpy(req.f),
-                    "div" => EwiseOp::Div,
-                    other => return Err(FnError::new(0x861, format!("bad ewise op `{other}`"))),
-                };
+                let op = EwiseOp::parse(&req.s, req.f)?;
                 session.ewise(from_i64(req.a), from_i64(req.b), op).map(h)
             }
             KernelId::Spmv => session
                 .spmv(
                     from_i64(req.g),
                     from_i64(req.a),
-                    semiring(&req.s)?,
-                    dir(&req.s2)?,
+                    Semiring::parse(&req.s)?,
+                    Direction::parse(&req.s2)?,
                     None,
                 )
                 .map(h),
@@ -481,7 +415,7 @@ impl GraphComputeRegistry {
                 session.zero_map(from_i64(req.g), ty).map(h)
             }
             KernelId::MapApply => session
-                .map_apply(from_i64(req.g), map_op(&req.s, req.f, req.f2)?)
+                .map_apply(from_i64(req.g), MapOp::parse(&req.s, req.f, req.f2)?)
                 .map(h),
             KernelId::EdgeCount => Ok(KernelResponse::Float(
                 session.edge_count(from_i64(req.g))? as f64
@@ -529,7 +463,7 @@ impl GraphComputeRegistry {
                 #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
                 let source = Vid::new(source as u64);
                 session
-                    .neighborhood_overlap(from_i64(req.g), source, overlap_metric(&req.s)?)
+                    .neighborhood_overlap(from_i64(req.g), source, OverlapMetric::parse(&req.s)?)
                     .map(h)
             }
             KernelId::AllPairsOverlap => {
@@ -539,7 +473,7 @@ impl GraphComputeRegistry {
                     _ => super::session::PairSpec::AdjacentPairs,
                 };
                 session
-                    .all_pairs_overlap(from_i64(req.g), spec, overlap_metric(&req.s)?)
+                    .all_pairs_overlap(from_i64(req.g), spec, OverlapMetric::parse(&req.s)?)
                     .map(h)
             }
             KernelId::EmitPairs => session
@@ -559,7 +493,7 @@ impl GraphComputeRegistry {
                 .expand(
                     from_i64(req.g),
                     from_i64(req.a),
-                    dir(&req.s)?,
+                    Direction::parse(&req.s)?,
                     Some(from_i64(req.b)),
                 )
                 .map(h),
@@ -594,7 +528,7 @@ impl GraphComputeRegistry {
                 .expand_masked(
                     from_i64(req.g),
                     from_i64(req.a),
-                    dir(&req.s)?,
+                    Direction::parse(&req.s)?,
                     if req.b == 0 {
                         None
                     } else {
@@ -607,7 +541,7 @@ impl GraphComputeRegistry {
                 .expand_sampled(
                     from_i64(req.g),
                     from_i64(req.a),
-                    dir(&req.s)?,
+                    Direction::parse(&req.s)?,
                     if req.b == 0 {
                         None
                     } else {
@@ -622,7 +556,7 @@ impl GraphComputeRegistry {
                 .spmv_masked(
                     from_i64(req.g),
                     from_i64(req.a),
-                    semiring(&req.s)?,
+                    Semiring::parse(&req.s)?,
                     from_i64(req.c),
                 )
                 .map(h),

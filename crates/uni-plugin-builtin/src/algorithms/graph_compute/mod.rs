@@ -29,12 +29,15 @@
 // Rust guideline compliant
 
 pub mod arena;
+#[cfg(test)]
+mod composition_recipes;
 pub mod conformance;
 pub mod dispatch;
 pub mod error;
 pub mod first_party;
 pub mod handle;
 pub mod kernel_id;
+pub mod op_parse;
 pub mod scratch;
 pub mod session;
 pub mod table;
@@ -52,6 +55,7 @@ pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
 pub use kernel_id::{KernelId, KernelReach};
+pub use op_parse::{OpFamily, RECIPES, recipe_for, rejection};
 // Re-exported for one more minor release so downstream code gets a deprecation
 // warning rather than a hard break; removed at the next major (§13.4).
 #[allow(deprecated)]

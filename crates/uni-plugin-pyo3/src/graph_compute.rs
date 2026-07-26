@@ -89,60 +89,11 @@ fn from_i64(v: i64) -> Handle {
 fn py_err(e: FnError) -> PyErr {
     PyRuntimeError::new_err(format!("GraphCompute (0x{:x}): {}", e.code, e.message))
 }
-
-fn dir(s: &str) -> PyResult<Direction> {
-    match s {
-        "out" => Ok(Direction::Out),
-        "in" => Ok(Direction::In),
-        "both" => Ok(Direction::Both),
-        other => Err(PyRuntimeError::new_err(format!("bad direction `{other}`"))),
-    }
-}
-
-fn overlap_metric(s: &str) -> PyResult<OverlapMetric> {
-    match s {
-        "count" => Ok(OverlapMetric::Count),
-        "jaccard" => Ok(OverlapMetric::Jaccard),
-        "overlap" => Ok(OverlapMetric::Overlap),
-        "cosine" => Ok(OverlapMetric::Cosine),
-        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
-        other => Err(PyRuntimeError::new_err(format!(
-            "bad overlap metric `{other}`"
-        ))),
-    }
-}
-
-fn semiring(s: &str) -> PyResult<Semiring> {
-    match s {
-        "reachability" => Ok(Semiring::Reachability),
-        "shortest_path" => Ok(Semiring::ShortestPath),
-        "propagate" => Ok(Semiring::Propagate),
-        "linear_algebra" => Ok(Semiring::LinearAlgebra),
-        "min_max" => Ok(Semiring::MinMax),
-        other => Err(PyRuntimeError::new_err(format!("bad semiring `{other}`"))),
-    }
-}
-
 /// Packs an external vertex id into the `i64` a guest holds.
 fn vid_to_i64(vid: Vid) -> i64 {
     #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
     let v = vid.as_u64() as i64;
     v
-}
-
-/// Parses a generic `map_apply` op string with its scalar operands.
-fn map_op(s: &str, a: f64, b: f64) -> PyResult<MapOp> {
-    match s {
-        "recip" => Ok(MapOp::Recip),
-        "scale" => Ok(MapOp::Scale(a)),
-        "log" => Ok(MapOp::Log),
-        "sqrt" => Ok(MapOp::Sqrt),
-        "exp" => Ok(MapOp::Exp),
-        "affine" => Ok(MapOp::AxPlusB(a, b)),
-        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
-        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
-        other => Err(PyRuntimeError::new_err(format!("bad map op `{other}`"))),
-    }
 }
 
 #[pymethods]
@@ -188,7 +139,7 @@ impl GcSession {
     /// BFS-to-fixpoint: the set of vertices reachable from `seeds` along `direction`.
     fn reach_fixpoint(&self, g: i64, seeds: Vec<i64>, direction: &str) -> PyResult<i64> {
         self.check_deadline()?;
-        let d = dir(direction)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
         let vids: Vec<Vid> = seeds.into_iter().map(|i| Vid::new(i as u64)).collect();
         self.session
@@ -201,7 +152,7 @@ impl GcSession {
     /// Per-vertex degree map in `direction` (`"out"`/`"in"`).
     fn degrees(&self, g: i64, direction: &str) -> PyResult<i64> {
         self.check_deadline()?;
-        let d = dir(direction)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         self.session
             .lock()
             .degrees(from_i64(g), d)
@@ -232,13 +183,7 @@ impl GcSession {
     /// Lowers a map into the set matching `pred` (`is_zero`/`gt`/`lt`/`eq`).
     fn map_to_set(&self, m: i64, pred: &str, threshold: f64) -> PyResult<i64> {
         self.check_deadline()?;
-        let p = match pred {
-            "is_zero" => Predicate::IsZero,
-            "gt" => Predicate::Gt(threshold),
-            "lt" => Predicate::Lt(threshold),
-            "eq" => Predicate::Eq(threshold),
-            other => return Err(PyRuntimeError::new_err(format!("bad predicate `{other}`"))),
-        };
+        let p = Predicate::parse(pred, threshold).map_err(py_err)?;
         self.session
             .lock()
             .map_to_set(from_i64(m), p)
@@ -269,11 +214,7 @@ impl GcSession {
     /// Normalizes a map to unit L1 or L2 norm.
     fn normalize(&self, m: i64, norm: &str) -> PyResult<i64> {
         self.check_deadline()?;
-        let n = match norm {
-            "l1" => Norm::L1,
-            "l2" => Norm::L2,
-            other => return Err(PyRuntimeError::new_err(format!("bad norm `{other}`"))),
-        };
+        let n = Norm::parse(norm).map_err(py_err)?;
         self.session
             .lock()
             .map_apply(from_i64(m), MapOp::Normalize(n))
@@ -285,15 +226,7 @@ impl GcSession {
     #[pyo3(signature = (a, b, op, coef=0.0))]
     fn ewise(&self, a: i64, b: i64, op: &str, coef: f64) -> PyResult<i64> {
         self.check_deadline()?;
-        let o = match op {
-            "mul" => EwiseOp::Mul,
-            "add" => EwiseOp::Add,
-            "min" => EwiseOp::Min,
-            "max" => EwiseOp::Max,
-            "axpy" => EwiseOp::Axpy(coef),
-            "div" => EwiseOp::Div,
-            other => return Err(PyRuntimeError::new_err(format!("bad ewise op `{other}`"))),
-        };
+        let o = EwiseOp::parse(op, coef).map_err(py_err)?;
         self.session
             .lock()
             .ewise(from_i64(a), from_i64(b), o)
@@ -304,8 +237,8 @@ impl GcSession {
     /// Sparse mat-vec under a named semiring and direction.
     fn spmv(&self, g: i64, vec: i64, sr: &str, direction: &str) -> PyResult<i64> {
         self.check_deadline()?;
-        let semi = semiring(sr)?;
-        let d = dir(direction)?;
+        let semi = Semiring::parse(sr).map_err(py_err)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         self.session
             .lock()
             .spmv(from_i64(g), from_i64(vec), semi, d, None)
@@ -345,7 +278,7 @@ impl GcSession {
     /// One-hop expansion of a frontier, excluding a visited mask.
     fn expand(&self, g: i64, frontier: i64, direction: &str, exclude: i64) -> PyResult<i64> {
         self.check_deadline()?;
-        let d = dir(direction)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         self.session
             .lock()
             .expand(from_i64(g), from_i64(frontier), d, Some(from_i64(exclude)))
@@ -399,7 +332,7 @@ impl GcSession {
     #[pyo3(signature = (m, op, a = 0.0, b = 0.0))]
     fn map_apply(&self, m: i64, op: &str, a: f64, b: f64) -> PyResult<i64> {
         self.check_deadline()?;
-        let o = map_op(op, a, b)?;
+        let o = MapOp::parse(op, a, b).map_err(py_err)?;
         self.session
             .lock()
             .map_apply(from_i64(m), o)
@@ -643,7 +576,7 @@ impl GcSession {
         exclude: i64,
     ) -> PyResult<i64> {
         self.check_deadline()?;
-        let d = dir(direction)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         self.session
             .lock()
             .expand_masked(
@@ -677,7 +610,7 @@ impl GcSession {
         iter: u64,
     ) -> PyResult<i64> {
         self.check_deadline()?;
-        let d = dir(direction)?;
+        let d = Direction::parse(direction).map_err(py_err)?;
         self.session
             .lock()
             .expand_sampled(
@@ -700,7 +633,7 @@ impl GcSession {
     /// `spmv` restricted to the masked out-edges (out-direction only).
     fn spmv_masked(&self, g: i64, vec: i64, semiring_name: &str, edge_mask: i64) -> PyResult<i64> {
         self.check_deadline()?;
-        let sr = semiring(semiring_name)?;
+        let sr = Semiring::parse(semiring_name).map_err(py_err)?;
         self.session
             .lock()
             .spmv_masked(from_i64(g), from_i64(vec), sr, from_i64(edge_mask))
@@ -732,7 +665,7 @@ impl GcSession {
     /// `metric` is `"jaccard"`, `"overlap"`, `"cosine"`, or `"adamic_adar"`.
     fn neighborhood_overlap(&self, g: i64, source: i64, metric: &str) -> PyResult<i64> {
         self.check_deadline()?;
-        let m = overlap_metric(metric)?;
+        let m = OverlapMetric::parse(metric).map_err(py_err)?;
         #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
         let src = Vid::new(source as u64);
         self.session
@@ -759,7 +692,7 @@ impl GcSession {
     #[pyo3(signature = (g, metric = "count", pair_mode = "adjacent", k = 0))]
     fn all_pairs_overlap(&self, g: i64, metric: &str, pair_mode: &str, k: u32) -> PyResult<i64> {
         self.check_deadline()?;
-        let m = overlap_metric(metric)?;
+        let m = OverlapMetric::parse(metric).map_err(py_err)?;
         let spec = if pair_mode == "topk" {
             PairSpec::TopKCandidates(k)
         } else {
@@ -975,5 +908,33 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// T5 — op strings must be parsed by `graph_compute::op_parse`, never here.
+    ///
+    /// Companion to the kernel-reachability test above: that one proves every
+    /// catalogued kernel is exposed, this one proves no string vocabulary has
+    /// been re-triplicated into this loader.
+    #[test]
+    fn op_strings_are_not_parsed_in_this_loader() {
+        let body = include_str!("graph_compute.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a non-test prefix");
+        for needle in [
+            "=> Direction::",
+            "=> EwiseOp::",
+            "=> MapOp::",
+            "=> Predicate::",
+            "=> Norm::",
+            "=> Semiring::",
+            "=> OverlapMetric::",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "`{needle}` appears in this loader — op strings belong in \
+                 graph_compute::op_parse, so every surface rejects them identically"
+            );
+        }
     }
 }

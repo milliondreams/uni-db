@@ -86,48 +86,11 @@ fn rt(e: FnError) -> Box<EvalAltResult> {
     ))
 }
 
-/// Parses a direction string (`"out"` / `"in"`).
-fn dir(s: &str) -> Result<Direction, Box<EvalAltResult>> {
-    match s {
-        "out" => Ok(Direction::Out),
-        "in" => Ok(Direction::In),
-        "both" => Ok(Direction::Both),
-        other => Err(rt(FnError::new(0x861, format!("bad direction `{other}`")))),
-    }
-}
-
 /// Packs an external vertex id into the `i64` a guest holds.
 fn vid_to_i64(vid: Vid) -> i64 {
     #[expect(clippy::cast_possible_wrap, reason = "vids fit i64 in practice")]
     let v = vid.as_u64() as i64;
     v
-}
-
-/// Parses a generic `map_apply` op string with its scalar operands.
-fn map_op(s: &str, a: f64, b: f64) -> Result<MapOp, Box<EvalAltResult>> {
-    match s {
-        "recip" => Ok(MapOp::Recip),
-        "scale" => Ok(MapOp::Scale(a)),
-        "log" => Ok(MapOp::Log),
-        "sqrt" => Ok(MapOp::Sqrt),
-        "exp" => Ok(MapOp::Exp),
-        "affine" => Ok(MapOp::AxPlusB(a, b)),
-        "normalize_l1" => Ok(MapOp::Normalize(Norm::L1)),
-        "normalize_l2" => Ok(MapOp::Normalize(Norm::L2)),
-        other => Err(rt(FnError::new(0x861, format!("bad map op `{other}`")))),
-    }
-}
-
-/// Parses a semiring string.
-fn semiring(s: &str) -> Result<Semiring, Box<EvalAltResult>> {
-    match s {
-        "reachability" => Ok(Semiring::Reachability),
-        "shortest_path" => Ok(Semiring::ShortestPath),
-        "propagate" => Ok(Semiring::Propagate),
-        "linear_algebra" => Ok(Semiring::LinearAlgebra),
-        "min_max" => Ok(Semiring::MinMax),
-        other => Err(rt(FnError::new(0x861, format!("bad semiring `{other}`")))),
-    }
 }
 
 impl GcSession {
@@ -194,7 +157,7 @@ impl GcSession {
                     })
             })
             .collect::<Result<_, _>>()?;
-        let direction = dir(d.as_str())?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.reach_fixpoint(from_i64(g), &vids, direction)
             .map(to_i64)
@@ -203,7 +166,7 @@ impl GcSession {
 
     /// Per-vertex degree map in `dir`.
     fn degrees(&mut self, g: i64, d: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
-        let direction = dir(d.as_str())?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.degrees(from_i64(g), direction).map(to_i64).map_err(rt)
     }
@@ -229,13 +192,7 @@ impl GcSession {
         pred: ImmutableString,
         threshold: f64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let p = match pred.as_str() {
-            "is_zero" => Predicate::IsZero,
-            "gt" => Predicate::Gt(threshold),
-            "lt" => Predicate::Lt(threshold),
-            "eq" => Predicate::Eq(threshold),
-            other => return Err(rt(FnError::new(0x861, format!("bad predicate `{other}`")))),
-        };
+        let p = Predicate::parse(pred.as_str(), threshold).map_err(rt)?;
         let mut s = self.session.lock();
         s.map_to_set(from_i64(m), p).map(to_i64).map_err(rt)
     }
@@ -258,11 +215,7 @@ impl GcSession {
 
     /// Normalizes a map to unit L1 or L2 norm.
     fn normalize(&mut self, m: i64, norm: ImmutableString) -> Result<i64, Box<EvalAltResult>> {
-        let n = match norm.as_str() {
-            "l1" => Norm::L1,
-            "l2" => Norm::L2,
-            other => return Err(rt(FnError::new(0x861, format!("bad norm `{other}`")))),
-        };
+        let n = Norm::parse(norm.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.map_apply(from_i64(m), MapOp::Normalize(n))
             .map(to_i64)
@@ -277,15 +230,7 @@ impl GcSession {
         op: ImmutableString,
         coef: f64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let o = match op.as_str() {
-            "mul" => EwiseOp::Mul,
-            "add" => EwiseOp::Add,
-            "min" => EwiseOp::Min,
-            "max" => EwiseOp::Max,
-            "axpy" => EwiseOp::Axpy(coef),
-            "div" => EwiseOp::Div,
-            other => return Err(rt(FnError::new(0x861, format!("bad ewise op `{other}`")))),
-        };
+        let o = EwiseOp::parse(op.as_str(), coef).map_err(rt)?;
         let mut s = self.session.lock();
         s.ewise(from_i64(a), from_i64(b), o).map(to_i64).map_err(rt)
     }
@@ -298,8 +243,8 @@ impl GcSession {
         sr: ImmutableString,
         d: ImmutableString,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let semi = semiring(sr.as_str())?;
-        let direction = dir(d.as_str())?;
+        let semi = Semiring::parse(sr.as_str()).map_err(rt)?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.spmv(from_i64(g), from_i64(vec), semi, direction, None)
             .map(to_i64)
@@ -336,7 +281,7 @@ impl GcSession {
         d: ImmutableString,
         exclude: i64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let direction = dir(d.as_str())?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.expand(
             from_i64(g),
@@ -391,7 +336,7 @@ impl GcSession {
         a: f64,
         b: f64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let o = map_op(op.as_str(), a, b)?;
+        let o = MapOp::parse(op.as_str(), a, b).map_err(rt)?;
         let mut s = self.session.lock();
         s.map_apply(from_i64(m), o).map(to_i64).map_err(rt)
     }
@@ -626,7 +571,7 @@ impl GcSession {
         exclude: i64,
         edge_mask: i64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let direction = dir(d.as_str())?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.expand_masked(
             from_i64(g),
@@ -658,7 +603,7 @@ impl GcSession {
         seed: i64,
         iter: i64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let direction = dir(d.as_str())?;
+        let direction = Direction::parse(d.as_str()).map_err(rt)?;
         #[expect(clippy::cast_sign_loss, reason = "seed/iter round-trip bit-exact")]
         let (seed, iter) = (seed as u64, iter as u64);
         let mut s = self.session.lock();
@@ -687,7 +632,7 @@ impl GcSession {
         sr: ImmutableString,
         edge_mask: i64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let semi = semiring(sr.as_str())?;
+        let semi = Semiring::parse(sr.as_str()).map_err(rt)?;
         let mut s = self.session.lock();
         s.spmv_masked(from_i64(g), from_i64(vec), semi, from_i64(edge_mask))
             .map(to_i64)
@@ -717,7 +662,7 @@ impl GcSession {
         source: i64,
         metric: ImmutableString,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let m = overlap_metric(metric.as_str())?;
+        let m = OverlapMetric::parse(metric.as_str()).map_err(rt)?;
         #[expect(clippy::cast_sign_loss, reason = "vertex ids are non-negative")]
         let src = Vid::new(source as u64);
         let mut s = self.session.lock();
@@ -753,7 +698,7 @@ impl GcSession {
         pair_mode: ImmutableString,
         k: i64,
     ) -> Result<i64, Box<EvalAltResult>> {
-        let m = overlap_metric(metric.as_str())?;
+        let m = OverlapMetric::parse(metric.as_str()).map_err(rt)?;
         let spec = if pair_mode.as_str() == "topk" {
             PairSpec::TopKCandidates(u32::try_from(k).unwrap_or(0))
         } else {
@@ -904,21 +849,6 @@ fn u32_arg(v: i64, what: &str) -> Result<u32, Box<EvalAltResult>> {
             format!("{what} must be a non-negative 32-bit value, got {v}"),
         ))
     })
-}
-
-/// Parses an overlap-metric name into an [`OverlapMetric`].
-fn overlap_metric(name: &str) -> Result<OverlapMetric, Box<EvalAltResult>> {
-    match name {
-        "count" => Ok(OverlapMetric::Count),
-        "jaccard" => Ok(OverlapMetric::Jaccard),
-        "overlap" => Ok(OverlapMetric::Overlap),
-        "cosine" => Ok(OverlapMetric::Cosine),
-        "adamic_adar" => Ok(OverlapMetric::AdamicAdar),
-        other => Err(rt(FnError::new(
-            0x861,
-            format!("overlap: bad metric `{other}`"),
-        ))),
-    }
 }
 
 /// Registers the [`GcSession`] type and its kernel methods on `engine`.
@@ -1252,6 +1182,144 @@ mod tests {
                 msg.contains("graph-arena@1"),
                 "`{script}` must be refused by slice, got: {msg}"
             );
+        }
+    }
+
+    /// REQ-D1 (uniscape stepped-dynamics): elementwise comparison and
+    /// conditional selection reported as a milestone blocker are in fact
+    /// composable from shipped kernels, *through the Rhai guest surface* --
+    /// not merely at the native `AlgoSession` trait level. The guest writes
+    /// the recipe; the host evaluates every element.
+    #[test]
+    fn reqd1_compare_and_select_compose_through_the_rhai_guest_surface() {
+        use std::collections::HashMap;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+
+        let node_rows: Vec<HashMap<String, Value>> = (0..5u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let edge_rows: Vec<HashMap<String, Value>> = vec![HashMap::from([
+            ("source".to_string(), Value::Int(0)),
+            ("target".to_string(), Value::Int(1)),
+        ])];
+        let graph = GraphProjection::from_rows(&node_rows, &edge_rows, None, false)
+            .expect("projection builds");
+
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            91,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(10_000_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(8 << 20, 1024),
+        )));
+        let g = session.lock().bind_graph(Arc::new(graph));
+
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), g));
+        scope.push("g", to_i64(g));
+
+        // a = [1,5,3,9,2], b = 4 everywhere; the guest wants `a > b` and
+        // `select(a > b, a, b)`. Neither `gt` nor `select` is a kernel.
+        let script = r#"
+            fn load(sess, g, vals) {
+                let m = sess.zero_map(g);
+                for i in 0..vals.len() {
+                    let f = sess.frontier(g, [i]);
+                    m = sess.scatter(m, f, vals[i]);
+                    sess.free(f);
+                }
+                m
+            }
+            let a = load(sess, g, [1.0, 5.0, 3.0, 9.0, 2.0]);
+            let b = load(sess, g, [4.0, 4.0, 4.0, 4.0, 4.0]);
+
+            // compare(a, b, "gt")
+            let diff = sess.ewise(a, b, "axpy", -1.0);
+            let hits = sess.map_to_set(diff, "gt", 0.0);
+            let mask = sess.set_to_map(hits, 1.0);
+
+            // select(mask, a, b) == b + mask * (a - b)
+            let blend = sess.ewise(mask, diff, "mul", 0.0);
+            let sel   = sess.ewise(b, blend, "add", 0.0);
+
+            [sess.reduce_sum(mask), sess.reduce_sum(sel)]
+        "#;
+
+        let out = engine
+            .eval_with_scope::<rhai::Array>(&mut scope, script)
+            .expect("the guest recipe must run to completion");
+        let mask_sum = out[0].clone().cast::<f64>();
+        let sel_sum = out[1].clone().cast::<f64>();
+
+        // a > b at slots 1 and 3 only.
+        assert_eq!(mask_sum, 2.0, "the mask must select exactly two slots");
+        // select -> [4, 5, 4, 9, 4] = 26.
+        assert_eq!(sel_sum, 26.0, "select must blend max(a, b) elementwise");
+    }
+
+    /// T5 — op strings must be parsed by `graph_compute::op_parse`, never here.
+    ///
+    /// The reachability test above proves every catalogued *kernel* is
+    /// registered; this proves no *vocabulary* has been re-triplicated. It is
+    /// the only check that catches a newly added string enum being hand-matched
+    /// in a loader, which is how the seven vocabularies drifted apart in the
+    /// first place (two loaders said `bad overlap metric`, this one said
+    /// `overlap: bad metric`).
+    #[test]
+    fn op_strings_are_not_parsed_in_this_loader() {
+        // Split at the test module so this test's own needles do not trip it.
+        let body = include_str!("graph_compute.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a non-test prefix");
+        for needle in [
+            "=> Direction::",
+            "=> EwiseOp::",
+            "=> MapOp::",
+            "=> Predicate::",
+            "=> Norm::",
+            "=> Semiring::",
+            "=> OverlapMetric::",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "`{needle}` appears in this loader — op strings belong in \
+                 graph_compute::op_parse, so every surface rejects them identically"
+            );
+        }
+    }
+
+    /// T4 — the shared vocabulary is accepted, and a rejection carries the
+    /// shared recipe, *through the Rhai guest surface*.
+    ///
+    /// A loader that re-introduced its own match could still accept every valid
+    /// name; what it could not do is produce the recipe, because only
+    /// `op_parse` knows the composition strings. That asymmetry is the
+    /// regression barrier.
+    #[test]
+    fn rejections_reach_the_guest_with_a_composition_recipe() {
+        use uni_plugin_builtin::algorithms::graph_compute::op_parse::OpFamily;
+
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            42,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(1_000_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        )));
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), from_i64(0)));
+
+        // `gt` is not an ewise op; the guest must be told how to get one.
+        let err = engine
+            .eval_with_scope::<i64>(&mut scope, r#"sess.ewise(0, 0, "gt", 0.0)"#)
+            .expect_err("`gt` must be rejected")
+            .to_string();
+        assert!(err.contains("composable"), "no recipe in: {err}");
+        assert!(err.contains("set_to_map"), "no recipe in: {err}");
+        for name in OpFamily::Ewise.valid_names() {
+            assert!(err.contains(name), "missing valid op `{name}` in: {err}");
         }
     }
 }

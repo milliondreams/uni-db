@@ -1,24 +1,20 @@
-//! REPRO (Phase 0): a manifest declaring two value columns is unsatisfiable.
+//! A guest can return every value column it declared (REQ-D2).
 //!
-//! The host trait is `emit(cols: &[(&str, Handle)])` — all columns in ONE call
-//! (proposal §4.6). Every guest shim, however, exposes `emit(name, handle)` —
-//! one column per call. The validator in `AlgoSession::emit` then demands that
-//! every declared column be present *in that single call*, and it runs before
-//! any capture. So for a manifest with two or more non-`nodeId` yields there is
-//! no guest program that satisfies it.
+//! The host trait is `emit(cols: &[(&str, Handle)])` — all columns in one call —
+//! but every guest shim exposes `emit(name, handle)`, one column per call. The
+//! validator in `AlgoSession::emit` used to demand the full declared set *in that
+//! single call*, and ran before capturing anything, so a manifest with two or
+//! more non-`nodeId` yields was unsatisfiable from every sandboxed loader: the
+//! first emit always failed.
 //!
-//! Two consequences the tests below pin:
+//! The reported symptom ("only the first emit registers; later ones vanish") was
+//! the inverse of the mechanism — nothing was ever captured, and the error named
+//! whichever sibling the first call happened to omit, which read as
+//! order-dependence.
 //!
-//! 1. The impossible manifest is **accepted at plugin load**. The constraint is
-//!    undiscoverable until a CALL fails at runtime.
-//! 2. The reported diagnosis ("the first emit lands, later ones vanish") is
-//!    wrong in a way that matters: the **first** emit is what fails. That is why
-//!    the error names whichever column the guest did not mention first — it
-//!    looks like order-dependence, but nothing was ever captured.
-//!
-//! Flips when Phase 3 accumulates across calls and moves the completeness check
-//! to session close. See
-//! `docs/proposals/graphcompute_dynamics_requirements_response_2026-07-25.md` §12.2.
+//! Phase 3 moved the completeness check to session close (`finish_emitted`) and
+//! made `emit` accumulate. What remains pinned here: the two-column manifest
+//! loads, and the CALL returns both columns.
 
 #![cfg(feature = "rhai-plugins")]
 
@@ -84,13 +80,10 @@ fn gc_caps() -> CapabilitySet {
     ])
 }
 
-/// A two-value-column manifest loads cleanly, so nothing warns the author that
-/// the algorithm they just registered can never return a row.
+/// A two-value-column manifest loads cleanly — and now also runs.
 ///
-/// This is the half of REQ-D2 that would remain even under the consumer's own
-/// fallback proposal ("reject a multi-field `yields` at load"): today neither
-/// the accept path nor a reject path exists, so the failure lands at CALL time,
-/// far from the mistake.
+/// The consumer's fallback proposal was "reject a multi-field `yields` at load".
+/// That is no longer needed: the declaration is legal, so accepting it is right.
 #[tokio::test]
 async fn multi_field_yields_is_accepted_at_plugin_load() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -115,12 +108,8 @@ async fn call_twocol(db: &Uni) -> Result<usize, String> {
         .map_err(|e| e.to_string())
 }
 
-/// REPRO-D2: a guest must be able to return the two value columns it declared.
-///
-/// Asserts the desired contract, so it is red until Phase 3.
+/// REQ-D2: a guest must be able to return the two value columns it declared.
 #[tokio::test]
-#[ignore = "REPRO (red on 254b4c26c, 0x869): flips when Phase 3 accumulates emit \
-            across calls. Run with --run-ignored all."]
 async fn repro_d2_a_guest_can_emit_two_declared_value_columns() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
     build_graph(&db).await?;
@@ -137,45 +126,95 @@ async fn repro_d2_a_guest_can_emit_two_declared_value_columns() -> anyhow::Resul
     Ok(())
 }
 
-/// Phase-0 diagnosis: the failure lands at the **first** `emit`, not the second.
-///
-/// The consumer reported "only the first `gc.emit` takes effect; every
-/// subsequent emit is silently discarded". The order-dependence they observed is
-/// real but the mechanism is the opposite: `AlgoSession::emit` validates the
-/// whole declared set *before* capturing anything, so `gc.emit("a", …)` itself
-/// raises and nothing is ever stored.
-///
-/// The message text is the discriminator. Intra-call validation says "declared
-/// output field `b` was not emitted"; the loader's batch assembly, which is the
-/// only other place this could fail, says "guest did not emit declared column".
-///
-/// This test pins *current* behaviour deliberately, as Phase 0 evidence.
-/// **Phase 3 deletes it** — by then the first emit legitimately succeeds and the
-/// completeness check has moved to session close.
+/// The batch form: `gc.emit(#{...})` delivers every declared column in one call.
+const BATCH_SCRIPT: &str = r#"
+    fn uni_manifest() {
+        #{
+            id: "ai.example.batchemit",
+            version: "0.1.0",
+            determinism: "pure",
+            algorithms: [
+                #{ name: "twocol", args: [], yields: ["nodeId:int", "a:float", "b:float"] },
+            ],
+        }
+    }
+
+    fn twocol(gc) {
+        let g = gc.graph();
+        gc.emit(#{ "a": gc.degrees(g, "out"), "b": gc.vertex_ids(g) });
+    }
+"#;
+
+/// A guest can deliver both declared columns in a single `emit` — the shape the
+/// host trait always modelled, and one boundary crossing instead of two.
 #[tokio::test]
-async fn d2_diagnosis_the_first_emit_is_what_fails() -> anyhow::Result<()> {
+async fn batch_emit_delivers_every_declared_column_in_one_call() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
     build_graph(&db).await?;
     let loader = uni_plugin_rhai::RhaiLoader::new();
-    db.load_rhai_plugin(&loader, TWO_COLUMN_SCRIPT, &gc_caps())
+    db.load_rhai_plugin(&loader, BATCH_SCRIPT, &gc_caps())
         .expect("load_rhai_plugin succeeds");
 
-    let err = call_twocol(&db)
-        .await
-        .expect_err("two-column emit cannot succeed today");
+    let res = db
+        .session()
+        .query(
+            "CALL ai.example.batchemit.twocol({nodeLabels: ['Node'], edgeTypes: ['LINKS']}) \
+             YIELD nodeId, a, b RETURN nodeId, a, b",
+        )
+        .await?;
+    assert_eq!(res.rows().len(), 4, "one row per projected vertex");
+    for row in res.rows() {
+        let a: f64 = row.get("a")?;
+        let b: f64 = row.get("b")?;
+        assert!(a.is_finite() && b.is_finite(), "both columns carry values");
+    }
+    Ok(())
+}
 
+/// Re-emitting a column is rejected rather than silently dropped.
+///
+/// Batch assembly resolves each declared field by the first matching entry, so
+/// an accumulating `emit` that appended a duplicate would quietly discard the
+/// second value — the silent-wrong-answer shape this contract exists to avoid.
+#[tokio::test]
+async fn re_emitting_a_column_is_rejected() -> anyhow::Result<()> {
+    const DUP_SCRIPT: &str = r#"
+        fn uni_manifest() {
+            #{
+                id: "ai.example.dupemit",
+                version: "0.1.0",
+                determinism: "pure",
+                algorithms: [
+                    #{ name: "dup", args: [], yields: ["nodeId:int", "a:float"] },
+                ],
+            }
+        }
+
+        fn dup(gc) {
+            let g = gc.graph();
+            gc.emit("a", gc.degrees(g, "out"));
+            gc.emit("a", gc.vertex_ids(g));
+        }
+    "#;
+
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    db.load_rhai_plugin(&loader, DUP_SCRIPT, &gc_caps())
+        .expect("load_rhai_plugin succeeds");
+
+    let err = db
+        .session()
+        .query(
+            "CALL ai.example.dupemit.dup({nodeLabels: ['Node'], edgeTypes: ['LINKS']}) \
+             YIELD nodeId, a RETURN nodeId, a",
+        )
+        .await
+        .expect_err("re-emitting a column must fail")
+        .to_string();
     assert!(
-        err.contains("was not emitted"),
-        "expected the intra-call validator's wording, got: {err}"
-    );
-    assert!(
-        err.contains('b'),
-        "the error must name the sibling column the first emit omitted: {err}"
-    );
-    assert!(
-        !err.contains("guest did not emit declared column"),
-        "batch assembly must not be where this fails — that would mean the first \
-         emit succeeded: {err}"
+        err.contains("already emitted"),
+        "the error must say the column was already emitted: {err}"
     );
     Ok(())
 }

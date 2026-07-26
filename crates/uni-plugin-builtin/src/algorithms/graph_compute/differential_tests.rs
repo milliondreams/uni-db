@@ -763,18 +763,93 @@ fn emit_validates_against_declared_columns() {
     let (mut s, m) = mk_session(vec!["score".to_string()]);
     s.emit(&[("score", m)]).expect("declared column emits");
 
-    // Omitting a declared column -> 0x869.
+    // Omitting a declared column is still 0x869 — but at session close, not at
+    // the emit call. Every guest shim emits one column per call, so a partial
+    // emit is a legal intermediate state; only the closed session can know the
+    // set is short.
     let (mut s, m) = mk_session(vec!["a".to_string(), "b".to_string()]);
+    s.emit(&[("a", m)])
+        .expect("a partial emit is legal; the set is checked at close");
     assert_eq!(
-        s.emit(&[("a", m)]).unwrap_err().code,
-        super::error::EMIT_SCHEMA_MISMATCH
+        s.finish_emitted().unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "a declared column the guest never emitted must fail at close"
     );
 
-    // Repeating a column -> 0x869.
+    // Repeating a column within one call -> 0x869.
     let (mut s, m) = mk_session(vec!["score".to_string()]);
     assert_eq!(
         s.emit(&[("score", m), ("score", m)]).unwrap_err().code,
         super::error::EMIT_SCHEMA_MISMATCH
+    );
+
+    // Repeating a column ACROSS calls -> 0x869. Accumulation makes this newly
+    // reachable, and it must not be silent: `build_batch` resolves each declared
+    // field by the first matching entry, so an appended duplicate would quietly
+    // discard the second value.
+    let (mut s, m) = mk_session(vec!["score".to_string()]);
+    s.emit(&[("score", m)]).expect("first emit lands");
+    assert_eq!(
+        s.emit(&[("score", m)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "re-emitting a column must be rejected, not silently dropped"
+    );
+}
+
+/// A guest emitting one column per call assembles the full declared set — the
+/// shape every loader shim actually produces.
+#[test]
+fn emit_accumulates_across_calls() {
+    let nodes = vec![0, 1, 2];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0)];
+    let arena = Arena::new(
+        super::DEFAULT_ARENA_MAX_BYTES,
+        super::DEFAULT_ARENA_MAX_HANDLES,
+    );
+    let mut s = AlgoSession::new(1, WorkBudget::from_edge_count(1_000), arena)
+        .with_expected_columns(vec!["a".to_string(), "b".to_string()]);
+    let g = s.bind_graph(Arc::new(build_projection(&nodes, &edges, false, false)));
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    let ids = s.vertex_ids(g).expect("vertex_ids");
+
+    s.emit(&[("a", deg)]).expect("first column");
+    s.emit(&[("b", ids)]).expect("second column");
+
+    let emitted = s.finish_emitted().expect("the declared set is complete");
+    let names: Vec<&str> = emitted.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"], "both columns survive, in emit order");
+    assert!(
+        emitted.iter().all(|(_, vals)| vals.len() == 3),
+        "columns stay keyed to the projected vertex space"
+    );
+}
+
+/// Columns must stay rectangular across calls, not merely within one.
+#[test]
+fn emit_rejects_a_ragged_column_from_a_later_call() {
+    let arena = Arena::new(
+        super::DEFAULT_ARENA_MAX_BYTES,
+        super::DEFAULT_ARENA_MAX_HANDLES,
+    );
+    let mut s = AlgoSession::new(1, WorkBudget::from_edge_count(1_000), arena);
+    // No expected-columns contract and NO bound graph, so the
+    // `primary_graph.vertex_count()` anchor is unavailable and the seeded
+    // cross-call length is the only thing standing between a guest and a ragged
+    // batch. Arena columns give differently-sized tensors without a projection.
+    use super::session::GraphArenaCompute as _;
+    let arena = s.arena_new(8, 2).expect("arena");
+    // `arena_alloc` yields a tensor of the requested slot count — the only
+    // tensor source that needs no projection.
+    // Lengths are the requested slot counts by construction. (These are
+    // i64-backed; `emit` widens them, so they exercise the length guard fine.)
+    let three = s.arena_alloc(arena, 3).expect("three slots");
+    let two = s.arena_alloc(arena, 2).expect("two slots");
+    s.emit(&[("a", three)])
+        .expect("first column sets the width");
+    assert_eq!(
+        s.emit(&[("b", two)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "a later call must not widen or narrow the emitted batch"
     );
 }
 

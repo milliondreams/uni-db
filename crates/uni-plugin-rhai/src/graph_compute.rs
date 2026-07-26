@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rhai::{Array, Dynamic, Engine, EvalAltResult, ImmutableString, Position};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, ImmutableString, Map, Position};
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
@@ -325,6 +325,31 @@ impl GcSession {
     fn emit(&mut self, name: ImmutableString, h: i64) -> Result<(), Box<EvalAltResult>> {
         let mut s = self.session.lock();
         s.emit(&[(name.as_str(), from_i64(h))]).map_err(rt)
+    }
+
+    /// Emits several named columns in one call: `gc.emit(#{"a": h1, "b": h2})`.
+    ///
+    /// Equivalent to one `emit` per entry — the session accumulates either way —
+    /// but it is the shape the host trait models, and it keeps a multi-column
+    /// algorithm's egress to a single boundary crossing.
+    fn emit_cols(&mut self, cols: Map) -> Result<(), Box<EvalAltResult>> {
+        let pairs: Vec<(String, i64)> = cols
+            .into_iter()
+            .map(|(name, v)| {
+                v.as_int().map(|h| (name.to_string(), h)).map_err(|_| {
+                    rt(FnError::new(
+                        0x802,
+                        "emit: each column value must be a handle",
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let borrowed: Vec<(&str, Handle)> = pairs
+            .iter()
+            .map(|(name, h)| (name.as_str(), from_i64(*h)))
+            .collect();
+        let mut s = self.session.lock();
+        s.emit(&borrowed).map_err(rt)
     }
 
     /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);
@@ -947,6 +972,9 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
     // Rhai overloads on arity, so `zero_map`'s dtype-taking form is a second
     // registration under the same name — one catalog entry, two signatures.
     engine.register_fn(KernelId::ZeroMap.op_name(), GcSession::zero_map_typed);
+    // Same shape for `emit`: the map-taking batch form is a second signature
+    // under the one catalog name.
+    engine.register_fn(KernelId::Emit.op_name(), GcSession::emit_cols);
     registered
 }
 

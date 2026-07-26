@@ -906,3 +906,71 @@ with zero failures and no change against the previous run.
 - `nodeProperties` passed together with `nodeQuery` is silently ignored: the resolver returns before
   the Native spec is read. Separate ergonomics gap.
 - The version bump and release notes for the breaking change in this phase are not done.
+
+---
+
+# Part V — Phase 3 result
+
+## 22. REQ-D2 closed on every loader
+
+`AlgoSession::emit` now accumulates, and the "every declared column is present"
+check moved to a new `finish_emitted`, called once per CALL after the guest returns.
+That single move is what makes a multi-column declaration satisfiable: the check was
+never wrong, it was just being asked of one call when it is a property of the session.
+
+Accumulation needed two guards that the old overwrite semantics made unreachable:
+
+- **A re-emitted column is rejected** (`0x869`). Batch assembly resolves each declared
+  field by the *first* matching entry, so an appended duplicate would have silently
+  discarded the second value — the exact silent-wrong-answer shape this track exists to
+  close. Consistent with the pre-existing within-call duplicate rule.
+- **Columns must stay rectangular across calls**, not merely within one. The
+  `primary_graph.vertex_count()` check anchors this whenever a graph is bound; the
+  cross-call seed covers a session without one (reachable via the arena).
+
+Per-call checks that stay per-call: undeclared name (best diagnostic locality), within-call
+duplicate, within-call length agreement, and the budget charge — N one-column calls cost
+exactly what one N-column call did, and `charge` also carries the deadline check.
+
+**A batch form now exists on every surface**, matching what the host trait always modelled:
+`gc.emit(#{"a": h1, "b": h2})` in Rhai, `gc.emit({...})` in Python, and `names[]`/`handles[]`
+on the JSON wire for WASM and Extism. The wire fields are additive and `#[serde(default)]`,
+so guests built before them are unaffected — proven by driving both shapes against one
+session, and by the three pre-existing single-`name` wire tests staying green untouched.
+
+Both sandboxed example components gained a second two-column algorithm and were rebuilt.
+Note the build script's `wasm-tools` prerequisite is stale — it is never invoked; both graph
+examples build with a plain `cargo build --target`.
+
+`d2_diagnosis_the_first_emit_is_what_fails` was **deleted**, as its own docstring scheduled.
+`emit_validates_against_declared_columns` was **retargeted**: three of its four assertions
+hold verbatim, and the fourth (omitting a declared column) now succeeds at `emit` and fails
+at `finish_emitted` — same contract, moved trigger.
+
+**Gate:** 5967/5967 workspace, clippy `-D warnings`, fmt, `cargo doc`. The four Phase 4
+repros stay red; `repro_d2` has left the red set.
+
+## 23. §17 answered: the Python path enforces G9; the tests are stale
+
+Phase 0 could not decide whether `bindings/uni-db`'s unscoped CALLs meant the Python path
+fails to enforce G9, or the tests simply predate the contract. A fresh maturin build settles
+it: **the Python path enforces G9 correctly.** Seven tests fail, all with the identical
+`code=2052` "an unscoped projection is not allowed", across all four loaders.
+
+They are stale, not broken by this work: G9 landed 2026-07-23 and the checked-in wheel was
+built 2026-07-21, so they have been latently red for anyone who rebuilt since. None of the
+failures involve `emit`, the detached-L0 guard, or property-name validation. The rest of the
+Python suite is green (883 passed, 2 xfailed, 2 xpassed).
+
+**Now fixed.** Each CALL gained the scope it always needed. Two required judgement rather
+than syntax, because G9 changed their *intent*:
+
+- `test_rhai_projection_scopes_to_labels` asserted that "default (unscoped) projects all 4
+  nodes". Under G9 there is no unscoped default — whole-graph is the deliberate
+  `projectAll: true` opt-in — so the assertion now says that instead.
+- `test_rhai_property_tensor_not_projected_errors` expects a failure when a guest reads an
+  undeclared property. It would have kept passing unscoped, but for the *wrong reason* (G9
+  rejecting the scope, not the missing property). It is now scoped, so the failure it
+  asserts is the one it names.
+
+`bindings/uni-db`: 916 passed, 2 xfailed, 2 xpassed; `ruff format` + `ruff check` clean.

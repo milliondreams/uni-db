@@ -298,9 +298,39 @@ impl AlgoSession {
     }
 
     /// Consumes the session's captured `emit` output.
+    ///
+    /// Prefer [`Self::finish_emitted`] on any path that installed an
+    /// expected-columns contract: this accessor does not check it, so a guest
+    /// that omitted a declared column would surface far away, as an opaque
+    /// Arrow error during batch assembly.
     #[must_use]
     pub fn take_emitted(&mut self) -> Vec<(String, Vec<f64>)> {
         std::mem::take(&mut self.emitted)
+    }
+
+    /// Closes the emit contract and consumes the captured output.
+    ///
+    /// A guest emits one column per call (every loader shim is shaped that way),
+    /// so "every declared column is present" is a property of the *session*, not
+    /// of any single `emit`. Checking it inside `emit` made a multi-column
+    /// declaration unsatisfiable: the first call necessarily lacked its
+    /// siblings and failed before capturing anything.
+    ///
+    /// Call once, after the guest returns and before assembling the batch.
+    ///
+    /// # Errors
+    /// Returns `0x869` naming the first declared column the guest never emitted.
+    pub fn finish_emitted(&mut self) -> Result<Vec<(String, Vec<f64>)>, FnError> {
+        if let Some(expected) = &self.expected_columns {
+            for want in expected {
+                if !self.emitted.iter().any(|(name, _)| name == want) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "declared output field `{want}` was not emitted"
+                    )));
+                }
+            }
+        }
+        Ok(std::mem::take(&mut self.emitted))
     }
 
     /// Consumes the session's captured `emit_walks` output.
@@ -1631,10 +1661,13 @@ impl GraphCompute for AlgoSession {
     }
 
     fn emit(&mut self, cols: &[(&str, Handle)]) -> Result<(), FnError> {
-        // Validate the emitted set against the declared columns (when known)
-        // before any handle work: exactly the declared names, no repeats, no
-        // extras, none missing (proposal §4.6, error 0x869).
-        if let Some(expected) = &self.expected_columns {
+        // Per-*call* validation only: no repeat within this call, no repeat of a
+        // column an earlier call already emitted, no undeclared name. Whether
+        // every declared column arrived is a property of the whole session and
+        // is checked in `finish_emitted` — every guest shim emits one column per
+        // call, so requiring the full set here made a multi-column declaration
+        // unsatisfiable (proposal §4.6, error 0x869).
+        {
             let mut seen: Vec<&str> = Vec::with_capacity(cols.len());
             for &(name, _) in cols {
                 if seen.contains(&name) {
@@ -1642,25 +1675,31 @@ impl GraphCompute for AlgoSession {
                         "emit column `{name}` declared more than once"
                     )));
                 }
-                if !expected.iter().any(|e| e == name) {
+                // Re-emitting a column is rejected rather than overwritten: the
+                // loader's batch assembly resolves each declared field by the
+                // *first* matching entry, so a silent append would quietly
+                // discard the second value.
+                if self.emitted.iter().any(|(prev, _)| prev == name) {
+                    return Err(error::emit_schema_mismatch(format!(
+                        "emit column `{name}` was already emitted by an earlier call"
+                    )));
+                }
+                if let Some(expected) = &self.expected_columns
+                    && !expected.iter().any(|e| e == name)
+                {
                     return Err(error::emit_schema_mismatch(format!(
                         "emit column `{name}` is not a declared output field"
                     )));
                 }
                 seen.push(name);
             }
-            for want in expected {
-                if !seen.contains(&want.as_str()) {
-                    return Err(error::emit_schema_mismatch(format!(
-                        "declared output field `{want}` was not emitted"
-                    )));
-                }
-            }
         }
 
         // Validate every column is a [V] map of equal length before capturing.
+        // Seed the expected length from what earlier calls already captured, so
+        // columns stay rectangular across calls and not merely within one.
         let mut captured = Vec::with_capacity(cols.len());
-        let mut expected_len: Option<usize> = None;
+        let mut expected_len: Option<usize> = self.emitted.first().map(|(_, vals)| vals.len());
         for &(name, h) in cols {
             let t = self.table.get_tensor(h)?;
             match expected_len {
@@ -1691,8 +1730,11 @@ impl GraphCompute for AlgoSession {
                 )));
             }
         }
+        // Charged per call, so N one-column calls cost exactly what one
+        // N-column call did. `charge` also carries the deadline check, which is
+        // why it stays here rather than moving to `finish_emitted`.
         self.charge(expected_len.unwrap_or(0) as u64 * cols.len() as u64)?;
-        self.emitted = captured;
+        self.emitted.extend(captured);
         Ok(())
     }
 

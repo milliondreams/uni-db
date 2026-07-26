@@ -195,7 +195,10 @@ impl AlgorithmProvider for PyAlgorithm {
                     .map_or(orig, DataFusionError::Execution),
                 );
             }
-            let emitted = session.lock().take_emitted();
+            let emitted = session
+                .lock()
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("python algorithm emit: {e}")))?;
             build_batch(&schema_for_batch, &graph, &emitted)
                 .map_err(|e| DataFusionError::Execution(format!("python algorithm emit: {e}")))
         });

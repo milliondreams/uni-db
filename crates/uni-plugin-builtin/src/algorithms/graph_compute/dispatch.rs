@@ -104,9 +104,18 @@ pub struct KernelRequest {
     /// Seed vertex ids (for `frontier`).
     #[serde(default)]
     pub seeds: Vec<i64>,
-    /// Column name (for `emit`).
+    /// Column name (for a single-column `emit`).
     #[serde(default)]
     pub name: String,
+    /// Column names for a batch `emit`, paired positionally with [`Self::handles`].
+    ///
+    /// Empty means the single-column form (`name` + `g`) — which is how every
+    /// guest built before the batch form existed, so old callers are unaffected.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Tensor handles for a batch `emit`, paired positionally with [`Self::names`].
+    #[serde(default)]
+    pub handles: Vec<i64>,
     /// Arena slot capacity (`arena_new`) or allocation count (`arena_alloc`).
     #[serde(default)]
     pub cap: u32,
@@ -577,9 +586,32 @@ impl GraphComputeRegistry {
                 .map(|v| KernelResponse::Float(v as f64)),
             KernelId::IsEmpty => session.is_empty(from_i64(req.g)).map(KernelResponse::Bool),
             KernelId::Free => session.free(from_i64(req.g)).map(|()| KernelResponse::Unit),
-            KernelId::Emit => session
-                .emit(&[(req.name.as_str(), from_i64(req.g))])
-                .map(|()| KernelResponse::Unit),
+            KernelId::Emit => {
+                // Batch form when `names` is populated, else the original
+                // single-column form. A guest emitting every declared column in
+                // one call is what the host trait always modelled; the
+                // one-per-call form remains supported and equivalent, since the
+                // session accumulates.
+                if req.names.is_empty() {
+                    session
+                        .emit(&[(req.name.as_str(), from_i64(req.g))])
+                        .map(|()| KernelResponse::Unit)
+                } else if req.names.len() != req.handles.len() {
+                    Err(super::error::arg_validation(format!(
+                        "emit: {} column name(s) but {} handle(s) — they pair positionally",
+                        req.names.len(),
+                        req.handles.len()
+                    )))
+                } else {
+                    let cols: Vec<(&str, Handle)> = req
+                        .names
+                        .iter()
+                        .map(String::as_str)
+                        .zip(req.handles.iter().copied().map(from_i64))
+                        .collect();
+                    session.emit(&cols).map(|()| KernelResponse::Unit)
+                }
+            }
             KernelId::ArenaNew => session.arena_new(req.cap, req.branch).map(h),
             KernelId::ArenaAlloc => session.arena_alloc(from_i64(req.g), req.cap).map(h),
             KernelId::ArenaLink => session
@@ -752,6 +784,8 @@ mod tests {
             iter: 0,
             seeds: vec![],
             name: String::new(),
+            names: vec![],
+            handles: vec![],
             cap: 0,
             branch: 0,
             col: 0,
@@ -1496,6 +1530,76 @@ mod tests {
             st.serialize_field("seeds", &self.seeds)?;
             st.serialize_field("name", &self.name)?;
             st.end()
+        }
+    }
+
+    /// The batch `emit` form carries N columns in one wire call, and the
+    /// single-column form keeps working unchanged.
+    ///
+    /// The `names`/`handles` pair is additive and `#[serde(default)]`, so a guest
+    /// built before it existed still deserializes — proven here by driving both
+    /// shapes against the same session.
+    #[test]
+    fn emit_accepts_both_the_batch_and_single_column_wire_forms() {
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            9,
+            WorkBudget::from_graph_size(3, 3),
+            Arena::new(1 << 20, 4096),
+        )
+        .with_expected_columns(vec!["a".to_string(), "b".to_string()]);
+        let g = to_i64(
+            session.bind_graph(StdArc::new(build_projection(&[0, 1, 2], &[(0, 1), (1, 2)]))),
+        );
+        let sid = registry.open(session);
+
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        let handle_of = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("expected handle, got {other:?}"),
+        };
+
+        let deg = handle_of(call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+        )));
+        let ids = handle_of(call(format!(
+            r#"{{"session":{sid},"op":"vertex_ids","g":{g}}}"#
+        )));
+
+        // Batch form: both declared columns in one call.
+        match call(format!(
+            r#"{{"session":{sid},"op":"emit","names":["a","b"],"handles":[{deg},{ids}]}}"#
+        )) {
+            KernelResponse::Unit => {}
+            other => panic!("batch emit -> {other:?}"),
+        }
+
+        // Mismatched arity is named, not silently truncated.
+        match call(format!(
+            r#"{{"session":{sid},"op":"emit","names":["a","b"],"handles":[{deg}]}}"#
+        )) {
+            KernelResponse::Err { message, .. } => {
+                assert!(
+                    message.contains("pair positionally"),
+                    "arity mismatch must say why: {message}"
+                );
+            }
+            other => panic!("expected an arity error, got {other:?}"),
+        }
+
+        // The single-column form still parses and still reaches `emit` — here it
+        // is rejected only because `a` was already emitted above, which proves
+        // the wire path ran rather than the request failing to deserialize.
+        match call(format!(
+            r#"{{"session":{sid},"op":"emit","g":{deg},"name":"a"}}"#
+        )) {
+            KernelResponse::Err { code, message } => {
+                assert_eq!(code, 0x869);
+                assert!(message.contains("already emitted"), "{message}");
+            }
+            other => panic!("expected a duplicate-column error, got {other:?}"),
         }
     }
 }

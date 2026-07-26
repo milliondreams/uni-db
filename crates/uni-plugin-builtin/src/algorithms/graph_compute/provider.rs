@@ -248,7 +248,9 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
             session
                 .emit(&[("score", rank)])
                 .map_err(|e| DataFusionError::Execution(format!("gcpagerank emit: {e}")))?;
-            let emitted = session.take_emitted();
+            let emitted = session
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("gcpagerank emit: {e}")))?;
             let scores = emitted
                 .into_iter()
                 .next()

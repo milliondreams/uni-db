@@ -32,6 +32,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
@@ -318,13 +319,41 @@ impl GcSession {
         self.session.lock().free(from_i64(h)).map_err(py_err)
     }
 
-    /// Emits a single named per-vertex column into the result sink.
-    fn emit(&self, name: &str, h: i64) -> PyResult<()> {
+    /// Emits named per-vertex columns into the result sink.
+    ///
+    /// Two forms: `gc.emit("score", h)` for one column, and
+    /// `gc.emit({"a": h1, "b": h2})` for several in one call. Python has no
+    /// overloading, so the batch form is the same function with the handle
+    /// omitted. Both are equivalent — the session accumulates across calls —
+    /// but the batch form is the shape the host trait models and keeps a
+    /// multi-column egress to a single boundary crossing.
+    #[pyo3(signature = (name, h = None))]
+    fn emit(&self, name: &Bound<'_, PyAny>, h: Option<i64>) -> PyResult<()> {
         self.check_deadline()?;
-        self.session
-            .lock()
-            .emit(&[(name, from_i64(h))])
-            .map_err(py_err)
+        if let Some(handle) = h {
+            let col: String = name.extract()?;
+            return self
+                .session
+                .lock()
+                .emit(&[(col.as_str(), from_i64(handle))])
+                .map_err(py_err);
+        }
+        // Batch form: a dict of column name -> handle. Iterating the dict (rather
+        // than collecting into a HashMap) keeps Python's insertion order.
+        let dict = name.cast::<PyDict>().map_err(|_| {
+            PyRuntimeError::new_err(
+                "emit: pass a column name and a handle, or a dict of name -> handle",
+            )
+        })?;
+        let mut pairs: Vec<(String, i64)> = Vec::with_capacity(dict.len());
+        for (k, v) in dict {
+            pairs.push((k.extract()?, v.extract()?));
+        }
+        let cols: Vec<(&str, Handle)> = pairs
+            .iter()
+            .map(|(n, handle)| (n.as_str(), from_i64(*handle)))
+            .collect();
+        self.session.lock().emit(&cols).map_err(py_err)
     }
 
     /// Generic map transform (`recip`/`scale`/`log`/`affine`/`normalize_l1|l2`);

@@ -48,6 +48,11 @@ pub fn register(_: ()) -> FnResult<String> {
             "qname": "ai.example.extismgc.ppr",
             "args": [{"kind": "primitive", "arrow": "int64"}],
             "yields": ["nodeId:int", "score:float"]
+        }, {
+            "kind": "algorithm",
+            "qname": "ai.example.extismgc.twocol",
+            "args": [],
+            "yields": ["nodeId:int", "a:float", "b:float"]
         }]
     })
     .to_string())
@@ -117,6 +122,29 @@ fn ppr(session: u64, g: i64, source: i64) -> Result<(), String> {
     kernel(session, serde_json::json!({"op": "free", "g": dangling}))?;
     kernel(session, serde_json::json!({"op": "emit", "g": rank, "name": "score"}))?;
     Ok(())
+}
+
+/// Emits two declared columns in a single `emit`, exercising the batch wire
+/// form (`names` + `handles`) that pairs positionally.
+fn twocol(session: u64, g: i64) -> Result<(), String> {
+    let deg = h(session, serde_json::json!({"op": "degrees", "g": g, "s": "out"}))?;
+    let ids = h(session, serde_json::json!({"op": "vertex_ids", "g": g}))?;
+    kernel(
+        session,
+        serde_json::json!({"op": "emit", "names": ["a", "b"], "handles": [deg, ids]}),
+    )?;
+    Ok(())
+}
+
+/// The two-column algorithm's invoke export.
+#[plugin_fn]
+pub fn algo_ai_example_extismgc_twocol_invoke(input: Vec<u8>) -> FnResult<Vec<u8>> {
+    let req: serde_json::Value = serde_json::from_slice(&input)
+        .map_err(|e| WithReturnCode::new(Error::msg(format!("input json: {e}")), 2))?;
+    let session = req.get("session").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let g = req.get("graph").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    twocol(session, g).map_err(|e| WithReturnCode::new(Error::msg(e), 2))?;
+    Ok(Vec::new())
 }
 
 /// The algorithm invoke export. Input JSON `{session, graph, args}`.

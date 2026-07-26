@@ -189,7 +189,9 @@ impl AlgorithmProvider for ExtismAlgorithm {
             }
             let mut closed =
                 closed.ok_or_else(|| DataFusionError::Execution("session vanished".into()))?;
-            let emitted = closed.take_emitted();
+            let emitted = closed
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("extism algorithm emit: {e}")))?;
 
             build_batch(&schema_for_batch, &graph, &emitted)
                 .map_err(|e| DataFusionError::Execution(format!("extism algorithm emit: {e}")))

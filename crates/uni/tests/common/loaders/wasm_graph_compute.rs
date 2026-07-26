@@ -129,3 +129,50 @@ async fn wasm_guest_ppr_via_call() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A sandboxed guest can return every value column it declared, delivered
+/// through the batch wire form (`names` + `handles`).
+///
+/// A two-column declaration used to be unsatisfiable from every sandboxed
+/// loader: the completeness check ran inside `emit`, so the first call always
+/// failed. Both halves of that are covered here — the component declares two
+/// yields, and emits them in one call.
+#[tokio::test]
+async fn wasm_guest_emits_two_declared_columns() -> anyhow::Result<()> {
+    let bytes = load_wasm_bytes();
+    let db = Uni::in_memory().build().await?;
+    let _ = build_graph(&db).await?;
+    let registry = Arc::new(GraphComputeRegistry::new());
+    let loader = uni_plugin_wasm::WasmLoader::new().with_graph(Arc::clone(&registry));
+    let registrar_caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    let host_grants = CapabilitySet::from_iter_of([
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    db.load_wasm_component(&loader, &bytes, &host_grants, &registrar_caps)?;
+
+    let res = db
+        .session()
+        .query(
+            "CALL ai.example.wasmgc.twocol({nodeLabels: ['Node'], edgeTypes: ['LINKS']}) \
+             YIELD nodeId, a, b RETURN nodeId, a, b",
+        )
+        .await?;
+    assert_eq!(res.rows().len(), 4, "one row per projected vertex");
+    for row in res.rows() {
+        let a: f64 = row.get("a")?;
+        let b: f64 = row.get("b")?;
+        assert!(a.is_finite() && b.is_finite(), "both columns carry values");
+    }
+    Ok(())
+}

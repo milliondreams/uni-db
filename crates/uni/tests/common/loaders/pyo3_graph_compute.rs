@@ -233,3 +233,66 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
     assert_eq!(ok.rows().len(), 4, "worker must survive the interrupt");
     Ok(())
 }
+
+/// A Python guest declaring two value columns, delivered both ways: one column
+/// per call, then the whole set in a single dict.
+const TWO_COLUMN_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pymulti")
+db.set_version("0.1.0")
+
+@db.algorithm("percall", args=[], yields=["nodeId:int", "a:float", "b:float"])
+def percall(gc):
+    g = gc.graph()
+    gc.emit("a", gc.degrees(g, "out"))
+    gc.emit("b", gc.vertex_ids(g))
+
+@db.algorithm("batch", args=[], yields=["nodeId:int", "a:float", "b:float"])
+def batch(gc):
+    g = gc.graph()
+    gc.emit({"a": gc.degrees(g, "out"), "b": gc.vertex_ids(g)})
+"#;
+
+/// Both multi-column emit forms work from Python.
+///
+/// The per-call form is what every guest shim has always offered and was
+/// unsatisfiable for a two-column declaration; the dict form is the batch shim.
+#[tokio::test]
+async fn python_guest_emits_two_declared_columns() -> anyhow::Result<()> {
+    Python::initialize();
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pymulti");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    Python::attach(|py| {
+        db.load_python_plugin(py, &loader, TWO_COLUMN_MODULE, "ai.example.pymulti", &caps)
+            .expect("load_python_plugin succeeds")
+    });
+
+    let session = db.session();
+    for algo in ["percall", "batch"] {
+        let res = session
+            .query(&format!(
+                "CALL ai.example.pymulti.{algo}({{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+                 YIELD nodeId, a, b RETURN nodeId, a, b"
+            ))
+            .await?;
+        assert_eq!(res.rows().len(), 4, "{algo}: one row per projected vertex");
+        for row in res.rows() {
+            let a: f64 = row.get("a")?;
+            let b: f64 = row.get("b")?;
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{algo}: both columns carry values"
+            );
+        }
+    }
+    Ok(())
+}

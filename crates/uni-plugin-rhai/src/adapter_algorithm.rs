@@ -189,7 +189,10 @@ impl AlgorithmProvider for RhaiAlgorithm {
             }
 
             // Read the guest's emitted columns and assemble the output batch.
-            let emitted = session.lock().take_emitted();
+            let emitted = session
+                .lock()
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("rhai algorithm emit: {e}")))?;
             build_batch(&schema_for_batch, &graph, &emitted)
                 .map_err(|e| DataFusionError::Execution(format!("rhai algorithm emit: {e}")))
         });

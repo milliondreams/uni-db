@@ -156,6 +156,15 @@ jobs:
           LOOM_MAX_PREEMPTIONS: 2
         run: cargo nextest run -p uni-store --features loom --test occ_model
 
+      # The GraphCompute handle trace is env-switched and always compiled. Its
+      # in-process tests force it on directly, so they run in the main suite; this
+      # step additionally exercises the real `UNI_GC_TRACE` path end-to-end, which
+      # is otherwise never taken by any job.
+      - name: GraphCompute handle trace (UNI_GC_TRACE)
+        env:
+          UNI_GC_TRACE: "1"
+        run: cargo nextest run -p uni-plugin-builtin -p uni-plugin-rhai -E 'test(graph_compute)'
+
   # Metamorphic query-correctness smoke — the TLP + NoREC oracles
   # (crates/uni/tests/common/metamorphic/) at a small case budget, catching
   # silent-wrong-answer regressions (pushdown drops, three-valued-logic bugs) on

@@ -63,7 +63,7 @@ pub use scratch::{LoaderClass, ScratchGraph, ScratchRegistry, ScratchRequest, Sc
 pub use session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
-pub use table::HandleTable;
+pub use table::{HandleTable, force_tracing_for_test};
 pub use value::{DType, PairList, Scalar, Shape, Tensor, VertexSet};
 
 /// The capability-slice name the GraphCompute kernel catalog is versioned under.

@@ -164,9 +164,13 @@ impl AlgorithmProvider for RhaiAlgorithm {
                     // A drained native-work budget is a typed Exhausted outcome
                     // (§5.2); a Rhai guest has no host wall-clock deadline, so a
                     // Timeout is never inferred here. Other faults report verbatim.
-                    let (spent, budget) = {
+                    let (spent, budget, crumbs) = {
                         let s = session.lock();
-                        (s.work_spent_units(), s.work_budget_units())
+                        (
+                            s.work_spent_units(),
+                            s.work_budget_units(),
+                            s.trace_breadcrumbs(),
+                        )
                     };
                     return Err(
                         uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
@@ -175,6 +179,7 @@ impl AlgorithmProvider for RhaiAlgorithm {
                             spent,
                             budget,
                             started.elapsed().as_millis() as u64,
+                            &crumbs,
                         )
                         .map_or_else(
                             || DataFusionError::Execution(format!("rhai algorithm `{name}`: {e}")),

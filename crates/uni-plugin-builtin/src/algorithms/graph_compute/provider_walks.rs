@@ -296,6 +296,7 @@ impl AlgorithmProvider for GraphComputeWalksProvider {
                     0,
                     session.work_spent_units(),
                     session.work_budget_units(),
+                    &session.trace_breadcrumbs(),
                 )
                 .map_or_else(
                     || DataFusionError::Execution(format!("gcwalks: {e}")),

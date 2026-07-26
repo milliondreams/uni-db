@@ -181,9 +181,13 @@ impl AlgorithmProvider for PyAlgorithm {
             // elapsed deadline is a Timeout (the watchdog fired), a drained
             // budget is Exhausted. Other faults surface verbatim (§5.2).
             if let Err(orig) = call_result {
-                let (spent, budget) = {
+                let (spent, budget, crumbs) = {
                     let s = session.lock();
-                    (s.work_spent_units(), s.work_budget_units())
+                    (
+                        s.work_spent_units(),
+                        s.work_budget_units(),
+                        s.trace_breadcrumbs(),
+                    )
                 };
                 let deadline_elapsed = deadline_at.is_some_and(|d| Instant::now() >= d);
                 return Err(
@@ -193,6 +197,7 @@ impl AlgorithmProvider for PyAlgorithm {
                         spent,
                         budget,
                         started.elapsed().as_millis() as u64,
+                        &crumbs,
                     )
                     .map_or(orig, DataFusionError::Execution),
                 );

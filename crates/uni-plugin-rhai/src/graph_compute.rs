@@ -1439,4 +1439,54 @@ mod tests {
         assert_eq!(after, 6.0, "degrees charges one unit per vertex");
         assert_eq!(remaining, total - after, "remaining is total minus spent");
     }
+
+    /// The trace reaches a **Rhai** guest — the surface that motivated the hook
+    /// site in the first place.
+    ///
+    /// `check_epoch_and_kind` was chosen over the JSON dispatcher precisely
+    /// because the Rhai loader never goes through the dispatcher: `GcSession`
+    /// calls `AlgoSession` directly. That reasoning went untested when the
+    /// feature landed, which is the same gap as shipping a kernel whose only
+    /// coverage is a `hasattr` check.
+    ///
+    /// Also asserts the suffix survives `rt()`'s `GraphCompute: {e}` wrapping
+    /// into `EvalAltResult`, since that is what a guest author actually sees.
+    #[test]
+    fn the_trace_reaches_a_rhai_guest() {
+        use uni_plugin_builtin::algorithms::graph_compute::force_tracing_for_test;
+
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            57,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(100_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        )));
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), from_i64(0)));
+
+        force_tracing_for_test(true);
+        // Allocate, free, then use — a use-after-free from guest code.
+        let err = engine
+            .eval_with_scope::<i64>(
+                &mut scope,
+                r#"
+                    let a = sess.arena_new(8, 2);
+                    let s = sess.arena_alloc(a, 3);
+                    sess.free(s);
+                    sess.set_len(s)
+                "#,
+            )
+            .expect_err("using a freed handle must fail")
+            .to_string();
+
+        assert!(
+            err.contains("gc-trace"),
+            "a Rhai guest's handle error must carry the trace: {err}"
+        );
+        assert!(
+            err.contains("GraphCompute"),
+            "and it must survive the loader's error wrapping: {err}"
+        );
+    }
 }

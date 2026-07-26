@@ -161,9 +161,16 @@ impl AlgorithmProvider for ComponentAlgorithm {
                 // Classify from the closed session: a drained budget is a typed
                 // Exhausted outcome (§5.2). This adapter sets no host wall-clock
                 // deadline, so a Timeout is never inferred. Other faults verbatim.
-                let (spent, budget) = closed
-                    .as_ref()
-                    .map_or((0, 0), |s| (s.work_spent_units(), s.work_budget_units()));
+                let (spent, budget, crumbs) = closed.as_ref().map_or_else(
+                    || (0, 0, Vec::new()),
+                    |s| {
+                        (
+                            s.work_spent_units(),
+                            s.work_budget_units(),
+                            s.trace_breadcrumbs(),
+                        )
+                    },
+                );
                 return Err(
                     uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
                         &qname_str,
@@ -171,6 +178,7 @@ impl AlgorithmProvider for ComponentAlgorithm {
                         spent,
                         budget,
                         started.elapsed().as_millis() as u64,
+                        &crumbs,
                     )
                     .map_or(orig, DataFusionError::Execution),
                 );

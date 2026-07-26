@@ -165,7 +165,60 @@ const TRACE_CAPACITY: usize = 64;
 /// shipped build are no use against a field report you cannot reproduce.
 fn tracing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match FORCE_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        FORCE_ON => return true,
+        FORCE_OFF => return false,
+        _ => {}
+    }
     *ENABLED.get_or_init(|| std::env::var_os("UNI_GC_TRACE").is_some())
+}
+
+/// Test-only override for [`tracing_enabled`].
+///
+/// The env read is `OnceLock`-cached, so a test cannot switch tracing on by
+/// setting the variable mid-process. Without this the positive test could only
+/// run under a separately-invoked `UNI_GC_TRACE=1` command — which is how it was
+/// first written, and since nothing in the repo set the variable, that test never
+/// actually executed.
+/// Three-valued on purpose: the override must be able to force tracing *off*
+/// as well as on, or the "invisible when off" test fails under the CI job that
+/// sets `UNI_GC_TRACE=1`. A boolean could only ever add tracing, never remove it.
+static FORCE_TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(FORCE_UNSET);
+
+/// Defer to the environment.
+const FORCE_UNSET: u8 = 0;
+/// Trace regardless of the environment.
+const FORCE_ON: u8 = 1;
+/// Do not trace, even if the environment asks for it.
+const FORCE_OFF: u8 = 2;
+
+/// Forces tracing on for the current process. Tests only.
+///
+/// Not `#[cfg(test)]`: the loader crates' tests need it too, and the Rhai case in
+/// particular is the one that matters — the hook sits in `check_epoch_and_kind`
+/// precisely because Rhai bypasses the JSON dispatcher, so a test that cannot
+/// reach that surface cannot demonstrate the design.
+#[doc(hidden)]
+pub fn force_tracing_for_test(on: bool) {
+    let v = if on { FORCE_ON } else { FORCE_OFF };
+    FORCE_TRACE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Appends a breadcrumb trail to an error message.
+///
+/// A free function rather than a method because `HandleTable::free` holds
+/// `&mut self` across the slab call and cannot also borrow `&self` to read the
+/// ring — it snapshots the crumbs first and calls this.
+fn attach_trace(mut err: FnError, crumbs: &[String]) -> FnError {
+    if crumbs.is_empty() {
+        return err;
+    }
+    err.message = format!(
+        "{} [gc-trace, oldest first, epoch:kind:gen:slot — {}]",
+        err.message,
+        crumbs.join(" ")
+    );
+    err
 }
 
 /// The per-invocation handle table: generational slabs keyed by value kind.
@@ -275,19 +328,11 @@ impl HandleTable {
     /// and what was resolved just before. Riding the error means it reaches the
     /// caller through the machinery that already carries diagnostics out, with no
     /// new surfacing mechanism. Inert unless `UNI_GC_TRACE` is set.
-    fn with_trace(&self, mut err: FnError) -> FnError {
+    fn with_trace(&self, err: FnError) -> FnError {
         if !tracing_enabled() {
             return err;
         }
-        let crumbs = self.trace_breadcrumbs();
-        if !crumbs.is_empty() {
-            err.message = format!(
-                "{} [gc-trace, oldest first, epoch:kind:gen:slot — {}]",
-                err.message,
-                crumbs.join(" ")
-            );
-        }
-        err
+        attach_trace(err, &self.trace_breadcrumbs())
     }
 
     /// Records a handle resolution when tracing is on.
@@ -335,10 +380,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_set(&self, h: Handle) -> Result<&VertexSet, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::VertexSet => self.sets.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("VertexSet")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::VertexSet => self.sets.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("VertexSet")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves a tensor handle.
@@ -347,10 +395,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_tensor(&self, h: Handle) -> Result<&Tensor, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::Tensor => self.tensors.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("Tensor")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::Tensor => self.tensors.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("Tensor")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves a graph handle.
@@ -359,10 +410,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_graph(&self, h: Handle) -> Result<&Arc<GraphProjection>, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::Graph => self.graphs.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("Graph")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::Graph => self.graphs.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("Graph")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves a walks handle.
@@ -371,10 +425,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_walks(&self, h: Handle) -> Result<&WalkMatrix, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::Walks => self.walks.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("Walks")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::Walks => self.walks.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("Walks")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves a pair-list handle.
@@ -383,10 +440,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_pairs(&self, h: Handle) -> Result<&PairList, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::Pairs => self.pairs.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("Pairs")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::Pairs => self.pairs.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("Pairs")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves an edge-mask handle.
@@ -395,10 +455,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_edge_set(&self, h: Handle) -> Result<&EdgeSet, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::EdgeSet => self.edge_sets.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("EdgeSet")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::EdgeSet => self.edge_sets.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("EdgeSet")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves an arena handle.
@@ -407,10 +470,13 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_arena(&self, h: Handle) -> Result<&GraphArena, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
-            HandleKind::Arena => self.arenas.get(h.slot(), h.generation()),
-            _ => Err(error::kind_mismatch("Arena")),
-        }
+        let out = {
+            match self.check_epoch_and_kind(h)? {
+                HandleKind::Arena => self.arenas.get(h.slot(), h.generation()),
+                _ => Err(error::kind_mismatch("Arena")),
+            }
+        };
+        out.map_err(|e| self.with_trace(e))
     }
 
     /// Resolves an arena handle for mutation.
@@ -419,10 +485,15 @@ impl HandleTable {
     /// Returns a typed [`FnError`] for an epoch, kind, or generation mismatch.
     pub fn get_arena_mut(&mut self, h: Handle) -> Result<&mut GraphArena, FnError> {
         self.trace_resolution(h);
-        match self.check_epoch_and_kind(h)? {
+        // Snapshot the crumbs before taking the mutable borrow — the same
+        // reason `free` does, and why `attach_trace` is a free function.
+        let crumbs = self.trace_breadcrumbs();
+        let kind = self.check_epoch_and_kind(h)?;
+        match kind {
             HandleKind::Arena => self.arenas.get_mut(h.slot(), h.generation()),
             _ => Err(error::kind_mismatch("Arena")),
         }
+        .map_err(|e| attach_trace(e, &crumbs))
     }
 
     /// Frees any handle, returning the number of heap bytes reclaimed.
@@ -435,6 +506,13 @@ impl HandleTable {
     /// including a double free (the generation will already have advanced).
     pub fn free(&mut self, h: Handle) -> Result<usize, FnError> {
         self.trace_resolution(h);
+        let crumbs = self.trace_breadcrumbs();
+        self.free_inner(h).map_err(|e| attach_trace(e, &crumbs))
+    }
+
+    /// The body of [`Self::free`], split out so the caller can snapshot the
+    /// trace before taking the mutable borrow.
+    fn free_inner(&mut self, h: Handle) -> Result<usize, FnError> {
         match self.check_epoch_and_kind(h)? {
             HandleKind::VertexSet => {
                 let v = self.sets.free(h.slot(), h.generation())?;
@@ -546,19 +624,16 @@ mod tests {
         assert_eq!(h.epoch(), 0xABCD);
     }
 
-    /// With `UNI_GC_TRACE` unset the trace is invisible: nothing recorded, and
-    /// error messages are byte-identical to what they were before it existed.
+    /// With tracing off the feature is invisible: nothing recorded, and error
+    /// messages are byte-identical to what they were before it existed.
     ///
-    /// This is the property that lets the hook ship always-compiled. It is
-    /// asserted rather than assumed because the check sits on the hottest path in
-    /// the module — every handle resolution.
+    /// This is the property that lets the hook ship always-compiled, on the
+    /// hottest path in the module.
     #[test]
-    fn the_trace_is_invisible_when_unset() {
-        // The suite does not set UNI_GC_TRACE; `tracing_enabled` is cached
-        // per-process, so this observes the default.
-        if std::env::var_os("UNI_GC_TRACE").is_some() {
-            return; // exercised by the UNI_GC_TRACE=1 gate run instead
-        }
+    fn the_trace_is_invisible_when_off() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        force_tracing_for_test(false);
+
         let mut t = HandleTable::new(7);
         let h = t.insert_set(VertexSet::with_capacity(4));
         for _ in 0..10 {
@@ -568,7 +643,6 @@ mod tests {
             t.trace_breadcrumbs().is_empty(),
             "nothing may be recorded when tracing is off"
         );
-
         let forged = Handle::pack(9, HandleKind::VertexSet, 0, 0);
         let err = t
             .get_set(forged)
@@ -580,13 +654,17 @@ mod tests {
         );
     }
 
-    /// With tracing on, a rejected handle carries the resolutions that preceded
-    /// it, and the ring stays bounded.
+    /// With tracing on, the ring stays bounded and rides *every* handle error —
+    /// not just the cross-epoch one.
+    ///
+    /// The first version of this test only exercised cross-epoch, which was also
+    /// the only path `with_trace` covered, so it could not have caught that
+    /// use-after-free carried nothing.
     #[test]
-    fn the_trace_is_bounded_and_rides_the_error() {
-        if std::env::var_os("UNI_GC_TRACE").is_none() {
-            return; // only meaningful under the UNI_GC_TRACE=1 gate run
-        }
+    fn the_trace_is_bounded_and_rides_every_handle_error() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        force_tracing_for_test(true);
+
         let mut t = HandleTable::new(7);
         let h = t.insert_set(VertexSet::with_capacity(4));
         for _ in 0..(TRACE_CAPACITY * 3) {
@@ -598,14 +676,49 @@ mod tests {
             "the ring must not grow with a long-running guest"
         );
 
+        // Cross-epoch.
         let forged = Handle::pack(9, HandleKind::VertexSet, 0, 0);
-        let err = t
-            .get_set(forged)
-            .expect_err("cross-epoch handle is rejected");
         assert!(
-            err.message.contains("gc-trace"),
-            "a rejected handle must carry what preceded it: {}",
-            err.message
+            t.get_set(forged)
+                .expect_err("forged")
+                .message
+                .contains("gc-trace"),
+            "cross-epoch must carry the trace"
         );
+        // Kind mismatch.
+        assert!(
+            t.get_tensor(h)
+                .expect_err("wrong kind")
+                .message
+                .contains("gc-trace"),
+            "a kind mismatch must carry the trace"
+        );
+        // Use-after-free — the case the published example shows, and the one the
+        // original implementation missed entirely.
+        t.free(h).expect("free succeeds");
+        let stale = t.get_set(h).expect_err("use-after-free");
+        assert!(
+            stale.message.contains("stale handle"),
+            "expected the stale-handle error: {}",
+            stale.message
+        );
+        assert!(
+            stale.message.contains("gc-trace"),
+            "use-after-free must carry the trace — this is the published example: {}",
+            stale.message
+        );
+        // Double free.
+        assert!(
+            t.free(h)
+                .expect_err("double free")
+                .message
+                .contains("gc-trace"),
+            "a double free must carry the trace"
+        );
+
+        FORCE_TRACE.store(FORCE_UNSET, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Both trace tests flip a process-global switch, so they must not overlap.
+    static TRACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

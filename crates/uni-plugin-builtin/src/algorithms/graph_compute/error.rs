@@ -159,6 +159,7 @@ pub fn incomplete_tag_for(
     iterations: u64,
     work_charged: u64,
     work_budget: u64,
+    breadcrumbs: &[String],
 ) -> Option<String> {
     let reason = uni_common::GraphComputeIncompleteReason::from_error_code(err.code)?;
     Some(
@@ -171,6 +172,26 @@ pub fn incomplete_tag_for(
             work_budget,
         }
         .to_tagged_message(),
+    )
+    .map(|tagged| append_breadcrumbs(tagged, breadcrumbs))
+}
+
+/// Appends a handle-resolution trail after a tagged diagnostic.
+///
+/// Safe by construction: `GraphComputeIncomplete::from_tagged_message` uses a
+/// streaming deserializer that reads exactly one JSON value and stops, so a
+/// suffix does not disturb the typed round trip.
+///
+/// This is what carries the trace on a `Timeout` / `Exhausted` / `IterationLimit`
+/// abort — the shape where a guest loops on a wrong value until the meter runs
+/// out, which arrives with no handle history otherwise.
+fn append_breadcrumbs(tagged: String, breadcrumbs: &[String]) -> String {
+    if breadcrumbs.is_empty() {
+        return tagged;
+    }
+    format!(
+        "{tagged} [gc-trace, oldest first, epoch:kind:gen:slot — {}]",
+        breadcrumbs.join(" ")
     )
 }
 
@@ -192,6 +213,7 @@ pub fn incomplete_tag_after_guest(
     work_charged: u64,
     work_budget: u64,
     elapsed_ms: u64,
+    breadcrumbs: &[String],
 ) -> Option<String> {
     let reason = if deadline_elapsed {
         uni_common::GraphComputeIncompleteReason::Timeout
@@ -211,6 +233,7 @@ pub fn incomplete_tag_after_guest(
         }
         .to_tagged_message(),
     )
+    .map(|tagged| append_breadcrumbs(tagged, breadcrumbs))
 }
 
 /// Builds a `0x868` seed-not-in-projection error for an unmapped Vid.

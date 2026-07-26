@@ -317,9 +317,11 @@ plausible-but-wrong. 3.0.0 made unscoped projection fail loud, so this requires 
   collision at `HandleTable` construction (`:161`).
 - **Fail closed on epoch wrap** — `next_session_epoch` (`mod.rs:250`) returns `Result`. This
   closes the only true global and is already flagged in-tree as a follow-up.
-- **`UNI_GC_TRACE` ring buffer**: every kernel call with `(epoch, kind, gen, slot)`, dumped on
-  demand. This is the forensic tool their `chunkguard2.py` guard wants on our side of the
-  boundary, and it does not perturb timing the way their inline check does.
+- **`UNI_GC_TRACE` handle trace**: a bounded per-session ring of handle resolutions, riding any
+  handle error and the incomplete tag on an abort. This is the forensic tool their
+  `chunkguard2.py` guard wants on our side of the boundary, and it does not perturb timing the way
+  their inline check does. Note it records handle *resolutions*, not every kernel call — a kernel
+  taking no handle leaves no crumb — and there is no dump-on-demand surface.
 
 ---
 
@@ -649,7 +651,9 @@ cannot rot).
 2. **Epoch-wrap fail-closed** — `next_session_epoch` (`mod.rs:250`) returns `Result`. Closes the
    only true process-global; already flagged in-tree as a follow-up. Live for Extism/WASM even
    though inert for Rhai.
-3. **`UNI_GC_TRACE` ring buffer** — kernel call + `(epoch, kind, gen, slot)`, dumped on demand.
+3. **`UNI_GC_TRACE` handle trace** — a bounded per-session ring of handle
+   resolutions `(epoch, kind, gen, slot)`, attached to any handle error and to the
+   incomplete tag on a `Timeout` / `Exhausted` / `IterationLimit` abort.
 
 *Gate:* an epoch-wrap test; `gc-paranoid` builds and runs in CI.
 *Release:* minor, feature-gated.

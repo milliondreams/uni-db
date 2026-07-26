@@ -126,3 +126,70 @@ async fn probe_fork_graph_compute_projects_the_same_as_its_parent() -> anyhow::R
     db.shutdown().await?;
     Ok(())
 }
+
+/// Runs a third-party provider under the given graphRef and returns the row count.
+async fn provider_rows(
+    session: &uni_db::Session,
+    plugin: &str,
+    vid: i64,
+    scope: &str,
+) -> anyhow::Result<usize> {
+    let q =
+        format!("CALL {plugin}.pr({vid}, 0.85, {scope}) YIELD nodeId, score RETURN nodeId, score");
+    Ok(session.query(&q).await?.rows().len())
+}
+
+/// The **row path**'s Cypher/Named `graphRef` resolver must observe L0
+/// (Phase 2, bug B).
+///
+/// It was L0-blind even on an ordinary writer-backed session:
+///
+/// `execute_algorithm_provider` built the resolver host with
+/// `QueryProcedureHost::from_components`, which hardcodes `L0Context::empty()`.
+/// The resolver runs `nodeQuery` / `edgeQuery` through that host, so the
+/// selection queries see flushed storage only — while the *outer* projection on
+/// the very same call has a correct `l0_manager`. The result is mode-dependent:
+/// a label-scoped projection works, a Cypher-scoped one silently returns nothing.
+///
+/// The sibling pin `pin_cypher_graph_ref_sees_committed_unflushed_rows` above
+/// does **not** cover this. It uses `uni.algo.gcpagerank`, which is DF-eligible
+/// by name prefix and therefore takes a different, correctly-populated host —
+/// which is exactly why the first pass concluded this path was fine.
+#[tokio::test]
+async fn row_path_cypher_graph_ref_sees_committed_unflushed_rows() -> anyhow::Result<()> {
+    use super::graph_compute_pagerank::DfFlagPlugin;
+
+    let db = Uni::in_memory().build().await?;
+    let vid = seed_unflushed(&db).await?;
+    // `df_composable = false` keeps this provider on the row path; the `true`
+    // twin is the control that isolates the path as the variable.
+    db.add_plugin(DfFlagPlugin::new("mycorow", "pr", false))?;
+    db.add_plugin(DfFlagPlugin::new("mycodf", "pr", true))?;
+    let session = db.session();
+
+    // Control: label-scoped on the row path already works — the outer
+    // l0_manager is correct, so this isolates the resolver as the fault.
+    assert_eq!(
+        provider_rows(&session, "mycorow", vid, LABEL_SCOPE).await?,
+        4,
+        "row path, label scope: the outer projection sees L0 today"
+    );
+
+    // Control: the same Cypher graphRef on the DF path works.
+    assert_eq!(
+        provider_rows(&session, "mycodf", vid, CYPHER_SCOPE).await?,
+        4,
+        "DF path, Cypher scope: the host carries a real L0Context"
+    );
+
+    // The regression.
+    assert_eq!(
+        provider_rows(&session, "mycorow", vid, CYPHER_SCOPE).await?,
+        4,
+        "row path, Cypher scope: the resolver's selection queries must observe \
+         the same committed state the outer projection does; they silently \
+         selected nothing instead"
+    );
+    db.shutdown().await?;
+    Ok(())
+}

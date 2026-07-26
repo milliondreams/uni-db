@@ -237,6 +237,21 @@ impl QueryProcedureHost {
         self
     }
 
+    /// Attach the outer query's L0 visibility snapshot to this host.
+    ///
+    /// [`Self::from_components`] starts from [`L0Context::empty`] because the
+    /// simple-executor path holds no `GraphExecutionContext`. Any call site that
+    /// has a `QueryContext` in hand must thread it through here, or this host's
+    /// inner queries ([`Self::execute_inner_query`]) read flushed storage only
+    /// and silently miss committed-but-unflushed rows — while the *outer* query
+    /// that built them sees the full state. That asymmetry is a wrong answer
+    /// that depends on which projection mode the caller happened to use.
+    #[must_use]
+    pub fn with_l0_context(mut self, l0_context: L0Context) -> Self {
+        self.l0_context = l0_context;
+        self
+    }
+
     /// Allocate a fresh transient id, unique within this host's
     /// lifetime. Wraps the bottom 63 bits and OR-s in the ephemeral
     /// bit before returning. Use `Vid::ephemeral` / `Eid::ephemeral`

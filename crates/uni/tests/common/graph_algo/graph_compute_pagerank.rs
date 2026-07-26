@@ -438,13 +438,13 @@ async fn l3_project_needs_hostquery_too() -> anyhow::Result<()> {
 /// [`GraphComputePageRankProvider`] but publishes a **chosen** `df_composable`
 /// flag — so a test can register the *same* algorithm on the DataFusion path
 /// and the row-based fallback and compare (DF-2 / DF-3).
-struct DfFlagProvider {
+pub(crate) struct DfFlagProvider {
     inner: uni_plugin_builtin::algorithms::graph_compute::provider::GraphComputePageRankProvider,
     sig: uni_plugin::traits::algorithm::AlgorithmSignature,
 }
 
 impl DfFlagProvider {
-    fn new(df_composable: bool) -> Self {
+    pub(crate) fn new(df_composable: bool) -> Self {
         use uni_plugin::traits::algorithm::AlgorithmProvider as _;
         let inner =
             uni_plugin_builtin::algorithms::graph_compute::provider::GraphComputePageRankProvider::new();
@@ -468,7 +468,7 @@ impl uni_plugin::traits::algorithm::AlgorithmProvider for DfFlagProvider {
 
 /// A third-party plugin registering [`DfFlagProvider`] under an arbitrary
 /// namespaced name with a chosen `df_composable` flag.
-struct DfFlagPlugin {
+pub(crate) struct DfFlagPlugin {
     manifest: OnceLock<PluginManifest>,
     ns: &'static str,
     local: &'static str,
@@ -476,7 +476,7 @@ struct DfFlagPlugin {
 }
 
 impl DfFlagPlugin {
-    fn new(ns: &'static str, local: &'static str, df_composable: bool) -> Self {
+    pub(crate) fn new(ns: &'static str, local: &'static str, df_composable: bool) -> Self {
         Self {
             manifest: OnceLock::new(),
             ns,

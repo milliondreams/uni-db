@@ -720,6 +720,14 @@ impl Executor {
         if let Some(writer) = &self.writer {
             host = host.with_writer(Arc::clone(writer));
         }
+        // Same reasoning as the graphRef resolver below: every row-path plugin
+        // procedure (including `uni.graph.project`'s Cypher mode and every
+        // `CypherProcedureSynthesizer`-declared procedure) runs its inner Cypher
+        // through this host, so it needs the outer query's L0 visibility or it
+        // reads committed storage only.
+        if let Some(qc) = ctx {
+            host = host.with_l0_context(crate::query::df_graph::L0Context::from_query_context(qc));
+        }
         // FU-1: propagate the in-flight principal so capability gates
         // (e.g., `Capability::ProcedureWrites` on
         // `uni.plugin.declareProcedure WRITE`) see the session's
@@ -810,17 +818,25 @@ impl Executor {
 
         // Guest Cypher/Named projections (issue #151 P3) resolve through a query
         // host built from the executor's components (the simple-executor path has
-        // no GraphExecutionContext). The host's inner queries read committed
-        // storage, matching the projection's storage-view contract for property
-        // values.
+        // no GraphExecutionContext of its own, so the outer query's L0 snapshot
+        // is threaded in explicitly below).
         let storage = self.effective_storage();
-        let resolver = crate::procedures_plugin::algo::guest_graph_resolver(
+        let mut resolver_host =
             crate::query::executor::procedure_host::QueryProcedureHost::from_components(
                 Arc::clone(&storage),
                 Some(Arc::clone(&self.algo_registry)),
                 self.procedure_registry.clone(),
-            ),
-        );
+            );
+        // The resolver's `nodeQuery` / `edgeQuery` must observe the same L0
+        // snapshot the outer projection does (`l0_manager`, above). Without this
+        // a guest Cypher/Named `graphRef` silently selects from flushed storage
+        // only, while a label-scoped projection on this very call sees L0 — a
+        // wrong answer that depends on which projection mode was used.
+        if let Some(qc) = ctx {
+            resolver_host = resolver_host
+                .with_l0_context(crate::query::df_graph::L0Context::from_query_context(qc));
+        }
+        let resolver = crate::procedures_plugin::algo::guest_graph_resolver(resolver_host);
         let mut stream = crate::procedures_plugin::algo::run_algorithm_provider(
             entry,
             storage,

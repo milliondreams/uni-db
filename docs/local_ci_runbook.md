@@ -218,7 +218,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace \
 ( cd bindings/uni-db
   uv sync --group dev --extra notebook-runtime
   rm -f dist/*.whl                         # else the glob below matches two versions
-  uv run maturin build --out dist          # RELEASE wheel — long build
+  uv run maturin build --out dist          # NOTE: `dev` profile — maturin only builds
+                                           # release with an explicit `--release`.
+                                           # ci.yml's notebooks job omits it, so the
+                                           # notebooks execute an UNOPTIMIZED build.
+                                           # The published wheels are unaffected:
+                                           # release-wheels.yml passes `--release`.
   uv pip install --force-reinstall dist/*.whl
   # Assert the notebooks will actually run against what was just built.
   .venv/bin/python3 -c "from importlib.metadata import version; print(version('uni-db'))" )

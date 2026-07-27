@@ -4,7 +4,7 @@ This document lists every CI job from `.github/workflows/pr.yml` and `.github/wo
 with the **exact command** to run it locally, plus prerequisites, ordering, and the local-only
 gotchas that bite.
 
-> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-06-29.
+> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-07-26.
 > If a command here disagrees with `.github/workflows/{pr,ci}.yml`, the YAML wins — update this doc.
 > Run commands from the repo root unless a "working dir" is noted. **Do not substitute workarounds**
 > for the documented commands; if a command fails, that is a real signal — report it.
@@ -17,7 +17,8 @@ rustup target add wasm32-unknown-unknown wasm32-wasip2
 
 # Test runner + wasm tooling
 cargo install cargo-nextest --locked
-cargo install wasm-tools --locked
+cargo install wasm-tools --locked   # only for wasm32-unknown-unknown fixtures;
+                                   # the wasip2 ones are components already
 
 # Python tooling (bindings)
 #   install uv:  https://docs.astral.sh/uv/   (CI uses python 3.12)
@@ -107,6 +108,14 @@ METAMORPHIC_CASES=64 cargo nextest run -p uni-db --test integration \
   -E 'test(/metamorphic::/) and not test(soak)'
 ```
 
+### GraphCompute handle trace (`UNI_GC_TRACE`)
+```bash
+# The trace is off by default and its assertions follow the env var, so this job
+# is the only place the real `UNI_GC_TRACE` read is exercised. It must pass in
+# BOTH states — the ordinary workspace run above covers the off case.
+UNI_GC_TRACE=1 cargo nextest run -p uni-plugin-builtin -E 'test(graph_compute)'
+```
+
 ### openCypher TCK (schemaless)
 ```bash
 cargo nextest run -p uni-tck --test tck
@@ -121,6 +130,17 @@ cargo nextest run -p uni-tck --test tck
   uv run ruff format --check .
   uv run ruff check .
   uv run pytest tests/ -v -n auto )
+
+# pyo3 loader Rust tests — these exist ONLY under `--features pyo3`, and every file in
+# the crate is `#![cfg(feature = "pyo3")]`, so the workspace run above lists zero tests
+# for it. They live in this job because it is the one with a `pyarrow` environment: the
+# vectorized scalar path hands guests an Arrow array and guest bodies compute on it.
+# pyo3 `auto-initialize` links the SYSTEM interpreter, whose sys.path excludes the venv —
+# so without PYTHONPATH the package is installed and still invisible, and the tests skip.
+( cd bindings/uni-db
+  SITE=$(uv run python -c "import site; print(site.getsitepackages()[0])")
+  PYTHONPATH="$SITE" cargo nextest run --manifest-path ../../Cargo.toml \
+    -p uni-plugin-pyo3 --features pyo3 )
 
 # uni-pydantic  (working dir: bindings/uni-pydantic) — imports the uni-db .so via editable path dep
 ( cd bindings/uni-pydantic
@@ -233,6 +253,22 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
 - **`RUSTC_WRAPPER=""`** — see §0. Unset any global wrapper for cargo/maturin.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
+- **Stale wheels in `bindings/uni-db/dist/` after a version bump** — the notebooks job does
+  `uv pip install --force-reinstall dist/*.whl`, and that glob matches *every* wheel ever built
+  there. Two versions present makes `uv` refuse with "Requirements contain conflicting URLs for
+  package `uni-db`". CI never sees this (fresh checkout, empty `dist/`), so it is local-only —
+  but the failure is quiet in the worst way: the notebooks that run afterwards use whatever
+  `maturin develop` left installed (a *debug* build), so the job appears to pass while never
+  exercising the release wheel it exists to test. `rm bindings/uni-db/dist/*.whl` before the
+  build, and check `importlib.metadata.version('uni-db')` matches the workspace version before
+  trusting a notebook run.
+- **`maturin develop` needs a `TMPDIR` that exists** — a missing one fails with
+  `Failed to create temporary directory ... (os error 2)`. And never judge it through a pipe:
+  `maturin develop | tail -N` returns *tail's* exit status, so a failed build looks like success
+  and the tests then run against the previous `.so`.
+- **Python steps need a venv-scoped `LD_PRELOAD`** of the built extension — see
+  `docs/` note on static-TLS exhaustion. A global `export LD_PRELOAD` poisons `uv` and other
+  non-Python subprocesses with `undefined symbol: _Py_IncRef`.
 - **Python static-TLS (glibc)** — on some boxes `uv run pytest` can fail with
   `ImportError: ... cannot allocate memory in static TLS block` (a large debug `.so` exhausting
   glibc's static-TLS surplus; CI runners have more surplus so they never hit it). If it triggers,

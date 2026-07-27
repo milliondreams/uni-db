@@ -1023,6 +1023,7 @@ pub fn register_graph_compute(engine: &mut Engine) {
     engine.register_type_with_name::<GcSession>("GcSession");
     let _ = register_kernels(engine);
     register_arena_stubs(engine);
+    register_scoped_graph_stub(engine);
     register_missing_kernel_hints(engine);
 }
 
@@ -1140,6 +1141,29 @@ fn arena_unavailable(op: &'static str) -> Box<EvalAltResult> {
 ///
 /// These stubs are the surface arriving ahead of its implementation: the arena
 /// kernels replace the bodies, keeping the same names and arities.
+/// Answers `gc.graph(#{...})` — the shape a guest reaches for when it wants a
+/// second projection.
+///
+/// Named scopes shipped, and a field report still recorded REQ-D5 as "still
+/// absent" against a build that contained them: the probe was `gc.graph(scope)`,
+/// which is a signature mismatch, and Rhai's `Function not found` says nothing
+/// about the feature that replaced it. `graph` is a registered kernel, so it
+/// cannot go in the method-hint table — that table must never shadow a working
+/// name. Binding the *wrong* signature explicitly is the way to answer it, and
+/// matches how the arena stubs already handle unavailable names.
+fn register_scoped_graph_stub(engine: &mut Engine) {
+    engine.register_fn("graph", |_: &mut GcSession, _: rhai::Map| {
+        Err::<i64, _>(rt(FnError::new(
+            0x86E,
+            "`graph` takes no arguments. A second projection is pre-declared at the \
+             CALL site and read by name: add `scopes: {agg: {nodeLabels: [..], \
+             edgeTypes: [..]}}` to the projection config, then `gc.graph_named(\"agg\")`. \
+             Scopes are built before the guest runs, so projection stays off the \
+             guest's hot path.",
+        )))
+    });
+}
+
 fn register_arena_stubs(engine: &mut Engine) {
     engine
         .register_fn("add_node", |_: &mut GcSession, _: f64| {
@@ -1194,6 +1218,45 @@ mod tests {
     ///
     /// It is meaningful because `register_kernels` registers and reports from
     /// one declaration: it cannot claim a kernel it did not register.
+    /// The exact probe a field report used to conclude scopes were absent.
+    ///
+    /// `gc.graph(#{..})` must name the feature that replaced it, not report an
+    /// unknown function — the feature was present in the build they tested.
+    #[test]
+    fn probing_for_a_scoped_graph_names_the_feature_that_replaced_it() {
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            5,
+            WorkBudget::from_edge_count(1000),
+            Arena::new(1 << 20, 64),
+        )));
+        let mut scope = rhai::Scope::new();
+        scope.push("gc", new_session(session, from_i64(0), Arc::default()));
+
+        let err = engine
+            .eval_with_scope::<rhai::Dynamic>(
+                &mut scope,
+                r#"gc.graph(#{nodeLabels: ["Lane"], edgeTypes: ["AGG"]})"#,
+            )
+            .expect_err("a scoped graph call must not silently succeed");
+        let msg = err.to_string();
+        for needle in ["scopes:", "graph_named"] {
+            assert!(
+                msg.contains(needle),
+                "the refusal must name `{needle}`, got: {msg}"
+            );
+        }
+
+        // The real accessor still works — the stub must not shadow it.
+        assert!(
+            engine
+                .eval_with_scope::<rhai::Dynamic>(&mut scope, "gc.graph()")
+                .is_ok(),
+            "the zero-arg `graph()` must still resolve"
+        );
+    }
+
     /// A guest reaching for a composable-but-absent kernel gets the recipe.
     ///
     /// This is the discoverability gap three consecutive field reports fell into:

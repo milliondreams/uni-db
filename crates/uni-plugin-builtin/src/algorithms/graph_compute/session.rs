@@ -2215,10 +2215,24 @@ impl GraphCompute for AlgoSession {
         if let Some(primary) = self.primary_graph_handle {
             for &(name, h) in cols {
                 let origin = self.table.get_tensor(h)?.origin();
-                if !origin.compatible_with(Origin::Graph(primary)) {
+                if !self
+                    .canonical_origin(origin)
+                    .compatible_with(self.canonical_origin(Origin::Graph(primary)))
+                {
+                    // Name the way out, not just the fault. A value computed over
+                    // an arena — the shape an arena-native algorithm reports its
+                    // results in — is rebased with `rekey`, and a reader who is
+                    // told only "different projection" has no way to guess that.
+                    let fix = match origin {
+                        Origin::Arena(_) => {
+                            " — rebase it first with rekey(col, g), which checks the \
+                             arena's slot count against the projection's vertices"
+                        }
+                        _ => "",
+                    };
                     return Err(error::emit_schema_mismatch(format!(
                         "emit column `{name}` comes from a different projection \
-                         ({origin:?}) than the one the output rows are keyed to"
+                         ({origin:?}) than the one the output rows are keyed to{fix}"
                     )));
                 }
             }
@@ -2862,11 +2876,35 @@ impl GraphCompute for AlgoSession {
         // arena-keyed value has no vertices to correspond, and an untracked one
         // is already permissive -- neither needs (or can have) a verified re-key.
         let origin = self.origin_of(value)?;
-        let Origin::Graph(src_h) = origin else {
-            return Err(error::shape_mismatch(
-                "rekey moves a value between projections, but this value is not \
-                 keyed to one (arena-slot or untracked values combine already)",
-            ));
+        // An arena-keyed value can be rebased too, but the check is weaker and
+        // the difference is worth stating. Two graph projections both carry
+        // slot->Vid maps, so their correspondence is *verifiable*. Arena slots
+        // carry no vertex identity at all, so "my slot i is your vertex i" is a
+        // claim only the guest can make; the host can check the counts agree and
+        // nothing more. This is still stricter than accepting it silently, which
+        // is what `emit` did before it checked provenance -- the guest now has to
+        // say what it means, at one call site, in the open.
+        let src_h = match origin {
+            Origin::Graph(h) => h,
+            Origin::Arena(a) => {
+                let slots = self.table.get_arena(a)?.len() as usize;
+                let n = target.vertex_count();
+                if slots != n {
+                    return Err(error::shape_mismatch(format!(
+                        "rekey: the arena holds {slots} live slots but the projection \
+                         has {n} vertices, so slot i cannot be vertex i"
+                    )));
+                }
+                self.charge(n as u64)?;
+                let copy = self.table.get_tensor(value)?.clone();
+                return self.alloc_tensor(copy, Origin::Graph(g));
+            }
+            Origin::Untracked => {
+                return Err(error::shape_mismatch(
+                    "rekey moves a value between index spaces, but this value has \
+                     no known space -- it already combines with anything",
+                ));
+            }
         };
         if src_h == g {
             return Err(error::arg_validation(

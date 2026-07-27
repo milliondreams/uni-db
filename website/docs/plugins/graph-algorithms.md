@@ -170,6 +170,16 @@ let total     = gc.ewise(deg_here, moved, "add");
 
 `rekey` is not a reinterpretation. It walks both projections' slot→Vid maps and succeeds only if they agree vertex for vertex; otherwise it fails naming the first slot where they diverge. So the claim "these two projections describe the same vertices" is checked at the point your algorithm depends on it, rather than assumed — and the check costs `O(V)`, charged to the work budget like any other kernel.
 
+It also rebases an **arena** column onto a projection, which is how an arena-native algorithm reports its results:
+
+```rhai
+let col   = gc.arena_gather(a, c, slots);   // computed over grown structure
+let moved = gc.rekey(col, g);               // now keyed to the projection
+gc.emit("score", moved);
+```
+
+That direction is a weaker check, and the difference matters. Two graph projections both carry slot→Vid maps, so `rekey` can *verify* their correspondence vertex by vertex. Arena slots carry no vertex identity, so "my slot `i` is your vertex `i`" is a claim only you can make — the host checks that the arena's live slot count matches the projection's vertex count, and nothing more. It is still stricter than passing the column to `emit` unannounced, because the claim is made once, explicitly, at a call site a reader can find.
+
 It accepts `[V]` tensors and vertex sets. `[E]` values are refused: CSR edge order is a property of one projection's topology and carries no meaning in another, even when every vertex lines up.
 
 !!! warning "Slot correspondence is a Native-only guarantee"

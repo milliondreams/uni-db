@@ -284,7 +284,7 @@ pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
     (
         &["select", "where", "blend", "ifelse"],
         "a conditional blend",
-        "ewise(b, ewise(m, ewise(a, b, \"sub\"), \"mul\"), \"add\")",
+        "ewise(b, ewise(m, ewise(a, b, \"axpy\", -1.0), \"mul\"), \"add\")",
     ),
     (
         &["sub", "subtract", "minus"],
@@ -296,11 +296,15 @@ pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
         "absolute value",
         "ewise(a, map_apply(a, \"scale\", -1.0), \"max\")",
     ),
-    (&["relu"], "rectification", "ewise(a, zero_map(g), \"max\")"),
+    (
+        &["relu"],
+        "ReLU",
+        "ewise(a, set_to_map(map_to_set(a, \"gt\", 0.0), 1.0), \"mul\")",
+    ),
     (
         &["clip", "clamp"],
-        "clamping to a range",
-        "ewise(map_apply(a, \"min_const\", hi), map_apply(a, \"max_const\", lo), \"max\")",
+        "clipping between two maps",
+        "ewise(ewise(a, lo, \"max\"), hi, \"min\")",
     ),
     (
         &["step", "heaviside", "threshold", "indicator"],
@@ -311,6 +315,17 @@ pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
         &["edge_mask", "nonzero"],
         "an exact edge mask from a stored selector column",
         "edge_mask_window(edge_property(g, prop), 0.5, 1.5)",
+    ),
+    (
+        &[
+            "arena_to_map",
+            "to_map",
+            "rebase",
+            "project",
+            "graph_column",
+        ],
+        "moving an arena-computed column onto a projection so it can be emitted",
+        "rekey(col, g)",
     ),
     (
         &["arena_spmv", "arena_neighbour_sum", "arena_aggregate"],
@@ -415,6 +430,30 @@ mod tests {
         }
         for &n in OverlapMetric::ALL_NAMES {
             assert_eq!(OverlapMetric::parse(n).expect(n).op_name(), n);
+        }
+    }
+
+    /// Every op string a method hint quotes must be a real op name.
+    ///
+    /// The op-string table has had this guard since it was written; the method
+    /// table shipped without it, and immediately published
+    /// `ewise(a, b, "sub")` — `sub` is not an ewise op, and the `sub` hint itself
+    /// correctly says to use `axpy` with a coefficient of -1. Two published
+    /// recipes contradicting each other is worse than no recipe: it costs a
+    /// reader the time to try it.
+    #[test]
+    fn method_recipes_only_quote_real_op_names() {
+        let mut valid: HashSet<&str> = HashSet::new();
+        for &family in OpFamily::ALL {
+            valid.extend(family.valid_names());
+        }
+        for (keys, _, recipe) in METHOD_RECIPES {
+            for token in recipe.split('"').skip(1).step_by(2) {
+                assert!(
+                    valid.contains(token),
+                    "method recipe for {keys:?} quotes `{token}`, which is not an op name"
+                );
+            }
         }
     }
 

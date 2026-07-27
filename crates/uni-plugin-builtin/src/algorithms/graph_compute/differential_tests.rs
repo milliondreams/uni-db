@@ -4001,6 +4001,88 @@ fn an_arena_seeded_from_a_projection_grows_into_it() {
     );
 }
 
+/// REQ-D9 repro: an arena-computed column must be able to leave the CALL.
+///
+/// An arena-native algorithm (MCTS is the reported case) grows structure, scores
+/// it, and reports a per-vertex result whose slots correspond positionally to the
+/// input projection. Tightening `emit` to check `Origin` made that impossible:
+/// the column is `Origin::Arena`, `emit` demands the primary graph, and there is
+/// no kernel that rebases one onto the other. The arena could compute but not
+/// report — a regression against the previous release with no workaround.
+#[test]
+fn an_arena_column_can_be_emitted_against_a_matching_projection() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    s = s.with_expected_columns(vec!["visit".to_string()]);
+
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 4).expect("four slots, one per vertex");
+    let c = s.arena_column(arena).expect("a state column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let col = s
+        .arena_gather(arena, c as u32, slots)
+        .expect("a scored column");
+
+    // `emit` stays strict — but the refusal must name the way out, since an
+    // arena-native algorithm reporting results is a legitimate thing to want.
+    let err = s
+        .emit(&[("visit", col)])
+        .expect_err("emit is keyed to the projection");
+    assert!(
+        err.message.contains("rekey"),
+        "the refusal must name the primitive that fixes it, got: {}",
+        err.message
+    );
+
+    // One explicit call, and the column reports. The guest states the
+    // correspondence; the host checks the counts agree.
+    let moved = s.rekey(col, g).expect("arena slots match the projection");
+    assert!(
+        s.emit(&[("visit", moved)]).is_ok(),
+        "a rebased arena column must be emittable"
+    );
+
+    // The count check is real: an arena sized differently cannot be rebased.
+    let small = s.arena_new(8, 2).expect("second arena");
+    let two = s.arena_alloc(small, 2).expect("two slots");
+    let c2 = s.arena_column(small).expect("column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let wrong = s.arena_gather(small, c2 as u32, two).expect("gather");
+    assert!(
+        s.rekey(wrong, g).is_err(),
+        "an arena with 2 slots cannot be rebased onto a 4-vertex projection"
+    );
+}
+
+/// REQ-D8's published hint must actually work.
+///
+/// The `arena_spmv` hint tells a guest to freeze the arena and `spmv` over it.
+/// Publishing a composition that fails is worse than publishing nothing, so this
+/// runs the hint verbatim.
+#[test]
+fn the_arena_spmv_hint_composition_actually_runs() {
+    let (mut s, _g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    ));
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 3).expect("slots");
+    let c = s.arena_column(arena).expect("a state column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let col = s.arena_gather(arena, c as u32, slots).expect("column");
+
+    // Verbatim: spmv(arena_freeze(a), col, "linear_algebra", "out")
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    let out = s.spmv(frozen, col, Semiring::LinearAlgebra, Direction::Out, None);
+    assert!(
+        out.is_ok(),
+        "the published arena_spmv composition must run: {:?}",
+        out.err()
+    );
+}
+
 /// `rekey` is a verified move between projections, not a cast.
 ///
 /// It is the escape hatch that makes named scopes useful: two edge layers over

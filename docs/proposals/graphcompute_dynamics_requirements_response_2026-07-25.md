@@ -1261,3 +1261,149 @@ the handle budget for no reason a guest could see.
 Both are the kind of thing a field report surfaces only indirectly. Thank you for
 the precision of these — the repro paths and the "measured, not inferred"
 discipline are what made them actionable.
+
+---
+
+# Part VIII — response to the 3.1.0 probe (REQ-D9, and what it exposed)
+
+## 35. The regression is fixed, and the migration is one line
+
+REQ-D9 is real, it was ours, and it was a bad one: tightening `emit` to check
+provenance made an arena-computed column impossible to return. The arena could
+compute and not report. Reproduced exactly, fixed, and pinned by a test.
+
+To adopt, add one call before the emit:
+
+```rhai
+let moved = gc.rekey(col, g);   // rebase the arena column onto the projection
+gc.emit("visit", moved);
+```
+
+`emit` stays strict — it will not silently accept a column keyed to something
+else — but its refusal now names `rekey` instead of only naming the fault. Being
+told "different projection" and nothing more is what sent you through eight dead
+ends, and that is the part we most regret.
+
+**Why a call rather than restoring 3.0.2's behaviour.** The check exists because
+`emit` previously accepted *any* column of the right length, and with more than
+one projection in play that silently mislabels every row. `rekey` keeps the
+guarantee and moves the claim into the open: you state the correspondence once,
+at a call site a reader can find. For the arena direction the host verifies the
+live slot count against the vertex count and no more — arena slots carry no
+vertex identity, so "my slot i is your vertex i" is a claim only you can make. We
+document that as a weaker check rather than implying it is verified.
+
+## 36. Both hint texts were wrong, and the guard that would have caught them was missing
+
+You are right on both counts, and the cause is worth stating plainly because it
+is not a typo.
+
+The op-string recipe table has had a guard since it was written that every quoted
+token is a real op name. When we added the *method* table, we re-authored the
+compositions by hand instead of reusing the verified ones, and shipped without
+the equivalent guard. So `select` published `ewise(a, b, "sub")` — with `sub` not
+an ewise op, and our own `sub` hint correctly recommending `axpy` with `-1.0`.
+Two published recipes contradicting each other.
+
+The guard now exists. It immediately failed on `sub`, and then on `min_const` in
+the `clip`/`clamp` entry, which was wrong the same way. Every method entry now
+reuses the op-string table's text verbatim.
+
+## 37. One correction: the `arena_spmv` composition does work
+
+The hint recommends `spmv(arena_freeze(a), col, "linear_algebra", "out")`, and
+you found it fails with an epoch mismatch. It works on current `main`.
+
+The fix landed *after* the 3.1.0 version bump, so a build taken at that tag
+predates it. There is now a test that runs the hint verbatim, precisely so a
+published composition cannot drift from what the kernels do.
+
+## 38. Table functions now ship as a kernel
+
+`interp(x, xs, ys)` — piecewise-linear through your breakpoints, clamped outside
+the range (the Vensim `WITH LOOKUP` convention). One pass over `[V]` regardless
+of breakpoint count. `lookup`, `table`, `with_lookup` and `piecewise` all point
+at it.
+
+We checked composability first, as we should have for the earlier rounds, and
+this time the answer was different in a way worth sharing. It *is* composable:
+
+```
+per segment:  max(min(slope_i * (x - x_i), rise_i), 0)   gated on (x >= x_i), summed
+```
+
+That formulation needs no upper-bound comparison and gets end-clamping for free,
+which matters because the predicate vocabulary has no `>=`/`<=`. But we measured
+it at ~14 passes over `[V]` per segment — a ten-point table is ~126x a single
+pass, and the work meter charges all of it. Expressible, not affordable, for a
+model evaluating several tables per tick. That is the case a kernel slot is for,
+and it is the first ask this round where "compose it" was the wrong answer.
+
+## 39. REQ-D5 was in the build you tested
+
+This is the one we are least comfortable with. Named scopes shipped *before* the
+3.1.0 bump — the feature was present in the exact wheel you probed. You recorded
+it "still absent" because the probe was `gc.graph(scope_map)`, and the shape we
+shipped is different: scopes are pre-declared at the CALL site and read by name.
+
+```cypher
+CALL myplugin.f([], {nodeLabels: ['Lane'], edgeTypes: ['ADJ'],
+                     scopes: {agg: {nodeLabels: ['Lane'], edgeTypes: ['AGG']}}})
+```
+```rhai
+let agg = gc.graph_named("agg");
+```
+
+They are built before the guest runs — deliberately, so projection cannot end up
+inside a guest loop where the work meter does not govern it.
+
+`gc.graph(#{..})` now answers with that, instead of a generic "function not
+found". It should have from the start.
+
+## 40. The pattern, restated — because it got worse, not better
+
+Part VII said three consecutive rounds had led with an ask that was already
+expressible. This round makes it four, and the fourth is the most damning: D5 was
+not merely composable, it was *implemented and shipped*, and the report against
+that build says "still absent".
+
+Every one of these is a discoverability failure on our side. The countermeasures
+now in place, in order of how much we think they matter:
+
+1. **Hints fire at the loader boundary**, not only on rejected op strings — so
+   `gc.arena_spmv(..)`, `gc.select(..)`, `gc.lookup(..)` all answer with the real
+   composition or kernel.
+2. **Mis-shaped calls to real kernels answer too**, which is what `gc.graph(map)`
+   needed and what the hint table structurally cannot do.
+3. **Every published composition is guarded** — the kernels it names must exist,
+   the op strings it quotes must be real, and it must not shadow a working name.
+4. **The `arena_spmv` hint has a test that runs it**, because a composition we
+   publish and never execute is a claim, not a fact.
+
+## 41. Status
+
+| ask | state |
+|---|---|
+| D1 comparison→mask | shipped (confirmed by you) |
+| D1 · table functions | **shipped this round** — `interp` |
+| D2 multi-emit | shipped (confirmed by you) |
+| D3 both questions | answered; `UNI_GC_TRACE=1` is the handle-validation mode |
+| D4 p∈{0,1} contract | documented + tested; `edge_mask_window` is the direct spelling |
+| D5 second projection | shipped before 3.1.0; now **findable** |
+| D6 work budget | shipped (confirmed by you) |
+| D7 `edge_property` NaN | fixed — a detached L0 tier, not fork-specific |
+| D8 arena aggregation | `arena_freeze`+`spmv`, plus `arena_seed` for growing networks |
+| **D9 arena columns** | **fixed** — `rekey(col, g)` before `emit` |
+| two wrong hints | corrected, with the missing guard added |
+| `arena_link` record | confirmed — it exists and works, as you said |
+
+Nothing on your list is outstanding. The one boundary we have not lifted, and are
+not planning to without input from you, is per-row egress for arena *newborns*:
+`emit` keys `nodeId` to the projection, and a node created inside a CALL has no
+store identity. Aggregates work today. If you have a preferred semantics for
+identifying newborns on the way out, that is the input we need.
+
+Thank you for the rigour of these reports — the repro paths, the "measured, not
+inferred" discipline, and especially the table of eight things you tried before
+filing D9. That table is what turned a vague regression into a same-day fix, and
+it is what told us which five names to publish `rekey` under.

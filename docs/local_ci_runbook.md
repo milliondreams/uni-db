@@ -217,12 +217,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace \
 ```bash
 ( cd bindings/uni-db
   uv sync --group dev --extra notebook-runtime
+  rm -f dist/*.whl                         # else the glob below matches two versions
   uv run maturin build --out dist          # RELEASE wheel — long build
-  uv pip install --force-reinstall dist/*.whl )
+  uv pip install --force-reinstall dist/*.whl
+  # Assert the notebooks will actually run against what was just built.
+  .venv/bin/python3 -c "from importlib.metadata import version; print(version('uni-db'))" )
 
 # Run the 6 notebooks SERIALLY (they fail spuriously under concurrent CPU/GIL load).
+# `--no-sync` is REQUIRED: a plain `uv run` re-syncs the project, uninstalls the wheel
+# installed above and restores the editable install, so the notebooks would silently
+# exercise a `maturin develop` build instead of the release wheel.
 for nb in semiconductor pharma cyber predictive_maintenance adverse_drug_reaction drug_drug_interaction; do
-  uv run --project bindings/uni-db python website/scripts/verify_${nb}_flagship_notebook.py
+  uv run --no-sync --project bindings/uni-db python website/scripts/verify_${nb}_flagship_notebook.py
 done
 ```
 
@@ -253,6 +259,11 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
 - **`RUSTC_WRAPPER=""`** — see §0. Unset any global wrapper for cargo/maturin.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
+- **`uv run` silently reverts a wheel install.** `uv run` syncs the project environment
+  first, which uninstalls anything `uv pip install`-ed over the editable project and restores
+  the editable install. In the notebooks job that means the built wheel is discarded before a
+  single notebook runs, and the job passes having tested a `maturin develop` build. Pass
+  `--no-sync` (or invoke `.venv/bin/python3` directly) whenever the installed artifact matters.
 - **Stale wheels in `bindings/uni-db/dist/` after a version bump** — the notebooks job does
   `uv pip install --force-reinstall dist/*.whl`, and that glob matches *every* wheel ever built
   there. Two versions present makes `uv` refuse with "Requirements contain conflicting URLs for

@@ -289,29 +289,56 @@ jobs:
 
       - name: Build Python wheel (uni-db)
         working-directory: bindings/uni-db
-        run: uv run maturin build --out dist
+        # Clear `dist/` first. The install below globs `dist/*.whl`, so a wheel
+        # left from an earlier build — a cached runner, or a local replication
+        # after a version bump — makes `uv` refuse two conflicting URLs for one
+        # package. The failure is mild; what it hides is not, see the guard below.
+        run: |
+          rm -f dist/*.whl
+          uv run maturin build --out dist
 
       - name: Install built wheel (uni-db)
         working-directory: bindings/uni-db
         run: uv pip install --force-reinstall dist/*.whl
 
+      # NOTE: every `uv run` below passes `--no-sync`. Without it uv re-syncs the
+      # project on each invocation, uninstalling the wheel installed above and
+      # restoring the editable install — so the build+install steps are discarded
+      # and the notebooks silently exercise a `maturin develop` build instead.
+      - name: Verify the notebooks will run against the built wheel
+        working-directory: bindings/uni-db
+        # Without this, a failed build or install leaves the *previous* install in
+        # place and every notebook below still passes — reporting success while
+        # never touching the artifact this job exists to verify. Assert the
+        # installed distribution is the version the workspace declares.
+        run: |
+          WANT=$(python3 -c "import tomllib,pathlib; \
+            print(tomllib.loads(pathlib.Path('../../Cargo.toml').read_text())\
+            ['workspace']['package']['version'])")
+          GOT=$(uv run --no-sync python -c "from importlib.metadata import version; print(version('uni-db'))")
+          echo "workspace declares $WANT; installed is $GOT"
+          test "$WANT" = "$GOT" || {
+            echo "::error::notebooks would run against uni-db $GOT, not the built $WANT"
+            exit 1
+          }
+
       - name: Execute flagship Locy notebook (semiconductor)
-        run: uv run --project bindings/uni-db python website/scripts/verify_semiconductor_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_semiconductor_flagship_notebook.py
 
       - name: Execute flagship Locy notebook (pharma batch genealogy)
-        run: uv run --project bindings/uni-db python website/scripts/verify_pharma_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_pharma_flagship_notebook.py
 
       - name: Execute flagship Locy notebook (cyber exposure twin)
-        run: uv run --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
 
       - name: Execute flagship Locy notebook (predictive maintenance)
-        run: uv run --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
 
       - name: Execute flagship Locy notebook (adverse drug reaction)
-        run: uv run --project bindings/uni-db python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
 
       - name: Execute flagship Locy notebook (drug-drug interaction)
-        run: uv run --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
+        run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
 
   # Release-path guards. Feature drift (a wheel variant missing a plugin feature)
   # and an incomplete crates.io publish list slip through the workspace build and

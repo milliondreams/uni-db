@@ -4083,6 +4083,85 @@ fn the_arena_spmv_hint_composition_actually_runs() {
     );
 }
 
+/// `interp` is the SD table function, checked against a hand oracle.
+///
+/// Breakpoints (0,0), (1,2), (3,3): slope 2 then 0.5, clamped outside. The
+/// composition this replaces was proven correct first — a per-segment ramp gated
+/// on `compare` — and measured at ~14 passes over `[V]` per segment, which is why
+/// this exists as a kernel rather than only as a published recipe.
+#[test]
+fn interp_evaluates_a_table_function_with_clamped_ends() {
+    let (mut s, g) = session_with(build_projection(&[0, 1, 2, 3, 4, 5], &[], false, false));
+    let xs = [0.0_f64, 1.0, 3.0];
+    let ys = [0.0_f64, 2.0, 3.0];
+
+    // below range | exact knot | mid-segment | exact knot | mid-segment | above
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![-1.0, 0.0, 0.5, 1.0, 2.0, 9.0]))
+        .expect("x");
+    let out = s.interp(x, &xs, &ys).expect("interp");
+    let got = s.tensor_values_for_test(out);
+    for (i, want) in [0.0_f64, 0.0, 1.0, 2.0, 2.5, 3.0].iter().enumerate() {
+        assert!(
+            (got[i] - want).abs() < 1e-12,
+            "slot {i}: got {}, want {want}",
+            got[i]
+        );
+    }
+
+    // One pass, not one per segment.
+    let before = s.spent_for_test();
+    let _ = s.interp(x, &xs, &ys).expect("second interp");
+    assert_eq!(
+        s.spent_for_test() - before,
+        6,
+        "interp must charge one pass over [V], independent of breakpoint count"
+    );
+
+    // Shape and provenance survive, so an [E] curve stays [E].
+    let e = s.edge_weights(g).expect("edge weights");
+    let ei = s.interp(e, &xs, &ys).expect("interp on [E]");
+    assert!(
+        s.tensor_for_test(ei).expect("tensor").is_edge_shaped(),
+        "an [E] input must yield an [E] result"
+    );
+}
+
+/// Malformed breakpoints are named, not silently reinterpreted.
+#[test]
+fn interp_rejects_a_curve_it_cannot_evaluate() {
+    let (mut s, _g) = session_with(build_projection(&[0, 1], &[], false, false));
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![0.5, 0.5]))
+        .expect("x");
+
+    for (xs, ys, needle) in [
+        (vec![1.0], vec![1.0], "at least two"),
+        (vec![0.0, 1.0], vec![1.0], "y-breakpoints"),
+        // Not merely unsorted — a repeated x makes the segment slope infinite.
+        (
+            vec![0.0, 1.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+            "strictly increase",
+        ),
+        (
+            vec![0.0, 2.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+            "strictly increase",
+        ),
+        (vec![0.0, f64::NAN], vec![0.0, 1.0], "NaN"),
+    ] {
+        let err = s
+            .interp(x, &xs, &ys)
+            .expect_err("a malformed curve must be rejected");
+        assert!(
+            err.message.contains(needle),
+            "error must mention `{needle}`, got: {}",
+            err.message
+        );
+    }
+}
+
 /// `rekey` is a verified move between projections, not a cast.
 ///
 /// It is the escape hatch that makes named scopes useful: two edge layers over

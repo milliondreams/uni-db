@@ -210,7 +210,7 @@ This fires on both the op-string form (`ewise(a, b, "gt")`) and the method form 
 
 ## Kernel catalogue
 
-70 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
+71 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -241,6 +241,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | Kernel | Returns |
 | --- | --- |
 | `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
+| `interp(x, xs, ys)` | Piecewise-linear table lookup — the System Dynamics table function. Interpolates `x` through the `(xs[i], ys[i])` breakpoints and **clamps** outside the range, the Vensim `WITH LOOKUP` convention. One pass over `[V]`, independent of breakpoint count. Shape-preserving. |
 | `compare(a, b, op)` | Elementwise `gt` / `ge` / `lt` / `le` / `eq` / `ne`, yielding a 1.0/0.0 mask. Shape-preserving, so an `[E]` comparison yields an `[E]` mask. |
 | `work_budget()` / `work_spent()` / `work_remaining()` | The native-work meter. Reading costs nothing — see the budget section below. |
 | `zero_map(g)` | A zeroed `[V]` map. |

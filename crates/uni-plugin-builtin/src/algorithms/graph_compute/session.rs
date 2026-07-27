@@ -754,6 +754,30 @@ pub trait GraphCompute {
     /// space, an i64 operand, or an exhausted budget/arena.
     fn compare(&mut self, a: Handle, b: Handle, op: CmpOp) -> Result<Handle, FnError>;
 
+    /// Group 0: piecewise-linear table lookup — the System Dynamics `interp`.
+    ///
+    /// Maps each element of `x` through the curve defined by the breakpoints
+    /// `(xs[i], ys[i])`, interpolating linearly between them and **clamping**
+    /// outside the range (`x < xs[0]` yields `ys[0]`, `x > xs[last]` yields
+    /// `ys[last]`). That is the Vensim/Stella `WITH LOOKUP` convention, and it is
+    /// what makes a table function safe to evaluate on an unbounded state
+    /// variable.
+    ///
+    /// This *is* composable from shipped kernels — a per-segment ramp gated on
+    /// `compare`, summed — but the composition costs roughly 14 passes over `[V]`
+    /// per segment, so a ten-point table runs ~126x the work of this one pass.
+    /// The work meter charges all of it, which is what makes the native kernel
+    /// worth its catalog slot rather than a published recipe alone.
+    ///
+    /// Shape- and provenance-preserving: an `[E]` input yields an `[E]` result.
+    /// Charges `O(V)` (the per-element breakpoint search is logarithmic).
+    ///
+    /// # Errors
+    /// `0x862` for an i64 input; `0x86E` if fewer than two breakpoints are given,
+    /// if `xs` and `ys` differ in length, if any value is NaN, or if `xs` is not
+    /// strictly increasing — naming the index where the ordering breaks.
+    fn interp(&mut self, x: Handle, xs: &[f64], ys: &[f64]) -> Result<Handle, FnError>;
+
     /// Group 0: lifts a set into a map, assigning `value` to set members.
     ///
     /// # Errors
@@ -1370,6 +1394,74 @@ impl GraphCompute for AlgoSession {
             reason = "budgets are far below f64's exact-integer range"
         )]
         Ok(self.budget.remaining() as f64)
+    }
+
+    fn interp(&mut self, x: Handle, xs: &[f64], ys: &[f64]) -> Result<Handle, FnError> {
+        if xs.len() < 2 {
+            return Err(error::arg_validation(format!(
+                "interp needs at least two breakpoints to define a curve, got {}",
+                xs.len()
+            )));
+        }
+        if xs.len() != ys.len() {
+            return Err(error::arg_validation(format!(
+                "interp: {} x-breakpoints but {} y-breakpoints",
+                xs.len(),
+                ys.len()
+            )));
+        }
+        if let Some(i) = xs.iter().chain(ys).position(|v| v.is_nan()) {
+            return Err(error::arg_validation(format!(
+                "interp: breakpoint {i} is NaN, which has no position on the curve"
+            )));
+        }
+        // Strictly increasing, not merely sorted: a repeated x would make the
+        // segment slope infinite, and the caller almost certainly meant a step.
+        if let Some(i) = (1..xs.len()).find(|&i| xs[i] <= xs[i - 1]) {
+            return Err(error::arg_validation(format!(
+                "interp: x-breakpoints must strictly increase, but xs[{}] = {} is not \
+                 greater than xs[{}] = {}",
+                i,
+                xs[i],
+                i - 1,
+                xs[i - 1]
+            )));
+        }
+        let t = self.table.get_tensor(x)?;
+        if t.is_i64() {
+            return Err(error::shape_mismatch(
+                "interp requires an f64 map; an integer curve is not meaningful",
+            ));
+        }
+        let (shape, origin) = (t.shape(), t.origin());
+        let src = t.values().to_vec();
+        self.charge(src.len() as u64)?;
+
+        let out: Vec<f64> = src
+            .iter()
+            .map(|&v| {
+                if v.is_nan() {
+                    return f64::NAN;
+                }
+                // Clamp outside the table, which is the whole point of the
+                // convention: a state variable that wanders past the last
+                // breakpoint saturates rather than extrapolating to nonsense.
+                if v <= xs[0] {
+                    return ys[0];
+                }
+                if v >= xs[xs.len() - 1] {
+                    return ys[ys.len() - 1];
+                }
+                // `partition_point` is the binary search; `i` is the first
+                // breakpoint strictly greater than `v`, so the segment is i-1..i
+                // and both indices are in range given the clamps above.
+                let i = xs.partition_point(|&b| b <= v);
+                let (x0, x1) = (xs[i - 1], xs[i]);
+                let (y0, y1) = (ys[i - 1], ys[i]);
+                y0 + (v - x0) * (y1 - y0) / (x1 - x0)
+            })
+            .collect();
+        self.alloc_tensor(Tensor::from_f64_shaped(out, shape), origin)
     }
 
     fn compare(&mut self, a: Handle, b: Handle, op: CmpOp) -> Result<Handle, FnError> {

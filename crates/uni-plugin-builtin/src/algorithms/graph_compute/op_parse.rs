@@ -317,6 +317,14 @@ pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
         "edge_mask_window(edge_property(g, prop), 0.5, 1.5)",
     ),
     (
+        // `interp` itself is a real kernel now, so it must NOT appear here — the
+        // shadowing guard enforces that. These are the names a modeller reaches
+        // for coming from Vensim/Stella.
+        &["lookup", "table", "with_lookup", "withlookup", "piecewise"],
+        "a table function (piecewise-linear lookup with clamped ends)",
+        "interp(x, xs, ys)",
+    ),
+    (
         &[
             "arena_to_map",
             "to_map",

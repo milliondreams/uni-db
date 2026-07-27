@@ -775,6 +775,16 @@ impl GcSession {
             .map_err(py_err)
     }
 
+    /// Piecewise-linear table lookup over `(xs, ys)` breakpoints.
+    fn interp(&self, x: i64, xs: Vec<f64>, ys: Vec<f64>) -> PyResult<i64> {
+        self.check_deadline()?;
+        self.session
+            .lock()
+            .interp(from_i64(x), &xs, &ys)
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
     /// Re-keys a `[V]` value into another projection's index space, verified.
     fn rekey(&self, value: i64, g: i64) -> PyResult<i64> {
         self.check_deadline()?;

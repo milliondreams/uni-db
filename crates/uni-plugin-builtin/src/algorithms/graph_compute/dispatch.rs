@@ -104,6 +104,12 @@ pub struct KernelRequest {
     /// Seed vertex ids (for `frontier`).
     #[serde(default)]
     pub seeds: Vec<i64>,
+    /// `interp` x-breakpoints (strictly increasing).
+    #[serde(default)]
+    pub xs: Vec<f64>,
+    /// `interp` y-breakpoints, parallel to [`Self::xs`].
+    #[serde(default)]
+    pub ys: Vec<f64>,
     /// Column name (for a single-column `emit`).
     #[serde(default)]
     pub name: String,
@@ -472,6 +478,7 @@ impl GraphComputeRegistry {
                 .walk_visit_counts(from_i64(req.a), from_i64(req.g))
                 .map(h),
             KernelId::Rekey => session.rekey(from_i64(req.a), from_i64(req.g)).map(h),
+            KernelId::Interp => session.interp(from_i64(req.a), &req.xs, &req.ys).map(h),
             KernelId::EmitWalks => session
                 .emit_walks(from_i64(req.g))
                 .map(|()| KernelResponse::Unit),
@@ -789,6 +796,8 @@ mod tests {
             f2: 0.0,
             k: 0,
             want_max: false,
+            xs: Vec::new(),
+            ys: Vec::new(),
             wl: 0,
             wn: 0,
             p: 1.0,

@@ -735,6 +735,27 @@ impl GcSession {
             .map_err(rt)
     }
 
+    /// Piecewise-linear table lookup over `(xs, ys)` breakpoints.
+    fn interp(&mut self, x: i64, xs: Array, ys: Array) -> Result<i64, Box<EvalAltResult>> {
+        let to_vec = |a: Array, which: &str| -> Result<Vec<f64>, Box<EvalAltResult>> {
+            a.into_iter()
+                .map(|d| {
+                    d.as_float()
+                        .or_else(|_| d.as_int().map(|i| i as f64))
+                        .map_err(|t| {
+                            rt(FnError::new(
+                                0x86E,
+                                format!("interp {which}-breakpoints must be numbers, got {t}"),
+                            ))
+                        })
+                })
+                .collect()
+        };
+        let (xs, ys) = (to_vec(xs, "x")?, to_vec(ys, "y")?);
+        let mut s = self.session.lock();
+        s.interp(from_i64(x), &xs, &ys).map(to_i64).map_err(rt)
+    }
+
     /// Re-keys a `[V]` value into another projection's index space, verified.
     fn rekey(&mut self, value: i64, g: i64) -> Result<i64, Box<EvalAltResult>> {
         let mut s = self.session.lock();
@@ -1076,6 +1097,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         SpmvMasked => GcSession::spmv_masked,
         WalkVisitCounts => GcSession::walk_visit_counts,
         Rekey => GcSession::rekey,
+        Interp => GcSession::interp,
         ArenaSeed => GcSession::arena_seed,
         EmitWalks => GcSession::emit_walks,
         NeighborhoodOverlap => GcSession::neighborhood_overlap,

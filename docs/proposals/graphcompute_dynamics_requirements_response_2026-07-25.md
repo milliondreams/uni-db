@@ -1521,3 +1521,103 @@ not have exercised, but it remains unexplained and unreproduced. If it recurs,
 `UNI_GC_TRACE=1` now attaches a bounded handle-resolution trail to any handle
 error *and* to budget/timeout aborts, which is the forensic hook that did not
 exist when you first filed it.
+
+---
+
+# Part X — REQ-D8, specifically
+
+Your §0 corrections and the D9–D12 rows are current, but the D8 *section* is still
+the original text, and two of its three load-bearing facts no longer hold. Since
+you cite them as the reason Tier-C ships as capacity + alive-mask, they are worth
+restating precisely.
+
+## 47. Fact by fact
+
+**(2) "No aggregation over arena links" — wrong, and now working.**
+`arena_freeze` compacts an arena into an ordinary graph handle, so the
+composition is *freeze, then `spmv`*. No `arena_spmv` is needed.
+
+You measured this failing, and you were not wrong to: our own index-space work
+had broken it. An arena column is `Origin::Arena`, a frozen graph is
+`Origin::Graph`, and the two did not unify — so the composition our hint
+recommended genuinely did not run on the build you tested. Fixed in `843bd3782`,
+and there is now a test that executes the published hint **verbatim**, because a
+composition we publish and never run is a claim rather than a fact.
+
+**(1) "`spmv` is restricted to the projected node set, so a newborn can never have
+neighbours" — wrong for the arena.** The frozen arena graph has its own `V`,
+equal to the arena's live slot count, and is independent of the CALL-site scope.
+
+What was genuinely missing is the other half, and it now ships: `arena_seed(a, g)`
+copies an existing projection's topology into an empty arena, so a simulation over
+a network that already exists can grow *into* it rather than starting from
+nothing. Slot `i` of the arena is vertex `i` of `g`; newborns take slots `V..` and
+extend the vertex set rather than colliding with it.
+
+```rhai
+let a  = gc.arena_new(capacity, max_degree);
+let s  = gc.arena_seed(a, g);        // the store's network, slot-for-slot
+let n  = gc.arena_alloc(a, births);  // newborns take slots V..
+gc.arena_link(a, parents, n);
+let gg = gc.arena_freeze(a);         // aggregate over the whole thing
+let agg = gc.spmv(gg, col, "linear_algebra", "out");
+```
+
+**(3) "Arena capacity is a hard ceiling" — correct, and unaddressed.** There is no
+`grow`/`resize`/`realloc`; `alloc` bumps a counter and errors past `capacity`.
+
+But the ceiling is *yours to choose*, not the `4` your probe hit. The footprint is
+`(capacity x branching + 2 x capacity) x 4` bytes plus `columns x capacity x 8`,
+against a 256 MB session cap — so with `branching = 8` and no state columns that
+is ~6.7M slots, and ~16.7M at `branching = 2`. Each state column costs
+`capacity x 8` more. Sizing for the worst case up front is the constraint; running
+out at realistic population sizes is not.
+
+One caveat found while testing this: every `arena_freeze` used to leak a handle
+slot permanently, so a grow/freeze loop — the natural per-tick shape — aborted at
+the handle budget with a `0x864` the guest could not attribute to anything, since
+it had freed everything it allocated. Fixed in `bbe8e838e`. Had you built on the
+composition before that, you would have hit it.
+
+## 48. So: your Tier-C conclusion may be worth revisiting
+
+You wrote that "the arena would *not* have lifted either, given (1) and (3)".
+(3) stands; (1) does not. With `arena_seed` the arena is a genuine dynamic graph
+substrate over an existing network, and the remaining cost is a pre-declared
+capacity rather than an inability to have neighbours.
+
+That is offered as input, not a recommendation. Capacity + alive-mask is entirely
+verified Tier-A and stays in one CALL, and its costs — a population ceiling and
+newborns inheriting a recycled slot's graph position — are real but bounded. The
+arena route trades the recycled-slot artefact for a pre-declared ceiling and one
+more kernel in the loop. You are better placed than we are to judge which is
+cheaper for M4.
+
+## 49. Two design questions we are *not* answering unilaterally
+
+**Newborn identity on egress.** `emit` keys `nodeId` to the projection, and a node
+created inside a CALL has no store identity — so per-row egress for genuinely new
+slots has no destination. Aggregates work today, and your `rekey` suggestion
+(adopted: the check is now on the *value's* length, not the arena's total live
+slots) makes subset egress work. Neither answers "what *is* the id of a node that
+was never persisted?" Options we can see: emit a dense local index and let the
+caller join; require newborns to be materialised in the store first, which defeats
+the point; or add a `nodeId`-free ragged egress alongside `emit_pairs`. We would
+rather implement your answer than guess.
+
+**Whether the arena should grow at all.** A `realloc` path is implementable, but
+it would invalidate every outstanding slot-id tensor the guest holds — the same
+class of hazard as index-space drift, and harder to check. Given the headroom
+above, pre-declaring capacity may simply be the right contract. If you hit the
+ceiling in practice with realistic sizing, say so and we will design the growth
+path properly rather than bolting one on.
+
+## 50. Status
+
+| D8 sub-claim | state |
+|---|---|
+| aggregation over arena links | **works** — `arena_freeze` + `spmv`, hint tested verbatim |
+| newborns can have neighbours | **works** — `arena_seed` imports the existing network |
+| arena capacity is fixed | **true**, guest-chosen, ~6.7M slots at `branching = 8` |
+| grow/freeze loops survive | **fixed** — the per-freeze handle leak is gone |
+| per-row egress for newborns | **open**, pending your semantics |

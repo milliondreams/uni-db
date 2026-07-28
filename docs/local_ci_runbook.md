@@ -264,6 +264,15 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
 - **`RUSTC_WRAPPER=""`** — see §0. Unset any global wrapper for cargo/maturin.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
+- **A version bump does not reach the editable install.** `bindings/uni-db` declares
+  `dynamic = ["version"]`, so maturin derives the version from `Cargo.toml` — but uv caches the
+  built editable metadata and does not invalidate it when only `Cargo.toml` moves. After a
+  release bump the venv keeps reporting the *old* version indefinitely, so
+  `importlib.metadata.version('uni-db')` is not a trustworthy freshness check on its own.
+  `maturin develop` writes the right version; the next `uv run`/`uv sync` clobbers it again from
+  cache. Fix with `uv sync --reinstall-package uni-db` (add `--extra notebook-runtime` if you
+  need it, or the sync strips numpy/onnxruntime/protobuf). `uv cache clean uni-db` alone is not
+  enough — sync still treats the existing install as satisfying.
 - **`uv run` silently reverts a wheel install.** `uv run` syncs the project environment
   first, which uninstalls anything `uv pip install`-ed over the editable project and restores
   the editable install. In the notebooks job that means the built wheel is discarded before a

@@ -1407,3 +1407,117 @@ Thank you for the rigour of these reports — the repro paths, the "measured, no
 inferred" discipline, and especially the table of eight things you tried before
 filing D9. That table is what turned a vague regression into a same-day fix, and
 it is what told us which five names to publish `rekey` under.
+
+---
+
+# Part IX — response to the 3.1.0 adoption round (D10, D11, D12)
+
+## 42. Both bugs are fixed, verified against your repro scripts
+
+**REQ-D11 — edge properties degenerate after ~300 write transactions.** Real, ours,
+and the worst shape a bug can take. Your repro now passes 400/400.
+
+The cause: adjacency compaction folds topology into the L2 table — which carries
+only `src_vid` / `neighbors` / `edge_ids` — and then physically deletes the delta
+rows it incorporated, on the stated invariant that "edge properties survive in
+`main_edges` (dual-written during flush)". Both sibling readers honour that: the
+single-EID path and the per-type batch path each fall back to `MainEdgeDataset`.
+`get_batch_edge_props` — the one a projection calls — did not. So from the *first*
+compaction it returned nothing for every EID and never recovered.
+
+Your two questions, answered:
+
+- **Is the column invalidated by a flush without being rebuilt?** Not by the
+  flush — flush preserves edge properties in both places. It is *compaction*, and
+  flushes only drive the `l1_runs` counter to the compaction threshold. That is
+  why write volume shifted the onset without changing the outcome.
+- **Should `edge_mask_window` on a degenerate column error rather than return an
+  empty mask?** We think not, and your evidence is why. NaN failing `v >= lo &&
+  v <= hi` is correct IEEE behaviour, and a legitimately NaN-valued edge should
+  simply not be selected. What was wrong was upstream: the column should never
+  have been NaN. Making the mask kernel loud would have converted a silent zero
+  into a noisy error at the wrong layer, and left the actual defect in place.
+
+Your diagnosis was right in every particular that mattered, and the sentence that
+made it tractable was: *the second mask's window spans every representable value
+— yet it fails too, so the mask is empty rather than built from wrong values.*
+That is the observation that turns "a masked traversal is wrong" into "the column
+is not there".
+
+**REQ-D12 — `in_memory()` + `shutdown()` strands its scratch directory.** Fixed;
+0/300 leaked, from 8/300.
+
+Our first attempt was wrong and worth recording: we assumed a `remove_dir_all`
+race and added a retry. The leak got *worse*. The actual cause is that the Python
+`shutdown()` called `flush()` and returned — real teardown was left to `Drop` at
+garbage-collection time, which *signals* the background tasks without awaiting
+them, and the `TempDir` then removed the directory while writers were still
+finishing. So both your questions have the same answer, yes:
+
+- **Should `shutdown()` be synchronous with respect to the background writer?**
+  It now is. `Uni::shutdown_in_place` gives a shared handle the real shutdown that
+  `shutdown(self)` structurally could not, and both Python facades call it.
+- **Should a failure to remove the directory be surfaced?** Yes. It now retries
+  briefly and warns rather than passing over it. You were right that this, not
+  the cleanup, was the ask.
+
+## 43. REQ-D10 — `edge_from_nodes`
+
+```rhai
+let x     = gc.node_property(g, "opinion");
+let diff  = gc.edge_from_nodes(g, x, "absdiff");   // |x[dst] - x[src]| per edge
+let close = gc.map_to_set(diff, "lt", epsilon);    // [E] mask -> EdgeSet
+let agg   = gc.spmv_masked(g, x, "linear_algebra", close);
+```
+
+`op` is `src` / `dst` / `sub` / `absdiff` / `add` / `min` / `max`, and the result
+is `[E]` in CSR out-edge order. The test runs bounded confidence end to end,
+because a kernel that does not unblock the stated use case has not answered the
+ask. `edge_endpoints`, `node_to_edge` and two more spellings point at it.
+
+## 44. You were right about `rekey`, and we were wrong about our own note
+
+**The rekey check now compares the value's length**, not the arena's total live
+slots — your suggestion, and the correct one. Subset egress works directly: an
+arena holding root + K arms, gathering the K arms against a projection sized to
+K. You worked around it by reshaping the projection and said so; the workaround
+should not have been necessary.
+
+**And the edge-shaped-compare note in this document was wrong.** You measured that
+`map_to_set` over an `[E]` property produces a mask `spmv_masked` accepts, and
+you are right. That note was true when written against 3.0.2 — and `7b9846a2b`,
+later in this same track, by us, made `map_to_set` shape-polymorphic without
+anyone revisiting the analysis that named the gap. So you spent effort disproving
+a claim we had already fixed and never retracted. The line is struck rather than
+deleted, since you measured against it.
+
+That is precisely the failure this document spends its length describing in your
+reports, occurring in ours. Noted without qualification.
+
+## 45. Where the count stands
+
+By our own framing this is the fifth discoverability failure on this track, and
+the second where the stale claim was ours rather than an unfound capability. Your
+§0 post-mortem sets out probe rules for your side; the symmetric obligation on
+ours is that a document consumers act on must be corrected when the code moves
+under it. We have no mechanism for that today beyond noticing, which is what
+failed here.
+
+## 46. Status
+
+| ask | state |
+|---|---|
+| D1–D8 | closed (see Parts VII–VIII) |
+| **D9** | closed — you adopted it |
+| **D10** node→edge gather | **shipped** — `edge_from_nodes` |
+| **D11** edge properties after compaction | **fixed** — your repro passes 400/400 |
+| **D12** scratch-directory leak | **fixed** — 0/300, and `shutdown()` now really shuts down |
+| rekey subset egress | **adopted** — your suggestion, length not slot count |
+| our edge-shaped-compare note | **retracted** — you were right |
+
+Still open, and genuinely: **REQ-D3**, the rare wrong-value CALL. Both questions
+are answered and two real L0-detachment bugs were fixed on paths you may or may
+not have exercised, but it remains unexplained and unreproduced. If it recurs,
+`UNI_GC_TRACE=1` now attaches a bounded handle-resolution trail to any handle
+error *and* to budget/timeout aborts, which is the forensic hook that did not
+exist when you first filed it.

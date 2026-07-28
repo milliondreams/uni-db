@@ -344,10 +344,14 @@ impl AsyncDatabase {
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Shutdown on exit.
+        // Shutdown on exit — really, not just a flush. The sync facade's
+        // `__exit__` delegates to `shutdown`; this one open-coded a flush, so
+        // `async with AsyncUni.in_memory() as db:` left the background tasks
+        // running and stranded the scratch directory on exit. That is the
+        // idiomatic path, so it leaked more often than the explicit call did.
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _ = inner.flush().await;
+            let _ = inner.shutdown_in_place().await;
             Ok(false)
         })
     }

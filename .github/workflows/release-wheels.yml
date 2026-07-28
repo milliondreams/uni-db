@@ -177,7 +177,7 @@ jobs:
           RUSTFLAGS: ""
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
           manylinux: 2_28
           before-script-linux: |
             yum install -y openssl-devel unzip
@@ -231,7 +231,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}-apple-darwin
-          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -253,7 +253,13 @@ jobs:
     if: github.repository == 'rustic-ai/uni-db'
     name: Build ${{ matrix.variant }} macOS wheels (aarch64)
     needs: [validate]
-    runs-on: macos-latest
+    # xlarge, not large: `large` is Intel x86_64, `xlarge` is Apple Silicon —
+    # this job targets aarch64-apple-darwin with Metal, so it wants a native
+    # arm64 host. Upgraded from the default macos-latest (7 GB) because the
+    # `dist` profile lowers codegen-units, which raises peak rustc RSS past
+    # 7 GB and would OOM this job. xlarge is 14 GB, so keep codegen-units
+    # high enough that peak RSS stays comfortably under that.
+    runs-on: macos-latest-xlarge
     strategy:
       fail-fast: false
       matrix:
@@ -277,7 +283,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: aarch64-apple-darwin
-          args: --release --strip --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --strip --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -314,7 +320,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64-pc-windows-msvc
-          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -366,7 +372,7 @@ jobs:
           RUSTFLAGS: ""
         with:
           target: x86_64
-          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
           manylinux: 2_28
           before-script-linux: |
             yum install -y openssl-devel unzip
@@ -482,7 +488,7 @@ jobs:
           CUDA_COMPUTE_CAP: "80"
         with:
           target: x86_64
-          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          args: --profile dist --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
           manylinux: 2_34
           before-script-linux: |
             set -euxo pipefail

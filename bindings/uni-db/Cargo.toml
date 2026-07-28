@@ -42,10 +42,14 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
-# The standard wheel ships the WASM loaders. Variant wheel crates
-# (uni-db-onnx / -cuda / -metal) reuse this source with their own feature
-# sets; without these features the WASM wrapper methods compile out.
-default = ["wasm-plugins", "extism-plugins"]
+# No WASM loaders by default, matching the variant wheel crates
+# (uni-db-onnx / -cuda / -metal), which reuse this source and already ship
+# without them. Both loaders route through wasmtime + cranelift (extism pulls
+# wasmtime on its own path, so dropping only `wasm-plugins` reclaims nothing)
+# — together ~7 MiB of .text for a capability no first-party plugin uses.
+# Enable explicitly for a source build: `--features wasm-plugins,extism-plugins`.
+# Without them the WASM wrapper methods compile out.
+default = []
 # Expose `Database.load_wasm_component` to Python (wasmtime Component Model).
 wasm-plugins = ["dep:uni-plugin-wasm", "dep:uni-plugin-builtin", "uni-db/wasm-plugins"]
 # Expose `Database.load_wasm_extism` to Python (wasmtime + extism).

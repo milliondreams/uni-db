@@ -76,6 +76,7 @@ pub mod repro_config_path_plugin_registry;
 pub mod repro_commit_timeout_after_durable;
 // Correctness-scan Wave 4 repro (fork-local index-kind collision).
 pub mod repro_fork_index_kind_collision;
+pub mod shutdown_reaps_scratch_dir;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;

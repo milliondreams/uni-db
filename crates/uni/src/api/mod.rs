@@ -2847,6 +2847,23 @@ impl Uni {
     /// This method flushes any pending data and waits for all background tasks to complete
     /// (with a timeout). After calling this method, the database instance should not be used.
     pub async fn shutdown(self) -> Result<()> {
+        self.shutdown_in_place().await
+    }
+
+    /// Shuts the database down without consuming it.
+    ///
+    /// [`Self::shutdown`] takes `self`, which a shared handle (an `Arc<Uni>`
+    /// behind a language binding) cannot satisfy — so the Python binding was
+    /// calling `flush()` and calling it a shutdown. Real teardown then only
+    /// happened at garbage-collection time through `Drop`, which *signals* the
+    /// background tasks and does not wait for them; a temporary database's
+    /// scratch directory was removed while writers were still finishing, and
+    /// survived a few percent of the time.
+    ///
+    /// # Errors
+    /// Propagates a failure to stop the background tasks. A flush failure is
+    /// logged rather than propagated, matching the previous behaviour.
+    pub async fn shutdown_in_place(&self) -> Result<()> {
         // Flush pending data.
         if let Some(writer) = &self.inner.writer {
             if let Err(e) = writer.flush_to_l1(None).await {
@@ -2868,7 +2885,49 @@ impl Uni {
             .shutdown_handle
             .shutdown_async()
             .await
-            .map_err(UniError::Internal)
+            .map_err(UniError::Internal)?;
+
+        self.reap_scratch_dir();
+        Ok(())
+    }
+
+    /// Removes an `in_memory()` database's scratch directory, loudly.
+    ///
+    /// A temporary database is only in-memory from the caller's side: it is
+    /// backed by a `uni_mem_*` directory whose removal is otherwise left to
+    /// `TempDir`'s `Drop`, which calls `remove_dir_all` and **discards the
+    /// error**. `remove_dir_all` is not atomic — it walks and unlinks, so a
+    /// background manifest write landing between the walk and the final `rmdir`
+    /// fails with `ENOTEMPTY` and the directory survives silently. Measured at
+    /// ~3% of shutdowns, and the survivors never expire: a suite opening
+    /// thousands of databases strands tens per run, and on a tmpfs `/tmp` that
+    /// exhausts *inodes* rather than space — which presents as unrelated
+    /// "failed to create temporary directory" errors while `df -h` looks fine.
+    ///
+    /// Retries briefly to close the race, then warns rather than passing over
+    /// it, because a leak nobody is told about is the part that actually costs
+    /// time. `TempDir`'s own `Drop` remains as the backstop for callers that
+    /// never call `shutdown()`.
+    fn reap_scratch_dir(&self) {
+        let Some(dir) = self.inner._temp_dir.as_ref() else {
+            return;
+        };
+        let path = dir.path().to_path_buf();
+        for attempt in 0..5 {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) if attempt == 4 => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "shutdown could not remove the temporary database directory; it will \
+                         be left behind. Repeated leaks exhaust inodes on a tmpfs TMPDIR."
+                    );
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1))),
+            }
+        }
     }
 }
 

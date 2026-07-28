@@ -1216,8 +1216,15 @@ impl Database {
     /// Calls `flush()` for data safety. The actual shutdown occurs when the
     /// last reference is dropped (Python GC triggers Rust `Drop`).
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.flush()))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+        // Really shut down, rather than flushing and calling it one. Flushing
+        // left the background tasks running and the teardown to `Drop` at GC
+        // time, which only *signals* them — so a temporary database's scratch
+        // directory was removed while writers were still finishing and survived
+        // a few percent of the time. `shutdown_in_place` awaits them first.
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.shutdown_in_place())
+        })
+        .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get database-wide metrics.

@@ -912,6 +912,52 @@ impl PropertyManager {
             }
         }
 
+        // 4. Main-edges fallback — the delta tables are NOT the durable home of
+        // edge properties.
+        //
+        // Adjacency compaction folds topology into the L2 table (which carries
+        // only `src_vid`/`neighbors`/`edge_ids`) and then physically deletes the
+        // delta rows it incorporated, on the stated invariant that "edge
+        // properties survive in main_edges (dual-written during flush)". Both
+        // sibling readers honour that invariant — the single-EID path and the
+        // per-type batch path each fall back here — but this one did not, so
+        // from the first compaction onward it returned nothing for every EID and
+        // never recovered.
+        //
+        // The projection is the caller that made it visible: a missing property
+        // becomes `NaN`, `edge_mask_window` compares `v >= lo && v <= hi` which
+        // NaN fails under *any* window, so every masked traversal silently read
+        // zero after a few hundred write transactions. Weighted algorithms
+        // degraded at the same instant, defaulting to unit weights.
+        //
+        // Only unresolved EIDs pay the per-EID lookup, so the batch fast path is
+        // unchanged for edges whose properties are still in the delta runs.
+        {
+            use crate::storage::main_edge::MainEdgeDataset;
+            for &eid in eids {
+                if l0_visibility::is_edge_deleted(eid, ctx) {
+                    continue;
+                }
+                // This map is keyed by Vid-from-Eid, matching the delta scan above.
+                let key = uni_common::core::id::Vid::from(eid.as_u64());
+                let missing_any = match result.get(&key) {
+                    None => true,
+                    Some(found) => properties.iter().any(|p| !found.contains_key(*p)),
+                };
+                if !missing_any {
+                    continue;
+                }
+                if let Some(props) =
+                    MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+                {
+                    let entry = result.entry(key).or_default();
+                    for (k, v) in props {
+                        entry.entry(k).or_insert(v);
+                    }
+                }
+            }
+        }
+
         Ok(result)
     }
 

@@ -515,7 +515,8 @@ impl AsyncDatabase {
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            db.flush()
+            // Same correction as the sync facade: flushing is not shutting down.
+            db.shutdown_in_place()
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)
         })

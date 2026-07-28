@@ -40,7 +40,9 @@
 
 use uni_plugin::errors::FnError;
 
-use super::session::{CmpOp, Direction, EwiseOp, MapOp, Norm, OverlapMetric, Predicate, Semiring};
+use super::session::{
+    CmpOp, Direction, EndpointOp, EwiseOp, MapOp, Norm, OverlapMetric, Predicate, Semiring,
+};
 
 /// Declares each string vocabulary once and derives every projection of it.
 ///
@@ -155,6 +157,16 @@ op_families! {
         "le" => CmpOp::Le, CmpOp::Le;
         "eq" => CmpOp::Eq, CmpOp::Eq;
         "ne" => CmpOp::Ne, CmpOp::Ne;
+    }
+
+    Endpoint: EndpointOp, noun = "endpoint combination", scalars = () {
+        "src"     => EndpointOp::Src,     EndpointOp::Src;
+        "dst"     => EndpointOp::Dst,     EndpointOp::Dst;
+        "sub"     => EndpointOp::Sub,     EndpointOp::Sub;
+        "absdiff" => EndpointOp::AbsDiff, EndpointOp::AbsDiff;
+        "add"     => EndpointOp::Add,     EndpointOp::Add;
+        "min"     => EndpointOp::Min,     EndpointOp::Min;
+        "max"     => EndpointOp::Max,     EndpointOp::Max;
     }
 
     Predicate: Predicate, noun = "predicate", scalars = (threshold) {
@@ -315,6 +327,17 @@ pub const METHOD_RECIPES: &[(&[&str], &str, &str)] = &[
         &["edge_mask", "nonzero"],
         "an exact edge mask from a stored selector column",
         "edge_mask_window(edge_property(g, prop), 0.5, 1.5)",
+    ),
+    (
+        // The names reached for when wanting node values on edges.
+        &[
+            "edge_endpoints",
+            "endpoint_gather",
+            "node_to_edge",
+            "gather_endpoints",
+        ],
+        "bringing node values onto edges (an endpoint predicate)",
+        "edge_from_nodes(g, x, \"absdiff\")",
     ),
     (
         // `interp` itself is a real kernel now, so it must NOT appear here — the

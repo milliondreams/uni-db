@@ -192,6 +192,19 @@ It accepts `[V]` tensors and vertex sets. `[E]` values are refused: CSR edge ord
 
 ---
 
+### Rules over an edge's two endpoints
+
+Comparing edge *properties* has always worked. Comparing the two *endpoints* of an edge — the shape of every interaction rule — needs node values brought onto edges first, which is what `edge_from_nodes` does. Bounded-confidence opinion dynamics, in full:
+
+```rhai
+let x     = gc.node_property(g, "opinion");
+let diff  = gc.edge_from_nodes(g, x, "absdiff");   // |x[dst] - x[src]| per edge
+let close = gc.map_to_set(diff, "lt", epsilon);    // an [E] mask -> EdgeSet
+let agg   = gc.spmv_masked(g, x, "linear_algebra", close);
+```
+
+Reaching for `edge_endpoints` or `node_to_edge` answers with `edge_from_nodes(g, x, "absdiff")`. `map_to_set` is shape-polymorphic, so an `[E]` tensor lowers to the `EdgeSet` that `spmv_masked` and `expand_masked` consume — no separate edge-comparison kernel is needed.
+
 ## When a kernel you reached for isn't there
 
 The catalogue is closed on purpose — every kernel is native `O(V+E)` work, so the set is small and each addition is deliberate. That means you will sometimes reach for a name that does not exist. When the operation is nonetheless *expressible*, the error tells you how:
@@ -210,7 +223,7 @@ This fires on both the op-string form (`ewise(a, b, "gt")`) and the method form 
 
 ## Kernel catalogue
 
-71 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
+72 kernels. Every one is reachable from every loader, except `graph` and `graph_named` — sandboxed guests receive their projection handles in the invocation arguments rather than calling for them.
 
 Operands are handles (opaque integers) and small scalars. **No vertex data crosses the boundary.**
 
@@ -241,6 +254,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | Kernel | Returns |
 | --- | --- |
 | `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
+| `edge_from_nodes(g, x, op)` | Gather a `[V]` node value onto edges, yielding `[E]` in CSR out-edge order. `op` is `src` / `dst` / `sub` (`x[dst]-x[src]`) / `absdiff` / `add` / `min` / `max`. The bridge from node quantities to edge quantities — an interaction rule is a predicate over an edge's two endpoints, and nothing else brings node values onto edges. |
 | `interp(x, xs, ys)` | Piecewise-linear table lookup — the System Dynamics table function. Interpolates `x` through the `(xs[i], ys[i])` breakpoints and **clamps** outside the range, the Vensim `WITH LOOKUP` convention. One pass over `[V]`, independent of breakpoint count. Shape-preserving. |
 | `compare(a, b, op)` | Elementwise `gt` / `ge` / `lt` / `le` / `eq` / `ne`, yielding a 1.0/0.0 mask. Shape-preserving, so an `[E]` comparison yields an `[E]` mask. |
 | `work_budget()` / `work_spent()` / `work_remaining()` | The native-work meter. Reading costs nothing — see the budget section below. |

@@ -33,8 +33,8 @@ use uni_plugin::errors::FnError;
 use super::handle::Handle;
 use super::kernel_id::KernelId;
 use super::session::{
-    AlgoSession, CmpOp, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm,
-    OverlapMetric, Predicate, ReduceOp, Semiring,
+    AlgoSession, CmpOp, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
+    Norm, OverlapMetric, Predicate, ReduceOp, Semiring,
 };
 use super::value::Scalar;
 
@@ -479,6 +479,12 @@ impl GraphComputeRegistry {
                 .map(h),
             KernelId::Rekey => session.rekey(from_i64(req.a), from_i64(req.g)).map(h),
             KernelId::Interp => session.interp(from_i64(req.a), &req.xs, &req.ys).map(h),
+            KernelId::EdgeFromNodes => {
+                let op = EndpointOp::parse(&req.s)?;
+                session
+                    .edge_from_nodes(from_i64(req.g), from_i64(req.a), op)
+                    .map(h)
+            }
             KernelId::EmitWalks => session
                 .emit_walks(from_i64(req.g))
                 .map(|()| KernelResponse::Unit),

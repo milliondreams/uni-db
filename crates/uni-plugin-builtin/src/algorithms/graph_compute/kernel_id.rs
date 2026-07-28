@@ -94,6 +94,7 @@ kernels! {
     GraphNamed => "graph_named", HostSuppliedOtherwise;
     Rekey => "rekey", AllLoaders;
     Interp => "interp", AllLoaders;
+    EdgeFromNodes => "edge_from_nodes", AllLoaders;
     VertexCount => "vertex_count", AllLoaders;
     EdgeCount => "edge_count", AllLoaders;
     Degrees => "degrees", AllLoaders;

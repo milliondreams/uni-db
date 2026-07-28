@@ -153,6 +153,26 @@ pub enum ReduceOp {
 /// `map_to_set` lowers to a set, it cannot produce an `[E]` mask usable by
 /// `spmv_masked`. This is the direct form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointOp {
+    /// The source endpoint's value.
+    Src,
+    /// The destination endpoint's value.
+    Dst,
+    /// `x[dst] - x[src]`.
+    Sub,
+    /// `|x[dst] - x[src]|` — the distance between the endpoints' values, which
+    /// is what similarity and bounded-confidence rules threshold on.
+    AbsDiff,
+    /// `x[src] + x[dst]`.
+    Add,
+    /// `min(x[src], x[dst])`.
+    Min,
+    /// `max(x[src], x[dst])`.
+    Max,
+}
+
+/// An elementwise comparison operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     /// `a > b`.
     Gt,
@@ -778,6 +798,30 @@ pub trait GraphCompute {
     /// strictly increasing — naming the index where the ordering breaks.
     fn interp(&mut self, x: Handle, xs: &[f64], ys: &[f64]) -> Result<Handle, FnError>;
 
+    /// Group 0: gathers a `[V]` node value onto edges, yielding `[E]`.
+    ///
+    /// The bridge from node quantities to edge quantities. Comparing edge
+    /// *properties* was always possible, but nothing brought node values onto
+    /// edges — so a predicate over the two endpoints of an edge, which is what
+    /// interaction rules are made of, could not be expressed at all.
+    ///
+    /// `op` selects what lands on each edge, in CSR out-edge order:
+    /// - `"src"` / `"dst"` — the value at that endpoint,
+    /// - `"sub"` — `x[dst] - x[src]`, the signed difference,
+    /// - `"absdiff"` — `|x[dst] - x[src]`|,
+    /// - `"add"` / `"min"` / `"max"` — the corresponding combination.
+    ///
+    /// With this the rest composes from shipped kernels: bounded-confidence
+    /// opinion dynamics is `edge_from_nodes(g, op, "absdiff")` compared against
+    /// epsilon, lowered by `map_to_set`, and fed to `spmv_masked`.
+    ///
+    /// Charges `O(E)`. The result is `[E]`-shaped and keyed to `g`.
+    ///
+    /// # Errors
+    /// `0x862` if `x` is not a `[V]` f64 map matching the graph; `0x86E` for an
+    /// unknown `op`.
+    fn edge_from_nodes(&mut self, g: Handle, x: Handle, op: EndpointOp) -> Result<Handle, FnError>;
+
     /// Group 0: lifts a set into a map, assigning `value` to set members.
     ///
     /// # Errors
@@ -1394,6 +1438,51 @@ impl GraphCompute for AlgoSession {
             reason = "budgets are far below f64's exact-integer range"
         )]
         Ok(self.budget.remaining() as f64)
+    }
+
+    fn edge_from_nodes(&mut self, g: Handle, x: Handle, op: EndpointOp) -> Result<Handle, FnError> {
+        self.require_compatible_origins(
+            self.table.get_tensor(x)?.origin(),
+            Origin::Graph(g),
+            "edge_from_nodes",
+        )?;
+        let graph = Arc::clone(self.table.get_graph(g)?);
+        let n = graph.vertex_count();
+        let t = self.table.get_tensor(x)?;
+        if t.is_i64() {
+            return Err(error::shape_mismatch(
+                "edge_from_nodes requires an f64 [V] map",
+            ));
+        }
+        if t.is_edge_shaped() || t.len() != n {
+            return Err(error::shape_mismatch(format!(
+                "edge_from_nodes gathers node values onto edges, so it needs a [V] map \
+                 of {n} elements, got {}",
+                t.len()
+            )));
+        }
+        let vals = t.values().to_vec();
+        let e = graph.edge_count();
+        self.charge(e as u64)?;
+
+        // CSR out-edge order, which is the index space every [E] value uses.
+        let mut out = vec![0.0f64; e];
+        for u in 0..n as u32 {
+            let base = graph.out_edge_start(u);
+            for (k, &v) in graph.out_neighbors(u).iter().enumerate() {
+                let (a, b) = (vals[u as usize], vals[v as usize]);
+                out[base + k] = match op {
+                    EndpointOp::Src => a,
+                    EndpointOp::Dst => b,
+                    EndpointOp::Sub => b - a,
+                    EndpointOp::AbsDiff => (b - a).abs(),
+                    EndpointOp::Add => a + b,
+                    EndpointOp::Min => a.min(b),
+                    EndpointOp::Max => a.max(b),
+                };
+            }
+        }
+        self.alloc_tensor(Tensor::from_f64_edge(out), Origin::Graph(g))
     }
 
     fn interp(&mut self, x: Handle, xs: &[f64], ys: &[f64]) -> Result<Handle, FnError> {
@@ -2978,13 +3067,21 @@ impl GraphCompute for AlgoSession {
         // say what it means, at one call site, in the open.
         let src_h = match origin {
             Origin::Graph(h) => h,
-            Origin::Arena(a) => {
-                let slots = self.table.get_arena(a)?.len() as usize;
+            Origin::Arena(_) => {
+                // Compare the *value's* length, not the arena's total live slots.
+                // A guest that gathers a subset — the arms of a bandit, the
+                // frontier of a search — produces a column shorter than the arena
+                // and pairs it with a projection sized to that subset. Checking
+                // the arena's total refused exactly that, forcing the caller to
+                // reshape the projection around an implementation detail of the
+                // arena. The length is also the only thing that has to line up:
+                // slot i of the *value* is row i of the output either way.
+                let len = self.table.get_tensor(value)?.len();
                 let n = target.vertex_count();
-                if slots != n {
+                if len != n {
                     return Err(error::shape_mismatch(format!(
-                        "rekey: the arena holds {slots} live slots but the projection \
-                         has {n} vertices, so slot i cannot be vertex i"
+                        "rekey: the value has {len} elements but the projection has \
+                         {n} vertices, so element i cannot be vertex i"
                     )));
                 }
                 self.charge(n as u64)?;

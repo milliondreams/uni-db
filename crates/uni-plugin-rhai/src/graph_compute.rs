@@ -29,8 +29,8 @@ use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::kernel_id::KernelId;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, CmpOp, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm,
-    OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
+    AlgoSession, CmpOp, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
+    Norm, OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -735,6 +735,15 @@ impl GcSession {
             .map_err(rt)
     }
 
+    /// Gathers a `[V]` node value onto edges, yielding `[E]`.
+    fn edge_from_nodes(&mut self, g: i64, x: i64, op: &str) -> Result<i64, Box<EvalAltResult>> {
+        let op = EndpointOp::parse(op).map_err(rt)?;
+        let mut s = self.session.lock();
+        s.edge_from_nodes(from_i64(g), from_i64(x), op)
+            .map(to_i64)
+            .map_err(rt)
+    }
+
     /// Piecewise-linear table lookup over `(xs, ys)` breakpoints.
     fn interp(&mut self, x: i64, xs: Array, ys: Array) -> Result<i64, Box<EvalAltResult>> {
         let to_vec = |a: Array, which: &str| -> Result<Vec<f64>, Box<EvalAltResult>> {
@@ -1099,6 +1108,7 @@ fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
         WalkVisitCounts => GcSession::walk_visit_counts,
         Rekey => GcSession::rekey,
         Interp => GcSession::interp,
+        EdgeFromNodes => GcSession::edge_from_nodes,
         ArenaSeed => GcSession::arena_seed,
         EmitWalks => GcSession::emit_walks,
         NeighborhoodOverlap => GcSession::neighborhood_overlap,

@@ -37,8 +37,8 @@ use uni_common::core::id::Vid;
 use uni_plugin::errors::FnError;
 use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
 use uni_plugin_builtin::algorithms::graph_compute::session::{
-    AlgoSession, CmpOp, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, Norm,
-    OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
+    AlgoSession, CmpOp, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
+    Norm, OverlapMetric, PairSpec, Predicate, ReduceOp, Semiring,
 };
 use uni_plugin_builtin::algorithms::graph_compute::value::{DType, Scalar};
 
@@ -771,6 +771,17 @@ impl GcSession {
         self.session
             .lock()
             .arena_seed(from_i64(arena), from_i64(g))
+            .map(to_i64)
+            .map_err(py_err)
+    }
+
+    /// Gathers a `[V]` node value onto edges, yielding `[E]`.
+    fn edge_from_nodes(&self, g: i64, x: i64, op: &str) -> PyResult<i64> {
+        self.check_deadline()?;
+        let op = EndpointOp::parse(op).map_err(py_err)?;
+        self.session
+            .lock()
+            .edge_from_nodes(from_i64(g), from_i64(x), op)
             .map(to_i64)
             .map_err(py_err)
     }

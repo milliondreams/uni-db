@@ -23,8 +23,8 @@ use super::first_party::{
 };
 use super::handle::{Handle, HandleKind};
 use super::session::{
-    AlgoSession, Direction, EwiseOp, GraphArenaCompute, GraphCompute, MapOp, OverlapMetric,
-    PairSpec, Predicate, Semiring,
+    AlgoSession, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
+    OverlapMetric, PairSpec, Predicate, Semiring,
 };
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
@@ -4042,7 +4042,7 @@ fn an_arena_column_can_be_emitted_against_a_matching_projection() {
         "a rebased arena column must be emittable"
     );
 
-    // The count check is real: an arena sized differently cannot be rebased.
+    // The length check is real: a value of the wrong length cannot be rebased.
     let small = s.arena_new(8, 2).expect("second arena");
     let two = s.arena_alloc(small, 2).expect("two slots");
     let c2 = s.arena_column(small).expect("column");
@@ -4050,7 +4050,25 @@ fn an_arena_column_can_be_emitted_against_a_matching_projection() {
     let wrong = s.arena_gather(small, c2 as u32, two).expect("gather");
     assert!(
         s.rekey(wrong, g).is_err(),
-        "an arena with 2 slots cannot be rebased onto a 4-vertex projection"
+        "a 2-element value cannot be rebased onto a 4-vertex projection"
+    );
+
+    // A *subset* of a larger arena rebases fine, because the check is on the
+    // value's length rather than the arena's total live slots. This is the
+    // bandit shape: an arena holding root + K arms, gathering the K arms against
+    // a projection sized to K. Checking the arena's total refused it and forced
+    // the caller to reshape the projection around an arena implementation detail.
+    let big = s.arena_new(16, 2).expect("big arena");
+    let _root = s.arena_alloc(big, 1).expect("root slot");
+    let arms_slots = s.arena_alloc(big, 4).expect("four arms");
+    let cb = s.arena_column(big).expect("column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let arms = s
+        .arena_gather(big, cb as u32, arms_slots)
+        .expect("gather the arms only");
+    assert!(
+        s.rekey(arms, g).is_ok(),
+        "a 4-element subset of a 5-slot arena must rebase onto a 4-vertex projection"
     );
 }
 
@@ -4160,6 +4178,92 @@ fn interp_rejects_a_curve_it_cannot_evaluate() {
             err.message
         );
     }
+}
+
+/// `edge_from_nodes` bridges node values onto edges — and unblocks the rule
+/// that motivated it.
+///
+/// Comparing edge *properties* was always possible; nothing brought node values
+/// onto edges, so a predicate over an edge's two endpoints — which is what an
+/// interaction rule is made of — could not be expressed at all.
+#[test]
+fn edge_from_nodes_gathers_endpoint_values_onto_edges() {
+    // 0->1, 1->2, 0->2 in CSR out-edge order.
+    let (mut s, g) = session_with(build_projection(
+        &[0, 1, 2],
+        &[(0, 1, 1.0), (1, 2, 1.0), (0, 2, 1.0)],
+        false,
+        false,
+    ));
+    // opinions: node0 = 0.0, node1 = 0.1, node2 = 0.9
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![0.0, 0.1, 0.9]))
+        .expect("opinions");
+
+    // CSR order is node 0's edges first (0->1, 0->2), then node 1's (1->2).
+    for (op, want) in [
+        (EndpointOp::Src, vec![0.0, 0.0, 0.1]),
+        (EndpointOp::Dst, vec![0.1, 0.9, 0.9]),
+        (EndpointOp::Sub, vec![0.1, 0.9, 0.8]),
+        (EndpointOp::AbsDiff, vec![0.1, 0.9, 0.8]),
+        (EndpointOp::Max, vec![0.1, 0.9, 0.9]),
+    ] {
+        let out = s.edge_from_nodes(g, x, op).expect("gather");
+        let got = s.tensor_values_for_test(out);
+        for (i, w) in want.iter().enumerate() {
+            assert!(
+                (got[i] - w).abs() < 1e-12,
+                "{op:?} edge {i}: got {}, want {w}",
+                got[i]
+            );
+        }
+        assert!(
+            s.tensor_for_test(out).expect("t").is_edge_shaped(),
+            "{op:?} must yield an [E] tensor"
+        );
+    }
+
+    // The whole point: bounded confidence. Keep only edges whose endpoints
+    // differ by less than epsilon = 0.5, then traverse only those.
+    let diff = s.edge_from_nodes(g, x, EndpointOp::AbsDiff).expect("diff");
+    let close = s
+        .map_to_set(diff, Predicate::Lt(0.5))
+        .expect("an [E] mask lowers to an EdgeSet");
+    let ones = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![1.0, 1.0, 1.0]))
+        .expect("ones");
+    let agg = s
+        .spmv_masked(g, ones, Semiring::LinearAlgebra, close)
+        .expect("masked traversal over the surviving edges");
+    let got = s.tensor_values_for_test(agg);
+    // Only 0->1 survives (|0.1-0.0| = 0.1 < 0.5), so node 1 receives 1.0.
+    assert!(
+        (got[1] - 1.0).abs() < 1e-12 && got[2].abs() < 1e-12,
+        "only the within-epsilon edge may contribute, got {got:?}"
+    );
+}
+
+/// A node map from another projection, or an `[E]` input, is refused.
+#[test]
+fn edge_from_nodes_rejects_a_value_it_cannot_gather() {
+    let (mut s, g) = session_with(build_projection(&[0, 1], &[(0, 1, 1.0)], false, false));
+    let e = s.edge_weights(g).expect("an [E] tensor");
+    assert!(
+        s.edge_from_nodes(g, e, EndpointOp::Src).is_err(),
+        "an [E] input is already edge-shaped and cannot be gathered onto edges"
+    );
+
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[10, 11],
+        &[(10, 11, 1.0)],
+        false,
+        false,
+    )));
+    let foreign = s.degrees(other, Direction::Out).expect("degrees elsewhere");
+    assert!(
+        s.edge_from_nodes(g, foreign, EndpointOp::Src).is_err(),
+        "a [V] map from another projection must not be gathered onto these edges"
+    );
 }
 
 /// `rekey` is a verified move between projections, not a cast.

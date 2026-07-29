@@ -167,6 +167,26 @@ fn recipe_abs_is_max_against_the_negation() {
     assert_eq!(read(&s, neg), want_neg);
 }
 
+/// `ceil(a) == -floor(-a)`.
+///
+/// The one member of the rounding family that composes *exactly* from `floor`,
+/// which is why it is published as a recipe rather than given its own op. The
+/// oracle is `f64::ceil`, so a half-open value like `-1.5` — where truncation
+/// and rounding-up disagree — is what actually pins the identity.
+#[test]
+fn recipe_ceil_is_the_negated_floor_of_the_negation() {
+    let vals = [-2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 4.0];
+    let (mut s, g) = session_of(7);
+    let a = load(&mut s, g, &vals);
+
+    let neg = s.map_apply(a, MapOp::Scale(-1.0)).expect("scale");
+    let floored = s.map_apply(neg, MapOp::Floor).expect("floor");
+    let out = s.map_apply(floored, MapOp::Scale(-1.0)).expect("scale");
+
+    let want: Vec<f64> = vals.iter().map(|x| x.ceil()).collect();
+    assert_eq!(read(&s, out), want);
+}
+
 /// `clip(a, lo, hi) == min(max(a, lo), hi)`.
 #[test]
 fn recipe_clip_is_min_of_max() {
@@ -292,6 +312,7 @@ fn every_published_recipe_has_a_proof() {
         "clip",
         "pow",
         "neg",
+        "ceil",
         "normalize",
         "edge_mask",
     ];

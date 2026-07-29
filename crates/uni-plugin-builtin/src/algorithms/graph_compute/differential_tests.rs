@@ -24,7 +24,7 @@ use super::first_party::{
 use super::handle::{Handle, HandleKind};
 use super::session::{
     AlgoSession, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
-    OverlapMetric, PairSpec, Predicate, Semiring,
+    OverlapMetric, PairSpec, Predicate, Semiring, rem_floor,
 };
 use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
@@ -3075,6 +3075,205 @@ fn reqd4_edge_mask_window_is_an_exact_selector_without_sampling() {
         s.edge_set_len(drawn).expect("len"),
         s.edge_set_len(win).expect("len"),
         "the sampler at degenerate p agrees with the explicit window"
+    );
+}
+
+// ---- REQ-D13 probe: floor and mod -----------------------------------------
+
+/// True when two `f64`s are indistinguishable, NaN and the zero sign included.
+///
+/// `assert_eq!` cannot express either half of what these tests check: `NaN` is
+/// never equal to itself, and `-0.0 == 0.0` hides exactly the divergence the
+/// zero-remainder sign rule exists to fix.
+fn identical(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+}
+
+fn assert_identical(got: &[f64], want: &[f64], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            identical(g, w),
+            "{what}: slot {i} is {g:?} (bits {:#x}), want {w:?} (bits {:#x})",
+            g.to_bits(),
+            w.to_bits()
+        );
+    }
+}
+
+#[test]
+fn reqd13_floor_matches_the_ieee_oracle() {
+    // The ask's acceptance criterion: `map_apply(x, "floor")` matches `np.floor`
+    // on the f64 path "including negatives (floor(-1.5) = -2, i.e. floor and
+    // not truncation) and the +-0 / +-inf / NaN edges". `f64::floor` is IEEE
+    // `roundToIntegralTowardNegative`, which is that function; the oracle here
+    // is the scalar loop, sharing no code with the kernel.
+    let vals = [
+        -1.5,
+        -0.5,
+        -0.0,
+        0.0,
+        0.5,
+        1.5,
+        2.999,
+        4.25,
+        // At and above 2^53 every f64 is already integral, so floor is identity.
+        9_007_199_254_740_992.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        1e308,
+        -1e308,
+    ];
+    let nodes: Vec<u64> = (0..vals.len() as u64).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let m = load_map(&mut s, g, &vals);
+
+    let out = s.map_apply(m, MapOp::Floor).expect("floor");
+    let want: Vec<f64> = vals.iter().map(|x| x.floor()).collect();
+    assert_identical(&read_tensor(&s, out), &want, "floor");
+
+    // Spelled out, because "floor, not truncation" is the whole distinction and
+    // a `trunc` implementation would pass every other case above.
+    assert!(
+        identical(want[0], -2.0),
+        "floor(-1.5) must be -2, not -1: got {:?}",
+        want[0]
+    );
+
+    // The requester's own published acceptance vector, verbatim from
+    // UNIDB_ASK_FLOOR_MOD.md section 0.3, where it was checked against
+    // `np.floor` by their `scratchpad/mod_floor_probe/probe.py`. Pinning it here
+    // means their probe and this suite cannot drift into disagreeing.
+    let ask = [0.0, 0.5, 1.0, 1.7, 2.0, 2.999, 3.5, 4.25];
+    let ask_nodes: Vec<u64> = (0..ask.len() as u64).collect();
+    let (mut s2, g2) = session_with(build_projection(&ask_nodes, &[(0, 1, 1.0)], false, false));
+    let m2 = load_map(&mut s2, g2, &ask);
+    let out2 = s2.map_apply(m2, MapOp::Floor).expect("floor");
+    assert_identical(
+        &read_tensor(&s2, out2),
+        &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 4.0],
+        "the ask's published acceptance vector",
+    );
+}
+
+#[test]
+fn reqd13_rem_floor_matches_numpy_on_every_edge() {
+    // `rem_floor` is the normative definition of the `mod` convention shared by
+    // `MapOp::Mod` and `EwiseOp::Mod`, so its edges are pinned directly rather
+    // than through a kernel. Every expectation below is `np.mod`'s answer.
+    let cases: &[(f64, f64, f64)] = &[
+        // The four sign quadrants: the result follows the *divisor*.
+        (5.0, 3.0, 2.0),
+        (5.0, -3.0, -1.0),
+        (-5.0, 3.0, 1.0),
+        (-5.0, -3.0, -2.0),
+        // A zero remainder also takes the divisor's sign. Without the
+        // `copysign`, four of these seven disagree with `np.mod` -- and
+        // `assert_eq!` on the value could not see it, since -0.0 == 0.0.
+        (-0.0, 3.0, 0.0),
+        (0.0, -3.0, -0.0),
+        (-0.0, -3.0, -0.0),
+        (6.0, 3.0, 0.0),
+        (-6.0, 3.0, 0.0),
+        (6.0, -3.0, -0.0),
+        (-6.0, -3.0, -0.0),
+        // A zero divisor is NaN -- deliberately NOT the `x / 0 = 0` convention
+        // that `EwiseOp::Div` and `MapOp::Recip` follow. See `rem_floor`.
+        (1.0, 0.0, f64::NAN),
+        (1.0, -0.0, f64::NAN),
+        // Infinities and NaN, per IEEE.
+        (3.0, f64::INFINITY, 3.0),
+        (3.0, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        (f64::INFINITY, 3.0, f64::NAN),
+        (f64::NAN, 3.0, f64::NAN),
+    ];
+    for &(x, y, want) in cases {
+        let got = rem_floor(x, y);
+        assert!(
+            identical(got, want),
+            "rem_floor({x:?}, {y:?}) = {got:?} (bits {:#x}), want {want:?} (bits {:#x})",
+            got.to_bits(),
+            want.to_bits()
+        );
+    }
+}
+
+#[test]
+fn reqd13_native_mod_survives_where_the_floor_composition_collapses() {
+    // THE reason `mod` is its own op rather than a published composition.
+    //
+    // The ask (UNIDB_ASK_FLOOR_MOD.md, 2026-07-28) states that `mod` follows
+    // from `floor` as `a - b*floor(a/b)` and asks us NOT to ship it. That
+    // identity holds in R but not in binary64: once `a/b` exceeds 2^53 the
+    // quotient carries no fractional bits, `floor` becomes the identity,
+    // `b*(a/b)` reconstructs `a`, and the subtraction collapses to 0.0.
+    //
+    // It is silent, and the wrong answer still lies inside [0, b), so a range
+    // assertion on a seasonality index cannot catch it. Any unbounded
+    // accumulator reaches that regime; a small divisor reaches it early.
+    //
+    // If this test ever fails because the two routes now agree, do NOT delete
+    // the op -- check whether `floor` or `div` changed.
+    let a_vals = [2e17, 1e12];
+    let b_vals = [12.0, 0.001];
+    let nodes: Vec<u64> = (0..2).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let a = load_map(&mut s, g, &a_vals);
+    let b = load_map(&mut s, g, &b_vals);
+
+    // The composition the ask proposed, built from real kernels.
+    let q = s.ewise(a, b, EwiseOp::Div).expect("div");
+    let fq = s.map_apply(q, MapOp::Floor).expect("floor");
+    let bq = s.ewise(b, fq, EwiseOp::Mul).expect("mul");
+    let composed = s.ewise(a, bq, EwiseOp::Axpy(-1.0)).expect("axpy");
+    assert_identical(
+        &read_tensor(&s, composed),
+        &[0.0, 0.0],
+        "the floor composition is expected to collapse here -- that is the bug",
+    );
+
+    // The native op, against `f64::%` (raw fmod) as an independent oracle: both
+    // operands are positive, so no sign adjust is exercised and the oracle
+    // shares no logic with `rem_floor`.
+    let native = s.ewise(a, b, EwiseOp::Mod).expect("mod");
+    let got = read_tensor(&s, native).to_vec();
+    assert_identical(&got, &[2e17 % 12.0, 1e12 % 0.001], "native mod");
+    assert!(identical(got[0], 8.0), "2e17 mod 12 is 8, not {:?}", got[0]);
+    assert!(got[1] > 0.0, "1e12 mod 0.001 is nonzero, got {:?}", got[1]);
+}
+
+#[test]
+fn reqd13_scalar_mod_is_one_op_and_agrees_with_the_tensor_form() {
+    // `time % <literal>` is the driving spelling, and the scalar form exists so
+    // it does not have to materialize a constant `[V]` map first. The two forms
+    // must not drift.
+    let vals = [0.0, 1.0, 5.0, 11.0, 12.0, 13.0, 59.0, -1.0];
+    let period = 12.0;
+    let nodes: Vec<u64> = (0..vals.len() as u64).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let t = load_map(&mut s, g, &vals);
+
+    let before = s.work_spent_units();
+    let scalar = s.map_apply(t, MapOp::Mod(period)).expect("scalar mod");
+    let charged = s.work_spent_units() - before;
+    assert_eq!(
+        charged,
+        vals.len() as u64,
+        "the scalar form charges one unit per element, once"
+    );
+
+    let divisor = load_map(&mut s, g, &[period; 8]);
+    let tensor = s.ewise(t, divisor, EwiseOp::Mod).expect("tensor mod");
+
+    let want: Vec<f64> = vals.iter().map(|x| rem_floor(*x, period)).collect();
+    assert_identical(&read_tensor(&s, scalar), &want, "scalar mod");
+    assert_identical(&read_tensor(&s, tensor), &want, "tensor mod");
+    // -1 % 12 == 11, not -1: the sign follows the divisor.
+    assert!(
+        identical(want[7], 11.0),
+        "-1 mod 12 is 11, got {:?}",
+        want[7]
     );
 }
 

@@ -1220,6 +1220,71 @@ mod tests {
         assert!((f - 2.0).abs() < 1e-12, "6/3 = 2, got {f}");
     }
 
+    /// REQ-D13 — `floor` and `mod` decode and evaluate over the JSON wire.
+    ///
+    /// Same reason as the `sqrt`/`exp`/`div` test above: the op-string decoders
+    /// are not covered by the `KernelId` reach tests, because `map_apply` and
+    /// `ewise` were already reachable before these names existed. Without this,
+    /// a name could be added to the vocabulary and never exercised on the wire
+    /// that serves WASM and Extism.
+    #[test]
+    fn map_and_ewise_floor_mod_over_json() {
+        let nodes = vec![0u64, 1, 2, 3];
+        // out-degrees: 0 -> 3, 1 -> 1, 2 -> 0, 3 -> 0.
+        let edges = vec![(0, 1), (0, 2), (0, 3), (1, 2)];
+        let graph = build_projection(&nodes, &edges);
+        let registry = GraphComputeRegistry::new();
+        let mut session = AlgoSession::new(
+            5,
+            WorkBudget::from_graph_size(4, 4),
+            Arena::new(1 << 20, 4096),
+        );
+        let g = to_i64(session.bind_graph(StdArc::new(graph)));
+        let sid = registry.open(session);
+        let call = |json: String| -> KernelResponse {
+            serde_json::from_str(&registry.call_json(&json)).unwrap()
+        };
+        let as_handle = |r: KernelResponse| match r {
+            KernelResponse::Handle(h) => h,
+            other => panic!("want handle, got {other:?}"),
+        };
+        let top1 = |h: i64| -> (i64, f64) {
+            match call(format!(r#"{{"session":{sid},"op":"topk","g":{h},"k":1}}"#)) {
+                KernelResponse::Pairs(p) => p[0],
+                other => panic!("topk -> {other:?}"),
+            }
+        };
+
+        let deg = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"degrees","g":{g},"s":"out"}}"#
+        )));
+        // deg = [3, 1, 0, 0]; affine(deg, 1.0, 0.5) = [3.5, 1.5, 0.5, 0.5].
+        let half = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{deg},"s":"affine","f":1.0,"f2":0.5}}"#
+        )));
+        // floor -> [3, 1, 0, 0]; the top value is 3.
+        let fl = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{half},"s":"floor"}}"#
+        )));
+        let (v, f) = top1(fl);
+        assert_eq!(v, 0, "node 0 has the largest degree");
+        assert!((f - 3.0).abs() < 1e-12, "floor(3.5) = 3, got {f}");
+
+        // Scalar mod: the divisor rides in `f`. 3.5 mod 2 = 1.5.
+        let sm = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"map_apply","g":{half},"s":"mod","f":2.0}}"#
+        )));
+        let (_, f) = top1(sm);
+        assert!((f - 1.5).abs() < 1e-12, "3.5 mod 2 = 1.5, got {f}");
+
+        // Tensor mod: half mod deg = [3.5 mod 3, 1.5 mod 1, ...] = [0.5, 0.5, ..].
+        let tm = as_handle(call(format!(
+            r#"{{"session":{sid},"op":"ewise","a":{half},"b":{deg},"s":"mod"}}"#
+        )));
+        let (_, f) = top1(tm);
+        assert!((f - 0.5).abs() < 1e-12, "3.5 mod 3 = 0.5, got {f}");
+    }
+
     #[test]
     fn expand_both_unions_out_and_in_neighbors() {
         // G5a — Direction::Both walks out ∪ in. On 0->1->2, expanding {1}:

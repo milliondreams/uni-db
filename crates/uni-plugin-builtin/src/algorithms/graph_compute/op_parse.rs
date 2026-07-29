@@ -137,6 +137,8 @@ op_families! {
         "sqrt"         => MapOp::Sqrt,                MapOp::Sqrt;
         "exp"          => MapOp::Exp,                 MapOp::Exp;
         "affine"       => MapOp::AxPlusB(_, _),       MapOp::AxPlusB(a, b);
+        "floor"        => MapOp::Floor,               MapOp::Floor;
+        "mod"          => MapOp::Mod(_),              MapOp::Mod(a);
         "normalize_l1" => MapOp::Normalize(Norm::L1), MapOp::Normalize(Norm::L1);
         "normalize_l2" => MapOp::Normalize(Norm::L2), MapOp::Normalize(Norm::L2);
     }
@@ -148,6 +150,7 @@ op_families! {
         "max"  => EwiseOp::Max,     EwiseOp::Max;
         "axpy" => EwiseOp::Axpy(_), EwiseOp::Axpy(coef);
         "div"  => EwiseOp::Div,     EwiseOp::Div;
+        "mod"  => EwiseOp::Mod,     EwiseOp::Mod;
     }
 
     Cmp: CmpOp, noun = "comparison", scalars = () {
@@ -266,6 +269,16 @@ recipes! {
     ["neg", "negate"] in [Map] =>
         "negation",
         "map_apply(a, \"scale\", -1.0)";
+
+    // `floor` and `mod` are real ops, so they get no recipe (the dead-recipe
+    // guard would reject one). `ceil` is exactly expressible from `floor` and
+    // has no second consumer yet, so it stays a composition. `round` and
+    // `trunc` get neither an op nor a recipe: `trunc` needs a sign-dependent
+    // select, and `round`'s half-to-even is not reachable from `floor` at all,
+    // so any recipe here would be an approximation published as an identity.
+    ["ceil", "ceiling"] in [Map] =>
+        "rounding up",
+        "map_apply(map_apply(map_apply(a, \"scale\", -1.0), \"floor\"), \"scale\", -1.0)";
 
     ["normalize"] in [Map] =>
         "an explicit norm",

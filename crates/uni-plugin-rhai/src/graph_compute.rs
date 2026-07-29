@@ -1031,6 +1031,7 @@ fn register_missing_kernel_hints(engine: &mut Engine) {
 pub fn register_graph_compute(engine: &mut Engine) {
     engine.register_type_with_name::<GcSession>("GcSession");
     let _ = register_kernels(engine);
+    register_optional_arities(engine);
     register_arena_stubs(engine);
     register_scoped_graph_stub(engine);
     register_missing_kernel_hints(engine);
@@ -1043,6 +1044,98 @@ pub fn register_graph_compute(engine: &mut Engine) {
 /// is what makes the reachability contract meaningful rather than a second list
 /// to keep in sync. Names come from [`KernelId::op_name`], so a rename in the
 /// catalog propagates here instead of silently diverging.
+/// Registers the short forms declared by [`OPTIONAL_ARITIES`].
+///
+/// Rhai resolves overloads by arity, so a kernel registered once at its full
+/// arity is simply *not found* when called with fewer arguments — which is how
+/// `map_apply(a, "scale", -1.0)`, the verbatim text of the published `neg`
+/// recipe, failed on this loader while working over JSON and PyO3. These
+/// registrations close that gap; they add no capability, only the spellings the
+/// documentation already promises. The omitted scalars default to `0.0`, which
+/// is what the JSON wire and PyO3 already use.
+///
+/// Deliberately not pushed onto the registered-kernel list: each name is already
+/// there from its full-arity registration, and counting it twice would weaken
+/// the reachability contract.
+fn register_optional_arities(engine: &mut Engine) {
+    engine.register_fn(
+        KernelId::MapApply.op_name(),
+        |s: &mut GcSession, m: i64, op: ImmutableString| s.map_apply(m, op, 0.0, 0.0),
+    );
+    engine.register_fn(
+        KernelId::MapApply.op_name(),
+        |s: &mut GcSession, m: i64, op: ImmutableString, a: f64| s.map_apply(m, op, a, 0.0),
+    );
+    engine.register_fn(
+        KernelId::Ewise.op_name(),
+        |s: &mut GcSession, a: i64, b: i64, op: ImmutableString| s.ewise(a, b, op, 0.0),
+    );
+
+    // The reproducible-sampling trio: a guest that does not care about the
+    // counter-hash stream should not have to name it. `0, 0` is the stream the
+    // documented examples use.
+    engine.register_fn(
+        KernelId::Sample.op_name(),
+        |s: &mut GcSession, prob: i64| s.sample(prob, 0, 0),
+    );
+    engine.register_fn(
+        KernelId::Sample.op_name(),
+        |s: &mut GcSession, prob: i64, seed: i64| s.sample(prob, seed, 0),
+    );
+    engine.register_fn(
+        KernelId::SampleEdges.op_name(),
+        |s: &mut GcSession, prob: i64| s.sample_edges(prob, 0, 0),
+    );
+    engine.register_fn(
+        KernelId::SampleEdges.op_name(),
+        |s: &mut GcSession, prob: i64, seed: i64| s.sample_edges(prob, seed, 0),
+    );
+
+    // Overlap defaults to plain adjacent-pair counts.
+    engine.register_fn(
+        KernelId::AllPairsOverlap.op_name(),
+        |s: &mut GcSession, g: i64| s.all_pairs_overlap(g, "count".into(), "adjacent".into(), 0),
+    );
+    engine.register_fn(
+        KernelId::AllPairsOverlap.op_name(),
+        |s: &mut GcSession, g: i64, metric: ImmutableString| {
+            s.all_pairs_overlap(g, metric, "adjacent".into(), 0)
+        },
+    );
+    engine.register_fn(
+        KernelId::AllPairsOverlap.op_name(),
+        |s: &mut GcSession, g: i64, metric: ImmutableString, pair_mode: ImmutableString| {
+            s.all_pairs_overlap(g, metric, pair_mode, 0)
+        },
+    );
+
+    // Walks default to one uniform (p = q = 1) walk per seed, stream 0.
+    engine.register_fn(
+        KernelId::RandomWalks.op_name(),
+        |s: &mut GcSession, g: i64, seeds: Array, len: i64| {
+            s.random_walks(g, seeds, len, 1, 1.0, 1.0, 0)
+        },
+    );
+    engine.register_fn(
+        KernelId::RandomWalks.op_name(),
+        |s: &mut GcSession, g: i64, seeds: Array, len: i64, n: i64| {
+            s.random_walks(g, seeds, len, n, 1.0, 1.0, 0)
+        },
+    );
+    engine.register_fn(
+        KernelId::RandomWalks.op_name(),
+        |s: &mut GcSession, g: i64, seeds: Array, len: i64, n: i64, p: f64| {
+            s.random_walks(g, seeds, len, n, p, 1.0, 0)
+        },
+    );
+    engine.register_fn(
+        KernelId::RandomWalks.op_name(),
+        |s: &mut GcSession, g: i64, seeds: Array, len: i64, n: i64, p: f64, q: f64| {
+            s.random_walks(g, seeds, len, n, p, q, 0)
+        },
+    );
+}
+
 fn register_kernels(engine: &mut Engine) -> Vec<KernelId> {
     let mut registered = Vec::new();
     macro_rules! reg {
@@ -1624,6 +1717,314 @@ mod tests {
         );
         for name in OpFamily::Ewise.valid_names() {
             assert!(err.contains(name), "missing valid op `{name}` in: {err}");
+        }
+    }
+
+    /// Rewrites a published recipe into a Rhai call against `sess`.
+    ///
+    /// Recipes are written in prefix-call form (`map_apply(a, "scale", -1.0)`).
+    /// Rhai's `register_fn` methods are callable both as `sess.f(..)` and as
+    /// `f(sess, ..)`, so injecting the receiver as the first argument of every
+    /// *kernel* call turns the published text into a runnable script without
+    /// otherwise altering it. Only identifiers that are real kernels are
+    /// rewritten, and text inside string literals is left alone.
+    fn as_rhai_call(recipe: &str) -> String {
+        let mut out = String::new();
+        let mut ident = String::new();
+        let mut in_quotes = false;
+        for ch in recipe.chars() {
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                out.push_str(&ident);
+                ident.clear();
+                out.push(ch);
+                continue;
+            }
+            if in_quotes {
+                out.push(ch);
+                continue;
+            }
+            if ch.is_alphanumeric() || ch == '_' {
+                ident.push(ch);
+                continue;
+            }
+            out.push_str(&ident);
+            let is_kernel = KernelId::from_op_name(&ident).is_some();
+            ident.clear();
+            out.push(ch);
+            if ch == '(' && is_kernel {
+                out.push_str("sess, ");
+            }
+        }
+        out.push_str(&ident);
+        out
+    }
+
+    /// Every published recipe **resolves** through this loader, as written.
+    ///
+    /// `composition_recipes.rs` proves each recipe computes the right values,
+    /// but it drives the *Rust* API — so it cannot see whether the published
+    /// spelling resolves on a guest surface. It did not. `map_apply(a, "scale",
+    /// -1.0)`, the verbatim text of the `neg` recipe, failed here with
+    /// `Function not found: map_apply (GcSession, i64, &str, f64)`, because this
+    /// loader registered `map_apply` at a fixed arity of four while the recipes
+    /// — and PyO3, which defaults its trailing scalars — are written at the
+    /// minimum arity. Every `map_apply`-quoting recipe was affected, and so was
+    /// the reference's `map_apply(counts, "log")` UCT snippet.
+    ///
+    /// The assertion is deliberately *resolution*, not success: a recipe may
+    /// legitimately raise a typed kernel error against synthetic fixture data,
+    /// but it must never fail to resolve. Arity and name drift are exactly what
+    /// `Function not found` reports, so that is what this forbids.
+    #[test]
+    fn every_published_recipe_resolves_through_this_loader() {
+        use std::collections::HashMap;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+        use uni_plugin_builtin::algorithms::graph_compute::op_parse::RECIPES;
+        use uni_plugin_builtin::algorithms::graph_compute::session::GraphCompute;
+        use uni_plugin_builtin::algorithms::graph_compute::value::DType;
+
+        /// Recipes that are prose rather than a single expression.
+        ///
+        /// Keyed by first alias, and locked both ways below so a new prose
+        /// recipe has to be added here consciously rather than silently
+        /// escaping the check.
+        const PROSE: &[&str] = &["pow"];
+
+        let node_rows: Vec<HashMap<String, Value>> = (0..4u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let graph =
+            GraphProjection::from_rows(&node_rows, &[], None, false).expect("projection builds");
+
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            17,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(1_000_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        )));
+        let g = session.lock().bind_graph(Arc::new(graph));
+
+        // Constant `[V]` maps for the recipe placeholders, built through the
+        // Rust API so the script under test does no setup of its own.
+        let constant = |v: f64| -> i64 {
+            let mut s = session.lock();
+            let z = s.zero_map(g, DType::F64).expect("zero_map");
+            let h = s
+                .map_apply(
+                    z,
+                    uni_plugin_builtin::algorithms::graph_compute::session::MapOp::AxPlusB(0.0, v),
+                )
+                .expect("affine");
+            to_i64(h)
+        };
+        let (a, b, m, x, lo, hi) = (
+            constant(3.0),
+            constant(2.0),
+            constant(1.0),
+            constant(3.0),
+            constant(0.0),
+            constant(5.0),
+        );
+
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), g, Arc::default()));
+        scope.push("g", to_i64(g));
+        for (name, h) in [
+            ("a", a),
+            ("b", b),
+            ("m", m),
+            ("x", x),
+            ("lo", lo),
+            ("hi", hi),
+        ] {
+            scope.push(name, h);
+        }
+        scope.push("theta", 0.5_f64);
+        scope.push("c", 1.0_f64);
+        scope.push("prop", "weight".to_string());
+
+        let mut checked = 0_usize;
+        for (keys, _, _, recipe) in RECIPES {
+            let head = keys[0];
+            if PROSE.contains(&head) {
+                continue;
+            }
+            // A recipe may offer alternatives; each one must resolve.
+            for alternative in recipe.split(" or ") {
+                let script = as_rhai_call(alternative.trim());
+                let err = engine
+                    .eval_with_scope::<rhai::Dynamic>(&mut scope, &script)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                assert!(
+                    !err.contains("Function not found"),
+                    "the `{head}` recipe does not resolve through this loader.\n  \
+                     published: {alternative}\n  as script: {script}\n  error:     {err}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "only {checked} recipes exercised");
+
+        // The other half of the lock: a name may not claim to be prose unless it
+        // is still published, or this list rots the way a stale skip always does.
+        let published: std::collections::HashSet<&str> =
+            RECIPES.iter().map(|(keys, _, _, _)| keys[0]).collect();
+        for name in PROSE {
+            assert!(
+                published.contains(name),
+                "`{name}` is listed as prose but is no longer a published recipe"
+            );
+        }
+    }
+
+    /// Every arity declared in `OPTIONAL_ARITIES` resolves on this loader.
+    ///
+    /// The recipe proof above covers the arities the *current* recipes happen to
+    /// use. This covers the declared contract itself, so adding a default to
+    /// PyO3 (or an entry to the table) without registering the matching Rhai
+    /// overload fails here rather than in a guest author's script.
+    #[test]
+    fn every_declared_optional_arity_resolves_through_this_loader() {
+        use std::collections::HashMap;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+        use uni_plugin_builtin::algorithms::graph_compute::kernel_id::OPTIONAL_ARITIES;
+        use uni_plugin_builtin::algorithms::graph_compute::session::GraphCompute;
+        use uni_plugin_builtin::algorithms::graph_compute::value::DType;
+
+        // One probe per declared (kernel, arity). Locked both ways below.
+        let probes: &[(KernelId, usize, &str)] = &[
+            (KernelId::MapApply, 2, r#"map_apply(sess, m, "log")"#),
+            (KernelId::MapApply, 3, r#"map_apply(sess, m, "scale", 2.0)"#),
+            (
+                KernelId::MapApply,
+                4,
+                r#"map_apply(sess, m, "affine", 1.0, 0.5)"#,
+            ),
+            (KernelId::Ewise, 3, r#"ewise(sess, m, m, "add")"#),
+            (KernelId::Ewise, 4, r#"ewise(sess, m, m, "axpy", -1.0)"#),
+            (KernelId::ZeroMap, 1, "zero_map(sess, g)"),
+            (KernelId::ZeroMap, 2, r#"zero_map(sess, g, "i64")"#),
+            (KernelId::Emit, 1, r#"emit(sess, #{"score": m})"#),
+            (KernelId::Emit, 2, r#"emit(sess, "score", m)"#),
+            (KernelId::Sample, 1, "sample(sess, m)"),
+            (KernelId::Sample, 2, "sample(sess, m, 1)"),
+            (KernelId::Sample, 3, "sample(sess, m, 1, 0)"),
+            (KernelId::SampleEdges, 1, "sample_edges(sess, e)"),
+            (KernelId::SampleEdges, 2, "sample_edges(sess, e, 1)"),
+            (KernelId::SampleEdges, 3, "sample_edges(sess, e, 1, 0)"),
+            (KernelId::AllPairsOverlap, 1, "all_pairs_overlap(sess, g)"),
+            (
+                KernelId::AllPairsOverlap,
+                2,
+                r#"all_pairs_overlap(sess, g, "count")"#,
+            ),
+            (
+                KernelId::AllPairsOverlap,
+                3,
+                r#"all_pairs_overlap(sess, g, "count", "adjacent")"#,
+            ),
+            (
+                KernelId::AllPairsOverlap,
+                4,
+                r#"all_pairs_overlap(sess, g, "count", "adjacent", 0)"#,
+            ),
+            (KernelId::RandomWalks, 3, "random_walks(sess, g, [], 2)"),
+            (KernelId::RandomWalks, 4, "random_walks(sess, g, [], 2, 1)"),
+            (
+                KernelId::RandomWalks,
+                5,
+                "random_walks(sess, g, [], 2, 1, 1.0)",
+            ),
+            (
+                KernelId::RandomWalks,
+                6,
+                "random_walks(sess, g, [], 2, 1, 1.0, 1.0)",
+            ),
+            (
+                KernelId::RandomWalks,
+                7,
+                "random_walks(sess, g, [], 2, 1, 1.0, 1.0, 0)",
+            ),
+        ];
+
+        let node_rows: Vec<HashMap<String, Value>> = (0..3u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let graph =
+            GraphProjection::from_rows(&node_rows, &[], None, false).expect("projection builds");
+        let mut engine = Engine::new();
+        register_graph_compute(&mut engine);
+        let session = Arc::new(Mutex::new(AlgoSession::new(
+            19,
+            uni_plugin_builtin::algorithms::graph_compute::WorkBudget::new(1_000_000),
+            uni_plugin_builtin::algorithms::graph_compute::Arena::new(1 << 20, 256),
+        )));
+        let g = session.lock().bind_graph(Arc::new(graph));
+        let m = to_i64(session.lock().zero_map(g, DType::F64).expect("zero_map"));
+        // An `[E]` tensor for `sample_edges`; empty here, which is enough to
+        // resolve the call — this test is about arity, not about the data.
+        let e = to_i64(session.lock().edge_weights(g).expect("edge_weights"));
+
+        let mut scope = rhai::Scope::new();
+        scope.push("sess", new_session(Arc::clone(&session), g, Arc::default()));
+        scope.push("m", m);
+        scope.push("e", e);
+        scope.push("g", to_i64(g));
+
+        for (kernel, arity, script) in probes {
+            let err = engine
+                .eval_with_scope::<rhai::Dynamic>(&mut scope, script)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                !err.contains("Function not found"),
+                "`{}` is declared callable at arity {arity} but does not resolve: {script}\n  {err}",
+                kernel.op_name()
+            );
+        }
+
+        // Negative control: the check above is only meaningful if a genuinely
+        // short call *is* rejected. `compare` declares no optional tail, so
+        // three arguments (receiver plus two) must fail to resolve — if this
+        // ever stops holding, the assertions above test nothing.
+        let control = engine
+            .eval_with_scope::<rhai::Dynamic>(&mut scope, "compare(sess, m, m)")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            control.contains("Function not found"),
+            "a too-short call must surface as `Function not found` for this test to have \
+             teeth, got: {control}"
+        );
+
+        // Two-way lock against the shared declaration.
+        for (kernel, arities) in OPTIONAL_ARITIES {
+            for arity in *arities {
+                assert!(
+                    probes.iter().any(|(k, a, _)| k == kernel && a == arity),
+                    "`{}` declares arity {arity} with no probe here",
+                    kernel.op_name()
+                );
+            }
+        }
+        for (kernel, arity, _) in probes {
+            let declared = OPTIONAL_ARITIES
+                .iter()
+                .find(|(k, _)| k == kernel)
+                .is_some_and(|(_, arities)| arities.contains(arity));
+            assert!(
+                declared,
+                "`{}` is probed at arity {arity} but the shared table does not declare it",
+                kernel.op_name()
+            );
         }
     }
 

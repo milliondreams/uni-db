@@ -180,6 +180,48 @@ kernels! {
     ArenaSeed => "arena_seed", AllLoaders;
 }
 
+/// Kernels a guest may call with trailing arguments omitted, and every arity
+/// each in-process loader must therefore accept.
+///
+/// Arities exclude the receiver — `map_apply(m, "log")` is arity 2.
+///
+/// This exists because the published text is written at the *minimum* arity.
+/// [`RECIPES`](super::op_parse::RECIPES) quotes `map_apply(a, "scale", -1.0)`
+/// and `ewise(b, ..., "add")`, and the reference's UCT walkthrough writes
+/// `map_apply(counts, "log")`. The JSON wire has always accepted those (absent
+/// scalars deserialize to zero) and PyO3 gets them from
+/// `#[pyo3(signature = ..)]` defaults — but Rhai registered one fixed arity per
+/// kernel, so every one of those published spellings failed there with
+/// `Function not found`. Nothing caught it: the recipe proofs in
+/// `composition_recipes` drive the Rust API, which has no arity to get wrong.
+///
+/// Declaring the contract here rather than in either loader is what keeps the
+/// two from drifting again — both assert against this table, so adding a default
+/// on one surface without the other is a test failure rather than a silent
+/// divergence discovered by a guest author.
+/// Two of these entries — `MapApply` and `Ewise` — were the defect. The rest
+/// already held on both surfaces when this table was written, and are listed so
+/// that they are *asserted* rather than true by accident of two hand-written
+/// registrations. `ZeroMap` and `Emit` in particular each carry a second Rhai
+/// signature added ad hoc, with nothing testing that PyO3 agreed.
+pub const OPTIONAL_ARITIES: &[(KernelId, &[usize])] = &[
+    // `m, op` then the two scalar operands (`scale a`, `affine a·x + b`).
+    (KernelId::MapApply, &[2, 3, 4]),
+    // `a, b, op` then `coef`, which only `axpy` reads.
+    (KernelId::Ewise, &[3, 4]),
+    // `g`, then the dtype — `"i64"` seeds exact path counting (F-9).
+    (KernelId::ZeroMap, &[1, 2]),
+    // A column map, or a name and a handle.
+    (KernelId::Emit, &[1, 2]),
+    // `prob`, then the counter-hash `seed` and `iter`.
+    (KernelId::Sample, &[1, 2, 3]),
+    (KernelId::SampleEdges, &[1, 2, 3]),
+    // `g`, then `metric`, `pair_mode`, `k`.
+    (KernelId::AllPairsOverlap, &[1, 2, 3, 4]),
+    // `g, seeds, walk_length`, then `walks_per_node`, `p`, `q`, `seed`.
+    (KernelId::RandomWalks, &[3, 4, 5, 6, 7]),
+];
+
 impl KernelId {
     /// The kernels every loader must expose — what the contract tests assert.
     pub fn all_loaders() -> impl Iterator<Item = KernelId> {

@@ -100,6 +100,17 @@ pub enum MapOp {
     Sqrt,
     /// Natural exponential (`e^x`), the inverse of [`MapOp::Log`].
     Exp,
+    /// Floor (`⌊x⌋`), IEEE `roundToIntegralTowardNegative`.
+    ///
+    /// Floor, not truncation: `⌊-1.5⌋ = -2`. Matches `f64::floor` on every edge,
+    /// so `floor(±0) = ±0`, `floor(±inf) = ±inf`, `floor(NaN) = NaN`, and any
+    /// value at or above `2^53` is returned unchanged (it is already integral).
+    Floor,
+    /// Remainder with the sign of the divisor, for a *scalar* divisor.
+    ///
+    /// The scalar counterpart of [`EwiseOp::Mod`]; see [`rem_floor`] for the
+    /// convention and why it is not composed from [`MapOp::Floor`].
+    Mod(f64),
 }
 
 /// A vector norm used by [`MapOp::Normalize`] and [`ReduceOp`].
@@ -127,6 +138,63 @@ pub enum EwiseOp {
     /// Element-wise quotient with the convention `x / 0 = 0`, mirroring
     /// [`MapOp::Recip`] so dangling (zero-denominator) rows drop out.
     Div,
+    /// Element-wise remainder with the sign of the divisor; see [`rem_floor`].
+    ///
+    /// Deliberately does **not** follow the `x / 0 = 0` convention of its
+    /// neighbour [`EwiseOp::Div`] — a zero divisor yields `NaN`. The rationale
+    /// is on [`rem_floor`].
+    Mod,
+}
+
+/// Remainder of `x` and `y` carrying the sign of the divisor.
+///
+/// This is Python's and NumPy's `%`, not C's `fmod`: `5 mod -3 = -1` and
+/// `-5 mod 3 = 1`. Computed as the exact IEEE remainder plus a sign adjust.
+///
+/// # Why this is a kernel and not a composition
+///
+/// The textbook identity `x - y * ⌊x / y⌋` holds in ℝ but not in binary64. Once
+/// `x / y` exceeds `2^53` the quotient carries no fractional bits, [`MapOp::Floor`]
+/// becomes the identity, `y * (x / y)` reconstructs `x`, and the subtraction
+/// collapses to `0.0` — silently, and still inside `[0, y)`, so a range assertion
+/// on the result cannot catch it. That regime is reached by any unbounded
+/// accumulator, and early for a small divisor (`y = 0.001` fails from `x ≈ 1e12`).
+/// `fmod` is exact at every magnitude, which is why this delegates to it.
+///
+/// # Conventions
+///
+/// A zero divisor yields `NaN`, matching IEEE, Rust's `%`, and NumPy's
+/// element-wise `np.mod`. This is a deliberate divergence from the neighbouring
+/// [`EwiseOp::Div`] and [`MapOp::Recip`], which map a zero denominator to `0`:
+/// those exist because a vertex with zero out-degree *legitimately* has degree 0
+/// and should drop out of a normalization. A zero modulus has no such reading —
+/// it is a broken parameter — and returning `0` would reproduce exactly the
+/// silent zero described above.
+///
+/// A zero remainder takes the sign of the divisor, so `-0.0 mod 3 = 0.0` and
+/// `6 mod -3 = -0.0`, again matching `np.mod`.
+///
+/// # Examples
+///
+/// ```
+/// use uni_plugin_builtin::algorithms::graph_compute::session::rem_floor;
+///
+/// assert_eq!(rem_floor(5.0, 3.0), 2.0);
+/// assert_eq!(rem_floor(5.0, -3.0), -1.0); // sign follows the divisor
+/// assert_eq!(rem_floor(-5.0, 3.0), 1.0);
+/// assert!(rem_floor(1.0, 0.0).is_nan()); // not the `x / 0 = 0` convention
+///
+/// // Exact where `x - y * (x / y).floor()` silently returns 0.0.
+/// assert_eq!(rem_floor(2e17, 12.0), 8.0);
+/// ```
+#[must_use]
+pub fn rem_floor(x: f64, y: f64) -> f64 {
+    // `x % y` is already NaN when y == 0, so the zero divisor needs no branch.
+    let r = x % y;
+    if r == 0.0 {
+        return 0.0_f64.copysign(y);
+    }
+    if (r < 0.0) != (y < 0.0) { r + y } else { r }
 }
 
 /// A closed reduction over a map, optionally masked (proposal §4.3).
@@ -1406,6 +1474,9 @@ impl GraphCompute for AlgoSession {
                             x / y
                         }
                     }
+                    // Deliberately NOT the `x / 0 = 0` convention above; see
+                    // `rem_floor` for why a zero modulus yields NaN instead.
+                    EwiseOp::Mod => rem_floor(x, y),
                 }
             })
             .collect();
@@ -2095,6 +2166,11 @@ impl GraphCompute for AlgoSession {
             MapOp::Log => x.iter().map(|v| v.ln()).collect(),
             MapOp::Sqrt => x.iter().map(|v| v.sqrt()).collect(),
             MapOp::Exp => x.iter().map(|v| v.exp()).collect(),
+            MapOp::Floor => x.iter().map(|v| v.floor()).collect(),
+            // Scalar divisor: the `time % 12` shape, without materializing a
+            // constant `[V]` map first (`zero_map` + `affine`, two extra ops
+            // and two allocations charged on every tick of a stepped loop).
+            MapOp::Mod(m) => x.iter().map(|&v| rem_floor(v, m)).collect(),
             MapOp::Normalize(norm) => {
                 let denom = match norm {
                     Norm::L1 => x.iter().map(|v| v.abs()).sum::<f64>(),

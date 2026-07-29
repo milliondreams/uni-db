@@ -253,7 +253,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 
 | Kernel | Returns |
 | --- | --- |
-| `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` (the division convention is `x/0 = 0`). |
+| `ewise(a, b, op, coef)` | Elementwise `mul` / `add` / `min` / `max` / `axpy` / `div` / `mod` (the division convention is `x/0 = 0`; `mod` deliberately differs — see [remainder conventions](#floor-and-mod)). |
 | `edge_from_nodes(g, x, op)` | Gather a `[V]` node value onto edges, yielding `[E]` in CSR out-edge order. `op` is `src` / `dst` / `sub` (`x[dst]-x[src]`) / `absdiff` / `add` / `min` / `max`. The bridge from node quantities to edge quantities — an interaction rule is a predicate over an edge's two endpoints, and nothing else brings node values onto edges. |
 | `interp(x, xs, ys)` | Piecewise-linear table lookup — the System Dynamics table function. Interpolates `x` through the `(xs[i], ys[i])` breakpoints and **clamps** outside the range, the Vensim `WITH LOOKUP` convention. One pass over `[V]`, independent of breakpoint count. Shape-preserving. |
 | `compare(a, b, op)` | Elementwise `gt` / `ge` / `lt` / `le` / `eq` / `ne`, yielding a 1.0/0.0 mask. Shape-preserving, so an `[E]` comparison yields an `[E]` mask. |
@@ -261,7 +261,7 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | `zero_map(g)` | A zeroed `[V]` map. |
 | `scatter(map, frontier, value)` | Write a scalar into the slots a vertex set selects. |
 | `rekey(value, g)` | Move a `[V]` tensor or vertex set into another projection's index space, **verified** — fails unless both projections name the same vertices slot for slot. See [named scopes](#more-than-one-graph-named-scopes). |
-| `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `normalize_l1`, `normalize_l2`. |
+| `map_apply(m, op, a, b)` | Generic map: `recip`, `scale`, `log`, `exp`, `sqrt`, `affine`, `floor`, `mod`, `normalize_l1`, `normalize_l2`. `mod` takes the divisor as the scalar `a`. |
 | `recip` / `scale` / `normalize` | Fixed-form shorthands for the above. |
 | `reduce_sum` / `reduce_sum_masked` | Deterministic sums (fixed-order, so bitwise-reproducible). |
 | `arg_extreme(m, want_max)` | The extremal `(vertexId, value)`. |
@@ -269,6 +269,34 @@ Operands are handles (opaque integers) and small scalars. **No vertex data cross
 | `l1_diff(a, b)` | Convergence metric for fixpoint loops. |
 
 With `sqrt` and `exp` alongside `log` and `div`, the canonical UCT/UCB exploration term `c·√(ln N / n)` composes directly out of kernels — `map_apply(counts, "log")`, `ewise(…, visits, "div")`, then `map_apply(…, "sqrt")` — with no per-element guest code and no host round-trip.
+
+### `floor` and `mod`
+
+Both are single ops. The stepped-dynamics shape `(time % period) / period` is
+`map_apply(t, "mod", 12.0)` for a literal period and `ewise(t, periods, "mod")` for a
+column of them — one charge of the work meter either way, independent of the horizon.
+
+The conventions, stated rather than left to be measured:
+
+- **`floor` is floor, not truncation.** `⌊-1.5⌋ = -2`. It is IEEE
+  `roundToIntegralTowardNegative`, matching `np.floor` on every edge: `floor(±0) = ±0`,
+  `floor(±inf) = ±inf`, `floor(NaN) = NaN`, and anything at or above `2^53` is already
+  integral and comes back unchanged.
+- **`mod` takes the sign of the divisor** — Python's and NumPy's `%`, not C's `fmod`. So
+  `5 mod -3 = -1` and `-5 mod 3 = 1`. A zero remainder also takes the divisor's sign
+  (`-0.0 mod 3 = 0.0`), matching `np.mod` bit for bit.
+- **`mod` by zero is `NaN`**, which is a deliberate exception to the `x/0 = 0` convention
+  that `div` and `recip` follow. Those exist so a vertex with zero out-degree drops out of
+  a normalization — a legitimate graph fact. A zero modulus is not a legitimate anything,
+  it is a broken parameter, and returning `0` would hide it.
+
+**Do not compose `mod` from `floor`.** The identity `x - y·⌊x/y⌋` holds in ℝ but not in
+binary64: once `x/y` exceeds `2^53` the quotient has no fractional bits left, `floor`
+becomes the identity, and the expression collapses to `0.0` — silently, and still inside
+`[0, y)`, so a range check on the result will not catch it. Any unbounded accumulator
+reaches that regime, and a small divisor reaches it early (`y = 0.001` fails from
+`x ≈ 1e12`). The `mod` op delegates to the exact IEEE remainder and is correct at every
+magnitude; that is why it exists as its own op rather than as a published composition.
 
 
 ### When `node_property` / `edge_property` return NaN
@@ -335,6 +363,7 @@ valid ewise ops: add, mul, min, max, axpy, div
 | `clip(a, lo, hi)` | `ewise(ewise(a, lo, "max"), hi, "min")` |
 | `a ** 2`, integer powers | `repeat ewise(x, x, "mul"); x squared is ewise(a, a, "mul")` |
 | `-a` | `map_apply(a, "scale", -1.0)` |
+| `ceil(a)` | `map_apply(map_apply(map_apply(a, "scale", -1.0), "floor"), "scale", -1.0)` — exact, since `⌈x⌉ = -⌊-x⌋`. `round` and `trunc` have no exact composition from `floor` and are not offered as one. |
 | `normalize(m)` | `map_apply(m, "normalize_l1") or map_apply(m, "normalize_l2")` |
 | an exact edge mask | `edge_mask_window(edge_property(g, prop), 0.5, 1.5)` |
 
@@ -346,8 +375,17 @@ Two caveats worth knowing before you rely on them:
 - **A composed comparison charges the native-work meter three times** (`ewise` + `map_to_set` +
   `set_to_map`, each `|V|`), where a primitive comparison would charge once.
 
+**Trailing scalars are optional.** The recipes above are written at the shortest arity that
+carries their meaning — `map_apply(a, "scale", -1.0)` omits `map_apply`'s second scalar,
+`ewise(b, …, "add")` omits the `axpy` coefficient — and every loader accepts them that way,
+defaulting the omitted arguments to `0.0`. `map_apply(counts, "log")` is a complete call.
+So a recipe can be copied out of this page, or out of the engine's own rejection message,
+and run as written.
+
 These identities are executed against an independent scalar oracle on every CI run
-(`composition_recipes.rs`), so a recipe that stops being true breaks the build rather than
+(`composition_recipes.rs`), **and are executed again through the Rhai and Python guest
+surfaces** so that the published spelling is known to resolve there and not merely to be
+expressible in Rust. A recipe that stops being true breaks the build rather than
 quietly misleading you.
 ### Traversal
 

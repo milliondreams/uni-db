@@ -1030,8 +1030,173 @@ impl GcSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uni_plugin_builtin::algorithms::graph_compute::kernel_id::{KernelId, KernelReach};
+    use uni_plugin_builtin::algorithms::graph_compute::kernel_id::{
+        KernelId, KernelReach, OPTIONAL_ARITIES,
+    };
     use uni_plugin_builtin::algorithms::graph_compute::{Arena, WorkBudget};
+
+    /// Every arity declared in `OPTIONAL_ARITIES` is callable **from Python**.
+    ///
+    /// The sibling of the Rhai test of the same shape. This surface already
+    /// satisfied the contract — its `#[pyo3(signature = ..)]` defaults supply
+    /// the short forms — so this is a drift guard, not a fix: dropping a default
+    /// here would silently break the published `map_apply(a, "scale", -1.0)`
+    /// spelling exactly the way Rhai's missing overloads did.
+    ///
+    /// It goes through the interpreter rather than calling the `#[pymethods]`
+    /// function directly, because a direct Rust call cannot observe a signature
+    /// default at all — which is why the neighbouring tests here never caught
+    /// the loader divergence.
+    #[test]
+    fn every_declared_optional_arity_is_callable_from_python() {
+        use std::collections::HashMap;
+        use std::ffi::CString;
+        use uni_algo::algo::GraphProjection;
+        use uni_common::Value;
+        use uni_plugin_builtin::algorithms::graph_compute::session::GraphCompute;
+        use uni_plugin_builtin::algorithms::graph_compute::value::DType;
+
+        // One probe per declared (kernel, arity). Locked both ways below.
+        let probes: &[(KernelId, usize, &str)] = &[
+            (KernelId::MapApply, 2, "gc.map_apply(m, 'log')"),
+            (KernelId::MapApply, 3, "gc.map_apply(m, 'scale', 2.0)"),
+            (KernelId::MapApply, 4, "gc.map_apply(m, 'affine', 1.0, 0.5)"),
+            (KernelId::Ewise, 3, "gc.ewise(m, m, 'add')"),
+            (KernelId::Ewise, 4, "gc.ewise(m, m, 'axpy', -1.0)"),
+            (KernelId::ZeroMap, 1, "gc.zero_map(g)"),
+            (KernelId::ZeroMap, 2, "gc.zero_map(g, 'i64')"),
+            (KernelId::Emit, 1, "gc.emit({'score': m})"),
+            (KernelId::Emit, 2, "gc.emit('score', m)"),
+            (KernelId::Sample, 1, "gc.sample(m)"),
+            (KernelId::Sample, 2, "gc.sample(m, 1)"),
+            (KernelId::Sample, 3, "gc.sample(m, 1, 0)"),
+            (KernelId::SampleEdges, 1, "gc.sample_edges(e)"),
+            (KernelId::SampleEdges, 2, "gc.sample_edges(e, 1)"),
+            (KernelId::SampleEdges, 3, "gc.sample_edges(e, 1, 0)"),
+            (KernelId::AllPairsOverlap, 1, "gc.all_pairs_overlap(g)"),
+            (
+                KernelId::AllPairsOverlap,
+                2,
+                "gc.all_pairs_overlap(g, 'count')",
+            ),
+            (
+                KernelId::AllPairsOverlap,
+                3,
+                "gc.all_pairs_overlap(g, 'count', 'adjacent')",
+            ),
+            (
+                KernelId::AllPairsOverlap,
+                4,
+                "gc.all_pairs_overlap(g, 'count', 'adjacent', 0)",
+            ),
+            (KernelId::RandomWalks, 3, "gc.random_walks(g, [], 2)"),
+            (KernelId::RandomWalks, 4, "gc.random_walks(g, [], 2, 1)"),
+            (
+                KernelId::RandomWalks,
+                5,
+                "gc.random_walks(g, [], 2, 1, 1.0)",
+            ),
+            (
+                KernelId::RandomWalks,
+                6,
+                "gc.random_walks(g, [], 2, 1, 1.0, 1.0)",
+            ),
+            (
+                KernelId::RandomWalks,
+                7,
+                "gc.random_walks(g, [], 2, 1, 1.0, 1.0, 0)",
+            ),
+        ];
+
+        Python::initialize();
+        let node_rows: Vec<HashMap<String, Value>> = (0..3u64)
+            .map(|id| HashMap::from([("id".to_string(), Value::Int(id as i64))]))
+            .collect();
+        let graph =
+            GraphProjection::from_rows(&node_rows, &[], None, false).expect("projection builds");
+        let mut session =
+            AlgoSession::new(23, WorkBudget::new(1_000_000), Arena::new(1 << 20, 256));
+        let g = session.bind_graph(Arc::new(graph));
+        let shared = Arc::new(Mutex::new(session));
+        let m = to_i64(shared.lock().zero_map(g, DType::F64).expect("zero_map"));
+        // An `[E]` tensor for `sample_edges`; empty here, which is enough to
+        // resolve the call — this test is about arity, not about the data.
+        let e = to_i64(shared.lock().edge_weights(g).expect("edge_weights"));
+        let g_i = to_i64(g);
+
+        Python::attach(|py| {
+            let gc = Py::new(py, new_session(Arc::clone(&shared), g, None, Vec::new()))
+                .expect("GcSession into Python");
+            for (kernel, arity, expr) in probes {
+                let code =
+                    CString::new(format!("def probe(gc, m, e, g):\n    return {expr}\n")).unwrap();
+                let module = pyo3::types::PyModule::from_code(
+                    py,
+                    code.as_c_str(),
+                    CString::new("arity_probe.py").unwrap().as_c_str(),
+                    CString::new("arity_probe").unwrap().as_c_str(),
+                )
+                .expect("probe module compiles");
+                let f = module.getattr("probe").expect("probe defined");
+                if let Err(err) = f.call1((gc.clone_ref(py), m, e, g_i)) {
+                    assert!(
+                        !err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                        "`{}` is declared callable at arity {arity} but Python rejects the \
+                         call: {expr}\n  {err}",
+                        kernel.op_name()
+                    );
+                }
+            }
+        });
+
+        // Negative control: the check above is only meaningful if a genuinely
+        // short call *is* rejected. `compare` declares no defaults, so two
+        // arguments must raise `TypeError` — if this ever stops holding, the
+        // assertions above have quietly stopped testing anything.
+        Python::attach(|py| {
+            let gc = Py::new(py, new_session(Arc::clone(&shared), g, None, Vec::new()))
+                .expect("GcSession into Python");
+            let code = CString::new("def probe(gc, m):\n    return gc.compare(m, m)\n").unwrap();
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                code.as_c_str(),
+                CString::new("arity_control.py").unwrap().as_c_str(),
+                CString::new("arity_control").unwrap().as_c_str(),
+            )
+            .expect("control module compiles");
+            let err = module
+                .getattr("probe")
+                .expect("probe defined")
+                .call1((gc.clone_ref(py), m))
+                .expect_err("`compare` takes three arguments, so two must be rejected");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyTypeError>(py),
+                "a too-short call must surface as TypeError for this test to have teeth, got {err}"
+            );
+        });
+
+        // Two-way lock against the shared declaration, identical to the Rhai side.
+        for (kernel, arities) in OPTIONAL_ARITIES {
+            for arity in *arities {
+                assert!(
+                    probes.iter().any(|(k, a, _)| k == kernel && a == arity),
+                    "`{}` declares arity {arity} with no probe here",
+                    kernel.op_name()
+                );
+            }
+        }
+        for (kernel, arity, _) in probes {
+            let declared = OPTIONAL_ARITIES
+                .iter()
+                .find(|(k, _)| k == kernel)
+                .is_some_and(|(_, arities)| arities.contains(arity));
+            assert!(
+                declared,
+                "`{}` is probed at arity {arity} but the shared table does not declare it",
+                kernel.op_name()
+            );
+        }
+    }
 
     /// The reachability contract for the PyO3 surface (proposal §5.4 / §13.2).
     ///

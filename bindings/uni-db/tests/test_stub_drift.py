@@ -75,7 +75,20 @@ _EXC_INSTANCE_ATTRS: dict[str, set[str]] = {
     },
 }
 
+# The WASM loaders are `#[cfg]`-gated on the `wasm-plugins` / `extism-plugins`
+# features. The published wheel drops both for size (they remain available for
+# source builds), so on a default build these stub entries have no runtime
+# counterpart. They are documented in the stub deliberately — a source build
+# does have them — so allowlist them on the reverse check rather than delete
+# them, which would leave feature-enabled builds undocumented.
+_FEATURE_GATED_MEMBERS: dict[str, set[str]] = {
+    "Uni": {"load_wasm_component", "load_wasm_extism"},
+    "AsyncUni": {"load_wasm_component", "load_wasm_extism"},
+}
+
 IGNORED_MEMBERS: dict[str, set[str]] = dict(_EXC_INSTANCE_ATTRS)
+for _cls, _members in _FEATURE_GATED_MEMBERS.items():
+    IGNORED_MEMBERS.setdefault(_cls, set()).update(_members)
 
 
 def _is_dunder(name: str) -> bool:

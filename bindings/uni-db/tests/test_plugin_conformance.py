@@ -53,6 +53,21 @@ def _fixture(rel):
 
 
 # Built WASM/Extism artifacts (gitignored; built by scripts/build-wasm-fixtures.sh).
+# The WASM/Extism loader methods are `#[cfg]`-gated on the `wasm-plugins` /
+# `extism-plugins` features, which the published wheel drops for size (they
+# remain available for source builds). A build without them is legitimate, so
+# these rows skip rather than fail — the same contract as the missing-fixture
+# skips they sit beside.
+def _loader_absent(method: str) -> bool:
+    """Whether `method` was compiled out of this build."""
+    return not hasattr(uni_db._uni_db.Uni, method)
+
+
+def _row_unavailable(method: str, fixture: str) -> bool:
+    """Skip predicate: fixture not built, or loader not compiled in."""
+    return not os.path.exists(fixture) or _loader_absent(method)
+
+
 WASM_GEO = _fixture(
     "examples/example-wasm-geo/target/wasm32-wasip2/release/example_wasm_geo.wasm"
 )
@@ -579,7 +594,8 @@ _GEO_CASES = [
         "load_wasm_component",
         WASM_GEO,
         marks=pytest.mark.skipif(
-            not os.path.exists(WASM_GEO), reason=f"missing fixture: {WASM_GEO}"
+            _row_unavailable("load_wasm_component", WASM_GEO),
+            reason=f"missing fixture {WASM_GEO} or loader load_wasm_component compiled out",
         ),
         id="wasm-geo",
     ),
@@ -587,7 +603,8 @@ _GEO_CASES = [
         "load_wasm_extism",
         EXT_GEO,
         marks=pytest.mark.skipif(
-            not os.path.exists(EXT_GEO), reason=f"missing fixture: {EXT_GEO}"
+            _row_unavailable("load_wasm_extism", EXT_GEO),
+            reason=f"missing fixture {EXT_GEO} or loader load_wasm_extism compiled out",
         ),
         id="extism-geo",
     ),
@@ -599,7 +616,8 @@ _GRAPH_CASES = [
         WASM_GRAPH,
         "ai.example.wasmgc",
         marks=pytest.mark.skipif(
-            not os.path.exists(WASM_GRAPH), reason=f"missing fixture: {WASM_GRAPH}"
+            _row_unavailable("load_wasm_component", WASM_GRAPH),
+            reason=f"missing fixture {WASM_GRAPH} or loader load_wasm_component compiled out",
         ),
         id="wasm-graph",
     ),
@@ -608,7 +626,8 @@ _GRAPH_CASES = [
         EXT_GRAPH,
         "ai.example.extismgc",
         marks=pytest.mark.skipif(
-            not os.path.exists(EXT_GRAPH), reason=f"missing fixture: {EXT_GRAPH}"
+            _row_unavailable("load_wasm_extism", EXT_GRAPH),
+            reason=f"missing fixture {EXT_GRAPH} or loader load_wasm_extism compiled out",
         ),
         id="extism-graph",
     ),
@@ -619,7 +638,8 @@ _NET_CASES = [
         "load_wasm_component",
         WASM_NET,
         marks=pytest.mark.skipif(
-            not os.path.exists(WASM_NET), reason=f"missing fixture: {WASM_NET}"
+            _row_unavailable("load_wasm_component", WASM_NET),
+            reason=f"missing fixture {WASM_NET} or loader load_wasm_component compiled out",
         ),
         id="wasm-net",
     ),
@@ -627,7 +647,8 @@ _NET_CASES = [
         "load_wasm_extism",
         EXT_NET,
         marks=pytest.mark.skipif(
-            not os.path.exists(EXT_NET), reason=f"missing fixture: {EXT_NET}"
+            _row_unavailable("load_wasm_extism", EXT_NET),
+            reason=f"missing fixture {EXT_NET} or loader load_wasm_extism compiled out",
         ),
         id="extism-net",
     ),

@@ -13,10 +13,6 @@ use anyhow::{Result, anyhow};
 use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{Field, Schema as ArrowSchema, TimeUnit};
-#[cfg(feature = "lance-backend")]
-use futures::TryStreamExt;
-#[cfg(feature = "lance-backend")]
-use lance::dataset::Dataset;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -89,8 +85,6 @@ pub struct L1Entry {
 /// merges them into the base CSR.
 #[derive(Debug)]
 pub struct DeltaDataset {
-    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
-    uri: String,
     edge_type: String,
     direction: String, // "fwd" or "bwd"
     /// Lance branch for branched reads. `None` = primary.
@@ -99,11 +93,12 @@ pub struct DeltaDataset {
 }
 
 impl DeltaDataset {
-    /// Create a new `DeltaDataset` rooted at `base_uri` for the given edge type and direction.
-    pub fn new(base_uri: &str, edge_type: &str, direction: &str) -> Self {
-        let uri = format!("{}/deltas/{}_{}", base_uri, edge_type, direction);
+    /// Create a new `DeltaDataset` for the given edge type and direction.
+    ///
+    /// `_base_uri` is ignored: physical path resolution belongs to the storage
+    /// backend; this type holds only the table's logical identity.
+    pub fn new(_base_uri: &str, edge_type: &str, direction: &str) -> Self {
         Self {
-            uri,
             edge_type: edge_type.to_string(),
             direction: direction.to_string(),
             branch: None,
@@ -120,25 +115,6 @@ impl DeltaDataset {
         let mut ds = Self::new(base_uri, edge_type, direction);
         ds.branch = Some(branch.into());
         ds
-    }
-
-    /// Open the delta dataset at its latest version.
-    #[cfg(feature = "lance-backend")]
-    pub async fn open(&self) -> Result<Arc<Dataset>> {
-        self.open_at(None).await
-    }
-
-    /// Open the delta dataset, optionally pinned to a specific Lance version.
-    #[cfg(feature = "lance-backend")]
-    pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
-        let mut ds = match &self.branch {
-            Some(branch) => crate::backend::lance_branch::open_branch(&self.uri, branch).await?,
-            None => Dataset::open(&self.uri).await?,
-        };
-        if let Some(v) = version {
-            ds = ds.checkout_version(v).await?;
-        }
-        Ok(Arc::new(ds))
     }
 
     /// Build the Arrow schema for this delta table using the given graph schema.
@@ -238,50 +214,6 @@ impl DeltaDataset {
             |i| &entries[i].properties,
             &[],
         )
-    }
-
-    /// Scan and return all L1 entries, sorted by direction key and version.
-    #[cfg(feature = "lance-backend")]
-    pub async fn scan_all(&self, schema: &Schema) -> Result<Vec<L1Entry>> {
-        self.scan_all_with_limit(schema, DEFAULT_MAX_COMPACTION_ROWS)
-            .await
-    }
-
-    /// Scan all entries with a configurable row limit to prevent OOM.
-    #[cfg(feature = "lance-backend")]
-    pub async fn scan_all_with_limit(
-        &self,
-        schema: &Schema,
-        max_rows: usize,
-    ) -> Result<Vec<L1Entry>> {
-        let ds = match self.open().await {
-            Ok(ds) => ds,
-            Err(_) => return Ok(vec![]),
-        };
-
-        let row_count = ds.count_rows(None).await?;
-        check_oom_guard(row_count, max_rows, &self.edge_type, &self.direction)?;
-
-        info!(
-            edge_type = %self.edge_type,
-            direction = %self.direction,
-            row_count,
-            estimated_bytes = row_count * ENTRY_SIZE_ESTIMATE,
-            "Starting delta scan for compaction"
-        );
-
-        let mut stream = ds.scan().try_into_stream().await?;
-
-        let mut entries = Vec::new();
-
-        while let Some(batch) = stream.try_next().await? {
-            let mut batch_entries = self.parse_batch(&batch, schema)?;
-            entries.append(&mut batch_entries);
-        }
-
-        self.sort_entries(&mut entries);
-
-        Ok(entries)
     }
 
     /// Sort entries by direction key (src_vid for fwd, dst_vid for bwd) then by version.

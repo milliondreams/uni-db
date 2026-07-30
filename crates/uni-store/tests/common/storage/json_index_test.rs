@@ -57,6 +57,36 @@ async fn test_json_index_query_nonexistent() {
     assert!(vids.is_empty(), "Nonexistent value should return empty");
 }
 
+/// A value containing a single quote must round-trip. Before the fix, the
+/// predicate was built as `value = 'O'Brien'`, which closes the string literal
+/// after `O` and fails to parse — the lookup errored instead of matching.
+#[tokio::test]
+async fn test_json_index_value_with_single_quote() {
+    let dir = tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let index = JsonPathIndex::new(base_uri, "Person", "$.name");
+
+    index
+        .write_entries(vec![
+            ("O'Brien".to_string(), vec![Vid::from(7u64)]),
+            ("d'Artagnan's".to_string(), vec![Vid::from(8u64)]),
+            ("Plain".to_string(), vec![Vid::from(9u64)]),
+        ])
+        .await
+        .unwrap();
+
+    let vids = index.get_vids("O'Brien").await.unwrap();
+    assert_eq!(vids, vec![Vid::from(7u64)], "single quote must be escaped");
+
+    // Two quotes, one of them trailing before the closing delimiter.
+    let vids = index.get_vids("d'Artagnan's").await.unwrap();
+    assert_eq!(vids, vec![Vid::from(8u64)]);
+
+    // A quote-bearing query must not match unrelated rows.
+    let vids = index.get_vids("Plain'").await.unwrap();
+    assert!(vids.is_empty(), "quote injection must not widen the match");
+}
+
 #[tokio::test]
 async fn test_json_index_open_nonexistent() {
     let dir = tempdir().unwrap();

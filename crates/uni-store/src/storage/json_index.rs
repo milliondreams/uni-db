@@ -77,10 +77,12 @@ impl JsonPathIndex {
             Err(_) => return Ok(vec![]),
         };
 
-        // Scan and filter (MVP)
+        // Scan and filter (MVP). The single-quote doubling is required: a value
+        // containing `'` would otherwise close the literal early and produce a
+        // malformed predicate. Matches `inverted_index.rs` and `pushdown.rs`.
         let mut stream = ds
             .scan()
-            .filter(&format!("value = '{}'", value))?
+            .filter(&format!("value = '{}'", value.replace('\'', "''")))?
             .try_into_stream()
             .await?;
 

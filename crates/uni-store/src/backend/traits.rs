@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use uni_common::core::schema::TokenizerConfig;
 
+use super::branching::ForkBranching;
 use super::types::*;
 
 /// A record batch stream returned by [`StorageBackend::scan_stream`].
@@ -216,6 +217,16 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Get the base URI for this backend's storage location.
     fn base_uri(&self) -> &str;
+
+    /// Copy-on-write branching support, if this backend provides it.
+    ///
+    /// `Some` unlocks the fork engine; `None` means forks are unavailable on
+    /// this backend rather than silently unisolated. Returning `None` is the
+    /// default so that a new backend cannot accidentally claim fork support it
+    /// has not implemented.
+    fn branching(&self) -> Option<Arc<dyn ForkBranching>> {
+        None
+    }
 
     // ========================
     // Capability Checks

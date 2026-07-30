@@ -304,7 +304,7 @@ The previous nine `gpu-*` features (`gpu-tensorrt`, `gpu-rocm`, `gpu-coreml`, `g
 
 | Feature | Description | Default |
 |---|---|---|
-| `lance-backend` | Lance columnar storage backend | Enabled |
+| `lance-backend` | Lance columnar storage backend. **Effectively mandatory** — Lance is currently the only `StorageBackend` implementation, and building without this feature does not compile. Keep it enabled; it is listed here for completeness, not as a supported toggle. | Enabled |
 | `mimalloc` | Re-export `mimalloc::MiMalloc` as `uni_db::MiMalloc` so consumers can install it as the global allocator (~3× throughput on mutation-heavy workloads). Setting `#[global_allocator]` is still the binary's job. | Disabled |
 | `snapshot-internals` | Expose snapshot internals (advanced) | Disabled |
 | `storage-internals` | Expose storage internals (advanced) | Disabled |

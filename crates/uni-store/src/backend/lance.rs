@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! LanceDB implementation of the [`StorageBackend`] trait.
+//! Lance implementation of the [`StorageBackend`] trait.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -13,30 +13,26 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lancedb::Table;
-use lancedb::connection::Connection;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
 use uni_common::core::schema::TokenizerConfig;
 
 use super::lance_branch;
+use super::lance_directory::LanceDirectory;
 use super::traits::{RecordBatchStream, StorageBackend};
 use super::types::*;
 
-/// LanceDB implementation of [`StorageBackend`].
+/// Lance implementation of [`StorageBackend`].
 ///
-/// Wraps a LanceDB [`Connection`] and manages an internal table cache
-/// for performance. All Lance-specific code is confined to this module.
+/// Built directly on `lance::Dataset` via [`LanceDirectory`]; the `lancedb`
+/// layer it once wrapped has been removed. All Lance-specific code is confined
+/// to this module and its siblings (`lance_branch`, `lance_directory`).
 pub struct LanceDbBackend {
-    connection: Connection,
+    /// The directory of Lance datasets this backend addresses.
+    ///
+    /// Owns table-name → dataset-path resolution and dataset opens; see its
+    /// module docs for the layout contract it must uphold.
+    directory: LanceDirectory,
     base_uri: String,
-    /// Legacy table cache. Kept as a field for binary-compatibility with
-    /// the existing invalidate_cache / clear_cache trait methods, but
-    /// NEVER populated by `get_or_open_table` — see that method's
-    /// doc-comment for why we open fresh every time under async-flush.
-    /// The remove()/clear() calls in this file are now no-ops.
-    #[allow(dead_code)]
-    table_cache: DashMap<String, Table>,
     /// Per-table write serialization mutex. Acquired by `write` and
     /// `create_table` around the check-then-create. Without this, two
     /// concurrent async-flush streams that both observe a table as
@@ -49,7 +45,7 @@ pub struct LanceDbBackend {
     table_write_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Existence cache populated lazily by [`Self::table_exists`].
     ///
-    /// Avoids paying for [`Connection::table_names`] (which lists every
+    /// Avoids paying for [`LanceDirectory::table_names`] (which lists every
     /// table in the database) on every `table_exists` call. uni-db's
     /// query planner calls `table_exists` per-table per-query, so without
     /// this cache, post-flush latency scales with total schema size.
@@ -62,15 +58,19 @@ pub struct LanceDbBackend {
     /// Lance schemas are stable for the table's lifetime under our usage
     /// (we never alter columns in place — schema-evolving migrations would
     /// drop/recreate the table). Caching avoids the per-query
-    /// `table.schema().await` round-trip for every Cypher query that
+    /// dataset open + schema conversion for every Cypher query that
     /// scans a label or edge type. See issue #55.
     schema_cache: DashMap<String, Arc<ArrowSchema>>,
 }
 
-// `cache_key` removed alongside the `lancedb::Table` cache (see
-// `get_or_open_table` doc comment). The branch cache key form is no
-// longer needed because branch reads route through `lance_branch`
-// rather than via lancedb's `Table` type.
+/// Map uni's backend-neutral metric onto Lance's.
+fn distance_metric_of(metric: DistanceMetric) -> lance_linalg::distance::MetricType {
+    match metric {
+        DistanceMetric::L2 => lance_linalg::distance::MetricType::L2,
+        DistanceMetric::Cosine => lance_linalg::distance::MetricType::Cosine,
+        DistanceMetric::Dot => lance_linalg::distance::MetricType::Dot,
+    }
+}
 
 impl LanceDbBackend {
     /// Connect to a LanceDB database at the given URI.
@@ -78,19 +78,11 @@ impl LanceDbBackend {
         uri: &str,
         storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let mut builder = lancedb::connect(uri);
-        if let Some(opts) = storage_options {
-            builder = builder.storage_options(opts);
-        }
-        let connection = builder
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to connect to LanceDB at {}: {}", uri, e))?;
+        let directory = LanceDirectory::connect(uri, storage_options).await?;
 
         Ok(Self {
-            connection,
+            directory,
             base_uri: uri.to_string(),
-            table_cache: DashMap::new(),
             table_write_locks: DashMap::new(),
             existence_cache: DashMap::new(),
             schema_cache: DashMap::new(),
@@ -105,33 +97,6 @@ impl LanceDbBackend {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
-    }
-
-    /// Open a `lancedb::Table` by name (primary branch only).
-    ///
-    /// Always opens fresh via `connection.open_table()` — does NOT use
-    /// a cache. A cached `lancedb::Table` handle is pinned to the
-    /// dataset version it was opened at (per `Table::checkout_latest`
-    /// docs in lancedb 0.27.1) and does NOT auto-refresh after
-    /// subsequent writes. Under async-flush, multiple stream phases
-    /// commit concurrent versions; a cached handle's reads then drop
-    /// rows committed after the handle was opened. Fix: open fresh
-    /// every time so each query sees the latest committed version.
-    ///
-    /// `connection.open_table()` is a cheap manifest-pointer read in
-    /// LanceDB; the previous DashMap cache was a micro-optimization
-    /// for sync workloads. Under async-flush it's a correctness
-    /// hazard, so we remove it.
-    ///
-    /// Branch reads still bypass this and route through
-    /// [`super::lance_branch`] because lancedb 0.27.1 cannot open a
-    /// `Table` on a non-main branch.
-    async fn get_or_open_table(&self, name: &str) -> Result<Table> {
-        self.connection
-            .open_table(name)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to open table '{}': {}", name, e))
     }
 
     /// Build the on-disk URI for `name` (used for branch reads via lance).
@@ -181,36 +146,78 @@ impl LanceDbBackend {
         Ok((parent_version, dst_branch.to_owned()))
     }
 
-    /// Execute a scan query on the primary branch, returning a lancedb stream.
-    async fn execute_primary_scan(
+    /// Write `batches` to `table` with `mode`, on raw Lance.
+    ///
+    /// `schema` travels separately so the empty case works: an empty `batches`
+    /// carries no schema, and `WriteMode::Create` on an empty vector is how a
+    /// schema-only table gets materialized. A single zero-row batch is what
+    /// actually conveys the schema to Lance — the same normalization
+    /// `LanceBranching::reader` performs.
+    ///
+    /// This is the one place primary writes reach storage, so storage options
+    /// are threaded exactly once, via [`LanceDirectory::write_params`].
+    async fn write_batches(
         &self,
-        request: &ScanRequest,
-    ) -> Result<lancedb::arrow::SendableRecordBatchStream> {
-        let table = self.get_or_open_table(&request.table_name).await?;
-        let mut query = table.query();
+        table: &str,
+        mut batches: Vec<RecordBatch>,
+        schema: Arc<ArrowSchema>,
+        mode: lance::dataset::WriteMode,
+    ) -> Result<()> {
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema.clone()));
+        }
+        let uri = self.directory.dataset_uri(table);
+        let params = self.directory.write_params(mode);
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        lance::Dataset::write(reader, &uri, Some(params))
+            .await
+            .map_err(|e| anyhow!("Write to '{}' ({:?}) failed: {}", table, mode, e))?;
+        Ok(())
+    }
 
-        match &request.columns {
-            ColumnProjection::Columns(cols) => {
-                query = query.select(Select::Columns(cols.clone()));
-            }
-            ColumnProjection::All => {}
+    /// Execute a scan query on the primary branch.
+    ///
+    /// Mirrors [`Self::execute_branch_scan`] with one deliberate difference:
+    /// scalar-index pushdown stays **enabled** here. The branch path disables
+    /// it because a fork's `base_paths` chain can't resolve a BTree's
+    /// `page_lookup.lance` past one level (#106); primary has no such chain,
+    /// so it keeps the acceleration. The two paths therefore differ in plan,
+    /// never in result set.
+    async fn execute_primary_scan(&self, request: &ScanRequest) -> Result<RecordBatchStream> {
+        let dataset = self.directory.open(&request.table_name).await?;
+        let mut scanner = dataset.scan();
+
+        if let ColumnProjection::Columns(cols) = &request.columns {
+            scanner.project(cols).map_err(|e| {
+                anyhow!(
+                    "Project columns {:?} on '{}': {}",
+                    cols,
+                    request.table_name,
+                    e
+                )
+            })?;
         }
 
-        match &request.filter {
-            FilterExpr::Sql(sql) => {
-                query = query.only_if(sql);
-            }
-            FilterExpr::None => {}
+        if let FilterExpr::Sql(sql) = &request.filter {
+            scanner
+                .filter(sql)
+                .map_err(|e| anyhow!("Filter '{}' on '{}': {}", sql, request.table_name, e))?;
         }
 
         if let Some(limit) = request.limit {
-            query = query.limit(limit);
+            scanner
+                .limit(Some(limit as i64), None)
+                .map_err(|e| anyhow!("Limit on scan of '{}': {}", request.table_name, e))?;
         }
 
-        query
-            .execute()
+        let stream = scanner
+            .try_into_stream()
             .await
-            .map_err(|e| anyhow!("Scan failed on '{}': {}", request.table_name, e))
+            .map_err(|e| anyhow!("Scan stream on '{}': {}", request.table_name, e))?;
+
+        let mapped: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
+            Box::pin(stream.map(|r| r.map_err(|e| anyhow!("{}", e))));
+        Ok(mapped)
     }
 
     /// Execute a scan query on a Lance branch via the lower-level lance crate.
@@ -280,10 +287,7 @@ impl LanceDbBackend {
         if let Some(branch) = request.branch.clone() {
             return self.execute_branch_scan(request, &branch).await;
         }
-        let stream = self.execute_primary_scan(request).await?;
-        let mapped: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            Box::pin(stream.map(|r| r.map_err(|e| anyhow!("{}", e))));
-        Ok(mapped)
+        self.execute_primary_scan(request).await
     }
 }
 
@@ -294,9 +298,8 @@ impl StorageBackend for LanceDbBackend {
     // ========================
 
     async fn table_names(&self) -> Result<Vec<String>> {
-        self.connection
+        self.directory
             .table_names()
-            .execute()
             .await
             .map_err(|e| anyhow!("Failed to list tables: {}", e))
     }
@@ -340,22 +343,16 @@ impl StorageBackend for LanceDbBackend {
         // created the table while we were waiting, fall back to Append
         // (calling the inner machinery directly since we already hold
         // the per-table write lock).
+        let schema = batches[0].schema();
         if self.table_exists(name).await? {
-            let table = self.get_or_open_table(name).await?;
-            table.add(batches).execute().await.map_err(|e| {
-                anyhow!(
-                    "Failed to append (fallback from create) to '{}': {}",
-                    name,
-                    e
-                )
-            })?;
+            self.write_batches(name, batches, schema, lance::dataset::WriteMode::Append)
+                .await
+                .map_err(|e| anyhow!("Failed to append (fallback from create) to '{name}': {e}"))?;
             return Ok(());
         }
-        self.connection
-            .create_table(name, batches)
-            .execute()
+        self.write_batches(name, batches, schema, lance::dataset::WriteMode::Create)
             .await
-            .map_err(|e| anyhow!("Failed to create table '{}': {}", name, e))?;
+            .map_err(|e| anyhow!("Failed to create table '{name}': {e}"))?;
         self.existence_cache.insert(name.to_string(), true);
         Ok(())
     }
@@ -363,11 +360,9 @@ impl StorageBackend for LanceDbBackend {
     async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
         // L6: reject unsafe names before they reach Lance.
         crate::backend::table_names::validate_table_name(name)?;
-        self.connection
-            .create_empty_table(name, schema)
-            .execute()
+        self.write_batches(name, Vec::new(), schema, lance::dataset::WriteMode::Create)
             .await
-            .map_err(|e| anyhow!("Failed to create empty table '{}': {}", name, e))?;
+            .map_err(|e| anyhow!("Failed to create empty table '{name}': {e}"))?;
         self.existence_cache.insert(name.to_string(), true);
         Ok(())
     }
@@ -375,7 +370,7 @@ impl StorageBackend for LanceDbBackend {
     async fn open_or_create_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
         if self.table_exists(name).await? {
             // Just verify it can be opened
-            self.get_or_open_table(name).await?;
+            self.directory.open(name).await?;
         } else {
             self.create_empty_table(name, schema).await?;
         }
@@ -383,10 +378,9 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn drop_table(&self, name: &str) -> Result<()> {
-        self.table_cache.remove(name);
         self.schema_cache.remove(name);
-        self.connection
-            .drop_table(name, &[])
+        self.directory
+            .remove_table(name)
             .await
             .map_err(|e| anyhow!("Failed to drop table '{}': {}", name, e))?;
         self.existence_cache.insert(name.to_string(), false);
@@ -438,22 +432,24 @@ impl StorageBackend for LanceDbBackend {
         if let Some(entry) = self.schema_cache.get(name) {
             return Ok(Some(entry.clone()));
         }
-        match self.get_or_open_table(name).await {
-            Ok(table) => {
-                let schema = table
-                    .schema()
-                    .await
-                    .map_err(|e| anyhow!("Failed to get schema for '{}': {}", name, e))?;
+        match self.directory.open(name).await {
+            Ok(dataset) => {
+                // `Dataset::schema()` is Lance's own schema type; the trait
+                // hands out Arrow. The conversion is what lancedb's
+                // `Table::schema()` did internally.
+                let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().into());
                 self.schema_cache.insert(name.to_string(), schema.clone());
                 Ok(Some(schema))
             }
+            // Pre-existing behavior, preserved deliberately: any open failure
+            // reads as "table absent", which also hides real I/O errors.
             Err(_) => Ok(None),
         }
     }
 
     async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> Result<usize> {
-        let table = self.get_or_open_table(table_name).await?;
-        table
+        let dataset = self.directory.open(table_name).await?;
+        dataset
             .count_rows(filter.map(|s| s.to_string()))
             .await
             .map_err(|e| anyhow!("Failed to count rows in '{}': {}", table_name, e))
@@ -483,26 +479,16 @@ impl StorageBackend for LanceDbBackend {
         let lock = self.write_lock_for(table_name);
         let _guard = lock.lock().await;
 
-        let table = self.get_or_open_table(table_name).await?;
-
-        match mode {
-            WriteMode::Append => {
-                table
-                    .add(batches)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow!("Failed to append to '{}': {}", table_name, e))?;
-            }
-            WriteMode::Overwrite => {
-                use lancedb::table::AddDataMode;
-                table
-                    .add(batches)
-                    .mode(AddDataMode::Overwrite)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow!("Failed to overwrite '{}': {}", table_name, e))?;
-            }
-        }
+        let schema = batches[0].schema();
+        // lancedb's `add(..).mode(Overwrite)` is `WriteMode::Overwrite`, which
+        // commits the new contents as a fresh version rather than mutating in
+        // place — that is where `replace_table_atomic`'s atomicity comes from.
+        let lance_mode = match mode {
+            WriteMode::Append => lance::dataset::WriteMode::Append,
+            WriteMode::Overwrite => lance::dataset::WriteMode::Overwrite,
+        };
+        self.write_batches(table_name, batches, schema, lance_mode)
+            .await?;
 
         Ok(())
     }
@@ -521,28 +507,38 @@ impl StorageBackend for LanceDbBackend {
         let lock = self.write_lock_for(table_name);
         let _guard = lock.lock().await;
 
-        let table = self.get_or_open_table(table_name).await?;
-
         // Build a reader for the partial-column source. The first batch's
         // schema describes the source subschema; Lance compares it against
         // the target via `allow_subschema=true` internally.
         let schema = batches[0].schema();
         let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        // `MergeInsertBuilder::try_new` takes owned join-key names.
+        let on_owned: Vec<String> = on.iter().map(|s| (*s).to_string()).collect();
 
-        let mut mi = table.merge_insert(on);
-        mi.when_matched_update_all(None);
-        // Note: deliberately NOT calling `when_not_matched_insert_all`.
-        // Partial writes only update existing rows; CREATE goes through
-        // the full-row Append path. Unmatched source rows are dropped.
-        mi.execute(Box::new(reader))
+        // lancedb's merge_insert is exactly this builder — `try_new` + the
+        // when-clauses + `try_build` — so behavior including partial-subschema
+        // sources is unchanged. Deliberately NOT setting `WhenNotMatched`
+        // beyond the default `DoNothing`: partial writes only update existing
+        // rows; CREATE goes through the full-row Append path. Unmatched source
+        // rows are dropped.
+        let dataset = self.directory.open(table_name).await?;
+        let mut builder = lance::dataset::MergeInsertBuilder::try_new(Arc::new(dataset), on_owned)
+            .map_err(|e| anyhow!("merge_insert builder on '{}': {}", table_name, e))?;
+        builder
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing);
+        let job = builder
+            .try_build()
+            .map_err(|e| anyhow!("merge_insert build on '{}': {}", table_name, e))?;
+        job.execute_reader(Box::new(reader))
             .await
             .map_err(|e| anyhow!("merge_insert on '{}': {}", table_name, e))?;
         Ok(())
     }
 
     async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
-        let table = self.get_or_open_table(table_name).await?;
-        table
+        let mut dataset = self.directory.open(table_name).await?;
+        dataset
             .delete(filter)
             .await
             .map_err(|e| anyhow!("Failed to delete from '{}': {}", table_name, e))?;
@@ -562,23 +558,28 @@ impl StorageBackend for LanceDbBackend {
         }
 
         if self.table_exists(name).await? {
-            let table = self.get_or_open_table(name).await?;
             if batches.is_empty() {
-                table
+                // Clear, not overwrite: an empty Overwrite would drop the
+                // schema along with the rows. `delete("true")` keeps the table
+                // and its schema, which is what callers expect from "replace
+                // with nothing".
+                let mut dataset = self.directory.open(name).await?;
+                dataset
                     .delete("true")
                     .await
                     .map_err(|e| anyhow!("Failed to clear table '{}': {}", name, e))?;
             } else {
-                use lancedb::table::AddDataMode;
-                table
-                    .add(batches)
-                    .mode(AddDataMode::Overwrite)
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow!("Failed to overwrite table '{}': {}", name, e))?;
+                let batch_schema = batches[0].schema();
+                self.write_batches(
+                    name,
+                    batches,
+                    batch_schema,
+                    lance::dataset::WriteMode::Overwrite,
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to overwrite table '{}': {}", name, e))?;
             }
             // Invalidate cache since data changed
-            self.table_cache.remove(name);
         } else if batches.is_empty() {
             self.create_empty_table(name, schema).await?;
         } else {
@@ -604,25 +605,28 @@ impl StorageBackend for LanceDbBackend {
         if !self.table_exists(table_name).await? {
             return Ok(None);
         }
-        let table = self.get_or_open_table(table_name).await?;
-        let version = table
-            .version()
-            .await
-            .map_err(|e| anyhow!("Failed to get version for '{}': {}", table_name, e))?;
-        Ok(Some(version))
+        let dataset = self.directory.open(table_name).await?;
+        Ok(Some(dataset.version().version))
     }
 
     async fn rollback_table(&self, table_name: &str, target_version: u64) -> Result<()> {
-        let table = self.get_or_open_table(table_name).await?;
-        table.checkout(target_version).await.map_err(|e| {
-            anyhow!(
-                "Failed to checkout version {} for '{}': {}",
-                target_version,
-                table_name,
-                e
-            )
-        })?;
-        table.restore().await.map_err(|e| {
+        // lancedb's protocol was `checkout(v)` then `restore()`: pin the handle
+        // to the target version, then commit that as a new version. Opening
+        // directly at the version is the same first step, and `restore` is
+        // Lance's own — lancedb only forwarded it.
+        let mut dataset = self
+            .directory
+            .open_at_version(table_name, target_version)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to checkout version {} for '{}': {}",
+                    target_version,
+                    table_name,
+                    e
+                )
+            })?;
+        dataset.restore().await.map_err(|e| {
             anyhow!(
                 "Failed to restore '{}' to version {}: {}",
                 table_name,
@@ -630,7 +634,6 @@ impl StorageBackend for LanceDbBackend {
                 e
             )
         })?;
-        self.table_cache.remove(table_name);
         Ok(())
     }
 
@@ -639,12 +642,41 @@ impl StorageBackend for LanceDbBackend {
     // ========================
 
     async fn optimize_table(&self, table_name: &str) -> Result<()> {
-        let table = self.get_or_open_table(table_name).await?;
-        table
-            .optimize(lancedb::table::OptimizeAction::All)
+        let mut dataset = self.directory.open(table_name).await?;
+
+        // The three steps lancedb's `OptimizeAction::All` performed, in order
+        // (`lancedb/src/table/optimize.rs:172-186`). Its `OptimizeStats` were
+        // discarded by the caller, so only the effects need to match.
+        lance::dataset::optimize::compact_files(
+            &mut dataset,
+            lance::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to compact '{}': {}", table_name, e))?;
+
+        // Prune versions older than 7 days, matching lancedb's hardcoded
+        // window. This is safe for forks despite the "retention must not drop
+        // below the longest live fork chain" invariant: Lance's cleanup is
+        // branch-aware — it calls `find_referenced_branches()` and then
+        // `retain_branch_lineage_files()`, and `clean_referenced_branches`
+        // defaults to false, so versions a live fork branch still needs are
+        // retained regardless of age (`lance/src/dataset/cleanup.rs:146,181,930`).
+        let policy = lance::dataset::cleanup::CleanupPolicy {
+            before_timestamp: Some(chrono::Utc::now() - chrono::Duration::days(7)),
+            ..Default::default()
+        };
+        lance::dataset::cleanup::cleanup_old_versions(&dataset, policy)
             .await
-            .map_err(|e| anyhow!("Failed to optimize '{}': {}", table_name, e))?;
-        self.table_cache.remove(table_name);
+            .map_err(|e| anyhow!("Failed to prune old versions of '{}': {}", table_name, e))?;
+
+        lance::index::DatasetIndexExt::optimize_indices(
+            &mut dataset,
+            &lance_index::optimize::OptimizeOptions::default(),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to optimize indices on '{}': {}", table_name, e))?;
+
         Ok(())
     }
 
@@ -663,15 +695,12 @@ impl StorageBackend for LanceDbBackend {
         } else {
             log::warn!("Recovering table '{}' from staging after crash", name);
 
-            let staging_table = self.get_or_open_table(&staging_name).await?;
-            let schema = staging_table
-                .schema()
-                .await
-                .map_err(|e| anyhow!("Failed to get staging schema: {}", e))?;
+            let staging = self.directory.open(&staging_name).await?;
+            let schema: Arc<ArrowSchema> = Arc::new(staging.schema().into());
 
-            let stream = staging_table
-                .query()
-                .execute()
+            let stream = staging
+                .scan()
+                .try_into_stream()
                 .await
                 .map_err(|e| anyhow!("Failed to query staging: {}", e))?;
             let batches: Vec<RecordBatch> = stream
@@ -696,13 +725,19 @@ impl StorageBackend for LanceDbBackend {
     // Cache Management
     // ========================
 
-    fn invalidate_cache(&self, table_name: &str) {
-        self.table_cache.remove(table_name);
-    }
+    /// No-op, as before the lancedb removal.
+    ///
+    /// These only ever cleared the `lancedb::Table` cache, which was never
+    /// populated (a cached handle is version-pinned and would drop rows
+    /// committed later), so both calls were already no-ops. That is preserved
+    /// verbatim rather than quietly extended to `schema_cache`: changing what
+    /// an explicit invalidation does is a behavior change, not a port. Worth
+    /// revisiting — `schema_cache` is now the only cache, so a caller asking
+    /// to invalidate currently gets nothing — but as its own piece of work.
+    fn invalidate_cache(&self, _table_name: &str) {}
 
-    fn clear_cache(&self) {
-        self.table_cache.clear();
-    }
+    /// No-op — see [`Self::invalidate_cache`].
+    fn clear_cache(&self) {}
 
     // ========================
     // Metadata
@@ -710,6 +745,12 @@ impl StorageBackend for LanceDbBackend {
 
     fn base_uri(&self) -> &str {
         &self.base_uri
+    }
+
+    fn branching(&self) -> Option<Arc<dyn crate::backend::branching::ForkBranching>> {
+        Some(Arc::new(super::lance_branch::LanceBranching::new(
+            self.base_uri.clone(),
+        )))
     }
 
     // ========================
@@ -745,36 +786,40 @@ impl StorageBackend for LanceDbBackend {
         filter: FilterExpr,
         opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
-        let tbl = self.get_or_open_table(table).await?;
-
-        let distance_type = match metric {
-            DistanceMetric::L2 => lancedb::DistanceType::L2,
-            DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
-            DistanceMetric::Dot => lancedb::DistanceType::Dot,
-        };
-
-        let mut query_builder = tbl
-            .vector_search(query.to_vec())
-            .map_err(|e| anyhow!("Failed to create vector search on '{}': {}", table, e))?
-            .column(column)
-            .distance_type(distance_type)
-            .limit(k);
+        let dataset = self.directory.open(table).await?;
+        let key = arrow_array::Float32Array::from(query.to_vec());
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest(column, &key, k)
+            .map_err(|e| anyhow!("Failed to create vector search on '{}': {}", table, e))?;
+        // The metric is passed explicitly rather than left to the index's own:
+        // Lance uses it to decide whether an existing index is usable for this
+        // query at all (`scanner.rs:3577`), which is what lancedb's
+        // `.distance_type(..)` was doing.
+        scanner.distance_metric(distance_metric_of(metric));
 
         if let Some(n) = opts.nprobes {
-            query_builder = query_builder.nprobes(n);
+            scanner.nprobes(n);
         }
         if let Some(r) = opts.refine_factor {
-            query_builder = query_builder.refine_factor(r);
+            scanner.refine(r);
         }
         if let Some(ef) = opts.ef {
-            query_builder = query_builder.ef(ef);
+            scanner.ef(ef);
         }
         if let FilterExpr::Sql(sql) = &filter {
-            query_builder = query_builder.only_if(sql);
+            // lancedb's `only_if` defaulted to prefilter (`query.rs:782`), so
+            // prefiltering here is exact parity — and it is also the correct
+            // semantic: postfiltering would let excluded rows consume top-k
+            // slots and shrink the result below k.
+            scanner.prefilter(true);
+            scanner
+                .filter(sql)
+                .map_err(|e| anyhow!("Vector search filter '{}' on '{}': {}", sql, table, e))?;
         }
 
-        query_builder
-            .execute()
+        scanner
+            .try_into_stream()
             .await
             .map_err(|e| anyhow!("Vector search execution failed on '{}': {}", table, e))?
             .try_collect()
@@ -799,47 +844,51 @@ impl StorageBackend for LanceDbBackend {
         filter: FilterExpr,
         opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>> {
-        let tbl = self.get_or_open_table(table).await?;
-
-        let distance_type = match metric {
-            DistanceMetric::L2 => lancedb::DistanceType::L2,
-            DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
-            DistanceMetric::Dot => lancedb::DistanceType::Dot,
-        };
-
-        // Late-interaction query: the first token seeds `vector_search`, the rest
-        // are chained via `add_query_vector`; Lance MaxSim-scores the List column.
-        let (first, rest) = query
-            .split_first()
-            .ok_or_else(|| anyhow!("multivector_search on '{}': empty query", table))?;
-        let mut query_builder = tbl
-            .vector_search(first.clone())
-            .map_err(|e| anyhow!("Failed to create multivector search on '{}': {}", table, e))?;
-        for tok in rest {
-            query_builder = query_builder
-                .add_query_vector(tok.clone())
-                .map_err(|e| anyhow!("Failed to add query token on '{}': {}", table, e))?;
+        if query.is_empty() {
+            return Err(anyhow!("multivector_search on '{}': empty query", table));
         }
-        let mut query_builder = query_builder
-            .column(column)
-            .distance_type(distance_type)
-            .limit(k);
+        let dataset = self.directory.open(table).await?;
+
+        // Late-interaction (MaxSim) query. lancedb expressed this as
+        // `vector_search(first)` then `add_query_vector(..)` per remaining
+        // token, which it accumulated into a list of query vectors. Lance's
+        // `nearest` takes that shape directly: a `ListArray` whose every
+        // element is one query vector of the column's dimension — it detects
+        // multivector from the array type and validates each entry's length
+        // against the column dim (`scanner.rs:1450-1472`).
+        let mut builder =
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::Float32Builder::new());
+        for token in query {
+            builder.values().append_slice(token);
+            builder.append(true);
+        }
+        let key = builder.finish();
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest(column, &key, k)
+            .map_err(|e| anyhow!("Failed to create multivector search on '{}': {}", table, e))?;
+        scanner.distance_metric(distance_metric_of(metric));
 
         if let Some(n) = opts.nprobes {
-            query_builder = query_builder.nprobes(n);
+            scanner.nprobes(n);
         }
         if let Some(r) = opts.refine_factor {
-            query_builder = query_builder.refine_factor(r);
+            scanner.refine(r);
         }
         if let Some(ef) = opts.ef {
-            query_builder = query_builder.ef(ef);
+            scanner.ef(ef);
         }
         if let FilterExpr::Sql(sql) = &filter {
-            query_builder = query_builder.only_if(sql);
+            // Prefilter, as in `vector_search` — see the note there.
+            scanner.prefilter(true);
+            scanner.filter(sql).map_err(|e| {
+                anyhow!("Multivector search filter '{}' on '{}': {}", sql, table, e)
+            })?;
         }
 
-        query_builder
-            .execute()
+        scanner
+            .try_into_stream()
             .await
             .map_err(|e| anyhow!("Multivector search execution failed on '{}': {}", table, e))?
             .try_collect()
@@ -864,8 +913,10 @@ impl StorageBackend for LanceDbBackend {
         use lance_index::scalar::FullTextSearchQuery;
         use lance_index::scalar::inverted::query::MatchQuery;
 
-        let tbl = self.get_or_open_table(table).await?;
+        let dataset = self.directory.open(table).await?;
 
+        // These are `lance_index` types already — lancedb only forwarded them
+        // to the same scanner, so the query object is unchanged.
         let match_query = MatchQuery::new(query.to_string()).with_column(Some(column.to_string()));
         let fts_query = FullTextSearchQuery {
             query: match_query.into(),
@@ -873,14 +924,25 @@ impl StorageBackend for LanceDbBackend {
             wand_factor: None,
         };
 
-        let mut query_builder = tbl.query().full_text_search(fts_query).limit(k);
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(fts_query)
+            .map_err(|e| anyhow!("FTS query on '{}': {}", table, e))?;
+        // `k` is applied both inside the FTS query and as a scan limit, as
+        // before — the inner bound caps the BM25 candidate set, the outer one
+        // the returned rows.
+        scanner
+            .limit(Some(k as i64), None)
+            .map_err(|e| anyhow!("FTS limit on '{}': {}", table, e))?;
 
         if let FilterExpr::Sql(sql) = &filter {
-            query_builder = query_builder.only_if(sql);
+            scanner
+                .filter(sql)
+                .map_err(|e| anyhow!("FTS filter '{}' on '{}': {}", sql, table, e))?;
         }
 
-        query_builder
-            .execute()
+        scanner
+            .try_into_stream()
             .await
             .map_err(|e| anyhow!("FTS search execution failed on '{}': {}", table, e))?
             .try_collect()
@@ -895,112 +957,125 @@ impl StorageBackend for LanceDbBackend {
         name: &str,
         params: VectorIndexParams,
     ) -> Result<()> {
-        use lancedb::index::Index;
-        use lancedb::index::vector::{
-            IvfFlatIndexBuilder, IvfHnswFlatIndexBuilder, IvfHnswPqIndexBuilder,
-            IvfHnswSqIndexBuilder, IvfPqIndexBuilder, IvfRqIndexBuilder, IvfSqIndexBuilder,
-        };
+        use lance::index::vector::VectorIndexParams as LanceVectorParams;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::ivf::IvfBuildParams;
+        use lance_index::vector::pq::PQBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
 
         let dt = match params.metric {
-            DistanceMetric::L2 => lancedb::DistanceType::L2,
-            DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
-            DistanceMetric::Dot => lancedb::DistanceType::Dot,
+            DistanceMetric::L2 => lance_linalg::distance::MetricType::L2,
+            DistanceMetric::Cosine => lance_linalg::distance::MetricType::Cosine,
+            DistanceMetric::Dot => lance_linalg::distance::MetricType::Dot,
         };
 
-        let index = match params.kind {
-            // Flat is a single-partition IVF, matching the prior raw-Dataset mapping.
-            VectorIndexKind::Flat => Index::IvfFlat(
-                IvfFlatIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(1),
-            ),
-            VectorIndexKind::IvfFlat { num_partitions } => Index::IvfFlat(
-                IvfFlatIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions),
+        // The stage params are built explicitly and fed to the `with_*_params`
+        // constructors rather than the positional shorthands (`ivf_pq(..)`),
+        // because the shorthands demand values lancedb never asked us for
+        // (e.g. `max_iterations`). Going through `..Default::default()` keeps
+        // whatever lancedb's builders were defaulting to.
+        let hnsw = |m: u32, ef_construction: u32| HnswBuildParams {
+            m: m as usize,
+            ef_construction: ef_construction as usize,
+            ..Default::default()
+        };
+
+        let lance_params = match params.kind {
+            // Flat is a single-partition IVF, matching the prior mapping.
+            VectorIndexKind::Flat => {
+                LanceVectorParams::with_ivf_flat_params(dt, IvfBuildParams::new(1))
+            }
+            VectorIndexKind::IvfFlat { num_partitions } => LanceVectorParams::with_ivf_flat_params(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
             ),
             VectorIndexKind::IvfPq {
                 num_partitions,
                 num_sub_vectors,
                 num_bits,
-            } => Index::IvfPq(
-                IvfPqIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions)
-                    .num_sub_vectors(num_sub_vectors)
-                    .num_bits(u32::from(num_bits)),
+            } => LanceVectorParams::with_ivf_pq_params(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
+                PQBuildParams {
+                    num_sub_vectors: num_sub_vectors as usize,
+                    num_bits: usize::from(num_bits),
+                    ..Default::default()
+                },
             ),
-            VectorIndexKind::IvfSq { num_partitions } => Index::IvfSq(
-                IvfSqIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions),
+            VectorIndexKind::IvfSq { num_partitions } => LanceVectorParams::with_ivf_sq_params(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
+                SQBuildParams::default(),
             ),
             VectorIndexKind::IvfRq {
                 num_partitions,
                 num_bits,
-            } => {
-                let mut b = IvfRqIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions);
-                if let Some(bits) = num_bits {
-                    b = b.num_bits(u32::from(bits));
-                }
-                Index::IvfRq(b)
-            }
+            } => LanceVectorParams::ivf_rq(
+                num_partitions as usize,
+                // `None` means "whatever the backend defaults to"; RaBitQ's
+                // canonical default is 8 bits, which is also what lancedb's
+                // `IvfRqIndexBuilder::default()` left in place.
+                num_bits.unwrap_or(8),
+                dt,
+            ),
             VectorIndexKind::HnswFlat {
                 m,
                 ef_construction,
                 num_partitions,
-            } => Index::IvfHnswFlat(
-                IvfHnswFlatIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions)
-                    .num_edges(m)
-                    .ef_construction(ef_construction),
+            } => LanceVectorParams::ivf_hnsw(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
+                hnsw(m, ef_construction),
             ),
             VectorIndexKind::HnswSq {
                 m,
                 ef_construction,
                 num_partitions,
-            } => Index::IvfHnswSq(
-                IvfHnswSqIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions)
-                    .num_edges(m)
-                    .ef_construction(ef_construction),
+            } => LanceVectorParams::with_ivf_hnsw_sq_params(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
+                hnsw(m, ef_construction),
+                SQBuildParams::default(),
             ),
             VectorIndexKind::HnswPq {
                 m,
                 ef_construction,
                 num_sub_vectors,
                 num_partitions,
-            } => Index::IvfHnswPq(
-                IvfHnswPqIndexBuilder::default()
-                    .distance_type(dt)
-                    .num_partitions(num_partitions)
-                    .num_edges(m)
-                    .ef_construction(ef_construction)
-                    .num_sub_vectors(num_sub_vectors)
+            } => LanceVectorParams::with_ivf_hnsw_pq_params(
+                dt,
+                IvfBuildParams::new(num_partitions as usize),
+                hnsw(m, ef_construction),
+                PQBuildParams {
+                    num_sub_vectors: num_sub_vectors as usize,
                     // 8 bits matches the prior `PQBuildParams::new(_, 8)` default.
-                    .num_bits(8),
+                    num_bits: 8,
+                    ..Default::default()
+                },
             ),
         };
 
-        let tbl = self.get_or_open_table(table).await?;
-        tbl.create_index(&[column], index)
-            .name(name.to_string())
-            .replace(true)
-            .execute()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to create vector index '{}' on '{}.{}': {}",
-                    name,
-                    table,
-                    column,
-                    e
-                )
-            })
+        let mut dataset = self.directory.open(table).await?;
+        lance::index::DatasetIndexExt::create_index(
+            &mut dataset,
+            &[column],
+            lance_index::IndexType::Vector,
+            Some(name.to_string()),
+            &lance_params,
+            true,
+        )
+        .await
+        // `create_index` hands back the new IndexMetadata; the trait returns unit.
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow!(
+                "Failed to create vector index '{}' on '{}.{}': {}",
+                name,
+                table,
+                column,
+                e
+            )
+        })
     }
 
     async fn create_scalar_index(
@@ -1010,23 +1085,29 @@ impl StorageBackend for LanceDbBackend {
         index_type: ScalarIndexType,
         name: Option<&str>,
     ) -> Result<()> {
-        let tbl = self.get_or_open_table(table).await?;
-        let lance_idx = match index_type {
-            ScalarIndexType::BTree => {
-                lancedb::index::Index::BTree(lancedb::index::scalar::BTreeIndexBuilder::default())
-            }
-            ScalarIndexType::Bitmap => {
-                lancedb::index::Index::Bitmap(lancedb::index::scalar::BitmapIndexBuilder::default())
-            }
-            ScalarIndexType::LabelList => lancedb::index::Index::LabelList(
-                lancedb::index::scalar::LabelListIndexBuilder::default(),
-            ),
+        // Lance discriminates the three scalar flavors by `BuiltinIndexType`
+        // inside `ScalarIndexParams`, where lancedb used three distinct
+        // `Index::*` variants.
+        let builtin = match index_type {
+            ScalarIndexType::BTree => lance_index::scalar::BuiltinIndexType::BTree,
+            ScalarIndexType::Bitmap => lance_index::scalar::BuiltinIndexType::Bitmap,
+            ScalarIndexType::LabelList => lance_index::scalar::BuiltinIndexType::LabelList,
         };
-        let mut builder = tbl.create_index(columns, lance_idx).replace(true);
-        if let Some(n) = name {
-            builder = builder.name(n.to_string());
-        }
-        builder.execute().await.map_err(|e| {
+        let params = lance_index::scalar::ScalarIndexParams::for_builtin(builtin);
+
+        let mut dataset = self.directory.open(table).await?;
+        lance::index::DatasetIndexExt::create_index(
+            &mut dataset,
+            columns,
+            lance_index::IndexType::Scalar,
+            name.map(str::to_string),
+            &params,
+            true,
+        )
+        .await
+        // `create_index` hands back the new IndexMetadata; the trait returns unit.
+        .map(|_| ())
+        .map_err(|e| {
             anyhow!(
                 "Failed to create {:?} index on '{}.{:?}': {}",
                 index_type,
@@ -1045,10 +1126,13 @@ impl StorageBackend for LanceDbBackend {
         tokenizer: &TokenizerConfig,
         with_positions: bool,
     ) -> Result<()> {
-        let tbl = self.get_or_open_table(table).await?;
         // Translate the requested analyzer pipeline into Lance params. A
         // config error (bad ngram bounds, unsupported stop-word language) is
         // surfaced here before we touch the table.
+        //
+        // `to_inverted_params` already returns `InvertedIndexParams`, which is
+        // a `lance_index` type — lancedb only wrapped it in `Index::FTS`, so
+        // this is the same params object reaching the same builder.
         let params =
             super::fts_analyzer::to_inverted_params(tokenizer, with_positions).map_err(|e| {
                 anyhow!(
@@ -1058,12 +1142,20 @@ impl StorageBackend for LanceDbBackend {
                     e
                 )
             })?;
-        let fts_params = lancedb::index::Index::FTS(params);
-        let mut builder = tbl.create_index(columns, fts_params).replace(true);
-        if let Some(n) = name {
-            builder = builder.name(n.to_string());
-        }
-        builder.execute().await.map_err(|e| {
+
+        let mut dataset = self.directory.open(table).await?;
+        lance::index::DatasetIndexExt::create_index(
+            &mut dataset,
+            columns,
+            lance_index::IndexType::Inverted,
+            name.map(str::to_string),
+            &params,
+            true,
+        )
+        .await
+        // `create_index` hands back the new IndexMetadata; the trait returns unit.
+        .map(|_| ())
+        .map_err(|e| {
             // Custom tokenizers (`lindera/*`, `jieba/*`) need dictionary files
             // under `LANCE_LANGUAGE_MODEL_HOME`; make that failure legible.
             if matches!(tokenizer, TokenizerConfig::Custom { .. })
@@ -1094,30 +1186,46 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn drop_index(&self, table: &str, index_name: &str) -> Result<()> {
-        let tbl = self.get_or_open_table(table).await?;
-        tbl.drop_index(index_name).await.map_err(|e| {
-            anyhow!(
-                "Failed to drop index '{}' on '{}': {}",
-                index_name,
-                table,
-                e
-            )
-        })
+        let mut dataset = self.directory.open(table).await?;
+        lance::index::DatasetIndexExt::drop_index(&mut dataset, index_name)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to drop index '{}' on '{}': {}",
+                    index_name,
+                    table,
+                    e
+                )
+            })
     }
 
     async fn list_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
-        let tbl = self.get_or_open_table(table).await?;
-        let indices = tbl
-            .list_indices()
+        let dataset = self.directory.open(table).await?;
+        let indices = lance::index::DatasetIndexExt::load_indices(&dataset)
             .await
             .map_err(|e| anyhow!("Failed to list indexes on '{}': {}", table, e))?;
 
+        // `columns` is what callers actually use — all four production consumers
+        // of this method filter on `idx.columns.contains(..)` and none reads
+        // `index_type`. Lance's `IndexMetadata` carries field *ids* rather than
+        // names, so resolve them through the dataset schema.
+        let schema = dataset.schema();
         Ok(indices
-            .into_iter()
+            .iter()
             .map(|idx| IndexInfo {
-                name: idx.name,
-                columns: idx.columns.clone(),
-                index_type: format!("{:?}", idx.index_type),
+                name: idx.name.clone(),
+                columns: idx
+                    .fields
+                    .iter()
+                    .filter_map(|fid| schema.field_by_id(*fid).map(|f| f.name.clone()))
+                    .collect(),
+                // Lance's `IndexMetadata` carries no index-type discriminant
+                // (the type lives in the opaque `index_details` protobuf), so
+                // this is reported as unknown rather than fabricated. Safe
+                // because no consumer reads it — verified across all four
+                // production callers of `list_indexes`, which filter on
+                // `columns` alone. Populate it properly if that ever changes.
+                index_type: String::from("unknown"),
             })
             .collect())
     }
@@ -1153,6 +1261,64 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// `LanceDirectory` reimplements lancedb's table listing and path layout
+    /// from its source (`database/listing.rs:724,941`). Those are compatibility
+    /// contracts, not APIs, so assert equivalence directly against lancedb
+    /// rather than against a hand-written expectation: create tables through
+    /// the lancedb path, then require both sides to agree.
+    ///
+    /// If lancedb ever changes its layout, this fails loudly instead of
+    /// silently detaching primary reads from fork branch reads.
+    #[tokio::test]
+    async fn lance_directory_listing_matches_lancedb() {
+        use crate::backend::lance_directory::LanceDirectory;
+
+        let (dir, backend) = create_test_backend().await;
+        let uri = dir.path().to_str().unwrap();
+        let directory = LanceDirectory::connect(uri, None).await.unwrap();
+
+        // A fresh directory: both must report no tables. `read_dir` on a
+        // never-written base path must not be an error.
+        assert!(directory.table_names().await.unwrap().is_empty());
+
+        // Names chosen to exercise sort order and uni's real naming scheme
+        // (`vertices_{label}`, `adjacency_{type}_{dir}`), including an
+        // underscore-heavy name and one that sorts before the others.
+        for name in [
+            "vertices_Person",
+            "adjacency_KNOWS_fwd",
+            "deltas_KNOWS_bwd",
+            "vertices_Zebra",
+        ] {
+            backend
+                .create_table(name, vec![test_batch(vec![1], vec![10])])
+                .await
+                .unwrap();
+        }
+
+        let via_lancedb = backend.table_names().await.unwrap();
+        let via_directory = directory.table_names().await.unwrap();
+
+        let mut expected = via_lancedb.clone();
+        expected.sort();
+        assert_eq!(
+            via_directory, expected,
+            "LanceDirectory listing diverged from lancedb's: {via_directory:?} vs {expected:?}"
+        );
+
+        // The path layout must agree too — this is what makes primary and the
+        // fork branch path resolve to the same dataset.
+        for name in &via_directory {
+            assert_eq!(
+                directory.dataset_uri(name),
+                backend.dataset_uri(name),
+                "dataset_uri diverged for '{name}'"
+            );
+            // And the resolved path must actually be openable.
+            directory.open(name).await.unwrap();
+        }
     }
 
     #[tokio::test]

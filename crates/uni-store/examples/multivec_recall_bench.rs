@@ -1,6 +1,6 @@
 // Rust guideline compliant
 //! Recall@k benchmark for native multi-vector (ColBERT / MaxSim) indexing on the
-//! pinned Lance stack (`lance = 7.0.0`, `lancedb = 0.30.0`), issue #96 Phase 2.
+//! pinned Lance stack (`lance = 7.0.0`), issue #96 Phase 2.
 //!
 //! This is the VALIDATION GATE for building a native multi-vector first-stage
 //! index (vs Phase 1's in-process rerank-only). It generates a fixed,
@@ -22,12 +22,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
-use futures::TryStreamExt;
-use lancedb::DistanceType;
-use lancedb::index::Index;
-use lancedb::index::vector::{IvfFlatIndexBuilder, IvfPqIndexBuilder};
-use lancedb::query::{ExecutableQuery, QueryBase};
 use tempfile::TempDir;
+use uni_store::backend::StorageBackend;
+use uni_store::backend::lance::LanceDbBackend;
+use uni_store::backend::types::{
+    DistanceMetric, FilterExpr, VectorIndexKind, VectorIndexParams, VectorQueryOpts,
+};
 
 /// Token-vector dimension.
 const DIM: i32 = 64;
@@ -101,63 +101,72 @@ async fn main() -> Result<()> {
 
     let tmp = TempDir::new().context("temp dir")?;
     let uri = tmp.path().to_str().context("non-utf8 temp path")?;
-    let conn = lancedb::connect(uri).execute().await.context("connect")?;
+    let backend = LanceDbBackend::connect(uri, None)
+        .await
+        .context("connect")?;
 
     // No index (Flat / brute force) — confirms Lance MaxSim matches our reference.
-    let flat = build_table(&conn, "flat", &docs).await?;
+    let flat = build_table(&backend, "flat", &docs).await?;
     report(
         "no-index (Flat)",
         &truth,
-        &query_topk(&flat, &query, None).await?,
+        &query_topk(&backend, &flat, &query, None).await?,
     );
 
     // IVF_FLAT, measured at default probing AND probing every partition (full
     // nprobes = best-case recall, but no speedup, so it bounds what tuning buys).
-    flat.create_index(
-        &["vector"],
-        Index::IvfFlat(
-            IvfFlatIndexBuilder::default()
-                .distance_type(DistanceType::Cosine)
-                .num_partitions(N_PARTITIONS),
-        ),
-    )
-    .execute()
-    .await
-    .context("create IVF_FLAT index")?;
+    backend
+        .create_vector_index(
+            &flat,
+            "vector",
+            "flat_ivf",
+            VectorIndexParams {
+                kind: VectorIndexKind::IvfFlat {
+                    num_partitions: N_PARTITIONS,
+                },
+                metric: DistanceMetric::Cosine,
+            },
+        )
+        .await
+        .context("create IVF_FLAT index")?;
     report(
         "IVF_FLAT (default nprobes)",
         &truth,
-        &query_topk(&flat, &query, None).await?,
+        &query_topk(&backend, &flat, &query, None).await?,
     );
     report(
         "IVF_FLAT (all partitions)",
         &truth,
-        &query_topk(&flat, &query, Some(N_PARTITIONS as usize)).await?,
+        &query_topk(&backend, &flat, &query, Some(N_PARTITIONS as usize)).await?,
     );
 
     // IVF_PQ (fresh table so the IVF_FLAT index does not interfere).
-    let pq = build_table(&conn, "pq", &docs).await?;
-    pq.create_index(
-        &["vector"],
-        Index::IvfPq(
-            IvfPqIndexBuilder::default()
-                .distance_type(DistanceType::Cosine)
-                .num_partitions(N_PARTITIONS)
-                .num_sub_vectors(8),
-        ),
-    )
-    .execute()
-    .await
-    .context("create IVF_PQ index")?;
+    let pq = build_table(&backend, "pq", &docs).await?;
+    backend
+        .create_vector_index(
+            &pq,
+            "vector",
+            "pq_ivf",
+            VectorIndexParams {
+                kind: VectorIndexKind::IvfPq {
+                    num_partitions: N_PARTITIONS,
+                    num_sub_vectors: 8,
+                    num_bits: 8,
+                },
+                metric: DistanceMetric::Cosine,
+            },
+        )
+        .await
+        .context("create IVF_PQ index")?;
     report(
         "IVF_PQ (default nprobes)",
         &truth,
-        &query_topk(&pq, &query, None).await?,
+        &query_topk(&backend, &pq, &query, None).await?,
     );
     report(
         "IVF_PQ (all partitions)",
         &truth,
-        &query_topk(&pq, &query, Some(N_PARTITIONS as usize)).await?,
+        &query_topk(&backend, &pq, &query, Some(N_PARTITIONS as usize)).await?,
     );
 
     println!(
@@ -202,11 +211,7 @@ fn top_k_ids(ranked: Vec<(u64, f32)>) -> Vec<u64> {
 ///
 /// # Errors
 /// Returns an error if Arrow assembly or table creation fails.
-async fn build_table(
-    conn: &lancedb::Connection,
-    name: &str,
-    docs: &[Doc],
-) -> Result<lancedb::Table> {
+async fn build_table(backend: &LanceDbBackend, name: &str, docs: &[Doc]) -> Result<String> {
     let ids = UInt64Array::from(docs.iter().map(|d| d.id).collect::<Vec<_>>());
     let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), DIM));
     for doc in docs {
@@ -221,10 +226,11 @@ async fn build_table(
         ("vector", Arc::new(vectors.finish()) as Arc<dyn Array>),
     ])
     .context("assemble batch")?;
-    conn.create_table(name, vec![batch])
-        .execute()
+    backend
+        .create_table(name, vec![batch])
         .await
-        .with_context(|| format!("create table {name}"))
+        .with_context(|| format!("create table {name}"))?;
+    Ok(name.to_string())
 }
 
 /// Runs a multi-vector MaxSim query and returns the top-k ids (best first).
@@ -232,26 +238,27 @@ async fn build_table(
 /// # Errors
 /// Returns an error if the query fails to build, execute, or decode.
 async fn query_topk(
-    table: &lancedb::Table,
+    backend: &LanceDbBackend,
+    table: &str,
     query: &[Vec<f32>],
     nprobes: Option<usize>,
 ) -> Result<Vec<u64>> {
-    let (first, rest) = query.split_first().ok_or_else(|| anyhow!("empty query"))?;
-    let mut vq = table.vector_search(first.clone())?;
-    for tok in rest {
-        vq = vq.add_query_vector(tok.clone())?;
+    if query.is_empty() {
+        return Err(anyhow!("empty query"));
     }
-    let mut vq = vq
-        .column("vector")
-        .distance_type(DistanceType::Cosine)
-        .limit(K);
-    if let Some(n) = nprobes {
-        vq = vq.nprobes(n);
-    }
-    let batches = vq
-        .execute()
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
+    let batches: Vec<RecordBatch> = backend
+        .multivector_search(
+            table,
+            "vector",
+            query,
+            K,
+            DistanceMetric::Cosine,
+            FilterExpr::None,
+            VectorQueryOpts {
+                nprobes,
+                ..Default::default()
+            },
+        )
         .await?;
 
     let mut out: Vec<(u64, f32)> = Vec::new();

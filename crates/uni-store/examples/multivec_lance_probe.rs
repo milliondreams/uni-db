@@ -1,13 +1,13 @@
 // Rust guideline compliant
 //! Validation probe for native multi-vector (ColBERT / MaxSim) support in the
-//! pinned Lance stack (`lance = 7.0.0`, `lancedb = 0.30.0`), issue #96.
+//! pinned Lance stack (`lance = 7.0.0`), issue #96.
 //!
 //! This is a throwaway de-risking harness, not shipping code. It answers the two
 //! Tier-0 questions from `docs/proposals/multivector_colbert_maxsim.md` before we
 //! commit to an implementation:
 //!
 //!   1. Does a `List<FixedSizeList<Float32, dim>>` column + a multi-vector query
-//!      yield MaxSim-ordered results through the SAME `lancedb::Table` API surface
+//!      yield MaxSim-ordered results through the SAME `StorageBackend` API surface
 //!      uni-store uses in production (`backend/lance.rs::vector_search`)?
 //!   2. Which distance metric (L2 / Cosine / Dot) reproduces canonical ColBERT
 //!      MaxSim (`score = Σ_i max_j q_i·d_j`) ordering?
@@ -23,10 +23,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
-use futures::TryStreamExt;
-use lancedb::DistanceType;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use tempfile::TempDir;
+use uni_store::backend::StorageBackend;
+use uni_store::backend::lance::LanceDbBackend;
+use uni_store::backend::types::{DistanceMetric, FilterExpr, VectorQueryOpts};
 
 /// Embedding dimension for the probe's token vectors.
 const DIM: i32 = 3;
@@ -78,14 +78,13 @@ async fn main() -> Result<()> {
     let tmp = TempDir::new().context("create temp dir")?;
     let uri = tmp.path().to_str().context("temp path is not utf-8")?;
 
-    let conn = lancedb::connect(uri).execute().await.context("connect")?;
+    let backend = LanceDbBackend::connect(uri, None)
+        .await
+        .context("connect")?;
 
     let batch = build_batch(&docs)?;
-    // Mirror the lancedb 0.30 API exactly (its own multivector test passes a
-    // `vec![batch]` to `create_table`).
-    let table = conn
+    backend
         .create_table("docs", vec![batch])
-        .execute()
         .await
         .context("create_table")?;
 
@@ -98,11 +97,11 @@ async fn main() -> Result<()> {
     // reproduce MaxSim (Dot, and Cosine since vectors are unit-norm); L2 is
     // printed for reference.
     for (metric, assert_maxsim) in [
-        (DistanceType::Dot, true),
-        (DistanceType::Cosine, true),
-        (DistanceType::L2, false),
+        (DistanceMetric::Dot, true),
+        (DistanceMetric::Cosine, true),
+        (DistanceMetric::L2, false),
     ] {
-        let ranked = run_maxsim_query(&table, &query, metric)
+        let ranked = run_maxsim_query(&backend, &query, metric)
             .await
             .with_context(|| format!("multivector query with {metric:?}"))?;
 
@@ -122,7 +121,7 @@ async fn main() -> Result<()> {
 
     println!(
         "PROBE PASSED: native multi-vector storage + MaxSim retrieval works \
-              on lance 7.0.0 / lancedb 0.30.0 via the production Table API, with \
+              on lance 7.0.0 via the production StorageBackend API, with \
               no vector index required."
     );
     Ok(())
@@ -147,7 +146,7 @@ fn build_batch(docs: &[Doc]) -> Result<RecordBatch> {
     let vectors = vectors.finish();
 
     // Derive the schema from the built arrays so the nested field names/nullability
-    // match exactly what lancedb expects.
+    // match exactly what Lance expects.
     RecordBatch::try_from_iter(vec![
         ("id", Arc::new(ids) as Arc<dyn Array>),
         ("vector", Arc::new(vectors) as Arc<dyn Array>),
@@ -157,31 +156,32 @@ fn build_batch(docs: &[Doc]) -> Result<RecordBatch> {
 
 /// Runs a multi-vector (MaxSim) search and returns `(id, _distance)` best-first.
 ///
-/// Builds the query the same way `uni-store::backend::lance::vector_search` does
-/// (`Table::vector_search(..).column(..).distance_type(..).limit(..)`), but with
-/// extra query tokens added via `add_query_vector`, which is what triggers the
-/// multi-vector plan against a `List`-typed column.
+/// Runs the multi-vector (MaxSim) query through the production backend API,
+/// which is the point of the probe: it exercises the same
+/// `StorageBackend::multivector_search` path real queries take, against a
+/// `List`-typed column.
 ///
 /// # Errors
 /// Returns an error if the query fails to build, execute, or decode.
 async fn run_maxsim_query(
-    table: &lancedb::Table,
+    backend: &LanceDbBackend,
     query: &[[f32; 3]],
-    metric: DistanceType,
+    metric: DistanceMetric,
 ) -> Result<Vec<(u64, f32)>> {
-    let (first, rest) = query.split_first().ok_or_else(|| anyhow!("empty query"))?;
-
-    let mut vq = table.vector_search(first.to_vec())?;
-    for tok in rest {
-        vq = vq.add_query_vector(tok.to_vec())?;
+    if query.is_empty() {
+        return Err(anyhow!("empty query"));
     }
-    let batches = vq
-        .column("vector")
-        .distance_type(metric)
-        .limit(docs_count())
-        .execute()
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
+    let tokens: Vec<Vec<f32>> = query.iter().map(|t| t.to_vec()).collect();
+    let batches: Vec<RecordBatch> = backend
+        .multivector_search(
+            "docs",
+            "vector",
+            &tokens,
+            docs_count(),
+            metric,
+            FilterExpr::None,
+            VectorQueryOpts::default(),
+        )
         .await?;
 
     let mut out = Vec::new();
@@ -198,7 +198,7 @@ async fn run_maxsim_query(
             out.push((ids.value(row), dist.value(row)));
         }
     }
-    // lancedb returns ascending `_distance` (closest first); keep that order but
+    // Lance returns ascending `_distance` (closest first); keep that order but
     // make it explicit so the assertion does not depend on backend stability.
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     Ok(out)
@@ -216,7 +216,7 @@ fn docs_count() -> usize {
 ///
 /// # Errors
 /// Returns an error describing the mismatch if the ordering is wrong.
-fn verify_maxsim_order(metric: DistanceType, order: &[u64]) -> Result<()> {
+fn verify_maxsim_order(metric: DistanceMetric, order: &[u64]) -> Result<()> {
     if order.len() != 4 {
         return Err(anyhow!(
             "{metric:?}: expected 4 results, got {}",

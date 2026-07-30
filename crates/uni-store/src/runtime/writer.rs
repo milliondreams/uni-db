@@ -410,31 +410,6 @@ fn props_subset(props: &Properties, keys: &HashSet<String>) -> Properties {
     out
 }
 
-/// Join a storage base URI and a dataset name into a `.lance` URI.
-///
-/// Mirrors the fork branch loop's `join_uri` so the versions captured
-/// by [`Writer::flush_and_capture_fork_point`] key the exact same
-/// datasets the fork later branches.
-fn join_lance_uri(base: &str, dataset: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{dataset}.lance")
-    } else {
-        format!("{base}/{dataset}.lance")
-    }
-}
-
-/// Cheap on-disk existence check for a dataset `.lance` directory.
-///
-/// Local-fs heuristic: a URI with a `://` scheme is assumed remote and
-/// reported present, deferring the real check to `current_version`.
-/// Mirrors the fork branch loop's `path_exists`.
-fn lance_path_exists(uri: &str) -> bool {
-    if uri.contains("://") {
-        return true;
-    }
-    std::path::Path::new(uri).exists()
-}
-
 /// Output of [`Writer::flush_stream_l1`]: the built (but not yet
 /// published) snapshot manifest and its id. Finalize is responsible
 /// for `save_snapshot` + `set_latest_snapshot` + `cached_manifest`
@@ -4689,15 +4664,19 @@ impl Writer {
         // rows. Cheap read lock; no buffer clone.
         let version_hwm = self.l0_manager.get_current().read().current_version;
 
-        let base = self.storage.base_uri();
+        let branching = self.storage.backend().branching().ok_or_else(|| {
+            anyhow::anyhow!(
+                "storage backend does not support fork branching; \
+                 cannot capture a fork point"
+            )
+        })?;
         let mut dataset_versions = BTreeMap::new();
         let mut parent_branch_versions = BTreeMap::new();
         for name in candidate_dataset_names {
-            let uri = join_lance_uri(base, name);
-            if !lance_path_exists(&uri) {
+            if !branching.table_exists(name).await? {
                 continue;
             }
-            let version = crate::backend::lance_branch::current_version(&uri).await?;
+            let version = branching.current_version(name).await?;
             dataset_versions.insert(name.clone(), version);
 
             // For a nested fork, also capture the parent branch's tip under the
@@ -4707,9 +4686,9 @@ impl Writer {
             // nested fork's branch point atomic w.r.t. a concurrent parent
             // commit+flush (the D2 fix).
             if let Some(parent_branch) = parent_branches.get(name) {
-                let branch_version =
-                    crate::backend::lance_branch::current_version_on_branch(&uri, parent_branch)
-                        .await?;
+                let branch_version = branching
+                    .current_version_on_branch(name, parent_branch)
+                    .await?;
                 parent_branch_versions.insert(name.clone(), branch_version);
             }
         }

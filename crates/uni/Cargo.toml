@@ -114,8 +114,6 @@ mimalloc = { version = "0.1", default-features = false }
 fail = "0.5"
 rand = { workspace = true }
 arrow = { workspace = true }
-lance = { workspace = true }
-lancedb = { workspace = true }
 parquet = { workspace = true }
 csv = { workspace = true }
 env_logger = { workspace = true }

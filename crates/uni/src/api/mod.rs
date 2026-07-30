@@ -282,16 +282,6 @@ fn register_builtin_plugins(
     Ok(cypher_sink)
 }
 
-/// Join a storage base URI with a dataset name into a `*.lance` URI,
-/// inserting a `/` separator only when the base lacks a trailing slash.
-///
-/// Delegates to [`uni_store::fork::recovery::join_uri_with`] so the
-/// fork-op join sites (`drop_fork` / `tag_fork` / `untag_fork` /
-/// `list_fork_tags`) share one source of truth with the recovery path.
-fn dataset_uri(base_uri: &str, dataset: &str) -> String {
-    uni_store::fork::recovery::join_uri_with(base_uri.to_string())(dataset)
-}
-
 /// Whether a schema element (label or edge type) is present and `Active`.
 ///
 /// Shared by `label_exists` / `edge_type_exists`; `state` is the looked-up
@@ -1402,13 +1392,20 @@ impl Uni {
         // deletes the recovery tombstone — the only anchor that lets boot-time
         // recovery retry the deletion. Dropping it would orphan the surviving
         // branches permanently (review M3). Leave the fork Tombstoned instead.
-        let storage_uri = self.inner.storage.base_uri().to_string();
+        let branching =
+            self.inner
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::ForkLifecycle {
+                    name: info.name.clone(),
+                    stage: "drop",
+                    source: anyhow::anyhow!("storage backend does not support fork branching")
+                        .into(),
+                })?;
         let mut delete_failure: Option<String> = None;
         for (dataset, branch) in &info.datasets {
-            let dataset_uri = dataset_uri(&storage_uri, dataset);
-            if let Err(e) =
-                uni_store::backend::lance_branch::delete_branch(&dataset_uri, branch).await
-            {
+            if let Err(e) = branching.delete_branch(dataset, branch).await {
                 tracing::warn!(
                     dataset = %dataset,
                     branch = %branch,
@@ -1832,24 +1829,35 @@ impl Uni {
     ///   (tag-name conflict, IO).
     pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
         let info = self.inner.fork_registry.get(fork_name).await?;
-        let storage_uri = self.inner.storage.base_uri().to_string();
+        let branching =
+            self.inner
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: anyhow::anyhow!("storage backend does not support fork branching")
+                        .into(),
+                })?;
 
-        // L9: a fork tag spans one Lance tag per dataset, and `create_tag`
+        // L9: a fork tag spans one backend tag per dataset, and `create_tag`
         // is not atomic across them. Pre-validate that none of the target
         // tags already exist (fail fast with no partial state on the common
         // "already tagged" case), then create while tracking what THIS call
         // created so a mid-loop failure rolls back only those — never a
         // pre-existing tag on another dataset.
         for dataset in info.datasets.keys() {
-            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
-            let existing = uni_store::backend::lance_branch::list_tags(&dataset_uri)
-                .await
-                .map_err(|e| UniError::ForkLifecycle {
-                    name: fork_name.to_string(),
-                    stage: "tag",
-                    source: e.into(),
-                })?;
+            let existing =
+                branching
+                    .list_tags(dataset)
+                    .await
+                    .map_err(|e| UniError::ForkLifecycle {
+                        name: fork_name.to_string(),
+                        stage: "tag",
+                        source: e.into(),
+                    })?;
             if existing.iter().any(|(n, _)| n == &lance_tag) {
                 return Err(UniError::ForkLifecycle {
                     name: fork_name.to_string(),
@@ -1861,17 +1869,12 @@ impl Uni {
 
         let mut created: Vec<(String, String)> = Vec::new();
         for (dataset, branch) in &info.datasets {
-            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
-            if let Err(e) =
-                uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch).await
-            {
-                for (uri, tag_name) in &created {
-                    if let Err(rb) =
-                        uni_store::backend::lance_branch::delete_tag(uri, tag_name).await
-                    {
+            if let Err(e) = branching.create_tag(dataset, &lance_tag, branch).await {
+                for (rb_dataset, tag_name) in &created {
+                    if let Err(rb) = branching.delete_tag(rb_dataset, tag_name).await {
                         tracing::warn!(
-                            "tag_fork rollback: delete_tag '{tag_name}' on '{uri}' failed: {rb}"
+                            "tag_fork rollback: delete_tag '{tag_name}' on '{rb_dataset}' failed: {rb}"
                         );
                     }
                 }
@@ -1881,7 +1884,7 @@ impl Uni {
                     source: e.into(),
                 });
             }
-            created.push((dataset_uri, lance_tag));
+            created.push((dataset.clone(), lance_tag));
         }
         Ok(())
     }
@@ -1896,11 +1899,21 @@ impl Uni {
     /// - [`UniError::ForkLifecycle`] (stage = `untag`) on Lance failures.
     pub async fn untag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
         let info = self.inner.fork_registry.get(fork_name).await?;
-        let storage_uri = self.inner.storage.base_uri().to_string();
+        let branching =
+            self.inner
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "untag",
+                    source: anyhow::anyhow!("storage backend does not support fork branching")
+                        .into(),
+                })?;
         for dataset in info.datasets.keys() {
-            let dataset_uri = dataset_uri(&storage_uri, dataset);
             let lance_tag = format!("fork_{tag}_{dataset}");
-            uni_store::backend::lance_branch::delete_tag(&dataset_uri, &lance_tag)
+            branching
+                .delete_tag(dataset, &lance_tag)
                 .await
                 .map_err(|e| UniError::ForkLifecycle {
                     name: fork_name.to_string(),
@@ -1924,19 +1937,30 @@ impl Uni {
     /// - [`UniError::ForkLifecycle`] (stage = `list_tags`) on Lance failures.
     pub async fn list_fork_tags(&self, fork_name: &str) -> Result<Vec<String>> {
         let info = self.inner.fork_registry.get(fork_name).await?;
-        let storage_uri = self.inner.storage.base_uri().to_string();
-        let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for dataset in info.datasets.keys() {
-            let dataset_uri = dataset_uri(&storage_uri, dataset);
-            let suffix = format!("_{dataset}");
-            let prefix = "fork_";
-            let on_disk = uni_store::backend::lance_branch::list_tags(&dataset_uri)
-                .await
-                .map_err(|e| UniError::ForkLifecycle {
+        let branching =
+            self.inner
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::ForkLifecycle {
                     name: fork_name.to_string(),
                     stage: "list_tags",
-                    source: e.into(),
+                    source: anyhow::anyhow!("storage backend does not support fork branching")
+                        .into(),
                 })?;
+        let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for dataset in info.datasets.keys() {
+            let suffix = format!("_{dataset}");
+            let prefix = "fork_";
+            let on_disk =
+                branching
+                    .list_tags(dataset)
+                    .await
+                    .map_err(|e| UniError::ForkLifecycle {
+                        name: fork_name.to_string(),
+                        stage: "list_tags",
+                        source: e.into(),
+                    })?;
             for (name, _) in on_disk {
                 if let Some(rest) = name.strip_prefix(prefix)
                     && let Some(tag) = rest.strip_suffix(&suffix)
@@ -3690,8 +3714,8 @@ impl UniBuilder {
         );
         // Phase 4a: apply the configured fork budget cap.
         fork_registry.set_max_forks(self.config.max_forks).await;
-        let storage_uri_for_recovery = storage_uri.clone();
         let recovery_store = storage.store();
+        let recovery_branching = storage.backend().branching();
         // L3: pass the schema-derived candidate dataset names so recovery can
         // reconstruct and reclaim zombie `fork_{id}_{dataset}` branches left
         // by a create that crashed before recording them in the registry.
@@ -3701,7 +3725,7 @@ impl UniBuilder {
             &fork_registry,
             &recovery_store,
             &recovery_candidates,
-            uni_store::fork::recovery::join_uri_with(storage_uri_for_recovery),
+            recovery_branching.as_deref(),
         )
         .await
         .map_err(|e| match e {

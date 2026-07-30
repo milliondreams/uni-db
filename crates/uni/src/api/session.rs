@@ -974,9 +974,18 @@ impl Session {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
         }
+        let branching =
+            self.db
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::InvalidArgument {
+                    arg: "self".into(),
+                    message: "storage backend does not support fork branching".into(),
+                })?;
         uni_store::fork::index_builder::build_fork_local_index(
             &scope,
-            self.db.storage.base_uri(),
+            branching.as_ref(),
             label,
             column,
             kind,

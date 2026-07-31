@@ -1008,6 +1008,41 @@ async fn build_edge_columns(
 ///
 /// This is a standalone async function so it can be boxed into a `Send` future
 /// without borrowing from `GraphTraverseStream`.
+/// The empty-expansions prologue shared by the async and sync batch builders.
+///
+/// Returns `Some(batch)` when there is nothing to expand — an empty batch for a
+/// non-OPTIONAL traverse, or the NULL-padded unmatched rows for an OPTIONAL one
+/// — and `None` when the caller should proceed with the real expansion.
+///
+/// Takes borrows throughout so the sync `poll_next` fast path keeps avoiding
+/// the clones its owned-argument sibling pays.
+fn traverse_empty_expansion_batch(
+    input: &RecordBatch,
+    schema: &SchemaRef,
+    optional: bool,
+    optional_pattern_vars: &HashSet<String>,
+) -> DFResult<Option<RecordBatch>> {
+    if !optional {
+        return Ok(Some(RecordBatch::new_empty(schema.clone())));
+    }
+    let unmatched_reps = collect_unmatched_optional_group_rows(
+        input,
+        &HashSet::new(),
+        schema,
+        optional_pattern_vars,
+    )?;
+    if unmatched_reps.is_empty() {
+        return Ok(Some(RecordBatch::new_empty(schema.clone())));
+    }
+    build_optional_null_batch_for_rows_with_optional_vars(
+        input,
+        &unmatched_reps,
+        schema,
+        optional_pattern_vars,
+    )
+    .map(Some)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Standalone async fn needs all context passed explicitly"
@@ -1025,25 +1060,11 @@ async fn build_traverse_output_batch(
     optional: bool,
     optional_pattern_vars: HashSet<String>,
 ) -> DFResult<RecordBatch> {
-    if expansions.is_empty() {
-        if !optional {
-            return Ok(RecordBatch::new_empty(schema));
-        }
-        let unmatched_reps = collect_unmatched_optional_group_rows(
-            &input,
-            &HashSet::new(),
-            &schema,
-            &optional_pattern_vars,
-        )?;
-        if unmatched_reps.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
-        }
-        return build_optional_null_batch_for_rows_with_optional_vars(
-            &input,
-            &unmatched_reps,
-            &schema,
-            &optional_pattern_vars,
-        );
+    if expansions.is_empty()
+        && let Some(batch) =
+            traverse_empty_expansion_batch(&input, &schema, optional, &optional_pattern_vars)?
+    {
+        return Ok(batch);
     }
 
     // Expand input columns via index array
@@ -1410,25 +1431,11 @@ fn build_traverse_output_batch_sync(
     optional: bool,
     optional_pattern_vars: &HashSet<String>,
 ) -> DFResult<RecordBatch> {
-    if expansions.is_empty() {
-        if !optional {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-        let unmatched_reps = collect_unmatched_optional_group_rows(
-            input,
-            &HashSet::new(),
-            schema,
-            optional_pattern_vars,
-        )?;
-        if unmatched_reps.is_empty() {
-            return Ok(RecordBatch::new_empty(schema.clone()));
-        }
-        return build_optional_null_batch_for_rows_with_optional_vars(
-            input,
-            &unmatched_reps,
-            schema,
-            optional_pattern_vars,
-        );
+    if expansions.is_empty()
+        && let Some(batch) =
+            traverse_empty_expansion_batch(input, schema, optional, optional_pattern_vars)?
+    {
+        return Ok(batch);
     }
 
     let indices: Vec<u64> = expansions

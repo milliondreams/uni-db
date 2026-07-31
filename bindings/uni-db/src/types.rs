@@ -3891,121 +3891,103 @@ impl PyEdgePropertyChange {
     }
 }
 
-/// Vertex-side of [`PyForkDiff`].
-#[pyclass(name = "VertexDiff", from_py_object)]
-#[derive(Debug, Clone)]
-pub struct PyVertexDiff {
-    inner: uni_db::VertexDiff,
+/// Generate a `*Diff` pyclass wrapping a Rust diff struct.
+///
+/// `PyVertexDiff` and `PyEdgeDiff` are the same shape — `added` / `deleted` /
+/// `changed` getters over element wrappers, plus `is_empty`, `total_rows` and
+/// `__repr__` — differing only in the wrapped type, the element wrappers and
+/// the repr name.
+///
+/// Doc strings are supplied per invocation rather than baked into the macro:
+/// the two families document different things to Python's `help()`, and a
+/// shared body would silently give the edge type the vertex type's wording.
+macro_rules! diff_pyclass {
+    (
+        $(#[$struct_meta:meta])*
+        $struct:ident, name = $py_name:literal, inner = $inner:ty,
+        element = $elem:ident, change = $change:ident,
+        added = $added_doc:literal,
+        deleted = $deleted_doc:literal,
+        changed = $changed_doc:literal,
+    ) => {
+        $(#[$struct_meta])*
+        #[pyclass(name = $py_name, from_py_object)]
+        #[derive(Debug, Clone)]
+        pub struct $struct {
+            inner: $inner,
+        }
+
+        #[pymethods]
+        impl $struct {
+            #[doc = $added_doc]
+            #[getter]
+            fn added(&self) -> Vec<$elem> {
+                self.inner
+                    .added
+                    .iter()
+                    .cloned()
+                    .map(|v| $elem { inner: v })
+                    .collect()
+            }
+
+            #[doc = $deleted_doc]
+            #[getter]
+            fn deleted(&self) -> Vec<$elem> {
+                self.inner
+                    .deleted
+                    .iter()
+                    .cloned()
+                    .map(|v| $elem { inner: v })
+                    .collect()
+            }
+
+            #[doc = $changed_doc]
+            #[getter]
+            fn changed(&self) -> Vec<$change> {
+                self.inner
+                    .changed
+                    .iter()
+                    .cloned()
+                    .map(|c| $change { inner: c })
+                    .collect()
+            }
+
+            fn is_empty(&self) -> bool {
+                self.inner.is_empty()
+            }
+
+            fn total_rows(&self) -> usize {
+                self.inner.total_rows()
+            }
+
+            fn __repr__(&self) -> String {
+                format!(
+                    concat!($py_name, "(added={}, deleted={}, changed={})"),
+                    self.inner.added.len(),
+                    self.inner.deleted.len(),
+                    self.inner.changed.len()
+                )
+            }
+        }
+    };
 }
 
-#[pymethods]
-impl PyVertexDiff {
-    /// Rows present in `b` but not `a`.
-    #[getter]
-    fn added(&self) -> Vec<PyDiffVertex> {
-        self.inner
-            .added
-            .iter()
-            .cloned()
-            .map(|v| PyDiffVertex { inner: v })
-            .collect()
-    }
-
-    /// Rows present in `a` but not `b`.
-    #[getter]
-    fn deleted(&self) -> Vec<PyDiffVertex> {
-        self.inner
-            .deleted
-            .iter()
-            .cloned()
-            .map(|v| PyDiffVertex { inner: v })
-            .collect()
-    }
-
-    /// Rows with matching UID and differing properties.
-    #[getter]
-    fn changed(&self) -> Vec<PyVertexPropertyChange> {
-        self.inner
-            .changed
-            .iter()
-            .cloned()
-            .map(|c| PyVertexPropertyChange { inner: c })
-            .collect()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    fn total_rows(&self) -> usize {
-        self.inner.total_rows()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "VertexDiff(added={}, deleted={}, changed={})",
-            self.inner.added.len(),
-            self.inner.deleted.len(),
-            self.inner.changed.len()
-        )
-    }
+diff_pyclass! {
+    /// Vertex-side of [`PyForkDiff`].
+    PyVertexDiff, name = "VertexDiff", inner = uni_db::VertexDiff,
+    element = PyDiffVertex, change = PyVertexPropertyChange,
+    added = "Rows present in `b` but not `a`.",
+    deleted = "Rows present in `a` but not `b`.",
+    changed = "Rows with matching UID and differing properties.",
 }
 
-/// Edge-side of [`PyForkDiff`].
-#[pyclass(name = "EdgeDiff", from_py_object)]
-#[derive(Debug, Clone)]
-pub struct PyEdgeDiff {
-    inner: uni_db::EdgeDiff,
-}
-
-#[pymethods]
-impl PyEdgeDiff {
-    #[getter]
-    fn added(&self) -> Vec<PyDiffEdge> {
-        self.inner
-            .added
-            .iter()
-            .cloned()
-            .map(|e| PyDiffEdge { inner: e })
-            .collect()
-    }
-
-    #[getter]
-    fn deleted(&self) -> Vec<PyDiffEdge> {
-        self.inner
-            .deleted
-            .iter()
-            .cloned()
-            .map(|e| PyDiffEdge { inner: e })
-            .collect()
-    }
-
-    #[getter]
-    fn changed(&self) -> Vec<PyEdgePropertyChange> {
-        self.inner
-            .changed
-            .iter()
-            .cloned()
-            .map(|c| PyEdgePropertyChange { inner: c })
-            .collect()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    fn total_rows(&self) -> usize {
-        self.inner.total_rows()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "EdgeDiff(added={}, deleted={}, changed={})",
-            self.inner.added.len(),
-            self.inner.deleted.len(),
-            self.inner.changed.len()
-        )
-    }
+diff_pyclass! {
+    /// Edge-side of [`PyForkDiff`].
+    PyEdgeDiff, name = "EdgeDiff", inner = uni_db::EdgeDiff,
+    element = PyDiffEdge, change = PyEdgePropertyChange,
+    added = "Edges present in `b` but not `a`.",
+    deleted = "Edges present in `a` but not `b`.",
+    changed = "Edges with matching endpoints and differing properties.",
 }
 
 /// Structural delta between two fork views (or a fork and primary).

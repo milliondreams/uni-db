@@ -256,54 +256,6 @@ impl MainEdgeDataset {
         Ok(())
     }
 
-    /// Query the main edges table for an edge by eid.
-    pub async fn find_by_eid(
-        backend: &dyn StorageBackend,
-        eid: Eid,
-    ) -> Result<Option<(Vid, Vid, String, Properties)>> {
-        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
-        let results = Self::execute_query(backend, filter, None).await?;
-
-        for batch in results {
-            if batch.num_rows() > 0 {
-                let src_vid_col = batch.column_by_name("src_vid");
-                let dst_vid_col = batch.column_by_name("dst_vid");
-                let type_col = batch.column_by_name("type");
-                let props_col = batch.column_by_name("props_json");
-
-                if let (Some(src), Some(dst), Some(typ), Some(props)) =
-                    (src_vid_col, dst_vid_col, type_col, props_col)
-                    && let (Some(src_arr), Some(dst_arr), Some(type_arr), Some(props_arr)) = (
-                        src.as_any().downcast_ref::<UInt64Array>(),
-                        dst.as_any().downcast_ref::<UInt64Array>(),
-                        typ.as_any().downcast_ref::<arrow_array::StringArray>(),
-                        props
-                            .as_any()
-                            .downcast_ref::<arrow_array::LargeBinaryArray>(),
-                    )
-                {
-                    let src_vid = Vid::from(src_arr.value(0));
-                    let dst_vid = Vid::from(dst_arr.value(0));
-                    let edge_type = type_arr.value(0).to_string();
-                    let properties: Properties = if props_arr.is_null(0)
-                        || props_arr.value(0).is_empty()
-                    {
-                        Properties::new()
-                    } else {
-                        let uni_val = uni_common::cypher_value_codec::decode(props_arr.value(0))
-                            .unwrap_or(uni_common::Value::Null);
-                        let json_val: serde_json::Value = uni_val.into();
-                        serde_json::from_value(json_val).unwrap_or_default()
-                    };
-
-                    return Ok(Some((src_vid, dst_vid, edge_type, properties)));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Check whether an edge exists by EID, regardless of deletion status.
     ///
     /// Unlike `find_props_by_eid`, this does NOT filter by `_deleted = false`,
@@ -335,43 +287,6 @@ impl MainEdgeDataset {
         }
 
         backend.scan(request).await
-    }
-
-    /// Extract EIDs from record batches.
-    fn extract_eids(batches: &[RecordBatch]) -> Vec<Eid> {
-        let mut eids = Vec::new();
-        for batch in batches {
-            if let Some(eid_col) = batch.column_by_name("_eid")
-                && let Some(eid_arr) = eid_col.as_any().downcast_ref::<UInt64Array>()
-            {
-                for i in 0..eid_arr.len() {
-                    if !eid_arr.is_null(i) {
-                        eids.push(Eid::new(eid_arr.value(i)));
-                    }
-                }
-            }
-        }
-        eids
-    }
-
-    /// Find all non-deleted EIDs from the main edges table.
-    pub async fn find_all_eids(backend: &dyn StorageBackend) -> Result<Vec<Eid>> {
-        let batches =
-            Self::execute_query(backend, FilterExpr::not_deleted(), Some(vec!["_eid"])).await?;
-        Ok(Self::extract_eids(&batches))
-    }
-
-    /// Find EIDs by type name in the main edges table.
-    pub async fn find_eids_by_type_name(
-        backend: &dyn StorageBackend,
-        type_name: &str,
-    ) -> Result<Vec<Eid>> {
-        let filter = FilterExpr::all([
-            FilterExpr::not_deleted(),
-            FilterExpr::equals("type", Scalar::Str(type_name.to_string())),
-        ]);
-        let batches = Self::execute_query(backend, filter, Some(vec!["_eid"])).await?;
-        Ok(Self::extract_eids(&batches))
     }
 
     /// Find properties for an edge by EID in the main edges table.
@@ -453,84 +368,6 @@ impl MainEdgeDataset {
         serde_json::from_value(json_val).map_err(|e| anyhow!("Failed to parse props_json: {}", e))
     }
 
-    /// Find edge type name by EID in the main edges table.
-    pub async fn find_type_by_eid(
-        backend: &dyn StorageBackend,
-        eid: Eid,
-    ) -> Result<Option<String>> {
-        // MVCC (review C2): take the highest-version row — including tombstones —
-        // and return `None` if that winner is deleted. The old code filtered
-        // `_deleted = false` and took `value(0)` with no version comparison, so
-        // it could return an arbitrary (and possibly stale) edge type.
-        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
-        let batches =
-            Self::execute_query(backend, filter, Some(vec!["type", "_version", "_deleted"]))
-                .await?;
-
-        let mut best_type: Option<String> = None;
-        let mut best_version: u64 = 0;
-        let mut best_deleted = false;
-
-        for batch in &batches {
-            let type_col = batch
-                .column_by_name("type")
-                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
-            let ver_col = batch
-                .column_by_name("_version")
-                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-            let deleted_col = batch
-                .column_by_name("_deleted")
-                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
-
-            if let (Some(type_arr), Some(ver_arr)) = (type_col, ver_col) {
-                for i in 0..batch.num_rows() {
-                    let version = if ver_arr.is_null(i) {
-                        0
-                    } else {
-                        ver_arr.value(i)
-                    };
-
-                    if version >= best_version {
-                        best_version = version;
-                        best_deleted = deleted_col.is_some_and(|d| d.value(i));
-                        best_type = if best_deleted || type_arr.is_null(i) {
-                            None
-                        } else {
-                            Some(type_arr.value(i).to_string())
-                        };
-                    }
-                }
-            }
-        }
-
-        if best_deleted {
-            return Ok(None);
-        }
-        Ok(best_type)
-    }
-
-    /// Find edge data (eid, src_vid, dst_vid, props) by type name in the main edges table.
-    ///
-    /// Returns all non-deleted edges with the given type name.
-    pub async fn find_edges_by_type_name(
-        backend: &dyn StorageBackend,
-        type_name: &str,
-    ) -> Result<Vec<(Eid, Vid, Vid, Properties)>> {
-        let filter = FilterExpr::all([
-            FilterExpr::not_deleted(),
-            FilterExpr::equals("type", Scalar::Str(type_name.to_string())),
-        ]);
-        // Fetch all columns for edge data
-        let batches = Self::execute_query(backend, filter, None).await?;
-
-        let mut edges = Vec::new();
-        for batch in &batches {
-            Self::extract_edges_from_batch(batch, &mut edges)?;
-        }
-
-        Ok(edges)
-    }
-
     /// Find edge data (eid, src_vid, dst_vid, edge_type, props) by multiple type names in the main edges table.
     ///
     /// Returns all non-deleted edges with any of the given type names.
@@ -589,22 +426,6 @@ impl MainEdgeDataset {
         }
 
         Ok(edges)
-    }
-
-    /// Extract edge data from a record batch (without edge type).
-    fn extract_edges_from_batch(
-        batch: &RecordBatch,
-        edges: &mut Vec<(Eid, Vid, Vid, Properties)>,
-    ) -> Result<()> {
-        // Reuse the with-type extraction and discard the edge type
-        let mut edges_with_type = Vec::new();
-        Self::extract_edges_with_type_from_batch(batch, &mut edges_with_type)?;
-        edges.extend(
-            edges_with_type
-                .into_iter()
-                .map(|(eid, src, dst, _type, props)| (eid, src, dst, props)),
-        );
-        Ok(())
     }
 
     /// Extract edge data with type from a record batch.
@@ -781,9 +602,8 @@ mod tests {
 
     /// MVCC regression (review C2): a deletion tombstone written at a higher
     /// version must win over the older live row. `find_props_by_eid` filtered
-    /// `_deleted = false` before version-ranking (so an older live version
-    /// resurrected a deleted edge), and `find_type_by_eid` took `value(0)` with
-    /// no version comparison.
+    /// `_deleted = false` before version-ranking, so an older live version
+    /// resurrected a deleted edge.
     #[tokio::test]
     async fn test_edge_key_reads_respect_tombstone_winner() {
         use crate::backend::lance::LanceDbBackend;
@@ -822,12 +642,6 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(
-            MainEdgeDataset::find_type_by_eid(backend, Eid::new(1))
-                .await
-                .unwrap(),
-            Some("KNOWS".to_string())
-        );
 
         // v2: deletion tombstone at a higher version — the winning row.
         let dead = MainEdgeDataset::build_record_batch(
@@ -852,13 +666,6 @@ mod tests {
                 .unwrap(),
             None,
             "deleted (highest-version) winner must not resurrect edge props"
-        );
-        assert_eq!(
-            MainEdgeDataset::find_type_by_eid(backend, Eid::new(1))
-                .await
-                .unwrap(),
-            None,
-            "deleted winner must not return an edge type"
         );
     }
 }

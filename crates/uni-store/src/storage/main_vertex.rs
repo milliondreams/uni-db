@@ -57,48 +57,6 @@ fn with_version_bound(filter: FilterExpr, version: Option<u64>) -> FilterExpr {
     }
 }
 
-/// Scan the main vertices table for `_vid`s matching `filter_body`.
-///
-/// `filter_body` is the predicate without the snapshot version bound, which
-/// is appended via [`with_version_bound`]. Returns an empty vec if the table
-/// does not exist. Shared by the `find_*_vids` lookups.
-async fn scan_vids(
-    backend: &dyn StorageBackend,
-    filter_body: FilterExpr,
-    version: Option<u64>,
-) -> Result<Vec<Vid>> {
-    let table_name = table_names::main_vertex_table_name();
-
-    if !backend.table_exists(table_name).await? {
-        return Ok(Vec::new());
-    }
-
-    let filter = with_version_bound(filter_body, version);
-
-    let results = backend
-        .scan(
-            ScanRequest::all(table_name)
-                .with_filter(filter)
-                .with_columns(vec!["_vid".to_string()]),
-        )
-        .await?;
-
-    let mut vids = Vec::new();
-    for batch in results {
-        if let Some(vid_col) = batch.column_by_name("_vid")
-            && let Some(vid_arr) = vid_col.as_any().downcast_ref::<UInt64Array>()
-        {
-            for i in 0..vid_arr.len() {
-                if !vid_arr.is_null(i) {
-                    vids.push(Vid::new(vid_arr.value(i)));
-                }
-            }
-        }
-    }
-
-    Ok(vids)
-}
-
 /// Extract a label vector from one row of a `List<Utf8>` labels column.
 ///
 /// Returns `None` when the row's values are not a `StringArray`. Nulls within
@@ -544,70 +502,6 @@ impl MainVertexDataset {
             return Ok(None);
         }
         Ok(best_labels)
-    }
-
-    /// Find all non-deleted VIDs in the main vertices table.
-    ///
-    /// Returns all VIDs where `_deleted = false`.
-    ///
-    /// # Arguments
-    /// * `version` - Optional version high water mark for snapshot isolation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table query fails.
-    pub async fn find_all_vids(
-        backend: &dyn StorageBackend,
-        version: Option<u64>,
-    ) -> Result<Vec<Vid>> {
-        scan_vids(backend, FilterExpr::not_deleted(), version).await
-    }
-
-    /// Find VIDs by label name in the main vertices table.
-    ///
-    /// Searches for vertices where the labels array contains the given label
-    /// and `_deleted = false`.
-    ///
-    /// # Arguments
-    /// * `version` - Optional version high water mark for snapshot isolation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table query fails.
-    pub async fn find_vids_by_label_name(
-        backend: &dyn StorageBackend,
-        label: &str,
-        version: Option<u64>,
-    ) -> Result<Vec<Vid>> {
-        let filter_body = FilterExpr::all([
-            FilterExpr::not_deleted(),
-            FilterExpr::array_contains("labels", Scalar::Str(label.to_string())),
-        ]);
-        scan_vids(backend, filter_body, version).await
-    }
-
-    /// Find VIDs by multiple label names (intersection semantics).
-    ///
-    /// Returns vertices that have ALL the specified labels.
-    /// Uses `array_contains(labels, 'A') AND array_contains(labels, 'B')` filtering.
-    ///
-    /// # Arguments
-    /// * `version` - Optional version high water mark for snapshot isolation.
-    pub async fn find_vids_by_labels(
-        backend: &dyn StorageBackend,
-        labels: &[&str],
-        version: Option<u64>,
-    ) -> Result<Vec<Vid>> {
-        if labels.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let filter_body = FilterExpr::all(std::iter::once(FilterExpr::not_deleted()).chain(
-            labels.iter().map(|label| {
-                FilterExpr::array_contains("labels", Scalar::Str((*label).to_string()))
-            }),
-        ));
-        scan_vids(backend, filter_body, version).await
     }
 
     /// Batch-fetch properties for multiple VIDs from the main vertices table.

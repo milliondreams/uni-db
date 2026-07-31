@@ -684,6 +684,79 @@ mod tests {
 
     // ---- explicit cases the plan calls out ----
 
+    /// A NULL in an `IN` list makes a miss unknown, not false, so the
+    /// predicate can never be FALSE. Rendering it literally as
+    /// `i IN (NULL, ...)` let Lance's multi-`InList` rewrite collapse the
+    /// unknown: `NOT ((i IN (NULL)) AND (i IN (0)))` selected every row
+    /// instead of only the non-null, non-zero ones. Pinned as SQL text so the
+    /// rendering cannot regress silently.
+    #[test]
+    fn in_list_with_null_renders_as_explicit_unknown() {
+        let all_null = FilterExpr::In {
+            column: "i".into(),
+            values: vec![Scalar::Null],
+        };
+        assert_eq!(all_null.to_sql().unwrap(), "CAST(NULL AS BOOLEAN)");
+
+        let mixed = FilterExpr::In {
+            column: "i".into(),
+            values: vec![Scalar::Int(0), Scalar::Null],
+        };
+        assert_eq!(
+            mixed.to_sql().unwrap(),
+            "(i IN (0) OR CAST(NULL AS BOOLEAN))"
+        );
+
+        // The common, NULL-free case keeps the plain rendering.
+        let plain = FilterExpr::In {
+            column: "i".into(),
+            values: vec![Scalar::Int(0), Scalar::Int(1)],
+        };
+        assert_eq!(plain.to_sql().unwrap(), "i IN (0, 1)");
+    }
+
+    /// End-to-end for the shape the proptest shrank to: the native evaluator
+    /// and Lance must select the same rows.
+    #[test]
+    fn not_and_of_two_in_lists_with_null_agrees_with_lance() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uri = tmp.path().join("t.lance").to_string_lossy().to_string();
+        let b = batch();
+        let schema = b.schema();
+        rt.block_on(async {
+            lance::Dataset::write(
+                RecordBatchIterator::new(vec![Ok(b.clone())], schema),
+                &uri,
+                None,
+            )
+            .await
+            .expect("write");
+        });
+        let ds = rt.block_on(lance::Dataset::open(&uri)).expect("open");
+
+        let expr = FilterExpr::Not(Box::new(FilterExpr::And(vec![
+            FilterExpr::In {
+                column: "i".into(),
+                values: vec![Scalar::Null],
+            },
+            FilterExpr::In {
+                column: "i".into(),
+                values: vec![Scalar::Int(0)],
+            },
+        ])));
+
+        let native = eval_rids(&expr, &b).expect("evaluable");
+        let lance = rt
+            .block_on(sql_rids(&ds, &expr.to_sql().expect("renderable")))
+            .expect("scan");
+        assert_eq!(native, lance);
+
+        // `i` cycles [-2, -1, 0, 1, 2, NULL]: the answer is every row whose
+        // `i` is neither NULL nor 0, i.e. four of every six.
+        assert_eq!(native.len(), 80, "expected the non-null, non-zero rows");
+    }
+
     #[test]
     fn null_yields_unknown_not_false() {
         let b = batch();

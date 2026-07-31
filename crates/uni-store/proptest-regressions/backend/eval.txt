@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d9ab0691f56b618776874cc380c075c6e1b924f30422d2e139241c8dd9341a8e # shrinks to expr = And([Compare { column: "i", op: Eq, value: Int(0) }])
+cc bfa9832e746e8f0f123958b3b76ade2c7dc4242f2442c24688ff33b6c61e9e6c # shrinks to expr = And([Compare { column: "i", op: Eq, value: Int(0) }, Or([Compare { column: "i", op: Eq, value: Int(0) }, Compare { column: "i", op: NotEq, value: Int(0) }])])
+cc fbe9eca3594e87af4aeedc6a46204bf076f0daa82c6d96ee9e0028b06490fcf0 # shrinks to expr = And([Compare { column: "s", op: Eq, value: Str("it's") }])
+cc 31ce68a9c787cee920b35bb3bd3b4358e96c447071d46fe2ad8131b3e52c9c2e # shrinks to expr = And([Or([ArrayContains { column: "labels", value: Str("Person") }, Compare { column: "i", op: Eq, value: Int(0) }]), Compare { column: "i", op: Eq, value: Int(0) }])
+cc a69bc97597bc006256f1fd9f17bfc547973ad621dff5493158fc8bfb0a08667c # shrinks to expr = Or([StringMatch { column: "s", kind: StartsWith, pattern: "'" }])
+cc bc28ffecc4e081d124b3635e0716db8a3391f27587ee8f8d6020092a0f9d0390 # shrinks to expr = Not(And([In { column: "i", values: [Null] }, In { column: "i", values: [Int(0)] }]))

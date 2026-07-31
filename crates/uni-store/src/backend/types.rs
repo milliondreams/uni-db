@@ -388,8 +388,39 @@ impl FilterExpr {
                     // the predicate is unsatisfiable anyway.
                     return Ok("false".to_string());
                 }
-                let items: Vec<_> = values.iter().map(scalar_to_sql).collect();
-                Ok(format!("{} IN ({})", column, items.join(", ")))
+                // A NULL in the list is not just another candidate value: it
+                // makes a *miss* unknown rather than false, so the predicate can
+                // be TRUE or NULL but never FALSE.
+                //
+                // Rendering it literally as `col IN (NULL, 0)` is not safe.
+                // Lance evaluates a lone `col IN (NULL, ...)` correctly, but
+                // once two `IN` predicates over the same column meet under a
+                // `NOT` its optimizer rewrites them into a form that loses the
+                // unknown: `NOT ((i IN (NULL)) AND (i IN (0)))` selected every
+                // row instead of only the non-null, non-zero ones. Swapping
+                // either side to `=` made it correct again, so the trigger is
+                // the multi-`InList`-on-one-column rewrite, not our `NOT`.
+                //
+                // Emitting the unknown explicitly sidesteps that path entirely
+                // and matches `eval`'s Kleene `In` exactly.
+                let (nulls, non_nulls): (Vec<_>, Vec<_>) =
+                    values.iter().partition(|v| matches!(v, Scalar::Null));
+                if nulls.is_empty() {
+                    let items: Vec<_> = non_nulls.iter().map(|v| scalar_to_sql(v)).collect();
+                    return Ok(format!("{} IN ({})", column, items.join(", ")));
+                }
+                if non_nulls.is_empty() {
+                    // Every candidate is NULL: the predicate is unknown for
+                    // every row, whatever the column holds.
+                    return Ok(SQL_UNKNOWN.to_string());
+                }
+                let items: Vec<_> = non_nulls.iter().map(|v| scalar_to_sql(v)).collect();
+                Ok(format!(
+                    "({} IN ({}) OR {})",
+                    column,
+                    items.join(", "),
+                    SQL_UNKNOWN
+                ))
             }
             FilterExpr::ArrayContains { column, value } => Ok(format!(
                 "array_contains({}, {})",
@@ -435,6 +466,13 @@ fn paren(s: String) -> String {
 }
 
 /// Render a literal. The single place string escaping happens.
+/// SQL for a boolean whose value is unknown.
+///
+/// A bare `NULL` is untyped and the optimizer is free to fold it; the cast
+/// pins it as a boolean so three-valued logic is preserved through `NOT` and
+/// `AND`/`OR`.
+const SQL_UNKNOWN: &str = "CAST(NULL AS BOOLEAN)";
+
 fn scalar_to_sql(v: &Scalar) -> String {
     match v {
         Scalar::Null => "NULL".to_string(),

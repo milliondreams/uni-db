@@ -5,8 +5,9 @@
 # openCypher TCK lane, and the Python binding tests.
 #
 # The thorough/expensive remainder (sidecar + Locy TCK, reranker, cloud,
-# cargo doc, flagship notebooks, release guards, cuda smoke) runs ONCE on push
-# to main in ci.yml and is deliberately NOT repeated here. This is safe because
+# cargo doc, flagship notebooks, the WASM/Extism loader lane, release guards,
+# cuda smoke) runs ONCE on push to main in ci.yml and is deliberately NOT
+# repeated here. This is safe because
 # branch protection requires PR branches to be up to date with main before
 # merging, so these gates run against the exact tree that will land on main.
 
@@ -315,79 +316,3 @@ jobs:
       - name: Run Python tests (uni-pydantic)
         working-directory: bindings/uni-pydantic
         run: uv run pytest tests/ -v -n auto
-
-  # ---------------------------------------------------------------------- #
-  # WASM / Extism loader tests — own runner, own wheel.
-  # ---------------------------------------------------------------------- #
-  # `Uni.load_wasm_component` / `load_wasm_extism` are `#[cfg]`-gated on the
-  # `wasm-plugins` / `extism-plugins` features, which `bindings/uni-db` drops
-  # from its default set so the published wheel stays under PyPI's size limit.
-  # Every loader test therefore SKIPS in the `python-tests` job above, and
-  # without this lane they would execute in no CI invocation at all and rot
-  # unnoticed — the same hole the pyo3 step in that job exists to close.
-  #
-  # A separate job rather than extra steps on `python-tests`: this needs a
-  # differently-featured wheel, and building it there would replace the
-  # default-feature wheel that job exists to exercise. Isolating it also lets
-  # the two run in parallel and keeps the wasm toolchain out of the main
-  # Python job.
-  python-wasm-tests:
-    if: github.repository == 'rustic-ai/uni-db'
-    name: Python WASM/Extism Loader Tests
-    runs-on: ubuntu-xlarge
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown, wasm32-wasip2
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mold protobuf-compiler
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "ci"
-          cache-on-failure: true
-
-      # Before the wheel: the loader tests skip on a missing fixture just as
-      # they do on a missing loader, so building these first is what makes the
-      # run below meaningful rather than vacuously green.
-      - name: Build WASM plugin fixtures
-        run: ./scripts/build-wasm-fixtures.sh
-
-      - name: Install Python dependencies (uni-db)
-        working-directory: bindings/uni-db
-        run: uv sync --group dev
-
-      - name: Build Python bindings with WASM/Extism loaders
-        working-directory: bindings/uni-db
-        run: uv run maturin develop --features wasm-plugins,extism-plugins
-
-      - name: Assert loaders are present
-        working-directory: bindings/uni-db
-        # Without this the loader tests would simply skip again and the job
-        # would pass green, recreating the silent rot it exists to prevent.
-        run: |
-          uv run python -c "
-          import sys, uni_db._uni_db as ext
-          missing = [m for m in ('load_wasm_component', 'load_wasm_extism')
-                     if not hasattr(ext.Uni, m)]
-          sys.exit('feature build did not take effect; missing: %r' % missing) if missing else None
-          "
-
-      - name: Run WASM/Extism loader tests
-        working-directory: bindings/uni-db
-        run: |
-          uv run pytest tests/test_wasm_plugin.py \
-            tests/test_plugin_conformance.py \
-            tests/test_stub_drift.py -v

@@ -8,8 +8,8 @@
 #
 # What runs here is everything the PR does NOT: the openCypher sidecar mode,
 # both Locy TCK lanes, the ONNX reranker suites, cloud integration, the rustdoc
-# gate, the flagship-notebook executions, the release-path guards, and the CUDA
-# wheel-graph smoke.
+# gate, the flagship-notebook executions, the WASM/Extism Python loader lane,
+# the release-path guards, and the CUDA wheel-graph smoke.
 #
 # The final `gate` job is named "Test" because release.yml's publish guard
 # asserts a passing check named "Test" on the tagged commit; keeping that name
@@ -340,6 +340,83 @@ jobs:
       - name: Execute flagship Locy notebook (drug-drug interaction)
         run: uv run --no-sync --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
 
+  # ---------------------------------------------------------------------- #
+  # WASM / Extism loader tests — own runner, own wheel.
+  # ---------------------------------------------------------------------- #
+  # `Uni.load_wasm_component` / `load_wasm_extism` are `#[cfg]`-gated on the
+  # `wasm-plugins` / `extism-plugins` features, which `bindings/uni-db` drops
+  # from its default set so the published wheel stays under PyPI's size limit.
+  # Every loader test therefore SKIPS in pr.yml's `python-tests` job, and
+  # without this lane they would execute in no CI invocation at all and rot
+  # unnoticed — the same hole the pyo3 step in that job exists to close.
+  #
+  # Post-merge rather than on the PR: it needs its own wasm toolchain and a
+  # second, differently-featured wheel, which is the most expensive Python lane
+  # for the least PR-time signal. It stays a standalone job rather than steps on
+  # another because building this wheel would replace the default-feature one
+  # those jobs exist to exercise.
+  python-wasm-tests:
+    if: github.repository == 'rustic-ai/uni-db'
+    name: Python WASM/Extism Loader Tests
+    runs-on: ${{ vars.CI_RUNNER_XLARGE32 || 'linux-xlarge-32' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip2
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+          save-if: false
+
+      # Before the wheel: the loader tests skip on a missing fixture just as
+      # they do on a missing loader, so building these first is what makes the
+      # run below meaningful rather than vacuously green.
+      - name: Build WASM plugin fixtures
+        run: ./scripts/build-wasm-fixtures.sh
+
+      - name: Install Python dependencies (uni-db)
+        working-directory: bindings/uni-db
+        run: uv sync --group dev
+
+      - name: Build Python bindings with WASM/Extism loaders
+        working-directory: bindings/uni-db
+        run: uv run maturin develop --features wasm-plugins,extism-plugins
+
+      - name: Assert loaders are present
+        working-directory: bindings/uni-db
+        # Without this the loader tests would simply skip again and the job
+        # would pass green, recreating the silent rot it exists to prevent.
+        run: |
+          uv run python -c "
+          import sys, uni_db._uni_db as ext
+          missing = [m for m in ('load_wasm_component', 'load_wasm_extism')
+                     if not hasattr(ext.Uni, m)]
+          sys.exit('feature build did not take effect; missing: %r' % missing) if missing else None
+          "
+
+      - name: Run WASM/Extism loader tests
+        working-directory: bindings/uni-db
+        run: |
+          uv run pytest tests/test_wasm_plugin.py \
+            tests/test_plugin_conformance.py \
+            tests/test_stub_drift.py -v
+
   # Release-path guards. Feature drift (a wheel variant missing a plugin feature)
   # and an incomplete crates.io publish list slip through the workspace build and
   # only fail at release time; these reproduce both failure modes cheaply.
@@ -413,7 +490,17 @@ jobs:
   gate:
     if: github.repository == 'rustic-ai/uni-db'
     name: Test
-    needs: [tck-full, reranker, cloud, docs, notebooks, release-guards, wheels-cuda-smoke]
+    needs:
+      [
+        tck-full,
+        reranker,
+        cloud,
+        docs,
+        notebooks,
+        python-wasm-tests,
+        release-guards,
+        wheels-cuda-smoke,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Thorough CI passed

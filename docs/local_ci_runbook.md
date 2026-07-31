@@ -142,32 +142,6 @@ cargo nextest run -p uni-tck --test tck
   PYTHONPATH="$SITE" cargo nextest run --manifest-path ../../Cargo.toml \
     -p uni-plugin-pyo3 --features pyo3 )
 
-# WASM/Extism loader tests — SEPARATE CI job (`python-wasm-tests`), separate wheel.
-# The loaders are `#[cfg]`-gated on `wasm-plugins` / `extism-plugins`, which
-# `bindings/uni-db` drops from its default set for wheel size, so every loader
-# test SKIPS in the default-feature pytest run above. This lane is the only
-# place they actually execute. Build the fixtures BEFORE the wheel — the tests
-# skip on a missing fixture exactly as they do on a missing loader, so without
-# them the run is vacuously green.
-#
-# Do NOT fold this into the block above: it needs a differently-featured wheel
-# and would replace the default-feature one those steps exist to exercise.
-( ./scripts/build-wasm-fixtures.sh
-  cd bindings/uni-db
-  uv run maturin develop --features wasm-plugins,extism-plugins
-  # Guard: assert the feature build took effect, else the tests below just skip
-  # and the lane passes green.
-  uv run python -c "
-import sys, uni_db._uni_db as ext
-missing = [m for m in ('load_wasm_component', 'load_wasm_extism')
-           if not hasattr(ext.Uni, m)]
-sys.exit('feature build did not take effect; missing: %r' % missing) if missing else None
-"
-  uv run pytest tests/test_wasm_plugin.py tests/test_plugin_conformance.py \
-    tests/test_stub_drift.py -v
-  # Restore the default-feature wheel for any later local step.
-  uv run maturin develop )
-
 # uni-pydantic  (working dir: bindings/uni-pydantic) — imports the uni-db .so via editable path dep
 ( cd bindings/uni-pydantic
   uv sync --group dev
@@ -261,6 +235,31 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace \
 for nb in semiconductor pharma cyber predictive_maintenance adverse_drug_reaction drug_drug_interaction; do
   uv run --no-sync --project bindings/uni-db python website/scripts/verify_${nb}_flagship_notebook.py
 done
+```
+
+### Python WASM/Extism Loader Tests
+```bash
+# The loaders are `#[cfg]`-gated on `wasm-plugins` / `extism-plugins`, which
+# `bindings/uni-db` drops from its default set for wheel size, so every loader
+# test SKIPS in pr.yml's default-feature pytest run. This lane is the only place
+# they actually execute. Build the fixtures BEFORE the wheel — the tests skip on
+# a missing fixture exactly as they do on a missing loader, so without them the
+# run is vacuously green.
+( ./scripts/build-wasm-fixtures.sh
+  cd bindings/uni-db
+  uv run maturin develop --features wasm-plugins,extism-plugins
+  # Guard: assert the feature build took effect, else the tests below just skip
+  # and the lane passes green.
+  uv run python -c "
+import sys, uni_db._uni_db as ext
+missing = [m for m in ('load_wasm_component', 'load_wasm_extism')
+           if not hasattr(ext.Uni, m)]
+sys.exit('feature build did not take effect; missing: %r' % missing) if missing else None
+"
+  uv run pytest tests/test_wasm_plugin.py tests/test_plugin_conformance.py \
+    tests/test_stub_drift.py -v
+  # Restore the default-feature wheel for any later local step.
+  uv run maturin develop )
 ```
 
 ### Release Guards

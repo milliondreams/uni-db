@@ -5522,39 +5522,31 @@ impl Executor {
         writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
-        let schema = self.storage.schema_manager().schema();
-        let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
+        self.detach_incident_edges(&[vid], writer, tx_l0).await
+    }
 
-        // 1. Find and delete all outgoing edges
-        let out_graph = self
-            .storage
-            .load_subgraph_cached(
-                &[vid],
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Outgoing,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
+    /// Delete every incident edge (both directions) of `vids`.
+    ///
+    /// The shared core of [`Self::detach_delete_vertex`] (the N=1 case) and
+    /// [`Self::batch_detach_delete_vertices`].
+    ///
+    /// Deletes edges ONLY, never the vertices themselves. That split is
+    /// load-bearing: `execute_delete_vertex` calls the N=1 path and then
+    /// deletes the vertex itself, so folding `writer.delete_vertex` in here
+    /// would delete it twice.
+    async fn detach_incident_edges(
+        &self,
+        vids: &[Vid],
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
 
         for edge in out_graph.edges() {
             writer
                 .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
-
-        // 2. Find and delete all incoming edges
-        let in_graph = self
-            .storage
-            .load_subgraph_cached(
-                &[vid],
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Incoming,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
-
         for edge in in_graph.edges() {
             writer
                 .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
@@ -5617,18 +5609,7 @@ impl Executor {
         writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
-        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
-
-        for edge in out_graph.edges() {
-            writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
-                .await?;
-        }
-        for edge in in_graph.edges() {
-            writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
-                .await?;
-        }
+        self.detach_incident_edges(vids, writer, tx_l0).await?;
 
         for (vid, labels) in vids.iter().zip(labels_per_vid) {
             writer.delete_vertex(*vid, labels, tx_l0).await?;

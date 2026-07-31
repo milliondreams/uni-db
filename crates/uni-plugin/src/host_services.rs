@@ -10,8 +10,10 @@
 //! Secret acquisition has no trait here — it reuses
 //! [`crate::secrets::SecretStore`] directly.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::capability::{Capability, CapabilitySet};
 use crate::errors::FnError;
 
 /// A signing / verification service backing the `uni.kms.*` host functions.
@@ -89,4 +91,87 @@ pub trait HttpEgress: Send + Sync {
         max_bytes: usize,
         traceparent: Option<&str>,
     ) -> Result<HttpResponse, FnError>;
+}
+
+// ---------------------------------------------------------------------------
+// Shared `uni.http.*` policy
+// ---------------------------------------------------------------------------
+
+/// Default per-call HTTP timeout when the grant carries no
+/// [`Capability::WallClockMillisPerCall`].
+///
+/// Conservative: long enough for a typical API call, short enough to bound a
+/// wedged request.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum response body bytes read before truncation — bounds host memory so a
+/// hostile or oversized response cannot exhaust it.
+pub const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Why a capability-gated HTTP call was refused.
+///
+/// The loaders share the *decisions* and keep their own *encoding*: the Extism
+/// loader maps these onto the numeric `FnError` codes its guest ABI pins
+/// (`0xC20`, `0xC21`, `0xC23`), the Rhai loader onto `EvalAltResult` strings.
+/// Splitting it this way is what lets both share the policy without either
+/// changing its published error contract.
+#[derive(Debug)]
+pub enum HttpPolicyError {
+    /// The URL is outside the granted [`Capability::Network`] allow-list.
+    NotAllowed,
+    /// No [`HttpEgress`] implementation was wired in.
+    NoEgress,
+    /// The transport itself failed.
+    Transport(FnError),
+    /// The response carried a `>= 400` status.
+    Status(u16),
+}
+
+/// Resolve the per-call HTTP timeout from the granted capabilities.
+///
+/// The first [`Capability::WallClockMillisPerCall`] in the set wins; absent
+/// one, [`DEFAULT_HTTP_TIMEOUT`].
+#[must_use]
+pub fn resolve_http_timeout(caps: &CapabilitySet) -> Duration {
+    caps.iter()
+        .find_map(|c| match c {
+            Capability::WallClockMillisPerCall(ms) => Some(Duration::from_millis(*ms)),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT)
+}
+
+/// Run a capability-gated HTTP request: allow-list check, egress presence,
+/// timeout resolution, dispatch, then the `>= 400` status gate.
+///
+/// `body` present selects POST, absent selects GET. `traceparent` is the host's
+/// active W3C trace context, threaded through as a parameter rather than read
+/// from ambient state so the dispatch stays unit-testable.
+///
+/// # Errors
+///
+/// Returns [`HttpPolicyError`] for each refusal reason; see its variants.
+pub fn http_request(
+    egress: Option<&Arc<dyn HttpEgress>>,
+    caps: &CapabilitySet,
+    url: &str,
+    body: Option<&[u8]>,
+    traceparent: Option<&str>,
+) -> Result<HttpResponse, HttpPolicyError> {
+    if !caps.iter().any(|c| c.network_allows(url)) {
+        return Err(HttpPolicyError::NotAllowed);
+    }
+    let egress = egress.ok_or(HttpPolicyError::NoEgress)?;
+    let timeout = resolve_http_timeout(caps);
+
+    let response = match body {
+        Some(b) => egress.post(url, b, timeout, MAX_HTTP_RESPONSE_BYTES, traceparent),
+        None => egress.get(url, timeout, MAX_HTTP_RESPONSE_BYTES, traceparent),
+    }
+    .map_err(HttpPolicyError::Transport)?;
+
+    if response.status >= 400 {
+        return Err(HttpPolicyError::Status(response.status));
+    }
+    Ok(response)
 }

@@ -13,19 +13,11 @@
 
 #![cfg(feature = "extism-runtime")]
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
-use uni_plugin::{Capability, FnError};
+use uni_plugin::FnError;
+use uni_plugin::host_services::{self, HttpPolicyError};
 
 use super::{HostSvcCtx, from_hex, to_hex};
-
-/// Default per-call HTTP timeout when the grant carries no
-/// `WallClockMillisPerCall`.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Maximum response body bytes read before truncation — bounds host memory.
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// `uni_http_get` / `uni_http_post` request. `body_hex` present ⇒ POST.
 #[derive(Debug, Deserialize)]
@@ -54,41 +46,42 @@ struct HttpResp {
 /// allow-list, no egress is configured, the request body hex is malformed, the
 /// transport fails, or the response status is `>= 400`.
 fn do_http(ctx: &HostSvcCtx, req: HttpReq, traceparent: Option<&str>) -> Result<HttpResp, FnError> {
-    if !ctx.effective.iter().any(|c| c.network_allows(&req.url)) {
-        return Err(FnError::new(
+    // Body-hex decoding stays here: it is an Extism wire concern (code 0xC22)
+    // and must happen before the shared policy runs, since a malformed body is
+    // rejected without ever reaching the allow-list check.
+    let body = match &req.body_hex {
+        Some(h) => Some(
+            from_hex(h)
+                .map_err(|e| FnError::new(0xC22, format!("uni.http.post: body hex: {e}")))?,
+        ),
+        None => None,
+    };
+
+    // The allow-list / egress / timeout / status policy is shared with the Rhai
+    // loader; only the mapping onto the guest ABI's numeric codes is ours.
+    let response = host_services::http_request(
+        ctx.http.as_ref(),
+        &ctx.effective,
+        &req.url,
+        body.as_deref(),
+        traceparent,
+    )
+    .map_err(|e| match e {
+        HttpPolicyError::NotAllowed => FnError::new(
             0xC20,
             format!(
                 "uni.http: url `{}` not in granted Network allow-list",
                 req.url
             ),
-        ));
-    }
-    let egress = ctx
-        .http
-        .as_ref()
-        .ok_or_else(|| FnError::new(0xC21, "uni.http: no HTTP egress configured"))?;
-    let timeout = ctx
-        .effective
-        .iter()
-        .find_map(|c| match c {
-            Capability::WallClockMillisPerCall(ms) => Some(Duration::from_millis(*ms)),
-            _ => None,
-        })
-        .unwrap_or(DEFAULT_TIMEOUT);
-    let response = match &req.body_hex {
-        Some(h) => {
-            let body = from_hex(h)
-                .map_err(|e| FnError::new(0xC22, format!("uni.http.post: body hex: {e}")))?;
-            egress.post(&req.url, &body, timeout, MAX_RESPONSE_BYTES, traceparent)?
-        }
-        None => egress.get(&req.url, timeout, MAX_RESPONSE_BYTES, traceparent)?,
-    };
-    if response.status >= 400 {
-        return Err(FnError::new(
+        ),
+        HttpPolicyError::NoEgress => FnError::new(0xC21, "uni.http: no HTTP egress configured"),
+        HttpPolicyError::Transport(err) => err,
+        HttpPolicyError::Status(status) => FnError::new(
             0xC23,
-            format!("uni.http(`{}`): HTTP status {}", req.url, response.status),
-        ));
-    }
+            format!("uni.http(`{}`): HTTP status {}", req.url, status),
+        ),
+    })?;
+
     Ok(HttpResp {
         status: response.status,
         body_hex: to_hex(&response.body),
@@ -135,8 +128,11 @@ extism::host_fn!(pub(crate) uni_http_post(ctx: HostSvcCtx; req_json: String) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
+    use uni_plugin::Capability;
     use uni_plugin::{CapabilitySet, HttpEgress, HttpResponse};
 
     /// Fake egress that records the traceparent it was handed and echoes the URL.

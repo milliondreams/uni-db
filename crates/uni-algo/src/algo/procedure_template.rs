@@ -289,28 +289,8 @@ pub async fn build_projection_from_direct_args(
     ctx: &AlgoContext,
     args: &[Value],
 ) -> Result<crate::algo::GraphProjection> {
-    let node_labels: Vec<String> = args
-        .first()
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("args[0] must be an array of node-label names"))?
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .ok_or_else(|| anyhow!("node-label must be a string"))
-                .map(str::to_owned)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let edge_types: Vec<String> = args
-        .get(1)
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("args[1] must be an array of edge-type names"))?
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .ok_or_else(|| anyhow!("edge-type must be a string"))
-                .map(str::to_owned)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let node_labels = arg_string_list(args, 0, "args[0] (node-label names)")?;
+    let edge_types = arg_string_list(args, 1, "args[1] (edge-type names)")?;
 
     let schema = ctx.storage.schema_manager().schema();
     for label in &node_labels {

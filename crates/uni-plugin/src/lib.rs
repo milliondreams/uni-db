@@ -61,6 +61,7 @@ pub mod capability;
 pub mod circuit_breaker;
 pub mod errors;
 pub mod fs_guard;
+pub mod hex;
 pub mod host;
 pub mod host_services;
 pub mod lifecycle;

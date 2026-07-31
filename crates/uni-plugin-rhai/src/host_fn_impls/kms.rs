@@ -9,7 +9,6 @@
 
 #![cfg(feature = "rhai-runtime")]
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use rhai::Engine;
@@ -80,39 +79,8 @@ fn register_verify(engine: &mut Engine, caps: CapabilitySet, kms: Option<Arc<dyn
     );
 }
 
-/// Lowercase hex encoding for the script boundary.
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Decode lowercase/uppercase hex; errors on odd length or non-hex digits.
-///
-/// Operates on raw bytes (`chunks_exact(2)`), NOT `&s[i..i+2]` string slicing,
-/// so a script-controlled string with a multibyte UTF-8 codepoint at an even
-/// byte length returns `Err` instead of panicking the host thread on a
-/// non-char-boundary slice.
-fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return Err("odd-length hex string".to_owned());
-    }
-    fn nibble(b: u8) -> Result<u8, String> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            _ => Err("invalid hex digit".to_owned()),
-        }
-    }
-    bytes
-        .chunks_exact(2)
-        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
-        .collect()
-}
+// Hex codec for the script boundary — shared with the Extism loader.
+use uni_plugin::hex::{from_hex, to_hex};
 
 #[cfg(test)]
 mod tests {

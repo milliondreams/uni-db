@@ -563,14 +563,4 @@ impl<'a> PluginRegistrar<'a> {
     pub fn commit_to_registry(self) -> Result<(), PluginError> {
         self.registry.apply_pending(&self.plugin_id, self.pending)
     }
-
-    /// Returns the number of pending registrations.
-    ///
-    /// Exposed for diagnostics and integration tests that want to verify
-    /// a plugin's `register()` queued the expected number of items before
-    /// the registrar commits.
-    #[must_use]
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
 }

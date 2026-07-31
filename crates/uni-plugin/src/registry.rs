@@ -610,45 +610,10 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Iterate every registered procedure — `(QName, ProcedureEntry)`.
-    ///
-    /// Arity-overloaded names yield one tuple per registered overload.
-    #[must_use]
-    pub fn iter_procedures(&self) -> Vec<(QName, Arc<ProcedureEntry>)> {
-        self.procedures
-            .iter()
-            .flat_map(|kv| {
-                let q = kv.key().clone();
-                kv.value()
-                    .iter()
-                    .map(move |e| (q.clone(), Arc::clone(e)))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    /// Iterate every registered Locy aggregate — `(QName, LocyAggregateEntry)`.
-    #[must_use]
-    pub fn iter_locy_aggregates(&self) -> Vec<(QName, Arc<LocyAggregateEntry>)> {
-        self.locy_aggregates
-            .iter()
-            .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
-            .collect()
-    }
-
     /// Iterate every registered Locy predicate — `(QName, LocyPredicateEntry)`.
     #[must_use]
     pub fn iter_locy_predicates(&self) -> Vec<(QName, Arc<LocyPredicateEntry>)> {
         self.locy_predicates
-            .iter()
-            .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
-            .collect()
-    }
-
-    /// Iterate every registered Locy generator — `(QName, LocyGeneratorEntry)`.
-    #[must_use]
-    pub fn iter_locy_generators(&self) -> Vec<(QName, Arc<LocyGeneratorEntry>)> {
-        self.locy_generators
             .iter()
             .map(|kv| (kv.key().clone(), Arc::clone(kv.value())))
             .collect()
@@ -860,13 +825,6 @@ impl PluginRegistry {
         table: Arc<dyn crate::traits::catalog::CatalogTable>,
     ) -> Result<u32, PluginError> {
         self.virtual_edge_types.lock().register(name.into(), table)
-    }
-
-    /// Look up a virtual edge type by name.
-    #[must_use]
-    pub fn virtual_edge_type_by_name(&self, name: &str) -> Option<u32> {
-        let inner = self.virtual_edge_types.lock();
-        inner.name_to_id.get(&SmolStr::new(name)).copied()
     }
 
     /// Look up the catalog table behind a virtual edge-type ID.

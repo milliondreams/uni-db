@@ -99,53 +99,6 @@ impl LanceDbBackend {
             .clone()
     }
 
-    /// Build the on-disk URI for `name` (used for branch reads via lance).
-    fn dataset_uri(&self, name: &str) -> String {
-        // lancedb stores tables as `<base_uri>/<name>.lance`.
-        if self.base_uri.ends_with('/') {
-            format!("{}{}.lance", self.base_uri, name)
-        } else {
-            format!("{}/{}.lance", self.base_uri, name)
-        }
-    }
-
-    /// Fork `src_branch` of `table` into `dst_branch`.
-    ///
-    /// Returns `(parent_version, dst_branch.to_owned())` so callers
-    /// orchestrating nested forks can chain without re-querying.
-    ///
-    /// Dispatch matches the layered Lance contract: the main trunk
-    /// uses [`lance_branch::current_version`] +
-    /// [`lance_branch::create_branch`], named branches use
-    /// [`lance_branch::current_version_on_branch`] +
-    /// [`lance_branch::create_branch_from`]. The
-    /// `current_version_on_branch` doc explicitly notes nested forks
-    /// must read "the parent branch's tip, not main's".
-    ///
-    /// # Errors
-    ///
-    /// Propagates the underlying anyhow error if either step fails
-    /// (`src_branch` missing, parent dataset missing, name collision,
-    /// or object-store I/O failure).
-    pub async fn fork_branch(
-        &self,
-        table: &str,
-        src_branch: &str,
-        dst_branch: &str,
-    ) -> Result<(u64, String)> {
-        let uri = self.dataset_uri(table);
-        let parent_version = if src_branch == "main" {
-            let v = lance_branch::current_version(&uri).await?;
-            lance_branch::create_branch(&uri, dst_branch, v).await?;
-            v
-        } else {
-            let v = lance_branch::current_version_on_branch(&uri, src_branch).await?;
-            lance_branch::create_branch_from(&uri, dst_branch, src_branch, v).await?;
-            v
-        };
-        Ok((parent_version, dst_branch.to_owned()))
-    }
-
     /// Write `batches` to `table` with `mode`, on raw Lance.
     ///
     /// `schema` travels separately so the empty case works: an empty `batches`
@@ -227,7 +180,7 @@ impl LanceDbBackend {
         request: &ScanRequest,
         branch: &str,
     ) -> Result<RecordBatchStream> {
-        let uri = self.dataset_uri(&request.table_name);
+        let uri = self.directory.dataset_uri(&request.table_name);
         let dataset = lance_branch::open_branch(&uri, branch).await?;
 
         let mut scanner = dataset.scan();
@@ -1314,15 +1267,9 @@ mod tests {
             "LanceDirectory listing diverged from lancedb's: {via_directory:?} vs {expected:?}"
         );
 
-        // The path layout must agree too — this is what makes primary and the
-        // fork branch path resolve to the same dataset.
+        // Every listed name must resolve to an openable dataset — this is what
+        // makes primary and the fork branch path agree on the layout.
         for name in &via_directory {
-            assert_eq!(
-                directory.dataset_uri(name),
-                backend.dataset_uri(name),
-                "dataset_uri diverged for '{name}'"
-            );
-            // And the resolved path must actually be openable.
             directory.open(name).await.unwrap();
         }
     }

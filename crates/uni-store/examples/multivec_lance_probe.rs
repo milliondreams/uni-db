@@ -179,7 +179,7 @@ async fn run_maxsim_query(
             &tokens,
             docs_count(),
             metric,
-            FilterExpr::None,
+            FilterExpr::Literal(true),
             VectorQueryOpts::default(),
         )
         .await?;

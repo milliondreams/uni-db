@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use crate::backend::types::{FilterExpr, Scalar};
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{FixedSizeBinaryBuilder, StringBuilder};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -30,7 +31,15 @@ impl UidIndex {
         Self { uri }
     }
 
-    pub async fn open(&self) -> Result<Arc<Dataset>> {
+    /// Open the backing dataset.
+    ///
+    /// Deliberately **private**. This type is raw-Lance inside, which is fine —
+    /// so is `backend::lance`. What is not fine is handing an
+    /// `Arc<lance::Dataset>` across a crate boundary: that was the last such
+    /// leak outside `uni-store`, and it made every consumer reimplement the
+    /// index's own scan. Consumers get domain methods
+    /// ([`Self::resolve_uids`], [`Self::resolve_all_vids`]) instead.
+    async fn open(&self) -> Result<Arc<Dataset>> {
         let ds = Dataset::open(&self.uri).await?;
         Ok(Arc::new(ds))
     }
@@ -197,7 +206,7 @@ impl UidIndex {
 
         // Use filter pushdown on _uid_hex for O(log N) or better lookup
         let hex = uid_to_hex(uid);
-        let filter = format!("_uid_hex = '{}'", hex);
+        let filter = FilterExpr::equals("_uid_hex", Scalar::Str(hex)).to_sql()?;
 
         // Deterministic resolution (review C3): a UID may have multiple rows
         // after delete+reinsert. Take the highest `_version` instead of the old
@@ -240,30 +249,21 @@ impl UidIndex {
         Ok(best_vid)
     }
 
-    pub async fn resolve_uids(&self, uids: &[UniId]) -> Result<HashMap<UniId, Vid>> {
-        if uids.is_empty() {
-            return Ok(HashMap::new());
-        }
+    /// Every `(uid, vid, version)` row registered for any of `uids`, in scan
+    /// order.
+    ///
+    /// The single place this index's `_uid_hex IN (…)` scan is expressed. Both
+    /// public resolvers fold this; `uni-fork` used to hand-roll a second copy
+    /// against a borrowed `Arc<Dataset>`, complete with its own hex encoder and
+    /// its own literal quoting.
+    ///
+    /// `_version` is absent on a not-yet-migrated legacy table, in which case
+    /// every row is reported as version 0.
+    async fn scan_uid_rows(ds: &Dataset, uids: &[UniId]) -> Result<Vec<(UniId, Vid, u64)>> {
+        let filter =
+            FilterExpr::one_of("_uid_hex", uids.iter().map(|u| Scalar::Str(uid_to_hex(u))))
+                .to_sql()?;
 
-        let ds = match self.open().await {
-            Ok(ds) => ds,
-            Err(_) => return Ok(HashMap::new()),
-        };
-
-        // Batch scan using IN filter on _uid_hex
-        let hex_values: Vec<String> = uids.iter().map(uid_to_hex).collect();
-        let filter = format!(
-            "_uid_hex IN ({})",
-            hex_values
-                .iter()
-                .map(|h| format!("'{}'", h))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        // Deterministic resolution (review C3): keep the highest-`_version` vid
-        // per UID rather than the old last-row-wins. `_version` is absent on a
-        // not-yet-migrated legacy table (every row treated as version 0).
         let has_version = ds.schema().field("_version").is_some();
         let project: &[&str] = if has_version {
             &["_uid_hex", "_vid", "_version"]
@@ -275,13 +275,11 @@ impl UidIndex {
         scanner.project(project)?;
         let mut stream = scanner.try_into_stream().await?;
 
-        // Build reverse map: hex -> UniId for fast lookup
+        // Reverse map hex -> UniId so each row resolves without re-hashing.
         let hex_to_uid: HashMap<String, UniId> =
             uids.iter().map(|uid| (uid_to_hex(uid), *uid)).collect();
 
-        // Per-UID best (version, vid).
-        let mut best: HashMap<UniId, (u64, Vid)> = HashMap::new();
-
+        let mut rows = Vec::new();
         while let Some(batch) = stream.try_next().await? {
             let uid_hex_col = batch
                 .column_by_name("_uid_hex")
@@ -289,7 +287,6 @@ impl UidIndex {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or(anyhow!("Invalid _uid_hex column type"))?;
-
             let vid_col = batch
                 .column_by_name("_vid")
                 .ok_or(anyhow!("Missing _vid column"))?
@@ -301,24 +298,65 @@ impl UidIndex {
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
 
             for i in 0..batch.num_rows() {
-                if !uid_hex_col.is_null(i) {
-                    let hex = uid_hex_col.value(i);
-                    if let Some(&uid) = hex_to_uid.get(hex) {
-                        let v = ver_col.map_or(0, |c| if c.is_null(i) { 0 } else { c.value(i) });
-                        let vid = Vid::from(vid_col.value(i));
-                        match best.get(&uid) {
-                            Some(&(bv, _)) if bv >= v => {}
-                            _ => {
-                                best.insert(uid, (v, vid));
-                            }
-                        }
-                    }
+                if uid_hex_col.is_null(i) {
+                    continue;
+                }
+                if let Some(&uid) = hex_to_uid.get(uid_hex_col.value(i)) {
+                    let version = ver_col.map_or(0, |c| if c.is_null(i) { 0 } else { c.value(i) });
+                    rows.push((uid, Vid::from(vid_col.value(i)), version));
                 }
             }
         }
+        Ok(rows)
+    }
 
-        let result = best.into_iter().map(|(uid, (_, vid))| (uid, vid)).collect();
-        Ok(result)
+    /// The single best vid per UID: highest `_version` wins.
+    ///
+    /// A missing index dataset resolves to "nothing registered" rather than an
+    /// error; a *scan* failure still propagates, so a transient read fault
+    /// cannot masquerade as an empty index.
+    pub async fn resolve_uids(&self, uids: &[UniId]) -> Result<HashMap<UniId, Vid>> {
+        if uids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let Ok(ds) = self.open().await else {
+            return Ok(HashMap::new());
+        };
+
+        // Deterministic resolution (review C3): keep the highest-`_version` vid
+        // per UID rather than the old last-row-wins.
+        let mut best: HashMap<UniId, (u64, Vid)> = HashMap::new();
+        for (uid, vid, version) in Self::scan_uid_rows(&ds, uids).await? {
+            match best.get(&uid) {
+                Some(&(bv, _)) if bv >= version => {}
+                _ => {
+                    best.insert(uid, (version, vid));
+                }
+            }
+        }
+        Ok(best.into_iter().map(|(uid, (_, vid))| (uid, vid)).collect())
+    }
+
+    /// **Every** vid registered for each UID, not just the winner.
+    ///
+    /// The index is shared across primary and fork branches and is append-only,
+    /// so one UID can carry several vids. [`Self::resolve_uids`] collapses them
+    /// to one, which loses the fork-vs-primary disambiguation that fork diff and
+    /// promote need — they must test each candidate against primary's view.
+    ///
+    /// Unlike [`Self::resolve_uids`], a missing index dataset is an error here:
+    /// the caller treats it as "cannot answer" and falls back, rather than
+    /// silently concluding that no vids are registered.
+    pub async fn resolve_all_vids(&self, uids: &[UniId]) -> Result<HashMap<UniId, Vec<Vid>>> {
+        if uids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ds = self.open().await?;
+        let mut out: HashMap<UniId, Vec<Vid>> = HashMap::new();
+        for (uid, vid, _) in Self::scan_uid_rows(&ds, uids).await? {
+            out.entry(uid).or_default().push(vid);
+        }
+        Ok(out)
     }
 }
 

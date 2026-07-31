@@ -304,12 +304,22 @@ impl Executor {
         // Generate filter SQL from expression
         let empty_props = std::collections::HashMap::new();
         let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
-        let filter_sql = filter.and_then(|expr| {
-            LanceFilterGenerator::generate(std::slice::from_ref(expr), variable, Some(label_props))
+        // `sql_pushable` because this predicate is handed to a SQL backend, and
+        // `generate_expr` may include a pattern the dialect cannot render. The
+        // weakening is sound here: the caller (`scan_label_with_filter`)
+        // re-evaluates the full `filter` per row in `verify_and_filter_candidates`.
+        let pushed = filter.map(|expr| {
+            LanceFilterGenerator::generate_expr(
+                std::slice::from_ref(expr),
+                variable,
+                Some(label_props),
+            )
+            .sql_pushable()
         });
+        let pushed = pushed.filter(|f| !f.is_trivially_true());
 
         self.storage
-            .scan_vertex_candidates(label_name, filter_sql.as_deref())
+            .scan_vertex_candidates(label_name, pushed.as_ref())
             .await
     }
 

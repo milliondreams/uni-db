@@ -5,7 +5,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, ScanRequest};
+use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
 use crate::storage::arrow_convert::build_timestamp_column;
 use crate::storage::property_builder::PropertyColumnBuilder;
 use crate::storage::value_codec::CrdtDecodeMode;
@@ -602,7 +602,7 @@ impl DeltaDataset {
             return Ok(());
         }
         backend
-            .delete_rows(&table_name, &format!("_version <= {hwm}"))
+            .delete_rows(&table_name, &FilterExpr::version_at_most(hwm))
             .await
     }
 
@@ -622,13 +622,12 @@ impl DeltaDataset {
             return Ok(vec![]);
         }
 
-        let base_filter = format!("{} = {}", self.filter_column(), vid.as_u64());
+        let base_filter = FilterExpr::equals(self.filter_column(), Scalar::UInt(vid.as_u64()));
 
         // Add version filtering if snapshot is active
-        let final_filter = if let Some(hwm) = version_hwm {
-            format!("({}) AND (_version <= {})", base_filter, hwm)
-        } else {
-            base_filter
+        let final_filter = match version_hwm {
+            Some(hwm) => FilterExpr::all([base_filter, FilterExpr::version_at_most(hwm)]),
+            None => base_filter,
         };
 
         let batches = backend
@@ -665,17 +664,14 @@ impl DeltaDataset {
             return Ok(HashMap::new());
         }
 
-        // Build IN filter for batch query
-        let vid_list = vids
-            .iter()
-            .map(|v| v.as_u64().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut filter = format!("{} IN ({})", self.filter_column(), vid_list);
+        let mut filter = FilterExpr::one_of(
+            self.filter_column(),
+            vids.iter().map(|v| Scalar::UInt(v.as_u64())),
+        );
 
         // Add version filtering if snapshot is active
         if let Some(hwm) = version_hwm {
-            filter = format!("({}) AND (_version <= {})", filter, hwm);
+            filter = FilterExpr::all([filter, FilterExpr::version_at_most(hwm)]);
         }
 
         let batches = backend

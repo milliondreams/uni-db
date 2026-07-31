@@ -221,14 +221,15 @@ impl StorageBackend for BranchedBackend {
         self.inner.scan_stream(self.apply_branch(request)).await
     }
 
-    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> Result<usize> {
+    async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize> {
         // Primary path counts via `Table::count_rows`. Branched count
         // delegates by scanning the branch and summing row counts; the
         // upstream lancedb 0.27.1 doesn't expose branch-aware count.
         if let Some(_branch) = self.scope.branch_for(table_name) {
-            let request = ScanRequest::all(table_name)
-                .with_optional_filter(filter)
-                .with_branch(_branch);
+            let mut request = ScanRequest::all(table_name).with_branch(_branch);
+            if let Some(f) = filter {
+                request = request.with_filter(f.clone());
+            }
             let batches = self.inner.scan(request).await?;
             Ok(batches.iter().map(|b| b.num_rows()).sum())
         } else {
@@ -442,10 +443,10 @@ impl StorageBackend for BranchedBackend {
         Ok(())
     }
 
-    async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
+    async fn delete_rows(&self, table_name: &str, filter: &FilterExpr) -> Result<()> {
         let branch = self.ensure_branch_for_existing(table_name).await?;
         self.branching()?
-            .delete_from_branch(table_name, &branch, &FilterExpr::Sql(filter.to_string()))
+            .delete_from_branch(table_name, &branch, filter)
             .await
     }
 

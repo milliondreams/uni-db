@@ -547,7 +547,9 @@ impl AdjacencyManager {
                     if adj_exists {
                         let mut request = crate::backend::types::ScanRequest::all(&adj_table_name);
                         if let Some(hwm) = version {
-                            request = request.with_filter(format!("_version <= {}", hwm));
+                            request = request.with_filter(
+                                crate::backend::types::FilterExpr::version_at_most(hwm),
+                            );
                         }
 
                         // Fail closed: a transient scan error must abort the warm,
@@ -620,7 +622,8 @@ impl AdjacencyManager {
             {
                 let mut request = crate::backend::types::ScanRequest::all(&delta_table_name);
                 if let Some(hwm) = version {
-                    request = request.with_filter(format!("_version <= {}", hwm));
+                    request = request
+                        .with_filter(crate::backend::types::FilterExpr::version_at_most(hwm));
                 }
 
                 // Fail closed: propagate a delta scan error rather than silently

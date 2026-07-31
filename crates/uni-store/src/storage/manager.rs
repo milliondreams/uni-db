@@ -5,7 +5,7 @@ use crate::backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 use crate::backend::lance::LanceDbBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScanRequest, VectorQueryOpts};
+use crate::backend::types::{FilterExpr, ScanRequest, VectorQueryOpts};
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
@@ -705,22 +705,26 @@ impl StorageManager {
 
     /// Apply version filtering to a base filter expression.
     ///
-    /// If a snapshot is pinned, wraps `base_filter` with an additional
-    /// `_version <= hwm` clause. Otherwise returns `base_filter` unchanged.
-    pub fn apply_version_filter(&self, base_filter: String) -> String {
-        if let Some(hwm) = self.version_high_water_mark() {
-            format!("({}) AND (_version <= {})", base_filter, hwm)
-        } else {
-            base_filter
+    /// If a snapshot is pinned, conjoins `_version <= hwm` onto `base_filter`.
+    /// Otherwise returns `base_filter` unchanged.
+    pub fn apply_version_filter(&self, base_filter: FilterExpr) -> FilterExpr {
+        match self.version_high_water_mark() {
+            Some(hwm) => FilterExpr::all([base_filter, FilterExpr::version_at_most(hwm)]),
+            None => base_filter,
         }
     }
 
     /// Build a filter expression that excludes soft-deleted rows and optionally
     /// includes a user-provided filter.
-    fn build_active_filter(user_filter: Option<&str>) -> String {
+    ///
+    /// The user filter stays [`FilterExpr::Raw`] — it is opaque text nothing in
+    /// the engine parses, so only the visibility half can be structured.
+    fn build_active_filter(user_filter: Option<&str>) -> FilterExpr {
         match user_filter {
-            Some(expr) => format!("({}) AND (_deleted = false)", expr),
-            None => "_deleted = false".to_string(),
+            Some(expr) => {
+                FilterExpr::all([FilterExpr::Raw(expr.to_string()), FilterExpr::not_deleted()])
+            }
+            None => FilterExpr::not_deleted(),
         }
     }
 
@@ -1168,7 +1172,7 @@ impl StorageManager {
 
         // Scan all non-deleted vertices and collect (VID, labels)
         let request = ScanRequest::all(vtable)
-            .with_filter("_deleted = false")
+            .with_filter(FilterExpr::not_deleted())
             .with_limit(100_000);
         let batches = backend
             .scan(request)
@@ -1340,7 +1344,7 @@ impl StorageManager {
         &self,
         label: &str,
         columns: &[&str],
-        additional_filter: Option<&str>,
+        additional_filter: Option<&FilterExpr>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
@@ -1369,9 +1373,12 @@ impl StorageManager {
 
         // Build filter with version HWM + optional additional filter
         let filter = match (self.version_high_water_mark(), additional_filter) {
-            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
-            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
-            (None, Some(f)) => Some(f.to_string()),
+            (Some(hwm), Some(f)) => Some(FilterExpr::all([
+                FilterExpr::version_at_most(hwm),
+                f.clone(),
+            ])),
+            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
+            (None, Some(f)) => Some(f.clone()),
             (None, None) => None,
         };
 
@@ -1404,7 +1411,7 @@ impl StorageManager {
         edge_type: &str,
         direction: &str,
         columns: &[&str],
-        additional_filter: Option<&str>,
+        additional_filter: Option<&FilterExpr>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
         // Edge path: manifest pin only. A transaction version pin must NOT
         // version-filter edge reads — the edge tier is not version-pinned
@@ -1438,9 +1445,12 @@ impl StorageManager {
             };
 
         let filter = match (edge_hwm, additional_filter) {
-            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
-            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
-            (None, Some(f)) => Some(f.to_string()),
+            (Some(hwm), Some(f)) => Some(FilterExpr::all([
+                FilterExpr::version_at_most(hwm),
+                f.clone(),
+            ])),
+            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
+            (None, Some(f)) => Some(f.clone()),
             (None, None) => None,
         };
 
@@ -1473,7 +1483,7 @@ impl StorageManager {
     pub async fn scan_main_vertex_table(
         &self,
         columns: &[&str],
-        filter: Option<&str>,
+        filter: Option<&FilterExpr>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
         let backend = self.backend();
         let table_name = table_names::main_vertex_table_name();
@@ -1484,15 +1494,18 @@ impl StorageManager {
 
         // Combine caller filter with version HWM for snapshot isolation
         let full_filter = match (self.version_high_water_mark(), filter) {
-            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
-            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
-            (None, Some(f)) => Some(f.to_string()),
+            (Some(hwm), Some(f)) => Some(FilterExpr::all([
+                FilterExpr::version_at_most(hwm),
+                f.clone(),
+            ])),
+            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
+            (None, Some(f)) => Some(f.clone()),
             (None, None) => None,
         };
 
         let request = ScanRequest::all(table_name)
             .with_columns(columns.iter().map(|s| s.to_string()).collect());
-        let request = match full_filter.as_deref() {
+        let request = match full_filter {
             Some(f) => request.with_filter(f),
             None => request,
         };
@@ -1517,7 +1530,7 @@ impl StorageManager {
     /// Scan the main edge table as a stream. Returns `None` if table doesn't exist.
     pub async fn scan_main_edge_table_stream(
         &self,
-        filter: Option<&str>,
+        filter: Option<&FilterExpr>,
     ) -> Result<
         Option<
             std::pin::Pin<Box<dyn futures::Stream<Item = Result<arrow_array::RecordBatch>> + Send>>,
@@ -1532,7 +1545,7 @@ impl StorageManager {
 
         let mut request = ScanRequest::all(table_name);
         if let Some(f) = filter {
-            request = request.with_filter(f);
+            request = request.with_filter(f.clone());
         }
 
         let stream = backend.scan_stream(request).await?;
@@ -1585,7 +1598,7 @@ impl StorageManager {
             return Ok(out);
         }
         let request = ScanRequest::all(vtable)
-            .with_filter("_deleted = false")
+            .with_filter(FilterExpr::not_deleted())
             .with_columns(vec!["_vid".to_string(), "ext_id".to_string()]);
         let batches = backend
             .scan(request)
@@ -1633,7 +1646,7 @@ impl StorageManager {
     pub async fn scan_vertex_candidates(
         &self,
         label: &str,
-        filter: Option<&str>,
+        filter: Option<&FilterExpr>,
     ) -> Result<Vec<Vid>> {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
@@ -1643,8 +1656,8 @@ impl StorageManager {
         }
 
         let full_filter = match filter {
-            Some(f) => format!("_deleted = false AND ({})", f),
-            None => "_deleted = false".to_string(),
+            Some(f) => FilterExpr::all([FilterExpr::not_deleted(), f.clone()]),
+            None => FilterExpr::not_deleted(),
         };
 
         let request = ScanRequest::all(&table_name)
@@ -1810,7 +1823,7 @@ impl StorageManager {
         opts: VectorQueryOpts,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
-        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+        use crate::backend::types::DistanceMetric as BackendMetric;
 
         // Look up vector index config to get the correct distance metric.
         let schema = self.schema_manager.schema();
@@ -1865,9 +1878,9 @@ impl StorageManager {
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                filter_parts.push(format!("_version <= {}", hwm));
+                filter_parts.push(FilterExpr::version_at_most(hwm));
             }
-            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+            let combined_filter = FilterExpr::all(filter_parts);
 
             // L1/Manhattan is served exact/brute-force: fetch every candidate
             // (limit = full row count) and rank by the exact L1 re-score below.
@@ -1956,9 +1969,9 @@ impl StorageManager {
         if ctx.is_some()
             && let Some(hwm) = self.version_high_water_mark()
         {
-            filter_parts.push(format!("_version <= {}", hwm));
+            filter_parts.push(FilterExpr::version_at_most(hwm));
         }
-        let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+        let combined_filter = FilterExpr::all(filter_parts);
 
         let batches = backend
             .vector_search(
@@ -2040,10 +2053,10 @@ impl StorageManager {
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                filter_parts.push(format!("_version <= {}", hwm));
+                filter_parts.push(FilterExpr::version_at_most(hwm));
             }
             let request = ScanRequest::all(&name)
-                .with_filter(filter_parts.join(" AND "))
+                .with_filter(FilterExpr::all(filter_parts))
                 .with_columns(vec!["_vid".to_string()]);
             let batches = backend.scan(request).await?;
             let mut results = Vec::new();
@@ -2075,9 +2088,9 @@ impl StorageManager {
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                filter_parts.push(format!("_version <= {}", hwm));
+                filter_parts.push(FilterExpr::version_at_most(hwm));
             }
-            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+            let combined_filter = FilterExpr::all(filter_parts);
 
             let batches = backend
                 .multivector_search(
@@ -2208,8 +2221,6 @@ impl StorageManager {
         filter: Option<&str>,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
-        use crate::backend::types::FilterExpr;
-
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
 
@@ -2219,9 +2230,9 @@ impl StorageManager {
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                filter_parts.push(format!("_version <= {}", hwm));
+                filter_parts.push(FilterExpr::version_at_most(hwm));
             }
-            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
+            let combined_filter = FilterExpr::all(filter_parts);
 
             let batches = backend
                 .full_text_search(&name, property, query, k, combined_filter)

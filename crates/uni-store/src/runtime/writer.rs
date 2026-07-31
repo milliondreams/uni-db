@@ -3,6 +3,7 @@
 
 #[cfg(feature = "lance-backend")]
 use crate::backend::table_names;
+use crate::backend::types::{CmpOp, FilterExpr, Scalar};
 use crate::runtime::context::QueryContext;
 use crate::runtime::embed_caps::is_multivector_property;
 use crate::runtime::flush_coordinator::{
@@ -306,6 +307,7 @@ fn refresh_touched_embed_targets(
 }
 
 #[derive(Clone, Debug)]
+
 pub struct WriterConfig {
     pub max_mutations: usize,
     /// Enable the partial-column MergeInsert path for SET-only flushes.
@@ -2301,36 +2303,31 @@ impl Writer {
                     let mut all_present = true;
                     for prop in unique_props {
                         if let Some(val) = properties.get(prop) {
-                            let val_str = match val {
-                                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                                Value::Int(n) => n.to_string(),
-                                Value::Float(f) => f.to_string(),
-                                Value::Bool(b) => b.to_string(),
-                                _ => {
-                                    all_present = false;
-                                    break;
-                                }
+                            let Some(scalar) = constraint_scalar(val) else {
+                                all_present = false;
+                                break;
                             };
-                            and_parts.push(format!("{} = {}", prop, val_str));
+                            and_parts.push(FilterExpr::equals(prop.as_str(), scalar));
                         } else {
                             all_present = false;
                             break;
                         }
                     }
                     if all_present {
-                        or_filters.push(format!("({})", and_parts.join(" AND ")));
+                        or_filters.push(FilterExpr::all(and_parts));
                     }
                 }
 
                 #[cfg(feature = "lance-backend")]
                 if !or_filters.is_empty() {
-                    let vid_list: Vec<String> =
-                        vids.iter().map(|v| v.as_u64().to_string()).collect();
-                    let filter = format!(
-                        "({}) AND _deleted = false AND _vid NOT IN ({})",
-                        or_filters.join(" OR "),
-                        vid_list.join(", ")
-                    );
+                    let filter = FilterExpr::all([
+                        FilterExpr::any_of(or_filters),
+                        FilterExpr::not_deleted(),
+                        FilterExpr::negate(FilterExpr::one_of(
+                            "_vid",
+                            vids.iter().map(|v| Scalar::UInt(v.as_u64())),
+                        )),
+                    ]);
 
                     // Count flushed duplicates through the `StorageBackend`
                     // (branch-aware, correct `.lance` path). A missing table
@@ -2341,7 +2338,7 @@ impl Writer {
                     let backend = self.storage.backend();
                     let table = table_names::vertex_table_name(label);
                     if backend.table_exists(&table).await? {
-                        let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                        let count = backend.count_rows(&table, Some(&filter)).await?;
                         if count > 0 {
                             return Err(anyhow!(
                                 "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
@@ -2691,28 +2688,27 @@ impl Writer {
         }
 
         // 2. Check Storage (L1/L2)
-        let filters: Vec<String> = key_values
+        let mut parts: Vec<FilterExpr> = key_values
             .iter()
             .map(|(prop, val)| {
-                let val_str = match val {
-                    Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                    Value::Int(n) => n.to_string(),
-                    Value::Float(f) => f.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    _ => "NULL".to_string(),
-                };
-                format!("{} = {}", prop, val_str)
+                FilterExpr::equals(
+                    prop.as_str(),
+                    constraint_scalar(val).unwrap_or(Scalar::Null),
+                )
             })
             .collect();
-
-        let mut filter = filters.join(" AND ");
-        filter.push_str(" AND _deleted = false");
+        parts.push(FilterExpr::not_deleted());
         // Exclude the vertex's own row only when it has a VID; a brand-new insert
         // (bulk) has none, and emitting `_vid != u64::MAX` would overflow the
         // filter's i64 literal parsing.
         if let Some(vid) = exclude_vid {
-            filter.push_str(&format!(" AND _vid != {}", vid.as_u64()));
+            parts.push(FilterExpr::compare(
+                "_vid",
+                CmpOp::NotEq,
+                Scalar::UInt(vid.as_u64()),
+            ));
         }
+        let filter = FilterExpr::all(parts);
 
         // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
         // correct `.lance` path). Skip cleanly when the table is not yet
@@ -2722,7 +2718,7 @@ impl Writer {
             let backend = self.storage.backend();
             let table = table_names::vertex_table_name(label);
             if backend.table_exists(&table).await? {
-                let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                let count = backend.count_rows(&table, Some(&filter)).await?;
                 if count > 0 {
                     return Ok(true);
                 }
@@ -3837,7 +3833,7 @@ impl Writer {
         }
 
         // Query for this specific vid (don't filter by _deleted yet - we need to find the latest version first)
-        let filter = format!("_vid = {}", vid.as_u64());
+        let filter = FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64()));
         let batches = backend
             .scan(
                 ScanRequest::all(table_name)
@@ -6179,6 +6175,22 @@ impl FinalizeFn for WriterFinalizer {
             drop(rotated.permit);
             err
         })
+    }
+}
+
+/// Map a constraint key's [`Value`] onto a [`Scalar`] literal.
+///
+/// `None` for anything with no scalar equivalent (list, map, vector, null).
+/// The two constraint probes differ in what they do with that: the batch check
+/// abandons the row entirely, while the full-horizon check probes with SQL
+/// NULL — preserving each site's prior behavior exactly.
+fn constraint_scalar(value: &Value) -> Option<Scalar> {
+    match value {
+        Value::String(s) => Some(Scalar::Str(s.clone())),
+        Value::Int(n) => Some(Scalar::Int(*n)),
+        Value::Float(f) => Some(Scalar::Float(*f)),
+        Value::Bool(b) => Some(Scalar::Bool(*b)),
+        _ => None,
     }
 }
 

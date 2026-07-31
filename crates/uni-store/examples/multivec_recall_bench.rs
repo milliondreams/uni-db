@@ -253,7 +253,7 @@ async fn query_topk(
             query,
             K,
             DistanceMetric::Cosine,
-            FilterExpr::None,
+            FilterExpr::Literal(true),
             VectorQueryOpts {
                 nprobes,
                 ..Default::default()

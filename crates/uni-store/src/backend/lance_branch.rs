@@ -308,10 +308,11 @@ pub async fn vector_search_on_branch(
     // + version HWM pin). Prefilter so excluded rows never consume a
     // top-k slot — otherwise a soft-deleted or out-of-version row could
     // shadow a live match and shrink the result below k.
-    if let FilterExpr::Sql(sql) = filter {
+    if !filter.is_trivially_true() {
+        let sql = filter.to_sql()?;
         scanner.prefilter(true);
         scanner
-            .filter(sql)
+            .filter(&sql)
             .map_err(|e| anyhow::anyhow!("vector_search_on_branch filter('{sql}'): {e}"))?;
     }
     let stream = scanner
@@ -361,10 +362,11 @@ pub async fn full_text_search_on_branch(
         .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;
     // M6: honor the caller's filter (user predicate + `_deleted = false`
     // + version HWM pin), prefiltered so excluded rows don't take a slot.
-    if let FilterExpr::Sql(sql) = filter {
+    if !filter.is_trivially_true() {
+        let sql = filter.to_sql()?;
         scanner.prefilter(true);
         scanner
-            .filter(sql)
+            .filter(&sql)
             .map_err(|e| anyhow::anyhow!("full_text_search_on_branch filter('{sql}'): {e}"))?;
     }
     let stream = scanner
@@ -821,18 +823,20 @@ impl LanceBranching {
         arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
     }
 
-    /// SQL text for a delete predicate, rejecting the empty filter.
+    /// SQL text for a delete predicate, rejecting a match-all filter.
     ///
-    /// See [`ForkBranching::delete_from_branch`] for why `None` is an error
-    /// rather than "match all".
-    fn delete_predicate(filter: &FilterExpr) -> Result<&str> {
-        filter.as_sql().ok_or_else(|| {
-            anyhow::anyhow!(
-                "delete_from_branch requires an explicit predicate; \
-                 FilterExpr::None would delete every row. Use replace_branch_tip \
-                 with no batches to clear a branch deliberately."
-            )
-        })
+    /// See [`ForkBranching::delete_from_branch`] for why a trivially-true
+    /// filter is an error rather than "match all".
+    fn delete_predicate(filter: &FilterExpr) -> Result<String> {
+        if filter.is_trivially_true() {
+            anyhow::bail!(
+                "delete_from_branch requires an explicit predicate; a \
+                 trivially-true filter would delete every row. Use \
+                 replace_branch_tip with no batches to clear a branch \
+                 deliberately."
+            );
+        }
+        Ok(filter.to_sql()?)
     }
 }
 
@@ -919,7 +923,7 @@ impl ForkBranching for LanceBranching {
         filter: &FilterExpr,
     ) -> Result<()> {
         let predicate = Self::delete_predicate(filter)?;
-        delete_from_branch(&self.dataset_uri(table), branch, predicate).await
+        delete_from_branch(&self.dataset_uri(table), branch, &predicate).await
     }
 
     async fn merge_insert_on_branch(

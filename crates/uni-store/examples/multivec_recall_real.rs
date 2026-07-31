@@ -301,7 +301,7 @@ async fn fde_ann_topk(
             fde_query,
             retrieval_k,
             DistanceMetric::Dot,
-            FilterExpr::None,
+            FilterExpr::Literal(true),
             VectorQueryOpts {
                 nprobes,
                 ..Default::default()
@@ -483,7 +483,7 @@ async fn query_topk(
             query,
             K,
             DistanceMetric::Cosine,
-            FilterExpr::None,
+            FilterExpr::Literal(true),
             VectorQueryOpts {
                 nprobes,
                 refine_factor: refine,

@@ -3,7 +3,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScanRequest, WriteMode};
+use crate::backend::types::{FilterExpr, Scalar, ScanRequest, WriteMode};
 use anyhow::{Result, anyhow};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -186,7 +186,7 @@ impl AdjacencyDataset {
             return Ok(None);
         }
 
-        let filter = format!("src_vid = {}", vid.as_u64());
+        let filter = FilterExpr::equals("src_vid", Scalar::UInt(vid.as_u64()));
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter))
             .await?;
@@ -219,13 +219,7 @@ impl AdjacencyDataset {
             return Ok(HashMap::new());
         }
 
-        // Build IN filter for batch query
-        let vid_list = vids
-            .iter()
-            .map(|v| v.as_u64().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let filter = format!("src_vid IN ({})", vid_list);
+        let filter = FilterExpr::one_of("src_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64())));
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter))
             .await?;

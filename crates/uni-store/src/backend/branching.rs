@@ -138,11 +138,12 @@ pub trait ForkBranching: Send + Sync + 'static {
 
     /// Delete rows matching `filter` from `branch`.
     ///
-    /// [`FilterExpr::None`] is rejected rather than treated as "match all".
-    /// `None` means "no predicate", which on a read is harmlessly "every row"
-    /// but on a delete would silently empty the branch — and a caller that
-    /// produced `None` by accident (an unset `Option`, a filter that optimized
-    /// away) would get exactly that. Clearing a branch deliberately is
+    /// A trivially-true filter ([`FilterExpr::Literal`]`(true)`, or an empty
+    /// [`FilterExpr::And`]) is rejected rather than treated as "match all".
+    /// On a read "no predicate" is harmlessly "every row", but on a delete it
+    /// would silently empty the branch — and a caller that produced it by
+    /// accident (an unset `Option`, a filter that optimized away) would get
+    /// exactly that. Clearing a branch deliberately is
     /// [`Self::replace_branch_tip`] with no batches.
     async fn delete_from_branch(
         &self,

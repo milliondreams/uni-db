@@ -50,6 +50,7 @@ use uni_common::Properties;
 use uni_common::Value;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::Schema as UniSchema;
+use uni_store::backend::types::{FilterExpr, Scalar};
 
 /// Graph scan execution plan.
 ///
@@ -825,7 +826,7 @@ async fn drop_superseded_pushdown_rows(
     const VERIFY_CHUNK: usize = 1000;
     let mut max_ver: HashMap<u64, u64> = HashMap::with_capacity(candidates.len());
     for chunk in candidates.chunks(VERIFY_CHUNK) {
-        let filter = format_vid_in_list(chunk);
+        let filter = FilterExpr::one_of("_vid", chunk.iter().map(|v| Scalar::UInt(*v)));
         let scanned = match label_table {
             Some(label) => {
                 storage
@@ -1390,34 +1391,6 @@ fn try_extract_vid_eq(
     }
 
     None
-}
-
-/// AND-combine an optional VID filter clause with an optional indexed-property
-/// filter clause. Either, both, or neither may be present. See issues #55, #57.
-fn combine_lance_filters(vid_filter: Option<&str>, extra: Option<&str>) -> Option<String> {
-    match (vid_filter, extra) {
-        (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
-        (Some(a), None) => Some(a.to_string()),
-        (None, Some(b)) => Some(b.to_string()),
-        (None, None) => None,
-    }
-}
-
-/// Format a slice of VIDs as a Lance `_vid IN (v1, v2, ...)` filter clause.
-/// Used by the scan-side IN-list pushdown introduced in issue #55 PR #4.
-fn format_vid_in_list(vids: &[u64]) -> String {
-    use std::fmt::Write;
-    debug_assert!(!vids.is_empty());
-    let mut s = String::with_capacity(vids.len() * 8 + 12);
-    s.push_str("_vid IN (");
-    for (i, v) in vids.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        let _ = write!(s, "{v}");
-    }
-    s.push(')');
-    s
 }
 
 /// Convert a `ScalarValue` to `u64` if it is a non-negative integer type.
@@ -2198,11 +2171,21 @@ async fn columnar_scan_vertex_batch_static(
     // single-VID `_vid = N` from the WHERE-clause path. AND-combined with
     // any indexed-property pushdown (issue #57).
     let vid_part = match (vid_list_filter, target_vid) {
-        (Some(vs), _) if !vs.is_empty() => Some(format_vid_in_list(vs)),
-        (_, Some(v)) => Some(format!("_vid = {v}")),
+        (Some(vs), _) if !vs.is_empty() => Some(FilterExpr::one_of(
+            "_vid",
+            vs.iter().map(|v| Scalar::UInt(*v)),
+        )),
+        (_, Some(v)) => Some(FilterExpr::equals("_vid", Scalar::UInt(v))),
         _ => None,
     };
-    let combined_filter = combine_lance_filters(vid_part.as_deref(), extra_lance_filter);
+    // `extra_lance_filter` arrives as rendered SQL from the planner's
+    // hash-index pushdown, so it stays `Raw` — nothing in the engine parses it.
+    let combined_filter = match (vid_part, extra_lance_filter) {
+        (Some(v), Some(e)) => Some(FilterExpr::all([v, FilterExpr::Raw(e.to_string())])),
+        (Some(v), None) => Some(v),
+        (None, Some(e)) => Some(FilterExpr::Raw(e.to_string())),
+        (None, None) => None,
+    };
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
 
     // M5h.2: route through plugin Storage if one is registered for
@@ -2255,7 +2238,7 @@ async fn columnar_scan_vertex_batch_static(
         Some(b) => (Some(b), false),
         None => (
             storage
-                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_ref())
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
             extra_lance_filter.is_some(),
@@ -2545,37 +2528,41 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     // Build the Lance filter expression — do NOT filter _deleted here;
     // MVCC dedup must see deletion tombstones to pick the highest version.
     let filter = {
-        let mut parts = Vec::new();
+        let mut parts: Vec<FilterExpr> = Vec::new();
 
         // VID point-lookup filter — uses BTree index on _vid. Prefer the
         // multi-VID list (formats as `_vid IN (...)`); fall back to single-VID.
         match (vid_list_filter, target_vid) {
-            (Some(vs), _) if !vs.is_empty() => parts.push(format_vid_in_list(vs)),
-            (_, Some(vid)) => parts.push(format!("_vid = {vid}")),
+            (Some(vs), _) if !vs.is_empty() => parts.push(FilterExpr::one_of(
+                "_vid",
+                vs.iter().map(|v| Scalar::UInt(*v)),
+            )),
+            (_, Some(vid)) => parts.push(FilterExpr::equals("_vid", Scalar::UInt(vid))),
             _ => {}
         }
 
         // Label filter
         if !label.is_empty() {
-            if label.contains(':') {
-                // Multi-label: each label must be present
-                for lbl in label.split(':') {
-                    parts.push(format!("array_contains(labels, '{}')", lbl));
-                }
-            } else {
-                parts.push(format!("array_contains(labels, '{}')", label));
+            // Multi-label: each label must be present. The label travels as a
+            // `Scalar`, so `to_sql` escapes it — the previous `format!` did not.
+            for lbl in label.split(':') {
+                parts.push(FilterExpr::array_contains(
+                    "labels",
+                    Scalar::Str(lbl.to_string()),
+                ));
             }
         }
 
-        // Indexed-property pushdown — issue #57.
+        // Indexed-property pushdown — issue #57. Already-rendered SQL from the
+        // planner, so it stays `Raw`.
         if let Some(extra) = extra_lance_filter {
-            parts.push(extra.to_string());
+            parts.push(FilterExpr::Raw(extra.to_string()));
         }
 
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(" AND "))
+            Some(FilterExpr::all(parts))
         }
     };
 
@@ -2583,7 +2570,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     let lance_batch = storage
         .scan_main_vertex_table(
             &["_vid", "_deleted", "labels", "props_json", "_version"],
-            filter.as_deref(),
+            filter.as_ref(),
         )
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;

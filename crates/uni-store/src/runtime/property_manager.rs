@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use crate::backend::types::{FilterExpr, Scalar};
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
 use crate::runtime::l0_visibility;
@@ -259,7 +260,7 @@ impl PropertyManager {
                 continue; // No data for this type, try next
             }
 
-            let base_filter = format!("eid = {}", eid.as_u64());
+            let base_filter = FilterExpr::equals("eid", Scalar::UInt(eid.as_u64()));
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
             let batches = match backend
@@ -414,16 +415,19 @@ impl PropertyManager {
         // that was since deleted or updated is discarded by the per-eid resolution
         // below.
         let (probe_prop, probe_val) = &key_values[0];
-        let val_sql = match probe_val {
-            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
+        let probe_scalar = match probe_val {
+            Value::String(s) => Scalar::Str(s.clone()),
+            Value::Int(n) => Scalar::Int(*n),
+            Value::Float(f) => Scalar::Float(*f),
+            Value::Bool(b) => Scalar::Bool(*b),
             // A NULL/unsupported key value can't satisfy a UNIQUE key — nothing to
             // probe (NodeKey's NOT-NULL half is enforced separately at the call site).
             _ => return Ok(false),
         };
-        let base_filter = format!("{probe_prop} = {val_sql} AND op = 0");
+        let base_filter = FilterExpr::all([
+            FilterExpr::equals(probe_prop.as_str(), probe_scalar),
+            FilterExpr::equals("op", Scalar::Int(0)),
+        ]);
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
         let batches = backend
@@ -547,13 +551,8 @@ impl PropertyManager {
                 continue; // Table doesn't exist yet — skip this label
             }
 
-            // Construct filter: _vid IN (...)
-            let vid_list = vids
-                .iter()
-                .map(|v| v.as_u64().to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let base_filter = format!("_vid IN ({})", vid_list);
+            let base_filter =
+                FilterExpr::one_of("_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64())));
 
             let final_filter = self.storage.apply_version_filter(base_filter);
 
@@ -809,12 +808,8 @@ impl PropertyManager {
                 continue; // Table doesn't exist yet — skip this edge type
             }
 
-            let eid_list = eids
-                .iter()
-                .map(|e| e.as_u64().to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let base_filter = format!("eid IN ({})", eid_list);
+            let base_filter =
+                FilterExpr::one_of("eid", eids.iter().map(|e| Scalar::UInt(e.as_u64())));
 
             let final_filter = self.storage.apply_version_filter(base_filter);
 
@@ -1234,12 +1229,10 @@ impl PropertyManager {
         columns.push("overflow_json".to_string());
 
         // Build IN filter for all VIDs at once.
-        let vid_list: String = need_storage
-            .iter()
-            .map(|v| v.as_u64().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let base_filter = format!("_vid IN ({})", vid_list);
+        let base_filter = FilterExpr::one_of(
+            "_vid",
+            need_storage.iter().map(|v| Scalar::UInt(v.as_u64())),
+        );
 
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
@@ -1249,7 +1242,7 @@ impl PropertyManager {
             .backend()
             .scan(
                 crate::backend::types::ScanRequest::all(&table_name)
-                    .with_filter(&filter_expr)
+                    .with_filter(filter_expr.clone())
                     .with_columns(columns.clone()),
             )
             .await?;
@@ -1453,12 +1446,8 @@ impl PropertyManager {
             return Ok(result);
         }
 
-        let eid_list: String = need_storage
-            .iter()
-            .map(|e| e.as_u64().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let base_filter = format!("eid IN ({})", eid_list);
+        let base_filter =
+            FilterExpr::one_of("eid", need_storage.iter().map(|e| Scalar::UInt(e.as_u64())));
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
         let batches = match backend
@@ -1816,7 +1805,7 @@ impl PropertyManager {
             columns.push("overflow_json".to_string());
 
             // Query using backend scan API
-            let base_filter = format!("_vid = {}", vid.as_u64());
+            let base_filter = FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64()));
 
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
@@ -1826,7 +1815,7 @@ impl PropertyManager {
                 .backend()
                 .scan(
                     crate::backend::types::ScanRequest::all(&table_name)
-                        .with_filter(&filter_expr)
+                        .with_filter(filter_expr.clone())
                         .with_columns(columns.clone()),
                 )
                 .await
@@ -2062,7 +2051,7 @@ impl PropertyManager {
             // Even if property is not in schema, we still check overflow_json
 
             // Query using backend scan API
-            let base_filter = format!("_vid = {}", vid.as_u64());
+            let base_filter = FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64()));
 
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
@@ -2084,7 +2073,7 @@ impl PropertyManager {
                 .backend()
                 .scan(
                     crate::backend::types::ScanRequest::all(&table_name)
-                        .with_filter(&filter_expr)
+                        .with_filter(filter_expr.clone())
                         .with_columns(columns),
                 )
                 .await

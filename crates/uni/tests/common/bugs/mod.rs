@@ -75,6 +75,7 @@ pub mod repro_config_path_plugin_registry;
 // Correctness-scan Wave 2 repros (L7 commit-timeout after durable point).
 pub mod repro_commit_timeout_after_durable;
 // Correctness-scan Wave 4 repro (fork-local index-kind collision).
+pub mod hash_index_range_quoting;
 pub mod repro_fork_index_kind_collision;
 pub mod shutdown_reaps_scratch_dir;
 pub mod test_issue_72_version_recovery;

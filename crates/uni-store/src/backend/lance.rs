@@ -198,9 +198,10 @@ impl LanceDbBackend {
             })?;
         }
 
-        if let FilterExpr::Sql(sql) = &request.filter {
+        if !request.filter.is_trivially_true() {
+            let sql = request.filter.to_sql()?;
             scanner
-                .filter(sql)
+                .filter(&sql)
                 .map_err(|e| anyhow!("Filter '{}' on '{}': {}", sql, request.table_name, e))?;
         }
 
@@ -250,8 +251,9 @@ impl LanceDbBackend {
             })?;
         }
 
-        if let FilterExpr::Sql(sql) = &request.filter {
-            scanner.filter(sql).map_err(|e| {
+        if !request.filter.is_trivially_true() {
+            let sql = request.filter.to_sql()?;
+            scanner.filter(&sql).map_err(|e| {
                 anyhow!(
                     "Filter '{}' on '{}@{}': {}",
                     sql,
@@ -447,10 +449,11 @@ impl StorageBackend for LanceDbBackend {
         }
     }
 
-    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> Result<usize> {
+    async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize> {
         let dataset = self.directory.open(table_name).await?;
+        let predicate = filter.map(FilterExpr::to_sql).transpose()?;
         dataset
-            .count_rows(filter.map(|s| s.to_string()))
+            .count_rows(predicate)
             .await
             .map_err(|e| anyhow!("Failed to count rows in '{}': {}", table_name, e))
     }
@@ -536,10 +539,10 @@ impl StorageBackend for LanceDbBackend {
         Ok(())
     }
 
-    async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
+    async fn delete_rows(&self, table_name: &str, filter: &FilterExpr) -> Result<()> {
         let mut dataset = self.directory.open(table_name).await?;
         dataset
-            .delete(filter)
+            .delete(&filter.to_sql()?)
             .await
             .map_err(|e| anyhow!("Failed to delete from '{}': {}", table_name, e))?;
         Ok(())
@@ -807,14 +810,15 @@ impl StorageBackend for LanceDbBackend {
         if let Some(ef) = opts.ef {
             scanner.ef(ef);
         }
-        if let FilterExpr::Sql(sql) = &filter {
+        if !filter.is_trivially_true() {
+            let sql = filter.to_sql()?;
             // lancedb's `only_if` defaulted to prefilter (`query.rs:782`), so
             // prefiltering here is exact parity — and it is also the correct
             // semantic: postfiltering would let excluded rows consume top-k
             // slots and shrink the result below k.
             scanner.prefilter(true);
             scanner
-                .filter(sql)
+                .filter(&sql)
                 .map_err(|e| anyhow!("Vector search filter '{}' on '{}': {}", sql, table, e))?;
         }
 
@@ -879,10 +883,11 @@ impl StorageBackend for LanceDbBackend {
         if let Some(ef) = opts.ef {
             scanner.ef(ef);
         }
-        if let FilterExpr::Sql(sql) = &filter {
+        if !filter.is_trivially_true() {
+            let sql = filter.to_sql()?;
             // Prefilter, as in `vector_search` — see the note there.
             scanner.prefilter(true);
-            scanner.filter(sql).map_err(|e| {
+            scanner.filter(&sql).map_err(|e| {
                 anyhow!("Multivector search filter '{}' on '{}': {}", sql, table, e)
             })?;
         }
@@ -935,9 +940,10 @@ impl StorageBackend for LanceDbBackend {
             .limit(Some(k as i64), None)
             .map_err(|e| anyhow!("FTS limit on '{}': {}", table, e))?;
 
-        if let FilterExpr::Sql(sql) = &filter {
+        if !filter.is_trivially_true() {
+            let sql = filter.to_sql()?;
             scanner
-                .filter(sql)
+                .filter(&sql)
                 .map_err(|e| anyhow!("FTS filter '{}' on '{}': {}", sql, table, e))?;
         }
 
@@ -1408,7 +1414,11 @@ mod tests {
 
         // Scan with filter
         let batches = backend
-            .scan(ScanRequest::all("test").with_filter("id > 1"))
+            .scan(ScanRequest::all("test").with_filter(FilterExpr::compare(
+                "id",
+                CmpOp::Gt,
+                Scalar::Int(1),
+            )))
             .await
             .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1439,7 +1449,10 @@ mod tests {
         // A real scan failure on an existing table (unparsable filter referencing
         // a non-existent column) must propagate as Err, not collapse to empty.
         let result = backend
-            .scan(ScanRequest::all("test").with_filter("no_such_column = 1"))
+            .scan(
+                ScanRequest::all("test")
+                    .with_filter(FilterExpr::equals("no_such_column", Scalar::Int(1))),
+            )
             .await;
         assert!(
             result.is_err(),

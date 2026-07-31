@@ -17,7 +17,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, ScanRequest};
+use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
 use crate::storage::arrow_convert::build_timestamp_column_from_eid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
@@ -261,8 +261,8 @@ impl MainEdgeDataset {
         backend: &dyn StorageBackend,
         eid: Eid,
     ) -> Result<Option<(Vid, Vid, String, Properties)>> {
-        let filter = format!("_eid = {}", eid.as_u64());
-        let results = Self::execute_query(backend, &filter, None).await?;
+        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
+        let results = Self::execute_query(backend, filter, None).await?;
 
         for batch in results {
             if batch.num_rows() > 0 {
@@ -310,8 +310,8 @@ impl MainEdgeDataset {
     /// so it returns true for both active and soft-deleted edges. Used by the
     /// compaction invariant check to verify dual-writes occurred.
     pub async fn exists_by_eid(backend: &dyn StorageBackend, eid: Eid) -> Result<bool> {
-        let filter = format!("_eid = {}", eid.as_u64());
-        let batches = Self::execute_query(backend, &filter, Some(vec!["_eid"])).await?;
+        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
+        let batches = Self::execute_query(backend, filter, Some(vec!["_eid"])).await?;
         Ok(!batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0))
     }
 
@@ -320,7 +320,7 @@ impl MainEdgeDataset {
     /// Returns empty vec if table doesn't exist.
     async fn execute_query(
         backend: &dyn StorageBackend,
-        filter: &str,
+        filter: FilterExpr,
         columns: Option<Vec<&str>>,
     ) -> Result<Vec<RecordBatch>> {
         let table_name = table_names::main_edge_table_name();
@@ -356,7 +356,8 @@ impl MainEdgeDataset {
 
     /// Find all non-deleted EIDs from the main edges table.
     pub async fn find_all_eids(backend: &dyn StorageBackend) -> Result<Vec<Eid>> {
-        let batches = Self::execute_query(backend, "_deleted = false", Some(vec!["_eid"])).await?;
+        let batches =
+            Self::execute_query(backend, FilterExpr::not_deleted(), Some(vec!["_eid"])).await?;
         Ok(Self::extract_eids(&batches))
     }
 
@@ -365,11 +366,11 @@ impl MainEdgeDataset {
         backend: &dyn StorageBackend,
         type_name: &str,
     ) -> Result<Vec<Eid>> {
-        let filter = format!(
-            "_deleted = false AND type = '{}'",
-            type_name.replace('\'', "''")
-        );
-        let batches = Self::execute_query(backend, &filter, Some(vec!["_eid"])).await?;
+        let filter = FilterExpr::all([
+            FilterExpr::not_deleted(),
+            FilterExpr::equals("type", Scalar::Str(type_name.to_string())),
+        ]);
+        let batches = Self::execute_query(backend, filter, Some(vec!["_eid"])).await?;
         Ok(Self::extract_eids(&batches))
     }
 
@@ -386,10 +387,10 @@ impl MainEdgeDataset {
         // Filtering `_deleted = false` here would let an OLDER live version
         // resurrect an edge whose tombstone is the true (highest-version)
         // winner.
-        let filter = format!("_eid = {}", eid.as_u64());
+        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
         let batches = Self::execute_query(
             backend,
-            &filter,
+            filter,
             Some(vec!["props_json", "_version", "_deleted"]),
         )
         .await?;
@@ -461,9 +462,9 @@ impl MainEdgeDataset {
         // and return `None` if that winner is deleted. The old code filtered
         // `_deleted = false` and took `value(0)` with no version comparison, so
         // it could return an arbitrary (and possibly stale) edge type.
-        let filter = format!("_eid = {}", eid.as_u64());
+        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
         let batches =
-            Self::execute_query(backend, &filter, Some(vec!["type", "_version", "_deleted"]))
+            Self::execute_query(backend, filter, Some(vec!["type", "_version", "_deleted"]))
                 .await?;
 
         let mut best_type: Option<String> = None;
@@ -515,12 +516,12 @@ impl MainEdgeDataset {
         backend: &dyn StorageBackend,
         type_name: &str,
     ) -> Result<Vec<(Eid, Vid, Vid, Properties)>> {
-        let filter = format!(
-            "_deleted = false AND type = '{}'",
-            type_name.replace('\'', "''")
-        );
+        let filter = FilterExpr::all([
+            FilterExpr::not_deleted(),
+            FilterExpr::equals("type", Scalar::Str(type_name.to_string())),
+        ]);
         // Fetch all columns for edge data
-        let batches = Self::execute_query(backend, &filter, None).await?;
+        let batches = Self::execute_query(backend, filter, None).await?;
 
         let mut edges = Vec::new();
         for batch in &batches {
@@ -547,44 +548,39 @@ impl MainEdgeDataset {
             return Ok(Vec::new());
         }
 
-        // Build IN clause: type IN ('T1', 'T2', ...)
-        let escaped_types: Vec<String> = type_names
-            .iter()
-            .map(|t| format!("'{}'", t.replace('\'', "''")))
-            .collect();
-        let base_filter = format!(
-            "_deleted = false AND type IN ({})",
-            escaped_types.join(", ")
-        );
+        let base_filter = FilterExpr::all([
+            FilterExpr::not_deleted(),
+            FilterExpr::one_of(
+                "type",
+                type_names.iter().map(|t| Scalar::Str((*t).to_string())),
+            ),
+        ]);
 
         let mut edges = Vec::new();
         match endpoint_filter {
             None => {
                 // Fetch all columns for edge data
-                let batches = Self::execute_query(backend, &base_filter, None).await?;
+                let batches = Self::execute_query(backend, base_filter.clone(), None).await?;
                 for batch in &batches {
                     Self::extract_edges_with_type_from_batch(batch, &mut edges)?;
                 }
             }
             Some((_, [])) => {}
             Some((side, vids)) => {
-                // Chunked so the filter string stays parseable for large sets.
+                // Chunked so the rendered predicate stays parseable for large sets.
                 const VID_CHUNK: usize = 8192;
                 for chunk in vids.chunks(VID_CHUNK) {
-                    let list = chunk
-                        .iter()
-                        .map(|v| v.as_u64().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let ids = || chunk.iter().map(|v| Scalar::UInt(v.as_u64()));
                     let endpoint_clause = match side {
-                        EndpointSide::Src => format!("src_vid IN ({list})"),
-                        EndpointSide::Dst => format!("dst_vid IN ({list})"),
-                        EndpointSide::Either => {
-                            format!("(src_vid IN ({list}) OR dst_vid IN ({list}))")
-                        }
+                        EndpointSide::Src => FilterExpr::one_of("src_vid", ids()),
+                        EndpointSide::Dst => FilterExpr::one_of("dst_vid", ids()),
+                        EndpointSide::Either => FilterExpr::any_of([
+                            FilterExpr::one_of("src_vid", ids()),
+                            FilterExpr::one_of("dst_vid", ids()),
+                        ]),
                     };
-                    let filter = format!("{base_filter} AND {endpoint_clause}");
-                    let batches = Self::execute_query(backend, &filter, None).await?;
+                    let filter = FilterExpr::all([base_filter.clone(), endpoint_clause]);
+                    let batches = Self::execute_query(backend, filter, None).await?;
                     for batch in &batches {
                         Self::extract_edges_with_type_from_batch(batch, &mut edges)?;
                     }

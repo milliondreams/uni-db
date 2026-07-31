@@ -120,7 +120,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn get_table_schema(&self, name: &str) -> Result<Option<Arc<ArrowSchema>>>;
 
     /// Count rows in a table, optionally with a filter.
-    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> Result<usize>;
+    async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize>;
 
     // ========================
     // Write Operations
@@ -153,7 +153,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     }
 
     /// Delete rows matching a filter expression.
-    async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()>;
+    async fn delete_rows(&self, table_name: &str, filter: &FilterExpr) -> Result<()>;
 
     /// Atomically replace a table's contents.
     ///

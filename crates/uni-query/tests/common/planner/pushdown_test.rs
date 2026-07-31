@@ -144,7 +144,10 @@ fn test_predicate_flattening() {
     assert_eq!(analysis.pushable.len(), 2);
 
     let sql = LanceFilterGenerator::generate(&analysis.pushable, "n", None).unwrap();
-    assert_eq!(sql, "a = 1 AND b = 2");
+    // Each conjunct is parenthesised unconditionally. Composing predicates by
+    // concatenation is only safe while no operand contains a lower-precedence
+    // operator, and nothing enforced that when this was built by `join(" AND ")`.
+    assert_eq!(sql, "(a = 1) AND (b = 2)");
 }
 
 // =====================================================================
@@ -580,4 +583,35 @@ fn test_btree_prefix_scan_skips_non_online_index() {
     assert_eq!(strategy.btree_prefix_scans.len(), 1);
     assert_eq!(strategy.btree_prefix_scans[0].0, "name");
     assert!(strategy.lance_predicates.is_empty());
+}
+
+/// A two-sided inclusive range must emit **bare** column names.
+///
+/// This used to be fused into `"col" >= L AND "col" <= R`. Lance parses a
+/// double-quoted name as a *string literal*, not a quoted identifier, so that
+/// clause was the data-independent constant `'col' >= L AND 'col' <= R` and
+/// matched every row — silently defeating the pushdown for every such query.
+/// Only a residual filter above the scan kept the answers correct.
+#[test]
+fn test_two_sided_range_emits_bare_identifiers() {
+    fn cmp(prop: &str, op: BinaryOp, v: i64) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(Expr::Property(
+                Box::new(Expr::Variable("n".to_string())),
+                prop.to_string(),
+            )),
+            op,
+            right: Box::new(Expr::Literal(CypherLiteral::Integer(v))),
+        }
+    }
+    let preds = vec![
+        cmp("createdAt", BinaryOp::GtEq, 2),
+        cmp("createdAt", BinaryOp::LtEq, 4),
+    ];
+    let sql = LanceFilterGenerator::generate(&preds, "n", None).unwrap();
+    assert!(
+        !sql.contains('"'),
+        "a double-quoted column is a string literal in Lance: {sql}"
+    );
+    assert_eq!(sql, "(createdAt >= 2) AND (createdAt <= 4)");
 }

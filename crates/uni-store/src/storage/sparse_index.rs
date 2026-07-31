@@ -23,6 +23,7 @@
 //! exactly as the dense `vector_search` path does — this module is the storage
 //! kernel.
 
+use crate::backend::types::{FilterExpr, Scalar};
 use anyhow::{Result, anyhow};
 use arrow_array::types::{Float32Type, UInt8Type, UInt64Type};
 use arrow_array::{
@@ -451,12 +452,11 @@ impl SparseVectorIndex {
         }
 
         let query_weights: HashMap<u32, f32> = query.iter().copied().collect();
-        let term_filter = query_weights
-            .keys()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let filter = format!("term_id IN ({term_filter})");
+        let filter = FilterExpr::one_of(
+            "term_id",
+            query_weights.keys().map(|t| Scalar::UInt(u64::from(*t))),
+        )
+        .to_sql()?;
 
         let mut scanner = ds.scan();
         scanner.filter(&filter)?;

@@ -17,7 +17,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, ScanRequest};
+use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
@@ -42,17 +42,19 @@ pub struct MainVertexDataset {
     _base_uri: String,
 }
 
-/// Append the snapshot-isolation version bound to a scan `filter`.
+/// Conjoin the snapshot-isolation version bound onto a scan `filter`.
 ///
 /// When `version` is `Some(hwm)`, restricts the scan to rows at or below the
-/// high water mark via ` AND _version <= {hwm}`; `None` leaves the filter
-/// unchanged (global visibility). This suffix is SSI/OCC-critical and must
-/// stay byte-identical across all snapshot reads.
-fn with_version_bound(mut filter: String, version: Option<u64>) -> String {
-    if let Some(hwm) = version {
-        filter.push_str(&format!(" AND _version <= {}", hwm));
+/// high water mark; `None` leaves the filter unchanged (global visibility).
+/// This bound is SSI/OCC-critical and must be applied identically across all
+/// snapshot reads — conjoining structured nodes is what guarantees that, where
+/// the previous `push_str(" AND …")` would have mis-bound against any body
+/// carrying a top-level `OR`.
+fn with_version_bound(filter: FilterExpr, version: Option<u64>) -> FilterExpr {
+    match version {
+        Some(hwm) => FilterExpr::all([filter, FilterExpr::version_at_most(hwm)]),
+        None => filter,
     }
-    filter
 }
 
 /// Scan the main vertices table for `_vid`s matching `filter_body`.
@@ -62,7 +64,7 @@ fn with_version_bound(mut filter: String, version: Option<u64>) -> String {
 /// does not exist. Shared by the `find_*_vids` lookups.
 async fn scan_vids(
     backend: &dyn StorageBackend,
-    filter_body: String,
+    filter_body: FilterExpr,
     version: Option<u64>,
 ) -> Result<Vec<Vid>> {
     let table_name = table_names::main_vertex_table_name();
@@ -398,7 +400,7 @@ impl MainVertexDataset {
         // did) would let an OLDER live version resurrect a vertex whose tombstone
         // is the true winner.
         let filter = with_version_bound(
-            format!("ext_id = '{}'", ext_id.replace('\'', "''")),
+            FilterExpr::equals("ext_id", Scalar::Str(ext_id.to_string())),
             version,
         );
 
@@ -486,7 +488,10 @@ impl MainVertexDataset {
         // and a deleted winner yields `None`. Filtering `_deleted = false` (and
         // taking `value(0)` with no version comparison, as the old code did)
         // would let an OLDER live version resurrect a deleted vertex.
-        let filter = with_version_bound(format!("_vid = {}", vid.as_u64()), version);
+        let filter = with_version_bound(
+            FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64())),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -555,7 +560,7 @@ impl MainVertexDataset {
         backend: &dyn StorageBackend,
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        scan_vids(backend, "_deleted = false".to_string(), version).await
+        scan_vids(backend, FilterExpr::not_deleted(), version).await
     }
 
     /// Find VIDs by label name in the main vertices table.
@@ -574,8 +579,10 @@ impl MainVertexDataset {
         label: &str,
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        // Use SQL array_contains to filter by label
-        let filter_body = format!("_deleted = false AND array_contains(labels, '{}')", label);
+        let filter_body = FilterExpr::all([
+            FilterExpr::not_deleted(),
+            FilterExpr::array_contains("labels", Scalar::Str(label.to_string())),
+        ]);
         scan_vids(backend, filter_body, version).await
     }
 
@@ -595,16 +602,11 @@ impl MainVertexDataset {
             return Ok(Vec::new());
         }
 
-        // Build AND conditions for each label
-        let label_conditions: Vec<String> = labels
-            .iter()
-            .map(|label| {
-                let escaped = label.replace('\'', "''");
-                format!("array_contains(labels, '{}')", escaped)
-            })
-            .collect();
-
-        let filter_body = format!("_deleted = false AND {}", label_conditions.join(" AND "));
+        let filter_body = FilterExpr::all(std::iter::once(FilterExpr::not_deleted()).chain(
+            labels.iter().map(|label| {
+                FilterExpr::array_contains("labels", Scalar::Str((*label).to_string()))
+            }),
+        ));
         scan_vids(backend, filter_body, version).await
     }
 
@@ -639,8 +641,10 @@ impl MainVertexDataset {
         // OLDER live version resurrect a vertex whose tombstone lives only in the
         // main table (review C2), and last-row-wins with no `_version` ranking
         // returned stale props depending on physical scan order.
-        let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
+        let filter = with_version_bound(
+            FilterExpr::one_of("_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64()))),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -742,7 +746,10 @@ impl MainVertexDataset {
             return Ok(None);
         }
 
-        let filter = with_version_bound(format!("_vid = {}", vid.as_u64()), version);
+        let filter = with_version_bound(
+            FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64())),
+            version,
+        );
 
         let results = backend
             .scan(
@@ -823,8 +830,10 @@ impl MainVertexDataset {
         // `find_batch_props_by_vids`: version-max winner per vid, tombstones
         // included (a deleted winner drops the vid). `_deleted = false` filtering
         // + last-row-wins previously resurrected deleted vertices' labels.
-        let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let filter = with_version_bound(format!("_vid IN ({})", vid_list.join(", ")), version);
+        let filter = with_version_bound(
+            FilterExpr::one_of("_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64()))),
+            version,
+        );
 
         let results = backend
             .scan(

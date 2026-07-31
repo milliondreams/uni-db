@@ -2003,6 +2003,67 @@ pub enum LogicalPlan {
     },
 }
 
+impl LogicalPlan {
+    /// Mutable access to this node's single child input, when it has one.
+    ///
+    /// `..` works in a *pattern* even though enum struct-variants have no
+    /// functional-update syntax for *construction* — which is what makes this
+    /// one line per variant while rebuilding a node by hand is not.
+    fn input_mut(&mut self) -> Option<&mut LogicalPlan> {
+        match self {
+            LogicalPlan::Unwind { input, .. }
+            | LogicalPlan::Traverse { input, .. }
+            | LogicalPlan::TraverseMainByType { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Create { input, .. }
+            | LogicalPlan::CreateBatch { input, .. }
+            | LogicalPlan::Merge { input, .. }
+            | LogicalPlan::Set { input, .. }
+            | LogicalPlan::Remove { input, .. }
+            | LogicalPlan::Delete { input, .. }
+            | LogicalPlan::Foreach { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Apply { input, .. }
+            | LogicalPlan::SubqueryCall { input, .. }
+            | LogicalPlan::ShortestPath { input, .. }
+            | LogicalPlan::AllShortestPaths { input, .. }
+            | LogicalPlan::QuantifiedPattern { input, .. }
+            | LogicalPlan::BindZeroLengthPath { input, .. }
+            | LogicalPlan::BindPath { input, .. }
+            | LogicalPlan::LocyFold { input, .. }
+            | LogicalPlan::LocyBestBy { input, .. }
+            | LogicalPlan::LocyPriority { input, .. }
+            | LogicalPlan::LocyProject { input, .. }
+            | LogicalPlan::LocyModelInvoke { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+
+    /// Replace this node's single child input, leaving every other field intact.
+    ///
+    /// Rust has no functional update (`..rest`) for enum struct-variants, so
+    /// swapping one field of a 19-field variant like `Traverse` otherwise means
+    /// destructuring and rebuilding all nineteen at the call site — and
+    /// silently dropping whichever one you forget. The plan rewriters carried
+    /// that 38-line dance once each.
+    ///
+    /// Nodes with no single input are returned unchanged, matching the
+    /// `other => other` arm those rewriters already had.
+    #[must_use]
+    pub fn map_input(mut self, f: impl FnOnce(LogicalPlan) -> LogicalPlan) -> Self {
+        if let Some(input) = self.input_mut() {
+            let taken = std::mem::replace(input, LogicalPlan::Empty);
+            *input = f(taken);
+        }
+        self
+    }
+}
+
 /// Extracted vector similarity predicate info for optimization
 struct VectorSimilarityPredicate {
     variable: String,
@@ -6390,49 +6451,9 @@ impl QueryPlanner {
                     }
                 }
             }
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional: trav_optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(
-                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
-                ),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional: trav_optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => other.map_input(|child| {
+                self.replace_scan_all_with_label_union(child, variable, labels, optional)
+            }),
             other => other,
         }
     }
@@ -7533,47 +7554,9 @@ impl QueryPlanner {
                     }
                 }
             }
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(Self::push_predicate_to_scan(*input, variable, predicate)),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => {
+                other.map_input(|child| Self::push_predicate_to_scan(child, variable, predicate))
+            }
             other => other,
         }
     }
@@ -8097,47 +8080,9 @@ impl QueryPlanner {
                 left: Box::new(Self::push_predicates_to_apply(*left, current_predicate)),
                 right: Box::new(Self::push_predicates_to_apply(*right, current_predicate)),
             },
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(Self::push_predicates_to_apply(*input, current_predicate)),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => {
+                other.map_input(|child| Self::push_predicates_to_apply(child, current_predicate))
+            }
             other => other,
         }
     }

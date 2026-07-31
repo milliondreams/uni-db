@@ -59,7 +59,6 @@ pub mod notifications {
     pub use uni_plugin_host::notifications::*;
 }
 pub mod prepared;
-pub mod query_builder;
 pub mod retry;
 pub mod rule_registry;
 pub mod schema;

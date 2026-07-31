@@ -77,6 +77,7 @@ pub mod secrets;
 pub mod surfaces;
 pub mod traits;
 pub mod verify;
+pub mod wire_manifest;
 
 #[doc(inline)]
 pub use crate::capability::{

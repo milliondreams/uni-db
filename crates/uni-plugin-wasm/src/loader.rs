@@ -105,18 +105,10 @@ fn default_proc_mode() -> String {
     "read".to_owned()
 }
 
-/// Wire-level argument type shipped by a plugin.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WireArgType {
-    /// Native Arrow primitive (`int64`, `float64`, `utf8`, …).
-    Primitive {
-        /// Arrow primitive name.
-        arrow: String,
-    },
-    /// Opaque `CypherValue` transported as `LargeBinary`.
-    CypherValue,
-}
+// Shared with the Extism loader — see `uni_plugin::wire_manifest`. This
+// loader's copy used to omit `Vector` and `Variadic`, so a manifest declaring
+// either loaded over Extism and failed to parse here.
+pub use uni_plugin::wire_manifest::WireArgType;
 
 /// One registration entry.
 #[derive(Debug, Clone, Deserialize)]
@@ -1461,6 +1453,11 @@ fn wire_arg(w: &WireArgType) -> Result<uni_plugin::traits::scalar::ArgType, Wasm
     Ok(match w {
         WireArgType::Primitive { arrow } => ArgType::Primitive(arrow_name_to_dt(arrow)?),
         WireArgType::CypherValue => ArgType::CypherValue,
+        WireArgType::Vector { len, element } => ArgType::Vector {
+            len: *len,
+            element: arrow_name_to_dt(element)?,
+        },
+        WireArgType::Variadic { inner } => ArgType::Variadic(Box::new(wire_arg(inner)?)),
     })
 }
 
@@ -1608,6 +1605,45 @@ mod tests {
     use super::*;
 
     use uni_plugin::{Capability, CapabilitySet};
+
+    /// A `kind:"vector"` arg used to load over Extism and be *rejected* here:
+    /// this loader carried its own `WireArgType` with only `Primitive` and
+    /// `CypherValue`, and `deny_unknown_fields` turned the extra variants into
+    /// a parse error. The schema is now shared, so it must both parse and
+    /// convert to a `FixedSizeList`-backed `ArgType::Vector`.
+    #[test]
+    fn vector_wire_arg_parses_and_converts() {
+        use uni_plugin::traits::scalar::ArgType;
+
+        let json = r#"{"kind":"vector","len":128,"element":"float32"}"#;
+        let wire: WireArgType = serde_json::from_str(json).expect("vector arg must parse");
+
+        let converted = wire_arg(&wire).expect("vector arg must convert");
+        match converted {
+            ArgType::Vector { len, element } => {
+                assert_eq!(len, 128);
+                assert_eq!(element, arrow_schema::DataType::Float32);
+            }
+            other => panic!("expected ArgType::Vector, got {other:?}"),
+        }
+    }
+
+    /// Same story for `kind:"variadic"`, including the recursive inner type.
+    #[test]
+    fn variadic_wire_arg_parses_and_converts() {
+        use uni_plugin::traits::scalar::ArgType;
+
+        let json = r#"{"kind":"variadic","inner":{"kind":"primitive","arrow":"int64"}}"#;
+        let wire: WireArgType = serde_json::from_str(json).expect("variadic arg must parse");
+
+        match wire_arg(&wire).expect("variadic arg must convert") {
+            ArgType::Variadic(inner) => match *inner {
+                ArgType::Primitive(dt) => assert_eq!(dt, arrow_schema::DataType::Int64),
+                other => panic!("expected inner Primitive, got {other:?}"),
+            },
+            other => panic!("expected ArgType::Variadic, got {other:?}"),
+        }
+    }
 
     /// Build a manifest JSON declaring the given (kebab-case) capability names.
     fn manifest_json(caps: &[&str]) -> String {

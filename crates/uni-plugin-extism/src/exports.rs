@@ -52,35 +52,11 @@ fn default_null_handling() -> String {
     "propagate".to_owned()
 }
 
-/// Wire-level argument type shipped by a plugin.
-///
-/// Each variant maps to the corresponding `uni_plugin::traits::scalar::ArgType`
-/// at adapter time. Primitive types use the lowercase Arrow names
-/// (`"int64"`, `"float64"`, `"utf8"`, `"boolean"`, `"date64"`,
-/// `"timestamp_ms"`, `"binary"`, `"largebinary"`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WireArgType {
-    /// A native Arrow primitive — `kind: "primitive", arrow: "<name>"`.
-    Primitive {
-        /// Arrow primitive name.
-        arrow: String,
-    },
-    /// A `CypherValue` shipped via `LargeBinary` opaque transport.
-    CypherValue,
-    /// A fixed-size vector — `kind: "vector", len: N, element: "<arrow>"`.
-    Vector {
-        /// Number of elements per row.
-        len: usize,
-        /// Element type.
-        element: String,
-    },
-    /// Variadic — repeats `inner` zero or more times.
-    Variadic {
-        /// Inner element type.
-        inner: Box<WireArgType>,
-    },
-}
+// The wire manifest schema is shared with the Component-Model loader so a
+// manifest cannot parse under one runtime and be rejected by the other.
+// Re-exported here because `WireArgType` is part of this crate's published
+// surface (see `lib.rs`).
+pub use uni_plugin::wire_manifest::WireArgType;
 
 /// One registration entry — a single qname plus its kind + signature.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

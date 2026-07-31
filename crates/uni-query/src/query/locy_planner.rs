@@ -424,22 +424,6 @@ struct ClassifierContext {
     provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 }
 
-/// Probabilistic-evaluation knobs threaded through the same builders.
-/// Fields are not yet read by the clause-level builders (the actual
-/// strict-domain / epsilon enforcement happens later in the fixpoint
-/// hot path); they ride along here so the planner surface stays
-/// consistent with the runtime config and is forward-compatible with
-/// plan-time enforcement.
-#[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "reserved for plan-time probabilistic-config rollout"
-)]
-struct ProbabilityConfig {
-    strict_domain: bool,
-    epsilon: f64,
-}
-
 /// Lookup state shared by the clause builder: target rule catalog,
 /// the in-progress stratum's rule names, and the clause's bound node
 /// variables. Bundled to keep `build_clause` under the
@@ -595,10 +579,6 @@ impl<'a> LocyPlanBuilder<'a> {
     ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
-        let prob_config = ProbabilityConfig {
-            strict_domain: strict_probability_domain,
-            epsilon: probability_epsilon,
-        };
         let classifiers = ClassifierContext {
             registry: Arc::clone(&classifier_registry),
             cache: classifier_cache.as_ref().map(Arc::clone),
@@ -607,13 +587,8 @@ impl<'a> LocyPlanBuilder<'a> {
         for stratum in &compiled.strata {
             let rule_names: HashSet<String> =
                 stratum.rules.iter().map(|r| r.name.clone()).collect();
-            let locy_stratum = self.build_stratum(
-                stratum,
-                &compiled.rule_catalog,
-                &rule_names,
-                prob_config,
-                &classifiers,
-            )?;
+            let locy_stratum =
+                self.build_stratum(stratum, &compiled.rule_catalog, &rule_names, &classifiers)?;
             strata.push(locy_stratum);
         }
 
@@ -692,7 +667,6 @@ impl<'a> LocyPlanBuilder<'a> {
         stratum: &Stratum,
         rule_catalog: &HashMap<String, CompiledRule>,
         stratum_rule_names: &HashSet<String>,
-        prob_config: ProbabilityConfig,
         classifiers: &ClassifierContext,
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
@@ -717,7 +691,6 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum.is_recursive,
                 stratum_rule_names,
                 rule_catalog,
-                prob_config,
                 classifiers,
             )?);
         }
@@ -738,7 +711,6 @@ impl<'a> LocyPlanBuilder<'a> {
         is_recursive: bool,
         stratum_rule_names: &HashSet<String>,
         rule_catalog: &HashMap<String, CompiledRule>,
-        prob_config: ProbabilityConfig,
         classifiers: &ClassifierContext,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
@@ -755,7 +727,6 @@ impl<'a> LocyPlanBuilder<'a> {
                     rule_catalog,
                     node_vars: &node_vars,
                 },
-                prob_config,
                 classifiers,
             )?);
         }
@@ -947,7 +918,6 @@ impl<'a> LocyPlanBuilder<'a> {
         yield_cols: &[YieldColumn],
         is_recursive: bool,
         ctx: ClauseCtx<'_>,
-        _prob_config: ProbabilityConfig,
         classifiers: &ClassifierContext,
     ) -> Result<LocyClausePlan> {
         let stratum_rule_names = ctx.stratum_rule_names;
@@ -2487,16 +2457,7 @@ mod tests {
         };
         let names: HashSet<String> = ["base".to_string()].into();
         let result = builder
-            .build_stratum(
-                &stratum,
-                &catalog,
-                &names,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
             .unwrap();
 
         assert_eq!(result.id, 0);
@@ -2526,16 +2487,7 @@ mod tests {
         };
         let names: HashSet<String> = ["reach".to_string()].into();
         let result = builder
-            .build_stratum(
-                &stratum,
-                &catalog,
-                &names,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
             .unwrap();
 
         assert!(result.is_recursive);
@@ -2563,16 +2515,7 @@ mod tests {
         };
         let names: HashSet<String> = ["derived".to_string()].into();
         let result = builder
-            .build_stratum(
-                &stratum,
-                &catalog,
-                &names,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
             .unwrap();
 
         assert_eq!(result.depends_on, vec![0, 1]);
@@ -2606,16 +2549,7 @@ mod tests {
         };
         let names: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let result = builder
-            .build_stratum(
-                &stratum,
-                &catalog,
-                &names,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
             .unwrap();
 
         assert_eq!(result.rules.len(), 3);
@@ -2643,17 +2577,7 @@ mod tests {
         let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
-            .build_rule(
-                &rule,
-                false,
-                &names,
-                &catalog,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
             .unwrap();
         assert_eq!(result.name, "reachable");
         assert_eq!(result.yield_schema.len(), 2);
@@ -2678,17 +2602,7 @@ mod tests {
         let names: HashSet<String> = ["prio".to_string()].into();
 
         let result = builder
-            .build_rule(
-                &rule,
-                false,
-                &names,
-                &catalog,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
             .unwrap();
         assert_eq!(result.priority, Some(5));
     }
@@ -2707,17 +2621,7 @@ mod tests {
         let names: HashSet<String> = ["noprio".to_string()].into();
 
         let result = builder
-            .build_rule(
-                &rule,
-                false,
-                &names,
-                &catalog,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
             .unwrap();
         assert_eq!(result.priority, None);
     }
@@ -2740,17 +2644,7 @@ mod tests {
         let names: HashSet<String> = ["multi".to_string()].into();
 
         let result = builder
-            .build_rule(
-                &rule,
-                false,
-                &names,
-                &catalog,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
     }
@@ -2773,17 +2667,7 @@ mod tests {
         let names: HashSet<String> = ["keyed".to_string()].into();
 
         let result = builder
-            .build_rule(
-                &rule,
-                false,
-                &names,
-                &catalog,
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
-                &test_classifier_ctx(),
-            )
+            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
             .unwrap();
         assert!(result.yield_schema[0].is_key);
         assert!(!result.yield_schema[1].is_key);
@@ -2813,10 +2697,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -2861,10 +2741,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -2920,10 +2796,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -2990,10 +2862,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3046,10 +2914,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -3126,10 +2990,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3192,10 +3052,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3251,10 +3107,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3308,10 +3160,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3357,10 +3205,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             )
             .unwrap();
@@ -3398,10 +3242,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -3480,10 +3320,6 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
-                },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
                 },
                 &test_classifier_ctx(),
             )
@@ -4225,10 +4061,6 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
             },
-            ProbabilityConfig {
-                strict_domain: false,
-                epsilon: 1e-15,
-            },
             &test_classifier_ctx(),
         );
         assert!(result.is_err());
@@ -4276,10 +4108,6 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
-            },
-            ProbabilityConfig {
-                strict_domain: false,
-                epsilon: 1e-15,
             },
             &test_classifier_ctx(),
         );
@@ -4332,10 +4160,6 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
             },
-            ProbabilityConfig {
-                strict_domain: false,
-                epsilon: 1e-15,
-            },
             &test_classifier_ctx(),
         );
         assert!(result.is_err());
@@ -4380,10 +4204,6 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
-            },
-            ProbabilityConfig {
-                strict_domain: false,
-                epsilon: 1e-15,
             },
             &test_classifier_ctx(),
         );
@@ -4434,10 +4254,6 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                 },
-                ProbabilityConfig {
-                    strict_domain: false,
-                    epsilon: 1e-15,
-                },
                 &test_classifier_ctx(),
             );
             assert!(
@@ -4487,10 +4303,6 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
-            },
-            ProbabilityConfig {
-                strict_domain: false,
-                epsilon: 1e-15,
             },
             &test_classifier_ctx(),
         );

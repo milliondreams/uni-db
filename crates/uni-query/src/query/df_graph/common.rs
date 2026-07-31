@@ -929,6 +929,60 @@ pub async fn execute_subplan(
 /// `collect_plan_metrics`, so this MUST run the plan to completion first
 /// (which it does, like `execute_subplan`). The non-profiled path calls
 /// [`execute_subplan`] instead and pays nothing.
+/// Execute a Locy clause body, threading operator stats out when profiling.
+///
+/// The recursive fixpoint loop (`locy_fixpoint.rs`) and the non-recursive
+/// stratum loop (`locy_program.rs`) both need exactly this: run the clause's
+/// body plan, and when a profile collector is active also append the
+/// per-operator stats. The two loops used to carry byte-identical copies of
+/// this `if collector.is_some()` dance; a divergence between them would be
+/// silent, so it lives here instead.
+///
+/// `profiling` mirrors `collector.is_some()` at the call site. Locy clause
+/// bodies are read-only, hence the `None` mutation context.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors execute_subplan's context parameters plus the profiling switch"
+)]
+pub async fn execute_locy_clause_body(
+    body: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    profiling: bool,
+    iter_ops: &mut Vec<OperatorStats>,
+) -> DFResult<Vec<RecordBatch>> {
+    if profiling {
+        let (batches, ops) = execute_subplan_collecting(
+            body,
+            params,
+            &HashMap::new(),
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            None,
+        )
+        .await?;
+        iter_ops.extend(ops);
+        Ok(batches)
+    } else {
+        execute_subplan(
+            body,
+            params,
+            &HashMap::new(),
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            None,
+        )
+        .await
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Mirrors execute_subplan's parameter list; profiling adds only the return value"

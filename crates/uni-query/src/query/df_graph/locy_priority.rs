@@ -261,7 +261,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::prelude::SessionContext;
 
     fn make_test_batch(names: Vec<&str>, values: Vec<i64>, priorities: Vec<i64>) -> RecordBatch {
@@ -285,59 +285,7 @@ mod tests {
 
     fn make_memory_exec(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
         let schema = batch.schema();
-        Arc::new(TestMemoryExec {
-            batches: vec![batch],
-            schema: schema.clone(),
-            properties: compute_plan_properties(schema),
-        })
-    }
-
-    #[derive(Debug)]
-    struct TestMemoryExec {
-        batches: Vec<RecordBatch>,
-        schema: SchemaRef,
-        properties: Arc<PlanProperties>,
-    }
-
-    impl DisplayAs for TestMemoryExec {
-        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "TestMemoryExec")
-        }
-    }
-
-    impl ExecutionPlan for TestMemoryExec {
-        fn name(&self) -> &str {
-            "TestMemoryExec"
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.properties
-        }
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-        fn with_new_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> DFResult<Arc<dyn ExecutionPlan>> {
-            Ok(self)
-        }
-        fn execute(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> DFResult<SendableRecordBatchStream> {
-            Ok(Box::pin(MemoryStream::try_new(
-                self.batches.clone(),
-                Arc::clone(&self.schema),
-                None,
-            )?))
-        }
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
 
     async fn execute_priority(

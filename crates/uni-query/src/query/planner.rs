@@ -722,90 +722,19 @@ fn extract_inner_aggregates(expr: &Expr) -> Vec<Expr> {
 
 fn extract_inner_aggregates_rec(expr: &Expr, out: &mut Vec<Expr>) {
     match expr {
+        // A bare aggregate is what we are looking for — collect it and stop;
+        // its own arguments cannot contain another top-level aggregate.
         Expr::FunctionCall {
             name, window_spec, ..
         } if window_spec.is_none() && is_aggregate_function_name(name) => {
-            // Found a bare aggregate — collect it and stop recursing
             out.push(expr.clone());
         }
-        Expr::CountSubquery(_) | Expr::CollectSubquery(_) => {
-            out.push(expr.clone());
-        }
-        // For list comprehension, only search the `list` source for aggregates
-        Expr::ListComprehension { list, .. } => {
-            extract_inner_aggregates_rec(list, out);
-        }
-        // For quantifier, only search the `list` source
-        Expr::Quantifier { list, .. } => {
-            extract_inner_aggregates_rec(list, out);
-        }
-        // For reduce, search `init` and `list` (not the body `expr`)
-        Expr::Reduce { init, list, .. } => {
-            extract_inner_aggregates_rec(init, out);
-            extract_inner_aggregates_rec(list, out);
-        }
-        // Standard recursive cases
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                extract_inner_aggregates_rec(arg, out);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            extract_inner_aggregates_rec(left, out);
-            extract_inner_aggregates_rec(right, out);
-        }
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::IsUnique(e) => extract_inner_aggregates_rec(e, out),
-        Expr::Property(base, _) => extract_inner_aggregates_rec(base, out),
-        Expr::List(items) => {
-            for item in items {
-                extract_inner_aggregates_rec(item, out);
-            }
-        }
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = case_expr {
-                extract_inner_aggregates_rec(e, out);
-            }
-            for (w, t) in when_then {
-                extract_inner_aggregates_rec(w, out);
-                extract_inner_aggregates_rec(t, out);
-            }
-            if let Some(e) = else_expr {
-                extract_inner_aggregates_rec(e, out);
-            }
-        }
-        Expr::In {
-            expr: in_expr,
-            list,
-        } => {
-            extract_inner_aggregates_rec(in_expr, out);
-            extract_inner_aggregates_rec(list, out);
-        }
-        Expr::ArrayIndex { array, index } => {
-            extract_inner_aggregates_rec(array, out);
-            extract_inner_aggregates_rec(index, out);
-        }
-        Expr::ArraySlice { array, start, end } => {
-            extract_inner_aggregates_rec(array, out);
-            if let Some(s) = start {
-                extract_inner_aggregates_rec(s, out);
-            }
-            if let Some(e) = end {
-                extract_inner_aggregates_rec(e, out);
-            }
-        }
-        Expr::Map(entries) => {
-            for (_, v) in entries {
-                extract_inner_aggregates_rec(v, out);
-            }
-        }
-        _ => {}
+        // Subquery aggregates count as aggregates at this node. `for_each_child`
+        // never descends into them, so they must be collected here or not at all.
+        Expr::CountSubquery(_) | Expr::CollectSubquery(_) => out.push(expr.clone()),
+        other => other.for_each_child_in_scope(&mut |child| {
+            extract_inner_aggregates_rec(child, out);
+        }),
     }
 }
 
@@ -816,129 +745,24 @@ fn extract_inner_aggregates_rec(expr: &Expr, out: &mut Vec<Expr>) {
 /// rewritten (the body references the loop variable, not outer-scope columns).
 fn replace_aggregates_with_columns(expr: &Expr) -> Expr {
     match expr {
+        // A bare aggregate becomes a reference to the column the aggregation
+        // stage will produce; its arguments are consumed by that stage.
         Expr::FunctionCall {
             name, window_spec, ..
         } if window_spec.is_none() && is_aggregate_function_name(name) => {
-            // Replace bare aggregate with column reference
             Expr::Variable(aggregate_column_name(expr))
         }
+        // Subquery aggregates likewise. `map_children` never descends into
+        // them, so they must be rewritten here or not at all.
         Expr::CountSubquery(_) | Expr::CollectSubquery(_) => {
             Expr::Variable(aggregate_column_name(expr))
         }
-        Expr::ListComprehension {
-            variable,
-            list,
-            where_clause,
-            map_expr,
-        } => Expr::ListComprehension {
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            where_clause: where_clause.clone(), // don't touch — references loop var
-            map_expr: map_expr.clone(),         // don't touch — references loop var
-        },
-        Expr::Quantifier {
-            quantifier,
-            variable,
-            list,
-            predicate,
-        } => Expr::Quantifier {
-            quantifier: *quantifier,
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            predicate: predicate.clone(), // don't touch — references loop var
-        },
-        Expr::Reduce {
-            accumulator,
-            init,
-            variable,
-            list,
-            expr: body,
-        } => Expr::Reduce {
-            accumulator: accumulator.clone(),
-            init: Box::new(replace_aggregates_with_columns(init)),
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            expr: body.clone(), // don't touch — references loop var
-        },
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            window_spec,
-        } => Expr::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(replace_aggregates_with_columns).collect(),
-            distinct: *distinct,
-            window_spec: window_spec.clone(),
-        },
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(replace_aggregates_with_columns(left)),
-            op: *op,
-            right: Box::new(replace_aggregates_with_columns(right)),
-        },
-        Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(replace_aggregates_with_columns(e)),
-        },
-        Expr::IsNull(e) => Expr::IsNull(Box::new(replace_aggregates_with_columns(e))),
-        Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(replace_aggregates_with_columns(e))),
-        Expr::IsUnique(e) => Expr::IsUnique(Box::new(replace_aggregates_with_columns(e))),
-        Expr::Property(base, prop) => Expr::Property(
-            Box::new(replace_aggregates_with_columns(base)),
-            prop.clone(),
-        ),
-        Expr::List(items) => {
-            Expr::List(items.iter().map(replace_aggregates_with_columns).collect())
-        }
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => Expr::Case {
-            expr: case_expr
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-            when_then: when_then
-                .iter()
-                .map(|(w, t)| {
-                    (
-                        replace_aggregates_with_columns(w),
-                        replace_aggregates_with_columns(t),
-                    )
-                })
-                .collect(),
-            else_expr: else_expr
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-        },
-        Expr::In {
-            expr: in_expr,
-            list,
-        } => Expr::In {
-            expr: Box::new(replace_aggregates_with_columns(in_expr)),
-            list: Box::new(replace_aggregates_with_columns(list)),
-        },
-        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
-            array: Box::new(replace_aggregates_with_columns(array)),
-            index: Box::new(replace_aggregates_with_columns(index)),
-        },
-        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
-            array: Box::new(replace_aggregates_with_columns(array)),
-            start: start
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-            end: end
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-        },
-        Expr::Map(entries) => Expr::Map(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), replace_aggregates_with_columns(v)))
-                .collect(),
-        ),
-        // Leaf expressions — return as-is
-        other => other.clone(),
+        // Everything else rewrites its in-scope children. The scoped map leaves
+        // comprehension bodies alone — they reference the loop variable, not a
+        // column the aggregation stage emits.
+        other => other
+            .clone()
+            .map_children_in_scope(&mut |child| replace_aggregates_with_columns(&child)),
     }
 }
 
@@ -978,73 +802,13 @@ fn contains_non_deterministic(expr: &Expr) -> bool {
 
 fn collect_aggregate_reprs(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if is_aggregate_function_name(name) {
-                out.insert(expr.to_string_repr());
-                return;
-            }
-            for arg in args {
-                collect_aggregate_reprs(arg, out);
-            }
+        // An aggregate contributes its own repr; its arguments are grouped over.
+        Expr::FunctionCall { name, .. } if is_aggregate_function_name(name) => {
+            out.insert(expr.to_string_repr());
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_aggregate_reprs(left, out);
-            collect_aggregate_reprs(right, out);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnique(expr) => collect_aggregate_reprs(expr, out),
-        Expr::List(items) => {
-            for item in items {
-                collect_aggregate_reprs(item, out);
-            }
-        }
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = expr {
-                collect_aggregate_reprs(e, out);
-            }
-            for (w, t) in when_then {
-                collect_aggregate_reprs(w, out);
-                collect_aggregate_reprs(t, out);
-            }
-            if let Some(e) = else_expr {
-                collect_aggregate_reprs(e, out);
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_aggregate_reprs(expr, out);
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Property(base, _) => collect_aggregate_reprs(base, out),
-        Expr::ListComprehension { list, .. } => {
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Quantifier { list, .. } => {
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Reduce { init, list, .. } => {
-            collect_aggregate_reprs(init, out);
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::ArrayIndex { array, index } => {
-            collect_aggregate_reprs(array, out);
-            collect_aggregate_reprs(index, out);
-        }
-        Expr::ArraySlice { array, start, end } => {
-            collect_aggregate_reprs(array, out);
-            if let Some(s) = start {
-                collect_aggregate_reprs(s, out);
-            }
-            if let Some(e) = end {
-                collect_aggregate_reprs(e, out);
-            }
-        }
-        _ => {}
+        other => other.for_each_child_in_scope(&mut |child| {
+            collect_aggregate_reprs(child, out);
+        }),
     }
 }
 

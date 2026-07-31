@@ -1717,4 +1717,53 @@ impl Expr {
             },
         }
     }
+
+    /// Map each direct child that shares the *enclosing* variable scope.
+    ///
+    /// The mapping counterpart of [`Self::for_each_child_in_scope`]: children
+    /// bound to a comprehension's own loop variable are returned untouched, so
+    /// a rewrite of the outer query cannot reach inside a comprehension body
+    /// and disturb its loop bindings.
+    #[must_use]
+    pub fn map_children_in_scope(self, f: &mut dyn FnMut(Expr) -> Expr) -> Expr {
+        match self {
+            Expr::ListComprehension {
+                variable,
+                list,
+                where_clause,
+                map_expr,
+            } => Expr::ListComprehension {
+                variable,
+                list: Box::new(f(*list)),
+                where_clause,
+                map_expr,
+            },
+            Expr::Quantifier {
+                quantifier,
+                variable,
+                list,
+                predicate,
+            } => Expr::Quantifier {
+                quantifier,
+                variable,
+                list: Box::new(f(*list)),
+                predicate,
+            },
+            Expr::Reduce {
+                accumulator,
+                init,
+                variable,
+                list,
+                expr,
+            } => Expr::Reduce {
+                accumulator,
+                init: Box::new(f(*init)),
+                variable,
+                list: Box::new(f(*list)),
+                expr,
+            },
+            Expr::PatternComprehension { .. } => self,
+            other => other.map_children(f),
+        }
+    }
 }

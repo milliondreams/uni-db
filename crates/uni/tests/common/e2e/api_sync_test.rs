@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use uni_db::{DataType, UniSync};
+use uni_db::{DataType, Uni, UniSync};
 
 #[test]
 fn test_sync_api() -> Result<()> {
@@ -130,5 +130,30 @@ fn test_sync_api_edge_operations() -> Result<()> {
     assert_eq!(result.rows()[0].get::<String>("src")?, "Alice");
     assert_eq!(result.rows()[0].get::<String>("dst")?, "Bob");
 
+    Ok(())
+}
+
+/// `UniBuilder::build_sync` is the blocking counterpart of `build()`: it spins
+/// its own runtime, so it must be called from outside one. It had no in-repo
+/// caller, which meant nothing checked that the runtime it creates actually
+/// yields a usable database.
+#[test]
+fn test_builder_build_sync() -> Result<()> {
+    let db: Uni = Uni::in_memory().build_sync()?;
+
+    // `build_sync` returns the async facade, so drive it with an explicit
+    // runtime — one it no longer owns, which is the point: the database must
+    // outlive the runtime `build_sync` spun up internally.
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Widget {sku: 'w-1'})").await?;
+        tx.commit().await?;
+
+        let result = session.query("MATCH (w:Widget) RETURN w.sku").await?;
+        assert_eq!(result.len(), 1);
+        anyhow::Ok(())
+    })?;
     Ok(())
 }

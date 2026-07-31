@@ -32,31 +32,7 @@ pub fn is_vertex_deleted(vid: Vid, ctx: Option<&QueryContext>) -> bool {
     // antidependency check (write-skew). No-op outside a write-tx. (review H1)
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s (newest first for early exit)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    false
+    visit_l0_buffers(Some(ctx), |buf| buf.vertex_tombstones.contains(&vid))
 }
 
 /// Check if an edge is deleted in the L0 chain.
@@ -70,31 +46,7 @@ pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
     // the SSI read-set. No-op outside a write-tx. (review H1)
     record_edge_read(ctx, eid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s (newest first for early exit)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    false
+    visit_l0_buffers(Some(ctx), |buf| buf.tombstones.contains_key(&eid))
 }
 
 /// Records a vertex read into the transaction's SSI read-set, when tracking.
@@ -131,37 +83,12 @@ pub fn lookup_vertex_prop(vid: Vid, prop: &str, ctx: Option<&QueryContext>) -> O
     let ctx = ctx?;
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if let Some(props) = tx_l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if let Some(props) = l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check pending flush L0s (newest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if let Some(props) = pending_l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    None
+    find_in_l0_buffers(ctx, |buf| {
+        buf.vertex_properties
+            .get(&vid)
+            .and_then(|props| props.get(prop))
+            .cloned()
+    })
 }
 
 /// Look up an edge property in the L0 chain.
@@ -171,37 +98,12 @@ pub fn lookup_edge_prop(eid: Eid, prop: &str, ctx: Option<&QueryContext>) -> Opt
     let ctx = ctx?;
     record_edge_read(ctx, eid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if let Some(props) = tx_l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if let Some(props) = l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check pending flush L0s (newest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if let Some(props) = pending_l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    None
+    find_in_l0_buffers(ctx, |buf| {
+        buf.edge_properties
+            .get(&eid)
+            .and_then(|props| props.get(prop))
+            .cloned()
+    })
 }
 
 /// Accumulate all vertex properties from the L0 chain.
@@ -333,91 +235,40 @@ where
     false
 }
 
-/// Overlay L0 properties onto a batch result.
-/// This applies L0 modifications to a set of vertices loaded from storage.
-pub fn overlay_vertex_batch(
-    vid_to_idx: &HashMap<Vid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-    ctx: Option<&QueryContext>,
-) {
-    let ctx = match ctx {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Apply pending flush L0s (oldest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        overlay_vertex_from_l0(&pending_l0, vid_to_idx, result, deleted);
-    }
-
-    // Apply main L0
-    {
-        let l0 = ctx.l0.read();
-        overlay_vertex_from_l0(&l0, vid_to_idx, result, deleted);
-    }
-
-    // Apply transaction L0 (newest, highest priority)
+/// Visit L0 buffers newest-to-oldest, returning the first `Some` a visitor yields.
+///
+/// The value-returning sibling of [`visit_l0_buffers`]: same
+/// transaction-L0 → main-L0 → pending-flush (newest first) order and the same
+/// early exit. The visitor runs while that layer's read guard is held, so it
+/// must clone anything it returns.
+///
+/// Callers MUST record their SSI read *before* calling this. The
+/// antidependency contract requires the observation to be registered whether or
+/// not any layer yields a hit, so read-recording cannot move inside the walk.
+/// (review H1)
+fn find_in_l0_buffers<T, F>(ctx: &QueryContext, mut visitor: F) -> Option<T>
+where
+    F: FnMut(&L0Buffer) -> Option<T>,
+{
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
-        overlay_vertex_from_l0(&tx_l0, vid_to_idx, result, deleted);
-    }
-}
-
-/// Helper to overlay a single L0 buffer onto the batch result.
-fn overlay_vertex_from_l0(
-    l0: &L0Buffer,
-    vid_to_idx: &HashMap<Vid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-) {
-    // Apply tombstones
-    for vid in &l0.vertex_tombstones {
-        if let Some(&idx) = vid_to_idx.get(vid) {
-            deleted[idx] = true;
+        if let Some(v) = visitor(&tx_l0) {
+            return Some(v);
         }
     }
-
-    // Apply property updates
-    for (vid, props) in &l0.vertex_properties {
-        if let Some(&idx) = vid_to_idx.get(vid) {
-            for (k, v) in props {
-                result[idx].insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
-/// Overlay L0 edge properties onto a batch result.
-pub fn overlay_edge_batch(
-    eid_to_idx: &HashMap<Eid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-    ctx: Option<&QueryContext>,
-) {
-    let ctx = match ctx {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Apply pending flush L0s (oldest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        overlay_edge_from_l0(&pending_l0, eid_to_idx, result, deleted);
-    }
-
-    // Apply main L0
     {
         let l0 = ctx.l0.read();
-        overlay_edge_from_l0(&l0, eid_to_idx, result, deleted);
+        if let Some(v) = visitor(&l0) {
+            return Some(v);
+        }
     }
-
-    // Apply transaction L0 (newest, highest priority)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        overlay_edge_from_l0(&tx_l0, eid_to_idx, result, deleted);
+    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
+        let pending_l0 = pending_l0_arc.read();
+        if let Some(v) = visitor(&pending_l0) {
+            return Some(v);
+        }
     }
+    None
 }
 
 /// Check if a vertex exists in any L0 buffer (has topology entry).
@@ -430,31 +281,9 @@ pub fn vertex_exists_in_l0(vid: Vid, ctx: Option<&QueryContext>) -> bool {
     // Existence is an SSI-relevant observation under a write-tx. (review H1)
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    false
+    // Existence is order-independent — any layer holding the key means "exists" —
+    // so the walk's newest-first pending order only affects early exit.
+    visit_l0_buffers(Some(ctx), |buf| buf.vertex_properties.contains_key(&vid))
 }
 
 /// Get the labels for a vertex from the L0 chain.
@@ -672,55 +501,9 @@ pub fn edge_exists_in_l0(eid: Eid, ctx: Option<&QueryContext>) -> bool {
         None => return false,
     };
 
-    // Check transaction L0 first
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Helper to overlay a single L0 buffer's edge data onto the batch result.
-fn overlay_edge_from_l0(
-    l0: &L0Buffer,
-    eid_to_idx: &HashMap<Eid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-) {
-    // Apply tombstones
-    for eid in l0.tombstones.keys() {
-        if let Some(&idx) = eid_to_idx.get(eid) {
-            deleted[idx] = true;
-        }
-    }
-
-    // Apply property updates
-    for (eid, props) in &l0.edge_properties {
-        if let Some(&idx) = eid_to_idx.get(eid) {
-            for (k, v) in props {
-                result[idx].insert(k.clone(), v.clone());
-            }
-        }
-    }
+    // NB: unlike `vertex_exists_in_l0` this deliberately does not record an SSI
+    // read; preserved as-is.
+    visit_l0_buffers(Some(ctx), |buf| buf.edge_endpoints.contains_key(&eid))
 }
 
 #[cfg(test)]

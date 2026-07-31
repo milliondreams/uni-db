@@ -13,12 +13,12 @@ use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 
-use uni_common::Value;
-use uni_common::cypher_value_codec::encode_int;
+use uni_common::cypher_value_codec::{encode, encode_int, encode_string};
+use uni_common::{TemporalValue, Value};
 
 use uni_query_functions::df_udfs::{
-    create_cypher_equal_udf, create_cypher_lt_eq_udf, create_range_udf, encode_cypher_sort_key,
-    invoke_cypher_string_op,
+    create_cypher_equal_udf, create_cypher_list_compare_udf, create_cypher_lt_eq_udf,
+    create_range_udf, encode_cypher_sort_key, invoke_cypher_string_op,
 };
 
 /// Build `ScalarFunctionArgs` from two ready-made `ColumnarValue`s.
@@ -204,5 +204,74 @@ fn repro_finding_13_sort_key_int_collapse() {
         encode_cypher_sort_key(&Value::Int(2)),
         encode_cypher_sort_key(&Value::Float(2.0)),
         "Int(2) and Float(2.0) must produce identical keys"
+    );
+}
+
+/// Invoke `_cypher_list_compare(left, right, op)` on two scalar list operands.
+fn invoke_list_compare(left: &Value, right: &Value, op: &str) -> Option<bool> {
+    let udf = create_cypher_list_compare_udf();
+    let scalar = |bytes: Vec<u8>| ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(bytes)));
+    let args = ScalarFunctionArgs {
+        args: vec![
+            scalar(encode(left)),
+            scalar(encode(right)),
+            scalar(encode_string(op)),
+        ],
+        arg_fields: vec![
+            Arc::new(Field::new("l", DataType::LargeBinary, true)),
+            Arc::new(Field::new("r", DataType::LargeBinary, true)),
+            Arc::new(Field::new("op", DataType::LargeBinary, true)),
+        ],
+        number_rows: 1,
+        return_field: Arc::new(Field::new("res", DataType::Boolean, true)),
+        config_options: Arc::new(ConfigOptions::default()),
+    };
+    match udf.invoke_with_args(args).unwrap() {
+        ColumnarValue::Array(arr) => {
+            let b = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            (!b.is_null(0)).then(|| b.value(0))
+        }
+        ColumnarValue::Scalar(ScalarValue::Boolean(v)) => v,
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
+/// `cypher_value_cmp` (df_udfs.rs) had no `Value::Temporal` arm, so temporals fell
+/// through to `_ => None` and every list-of-temporals comparison returned NULL —
+/// while the interpreter path (`expr_eval::cypher_partial_cmp`) compared them
+/// correctly. This pins the two paths together.
+#[test]
+fn repro_cypher_value_cmp_missing_temporal_arm() {
+    let date = |days: i32| {
+        Value::List(vec![Value::Temporal(TemporalValue::Date {
+            days_since_epoch: days,
+        })])
+    };
+
+    // 2024-01-15 (19737) vs 2024-01-16 (19738).
+    assert_eq!(
+        invoke_list_compare(&date(19737), &date(19738), "lt"),
+        Some(true),
+        "[date(2024-01-15)] < [date(2024-01-16)] must be true, not NULL"
+    );
+    assert_eq!(
+        invoke_list_compare(&date(19738), &date(19737), "lt"),
+        Some(false),
+        "comparison must be antisymmetric, not NULL in both directions"
+    );
+    assert_eq!(
+        invoke_list_compare(&date(19737), &date(19737), "lteq"),
+        Some(true),
+        "equal dates must satisfy <="
+    );
+
+    // Mismatched temporal types stay incomparable (NULL), as in `expr_eval`.
+    let time = Value::List(vec![Value::Temporal(TemporalValue::LocalTime {
+        nanos_since_midnight: 0,
+    })]);
+    assert_eq!(
+        invoke_list_compare(&date(19737), &time, "lt"),
+        None,
+        "Date vs LocalTime must remain incomparable"
     );
 }

@@ -944,54 +944,22 @@ fn replace_aggregates_with_columns(expr: &Expr) -> Expr {
 
 /// Check if an expression contains any aggregate function (recursively).
 fn contains_aggregate_recursive(expr: &Expr) -> bool {
-    match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            is_aggregate_function_name(name) || args.iter().any(contains_aggregate_recursive)
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            contains_aggregate_recursive(left) || contains_aggregate_recursive(right)
-        }
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::IsUnique(e) => contains_aggregate_recursive(e),
-        Expr::List(items) => items.iter().any(contains_aggregate_recursive),
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            expr.as_deref().is_some_and(contains_aggregate_recursive)
-                || when_then.iter().any(|(w, t)| {
-                    contains_aggregate_recursive(w) || contains_aggregate_recursive(t)
-                })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(contains_aggregate_recursive)
-        }
-        Expr::In { expr, list } => {
-            contains_aggregate_recursive(expr) || contains_aggregate_recursive(list)
-        }
-        Expr::Property(base, _) => contains_aggregate_recursive(base),
-        Expr::ListComprehension { list, .. } => {
-            // Only check the list source — where_clause/map_expr reference the loop variable
-            contains_aggregate_recursive(list)
-        }
-        Expr::Quantifier { list, .. } => contains_aggregate_recursive(list),
-        Expr::Reduce { init, list, .. } => {
-            contains_aggregate_recursive(init) || contains_aggregate_recursive(list)
-        }
-        Expr::ArrayIndex { array, index } => {
-            contains_aggregate_recursive(array) || contains_aggregate_recursive(index)
-        }
-        Expr::ArraySlice { array, start, end } => {
-            contains_aggregate_recursive(array)
-                || start.as_deref().is_some_and(contains_aggregate_recursive)
-                || end.as_deref().is_some_and(contains_aggregate_recursive)
-        }
-        Expr::Map(entries) => entries.iter().any(|(_, v)| contains_aggregate_recursive(v)),
-        _ => false,
+    if matches!(expr, Expr::FunctionCall { name, .. } if is_aggregate_function_name(name)) {
+        return true;
     }
+    // `for_each_child_in_scope`, not `for_each_child`: an aggregate inside a
+    // comprehension's body belongs to the comprehension, not to the query
+    // containing it. Using the scoped walk keeps that narrowing while picking
+    // up the variants the old hand-rolled match silently missed through its
+    // `_ => false` arm — `MapProjection`, `ValidAt` and `LabelCheck`. Missing
+    // `MapProjection` made `RETURN n{.name, c: count(*)}` fail to plan.
+    let mut found = false;
+    expr.for_each_child_in_scope(&mut |child| {
+        if !found {
+            found = contains_aggregate_recursive(child);
+        }
+    });
+    found
 }
 
 /// Check if an expression contains a non-deterministic function (e.g. rand()).
@@ -1089,74 +1057,30 @@ enum NonAggregateRef {
     },
 }
 
-fn collect_non_aggregate_refs(expr: &Expr, inside_agg: bool, out: &mut Vec<NonAggregateRef>) {
+fn collect_non_aggregate_refs(expr: &Expr, out: &mut Vec<NonAggregateRef>) {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if is_aggregate_function_name(name) {
-                return;
-            }
-            for arg in args {
-                collect_non_aggregate_refs(arg, inside_agg, out);
-            }
-        }
-        Expr::Variable(v) if !inside_agg => out.push(NonAggregateRef::Var(v.clone())),
-        Expr::Property(base, _) if !inside_agg => {
-            let base_var = if let Expr::Variable(v) = base.as_ref() {
-                Some(v.clone())
-            } else {
-                None
+        // An aggregate's arguments are grouped over — they are not group keys.
+        Expr::FunctionCall { name, .. } if is_aggregate_function_name(name) => {}
+        Expr::Variable(v) => out.push(NonAggregateRef::Var(v.clone())),
+        // A property reference is itself a key; do not descend into its base.
+        Expr::Property(base, _) => {
+            let base_var = match base.as_ref() {
+                Expr::Variable(v) => Some(v.clone()),
+                _ => None,
             };
             out.push(NonAggregateRef::Property {
                 repr: expr.to_string_repr(),
                 base_var,
             });
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_non_aggregate_refs(left, inside_agg, out);
-            collect_non_aggregate_refs(right, inside_agg, out);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnique(expr) => collect_non_aggregate_refs(expr, inside_agg, out),
-        Expr::List(items) => {
-            for item in items {
-                collect_non_aggregate_refs(item, inside_agg, out);
-            }
-        }
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = expr {
-                collect_non_aggregate_refs(e, inside_agg, out);
-            }
-            for (w, t) in when_then {
-                collect_non_aggregate_refs(w, inside_agg, out);
-                collect_non_aggregate_refs(t, inside_agg, out);
-            }
-            if let Some(e) = else_expr {
-                collect_non_aggregate_refs(e, inside_agg, out);
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_non_aggregate_refs(expr, inside_agg, out);
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        // For ListComprehension/Quantifier/Reduce, only recurse into the `list`
-        // source. The body references the loop variable, not outer-scope vars.
-        Expr::ListComprehension { list, .. } => {
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        Expr::Quantifier { list, .. } => {
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        Expr::Reduce { init, list, .. } => {
-            collect_non_aggregate_refs(init, inside_agg, out);
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        _ => {}
+        // Everything else contributes whatever its in-scope children do. The
+        // old hand-rolled match ended in `_ => {}`, so `MapProjection`,
+        // `ValidAt`, `LabelCheck`, `Map`, `ArrayIndex` and `ArraySlice` never
+        // yielded group keys — which is why `RETURN n{.name, c: count(*)}`
+        // planned without `n.name` in the grouping and failed on its schema.
+        other => other.for_each_child_in_scope(&mut |child| {
+            collect_non_aggregate_refs(child, out);
+        }),
     }
 }
 
@@ -1178,7 +1102,7 @@ fn validate_with_order_by_aggregate_item(
     }
 
     let mut refs = Vec::new();
-    collect_non_aggregate_refs(expr, false, &mut refs);
+    collect_non_aggregate_refs(expr, &mut refs);
     refs.retain(|r| match r {
         NonAggregateRef::Var(v) => !projected_aliases.contains(v),
         NonAggregateRef::Property { repr, .. } => !projected_simple_reprs.contains(repr),
@@ -3072,7 +2996,7 @@ impl QueryPlanner {
                 group_by.iter().map(|e| e.to_string_repr()).collect();
             for expr in &compound_agg_exprs {
                 let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, false, &mut refs);
+                collect_non_aggregate_refs(expr, &mut refs);
                 for r in &refs {
                     let is_covered = match r {
                         NonAggregateRef::Var(v) => group_by_reprs.contains(v),
@@ -7173,7 +7097,7 @@ impl QueryPlanner {
                 group_by.iter().map(|e| e.to_string_repr()).collect();
             for expr in &compound_agg_exprs {
                 let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, false, &mut refs);
+                collect_non_aggregate_refs(expr, &mut refs);
                 for r in &refs {
                     let is_covered = match r {
                         NonAggregateRef::Var(v) => group_by_reprs.contains(v),

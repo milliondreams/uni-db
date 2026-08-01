@@ -210,10 +210,53 @@ fn rows_for_results(
         .collect()
 }
 
+/// Coarse in-memory size estimate for a result batch: a per-value size plus a
+/// fixed 64-byte overhead.
+///
+/// Shared by the materializing and cursor paths so the two cannot drift — the
+/// cursor previously had no accounting at all, and a second copy of this
+/// formula would have let the same query be accepted by one path and rejected
+/// by the other.
+fn estimate_result_bytes(results: &[HashMap<String, ApiValue>]) -> usize {
+    results
+        .iter()
+        .map(|row| {
+            row.values()
+                .map(|v| std::mem::size_of_val(v) + 64)
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The error both paths raise when `max_query_memory` is exceeded.
+fn memory_limit_error(estimated_bytes: usize, max_mem: usize, cypher: &str) -> UniError {
+    UniError::Query {
+        message: format!(
+            "Query exceeded memory limit ({estimated_bytes} bytes > {max_mem} byte limit)"
+        ),
+        query: Some(cypher.to_string()),
+    }
+}
+
+/// The error both paths raise when `query_timeout` elapses.
+fn query_timed_out_error(cypher: &str) -> UniError {
+    UniError::Query {
+        message: "Query timed out".to_string(),
+        query: Some(cypher.to_string()),
+    }
+}
+
+/// The error the cursor path raises when its cancellation token fires.
+fn query_cancelled_error(cypher: &str) -> UniError {
+    UniError::Query {
+        message: "Query cancelled".to_string(),
+        query: Some(cypher.to_string()),
+    }
+}
+
 /// Reject a result set whose estimated in-memory size exceeds `max_mem` bytes.
 ///
-/// A `max_mem` of `0` disables the limit. The estimate is a coarse per-value
-/// size plus a fixed 64-byte overhead, matching the historical accounting.
+/// A `max_mem` of `0` disables the limit.
 fn enforce_memory_limit(
     results: &[HashMap<String, ApiValue>],
     max_mem: usize,
@@ -222,21 +265,9 @@ fn enforce_memory_limit(
     if max_mem == 0 {
         return Ok(());
     }
-    let estimated_bytes: usize = results
-        .iter()
-        .map(|row| {
-            row.values()
-                .map(|v| std::mem::size_of_val(v) + 64)
-                .sum::<usize>()
-        })
-        .sum();
+    let estimated_bytes = estimate_result_bytes(results);
     if estimated_bytes > max_mem {
-        return Err(UniError::Query {
-            message: format!(
-                "Query exceeded memory limit ({estimated_bytes} bytes > {max_mem} byte limit)"
-            ),
-            query: Some(cypher.to_string()),
-        });
+        return Err(memory_limit_error(estimated_bytes, max_mem, cypher));
     }
     Ok(())
 }
@@ -395,6 +426,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -404,18 +436,53 @@ impl crate::api::UniInner {
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
+        if let Some(ref token) = cancellation_token {
+            executor.set_cancellation_token(token.clone());
+        }
 
         let projection_order = extract_projection_order(&logical_plan);
         let projection_order_for_rows = projection_order.clone();
         let cypher_for_error = cypher.to_string();
+        let cypher_for_limits = cypher.to_string();
         let batch_size = config.batch_size;
+        let max_mem = config.max_query_memory;
+
+        // Mirrors `execute_plan_internal`, which enforces the deadline twice:
+        // a `tokio::time::timeout` around execution (installed below) plus an
+        // explicit post-execution comparison. The second one is load-bearing —
+        // an in-memory query can finish the whole plan inside a single poll
+        // without ever returning `Pending`, so the timer never gets a chance to
+        // fire and only the elapsed-time comparison catches the overrun.
+        let exec_deadline = Instant::now() + config.query_timeout;
 
         let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
+
+        // Running total across batches, mirroring how the materializing path
+        // measures the whole result set at once. `execute_stream` currently
+        // yields a single batch, so the two agree exactly; accumulating keeps
+        // that true if it ever becomes genuinely incremental.
+        let mut streamed_bytes: usize = 0;
 
         // Convert raw hash-map batches to Row batches, chunked by batch_size.
         let row_stream = stream
             .map(move |batch_res| {
                 let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
+                // Applied to the executor's own output, not to the re-chunked
+                // pieces below, so a slow consumer paging an already-computed
+                // result is not charged against the query's execution budget.
+                if Instant::now() > exec_deadline {
+                    return Err(query_timed_out_error(&cypher_for_limits));
+                }
+                if max_mem > 0 {
+                    streamed_bytes = streamed_bytes.saturating_add(estimate_result_bytes(&results));
+                    if streamed_bytes > max_mem {
+                        return Err(memory_limit_error(
+                            streamed_bytes,
+                            max_mem,
+                            &cypher_for_limits,
+                        ));
+                    }
+                }
                 if results.is_empty() {
                     return Ok(vec![]);
                 }
@@ -434,10 +501,65 @@ impl crate::api::UniInner {
                 },
             );
 
+        // Wall-clock ceiling and cooperative cancellation.
+        //
+        // The materializing path gets both from `execute_plan_internal`, which
+        // wraps execution in `tokio::time::timeout` and hands the token to the
+        // executor. Neither reached the cursor, so `.timeout()`,
+        // `.max_memory()` and `.cancellation_token()` were all accepted by the
+        // builder and silently ignored once `.cursor()` was the terminal.
+        //
+        // `GraphContext::check_timeout` is not sufficient on its own: it fires
+        // only where an operator happens to call it, and no scan/join/traverse
+        // plan reaches one — which is why the executor token set above needs
+        // this outer guard to have any observable effect.
+        //
+        // The deadline is absolute from cursor creation, matching the
+        // materializing path's ceiling on execution. That is exact while
+        // `execute_stream` yields a single batch (all work happens in the first
+        // poll and later polls resolve immediately from the materialized
+        // vector). If it ever streams incrementally, revisit whether a slow
+        // consumer should be charged against the query's own budget.
+        let deadline = tokio::time::Instant::now() + config.query_timeout;
+        let cypher_for_guard = cypher.to_string();
+        let guarded = futures::stream::unfold(Some(row_stream.boxed()), move |state| {
+            let token = cancellation_token.clone();
+            let cypher = cypher_for_guard.clone();
+            async move {
+                let stream = state?;
+                let next = stream.into_future();
+                let outcome = match token {
+                    // `biased` so an already-cancelled token wins
+                    // deterministically rather than racing the first poll.
+                    Some(token) => tokio::select! {
+                        biased;
+                        _ = token.cancelled() => None,
+                        res = tokio::time::timeout_at(deadline, next) => Some(res),
+                    },
+                    None => Some(tokio::time::timeout_at(deadline, next).await),
+                };
+                match outcome {
+                    // Emit the failure once, then end the stream — re-polling a
+                    // timed-out or cancelled cursor must not yield the same
+                    // error forever.
+                    None => Some((Err(query_cancelled_error(&cypher)), None)),
+                    Some(Err(_elapsed)) => Some((Err(query_timed_out_error(&cypher)), None)),
+                    Some(Ok((Some(item), rest))) => Some((item, Some(rest))),
+                    Some(Ok((None, _exhausted))) => None,
+                }
+            }
+        });
+
         // We need columns ahead of time for QueryCursor if possible.
         let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
 
-        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
+        // `.fuse()` is required, not cosmetic: `stream::unfold` panics if polled
+        // after it yields `None`, and callers legitimately do that — an empty
+        // result set polls once, and `fetch_one()` on an exhausted cursor polls
+        // again to confirm exhaustion. The previous `map`/`flat_map` chain
+        // tolerated it, so dropping the fuse turns a supported call into a
+        // panic that crosses the pyo3 boundary.
+        Ok(QueryCursor::new(columns, Box::pin(guarded.fuse())))
     }
 
     pub(crate) async fn execute_internal(

@@ -1581,9 +1581,12 @@ impl<'a> QueryBuilder<'a> {
         uni_query::scoped_with_session_context(
             session_pr,
             session_principal,
-            self.session
-                .db
-                .execute_cursor_internal_with_config(&self.cypher, params, db_config),
+            self.session.db.execute_cursor_internal_with_config(
+                &self.cypher,
+                params,
+                db_config,
+                self.cancellation_token,
+            ),
         )
         .await
     }

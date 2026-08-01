@@ -60,3 +60,162 @@ async fn test_query_memory_limit() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Cursor parity — the streaming path must enforce the same limits
+// ---------------------------------------------------------------------------
+//
+// `QueryBuilder::cursor` advertises `.timeout()`, `.max_memory()` and
+// `.cancellation_token()`, but enforcement lived entirely in the materializing
+// path: `execute_plan_internal` wraps execution in `tokio::time::timeout` and
+// calls `enforce_memory_limit`, while `execute_cursor_internal_with_config`
+// did neither and never received the token at all. Every limit the builder
+// accepted was silently inert once `.cursor()` was the terminal.
+//
+// The cooperative `GraphContext::check_timeout` is not a substitute: it only
+// fires where an operator happens to call it, and no scan/join/traverse plan
+// exercised here reaches one. `test_concurrent_query_cancellation_isolation`
+// documents the same weakness from the other side — it accepts a cancelled
+// query "racing to completion" as a valid outcome.
+
+/// Drain a cursor to exhaustion, returning the first streamed error.
+async fn drain_cursor(mut cursor: uni_query::QueryCursor) -> Option<String> {
+    while let Some(batch) = cursor.next_batch().await {
+        if let Err(e) = batch {
+            return Some(e.to_string());
+        }
+    }
+    None
+}
+
+async fn seeded_db() -> Result<Uni> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+    let tx = db.session().tx().await?;
+    for _ in 0..100 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+    Ok(db)
+}
+
+#[tokio::test]
+async fn test_query_memory_limit_applies_to_cursor() -> Result<()> {
+    let db = seeded_db().await?;
+
+    // Identical query and limit to `test_query_memory_limit`, which rejects.
+    let cursor = db
+        .session()
+        .query_with("MATCH (n:Node) RETURN n")
+        .max_memory(100)
+        .cursor()
+        .await?;
+
+    let err = drain_cursor(cursor).await.expect(
+        "cursor streamed every row under a 100-byte ceiling; `fetch_all` \
+         rejects the same query with the same limit",
+    );
+    assert!(
+        err.contains("Query exceeded memory limit"),
+        "expected the memory-limit error `fetch_all` produces, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_query_timeout_applies_to_cursor() -> Result<()> {
+    let db = seeded_db().await?;
+
+    // Identical query and timeout to `test_query_timeout`, which rejects.
+    let cursor = db
+        .session()
+        .query_with("MATCH (n:Node) RETURN n")
+        .timeout(Duration::from_nanos(1))
+        .cursor()
+        .await?;
+
+    let err = drain_cursor(cursor).await.expect(
+        "cursor ran to completion under a 1ns timeout; `fetch_all` rejects \
+         the same query with the same timeout",
+    );
+    assert!(
+        err.contains("Query timed out"),
+        "expected the timeout error `fetch_all` produces, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cancellation_token_aborts_a_cursor() -> Result<()> {
+    let db = seeded_db().await?;
+
+    // Pre-cancelled: the outcome must be deterministic, not a race.
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+
+    let cursor = db
+        .session()
+        .query_with("MATCH (n:Node) RETURN n")
+        .cancellation_token(token)
+        .cursor()
+        .await?;
+
+    let err = drain_cursor(cursor).await.expect(
+        "cursor streamed every row despite an already-cancelled token; \
+         `QueryBuilder::cursor` never read `self.cancellation_token`",
+    );
+    assert!(
+        err.contains("cancelled"),
+        "expected a cancellation error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cursor_tolerates_polling_past_exhaustion() -> Result<()> {
+    // The limit guard wraps the row stream in `stream::unfold`, which panics
+    // outright if polled after it has yielded `None`. Two supported call
+    // patterns do exactly that, and neither is exotic:
+    //
+    //   * an empty result set — the very first poll is also the last;
+    //   * `fetch_one()` on a drained cursor, which polls again to confirm
+    //     exhaustion and is how Python's cursor reports "no more rows".
+    //
+    // The pre-guard `map`/`flat_map` chain tolerated both, so the guard has to
+    // be `.fuse()`d. Without it the panic crosses the pyo3 boundary as a hard
+    // abort rather than a Python exception.
+    let db = seeded_db().await?;
+
+    // Empty result: exhausted immediately, then polled once more.
+    let mut empty = db
+        .session()
+        .query_with("MATCH (n:Node) WHERE n.missing = 'nope' RETURN n")
+        .cursor()
+        .await?;
+    while let Some(batch) = empty.next_batch().await {
+        batch?;
+    }
+    assert!(
+        empty.next_batch().await.is_none(),
+        "re-polling an exhausted empty cursor must stay None"
+    );
+
+    // Non-empty result, drained and then over-polled twice.
+    let mut full = db
+        .session()
+        .query_with("MATCH (n:Node) RETURN n")
+        .cursor()
+        .await?;
+    let mut seen = 0usize;
+    while let Some(batch) = full.next_batch().await {
+        seen += batch?.len();
+    }
+    assert_eq!(seen, 100, "cursor must stream every seeded row");
+    assert!(full.next_batch().await.is_none());
+    assert!(full.next_batch().await.is_none());
+
+    Ok(())
+}

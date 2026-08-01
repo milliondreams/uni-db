@@ -186,6 +186,32 @@ pub fn guest_emit_columns(fields: &[arrow_schema::Field]) -> Vec<String> {
         .collect()
 }
 
+/// Map an algorithm `yields` type token to the Arrow [`DataType`] the emit path
+/// can actually build.
+///
+/// Deliberately narrower than the loaders' general `type_name_to_datatype`,
+/// which also serves scalar UDFs and procedures where `Utf8`/`Boolean` are
+/// perfectly buildable. The algorithm emit channel is `Vec<f64>` per column, and
+/// every `build_batch` handles exactly `Int64` and `Float64` — so a declaration
+/// of `score:string` used to register cleanly and then fail on *every* CALL with
+/// "unsupported emit column type". Rejecting at load turns a permanently broken
+/// algorithm into an immediate, legible error.
+///
+/// Do not widen this to `arg_type_from_token`: that maps `value` to
+/// `CypherValue` and `list` to `Vector`, which are right for *arguments* and
+/// which `build_batch` can build even less than `Utf8`.
+///
+/// Returns `None` for anything unbuildable, so each loader can wrap the failure
+/// in its own error type.
+#[must_use]
+pub fn algorithm_yield_datatype(token: &str) -> Option<arrow_schema::DataType> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "float" | "float64" | "double" | "f64" => Some(arrow_schema::DataType::Float64),
+        "int" | "int64" | "long" | "i64" => Some(arrow_schema::DataType::Int64),
+        _ => None,
+    }
+}
+
 /// Native-work budget multiplier applied to graph size to derive the default cap.
 ///
 /// The default budget is `min(DEFAULT_WORK_EDGE_MULTIPLIER * (|V| + |E|),

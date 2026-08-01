@@ -396,3 +396,63 @@ async fn pyo3_guest_reads_a_named_scope() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Yield types the emit path cannot assemble must be rejected at load
+// ---------------------------------------------------------------------------
+//
+// Companion to the rhai fixture's pair. The PyO3 loader mapped `yields` tokens
+// through the general type map, which also serves scalar UDFs and procedures
+// and so accepts `string`/`bool`. The algorithm emit channel is `Vec<f64>` per
+// column and `build_batch` handles exactly Int64/Float64, so such a declaration
+// registered cleanly and failed on every CALL with `0x862 unsupported emit
+// column type` — permanently broken, reported at the call site rather than at
+// the manifest.
+
+const BAD_YIELD_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pybadyield")
+db.set_version("0.1.0")
+
+@db.algorithm("labelled", args=["int"], yields=["nodeId:int", "label:string"])
+def labelled(gc, source):
+    g = gc.graph()
+    d = gc.degrees(g, "out")
+    gc.emit("label", d)
+"#;
+
+#[tokio::test]
+async fn pyo3_string_yield_is_rejected_at_load() -> anyhow::Result<()> {
+    Python::initialize();
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader =
+        uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pybadyield");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+
+    let msg = Python::attach(|py| {
+        db.load_python_plugin(
+            py,
+            &loader,
+            BAD_YIELD_MODULE,
+            "ai.example.pybadyield",
+            &caps,
+        )
+        .expect_err("a yield type the emit path cannot build must fail to load")
+        .to_string()
+    });
+
+    assert!(
+        msg.contains("string") && msg.contains("int or float"),
+        "the error must name the offending token and the buildable set, got: {msg}"
+    );
+
+    Ok(())
+}

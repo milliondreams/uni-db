@@ -379,7 +379,18 @@ fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignatur
         .iter()
         .enumerate()
         .map(|(i, y)| {
-            let dt = type_name_to_datatype(&y.type_name)?;
+            // See the pyo3 loader: algorithm yields are narrower than the
+            // general type map, because the emit channel is `Vec<f64>`.
+            let dt = uni_plugin_builtin::algorithms::graph_compute::algorithm_yield_datatype(
+                &y.type_name,
+            )
+            .ok_or_else(|| {
+                RhaiError::ManifestInvalid(format!(
+                    "algorithm `{}` declares yield type `{}`, which the emit path cannot \
+                     build; algorithm yields must be int or float",
+                    entry.name, y.type_name
+                ))
+            })?;
             let name = y.name.clone().unwrap_or_else(|| format!("col{i}"));
             Ok(Field::new(name, dt, false))
         })

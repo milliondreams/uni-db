@@ -561,3 +561,88 @@ async fn a_non_corresponding_cypher_scope_is_refused_by_rekey() -> anyhow::Resul
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Yield types the emit path cannot assemble must be rejected at load
+// ---------------------------------------------------------------------------
+//
+// The loaders mapped `yields` tokens through the *general* type map, which also
+// serves scalar UDFs and procedures and therefore accepts string/bool (and, on
+// rhai, f32/i32/null). But the algorithm emit channel is `Vec<f64>` per column
+// and every `build_batch` handles exactly Int64 and Float64.
+//
+// So `yields: ["label:string"]` registered cleanly and then failed on *every*
+// CALL with `0x862 unsupported emit column type` — an algorithm that could
+// never work, reported as a runtime fault at the call site rather than a
+// manifest error at the point the mistake was made.
+
+/// A manifest whose yield type the emit path cannot build.
+const BAD_YIELD_SCRIPT: &str = r#"
+    fn uni_manifest() {
+        #{
+            id: "ai.example.badyield",
+            version: "0.1.0",
+            determinism: "pure",
+            algorithms: [
+                #{ name: "labelled", args: ["int"], yields: ["nodeId:int", "label:string"] },
+            ],
+        }
+    }
+
+    fn labelled(gc, source) {
+        let g = gc.graph();
+        let front = gc.frontier(g, [source]);
+        let seen = gc.set_to_map(front, 1.0);
+        gc.free(front);
+        gc.emit("label", seen);
+    }
+"#;
+
+#[tokio::test]
+async fn rhai_string_yield_is_rejected_at_load() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+
+    let err = db
+        .load_rhai_plugin(&loader, BAD_YIELD_SCRIPT, &caps)
+        .expect_err("a yield type the emit path cannot build must fail to load");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("string") && msg.contains("int or float"),
+        "the error must name the offending token and the buildable set, got: {msg}"
+    );
+
+    Ok(())
+}
+
+/// Inverse guard: the numeric tokens every real algorithm uses still load.
+#[tokio::test]
+async fn rhai_numeric_yields_still_load() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader = uni_plugin_rhai::RhaiLoader::new();
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    db.load_rhai_plugin(&loader, PPR_SCRIPT, &caps)
+        .expect("int/float yields load");
+
+    Ok(())
+}

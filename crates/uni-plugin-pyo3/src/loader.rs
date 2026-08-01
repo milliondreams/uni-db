@@ -545,7 +545,20 @@ fn register_algorithms(
                     Some((n, t)) => (n.trim().to_string(), t.trim()),
                     None => (format!("col{i}"), spec.as_str()),
                 };
-                let dt = type_name_to_datatype(type_name)?;
+                // Algorithm yields are narrower than the general type map:
+                // the emit channel is `Vec<f64>` and `build_batch` can only
+                // assemble Int64/Float64, so accepting `string`/`bool` here
+                // registered an algorithm that failed on every CALL.
+                let dt = uni_plugin_builtin::algorithms::graph_compute::algorithm_yield_datatype(
+                    type_name,
+                )
+                .ok_or_else(|| {
+                    PyPluginError::ManifestInvalid(format!(
+                        "algorithm `{}` declares yield type `{type_name}`, which the emit \
+                         path cannot build; algorithm yields must be int or float",
+                        entry.name
+                    ))
+                })?;
                 Ok(Field::new(name, dt, false))
             })
             .collect::<Result<_, PyPluginError>>()?;

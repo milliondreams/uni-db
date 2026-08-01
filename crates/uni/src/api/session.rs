@@ -1082,6 +1082,20 @@ impl Session {
         self.cancellation_token.read().unwrap().clone()
     }
 
+    /// The cancellation scope statements issued on this session run under.
+    ///
+    /// Every execution path takes one of these, so `cancel()` reaches work that
+    /// is already in flight. Previously only `QueryBuilder` with an explicit
+    /// token carried anything down, and the plain `query()` path passed `None`
+    /// at each of its three call sites — which made `Session::cancel()` inert
+    /// for the most common way of running a query.
+    pub(crate) fn cancel_scope(
+        &self,
+        caller: Option<CancellationToken>,
+    ) -> crate::api::impl_query::CancelScope {
+        crate::api::impl_query::CancelScope::new(Some(self.cancellation_token()), caller)
+    }
+
     // ── Prepared Statements ──────────────────────────────────────────
 
     /// Prepare a Cypher query for repeated execution.
@@ -1095,7 +1109,13 @@ impl Session {
             self.hooks.values().cloned().collect(),
             self.id.clone(),
         );
-        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher, guards).await
+        crate::api::prepared::PreparedQuery::new(
+            self.db.clone(),
+            cypher,
+            guards,
+            self.cancel_scope(None),
+        )
+        .await
     }
 
     /// Prepare a Locy program for repeated evaluation.
@@ -1312,8 +1332,13 @@ impl Session {
             return uni_query::scoped_with_session_context(
                 session_pr,
                 session_principal,
-                self.db
-                    .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None),
+                self.db.execute_plan_internal(
+                    plan,
+                    cypher,
+                    params,
+                    self.db.config.clone(),
+                    self.cancel_scope(None),
+                ),
             )
             .await;
         }
@@ -1338,8 +1363,12 @@ impl Session {
             return uni_query::scoped_with_session_context(
                 Arc::clone(&session_pr),
                 session_principal.clone(),
-                self.db
-                    .execute_internal_with_config(cypher, params, self.db.config.clone()),
+                self.db.execute_internal_with_config(
+                    cypher,
+                    params,
+                    self.db.config.clone(),
+                    self.cancel_scope(None),
+                ),
             )
             .await;
         }
@@ -1381,7 +1410,7 @@ impl Session {
                 cypher,
                 params,
                 self.db.config.clone(),
-                None,
+                self.cancel_scope(None),
             ),
         )
         .await
@@ -1545,7 +1574,7 @@ impl<'a> QueryBuilder<'a> {
                     &self.cypher,
                     params,
                     db_config,
-                    self.cancellation_token,
+                    self.session.cancel_scope(self.cancellation_token),
                 ),
             )
             .await
@@ -1585,7 +1614,7 @@ impl<'a> QueryBuilder<'a> {
                 &self.cypher,
                 params,
                 db_config,
-                self.cancellation_token,
+                self.session.cancel_scope(self.cancellation_token),
             ),
         )
         .await

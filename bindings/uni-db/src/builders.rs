@@ -1639,6 +1639,10 @@ pub struct PyTxQueryBuilder {
     pub(crate) cypher: String,
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
+    /// Mirrors `SessionQueryBuilder`. Its absence made the whole transaction
+    /// surface uncancellable from Python even though the Rust builder this
+    /// wraps has carried the field all along.
+    pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -1655,6 +1659,15 @@ impl PyTxQueryBuilder {
         slf
     }
 
+    /// Attach a cancellation token for cooperative query cancellation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Fetch all results as a `QueryResult`.
     fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let tx_ref = self.tx.borrow(py);
@@ -1668,6 +1681,9 @@ impl PyTxQueryBuilder {
         }
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
@@ -1692,6 +1708,9 @@ impl PyTxQueryBuilder {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
         }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
         let result = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -1711,6 +1730,9 @@ impl PyTxQueryBuilder {
         }
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let cursor = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.cursor()))

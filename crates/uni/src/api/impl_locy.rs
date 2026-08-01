@@ -1386,7 +1386,13 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                 .await
         } else {
             self.db
-                .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
+                .execute_ast_internal(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    crate::api::impl_query::CancelScope::default(),
+                )
                 .await
         }
         .map_err(|e| LocyError::ExecutorError {
@@ -1446,7 +1452,13 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         // Standard path: mutations go through writer's global L0
         let before = self.db.get_mutation_count().await;
         self.db
-            .execute_ast_internal(ast, "<locy>", params, self.db.config.clone())
+            .execute_ast_internal(
+                ast,
+                "<locy>",
+                params,
+                self.db.config.clone(),
+                crate::api::impl_query::CancelScope::default(),
+            )
             .await
             .map_err(|e| LocyError::ExecutorError {
                 message: e.to_string(),

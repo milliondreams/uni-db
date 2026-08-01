@@ -1570,6 +1570,7 @@ impl AsyncTransaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             timeout_secs: None,
+            cancellation_token: None,
         }
     }
 
@@ -3665,6 +3666,9 @@ pub struct AsyncTxQueryBuilder {
     cypher: String,
     params: HashMap<String, Py<PyAny>>,
     timeout_secs: Option<f64>,
+    /// Mirrors the sync `TxQueryBuilder`; the cross-language surfaces must not
+    /// drift apart.
+    cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -3681,12 +3685,22 @@ impl AsyncTxQueryBuilder {
         slf
     }
 
+    /// Attach a cancellation token for cooperative query cancellation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Fetch all results (returns awaitable QueryResult).
     fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rust_params = convert::convert_params_ref(py, &self.params)?;
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3696,6 +3710,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let result = builder
                 .fetch_all()
@@ -3711,6 +3728,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3720,6 +3738,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             // `fetch_one` returns at most one `Row`, so only that row is
             // converted to Python instead of materializing the whole result set.
@@ -3740,6 +3761,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3749,6 +3771,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let result = builder
                 .run()
@@ -3767,6 +3792,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3776,6 +3802,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let cursor = builder
                 .cursor()

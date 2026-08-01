@@ -102,7 +102,15 @@ pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniEr
 /// TypeError messages from UDF execution become `UniError::Type` (Runtime phase).
 /// ConstraintVerificationFailed messages become `UniError::Constraint` (Runtime phase).
 /// All other executor errors remain `UniError::Query`.
-fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
+///
+/// `timeout` is the effective `query_timeout` for the statement. The lower
+/// layers signal an elapsed deadline with a bare `anyhow!("Query timed out")`
+/// and cannot know the budget they blew, so it is reattached here.
+fn into_execution_error(
+    e: impl std::fmt::Display,
+    cypher: &str,
+    timeout: std::time::Duration,
+) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
         UniError::GraphComputeIncomplete {
@@ -111,10 +119,7 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     } else if msg.contains("Query cancelled") {
         UniError::Cancelled
     } else if msg.contains("Query timed out") {
-        UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        }
+        query_timed_out_error(timeout)
     } else if msg.contains("Query exceeded memory limit") {
         UniError::Query {
             message: msg,
@@ -137,9 +142,11 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
 
 /// Map a streaming-execution error into the appropriate `UniError`.
 ///
-/// The streaming cursor paths cannot encounter cancellation or timeout (those
-/// are enforced around the eager `execute` call), so this is the
-/// [`into_execution_error`] classification minus those two arms.
+/// This is the [`into_execution_error`] classification minus its cancellation
+/// and timeout arms. Those are still not reachable *here* — the cursor's own
+/// guard in [`UniInner::build_guarded_cursor`] raises them around the stream
+/// rather than letting the executor surface them through this function — so
+/// there is nothing for those two arms to match.
 fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
@@ -238,19 +245,98 @@ fn memory_limit_error(estimated_bytes: usize, max_mem: usize, cypher: &str) -> U
     }
 }
 
-/// The error both paths raise when `query_timeout` elapses.
-fn query_timed_out_error(cypher: &str) -> UniError {
-    UniError::Query {
-        message: "Query timed out".to_string(),
-        query: Some(cypher.to_string()),
+/// The error every path raises when `query_timeout` elapses.
+///
+/// `UniError::Timeout`, not a `Query` carrying the words "Query timed out":
+/// an elapsed deadline is exactly what the typed variant exists for, it carries
+/// the budget that was exceeded, and the bindings map it to a dedicated
+/// `UniTimeoutError`. The transaction builder's own timeout wrapper has always
+/// produced this variant; the session surface used to disagree, so the same
+/// condition surfaced as two different classes depending on which terminal the
+/// caller reached for.
+fn query_timed_out_error(timeout: std::time::Duration) -> UniError {
+    UniError::Timeout {
+        timeout_ms: timeout.as_millis() as u64,
     }
 }
 
 /// The error the cursor path raises when its cancellation token fires.
-fn query_cancelled_error(cypher: &str) -> UniError {
-    UniError::Query {
-        message: "Query cancelled".to_string(),
-        query: Some(cypher.to_string()),
+///
+/// `UniError::Cancelled`, not a generic `Query` — `into_execution_error`
+/// already classifies a cancelled execution that way, and the bindings map it
+/// to a dedicated `UniCancelledError`. Rendering it as `Query` would collapse
+/// it into the same class as every other query failure, which is the exact
+/// defect fixed on the async cursor in the preceding commit.
+fn query_cancelled_error() -> UniError {
+    UniError::Cancelled
+}
+
+/// The cancellation sources a single statement executes under.
+///
+/// uni already scopes cancellation hierarchically — a forked session's token is
+/// a child of its parent's, and a `Transaction`'s is a child of its session's —
+/// so cancelling an outer scope is meant to abort everything running inside it.
+/// A caller may additionally attach a token to one statement through
+/// `.cancellation_token()`.
+///
+/// Those two are independent `CancellationToken`s, and `tokio_util` has no
+/// combinator for "whichever fires first". Merging them would take a spawned
+/// linker task plus a drop guard on every statement, so instead the places that
+/// actually enforce cancellation await both directly.
+///
+/// **The guard is authoritative, the executor's token is an optimisation.**
+/// `Executor::set_cancellation_token` accepts exactly one token and only feeds
+/// `GraphContext::check_timeout`, which fires solely where an operator happens
+/// to call it — no scan/join/traverse plan reaches one. It is worth setting for
+/// the long-running operators that *do* check (traverse, shortest-path,
+/// vector-KNN, procedure calls), but correctness comes from
+/// [`Self::cancelled`], which every terminal races its execution against.
+#[derive(Clone, Default)]
+pub(crate) struct CancelScope {
+    /// The enclosing session or transaction scope.
+    scope: Option<tokio_util::sync::CancellationToken>,
+    /// A token attached to this one statement by the caller.
+    caller: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl CancelScope {
+    pub(crate) fn new(
+        scope: Option<tokio_util::sync::CancellationToken>,
+        caller: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self { scope, caller }
+    }
+
+    /// Resolve as soon as any source is cancelled; pend forever if there are
+    /// none, so callers can `select!` on it unconditionally.
+    pub(crate) async fn cancelled(&self) {
+        match (&self.scope, &self.caller) {
+            (Some(scope), Some(caller)) => {
+                tokio::select! {
+                    _ = scope.cancelled() => {}
+                    _ = caller.cancelled() => {}
+                }
+            }
+            (Some(token), None) | (None, Some(token)) => token.cancelled().await,
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Best-effort token for the executor's in-operator checks.
+    ///
+    /// Prefers the caller's, which is scoped to this statement; the enclosing
+    /// scope's token outlives it and would leave the executor holding a token
+    /// for work it no longer runs. Only one can be installed — see the type
+    /// docs for why that is an optimisation rather than the enforcement point.
+    fn executor_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.caller.clone().or_else(|| self.scope.clone())
+    }
+
+    /// Install the best-effort token on an executor.
+    pub(crate) fn install(&self, executor: &mut uni_query::Executor) {
+        if let Some(token) = self.executor_token() {
+            executor.set_cancellation_token(token);
+        }
     }
 }
 
@@ -410,7 +496,7 @@ impl crate::api::UniInner {
         let (results, profile_output) = executor
             .profile(logical_plan, &params)
             .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+            .map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -426,7 +512,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancelScope,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -436,10 +522,35 @@ impl crate::api::UniInner {
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
-        if let Some(ref token) = cancellation_token {
-            executor.set_cancellation_token(token.clone());
-        }
+        cancel.install(&mut executor);
 
+        Ok(self.build_guarded_cursor(executor, logical_plan, params, cypher, &config, cancel))
+    }
+
+    /// Assemble the streaming cursor shared by the session and transaction
+    /// entry points.
+    ///
+    /// The two callers differ only in how they *prepare* — the session one
+    /// takes a per-query config override, the transaction one rejects
+    /// time-travel and installs the tx-private L0. From the configured executor
+    /// onward the work is identical: batches to rows, re-chunk to `batch_size`,
+    /// and guard the stream against the deadline, the memory ceiling and the
+    /// cancellation token.
+    ///
+    /// That tail used to be copy-pasted into both functions, and the copies
+    /// drifted: every limit added to the session cursor was absent from the
+    /// transaction one, so a transaction cursor streamed unbounded while the
+    /// builder happily accepted `.timeout()` and `.cancellation_token()`.
+    /// Keeping one body is what stops that recurring.
+    fn build_guarded_cursor(
+        &self,
+        executor: uni_query::Executor,
+        logical_plan: LogicalPlan,
+        params: HashMap<String, ApiValue>,
+        cypher: &str,
+        config: &UniConfig,
+        cancel: CancelScope,
+    ) -> QueryCursor {
         let projection_order = extract_projection_order(&logical_plan);
         let projection_order_for_rows = projection_order.clone();
         let cypher_for_error = cypher.to_string();
@@ -453,7 +564,8 @@ impl crate::api::UniInner {
         // an in-memory query can finish the whole plan inside a single poll
         // without ever returning `Pending`, so the timer never gets a chance to
         // fire and only the elapsed-time comparison catches the overrun.
-        let exec_deadline = Instant::now() + config.query_timeout;
+        let query_timeout = config.query_timeout;
+        let exec_deadline = Instant::now() + query_timeout;
 
         let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
 
@@ -471,7 +583,7 @@ impl crate::api::UniInner {
                 // pieces below, so a slow consumer paging an already-computed
                 // result is not charged against the query's execution budget.
                 if Instant::now() > exec_deadline {
-                    return Err(query_timed_out_error(&cypher_for_limits));
+                    return Err(query_timed_out_error(query_timeout));
                 }
                 if max_mem > 0 {
                     streamed_bytes = streamed_bytes.saturating_add(estimate_result_bytes(&results));
@@ -520,30 +632,26 @@ impl crate::api::UniInner {
         // poll and later polls resolve immediately from the materialized
         // vector). If it ever streams incrementally, revisit whether a slow
         // consumer should be charged against the query's own budget.
-        let deadline = tokio::time::Instant::now() + config.query_timeout;
-        let cypher_for_guard = cypher.to_string();
+        let deadline = tokio::time::Instant::now() + query_timeout;
         let guarded = futures::stream::unfold(Some(row_stream.boxed()), move |state| {
-            let token = cancellation_token.clone();
-            let cypher = cypher_for_guard.clone();
+            let cancel = cancel.clone();
             async move {
                 let stream = state?;
                 let next = stream.into_future();
-                let outcome = match token {
-                    // `biased` so an already-cancelled token wins
-                    // deterministically rather than racing the first poll.
-                    Some(token) => tokio::select! {
-                        biased;
-                        _ = token.cancelled() => None,
-                        res = tokio::time::timeout_at(deadline, next) => Some(res),
-                    },
-                    None => Some(tokio::time::timeout_at(deadline, next).await),
+                // `biased` so an already-cancelled scope wins deterministically
+                // rather than racing the first poll. An empty scope pends
+                // forever, so the branch is safe to take unconditionally.
+                let outcome = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    res = tokio::time::timeout_at(deadline, next) => Some(res),
                 };
                 match outcome {
                     // Emit the failure once, then end the stream — re-polling a
                     // timed-out or cancelled cursor must not yield the same
                     // error forever.
-                    None => Some((Err(query_cancelled_error(&cypher)), None)),
-                    Some(Err(_elapsed)) => Some((Err(query_timed_out_error(&cypher)), None)),
+                    None => Some((Err(query_cancelled_error()), None)),
+                    Some(Err(_elapsed)) => Some((Err(query_timed_out_error(query_timeout)), None)),
                     Some(Ok((Some(item), rest))) => Some((item, Some(rest))),
                     Some(Ok((None, _exhausted))) => None,
                 }
@@ -559,7 +667,7 @@ impl crate::api::UniInner {
         // again to confirm exhaustion. The previous `map`/`flat_map` chain
         // tolerated it, so dropping the fuse turns a supported call into a
         // panic that crosses the pyo3 boundary.
-        Ok(QueryCursor::new(columns, Box::pin(guarded.fuse())))
+        QueryCursor::new(columns, Box::pin(guarded.fuse()))
     }
 
     pub(crate) async fn execute_internal(
@@ -567,8 +675,13 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
     ) -> Result<QueryResult> {
-        self.execute_internal_with_config(cypher, params, self.config.clone())
-            .await
+        self.execute_internal_with_config(
+            cypher,
+            params,
+            self.config.clone(),
+            CancelScope::default(),
+        )
+        .await
     }
 
     /// Execute a Cypher query with a private transaction L0 buffer.
@@ -581,6 +694,7 @@ impl crate::api::UniInner {
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -682,15 +796,30 @@ impl crate::api::UniInner {
         if let Some(r) = id_reservoir {
             executor.set_id_reservoir(r);
         }
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        // The transaction's own scope reaches execution here. Without this the
+        // token accepted by `TxQueryBuilder::cancellation_token` was discarded
+        // for want of a parameter to put it in, and `Transaction::cancel()`
+        // cancelled a token nothing was listening to.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = executor.execute(logical_plan, &self.properties, &params) => {
+                res.map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?
+            }
+        };
         let exec_time = exec_start.elapsed();
+
+        // `max_query_memory` was previously enforced only on the session's
+        // materializing paths, so a transaction query had no ceiling at all.
+        // Adding it to the cursor without adding it here would have handed the
+        // transaction surface a fresh asymmetry — streaming stricter than
+        // materializing — which is the shape of defect this work removes.
+        enforce_memory_limit(&results, self.config.max_query_memory, cypher)?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -760,7 +889,7 @@ impl crate::api::UniInner {
         let (results, profile_output) = executor
             .profile(logical_plan, &params)
             .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+            .map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -780,6 +909,8 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -799,40 +930,12 @@ impl crate::api::UniInner {
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
-        executor.set_config(self.config.clone());
+        executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
+        cancel.install(&mut executor);
 
-        let projection_order = extract_projection_order(&logical_plan);
-        let projection_order_for_rows = projection_order.clone();
-        let cypher_for_error = cypher.to_string();
-        let batch_size = self.config.batch_size;
-
-        let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
-
-        let row_stream = stream
-            .map(move |batch_res| {
-                let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
-                if results.is_empty() {
-                    return Ok(vec![]);
-                }
-                let columns = columns_for_results(&results, projection_order_for_rows.clone());
-                Ok(rows_for_results(results, &columns, false))
-            })
-            .flat_map(
-                move |batch_res: std::result::Result<Vec<Row>, UniError>| match batch_res {
-                    Ok(rows) if batch_size > 0 => {
-                        let chunks: Vec<_> =
-                            rows.chunks(batch_size).map(|c| Ok(c.to_vec())).collect();
-                        futures::stream::iter(chunks).boxed()
-                    }
-                    other => futures::stream::iter(vec![other]).boxed(),
-                },
-            );
-
-        let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
-
-        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
+        Ok(self.build_guarded_cursor(executor, logical_plan, params, cypher, &config, cancel))
     }
 
     pub(crate) async fn execute_internal_with_config(
@@ -840,6 +943,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -859,12 +963,12 @@ impl crate::api::UniInner {
             let snapshot_id = self.resolve_time_travel(&spec).await?;
             let pinned = self.at_snapshot(&snapshot_id).await?;
             return pinned
-                .execute_ast_internal(ast, cypher, params, config)
+                .execute_ast_internal(ast, cypher, params, config, cancel)
                 .await;
         }
 
         let mut result = self
-            .execute_ast_internal(ast, cypher, params, config)
+            .execute_ast_internal(ast, cypher, params, config, cancel)
             .await?;
         result.update_parse_timing(parse_time, total_start.elapsed());
         Ok(result)
@@ -876,7 +980,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -894,7 +998,7 @@ impl crate::api::UniInner {
             let snapshot_id = self.resolve_time_travel(&spec).await?;
             let pinned = self.at_snapshot(&snapshot_id).await?;
             return pinned
-                .execute_ast_internal(ast, cypher, params, config)
+                .execute_ast_internal(ast, cypher, params, config, cancel)
                 .await;
         }
 
@@ -902,7 +1006,7 @@ impl crate::api::UniInner {
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut result = self
-            .execute_plan_internal(logical_plan, cypher, params, config, cancellation_token)
+            .execute_plan_internal(logical_plan, cypher, params, config, cancel)
             .await?;
         result.update_parse_timing(parse_time, total_start.elapsed());
         Ok(result)
@@ -935,7 +1039,7 @@ impl crate::api::UniInner {
         let results = executor
             .execute(logical_plan, &self.properties, &params)
             .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+            .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?;
         let exec_time = exec_start.elapsed();
 
         let columns = columns_for_results(&results, projection_order);
@@ -968,6 +1072,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
         let deadline = total_start + config.query_timeout;
@@ -980,30 +1085,30 @@ impl crate::api::UniInner {
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
         let timeout_duration = config.query_timeout;
-        let results = tokio::time::timeout(
-            timeout_duration,
-            executor.execute(logical_plan, &self.properties, &params),
-        )
-        .await
-        .map_err(|_| UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        })?
-        .map_err(|e| into_execution_error(e, cypher))?;
+        // See `execute_plan_internal` for why the scope is raced here rather
+        // than left to the executor's cooperative checks.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = tokio::time::timeout(
+                timeout_duration,
+                executor.execute(logical_plan, &self.properties, &params),
+            ) => res
+                .map_err(|_| query_timed_out_error(timeout_duration))?
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         // Instant-based deadline check for sub-millisecond timeouts that
         // tokio::time::timeout cannot catch due to timer wheel resolution.
         if Instant::now() > deadline {
-            return Err(UniError::Query {
-                message: "Query timed out".to_string(),
-                query: Some(cypher.to_string()),
-            });
+            return Err(query_timed_out_error(timeout_duration));
         }
 
         enforce_memory_limit(&results, config.max_query_memory, cypher)?;
@@ -1072,39 +1177,40 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
-        if let Some(token) = cancellation_token {
-            executor.set_cancellation_token(token);
-        }
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&plan);
 
         let exec_start = Instant::now();
         let deadline = exec_start + config.query_timeout;
         let timeout_duration = config.query_timeout;
-        let results = tokio::time::timeout(
-            timeout_duration,
-            executor.execute(plan, &self.properties, &params),
-        )
-        .await
-        .map_err(|_| UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        })?
-        .map_err(|e| into_execution_error(e, cypher))?;
+        // Race execution against the cancellation scope. Handing the token to
+        // the executor is not sufficient on its own: it only reaches
+        // `GraphContext::check_timeout`, which no scan/join/traverse plan
+        // calls, so a cancelled statement previously ran to completion and
+        // returned its rows. `biased` makes an already-cancelled scope win
+        // deterministically instead of racing the first poll.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = tokio::time::timeout(
+                timeout_duration,
+                executor.execute(plan, &self.properties, &params),
+            ) => res
+                .map_err(|_| query_timed_out_error(timeout_duration))?
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         if Instant::now() > deadline {
-            return Err(UniError::Query {
-                message: "Query timed out".to_string(),
-                query: Some(cypher.to_string()),
-            });
+            return Err(query_timed_out_error(timeout_duration));
         }
 
         enforce_memory_limit(&results, config.max_query_memory, cypher)?;

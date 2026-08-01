@@ -412,6 +412,7 @@ impl Transaction {
             self.tx_l0.clone(),
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
+            self.cancel_scope(None),
         );
         uni_query::maybe_scope_with_principal(principal, fut).await
     }
@@ -607,6 +608,7 @@ impl Transaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             timeout: None,
+            cancellation_token: None,
         }
     }
 
@@ -929,8 +931,14 @@ impl Transaction {
             self.session_id.clone(),
             classify_verb(cypher).to_string(),
         );
-        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding, guards)
-            .await
+        crate::api::prepared::PreparedQuery::new_tx_bound(
+            self.db.clone(),
+            cypher,
+            binding,
+            guards,
+            self.cancel_scope(None),
+        )
+        .await
     }
 
     /// Prepare a Locy program for repeated evaluation within this transaction.
@@ -1435,6 +1443,20 @@ impl Transaction {
         self.cancellation_token.clone()
     }
 
+    /// The cancellation scope statements in this transaction run under.
+    ///
+    /// The transaction's token is a child of its session's, so cancelling the
+    /// session cascades here. Every terminal passes one of these down, which is
+    /// what makes [`Self::cancel`] mean anything — the child token created at
+    /// construction was previously never handed to an executor, so "cancel all
+    /// in-flight queries in this transaction" cancelled nothing.
+    pub(crate) fn cancel_scope(
+        &self,
+        caller: Option<CancellationToken>,
+    ) -> crate::api::impl_query::CancelScope {
+        crate::api::impl_query::CancelScope::new(Some(self.cancellation_token.clone()), caller)
+    }
+
     /// Snapshot the current L0 mutation count and stats for before/after comparison.
     fn snapshot_l0(&self) -> L0Snapshot {
         let l0 = self.tx_l0.read();
@@ -1547,9 +1569,19 @@ pub struct ExecuteBuilder<'a> {
     cypher: String,
     params: HashMap<String, Value>,
     timeout: Option<Duration>,
+    /// Mirrors [`TxQueryBuilder`]. Without it a caller could attach a token to
+    /// a read on this transaction but not to a write, and the mutation
+    /// terminal would silently ignore one.
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl<'a> ExecuteBuilder<'a> {
+    /// Attach a cancellation token for cooperative cancellation.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
     /// Bind a parameter to the mutation.
     pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
         self.params.insert(key.into(), value.into());
@@ -1582,12 +1614,14 @@ impl<'a> ExecuteBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1689,12 +1723,14 @@ impl<'a> TxQueryBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1722,12 +1758,14 @@ impl<'a> TxQueryBuilder<'a> {
     async fn fetch_all_inner(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1757,9 +1795,28 @@ impl<'a> TxQueryBuilder<'a> {
     async fn cursor_inner(self) -> Result<QueryCursor> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+
+        // `execute`/`fetch_all` apply `.timeout()` by wrapping their future in
+        // `tokio::time::timeout`. A cursor returns a stream that outlives this
+        // call, so the ceiling has to travel with the stream instead: it goes
+        // into the config the cursor guard reads. The token likewise has to be
+        // handed down rather than awaited here — until now `cursor_inner`
+        // dropped both on the floor, so a transaction cursor ran unbounded and
+        // uncancellable while the builder accepted the options.
+        let mut config = self.tx.db.config.clone();
+        if let Some(t) = self.timeout {
+            config.query_timeout = t;
+        }
+
         self.tx
             .db
-            .execute_cursor_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
+            .execute_cursor_internal_with_tx_l0(
+                &self.cypher,
+                self.params,
+                self.tx.tx_l0.clone(),
+                config,
+                self.tx.cancel_scope(self.cancellation_token),
+            )
             .await
     }
 }

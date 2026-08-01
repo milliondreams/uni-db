@@ -310,6 +310,7 @@ impl Transaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             timeout_secs: None,
+            cancellation_token: None,
         }
     }
 

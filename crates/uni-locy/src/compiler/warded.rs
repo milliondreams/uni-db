@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use uni_cypher::ast::PatternElement;
+use uni_cypher::ast::{PathPattern, PatternElement};
 use uni_cypher::locy_ast::{DeriveClause, RuleDefinition, RuleOutput};
 
 use super::errors::LocyCompileError;
@@ -25,26 +25,46 @@ pub fn check_wardedness(
 fn extract_match_variables(def: &RuleDefinition) -> HashSet<String> {
     let mut vars = HashSet::new();
     for path in &def.match_pattern.paths {
-        if let Some(v) = &path.variable {
-            vars.insert(v.clone());
-        }
-        for elem in &path.elements {
-            match elem {
-                PatternElement::Node(n) => {
-                    if let Some(v) = &n.variable {
-                        vars.insert(v.clone());
-                    }
+        collect_path_vars(path, &mut vars);
+    }
+    vars
+}
+
+/// Collect every variable a path binds, descending into parenthesized
+/// sub-patterns.
+///
+/// `Parenthesized` is the only `PatternElement` that carries a nested
+/// `PathPattern`, and its arm here used to be empty. So a variable bound inside
+/// parentheses was invisible to wardedness, and a rule that is perfectly warded
+/// became a `WardednessViolation` purely because of how its pattern was
+/// written — which matters because a quantified sub-pattern *has* to be
+/// parenthesised. Every other consumer of the variant in the planner recurses;
+/// this checker was the exception.
+///
+/// The arm stays explicit rather than collapsing into `_ => {}`: a future
+/// `PatternElement` that binds variables should fail to compile here rather
+/// than silently reintroduce the same false positive.
+fn collect_path_vars(path: &PathPattern, vars: &mut HashSet<String>) {
+    if let Some(v) = &path.variable {
+        vars.insert(v.clone());
+    }
+    for elem in &path.elements {
+        match elem {
+            PatternElement::Node(n) => {
+                if let Some(v) = &n.variable {
+                    vars.insert(v.clone());
                 }
-                PatternElement::Relationship(r) => {
-                    if let Some(v) = &r.variable {
-                        vars.insert(v.clone());
-                    }
+            }
+            PatternElement::Relationship(r) => {
+                if let Some(v) = &r.variable {
+                    vars.insert(v.clone());
                 }
-                PatternElement::Parenthesized { .. } => {}
+            }
+            PatternElement::Parenthesized { pattern, .. } => {
+                collect_path_vars(pattern, vars);
             }
         }
     }
-    vars
 }
 
 /// For each derive pattern with a NEW node, the other node must be match-bound.

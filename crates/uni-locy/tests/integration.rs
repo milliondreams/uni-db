@@ -7,3 +7,4 @@ mod repro_assume_body_outer_rule_ref;
 mod repro_isotonic_tied_preds;
 mod repro_module_self_recursion_typecheck;
 mod repro_pathctx_list_no_dep_edge;
+mod repro_warded_parenthesized_path;

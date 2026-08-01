@@ -20,6 +20,7 @@ pub mod locy_predicate_plugin;
 pub mod locy_prefix_to_grouped_recursion;
 pub mod locy_profile;
 pub mod locy_program_persistence;
+pub mod locy_warded_parenthesized_path;
 pub mod repro_locy_runtime_distinct_debug_dedup;
 // Correctness-scan Wave 2 repros (R12 Locy probabilistic).
 pub mod locy_rule_durability;

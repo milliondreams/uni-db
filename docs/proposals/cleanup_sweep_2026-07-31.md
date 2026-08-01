@@ -21,13 +21,14 @@ Every item below landed test-first: the regression test was written and **observ
 | 0.12 `PyForkStatus` fails open | ✅ done | `0ca8efb50` | arm unreachable today; now fails closed (future guard) |
 | 0.10 async cursor stringifies `UniError` | ✅ done, **uncommitted** | — | async `fetch_one`/`fetch_many`/`async for` raised `RuntimeError`; sync twin raised `UniQueryError` |
 | 0.13 pydantic `_result_to_model` swallow | ✅ done, **uncommitted** | — | a falsy-but-valid model **vanished** from `.all()`; a hydration `RuntimeError` vanished with it |
-| 0.14 pydantic `eager_load` raw dicts | ⬜ next — 0.13 has landed, so it is unblocked | — | |
+| 0.14 pydantic `eager_load` raw dicts | ✅ done, **uncommitted** | — | eager returned `list[dict]` where lazy returned `list[Model]`; **needed two prerequisite fixes first — see below** |
 | 0.5 `VERSION AS OF` panics | ✅ done, **uncommitted** | — | `explain`/`profile`/`cursor` all **panicked** on a time-travel query |
 | 0.3 wardedness parenthesized paths | ✅ done, **uncommitted** | — | parenthesising an identical pattern turned a legal rule into `WardednessViolation` |
-| 0.9 algorithm yield types | ⬜ pending | — | |
+| 0.9 algorithm yield types | ✅ done, **uncommitted** | — | `yields=["label:string"]` loaded cleanly and failed on **every** CALL |
 | 0.7 plugin CypherValue transport | ⬜ pending | — | |
 | 0.2 Locy `prev.X` in comparison | ⬜ pending | — | breaking; needs changelog |
 | 0.4 ASSUME drops MODULE context | ⬜ pending, riskiest | — | has a stop-and-rescope gate |
+| **0.15 `properties()` empty on a multi-label edge endpoint** | ⬜ **new — not in the original 84** | — | `properties(b)` returns `{}` while `labels(b)` reports correctly |
 
 Plus **D1/D2/D3** — three cursor-path bugs not in the original 84 findings, discovered while
 reproducing 0.10 and fixed on request. See *Bugs discovered during implementation* below.
@@ -390,6 +391,26 @@ Change the field to `Box<dyn Fn() -> Result<T, E> + Send + Sync>`, call `(self.f
 Add `algorithm_yield_datatype(token) -> Option<DataType>` beside `guest_emit_columns` in `uni_plugin_builtin::algorithms::graph_compute`, admitting exactly the Int64/Float64 spellings, and route all four loaders through it. Keep per-loader error wrapping.
 
 > **Note the error code:** it is **`0x862`**, not `0x869` (`0x869` is the missing-column arm). The scout had this wrong.
+
+**✅ DONE (uncommitted)** — `algorithm_yield_datatype` added beside `guest_emit_columns`, admitting
+exactly the Int64/Float64 spellings; pyo3 and rhai route their **yields** through it with
+per-loader error wrapping. WASM and Extism already restricted inline and are untouched, so
+"route all four loaders through it" turned out to be two.
+
+The general `type_name_to_datatype` in each loader is deliberately left alone: it also serves
+scalar UDFs and procedures, where `Utf8`/`Boolean` are perfectly buildable. Narrowing it would
+have broken those. The trap in this document is real and was honoured — `arg_type_from_token`
+is *not* reused, because it maps `value`→CypherValue and `list`→Vector, which `build_batch` can
+build even less than `Utf8`.
+
+**Zero fixtures churned.** Every algorithm registration in the tree already used int/float, so
+this is behaviour-breaking in principle but inert in practice. The two `yields: [..., "name:string"]`
+occurrences found are `procedures:` entries, a different code path, and were left alone.
+
+**Tests:** a rejected-at-load case plus an inverse guard in each of
+`crates/uni/tests/common/loaders/{rhai,pyo3}_graph_compute.rs` — already-registered modules, so
+the pyo3 crate's 3-binary cap is not touched. Both negative tests were verified to fail against
+a temporarily-reverted loader, since each loader is a separate copy of the defect.
 >
 > **Trap:** This turns "loads fine, never CALLed" into "fails to load" for existing plugins. Check `crates/uni/tests/common/loaders/pyo3_graph_compute.rs` and the rhai loader tests for fixtures with non-numeric yields first. Do **not** implement by reusing `arg_type_from_token` — it maps `value`→CypherValue and `list`→Vector, which `build_batch` also cannot assemble, widening the hole.
 
@@ -472,9 +493,90 @@ Eager loading caches `_row_to_node_dict(row)` — plain dicts — while the lazy
 
 Resolve the target model from `node_data.get('_label')` via `self._schema_gen._node_models`, run through `_result_to_model`, and honour `descriptor.is_list`.
 
+**✅ DONE (uncommitted)** — but **the prescription above would have made things worse on its own**,
+and two prerequisite defects had to be fixed first. Both were found because 0.13's new warning
+surfaced them; under the old swallow they were invisible.
+
+1. **`descriptor.is_list` is always `False` and `target_type` always `None`.** The metaclass
+   deletes a relationship's annotation (`base.py`, "so Pydantic doesn't treat it as a required
+   field") *before* the descriptor loop re-reads `annotations[field_name]`. So "honour
+   `descriptor.is_list`" would have turned **every** to-many relationship into a to-one. Fixed by
+   capturing the shape before deletion and passing `target_type` through.
+
+2. **Relationship-implied edge types declared every registered label on both endpoints.**
+   `schema.py` used `from_labels=list(self._node_models), to_labels=list(self._node_models)`,
+   discarding both the owning model and the annotated target. That is not merely imprecise: an
+   edge type whose endpoints span several labels makes `properties(b)` on an **unlabelled** `b`
+   return `{}`, so every relationship target loaded as a propertyless node and failed validation.
+   Endpoints are now derived from the declaration, honouring `direction` and unioning across
+   models that share an edge type.
+
+With those in place the documented fix applies cleanly. Also fixed: entities with no related
+rows now get an explicit empty cache entry — previously they got none, so first access fell
+through to the lazy path, which on async raises and tells the caller to use the `eager_load()`
+they had already used.
+
+**Tests:** 4 sync + 2 async. The async pair was verified against a temporarily-reverted loader,
+since `AsyncUniSession._result_to_model` is a second copy.
+
+> **Engine bug, NOT fixed, needs its own decision.** `properties(b)` returns `{}` when `b` is
+> unlabelled and the edge type's endpoints span multiple labels — silently, while `labels(b)`
+> still reports correctly. The OGM no longer *triggers* it, but any user writing an unlabelled
+> relationship traversal against a genuinely multi-label edge type still hits it. This is a
+> silent-wrong-answer in query execution and deserves a Tier 0 entry of its own.
+> Repro: declare `edge_type('WROTE', ['Author','Book'], ['Author','Book'])`, create
+> `(:Author)-[:WROTE]->(:Book)`, then `MATCH (a:Author)-[:WROTE]->(b) RETURN properties(b)`.
+
 > **⚠️ Order dependency:** this composes badly with 0.13 unfixed. Routing eager rows through `_result_to_model` means a validation failure now silently **drops** the related node, where today it at least survives as a dict. **Land 0.13 first**, or you trade a type bug for a data-loss bug.
 >
 > **Trap:** User-visible break on a shipped OGM — code written against today's eager path uses `user.posts[0]['title']`.
+
+---
+
+### 0.15 — `properties()` returns `{}` for an unlabelled endpoint of a multi-label edge type
+
+**Files:** query execution (`uni-query`) — exact operator not yet localised
+**LOC:** unknown · **Risk:** unknown · **Verdict:** CONFIRMED (reproduced against a plain `Uni`, no OGM involved)
+
+**Not in the original 84 findings.** Found while fixing 0.14: every relationship target the
+pydantic OGM loaded came back with no properties, and the cause turned out to be below the OGM
+entirely.
+
+When an edge type declares more than one label on an endpoint, reading `properties(b)` for an
+**unlabelled** `b` returns an empty map. `labels(b)` on the same row reports the label
+correctly, and naming the label in the pattern makes the properties reappear — so the row is
+found, its identity is known, and only its properties are silently dropped.
+
+```
+// declared endpoints: correct
+edge_type('WROTE', ['Author'], ['Book'])
+MATCH (a:Author)-[:WROTE]->(b) RETURN properties(b)   // {'title': 'Earthsea'}  ✔
+
+// declared endpoints: multi-label — same data, same query
+edge_type('WROTE', ['Author','Book'], ['Author','Book'])
+MATCH (a:Author)-[:WROTE]->(b) RETURN properties(b)   // {}                     ✘
+MATCH (a:Author)-[:WROTE]->(b) RETURN labels(b)       // ['Book']               ✔
+MATCH (a:Author)-[:WROTE]->(b:Book) RETURN properties(b)  // {'title': ...}     ✔
+```
+
+This is a **silent wrong answer**, not an error — the query succeeds and returns a row that
+merely appears to have no properties. Multi-label endpoints are legal and useful (a `TAGGED`
+edge from several kinds of node), and an unlabelled traversal target is the natural way to
+write a polymorphic relationship read, so the combination is not exotic.
+
+**Why it is Tier 0 despite the unknown scope.** Every other confirmed silent-wrong-answer in
+this document was ranked above tidiness for the same reason: a caller cannot tell it happened.
+Here the caller gets a well-formed row with a plausible-looking empty property map.
+
+**Not fixed.** 0.14 stopped the OGM *triggering* it — relationship-implied edge types now
+declare precise endpoints — but that is containment, not a fix. Any user writing an unlabelled
+traversal against a genuinely multi-label edge type still hits it. Fixing it means finding
+where the scan resolves an unlabelled binding's property source and why a multi-label candidate
+set yields nothing rather than a union; that is a query-execution change with its own risk
+profile, which is why it is filed rather than folded into an OGM commit.
+
+**Repro:** `bindings/uni-db` Python, no OGM — declare the edge type both ways, create
+`(:Author {name})-[:WROTE]->(:Book {title})`, compare the two `properties(b)` results.
 
 ---
 

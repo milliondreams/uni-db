@@ -109,15 +109,141 @@ already-registered module — no new integration binary).
 **Gates:** workspace `nextest --no-fail-fast` **6078/6078 passed**; uni-db Python suite
 **915 passed**; `cargo fmt --check` and workspace `clippy -D warnings` clean.
 
-#### Still open — the transaction cursor has all three gaps
+#### D4 — the transaction cursor, and unifying the two cursor bodies ✅ FIXED (uncommitted)
 
-Deliberately untouched; this is Tier 1 item **1.7** and a larger change.
-`TxQueryBuilder::cancellation_token()` is inert across all three of its terminals
-(`execute_inner`, `fetch_all_inner`, `cursor_inner`), `cursor_inner` does not honour
-`timeout` either, and `Transaction.cancellation_token` (`transaction.rs:117`, cancelled at
-`:1430`) is never handed to an executor — so `Transaction::cancel()` affects nothing
-in flight. Fixing only the session cursor leaves exactly the asymmetry that produced these
-three bugs.
+D1–D3 fixed the session cursor and left its twin broken, which is how the defect arose in
+the first place: `execute_cursor_internal_with_config` and
+`execute_cursor_internal_with_tx_l0` held **two copies of the same cursor-assembly code**,
+and every limit added to one was absent from the other.
+
+The tail from the configured executor onward — batches to rows, re-chunk to `batch_size`,
+guard against deadline / memory ceiling / cancellation — now lives once, in
+`UniInner::build_guarded_cursor`. The two entry points keep only what genuinely differs:
+the session one takes a per-query config override, the transaction one rejects time-travel
+and installs the tx-private L0. They are now 29 and 44 lines of preparation around a
+single 131-line shared body.
+
+Fixed as a consequence:
+
+- **`TxQueryBuilder::cursor_inner` dropped both `.timeout()` and `.cancellation_token()`.**
+  `execute`/`fetch_all` apply the timeout by wrapping their future in
+  `tokio::time::timeout`; a cursor returns a stream that outlives the call, so the ceiling
+  now travels with the stream via the config the guard reads.
+- **`max_query_memory` was inert on the whole transaction surface**, not just its cursor —
+  `execute_internal_with_tx_l0` never called `enforce_memory_limit`. Adding the ceiling to
+  the tx cursor alone would have handed that surface a *fresh* asymmetry (streaming
+  stricter than materializing), so it was added to both.
+  `test_tx_fetch_all_enforces_configured_memory_limit` exists specifically to stop a future
+  change from fixing only the streaming half again.
+
+Two corrections to what D1–D3 shipped:
+
+1. **The cancellation error was the wrong variant.** The guard raised
+   `Query { "Query cancelled" }`, but `into_execution_error` already classifies a cancelled
+   execution as `UniError::Cancelled`, which the bindings map to a dedicated
+   `UniCancelledError`. Rendering it as `Query` collapsed it into the same class as every
+   other query failure — precisely the defect 0.10 fixed on the async cursor. Python now
+   reports `UniCancelledError: Operation cancelled`.
+2. **`into_stream_error`'s doc comment was falsified** by the guard and has been corrected.
+   Its cancellation/timeout arms are still unreachable, but for a new reason: the guard
+   raises those *around* the stream rather than through this function.
+
+An elapsed deadline is rendered per surface — `Query { "Query timed out" }` for the
+session, `Timeout { timeout_ms }` for the transaction — via `CursorTimeoutError`, because
+the two surfaces' *materializing* terminals already disagree. That divergence predates this
+work and is not resolved here; each cursor matches its own builder so `.timeout()` is
+consistent across a given builder's terminals. Verified from Python:
+`UniTimeoutError: Operation timed out after 50ms`.
+
+**Gates:** workspace `nextest --no-fail-fast` **6083/6083 passed** · uni-db Python
+**915 passed** · fmt and `clippy -D warnings` clean. 5 new tests, all four
+limit-related ones observed failing first.
+
+#### D5 — cancellation made real everywhere ✅ FIXED (uncommitted) · closes Tier 1 item 1.7
+
+Fixing the cursors exposed that cancellation was **decorative across the whole engine**, not
+just on the two paths D1 touched. Three findings, none of them in the original 84:
+
+- **`Session::cancel()` did nothing at all.** Plain `Session::query()` routes through
+  `execute_cached`, which hard-coded `None` for the token at all three of its call sites.
+  Only `QueryBuilder` *with an override* ever carried one, so the most-used API on the
+  most-used surface had a `cancel()` that cancelled nothing.
+- **`Transaction::query_with` never seeded the builder from the transaction's own token**,
+  which is the whole reason `Transaction::cancel()` was inert — the child token created at
+  `transaction.rs:316` was simply never read.
+- **`execute_ast_internal` is cancellation-blind by construction** — no parameter, and
+  `apply_session_executor_state` does not set one. The time-travel branch of
+  `execute_internal_with_config_and_token` routes there, so a time-travel query silently
+  discarded its token.
+
+So the fix is not per-builder plumbing. **Every execution path now runs under a
+`CancelScope`** (`impl_query.rs`), which carries the enclosing session/transaction scope plus
+an optional caller token and is awaited by whatever enforces it. Because it is a required
+parameter, the compiler enumerated every path that had been silently dropping cancellation —
+including `PreparedQuery`, which had no token on either of its branches and now captures the
+scope of whatever prepared it.
+
+Two design notes worth keeping:
+
+1. **The guard is authoritative; the executor's token is an optimisation.**
+   `Executor::set_cancellation_token` takes exactly one token and only feeds
+   `GraphContext::check_timeout`, which fires solely where an operator happens to call it —
+   no scan/join/traverse plan reaches one. It is still worth setting for the long-running
+   operators that *do* check (traverse, shortest-path, vector-KNN, procedure calls), but
+   correctness comes from racing `CancelScope::cancelled()` against execution at every
+   terminal.
+2. **Two independent tokens cannot be merged cheaply.** `tokio_util` has no "whichever fires
+   first" combinator, and merging would cost a spawned linker task plus a drop guard per
+   statement. `CancelScope` holds both and `select!`s on them instead; an empty scope pends
+   forever so the branch is safe to take unconditionally.
+
+Also closed, because leaving them would have re-created the asymmetry:
+
+- **Rust `ExecuteBuilder` had no `cancellation_token`**, so Python's
+  `TxQueryBuilder.execute()` would have accepted a token and silently ignored it — the exact
+  defect class this work removes. Added a field and setter.
+- **Python's `TxQueryBuilder` never exposed `cancellation_token`** at all (`builders.rs`),
+  despite the Rust builder having carried the field all along. Added on the sync class, the
+  async twin, and `__init__.pyi` in one change — `test_stub_drift.py` enumerates both
+  directions and fails on either half alone.
+
+**Gates:** workspace `nextest --no-fail-fast` **6088/6088 passed** · uni-db Python
+**922 passed** (was 915) · fmt and `clippy -D warnings` clean. 12 new tests — 6 Rust, 6
+Python — all observed failing first, each paired with an inverse guard so that wiring a scope
+into every path cannot silently break ordinary queries.
+
+#### D6 — one timeout error across both surfaces ✅ FIXED (uncommitted) · **BREAKING**
+
+An elapsed deadline used to render per surface: `Query { "Query timed out" }` on the session,
+`Timeout { timeout_ms }` on the transaction. The same condition therefore needed two
+different `except` clauses depending on which terminal produced it — the same stringly-typed
+erasure item 0.10 fixed on the async cursor, in a second place.
+
+Everything now raises `UniError::Timeout { timeout_ms }`: typed, carrying the budget that was
+exceeded, and mapped by the bindings to a dedicated `UniTimeoutError`.
+
+The lower layers signal an elapsed deadline with a bare `anyhow!("Query timed out")` and
+cannot know the budget they blew, so `into_execution_error` takes the effective
+`query_timeout` and reattaches it when re-classifying.
+
+**`CursorTimeoutError` is deleted.** It existed only to model the divergence — a type, a
+parameter threaded through two entry points, and a branch in `cursor_inner`, all of which
+were the cost of the inconsistency rather than anything intrinsic. Removing the parameter
+also brought `build_guarded_cursor` back under clippy's argument limit, so its
+`#[expect(clippy::too_many_arguments)]` went too; the suppression turning unfulfilled is
+independent evidence the simplification was real rather than cosmetic.
+
+Assertions were rewritten to match on the **variant** rather than on message text, which is
+the point of the change; `drain_cursor` now hands back the `UniError` instead of its
+rendering.
+
+> **Breaking:** Python code catching `UniQueryError` for a query timeout must catch
+> `UniTimeoutError`. Rust code matching `UniError::Query` with a `"Query timed out"` message
+> must match `UniError::Timeout`. Belongs in the breaking-change ledger; the version decision
+> is deferred until the whole sweep lands.
+
+**Gates:** workspace `nextest --no-fail-fast` **6088/6088 passed** · uni-db Python
+**923 passed** · fmt and `clippy -D warnings` clean.
 
 ### Documentation gap blocking the changelog requirement
 
@@ -605,6 +731,7 @@ Published crates: `uni-query`, `uni-store`, `uni-plugin`, `uni-plugin-host`, `un
 | 3.7 seven `datetime` helpers | uni-query-functions | major |
 | 3.8 `single_row_record_batch` | uni-plugin | minor-breaking + CHANGELOG entry required |
 | 0.2 Locy `prev`-in-comparison → hard `ParseError` | uni-cypher | **behaviour-breaking on the parse surface** |
+| D6 query timeout → `UniError::Timeout` | uni / bindings | **breaking**: `UniQueryError` → `UniTimeoutError` for an elapsed deadline |
 | 1.4 CHECK `=` numeric coercion on the tx path | uni-store | **behaviour-breaking** (a currently-rejected CHECK starts passing) |
 | 1.5 registry-backed oracle | uni-locy | **behaviour-breaking** unless it falls back to default on registry miss |
 | 5.2 Locy string unescape delegation | uni-cypher | behaviour-breaking on 3 lenient inputs |

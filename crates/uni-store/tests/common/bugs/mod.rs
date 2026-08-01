@@ -47,3 +47,4 @@ pub mod repro_05_06_temporal_missing_not_null;
 pub mod repro_04_adjacency_incoming_shadow;
 pub mod repro_10_id_allocator_persist_fail;
 pub mod repro_16_compact_vertices_concurrent_flush;
+pub mod repro_id_allocator_substring_notfound;

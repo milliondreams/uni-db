@@ -28,6 +28,12 @@ pub struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     fail_get: AtomicBool,
     fail_put_remaining: AtomicUsize,
+    /// When set, [`FaultStore::transient`] uses this text instead of the
+    /// default. Lets a test inject a *transient* error whose message happens to
+    /// read like a missing object — a proxy 404 body, or a wrapped S3
+    /// "bucket not found" — which is what defeats substring-based NotFound
+    /// detection.
+    transient_message: std::sync::Mutex<Option<String>>,
 }
 
 impl FaultStore {
@@ -36,6 +42,7 @@ impl FaultStore {
             inner,
             fail_get: AtomicBool::new(false),
             fail_put_remaining: AtomicUsize::new(0),
+            transient_message: std::sync::Mutex::new(None),
         }
     }
 
@@ -49,10 +56,25 @@ impl FaultStore {
         self.fail_put_remaining.store(n, Ordering::SeqCst);
     }
 
-    fn transient() -> object_store::Error {
+    /// Override the injected transient error's message.
+    ///
+    /// The error stays an `object_store::Error::Generic` — only its rendered
+    /// text changes. This is the distinction a typed `NotFound` check makes and
+    /// a `to_string().contains(..)` check cannot.
+    pub fn set_transient_message(&self, msg: &str) {
+        *self.transient_message.lock().unwrap() = Some(msg.to_owned());
+    }
+
+    fn transient(&self) -> object_store::Error {
+        let msg = self
+            .transient_message
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "injected transient store failure".to_owned());
         object_store::Error::Generic {
             store: "FaultStore",
-            source: Box::new(std::io::Error::other("injected transient store failure")),
+            source: Box::new(std::io::Error::other(msg)),
         }
     }
 }
@@ -86,7 +108,7 @@ impl ObjectStore for FaultStore {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Err(Self::transient()),
+                Ok(_) => return Err(self.transient()),
                 Err(observed) => cur = observed,
             }
         }
@@ -103,7 +125,7 @@ impl ObjectStore for FaultStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
         if self.fail_get.load(Ordering::SeqCst) {
-            return Err(Self::transient());
+            return Err(self.transient());
         }
         self.inner.get_opts(location, options).await
     }

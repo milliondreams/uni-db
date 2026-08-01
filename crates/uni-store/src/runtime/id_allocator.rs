@@ -57,7 +57,12 @@ impl IdAllocator {
                 let manifest: CounterManifest = serde_json::from_slice(&bytes)?;
                 (manifest, version)
             }
-            Err(e) if e.to_string().contains("not found") => (CounterManifest::default(), None),
+            // Typed, not substring: a transient failure whose message merely
+            // reads like a missing object (proxy 404, wrapped S3 "bucket not
+            // found") would otherwise start the allocator from a defaulted
+            // manifest against a populated database and re-issue live VIDs.
+            // Same rationale as `fork/registry.rs` and `snapshot/manager.rs`.
+            Err(e) if crate::store_utils::is_not_found(&e) => (CounterManifest::default(), None),
             Err(e) => return Err(e),
         };
 

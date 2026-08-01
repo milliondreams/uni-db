@@ -3130,10 +3130,18 @@ pub struct AsyncQueryCursor {
 ///
 /// Free function over the cursor/buffer `Arc`s so the awaitable cursor methods
 /// can drive it without rebuilding a throwaway `AsyncQueryCursor`.
+///
+/// The error type is deliberately `UniError`, not `String`: stringifying here
+/// erases the variant, and every caller is then forced to invent an exception
+/// class. They all guessed `PyRuntimeError`, so a retriable conflict surfaced
+/// through `fetch_one`/`fetch_many`/`async for` could not be recognised by
+/// `_retry.RETRIABLE_EXCEPTIONS`, which matches by class. The sync twin
+/// (`sync_api.rs`) and `fetch_all` below both keep the typed error; this path
+/// was the odd one out.
 async fn next_row_async(
     cursor: &Arc<tokio::sync::Mutex<Option<core::QueryCursor>>>,
     buffer: &Arc<tokio::sync::Mutex<VecDeque<core::Row>>>,
-) -> Result<Option<core::Row>, String> {
+) -> Result<Option<core::Row>, uni_common::UniError> {
     {
         let mut buf = buffer.lock().await;
         if let Some(row) = buf.pop_front() {
@@ -3154,7 +3162,7 @@ async fn next_row_async(
             buf.extend(iter);
             Ok(first)
         }
-        Some(Err(e)) => Err(e.to_string()),
+        Some(Err(e)) => Err(e),
         None => Ok(None),
     }
 }
@@ -3171,7 +3179,7 @@ impl AsyncQueryCursor {
                     Python::attach(|py| Ok(Some(convert::row_to_dict(py, &row)?.into_py_any(py)?)))
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
             }
         })
     }
@@ -3187,7 +3195,7 @@ impl AsyncQueryCursor {
                 match next_row_async(&cursor, &buffer).await {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => break,
-                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                    Err(e) => return Err(crate::exceptions::uni_error_to_pyerr(e)),
                 }
             }
             Python::attach(|py| convert::rows_to_py(py, rows))
@@ -3246,7 +3254,7 @@ impl AsyncQueryCursor {
                 Ok(None) => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
                     "end of cursor",
                 )),
-                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
             }
         })
     }

@@ -3568,6 +3568,15 @@ pub enum PyForkStatus {
     Pending,
     Active,
     Tombstoned,
+    /// A lifecycle state this build of the binding does not know about.
+    ///
+    /// `ForkStatus` is `#[non_exhaustive]` upstream, so the wildcard below
+    /// cannot be removed. Reporting an unknown state as `Unknown` rather than
+    /// `Active` matters: recovery resumes any non-`Active` state, so
+    /// non-`Active` is precisely the "mid-lifecycle, do not use" signal, and
+    /// Python code branching on `status == ForkStatus.Active` would otherwise
+    /// open sessions against a fork the engine considers unsafe.
+    Unknown,
 }
 
 impl PyForkStatus {
@@ -3577,7 +3586,8 @@ impl PyForkStatus {
             ForkStatus::Pending => Self::Pending,
             ForkStatus::Active => Self::Active,
             ForkStatus::Tombstoned => Self::Tombstoned,
-            _ => Self::Active, // future variants surface as Active for now
+            // Fail closed, not open — see the `Unknown` variant's doc.
+            _ => Self::Unknown,
         }
     }
 }

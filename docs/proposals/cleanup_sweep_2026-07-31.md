@@ -25,8 +25,8 @@ Every item below landed test-first: the regression test was written and **observ
 | 0.5 `VERSION AS OF` panics | ✅ done, **uncommitted** | — | `explain`/`profile`/`cursor` all **panicked** on a time-travel query |
 | 0.3 wardedness parenthesized paths | ✅ done, **uncommitted** | — | parenthesising an identical pattern turned a legal rule into `WardednessViolation` |
 | 0.9 algorithm yield types | ✅ done, **uncommitted** | — | `yields=["label:string"]` loaded cleanly and failed on **every** CALL |
-| 0.7 plugin CypherValue transport | ⬜ pending | — | |
-| 0.2 Locy `prev.X` in comparison | ⬜ pending | — | breaking; needs changelog |
+| 0.7 plugin CypherValue transport | ✅ done, **uncommitted** | — | a plugin yielding a CypherValue got its wire bytes |
+| 0.2 Locy `prev.X` in comparison | ✅ done, **uncommitted** | — | `prev.h + 1` refused in a base case; `prev.h > 5` **accepted**, binding lost |
 | 0.4 ASSUME drops MODULE context | ⬜ pending, riskiest | — | has a stop-and-rescope gate |
 | **0.15 `properties()` empty on a multi-label edge endpoint** | ⬜ **new — not in the original 84** | — | `properties(b)` returns `{}` while `labels(b)` reports correctly |
 
@@ -272,6 +272,26 @@ Add a regression test: fault store returning a Generic error whose message conta
 
 **Files:** `crates/uni-cypher/src/grammar/locy_walker.rs:937-958`, `crates/uni-locy/src/compiler/typecheck.rs:383-393`, `crates/uni-query/src/query/locy_planner.rs:2060`
 **LOC:** 35 · **Risk:** med · **Verdict:** CONFIRMED (reproduced with a compiled probe)
+**✅ DONE (uncommitted)** — the walker now finds a `prev_reference` anywhere beneath a
+comparison (recursively — `prev.h * 2 > f(x)` loses it just the same) and refuses it with an
+error that names the field and points at the backtick escape, instead of falling through to the
+re-parse.
+
+**A correction to this item, and it changes the trade.** The measured behaviour is not
+"rejected in a base case, accepted otherwise" — it is that rejection happens at **compile**
+time, and `prev` is *legitimate in a recursive rule*: `prev.h + 1` compiles there and is the
+whole point of `ALONG`. So the comparison form is broken in **both** positions — wrongly
+accepted in a base case, and compiled with the binding silently stripped in a recursive one.
+
+Refusing it therefore also forbids a construct that ought to be legal. That is still the right
+call, because the form has never worked in either position and a structured walk would mean
+re-implementing `IN` / `STARTS WITH` / `IS NULL` / list literals that the re-parse handles for
+free and `LocyBinaryOp` does not model — but it is a trade, not a pure fix, and the door is left
+open to supporting it properly later.
+
+**Tests:** 6, including both controls that pass today (`prev` in base-case arithmetic still
+raises `PrevInBaseCase`; `prev` in *recursive* arithmetic still compiles) and the four
+comparison forms the re-parse must keep handling.
 
 `build_locy_comparison_expression` re-slices the raw source span and re-parses with `CypherParser` whenever a `comparison_tail` is present. `PREV` is not in `cypher.pest`'s `keyword_reserved`, so the re-parse succeeds and destroys the `LocyExpr::PrevRef` marker. Verified:
 
@@ -366,6 +386,25 @@ Delete the `mem::forget` and return `result` directly.
 Change `arrow_scalar_to_value` to take the `&Field` (both call sites already hold it). For `LargeBinary`: return `Value::Bytes` when metadata carries `uni_raw_bytes=true`, else `cypher_value_codec::decode(...)`.
 
 > **Trap — this is why risk went to med:** `uni_raw_bytes` is stamped **only** on the storage/scan path (`uni-common/src/core/schema.rs:113`, `df_graph/scan.rs:638`, `raw_bytes_marker.rs`). No plugin loader sets it on a yield `Field`. **Decode must fall back to `Value::Bytes` on decode error, not hard-error** — otherwise every existing plugin yielding genuine opaque bytes goes from `Value::Bytes` to an error at the CALL site. The fallback branch is load-bearing, not optional. Add both a decode test and a raw-bytes round-trip test.
+
+**✅ DONE (uncommitted)** — `arrow_scalar_to_value` now takes the `&Field` that both call sites
+already held one line above and discarded. The `LargeBinary` arm decodes through
+`cypher_value_codec` unless the column carries `uni_raw_bytes`, and degrades to `Value::Bytes`
+on decode failure. The trap was honoured: the fallback is load-bearing, and its test says so.
+
+**The default is inverted relative to `read.rs`, deliberately.** There, a marked column is raw
+and everything else decodes by uni `DataType`; here there is no `DataType` and no loader stamps
+the marker, so gating on the marker being *present* would have fixed nothing.
+
+**Residual hazard, documented at the site:** a raw payload whose first byte happens to be a
+valid codec tag *and* whose remainder is valid msgpack decodes silently and wrongly. The error
+fallback cannot catch that — `uni_raw_bytes` on the yield field is the only escape, and no
+loader stamps it yet. This trades a guaranteed wrong answer for every CypherValue yield against
+a rare one for byte payloads that collide with the tag space.
+
+**Tests:** 6 co-located unit tests (the function is private, so no integration binary is
+touched) — decode of int and string, the raw-marker override, the undecodable fallback,
+non-binary passthrough, and null preservation.
 
 ### 0.8 — Plugin instance pool serializes every cold start behind a Mutex
 
@@ -870,7 +909,8 @@ Published crates: `uni-query`, `uni-store`, `uni-plugin`, `uni-plugin-host`, `un
 | 3.6 `SourceType`/`resolve_source_type`/`validate_pair` | uni-query-functions | major (defer the 3 error variants) |
 | 3.7 seven `datetime` helpers | uni-query-functions | major |
 | 3.8 `single_row_record_batch` | uni-plugin | minor-breaking + CHANGELOG entry required |
-| 0.2 Locy `prev`-in-comparison → hard `ParseError` | uni-cypher | **behaviour-breaking on the parse surface** |
+| 0.2 Locy `prev`-in-comparison → hard `ParseError` | uni-cypher | **behaviour-breaking on the parse surface** — also refuses the *recursive* form, which is legitimate but has never worked |
+| 0.7 plugin `LargeBinary` yield decoded as CypherValue | uni-query | **breaking**: a procedure yielding opaque bytes now decodes unless it stamps `uni_raw_bytes` |
 | D6 query timeout → `UniError::Timeout` | uni / bindings | **breaking**: `UniQueryError` → `UniTimeoutError` for an elapsed deadline |
 | 1.4 CHECK `=` numeric coercion on the tx path | uni-store | **behaviour-breaking** (a currently-rejected CHECK starts passing) |
 | 1.5 registry-backed oracle | uni-locy | **behaviour-breaking** unless it falls back to default on registry miss |

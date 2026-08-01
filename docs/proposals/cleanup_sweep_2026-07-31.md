@@ -20,10 +20,10 @@ Every item below landed test-first: the regression test was written and **observ
 | 0.11 `value_to_py` nulls unknown variants | ✅ done | `0847283ef` | arm unreachable today; converted to loud failure (future guard) |
 | 0.12 `PyForkStatus` fails open | ✅ done | `0ca8efb50` | arm unreachable today; now fails closed (future guard) |
 | 0.10 async cursor stringifies `UniError` | ✅ done, **uncommitted** | — | async `fetch_one`/`fetch_many`/`async for` raised `RuntimeError`; sync twin raised `UniQueryError` |
-| 0.13 pydantic `_result_to_model` swallow | ⬜ next | — | must land before 0.14 |
-| 0.14 pydantic `eager_load` raw dicts | ⬜ blocked on 0.13 | — | |
-| 0.5 `VERSION AS OF` panics | ⬜ pending | — | |
-| 0.3 wardedness parenthesized paths | ⬜ pending | — | |
+| 0.13 pydantic `_result_to_model` swallow | ✅ done, **uncommitted** | — | a falsy-but-valid model **vanished** from `.all()`; a hydration `RuntimeError` vanished with it |
+| 0.14 pydantic `eager_load` raw dicts | ⬜ next — 0.13 has landed, so it is unblocked | — | |
+| 0.5 `VERSION AS OF` panics | ✅ done, **uncommitted** | — | `explain`/`profile`/`cursor` all **panicked** on a time-travel query |
+| 0.3 wardedness parenthesized paths | ✅ done, **uncommitted** | — | parenthesising an identical pattern turned a legal rule into `WardednessViolation` |
 | 0.9 algorithm yield types | ⬜ pending | — | |
 | 0.7 plugin CypherValue transport | ⬜ pending | — | |
 | 0.2 Locy `prev.X` in comparison | ⬜ pending | — | breaking; needs changelog |
@@ -287,6 +287,14 @@ Both validation sites are blinded identically: `collect_prev_refs` returns `vec!
 
 **File:** `crates/uni-locy/src/compiler/warded.rs:43`
 **LOC:** 20 · **Risk:** low · **Verdict:** CONFIRMED (reproduced)
+**✅ DONE (uncommitted)** — extracted `collect_path_vars`, which recurses into the nested
+`PathPattern`; the arm stays explicit so a future variable-binding `PatternElement` fails to
+compile rather than silently reintroducing the false positive. **The trap was checked, not
+assumed:** a compile-only fix would have moved the failure downstream, so
+`crates/uni/tests/common/locy/locy_warded_parenthesized_path.rs` runs the rule against a real
+database and asserts it derives the same edge as the unparenthesised form. 4 compiler tests +
+2 runtime tests; the parenthesised and quantified cases failed first, the baseline and the
+still-unwarded case passed throughout.
 
 `PatternElement::Parenthesized { .. } => {}` — empty body, no comment. This is the swallowing-walker case, not a documented narrowing (checked: no comment anywhere in the 81-line file). Every other consumer of this variant in the repo recurses (`planner.rs:4415/4632/9453/10141`, `df_planner.rs:6968/7097`, `session.rs:1901`).
 
@@ -313,6 +321,19 @@ This is the MODULE-qualified sibling of the bug already pinned by `crates/uni-lo
 
 **Files:** `crates/uni/src/api/impl_query.rs:347-441`, `crates/uni-query/src/query/planner.rs:2635`
 **LOC:** 50 · **Risk:** low · **Verdict:** CONFIRMED (AST shape confirmed empirically)
+**✅ DONE (uncommitted)** — `split_time_travel` is now a named function with one definition and
+seven call sites; it had been inlined at four and simply absent from three, and the three that
+omitted it panicked. `explain`/`profile`/`cursor` resolve the spec and re-dispatch against a
+pinned instance via a shared `pinned_at`, so none of them plans a wrapped AST.
+**There is a second `unreachable!`**, not mentioned in this document, at
+`uni-query-functions/src/rewrite/walker.rs:57` ("TimeTravel should be resolved at API layer
+before rewriting") — it fires *first*, so that is the panic the repro actually caught. Fixing
+at the API layer satisfies both.
+The tests assert the **historical** row count, not merely the absence of a panic: stripping
+the spec and running against the live version would also stop the panic while silently
+answering a different question. `explain` stays read-only-permissive, matching its existing
+documented behaviour (EXPLAIN never executes, so describing a write plan is legitimate);
+`profile` and `cursor` validate read-only because they do execute.
 
 `planner.rs:2635` is a literal `unreachable!("TimeTravel should be resolved at API layer before planning")`. Four entry points destructure `Query::TimeTravel` first (`impl_query.rs:495-505, 612-622, 664-674, 729-742`); three do not — `explain_internal` (347-359), `profile_internal` (361-391), `execute_cursor_internal_with_config` (393-441). `run_query_guards` does **not** intercept: `validate_read_only_with` recurses through TimeTravel and returns `Ok`, and `explain()` doesn't even call the guards.
 
@@ -418,6 +439,23 @@ Add an `Unknown` variant to `PyForkStatus`, map the wildcard to it, **and** add 
 `except Exception: return None`, then `if instance: instances.append(instance)` — the row vanishes with no log, no warning, no counter. Consequences: `Model.query().all()` returns fewer rows than exist; `.count()` uses separate Cypher so `len(q.all()) != q.count()`; `.one()` raises `QueryError("Query returned no results")` for a row that demonstrably exists.
 
 **Additional defect the scout missed:** the guard is `if instance:` (truthiness), so a validly-hydrated model whose type defines a falsy `__bool__`/`__len__` is *also* dropped.
+
+**✅ DONE (uncommitted)** — `except Exception` narrowed to `ValidationError`; invalid stored data
+is still skipped but now warns through `_warn_unhydratable`, naming the label and vid. All
+**9** truthiness guards became `is not None` (8 × `if instance:` plus one `if not instance:` in
+`_rows_to_scored_instances`). `query.py` is shared by the sync and async builders, so one fix
+covers both; the swallow itself was duplicated per-surface and needed fixing twice.
+
+`warnings.warn` rather than a logger: the package has no logging configuration at all, so a
+logger would be silent by default under pytest and most app configs — reproducing the original
+defect more quietly. Warnings surface by default and are capturable with `pytest.warns`.
+
+> **The predicted regressions did not happen, and the prediction was wrong.** This document's
+> "expect previously-green tests to fail" rests on the try block covering `from_properties(…,
+> session=self)` *plus* session wiring, `int()` coercion and `@before_load` hooks. It does not:
+> `run_class_hooks(_BEFORE_LOAD)` and `int(vid)` both sit **outside** the try. Only
+> `from_properties` was ever wrapped, so narrowing the except exposed nothing pre-existing —
+> 263 tests passed unchanged.
 
 Narrow both excepts to `pydantic.ValidationError`, log a warning naming label + vid, change both guards to `if instance is not None:`. Prefer a session-level strictness flag defaulting to raise.
 

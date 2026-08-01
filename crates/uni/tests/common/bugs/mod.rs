@@ -85,3 +85,5 @@ pub mod test_python_repro;
 pub mod traverse_labels_after_flush;
 pub mod unwind_correlated_hash_index_pushdown;
 pub mod vlp_label_filter_after_flush;
+// `VERSION AS OF` reaching the planner un-unwrapped (explain/profile/cursor).
+pub mod repro_time_travel_explain_profile_cursor;

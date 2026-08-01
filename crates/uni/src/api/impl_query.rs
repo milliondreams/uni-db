@@ -168,6 +168,26 @@ fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     }
 }
 
+/// Peel a `VERSION AS OF` / `TIMESTAMP AS OF` wrapper off a parsed query.
+///
+/// Resolving the spec is the API layer's responsibility: both
+/// `QueryPlanner::plan_with_scope` and the expression rewriter declare a
+/// `Query::TimeTravel` that reaches them `unreachable!`, since neither can
+/// open a snapshot. Every terminal that parses Cypher must therefore split
+/// first and re-dispatch against a pinned instance.
+///
+/// This exists as a named function rather than an inline `match` because it
+/// was inlined at two call sites and simply absent from three others, and the
+/// three that omitted it panicked.
+fn split_time_travel(
+    ast: uni_cypher::ast::Query,
+) -> (uni_cypher::ast::Query, Option<uni_query::TimeTravelSpec>) {
+    match ast {
+        uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+        other => (other, None),
+    }
+}
+
 /// Determine the output column order for a result set.
 ///
 /// Uses the planner's projection order when available; otherwise falls back to
@@ -462,10 +482,47 @@ impl crate::api::UniInner {
         Ok(uni_query::fuse_create_set(logical_plan))
     }
 
+    /// Resolve a time-travel spec to an instance pinned at that snapshot.
+    ///
+    /// Every terminal that accepts `VERSION AS OF` / `TIMESTAMP AS OF` has to
+    /// do this *before* planning: both the planner and the expression rewriter
+    /// treat a `Query::TimeTravel` that reaches them as `unreachable!`, because
+    /// resolving a snapshot is the API layer's job and neither layer can do it.
+    async fn pinned_at(&self, spec: &uni_query::TimeTravelSpec) -> Result<crate::api::UniInner> {
+        let snapshot_id = self.resolve_time_travel(spec).await?;
+        self.at_snapshot(&snapshot_id).await
+    }
+
     /// Explain a Cypher query plan without executing it.
     pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
+        if let Some(spec) = tt_spec {
+            // Plan against the pinned instance, not the live one. Stripping the
+            // spec and explaining the current version would answer a different
+            // question than the caller asked -- quietly, which is worse than
+            // the panic this replaces.
+            //
+            // Read-only validation is deliberately *not* applied, matching the
+            // non-time-travel explain path: EXPLAIN never executes, so
+            // describing a write plan is legitimate introspection.
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .explain_ast_internal(ast, cypher),
+            )
+            .await;
+        }
+
+        self.explain_ast_internal(ast, cypher).await
+    }
+
+    async fn explain_ast_internal(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+    ) -> Result<ExplainOutput> {
         let planner = self.base_planner();
         // Phase 5a-impl: `plan_and_rewrite` applies the fork-aware fusion
         // rewrite so explain output reflects the operators the executor will
@@ -483,7 +540,30 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
+        if let Some(spec) = tt_spec {
+            // `profile` executes, so pinning is mandatory rather than cosmetic:
+            // profiling the live version would report timings for rows the
+            // caller did not ask about.
+            uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .profile_ast_internal(ast, cypher, params),
+            )
+            .await;
+        }
+
+        self.profile_ast_internal(ast, cypher, params).await
+    }
+
+    async fn profile_ast_internal(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+    ) -> Result<(QueryResult, ProfileOutput)> {
         let planner = self.base_planner();
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
@@ -515,7 +595,32 @@ impl crate::api::UniInner {
         cancel: CancelScope,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
+        if let Some(spec) = tt_spec {
+            // Streaming executes too, so the cursor must be built on the pinned
+            // instance -- its storage is what the stream reads from.
+            uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .cursor_from_ast(ast, cypher, params, config, cancel),
+            )
+            .await;
+        }
+
+        self.cursor_from_ast(ast, cypher, params, config, cancel)
+            .await
+    }
+
+    async fn cursor_from_ast(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        config: UniConfig,
+        cancel: CancelScope,
+    ) -> Result<QueryCursor> {
         let planner = self.base_planner().with_params(params.clone());
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
@@ -728,10 +833,7 @@ impl crate::api::UniInner {
                 let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
                 let parse_time = parse_start.elapsed();
 
-                let (ast, tt_spec) = match ast {
-                    uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-                    other => (other, None),
-                };
+                let (ast, tt_spec) = split_time_travel(ast);
                 if tt_spec.is_some() {
                     return Err(UniError::Query {
                         message: "Time-travel queries are not supported within transactions"
@@ -860,10 +962,7 @@ impl crate::api::UniInner {
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if tt_spec.is_some() {
             return Err(UniError::Query {
@@ -914,10 +1013,7 @@ impl crate::api::UniInner {
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if tt_spec.is_some() {
             return Err(UniError::Query {
@@ -952,10 +1048,7 @@ impl crate::api::UniInner {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let parse_time = parse_start.elapsed();
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if let Some(spec) = tt_spec {
             uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
@@ -988,10 +1081,7 @@ impl crate::api::UniInner {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let parse_time = parse_start.elapsed();
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if let Some(spec) = tt_spec {
             uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;

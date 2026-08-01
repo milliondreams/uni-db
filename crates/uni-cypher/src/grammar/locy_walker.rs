@@ -936,6 +936,28 @@ fn build_locy_not_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseErro
     Ok(result)
 }
 
+/// Find a `prev.<field>` reference anywhere beneath `pair`, returning the field.
+///
+/// Used to refuse a `prev` reference before it reaches the Cypher re-parse,
+/// which would silently strip it. Recursive because a comparison operand may
+/// nest arbitrarily (`prev.h * 2 > f(x)`), and a reference at any depth is lost
+/// just the same.
+fn find_prev_reference(pair: &Pair<LocyRule>) -> Option<String> {
+    if pair.as_rule() == LocyRule::prev_reference {
+        // `prev_reference = { PREV ~ "." ~ identifier }` -- the field is the
+        // last child; fall back to the whole span if the shape ever changes.
+        return Some(
+            pair.clone()
+                .into_inner()
+                .next_back()
+                .map_or_else(|| pair.as_str().to_string(), |f| f.as_str().to_string()),
+        );
+    }
+    pair.clone()
+        .into_inner()
+        .find_map(|child| find_prev_reference(&child))
+}
+
 fn build_locy_comparison_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, ParseError> {
     // locy_comparison_expression = { locy_additive_expression ~ comparison_tail* }
     // If there are comparison_tail elements, the entire thing is better handled as
@@ -946,6 +968,33 @@ fn build_locy_comparison_expression(pair: Pair<LocyRule>) -> Result<LocyExpr, Pa
         .any(|p| p.as_rule() == LocyRule::comparison_tail);
 
     if has_comparison {
+        // The re-parse below hands the text to `CypherParser`, which does not
+        // reserve `PREV` -- `locy.pest` does, `cypher.pest` does not. So a
+        // `prev.<field>` inside a comparison came back as an ordinary
+        // `Expr::Property` on a variable named `prev`, and the `PrevRef` marker
+        // was gone. `collect_prev_refs` and `validate_prev_refs` both see only a
+        // `LocyExpr::Cypher` and return empty/`Ok`, so nothing downstream
+        // noticed: `prev.h + 1` was correctly refused in a base case while
+        // `prev.h > 5` compiled, and in a recursive rule the comparison
+        // compiled with the previous-hop binding silently dropped.
+        //
+        // Refuse it rather than re-parse it. Walking comparisons structurally
+        // instead would mean re-implementing what the re-parse handles for free
+        // -- `IN`, `STARTS WITH`, `IS NULL`, list literals -- none of which
+        // `LocyBinaryOp` models; regressing those to rescue a form that has
+        // never worked is the worse trade. A user with a variable genuinely
+        // named `prev` still has the backtick escape that `locy.pest`
+        // documents.
+        if let Some(field) = children.iter().find_map(find_prev_reference) {
+            return Err(ParseError::new(format!(
+                "`prev.{field}` cannot be used inside a comparison: the \
+                 previous-hop binding is not carried through comparison \
+                 expressions. Compute the value in a separate ALONG binding \
+                 and compare that, or backtick-escape a variable literally \
+                 named `prev`."
+            )));
+        }
+
         // Re-parse the whole comparison as a Cypher expression using span offsets
         let first_start = children.first().unwrap().as_span().start();
         let last_end = children.last().unwrap().as_span().end();

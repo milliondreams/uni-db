@@ -15,6 +15,8 @@ from typing import (
 )
 from weakref import WeakValueDictionary
 
+from pydantic import ValidationError
+
 from .async_query import AsyncQueryBuilder
 from .base import UniEdge, UniNode
 from .exceptions import (
@@ -36,7 +38,12 @@ from .hooks import (
     run_class_hooks,
     run_hooks,
 )
-from .query import _edge_pattern, _row_to_node_dict, _validate_property
+from .query import (
+    _edge_pattern,
+    _row_to_node_dict,
+    _validate_property,
+    _warn_unhydratable,
+)
 from .schema import SchemaGenerator
 from .session import _NODE_RETURN, UniSession
 from .types import db_to_python_value, python_to_db_value
@@ -336,7 +343,7 @@ class AsyncUniSession:
                 if isinstance(value, dict):
                     if "_id" in value and "_label" in value:
                         instance = self._result_to_model(value, result_type)
-                        if instance:
+                        if instance is not None:
                             mapped.append(instance)
                             break
                     elif "_label" in value:
@@ -344,14 +351,14 @@ class AsyncUniSession:
                         if label in self._schema_gen._node_models:
                             model = self._schema_gen._node_models[label]
                             instance = self._result_to_model(value, model)
-                            if instance:
+                            if instance is not None:
                                 mapped.append(instance)
                                 break
             else:
                 first_value = next(iter(row.values()), None)
                 if isinstance(first_value, dict):
                     instance = self._result_to_model(first_value, result_type)
-                    if instance:
+                    if instance is not None:
                         mapped.append(instance)
 
         return mapped
@@ -563,7 +570,8 @@ class AsyncUniSession:
                 NodeT,
                 model.from_properties(data, vid=vid, session=self),
             )
-        except Exception:
+        except ValidationError as exc:
+            _warn_unhydratable(model, vid, exc)
             return None
 
         if vid is not None:

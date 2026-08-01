@@ -16,6 +16,8 @@ from typing import (
 )
 from weakref import WeakValueDictionary
 
+from pydantic import ValidationError
+
 from .base import UniEdge, UniNode
 from .exceptions import (
     BulkLoadError,
@@ -41,6 +43,7 @@ from .query import (
     _edge_pattern,
     _row_to_node_dict,
     _validate_property,
+    _warn_unhydratable,
 )
 from .schema import SchemaGenerator
 from .types import db_to_python_value, python_to_db_value
@@ -443,7 +446,7 @@ class UniSession:
                     # Check for _id/_label keys (uni-db node dict)
                     if "_id" in value and "_label" in value:
                         instance = self._result_to_model(value, result_type)
-                        if instance:
+                        if instance is not None:
                             mapped.append(instance)
                             break
                     # Also check if _label matches registered model
@@ -452,7 +455,7 @@ class UniSession:
                         if label in self._schema_gen._node_models:
                             model = self._schema_gen._node_models[label]
                             instance = self._result_to_model(value, model)
-                            if instance:
+                            if instance is not None:
                                 mapped.append(instance)
                                 break
             else:
@@ -460,7 +463,7 @@ class UniSession:
                 first_value = next(iter(row.values()), None)
                 if isinstance(first_value, dict):
                     instance = self._result_to_model(first_value, result_type)
-                    if instance:
+                    if instance is not None:
                         mapped.append(instance)
 
         return mapped
@@ -842,8 +845,8 @@ class UniSession:
                     session=self,
                 ),
             )
-        except Exception:
-            # If validation fails, return None
+        except ValidationError as exc:
+            _warn_unhydratable(model, vid, exc)
             return None
 
         # Add to identity map if we have a vid
@@ -888,7 +891,7 @@ class UniSession:
             if node_label and node_label in self._schema_gen._node_models:
                 model = self._schema_gen._node_models[node_label]
                 instance = self._result_to_model(node_data, model)
-                if instance:
+                if instance is not None:
                     nodes.append(instance)
 
         if not descriptor.is_list:

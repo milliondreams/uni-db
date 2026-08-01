@@ -6,6 +6,7 @@
 from datetime import date, datetime
 
 import pytest
+from pydantic import field_validator
 
 from uni_pydantic import (
     AsyncUniSession,
@@ -249,3 +250,77 @@ class TestAsyncLifecycleHooks:
         await async_session.commit()
 
         assert alice.created_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Async hydration must not silently drop rows either
+# ---------------------------------------------------------------------------
+#
+# `AsyncUniSession._result_to_model` is a second copy of the sync method, with
+# its own `except Exception: return None`. The row-mapping helpers in
+# `query.py` are shared, so the truthiness guards were common to both; the
+# swallow was not.
+
+
+class AsyncFalsyThing(UniNode):
+    """Legitimately falsy when empty — must survive hydration."""
+
+    __label__ = "AsyncFalsyThing"
+
+    name: str
+    count: int = 0
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+
+class AsyncBuggyThing(UniNode):
+    """Raises a non-validation error during hydration."""
+
+    __label__ = "AsyncBuggyThing"
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _boom(cls, v: str) -> str:
+        if v == "boom":
+            raise RuntimeError("async hydration bug, not a validation failure")
+        return v
+
+
+async def _async_raw_create(async_session, cypher: str) -> None:
+    tx = await async_session._db_session.tx()
+    await tx.execute(cypher)
+    await tx.commit()
+
+
+class TestAsyncHydrationDoesNotDropRows:
+    async def test_falsy_instance_is_not_dropped(self, async_session):
+        async_session.register(AsyncFalsyThing)
+        await async_session.sync_schema()
+
+        await _async_raw_create(
+            async_session,
+            "CREATE (:AsyncFalsyThing {name: 'empty', count: 0}) "
+            "CREATE (:AsyncFalsyThing {name: 'full', count: 3})",
+        )
+
+        found = await async_session.query(AsyncFalsyThing).all()
+        names = sorted(f.name for f in found)
+        assert names == ["empty", "full"], (
+            f"a validly hydrated but falsy model was dropped; got {names}"
+        )
+
+    async def test_hydration_bug_is_not_swallowed(self, async_session):
+        async_session.register(AsyncBuggyThing)
+        await async_session.sync_schema()
+
+        await _async_raw_create(
+            async_session,
+            "CREATE (:AsyncBuggyThing {name: 'ok'}) "
+            "CREATE (:AsyncBuggyThing {name: 'boom'})",
+        )
+
+        with pytest.raises(RuntimeError, match="async hydration bug"):
+            await async_session.query(AsyncBuggyThing).all()

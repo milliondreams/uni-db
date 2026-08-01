@@ -324,3 +324,65 @@ class TestAsyncHydrationDoesNotDropRows:
 
         with pytest.raises(RuntimeError, match="async hydration bug"):
             await async_session.query(AsyncBuggyThing).all()
+
+
+# ---------------------------------------------------------------------------
+# eager_load() on the async session
+# ---------------------------------------------------------------------------
+#
+# `AsyncUniSession._load_relationship` raises and tells the caller to use
+# `eager_load()`, so the eager path is the only relationship path async has --
+# and it was the one caching raw dicts. An entity with nothing attached was
+# left with no cache entry at all, which sent the descriptor down that raising
+# lazy path on first access.
+
+
+class AsyncTag(UniNode):
+    __label__ = "AsyncTag"
+
+    name: str
+
+
+class AsyncDoc(UniNode):
+    __label__ = "AsyncDoc"
+
+    title: str
+
+    tags: list[AsyncTag] = Relationship("TAGGED")
+
+
+class TestAsyncEagerLoad:
+    async def _seed(self, async_session):
+        async_session.register(AsyncDoc, AsyncTag)
+        await async_session.sync_schema()
+
+        doc = AsyncDoc(title="Guide")
+        tag = AsyncTag(name="howto")
+        bare = AsyncDoc(title="Untagged")
+        async_session.add_all([doc, tag, bare])
+        await async_session.commit()
+
+        await async_session.create_edge(doc, "TAGGED", tag, {})
+        await async_session._db.flush()
+
+    async def test_eager_load_yields_models(self, async_session):
+        await self._seed(async_session)
+
+        docs = await async_session.query(AsyncDoc).eager_load("tags").all()
+        guide = next(d for d in docs if d.title == "Guide")
+
+        assert len(guide.tags) == 1
+        assert isinstance(guide.tags[0], AsyncTag), (
+            f"eager_load cached a raw {type(guide.tags[0]).__name__}"
+        )
+        assert guide.tags[0].name == "howto"
+
+    async def test_entity_without_relations_does_not_lazy_load(self, async_session):
+        await self._seed(async_session)
+
+        docs = await async_session.query(AsyncDoc).eager_load("tags").all()
+        untagged = next(d for d in docs if d.title == "Untagged")
+
+        # Must not raise: with no cache entry the descriptor would fall through
+        # to the async lazy path, which raises on principle.
+        assert untagged.tags == []

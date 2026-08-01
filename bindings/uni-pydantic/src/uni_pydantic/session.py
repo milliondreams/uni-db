@@ -928,7 +928,16 @@ class UniSession:
             )
             results = self._db_session.query(cypher, {"vids": vids})
 
-            # Group results by source vid
+            # Hydrate, exactly as the lazy path does.
+            #
+            # These rows used to be cached as raw result dicts.
+            # `RelationshipDescriptor.__get__` returns the cache verbatim, so
+            # eager loading handed back `list[dict]` where lazy loading hands
+            # back `list[Model]` -- `user.posts[0].title` raised where the same
+            # access worked without `.eager_load()`.
+            descriptor = getattr(model, rel_name, None)
+            is_list = getattr(descriptor, "is_list", True)
+
             by_source: dict[int, list[Any]] = {}
             for raw_row in results:
                 row = raw_row.to_dict()
@@ -936,13 +945,23 @@ class UniSession:
                 node_data = _row_to_node_dict(row)
                 if node_data is None:
                     continue
-                if src_vid not in by_source:
-                    by_source[src_vid] = []
-                by_source[src_vid].append(node_data)
+                node_label = node_data.get("_label")
+                if not node_label or node_label not in self._schema_gen._node_models:
+                    continue
+                target_model = self._schema_gen._node_models[node_label]
+                instance = self._result_to_model(node_data, target_model)
+                if instance is None:
+                    continue
+                by_source.setdefault(src_vid, []).append(instance)
 
-            # Set cached values on entities
+            # Every entity gets a cache entry, including the ones with nothing
+            # attached. Leaving those unset sends the descriptor down the lazy
+            # path on first access -- which on an async session raises, telling
+            # the caller to use the `eager_load()` they already used.
+            cache_attr = f"_rel_cache_{rel_name}"
             for entity in entities:
-                if entity._vid in by_source:
-                    related = by_source[entity._vid]
-                    cache_attr = f"_rel_cache_{rel_name}"
+                related = by_source.get(entity._vid, [])
+                if is_list:
                     setattr(entity, cache_attr, related)
+                else:
+                    setattr(entity, cache_attr, related[0] if related else None)

@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, get_type_hints
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 from .base import UniEdge, UniNode
 from .exceptions import SchemaError
@@ -210,20 +211,78 @@ class SchemaGenerator:
                 edge_model
             )
 
-        # Also generate labels from relationships in node models
+        # Edge types implied by `Relationship(...)` fields, for which no
+        # explicit `UniEdge` model was registered.
+        #
+        # These used to declare *every* registered label on both endpoints,
+        # discarding the two things the declaration actually states: the model
+        # that owns the field, and the model its annotation points at. That is
+        # not merely imprecise -- an edge type whose endpoints span several
+        # labels makes `properties(b)` on an unlabelled `b` come back empty, so
+        # every relationship target loaded as a propertyless node.
         for model in self._node_models.values():
             for rel_name, rel_config in model.get_relationship_fields().items():
                 edge_type = rel_config.edge_type
-                if edge_type not in schema.edge_types:
-                    # Create a minimal edge type schema
+                if edge_type in self._edge_models:
+                    # An explicit UniEdge model declares its own endpoints.
+                    continue
+
+                owner = model.__label__
+                target = self._relationship_target_label(model, rel_name)
+                if target is None:
+                    # Unresolvable annotation (e.g. a forward reference to a
+                    # model that was never registered). Fall back to the old
+                    # permissive shape rather than guessing wrong.
+                    src, dst = set(self._node_models), set(self._node_models)
+                elif rel_config.direction == "incoming":
+                    src, dst = {target}, {owner}
+                elif rel_config.direction == "both":
+                    src, dst = {owner, target}, {owner, target}
+                else:
+                    src, dst = {owner}, {target}
+
+                existing = schema.edge_types.get(edge_type)
+                if existing is None:
                     schema.edge_types[edge_type] = EdgeTypeSchema(
                         name=edge_type,
-                        from_labels=list(self._node_models.keys()),
-                        to_labels=list(self._node_models.keys()),
+                        from_labels=sorted(src),
+                        to_labels=sorted(dst),
                     )
+                else:
+                    # Several models may declare the same edge type; the
+                    # endpoint sets union.
+                    existing.from_labels = sorted(set(existing.from_labels) | src)
+                    existing.to_labels = sorted(set(existing.to_labels) | dst)
 
         self._schema = schema
         return schema
+
+    def _relationship_target_label(self, model: type[Any], rel_name: str) -> str | None:
+        """Resolve the label a relationship field points at.
+
+        The descriptor carries `target_type` as either a model class or an
+        unresolved forward-reference string; a string is matched against
+        registered models by class name, since `__label__` may differ from it.
+        Returns None when the target cannot be resolved.
+        """
+        descriptor = getattr(model, rel_name, None)
+        target = getattr(descriptor, "target_type", None)
+        if target is None:
+            return None
+        if isinstance(target, str):
+            # A quoted annotation may be a bare name (`"Book"`) or a whole
+            # expression the metaclass could not evaluate (`"Bio | None"`,
+            # `"list[Book]"`). Pull identifiers out and match any of them
+            # against registered models, skipping typing spelling.
+            noise = {"None", "Optional", "Union", "list", "List", "set", "Set"}
+            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", target):
+                if token in noise:
+                    continue
+                for label, candidate in self._node_models.items():
+                    if candidate.__name__ == token or label == token:
+                        return label
+            return None
+        return getattr(target, "__label__", None)
 
     def apply_to_database(self, db: uni_db.Uni) -> None:
         """Apply the generated schema to a database using SchemaBuilder.

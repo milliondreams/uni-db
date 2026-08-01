@@ -116,6 +116,13 @@ class UniModelMeta(type(BaseModel)):  # type: ignore[misc]
         # Process relationship markers in annotations
         annotations = namespace.get("__annotations__", {})
         relationships: dict[str, RelationshipConfig] = {}
+        # Shape of each relationship, captured *before* its annotation is
+        # deleted below. The descriptor loop further down used to re-read
+        # `annotations[field_name]`, which by then no longer existed -- so
+        # `is_list` was always False and `target_type` always None for every
+        # relationship ever declared. A `list[Book]` field was indistinguishable
+        # from a to-one, and the target model was simply unavailable.
+        rel_shapes: dict[str, tuple[bool, Any]] = {}
 
         # Collect relationship markers and convert to descriptors
         for field_name, annotation in list(annotations.items()):
@@ -124,6 +131,10 @@ class UniModelMeta(type(BaseModel)):  # type: ignore[misc]
                 # Determine if it's a list or single relationship
                 is_opt, inner = is_optional(annotation)
                 is_lst, elem_type = is_list_type(inner if is_opt else annotation)
+                rel_shapes[field_name] = (
+                    is_lst,
+                    elem_type if is_lst else (inner if is_opt else annotation),
+                )
 
                 # Store relationship config
                 relationships[field_name] = default.config
@@ -143,17 +154,12 @@ class UniModelMeta(type(BaseModel)):  # type: ignore[misc]
 
         # Add relationship descriptors
         for field_name, config in relationships.items():
-            annotation = annotations.get(field_name)
-            is_opt, inner = is_optional(annotation) if annotation else (False, None)
-            is_lst, _ = (
-                is_list_type(inner if is_opt else annotation)
-                if annotation
-                else (False, None)
-            )
+            is_lst, target = rel_shapes.get(field_name, (False, None))
 
             descriptor: RelationshipDescriptor[Any] = RelationshipDescriptor(
                 config=config,
                 field_name=field_name,
+                target_type=target,
                 is_list=is_lst,
             )
             setattr(cls, field_name, descriptor)

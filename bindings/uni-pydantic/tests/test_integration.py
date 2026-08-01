@@ -632,3 +632,112 @@ class TestHydrationDoesNotDropRows:
 
         found = session.query(Person).all()
         assert sorted(p.name for p in found) == ["Alice", "Bob"]
+
+
+# ---------------------------------------------------------------------------
+# eager_load() must hydrate models, exactly as lazy loading does
+# ---------------------------------------------------------------------------
+
+
+class Author(UniNode):
+    """Owner of both a to-many and a to-one relationship."""
+
+    __label__ = "Author"
+
+    name: str
+
+    books: list["Book"] = Relationship("WROTE")
+    bio: "Bio | None" = Relationship("HAS_BIO")
+
+
+class Book(UniNode):
+    __label__ = "Book"
+
+    title: str
+
+
+class Bio(UniNode):
+    __label__ = "Bio"
+
+    summary: str
+
+
+class TestEagerLoadHydratesModels:
+    """`_eager_load_relationships` cached raw result dicts.
+
+    The lazy path (`_load_relationship`) routes rows through
+    `_result_to_model` and honours `descriptor.is_list`; the eager path did
+    neither. `RelationshipDescriptor.__get__` returns whatever is cached
+    verbatim, so eager loading handed back `list[dict]` where lazy loading
+    hands back `list[Model]` — and a to-one relationship came back as a list.
+
+    This is worse on the async session, where `_load_relationship` *raises*
+    and tells the caller to use `eager_load()`. There, the broken path is the
+    only relationship path there is.
+    """
+
+    def _seed(self, session):
+        session.register(Author, Book, Bio)
+        session.sync_schema()
+
+        author = Author(name="Ursula")
+        book = Book(title="A Wizard of Earthsea")
+        bio = Bio(summary="Wrote about wizards.")
+        session.add_all([author, book, bio])
+        session.commit()
+
+        session.create_edge(author, "WROTE", book, {})
+        session.create_edge(author, "HAS_BIO", bio, {})
+        session._db.flush()
+        return author
+
+    def test_to_many_yields_models_not_dicts(self, session):
+        self._seed(session)
+
+        found = session.query(Author).eager_load("books").all()
+        assert len(found) == 1
+        books = found[0].books
+
+        assert len(books) == 1
+        assert isinstance(books[0], Book), (
+            f"eager_load cached a raw {type(books[0]).__name__}; "
+            "attribute access on it fails where lazy loading works"
+        )
+        # The symptom a user actually hits.
+        assert books[0].title == "A Wizard of Earthsea"
+
+    def test_to_one_yields_a_model_not_a_list(self, session):
+        self._seed(session)
+
+        found = session.query(Author).eager_load("bio").all()
+        bio = found[0].bio
+
+        assert not isinstance(bio, list), (
+            "a to-one relationship must not come back as a list; "
+            "`descriptor.is_list` was ignored"
+        )
+        assert isinstance(bio, Bio)
+        assert bio.summary == "Wrote about wizards."
+
+    def test_eager_and_lazy_agree(self, session):
+        """The two paths must produce the same thing for the same data."""
+        self._seed(session)
+
+        eager = session.query(Author).eager_load("books").all()[0].books
+        lazy = session.query(Author).all()[0].books
+
+        assert [type(b) for b in eager] == [type(b) for b in lazy]
+        assert [b.title for b in eager] == [b.title for b in lazy]
+
+    def test_no_related_rows_is_still_well_typed(self, session):
+        """Inverse guard: an author with nothing attached."""
+        session.register(Author, Book, Bio)
+        session.sync_schema()
+
+        session.add(Author(name="Nobody"))
+        session.commit()
+        session._db.flush()
+
+        found = session.query(Author).eager_load("books", "bio").all()
+        assert found[0].books == []
+        assert found[0].bio is None

@@ -75,18 +75,16 @@ impl UniSync {
 
     /// Shutdown the database gracefully (blocking).
     ///
-    /// Note: This consumes self, which prevents the Drop impl from also
-    /// triggering shutdown. Use this for explicit shutdown with error handling.
+    /// Consumes `self` so the runtime is torn down with it. Use this over an
+    /// implicit drop when you want the shutdown error rather than a silent
+    /// best-effort one.
     pub fn shutdown(mut self) -> Result<()> {
-        // Take ownership of the inner Uni to prevent Drop from also running
+        // Taking the inner Uni is what disarms `Drop` — its guard is
+        // `if let Some(ref uni) = self.inner`, so after this the Drop impl is
+        // already a no-op and `self` can fall out of scope normally. It must:
+        // dropping `self` is what shuts down and joins `rt`'s worker threads.
         if let Some(uni) = self.inner.take() {
-            let result = self.rt.block_on(uni.shutdown());
-
-            // Prevent Drop from running by forgetting self
-            // (we've already done the cleanup in the async shutdown)
-            std::mem::forget(self);
-
-            result
+            self.rt.block_on(uni.shutdown())
         } else {
             Ok(()) // Already shut down
         }

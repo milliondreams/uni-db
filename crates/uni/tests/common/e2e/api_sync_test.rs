@@ -157,3 +157,42 @@ fn test_builder_build_sync() -> Result<()> {
     })?;
     Ok(())
 }
+
+/// `UniSync::shutdown` used to end with `std::mem::forget(self)`, justified as
+/// "prevents the Drop impl from also triggering shutdown". But `Drop` guards on
+/// `if let Some(ref uni) = self.inner`, and `shutdown` has already done
+/// `self.inner.take()` — so Drop was a no-op by then and the only thing `forget`
+/// suppressed was `Runtime::drop`. Every explicit shutdown leaked a whole
+/// multi-threaded runtime whose worker threads were never joined.
+///
+/// The implicit path (letting a `UniSync` fall out of scope) always dropped the
+/// runtime, so this also made explicit shutdown inconsistent with it.
+#[test]
+fn shutdown_does_not_leak_runtime_threads() {
+    fn threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+    if threads() == 0 {
+        return; // not Linux — nothing to measure
+    }
+
+    // Warm up so one-off lazy allocations aren't counted as growth.
+    for _ in 0..2 {
+        UniSync::in_memory().unwrap().shutdown().unwrap();
+    }
+    let before = threads();
+
+    for _ in 0..8 {
+        UniSync::in_memory().unwrap().shutdown().unwrap();
+    }
+
+    let after = threads();
+    // Each leaked runtime strands a worker per core, so a leak shows up as
+    // growth far beyond any incidental churn.
+    assert!(
+        after <= before + 4,
+        "shutdown leaked runtime threads: {before} before, {after} after 8 cycles"
+    );
+}

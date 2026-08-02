@@ -172,8 +172,12 @@ pub struct Transaction {
 fn classify_verb(cypher: &str) -> &'static str {
     let s = cypher.trim_start();
     // Take up to 32 chars and uppercase for a cheap prefix match.
-    let prefix_len = s.len().min(32);
-    let prefix = s[..prefix_len].to_uppercase();
+    //
+    // Iterate by `char`, not by byte. `s.len()` is a BYTE length, so slicing
+    // `s[..s.len().min(32)]` panicked whenever byte 32 landed inside a
+    // multi-byte codepoint — i.e. on any query with non-ASCII text near the
+    // start, such as `CREATE (:Thing)-[:\`CONNAÎT\`]->(:Thing)`.
+    let prefix: String = s.chars().take(32).flat_map(char::to_uppercase).collect();
     let p = prefix.as_str();
 
     if p.starts_with("CREATE INDEX")
@@ -1911,5 +1915,49 @@ impl uni_fork::ForkPromoteSink for Transaction {
 
     async fn delete_vertex(&self, label: &str, vid: uni_common::core::id::Vid) -> Result<()> {
         Transaction::delete_vertex_by_vid(self, label, vid).await
+    }
+}
+
+#[cfg(test)]
+mod classify_verb_tests {
+    use super::classify_verb;
+
+    /// `classify_verb` sliced `s[..s.len().min(32)]` — a **byte** length, while
+    /// its comment said "up to 32 chars". Any statement whose 32nd byte landed
+    /// inside a multi-byte codepoint panicked, and because every write goes
+    /// through here the panic crossed the pyo3 boundary as an abort rather than
+    /// an exception.
+    ///
+    /// The sweep below necessarily places a multi-byte character across the
+    /// byte-32 boundary at some padding length.
+    #[test]
+    fn classify_verb_does_not_panic_on_multibyte_boundaries() {
+        // Sweep the padding rather than computing the offset by hand: some
+        // length in this range necessarily puts the two-byte `Î` across byte
+        // 32. (An earlier draft of this test guessed one offset, landed the
+        // codepoint at byte 35, and passed against the unfixed code.)
+        for pad in 0..40 {
+            let cypher = format!("CREATE (:T)-[:`{}Î`]->(:T)", "x".repeat(pad));
+            assert_eq!(
+                classify_verb(&cypher),
+                "write",
+                "panicked or misclassified at pad={pad}"
+            );
+        }
+    }
+
+    /// Non-ASCII must not change the classification of a leading keyword.
+    #[test]
+    fn classify_verb_still_recognises_keywords() {
+        assert_eq!(classify_verb("  CREATE INDEX idx ON :T(x)"), "schema");
+        assert_eq!(classify_verb("DROP CONSTRAINT c"), "schema");
+        assert_eq!(classify_verb("CREATE (:Café {n: 'Ünter'})"), "write");
+    }
+
+    /// A statement shorter than the prefix window is unaffected.
+    #[test]
+    fn classify_verb_handles_short_input() {
+        assert_eq!(classify_verb("CREATE (:T)"), "write");
+        assert_eq!(classify_verb(""), "write");
     }
 }

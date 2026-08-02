@@ -104,6 +104,33 @@ pub fn compile_with_config(
 /// that resolves aggregate names through the registry and reads
 /// `Semilattice.monotone_join`, so user-registered aggregates participate
 /// in the recursive-stratum FOLD check.
+/// Compile with both a host-supplied monotonicity oracle and a [`LocyConfig`].
+///
+/// The combination every `uni` host entry point needs: hosts hold a
+/// `PluginRegistry` *and* a config carrying the neural-predicate preview gate,
+/// and neither [`compile_with_oracle`] nor [`compile_with_config`] offers both.
+///
+/// Deliberately a seventh shim rather than a `CompileOptions` struct.
+/// [`MonotonicityOracle`] carries a lifetime parameter, so such a struct cannot
+/// derive `Default` and would need a hand-written impl plus a borrowed empty
+/// module map — real work for no call-site benefit while exactly one new
+/// combination is required.
+pub fn compile_with_oracle_and_config(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+    config: &LocyConfig,
+    is_monotonic: MonotonicityOracle<'_>,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        available_modules,
+        external_rules,
+        config.neural_predicates_preview,
+        is_monotonic,
+    )
+}
+
 pub fn compile_with_oracle(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
@@ -146,6 +173,7 @@ fn compile_with_context(
             &empty_rule_catalog,
             neural_predicates_preview,
             &mut extra_warnings,
+            is_monotonic,
         )?;
         model_warnings.extend(extra_warnings);
         return Ok(CompiledProgram {
@@ -208,6 +236,7 @@ fn compile_with_context(
         &compiled_rules,
         neural_predicates_preview,
         &mut extra_command_warnings,
+        is_monotonic,
     )?;
     warnings.extend(extra_command_warnings);
 
@@ -223,6 +252,10 @@ fn compile_with_context(
 /// Extract non-rule statements as compiled commands, validating rule references.
 /// Returns the commands and any extra warnings emitted by command
 /// compilation (e.g., Phase C C4 `EceBinningBias`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threads the compile context (rules, modules, catalogs, preview gate, warning sink) plus the caller's monotonicity oracle into command extraction; grouping into a struct would just move the argument list."
+)]
 fn extract_commands(
     program: &LocyProgram,
     defined_rules: &[String],
@@ -231,6 +264,9 @@ fn extract_commands(
     rule_catalog: &HashMap<String, crate::types::CompiledRule>,
     neural_predicates_preview_flag: bool,
     extra_warnings: &mut Vec<crate::types::CompilerWarning>,
+    // Threaded so an ASSUME body inherits the caller's oracle rather than
+    // silently re-defaulting at the boundary.
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<Vec<CompiledCommand>, LocyCompileError> {
     let validate_rule = |raw_name: &str| -> Result<(), LocyCompileError> {
         let resolved = modules::resolve_rule_name(module_ctx, raw_name);
@@ -306,6 +342,7 @@ fn extract_commands(
                     rule_catalog,
                     neural_predicates_preview_flag,
                     &mut body_extra_warnings,
+                    is_monotonic,
                 )?;
                 extra_warnings.extend(body_extra_warnings);
 
@@ -319,7 +356,11 @@ fn extract_commands(
                         &HashMap::new(),
                         &outer_visible,
                         neural_predicates_preview_flag,
-                        &default_monotonicity_oracle,
+                        // Inherit the caller's oracle. Re-defaulting here would
+                        // silently stop a host-supplied oracle at the ASSUME
+                        // boundary, so a plugin aggregate legal in the outer
+                        // program would be rejected inside an ASSUME body.
+                        is_monotonic,
                     )?
                 } else {
                     CompiledProgram {

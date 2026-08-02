@@ -726,22 +726,32 @@ impl Session {
             context: None,
         })?;
         let registry = self.rule_registry.read().unwrap();
-        if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile(&ast).map_err(|e| UniError::Query {
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+
+        // Consult the session registry before the instance one, so a
+        // session-scoped plugin aggregate is visible. This is also why the
+        // oracle is passed explicitly rather than read from the task-local:
+        // `LocyBuilder::run` wraps itself in `scoped_with_session_context` but
+        // `explain()` and `profile()` do not, so a task-local would make
+        // `explain()` reject a program `run()` accepts.
+        let session_reg = &self.session_plugin_registry;
+        let instance_reg = self.instance_plugin_registry();
+        let oracle = |name: &str| {
+            uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(session_reg, name)
+                .or_else(|| {
+                    uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(
+                        instance_reg,
+                        name,
+                    )
+                })
+        };
+        uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external_names, &oracle).map_err(
+            |e| UniError::Query {
                 message: format!("LocyCompileError: {e}"),
                 query: None,
-            })
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
-                UniError::Query {
-                    message: format!("LocyCompileError: {e}"),
-                    query: None,
-                }
-            })
-        }
+            },
+        )
     }
 
     // ── Transaction & Writer Factories ────────────────────────────────

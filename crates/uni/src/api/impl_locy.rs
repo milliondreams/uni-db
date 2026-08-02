@@ -322,12 +322,15 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
             Some(registry.rules.keys().cloned().collect())
         }
     };
-    let mut compiled = if let Some(names) = external_names {
-        uni_locy::compile_with_external_rules_and_config(&ast, &names, config)
-            .map_err(map_compile_error)?
-    } else {
-        uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)?
-    };
+    let oracle = plugin_monotonicity_oracle(&db.plugin_registry);
+    let mut compiled = uni_locy::compile_with_oracle_and_config(
+        &ast,
+        &HashMap::new(),
+        external_names.as_deref().unwrap_or(&[]),
+        config,
+        &oracle,
+    )
+    .map_err(map_compile_error)?;
 
     // Merge registered rules
     {
@@ -371,6 +374,20 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     engine
         .evaluate_compiled_capturing(compiled, config, profile_capture)
         .await
+}
+
+/// Build a monotonicity oracle backed by `registry`, falling back to the
+/// built-in `M*` contract.
+///
+/// Returned as an `impl Fn` borrowed for the call: `MonotonicityOracle<'a>` is
+/// `&'a dyn Fn(&str) -> Option<bool>`, so no `'static` bound, boxing or `Arc` is
+/// needed — `&oracle` coerces at the call site.
+pub(crate) fn plugin_monotonicity_oracle(
+    registry: &uni_plugin::PluginRegistry,
+) -> impl Fn(&str) -> Option<bool> + '_ {
+    move |name: &str| {
+        uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(registry, name)
+    }
 }
 
 /// Engine for evaluating Locy programs against a real database.
@@ -441,15 +458,17 @@ impl<'a> LocyEngine<'a> {
     ) -> Result<CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
         let registry = self.db.locy_rule_registry.read().unwrap();
-        if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules_and_config(&ast, &external_names, config)
-                .map_err(map_compile_error)
-        }
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+        let oracle = plugin_monotonicity_oracle(&self.db.plugin_registry);
+        uni_locy::compile_with_oracle_and_config(
+            &ast,
+            &HashMap::new(),
+            &external_names,
+            config,
+            &oracle,
+        )
+        .map_err(map_compile_error)
     }
 
     /// Compile and register a Locy program's rules for reuse.

@@ -943,7 +943,7 @@ impl<'a> LocyPlanBuilder<'a> {
                         );
                     }
                 };
-                match crate::query::df_graph::locy_fold::is_monotonic_aggregate(
+                match crate::query::df_graph::locy_fold::locy_monotonicity_verdict(
                     &self.plugin_registry,
                     &fname,
                 ) {

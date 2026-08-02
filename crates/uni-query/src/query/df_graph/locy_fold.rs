@@ -64,6 +64,31 @@ pub fn is_monotonic_aggregate(registry: &uni_plugin::PluginRegistry, name: &str)
     resolve_locy_aggregate(registry, name).map(|e| e.aggregate.semilattice().monotone_join)
 }
 
+/// The registry's verdict, falling back to the built-in `M*` contract.
+///
+/// This is the composition every consumer should use, and it exists because
+/// registry-alone is wrong in both directions.
+///
+/// A bare `PluginRegistry::new()` — a plugin-less embedding, or a host that has
+/// removed a plugin — answers `None` for `MSUM`, `MMAX` and the rest, so a
+/// registry-only oracle would start rejecting recursive programs that use the
+/// built-in lattice folds. Falling back to
+/// [`uni_locy::default_monotonicity_oracle`] keeps that user-asserted contract
+/// working regardless of registry state.
+///
+/// The compile-time oracle and the planner's guard must both go through this
+/// function. When they disagree — as they did while the compiler consulted the
+/// default and the planner consulted the registry — a program can compile
+/// cleanly and then fail at plan time with an unstructured error, or the
+/// reverse.
+#[must_use]
+pub fn locy_monotonicity_verdict(
+    registry: &uni_plugin::PluginRegistry,
+    name: &str,
+) -> Option<bool> {
+    is_monotonic_aggregate(registry, name).or_else(|| uni_locy::default_monotonicity_oracle(name))
+}
+
 #[must_use]
 pub fn resolve_locy_aggregate(
     registry: &uni_plugin::PluginRegistry,

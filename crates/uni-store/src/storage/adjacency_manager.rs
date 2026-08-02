@@ -777,7 +777,21 @@ impl AdjacencyManager {
 
     /// Returns the current approximate memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
-        self.current_bytes.load(Ordering::Relaxed)
+        // `current_bytes` accounts only for the main CSR — every mutation of it
+        // is on a `main_csr` path. Shadow retention was therefore invisible to
+        // the budget and could never trip `max_bytes`, which is how an
+        // unbounded leak there went unnoticed. Counted approximately rather
+        // than tracked incrementally: the shadow is small when healthy, and an
+        // exact counter would need hooks on every retain in `gc`.
+        self.current_bytes.load(Ordering::Relaxed) + self.shadow.approx_bytes()
+    }
+
+    /// Shadow-CSR entries currently retained.
+    ///
+    /// Exposed for retention tests and diagnostics; see
+    /// [`ShadowCsr::add_deleted_edge`] for why this can grow.
+    pub fn shadow_entry_count(&self) -> usize {
+        self.shadow.entry_count()
     }
 
     /// Returns the maximum memory budget in bytes.

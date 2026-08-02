@@ -48,3 +48,8 @@ pub mod repro_04_adjacency_incoming_shadow;
 pub mod repro_10_id_allocator_persist_fail;
 pub mod repro_16_compact_vertices_concurrent_flush;
 pub mod repro_id_allocator_substring_notfound;
+
+// Tier 1.10a — object-store error classification (typed vs. substring), and the
+// classifier/attempt-budget ordering bug in ResilientObjectStore::retry.
+pub mod repro_resilient_stringly_classifier;
+

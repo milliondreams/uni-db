@@ -9,7 +9,7 @@
 //! affecting accept/reject decisions:
 //!
 //! 1. **Numeric equality.** The bulk copy routed `=` / `!=` operands through
-//!    [`compare_values`] when both sides are numeric, because [`Value`]'s
+//!    `compare_values` when both sides are numeric, because [`Value`]'s
 //!    `PartialEq` is type-strict and has no Int/Float arm. The writer copy used
 //!    bare `==`. So `CHECK (score = 5)` against a stored `Float(5.0)` *passed*
 //!    through the bulk loader and *failed* through `tx.execute`.

@@ -736,10 +736,10 @@ pass for the wrong reason, that is recorded rather than glossed over.*
 | 1.7 tx cancellation | ✅ already closed | committed as `b63deba8a`; the doc's "uncommitted" tag was stale |
 | *(adjacent)* `LocyBuilder` token + tx-bound AST | ✅ done | a pre-cancelled Locy query ran to completion and returned 100 facts |
 | 1.3 + 2.8 `map_variables` | ✅ done | an ALONG binding in a `LabelCheck` / map-projection / comprehension-source position was left un-inlined |
-| 1.2 ShadowCsr retention | ✅ partial | each warm re-pushed the whole delete history; GC bound documented, registry deferred |
+| 1.2 ShadowCsr retention + GC | ✅ done | each warm re-pushed the whole delete history; `gc` was never called |
 | 1.4 CHECK evaluator | ✅ done | bulk and tx disagreed on `CHECK (score = 5)` against `Float(5.0)` |
 | 1.5 oracle wiring, phase 1 | ✅ done | a recursive `FOLD MAX(x)` was refused as "non-monotonic" while the planner's own guard accepted it |
-| **1.5 oracle wiring, phase 2** | ⬜ not started | registration + persisted reload still use the default oracle |
+| 1.5 oracle wiring, phase 2 | ✅ done | `rules().register()` and reopen both failed with "non-monotonic aggregate 'MAX'" |
 
 **Gates after the above:** `uni-db` **2331/2331** · `uni-store` **643/643** ·
 `uni-query` **766/766** · `uni-locy` + Locy TCK **637/637** · `uni-common` +
@@ -825,25 +825,24 @@ pass for the wrong reason, that is recorded rather than glossed over.*
 
 #### Still open
 
-**`1.5` phase 2** — the rule-registration and persisted-reload paths, and the
-TCK's `when_compile` step, still compile with the default oracle. The seam is
-fail-closed and self-consistent (`register` and reload agree with each other),
-so no program silently changes meaning; a plugin aggregate simply cannot be
-pre-registered yet.
+**Nothing in Tier 1.** All ten items are closed, plus four adjacent defects
+found while implementing them.
 
-The blocking piece is a `Uni::build` reordering: `build_locy_registry_from_persisted`
-runs at `api/mod.rs:3315` while `plugin_registry` is not constructed until
-`:3363`. Tracing the intervening bindings says the move is feasible —
-`persistence_data_path` depends only on `uri` / `is_remote_uri`, both bound
-earlier, and hoisting the registry keeps it before the `StorageManager` is
-wrapped in `Arc`, which is the constraint documented at that site. It remains
-the single highest-risk edit in the sweep (the audit records five undocumented
-ordering dependencies in that function), so it wants its own change with room to
-verify.
+Two things were finished in a later pass than the rest and are worth calling out
+because their difficulty was in the design, not the code:
 
-**`1.2`'s GC bound** — `ShadowCsr::gc` stays unwired pending a registry of
-in-flight `pinned_at_version` transactions. The bound and why `SnapshotManager`
-cannot supply it are documented on the function.
+* **1.5 phase 2** needed a `Uni::build` reordering — the persisted Locy rules
+  were loaded and recompiled *before* `plugin_registry` was constructed, so
+  there was nothing to compile against. Nothing between the two positions
+  depended on the registry, and hoisting it keeps it ahead of the
+  `Arc::new(storage)` wrap `set_plugin_registry` requires. Switching the TCK's
+  `when_compile` step off bare `uni_locy::compile` also revealed that
+  `FoldMonotonicity.feature`'s prose asserted two things the suite never
+  checked; both are corrected and the missing `COLLECT` scenario added.
+* **1.2's GC bound** is the minimum version among in-flight `pinned_at_version`
+  views, refcounted. Not "the oldest live snapshot", and not from
+  `SnapshotManager`, which tracks no live readers — that prescription would have
+  dropped entries live readers still resolve.
 
 Also filed and not taken: the GET retry-amplification asymmetry (primary WAL 4
 attempts, fork WAL 16 for the same work), `find_edges_by_type_names`'

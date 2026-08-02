@@ -1802,139 +1802,69 @@ pub(crate) fn rewrite_locy_expr(expr: &LocyExpr) -> Result<Expr> {
 /// exist in the aliased scan schema and planning fails with a "No field named
 /// …" DataFusion error.
 fn rewrite_is_ref_cols(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
-    if aliases.is_empty() {
-        return expr;
-    }
-    let recur = |e: Expr| rewrite_is_ref_cols(e, aliases);
-    let boxed = |e: Box<Expr>| Box::new(rewrite_is_ref_cols(*e, aliases));
+    rename_variables(expr, aliases)
+}
+
+/// Rewrite `Variable` nodes in an expression tree.
+///
+/// At each `Variable(name)`, replaces the node with `f(name)` when that returns
+/// `Some`, leaving it unchanged otherwise. Substitution is not re-entered: the
+/// expression `f` returns is inserted as-is and never re-scanned, so a rewrite
+/// mapping a name onto itself cannot loop.
+///
+/// This is the single source of truth for variable substitution in Locy
+/// planning — the ALONG-inlining, IS-ref-column and FOLD-alias rewrites are all
+/// thin wrappers over it.
+///
+/// Recursion is delegated to [`Expr::map_children_in_scope`], which reaches the
+/// full variant set through `Expr::map_children` — the canonical exhaustive
+/// match, with no wildcard arm, so a new `Expr` variant fails to compile there
+/// until it is classified. This function previously hand-matched 14 arms and
+/// ended in `other => other`, silently dropping ten sub-expression-carrying
+/// variants (`Exists`, `CountSubquery`, `CollectSubquery`, `Quantifier`,
+/// `Reduce`, `ListComprehension`, `PatternComprehension`, `ValidAt`,
+/// `MapProjection`, `LabelCheck`) — the "No field named …" class it claimed to
+/// prevent. Locy reaches all of them: `locy_yield_item` and `fold_expression`
+/// re-parse an arbitrary Cypher `expression` wholesale.
+///
+/// Four positions are deliberately NOT rewritten:
+///
+/// * **Subquery bodies** (`Exists`, `CountSubquery`, `CollectSubquery`) own a
+///   `Box<Query>`, not an `Expr`. A `Fn(&str) -> Option<Expr>` cannot express a
+///   rewrite over a whole query, and Locy binds no name a subquery could
+///   legally reference.
+/// * **Comprehension bodies** — `ListComprehension`'s where/map, `Quantifier`'s
+///   predicate, `Reduce`'s body — are scoped to the comprehension's own loop
+///   variable, so only their outer-scope children (`list`, `init`) are visited.
+///   Rewriting inside would capture: `ALONG w = e.weight` combined with
+///   `[e IN xs | e + w]` would inline `e.weight` under a binder also named `e`.
+///   `PatternComprehension` is skipped whole, since its shadowing set is every
+///   variable its `pattern` binds rather than a single field.
+/// * **`MapProjectionItem::Variable`** holds a `String`, not an `Expr`, so
+///   `n{w}` cannot receive an expression-valued rewrite.
+/// * **`FunctionCall::window_spec`** (its `partition_by` / `order_by`
+///   expressions) is not visited. That is an upstream gap in
+///   `Expr::map_children` shared by every consumer, not specific to Locy.
+fn map_variables(expr: Expr, f: &dyn Fn(&str) -> Option<Expr>) -> Expr {
     match expr {
-        Expr::Variable(ref name) if aliases.contains_key(name) => {
-            Expr::Variable(aliases[name].clone())
-        }
-        Expr::Property(inner, prop) => Expr::Property(boxed(inner), prop),
-        Expr::List(items) => Expr::List(items.into_iter().map(recur).collect()),
-        Expr::Map(entries) => Expr::Map(entries.into_iter().map(|(k, v)| (k, recur(v))).collect()),
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            window_spec,
-        } => Expr::FunctionCall {
-            name,
-            args: args.into_iter().map(recur).collect(),
-            distinct,
-            window_spec,
-        },
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: boxed(left),
-            op,
-            right: boxed(right),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op,
-            expr: boxed(inner),
-        },
-        Expr::Case {
-            expr: scrutinee,
-            when_then,
-            else_expr,
-        } => Expr::Case {
-            expr: scrutinee.map(boxed),
-            when_then: when_then
-                .into_iter()
-                .map(|(w, t)| (recur(w), recur(t)))
-                .collect(),
-            else_expr: else_expr.map(boxed),
-        },
-        Expr::IsNull(inner) => Expr::IsNull(boxed(inner)),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(boxed(inner)),
-        Expr::IsUnique(inner) => Expr::IsUnique(boxed(inner)),
-        Expr::In { expr: e, list } => Expr::In {
-            expr: boxed(e),
-            list: boxed(list),
-        },
-        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
-            array: boxed(array),
-            index: boxed(index),
-        },
-        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
-            array: boxed(array),
-            start: start.map(boxed),
-            end: end.map(boxed),
-        },
-        other => other,
+        Expr::Variable(name) => f(&name).unwrap_or(Expr::Variable(name)),
+        other => other.map_children_in_scope(&mut |e| map_variables(e, f)),
     }
 }
 
-/// Exhaustively rewrite `Variable` nodes in an expression tree.
+/// Rename `Variable` nodes according to a name -> name map.
 ///
-/// At each `Variable(name)`, replaces the node with `f(name)` when that returns
-/// `Some`, leaving it unchanged otherwise. This is the single source of truth for
-/// variable substitution in Locy planning: the ALONG-inlining and FOLD-alias
-/// rewrites are thin wrappers over it. Recursing through *every* `Expr` variant
-/// (not just `BinaryOp`/`UnaryOp`/`FunctionCall`) ensures a variable nested inside
-/// `CASE`, `IN`, `IS [NOT] NULL`, a list, a map, an index, etc. is rewritten
-/// rather than silently dropped — the root cause of the "No field named …" class.
-///
-/// The variant set below must stay in sync with [`rewrite_is_ref_cols`].
-fn map_variables(expr: Expr, f: &dyn Fn(&str) -> Option<Expr>) -> Expr {
-    let recur = |e: Expr| map_variables(e, f);
-    let boxed = |e: Box<Expr>| Box::new(map_variables(*e, f));
-    match expr {
-        Expr::Variable(name) => f(&name).unwrap_or(Expr::Variable(name)),
-        Expr::Property(inner, prop) => Expr::Property(boxed(inner), prop),
-        Expr::List(items) => Expr::List(items.into_iter().map(recur).collect()),
-        Expr::Map(entries) => Expr::Map(entries.into_iter().map(|(k, v)| (k, recur(v))).collect()),
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            window_spec,
-        } => Expr::FunctionCall {
-            name,
-            args: args.into_iter().map(recur).collect(),
-            distinct,
-            window_spec,
-        },
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: boxed(left),
-            op,
-            right: boxed(right),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op,
-            expr: boxed(inner),
-        },
-        Expr::Case {
-            expr: scrutinee,
-            when_then,
-            else_expr,
-        } => Expr::Case {
-            expr: scrutinee.map(boxed),
-            when_then: when_then
-                .into_iter()
-                .map(|(w, t)| (recur(w), recur(t)))
-                .collect(),
-            else_expr: else_expr.map(boxed),
-        },
-        Expr::IsNull(inner) => Expr::IsNull(boxed(inner)),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(boxed(inner)),
-        Expr::IsUnique(inner) => Expr::IsUnique(boxed(inner)),
-        Expr::In { expr: e, list } => Expr::In {
-            expr: boxed(e),
-            list: boxed(list),
-        },
-        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
-            array: boxed(array),
-            index: boxed(index),
-        },
-        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
-            array: boxed(array),
-            start: start.map(boxed),
-            end: end.map(boxed),
-        },
-        other => other,
+/// Shared body of [`rewrite_is_ref_cols`] and [`substitute_fold_aliases`],
+/// which differ only in what the map means at their call sites. Keeping the two
+/// names is deliberate: their doc comments carry domain knowledge that a single
+/// call of this function would not.
+fn rename_variables(expr: Expr, renames: &HashMap<String, String>) -> Expr {
+    if renames.is_empty() {
+        return expr;
     }
+    map_variables(expr, &|name| {
+        renames.get(name).map(|n| Expr::Variable(n.clone()))
+    })
 }
 
 /// Substitute `Variable(name)` nodes matching ALONG binding names with their
@@ -1958,12 +1888,7 @@ fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
 /// variants via [`map_variables`], so a fold output nested in `CASE`/`IN`/etc. is
 /// also renamed.
 fn substitute_fold_aliases(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
-    if aliases.is_empty() {
-        return expr;
-    }
-    map_variables(expr, &|name| {
-        aliases.get(name).map(|a| Expr::Variable(a.clone()))
-    })
+    rename_variables(expr, aliases)
 }
 
 /// Return whether `expr` references any FOLD-output variable.
@@ -2997,6 +2922,163 @@ mod tests {
         assert_eq!(result.is_refs.len(), 2);
         assert_eq!(result.is_refs[0].rule_name, "reachable");
         assert_eq!(result.is_refs[1].rule_name, "connected");
+    }
+
+    // ── map_variables traversal (Tier 1.3) ───────────────────────────
+
+    /// Ten sub-expression-carrying `Expr` variants were silently dropped by the
+    /// old `other => other` arm. Locy reaches them because `locy_yield_item` and
+    /// `fold_expression` re-parse an arbitrary Cypher `expression` wholesale.
+    #[test]
+    fn map_variables_rewrites_newly_traversed_variants() {
+        let sub = |name: &str| -> Option<Expr> {
+            (name == "w")
+                .then(|| Expr::Property(Box::new(Expr::Variable("e".into())), "weight".into()))
+        };
+        let w = || Expr::Variable("w".into());
+        let inlined = Expr::Property(Box::new(Expr::Variable("e".into())), "weight".into());
+
+        // LabelCheck.expr
+        let got = map_variables(
+            Expr::LabelCheck {
+                expr: Box::new(w()),
+                labels: vec!["L".into()],
+            },
+            &sub,
+        );
+        match got {
+            Expr::LabelCheck { expr, .. } => assert_eq!(*expr, inlined),
+            other => panic!("expected LabelCheck, got {other:?}"),
+        }
+
+        // MapProjection literal-entry value
+        let got = map_variables(
+            Expr::MapProjection {
+                base: Box::new(Expr::Variable("n".into())),
+                items: vec![uni_cypher::ast::MapProjectionItem::LiteralEntry(
+                    "k".into(),
+                    Box::new(w()),
+                )],
+            },
+            &sub,
+        );
+        match got {
+            Expr::MapProjection { items, .. } => match &items[0] {
+                uni_cypher::ast::MapProjectionItem::LiteralEntry(_, v) => {
+                    assert_eq!(**v, inlined)
+                }
+                other => panic!("expected LiteralEntry, got {other:?}"),
+            },
+            other => panic!("expected MapProjection, got {other:?}"),
+        }
+
+        // ListComprehension.list — the outer-scope child
+        let got = map_variables(
+            Expr::ListComprehension {
+                variable: "x".into(),
+                list: Box::new(w()),
+                where_clause: None,
+                map_expr: Box::new(Expr::Variable("x".into())),
+            },
+            &sub,
+        );
+        match got {
+            Expr::ListComprehension { list, .. } => assert_eq!(*list, inlined),
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+
+        // Reduce.init and Reduce.list — both outer-scope
+        let got = map_variables(
+            Expr::Reduce {
+                accumulator: "acc".into(),
+                init: Box::new(w()),
+                variable: "x".into(),
+                list: Box::new(w()),
+                expr: Box::new(Expr::Variable("acc".into())),
+            },
+            &sub,
+        );
+        match got {
+            Expr::Reduce { init, list, .. } => {
+                assert_eq!(*init, inlined);
+                assert_eq!(*list, inlined);
+            }
+            other => panic!("expected Reduce, got {other:?}"),
+        }
+    }
+
+    /// The negative half, and the reason this delegates to
+    /// `map_children_in_scope` rather than `map_children`.
+    ///
+    /// A comprehension body is scoped to its own loop variable. Rewriting there
+    /// would capture — `ALONG w = e.weight` plus `[e IN xs | e + w]` would
+    /// inline `e.weight` under a binder also named `e`. `substitute_along_vars`
+    /// inlines arbitrary expressions, so this is reachable, not theoretical.
+    #[test]
+    fn map_variables_does_not_capture_comprehension_binders() {
+        let sub = |name: &str| -> Option<Expr> {
+            (name == "e")
+                .then(|| Expr::Property(Box::new(Expr::Variable("edge".into())), "weight".into()))
+        };
+        let body = || {
+            Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Variable("e".into())),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Literal(CypherLiteral::Integer(1))),
+            })
+        };
+
+        let input = Expr::ListComprehension {
+            variable: "e".into(),
+            list: Box::new(Expr::Variable("xs".into())),
+            where_clause: Some(body()),
+            map_expr: body(),
+        };
+        let got = map_variables(input.clone(), &sub);
+        assert_eq!(got, input, "comprehension body must not be rewritten");
+
+        // A whole PatternComprehension is skipped: its shadowing set is every
+        // variable its `pattern` binds, not one field.
+        let quant = Expr::Quantifier {
+            quantifier: uni_cypher::ast::Quantifier::All,
+            variable: "e".into(),
+            list: Box::new(Expr::Variable("xs".into())),
+            predicate: body(),
+        };
+        assert_eq!(
+            map_variables(quant.clone(), &sub),
+            quant,
+            "quantifier predicate must not be rewritten"
+        );
+    }
+
+    /// `expr_references_fold_output` reuses the same walk, so widening it also
+    /// widens fold-output detection — in the right direction: such expressions
+    /// were already failing at plan time against a column that does not exist
+    /// pre-fold, and are now correctly deferred.
+    #[test]
+    fn expr_references_fold_output_sees_newly_traversed_variants() {
+        let mut names = HashSet::new();
+        names.insert("total");
+
+        assert!(expr_references_fold_output(
+            &Expr::LabelCheck {
+                expr: Box::new(Expr::Variable("total".into())),
+                labels: vec!["L".into()],
+            },
+            &names
+        ));
+
+        // Documented limit: a comprehension body is still not scanned.
+        assert!(!expr_references_fold_output(
+            &Expr::ListComprehension {
+                variable: "x".into(),
+                list: Box::new(Expr::Variable("xs".into())),
+                where_clause: None,
+                map_expr: Box::new(Expr::Variable("total".into())),
+            },
+            &names
+        ));
     }
 
     #[test]

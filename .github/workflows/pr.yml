@@ -259,6 +259,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mold protobuf-compiler
 
+      # Needed by the pyo3 loader step below. This is a Python job, so Rust is
+      # otherwise only here for `maturin develop`, which needs plain `cargo
+      # build` — nextest is a separate subcommand and is not part of the
+      # toolchain.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:

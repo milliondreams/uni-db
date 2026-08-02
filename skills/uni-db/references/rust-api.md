@@ -252,6 +252,8 @@ impl<'a> LocyBuilder<'a> {
 }
 ```
 
+`.cancellation_token()` here races the token against the whole evaluation, so a long-running fixpoint is cancellable, not merely at statement boundaries. Cancelling yields `UniError::Cancelled`. The same holds for the enclosing scope: `Transaction::cancel()` reaches `tx.locy()` / `tx.locy_with()` and `tx.apply()` in addition to the transaction's Cypher statements.
+
 ### Other builders (tx-level)
 
 - **`ExecuteBuilder`** (`tx.execute_with()`): `.param()`, `.params()`, `.timeout()` -> `.run()` -> `ExecuteResult` | `.profile()` -> `(ExecuteResult, ProfileOutput)`

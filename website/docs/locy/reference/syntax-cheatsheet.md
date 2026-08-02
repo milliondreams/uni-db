@@ -21,20 +21,22 @@ The second `WHERE` (after `FOLD`) filters on aggregated values — equivalent to
 
 | Operator | Semantics | Use In Recursion? |
 |----------|-----------|-------------------|
-| `COUNT(*)` / `COUNT(expr)` | Row count | Non-recursive only |
+| `COUNT(*)` / `COUNT(expr)` | Row count | Safe (unbounded) |
 | `SUM(expr)` | Arithmetic sum | Non-recursive only |
 | `AVG(expr)` | Arithmetic mean | Non-recursive only |
-| `MIN(expr)` | Minimum value | Non-recursive only |
-| `MAX(expr)` | Maximum value | Non-recursive only |
-| `COLLECT(expr)` | Collect into list | Non-recursive only |
-| `MSUM(expr)` | Monotonic sum (non-decreasing) | Safe in recursion |
+| `MIN(expr)` | Minimum value | Safe in recursion |
+| `MAX(expr)` | Maximum value | Safe in recursion |
+| `COLLECT(expr)` | Collect into list | Safe (unbounded) |
+| `MSUM(expr)` | Monotonic sum (non-decreasing) | Safe (unbounded) |
 | `MMAX(expr)` | Monotonic maximum | Safe in recursion |
 | `MMIN(expr)` | Monotonic minimum | Safe in recursion |
-| `MCOUNT(expr)` | Monotonic count | Safe in recursion |
+| `MCOUNT(expr)` | Monotonic count | Safe (unbounded) |
 | `MNOR(expr)` | Noisy-OR probability: `1 − ∏(1 − pᵢ)` | Safe in recursion |
 | `MPROD(expr)` | Product probability: `∏ pᵢ` | Safe in recursion |
 
-Standard aggregators (`SUM`, `MAX`, etc.) can decrease between fixpoint iterations, which violates the monotonicity required for safe recursive evaluation. Use the `M`-prefixed monotonic variants in recursive strata.
+Recursion safety comes from the aggregate's registered semilattice (`monotone_join`), not from an `M` prefix; the compiler falls back to the six built-in `M*` names only when the aggregate registry has no entry. `SUM` and `AVG` are non-monotone and are rejected inside a recursive stratum.
+
+The aggregates marked *unbounded* are monotone but have no top element, so a recursive fold over one can iterate until `max_iterations` rather than converging — the iteration cap is the backstop. The exception is `COLLECT`, which is assembled after the fixpoint rather than tracked inside it, so it does not itself keep the loop iterating.
 
 ## Goal Query
 

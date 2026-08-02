@@ -269,6 +269,8 @@ class Transaction:
 
 Same methods as SessionLocyBuilder (minus `.params(dict)`). Terminal: `.run()` -> `LocyResult`.
 
+`.cancellation_token(token)` races the token against the whole evaluation, so a long-running fixpoint is cancellable, not merely at statement boundaries; it raises `UniCancelledError`. `Transaction.cancel()` likewise reaches `tx.locy()` / `tx.locy_with()` and `tx.apply()`, not just the transaction's Cypher statements.
+
 ### ApplyBuilder (`tx.apply_with(derived)`)
 
 `.require_fresh(bool)`, `.max_version_gap(int)` -> self. Terminal: `.run()` -> `ApplyResult`.

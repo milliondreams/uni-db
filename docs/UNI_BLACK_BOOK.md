@@ -1200,6 +1200,30 @@ MainCsr {
 
 Each `CsrEdgeEntry` carries a `created_version` field, enabling snapshot queries without rebuilding the CSR.
 
+### ShadowCsr (Deleted-Edge Overlay)
+
+A deleted edge leaves the Main CSR but stays recorded in `ShadowCsr`, so snapshot and time-travel reads can resurrect it:
+
+```rust
+ShadowEdge {
+    neighbor_vid: Vid,
+    eid: Eid,
+    edge_type: u32,
+    created_version: u64,
+    deleted_version: u64,
+}
+```
+
+An entry is alive at `version` when `created_version <= version < deleted_version` (`get_entries_at_version`). Entries arrive from two places: `AdjacencyManager::compact`, which moves overlay tombstones into the shadow as it merges frozen segments, and `AdjacencyManager::warm`, which pushes one for every `op = 1` row it reads out of the L1 delta. The regular (non-snapshot) read path never consults it.
+
+**Retention.** `add_deleted_edge` ignores a repeat of an `Eid` it already holds. The dedup is load-bearing rather than tidiness: unlike `warm_coalesced`, `warm` has no `has_csr` short-circuit, so each warm of the same `(edge_type, direction)` re-pushed the *entire* delete history — growth was unbounded in the number of warms, not the number of deletes. Reads already dedupe by `Eid` downstream, which is why it surfaced as memory rather than as wrong answers.
+
+**GC bound.** `AdjacencyManager::gc_shadow(current_version)` drops entries whose `deleted_version` is at or below a floor, and is called after CSR compaction. The floor is `min(min_pinned_version, current_version)`, collapsing to `current_version` when nothing is pinned. `StorageManager::pinned_at_version` registers a `PinGuard` for the lifetime of the view it builds, and `PinnedVersions` is refcounted so the floor cannot rise while another reader still holds the same version.
+
+The bound is that narrow for a specific reason: `StorageManager::pinned()` and `at_fork` each build a **fresh** `AdjacencyManager` with its own empty `ShadowCsr`, so those readers never consult the live one. `pinned_at_version` — the path a read-write transaction takes whenever it pins at all (`ssi_enabled`, or any ephemeral/scratch transaction) — is the only one that shares it. `SnapshotManager` cannot supply the floor because it is a manifest reader-writer and tracks no live readers.
+
+**Observability.** `AdjacencyManager::memory_usage` adds `ShadowCsr::approx_bytes` to the main-CSR byte counter, so shadow retention is visible to the cache budget; `shadow_entry_count()` / `ShadowCsr::entry_count()` expose the raw count for retention tests and diagnostics.
+
 ### AdjacencyDataset (Persistent CSR)
 
 Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-vertex format:
@@ -1373,8 +1397,14 @@ PropertyManager {
 1. Check if deleted in L0 → return None
 2. Check L0 chain (transaction → main → pending flush) → return if found
 3. Check LRU cache → return if found
-4. Fetch from Lance storage runs → update cache → return
+4. Fetch from Lance storage runs, bounded by the reader's version high water mark when it has one → update cache → return
 5. L0 properties **always** take precedence over storage
+
+Step 4 spans two tiers, and both conjoin `_version <= hwm` when the `PropertyManager`'s own `StorageManager` carries one: the per-type delta scan (via `StorageManager::apply_version_filter`) and the `props_json` fallback in the main edges table (via `MainEdgeDataset::find_props_by_eid`). Schemaless and overflow edge properties live *only* in `props_json`, so every such read reaches the fallback — not only reads that come after a compaction.
+
+> **Which readers are actually bounded.** The high water mark comes from the `StorageManager` the `PropertyManager` was *constructed* with, not from whatever manager the surrounding query routes its scans through. Only the manifest-pinned time-travel view built by `UniInner::at_snapshot` constructs a `PropertyManager` over pinned storage, so only it gets a bounded step 4. A read-write transaction routes *scans* through `pinned_at_version` but keeps the live database-level `PropertyManager` on purpose (see [Known Limitations](#known-limitations)), so its hwm is `None` and step 4 reads at HEAD; forks are likewise unbounded. Step 3's LRU cache is version-agnostic in every case.
+
+> **Embedder note (breaking).** `MainEdgeDataset::find_props_by_eid` takes a third argument, `version: Option<u64>`; pass `storage.version_high_water_mark()`, or `None` for an unbounded read at HEAD. Without it even a snapshot-pinned reader read L0 and the delta tier at its snapshot but this tier at HEAD, so a post-snapshot write leaked in and a post-snapshot delete made the edge vanish. The version bound is a *conjunct* — the highest-version-row-wins tombstone rule runs unchanged over whatever survives it. `exists_by_eid` stays deliberately unbounded: it is the compaction dual-write invariant check and must see rows at any version.
 
 ## Storage Best Practices
 
@@ -3339,6 +3369,16 @@ CREATE RULE total_exposure AS
 
 Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`
 
+#### Monotonicity in Recursive Strata
+
+A rule in a recursive stratum may only `FOLD` with an aggregate the compiler can prove monotone; anything else fails with `NonMonotonicInRecursion` at compile time. The verdict comes from the plugin registry — `Semilattice::monotone_join` on the registered `LocyAggregate` — falling back to the built-in `M*` contract (`MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`, `MSUM`) when the registry has no entry, so a plugin-less embedding keeps working. The compile-time oracle and the planner's guard both go through the same `locy_monotonicity_verdict`; when they disagreed, a program could compile cleanly and then fail at plan time.
+
+Consequences:
+
+- `COUNT` and `COLLECT` are `monotone_join: true` in the builtin registry, so a recursive `FOLD n = COUNT(*)` or `FOLD xs = COLLECT(x)` **compiles**. Both are `has_top: false` — monotone but unbounded. The unboundedness only costs iterations for the aggregates the fixpoint loop actually tracks: `COUNT` overrides `update_step`, so its accumulator can keep changing and fail convergence condition (2) indefinitely, ending at `max_iterations`. `COLLECT` does not override `update_step`, so `AggregateTracker::update` skips it (the `CODE_UNKNOWN_FUNCTION` arm) and it is aggregated after the fixpoint via `LocyAggState::ingest` — it cannot itself keep the loop iterating. The iteration cap is the backstop, not a proof of termination.
+- `SUM` and `AVG` are `monotone_join: false` and remain rejected in recursion. Use `MSUM` (caller-asserted non-negative) when a recursive sum is genuinely wanted.
+- A plugin-registered aggregate declaring `monotone_join: true` works in a recursive stratum. That includes rules registered through `db.rules().register(...)` — the facade chains `RuleRegistry::with_plugin_registry` so registration compiles against the same aggregates queries see. It does **not** extend to reopening the database: `UniBuilder` has no plugin-registration hook (`Uni::add_plugin` is only reachable after open), and `build_locy_registry_from_persisted` runs immediately after `register_builtin_plugins` with a registry that holds builtins only. A persisted rule folding over a plugin aggregate therefore fails the open naming that rule, unless `skip_invalid_locy_rules(true)` is set — in which case it is dropped with a warning and must be re-registered after `add_plugin`. Rules folding over built-in aggregates reload normally.
+
 ### Post-FOLD WHERE (HAVING)
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
@@ -3453,6 +3493,8 @@ CREATE RULE best_route AS
 ```
 
 Enables `LIMIT 1` optimization — the engine can prune suboptimal paths early during semi-naive evaluation.
+
+`BEST BY` cannot be combined with a *declared lattice fold* — `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`, `MSUM` — and the combination is rejected with `BestByWithMonotonicFold`. That guard is purely syntactic over those six spellings and is deliberately decoupled from the monotonicity oracle above: the oracle asks whether an aggregate is sound under a fixpoint, this asks whether the user wrote a lattice fold. It also runs for **every** rule, not just recursive ones. `BEST BY … FOLD MAX(x)` / `MIN` / `COUNT` / `COLLECT` are therefore legal, even though those aggregates are `monotone_join: true`.
 
 ### YIELD KEY (Grouping)
 
@@ -3878,10 +3920,16 @@ lose updates in this mode.
 - **Flush-boundary edge cases**: transactions pin the L1 vertex-scan tier
   (vertex rows filter to `_version <=` the snapshot version, so
   post-snapshot inserts flushed mid-transaction stay invisible). The pin is
-  on row *existence*, not property values or edges: property point-reads and
-  edge traversals stay on live storage so a transaction reads its own
-  uncommitted writes (tx_l0), and cross-transaction property/edge skew on an
-  already-visible row is caught by OCC validation at commit. A vertex whose
+  on row *existence*, not property values or edges. Scans route through the
+  version-pinned `StorageManager`, but the `PropertyManager` deliberately
+  stays on **live** storage: a transaction must read its own uncommitted
+  properties out of tx_l0, and a version filter would hide them (it would
+  break e.g. MERGE's edge-property match). The edge/adjacency tier stays
+  live for the mirror-image reason — a `pinned_at_version` view *shares* the
+  live `AdjacencyManager`, so the transaction's own unflushed edges stay
+  visible to traversal. Cross-transaction property/edge skew on an
+  already-visible row is therefore caught by OCC validation at commit (edge
+  reads are recorded in the read-set), not by the pin. A vertex whose
   only pre-transaction state is in L1 and that is updated-and-flushed
   mid-transaction is *excluded* from the pinned scan rather than shown old
   (L1 rows are single-versioned).
@@ -4325,6 +4373,7 @@ The first matching trigger fires a compaction task. After semantic compaction co
 - **CompactionGuard** (RAII): Only one compaction task at a time
 - Frozen L0 segments remain readable during CSR rebuild until atomic swap
 - Snapshot-based reads are completely unaffected by compaction
+- Shadow-CSR GC (`AdjacencyManager::gc_shadow`) runs on the same task, right after CSR compaction, bounded by the versions in-flight `pinned_at_version` views hold — an entry a live reader still resolves is never reclaimed (see [ShadowCsr](#shadowcsr-deleted-edge-overlay))
 - OOM guard prevents loading more than `max_compaction_rows` into memory
 
 ---
@@ -5657,7 +5706,7 @@ The foundation crate is `uni-plugin` (traits, manifest, capability, registry, re
 
 ## Why Plugins?
 
-- **Closing closed-enum dispatch.** Before the framework, adding an aggregate or procedure meant editing a `match` in the executor. That coupling is gone: a new `LocyAggregate` or `ProcedurePlugin` registers and is dispatched purely through its trait object. The non-recursive Locy `FOLD` executor, the last holdout, now dispatches through `LocyAggState` rather than a name match (`crates/uni-query/src/query/df_graph/locy_fold.rs`).
+- **Closing closed-enum dispatch.** Before the framework, adding an aggregate or procedure meant editing a `match` in the executor. That coupling is gone: a new `LocyAggregate` or `ProcedurePlugin` registers and is dispatched purely through its trait object. The non-recursive Locy `FOLD` executor, the last holdout, now dispatches through `LocyAggState` rather than a name match (`crates/uni-query/src/query/df_graph/locy_fold.rs`). The Locy compiler's recursive-stratum monotonicity gate was a *second* hardcoded name list until it too was routed through the registry: it now reads `Semilattice::monotone_join` off the registered `LocyAggregate` (`locy_monotonicity_verdict`, falling back to the built-in `M*` names on a registry miss), so a plugin aggregate declaring `monotone_join: true` is accepted in a recursive stratum — via `session.locy(...)` and via `db.rules().register(...)`. The reopen path threads the same registry into `build_locy_registry_from_persisted`, but it runs before any plugin can be added, so only built-in aggregates survive a reopen (see [Monotonicity in Recursive Strata](#monotonicity-in-recursive-strata)).
 - **Host-language extensibility.** Five loaders cover the spectrum: Rust for native performance, WASM (Component Model and Extism) for sandboxed polyglot third parties, PyO3 for data scientists authoring in-process, Rhai for sandboxed pure-Rust ops scripts.
 - **Capability gating as a security boundary.** A plugin gets only the host services its grant intersection permits. An untrusted WASM scalar fn that declared only `[ScalarFn]` cannot touch the filesystem, the network, or run a host query — the relevant host functions are not even linked into its instance.
 - **A measured perf path.** Scalar fns that declare a primitive Arrow return type (the native path) skip the `LargeBinary` `CypherValue` round-trip — the proposal's criterion #9 perf win.

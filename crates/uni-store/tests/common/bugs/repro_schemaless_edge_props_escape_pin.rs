@@ -10,8 +10,17 @@
 //! Every other tier of the same read *is* bounded: `PropertyManager` conjoins
 //! `apply_version_filter` onto the delta scan, and `overlay_l0_edge_batch`
 //! skips entries whose `entry_version > hwm`. Only this L1 main-table fallback
-//! read at HEAD. So a pinned or SSI transaction saw its own snapshot in L0 and
+//! read at HEAD. So a snapshot-pinned reader saw its own snapshot in L0 and
 //! delta, and post-snapshot state in L1 — a snapshot-isolation violation.
+//!
+//! Scope, established after the fix landed: the bound only takes effect when the
+//! calling `PropertyManager` was constructed over pinned storage, which today
+//! means `UniInner::at_snapshot`'s time-travel view. A read-write transaction
+//! routes its *scans* through `pinned_at_version` but deliberately keeps the
+//! live `PropertyManager`, so property point-reads honour read-your-writes and
+//! cross-transaction property skew is caught by OCC at commit instead. The
+//! tests below exercise the dataset directly, which is the layer the bound
+//! lives at.
 //!
 //! The vertex side has had the bound since it was written
 //! (`MainVertexDataset::find_props_by_vid` takes `version: Option<u64>`), and

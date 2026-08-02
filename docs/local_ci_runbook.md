@@ -332,5 +332,21 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
   This is a last-resort local fix, not part of the workflow.
 - **Notebooks** — run serially (see §3); concurrent runs fail spuriously, not from a code bug.
 - **Cloud** — always `docker rm -f uni-localstack` when done so the port/container doesn't linger.
+- **Cloud: published ports can be unreachable from the host.** On some machines a
+  `-p 4566:4566` container is healthy and serving *inside* the container while every
+  connection from the host times out (`curl` gives `http_code=000`, and the tests fail with
+  `curl: (56) Recv failure: Connection reset by peer` / `failed to create localstack bucket`).
+  This is Docker's port-publishing/NAT path, not LocalStack. Confirm with a minimal case —
+  `docker run -d -p 8098:80 nginx:alpine`, then `curl 127.0.0.1:8098` from the host versus
+  from inside the container. If it reproduces, start LocalStack with **`--network host`**
+  (drop `-p`); the container binds 4566 in the host namespace and the NAT path is bypassed.
+  Nothing else changes — endpoint, credentials and every S3 code path under test are
+  identical, so the run is still valid evidence. Note this is *not* CI's topology (GitHub
+  Actions publishes the port normally), so a pass here means "the cloud tests pass against
+  LocalStack", not "the cloud job as CI runs it is reproduced".
+- **Cloud: check the readiness wait's exit status.** `timeout 120 bash -c 'until curl ...'`
+  returns **124** when it gives up, and the snippet above does not abort on it — the tests
+  then run against a dead endpoint and fail ~134s later on connection timeouts, which reads
+  like a code failure. Capture the status and stop if it is non-zero.
 - **Reranker real-ONNX tests** need network (HF). A flaky download is an infra failure, not a code
   failure — re-run before concluding.

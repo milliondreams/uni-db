@@ -467,10 +467,16 @@ DROP INDEX idx_name
 ### Constraints
 
 ```cypher
-CREATE CONSTRAINT UNIQUE ON Person (email)
-CREATE CONSTRAINT PRIMARY KEY ON Product (sku)
+CREATE CONSTRAINT uniq_email ON (p:Person) ASSERT p.email IS UNIQUE
+CREATE CONSTRAINT pk_sku ON (p:Product) ASSERT p.sku IS KEY
+CREATE CONSTRAINT has_since ON ()-[r:KNOWS]->() ASSERT EXISTS(r.since)
+CREATE CONSTRAINT score_chk ON (p:Person) ASSERT p.score >= 0    -- CHECK
 DROP CONSTRAINT constraint_name
 ```
+
+The name and `IF NOT EXISTS` are optional; `ON` takes a node pattern `(v:Label)` or a relationship pattern `()-[v:TYPE]->()`. An assertion that is not `IS UNIQUE`, `IS KEY` or `EXISTS(...)` becomes a CHECK constraint.
+
+CHECK is enforced by the bulk loader and the transactional path, which share one evaluator. It handles the shape `prop op literal` with `op` in `= == != <> > < >= <=`; comparisons coerce `Int`/`Float`, so `ASSERT p.score = 5` passes against a stored `5.0`. A missing property passes -- absence is `EXISTS`'s concern. An expression outside that shape is **allowed with a warning**, not enforced.
 
 ### SHOW Commands
 

@@ -26,8 +26,6 @@ YIELD KEY a, total
 
 ### Standard Aggregators
 
-Standard aggregators work in **non-recursive** strata only. They can decrease between iterations, which violates fixpoint requirements:
-
 | Operator | Description | Example |
 |----------|-------------|---------|
 | `COUNT(*)` | Row count | `FOLD n = COUNT(*)` |
@@ -38,9 +36,13 @@ Standard aggregators work in **non-recursive** strata only. They can decrease be
 | `MAX(expr)` | Maximum | `FOLD high = MAX(b.price)` |
 | `COLLECT(expr)` | Collect into list | `FOLD paths = COLLECT(b.name)` |
 
+`SUM` and `AVG` are **non-monotone** — they can decrease between iterations, which violates fixpoint requirements, so the compiler rejects them inside a recursive stratum. The rest (`COUNT(*)`, `COUNT(expr)`, `MIN`, `MAX`, `COLLECT`) declare a monotone join and are accepted in recursion.
+
+`COUNT` and `COLLECT` are monotone but **unbounded** — the accumulator has no top element. That only costs iterations for `COUNT`, whose accumulator the fixpoint loop tracks: a recursive fold over it can iterate until `max_iterations` rather than converging. `COLLECT` is assembled after the fixpoint, so it does not itself keep the loop iterating.
+
 ### Monotonic Aggregators (Safe in Recursion)
 
-Monotonic variants guarantee the aggregate never decreases between iterations, enabling safe use inside recursive strata:
+Monotonic variants guarantee the aggregate only ever moves forward in its own lattice order between iterations — upward for `MSUM`/`MMAX`/`MCOUNT`/`MNOR`, downward for `MMIN`/`MPROD` — enabling safe use inside recursive strata:
 
 | Operator | Formula | Identity | Use When |
 |----------|---------|----------|----------|
@@ -50,6 +52,8 @@ Monotonic variants guarantee the aggregate never decreases between iterations, e
 | `MCOUNT(expr)` | Running count | `0` | Monotonically growing count |
 | `MNOR(expr)` | `1 − ∏(1 − pᵢ)` | `0.0` | Independent OR-causes (probabilities) |
 | `MPROD(expr)` | `∏ pᵢ` | `1.0` | Independent AND-conditions (probabilities) |
+
+These six spellings are Locy's *declared lattice folds*. Writing one is an explicit assertion that the fold is a lattice join, and it is what the [`BEST BY` guard](#best-by-witness-selection) keys on. `MSUM` and `MCOUNT` are unbounded, so the same `max_iterations` caveat applies to them.
 
 ### Monotonic Probabilistic Folds
 
@@ -139,6 +143,14 @@ ALONG cost = prev.cost + e.weight
 BEST BY cost ASC
 YIELD KEY a, KEY b, cost
 ```
+
+### BEST BY and FOLD
+
+`BEST BY` picks one witness row; a declared lattice fold aggregates across all of them. Combining the two in one rule is rejected at compile time with `BestByWithMonotonicFold`.
+
+The guard is **syntactic** over the six declared lattice folds (`MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`) and applies to **every** rule, recursive or not. It is deliberately decoupled from the recursion monotonicity check, so `BEST BY` combined with `MAX`, `MIN`, `COUNT` or `COLLECT` is legal even though those aggregates are monotone.
+
+To get both, compute the aggregate in its own rule and reference it with `IS` from the `BEST BY` rule.
 
 ## Using `similar_to` in ALONG and BEST BY
 

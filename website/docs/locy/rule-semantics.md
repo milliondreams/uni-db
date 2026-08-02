@@ -53,9 +53,17 @@ If the referenced rule exposes a `PROB` column, `IS NOT` becomes probabilistic c
 
 ## Monotonic Recursion
 
-Recursive aggregation requires monotonic operators where specified. Non-monotonic recursive shapes are rejected.
+Recursive aggregation requires monotonic operators. Non-monotonic recursive shapes are rejected at compile time with `NonMonotonicInRecursion`.
 
-`MNOR` and `MPROD` are monotonic and therefore legal inside recursive strata. They assume independent derivations unless `exact_probability` is enabled.
+Monotonicity is decided by the aggregate registry: the compiler reads the aggregate's `monotone_join` semilattice flag, falling back to the six built-in `M*` names (`MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`) only when the registry has no entry for the name. So `MIN`, `MAX`, `COUNT`, `COUNT(*)` and `COLLECT` are legal inside recursive strata too; `SUM` and `AVG` are non-monotone and rejected.
+
+Monotone does not imply convergent. `COUNT`, `COLLECT`, `MSUM` and `MCOUNT` are monotone but unbounded — they have no top element. For the ones the fixpoint loop tracks row by row (`COUNT`, `MSUM`, `MCOUNT`) that means a recursive fold can run to `max_iterations` instead of reaching a fixed point; the iteration cap is the backstop. `COLLECT` is the exception: it has no row-level accumulator and is assembled after the fixpoint, so it does not itself keep the loop iterating.
+
+`MNOR` and `MPROD` are monotonic and bounded, therefore legal inside recursive strata. They assume independent derivations unless `exact_probability` is enabled.
+
+**Plugin-registered aggregates.** Because the verdict comes from the registry, an aggregate registered by a plugin participates in the check on the same terms as a built-in: declaring `monotone_join: true` makes it usable inside a recursive stratum. Load the plugin first and this holds for rules compiled through `session.locy(...)` and for rules registered with `db.rules().register(...)`.
+
+It does *not* extend to reopening a database. Persisted rules are recompiled during open, before any plugin can be added, so a stored rule folding over a plugin aggregate no longer compiles and the open fails naming that rule — unless you open with `skip_invalid_locy_rules(true)`, which drops it with a warning. Rules folding over built-in aggregates (`MIN`, `MAX`, `COUNT`, `COLLECT`, the `M*` names) reload normally.
 
 ## Determinism
 

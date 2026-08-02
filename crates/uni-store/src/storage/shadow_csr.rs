@@ -71,9 +71,10 @@ impl ShadowCsr {
 
     /// Total shadow entries retained, across every key.
     ///
-    /// Exposed so retention is observable: shadow memory is not counted in
-    /// `AdjacencyManager::memory_usage`, whose `current_bytes` tracks only the
-    /// main CSR, so nothing else can see this grow.
+    /// Exposed so retention is observable directly. `current_bytes` in
+    /// `AdjacencyManager` tracks only the main CSR, so `memory_usage` folds in
+    /// [`Self::approx_bytes`] rather than counting shadow entries
+    /// incrementally.
     pub fn entry_count(&self) -> usize {
         self.entries
             .iter()

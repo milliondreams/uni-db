@@ -52,7 +52,7 @@ Builder methods:
 | `.timeout(duration)` | Set evaluation timeout (`std::time::Duration`) |
 | `.max_iterations(n)` | Set recursion iteration cap |
 | `.with_config(cfg)` | Set full `LocyConfig` options (taken by value) |
-| `.cancellation_token(token)` | Attach a cancellation token |
+| `.cancellation_token(token)` | Attach a cancellation token; cancelling it aborts the evaluation with `UniError::Cancelled` |
 | `.run()` | Execute and return `LocyResult` |
 | `.explain()` | Compile and return `LocyExplainOutput` without evaluating |
 

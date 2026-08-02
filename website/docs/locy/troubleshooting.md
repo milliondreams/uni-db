@@ -20,11 +20,17 @@ Cause: overloaded rule clauses yield incompatible column sets/types.
 
 Fix: align `YIELD` contracts across clauses.
 
+### NonMonotonicInRecursion
+
+Cause: a recursive rule folds with an aggregate whose registered semilattice declares `monotone_join: false` — `SUM` and `AVG` among the built-ins — or with an aggregate the compiler cannot resolve at all.
+
+Fix: switch to a monotone aggregate (`MSUM` for additive accumulation, `MMAX`/`MMIN`, or the plain `MIN`/`MAX`/`COUNT`/`COLLECT`), or move the non-monotone fold into a separate non-recursive rule that consumes the recursive relation with `IS`.
+
 ### BestByWithMonotonicFold
 
-Cause: `BEST BY` used in the same rule as `MNOR` or `MPROD`.
+Cause: `BEST BY` used in the same rule as a declared lattice fold — `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR` or `MPROD`. The check is syntactic over those six names and applies to every rule, recursive or not.
 
-Fix: Monotonic folds are incompatible with witness selection. Use a separate rule to compute the probability, then reference it with `IS` in the `BEST BY` rule.
+Fix: Declared lattice folds are incompatible with witness selection. Use a separate rule to compute the aggregate, then reference it with `IS` in the `BEST BY` rule. Plain `MAX`, `MIN`, `COUNT` and `COLLECT` are fine alongside `BEST BY`.
 
 ### ProbabilityDomainViolation (warning)
 

@@ -492,6 +492,8 @@ db.indexes().rebuild("Person", background=True)
 
 **LabelInfo fields:** `name`, `count`, `properties: list[PropertyInfo]`, `indexes: list[IndexInfo]`, `constraints: list[ConstraintInfo]`
 
+`count` on both `LabelInfo` and `EdgeTypeInfo` is computed with a Cypher `count()`, so it includes rows still in the L0 buffers (no flush needed) and excludes tombstoned/superseded versions. It is **not** the same number as `nodeCount` from `CALL uni.schema.labels()`, which is still a raw storage row count: flushed rows only, tombstones and superseded versions included. The name is backtick-quoted in the generated query, so punctuation (`.` included), leading digits and non-ASCII names count correctly; a name containing a backtick is refused with an error, since Cypher's quoted-identifier syntax has no escape for it.
+
 **PropertyInfo fields:** `name`, `data_type`, `nullable`, `is_indexed`
 
 **IndexInfo fields:** `name`, `index_type`, `properties: list[str]`, `status`

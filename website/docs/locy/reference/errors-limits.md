@@ -4,7 +4,9 @@
 
 - Parse errors: invalid Locy syntax.
 - Compile errors: invalid dependencies, type/schema mismatches, stratification violations.
-- Runtime errors: timeout, iteration limit, memory constraints, mutation constraints.
+- Runtime errors: timeout, iteration limit, memory constraints, mutation constraints, cancellation.
+
+Cancelling the token attached to an evaluation aborts it with `UniError::Cancelled` (`UniCancelledError` in Python). Enforcement races the whole evaluation, so a long-running fixpoint is interruptible rather than only checked at statement boundaries.
 
 ## Operational Limits (via `LocyConfig`)
 
